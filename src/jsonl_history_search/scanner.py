@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from .clustering import facets_for_record
 from .query import QueryIntent
 from .ranking import Match, group_matches, make_snippet, score_record, should_consider
 from .records import parse_record
@@ -63,6 +64,7 @@ def search(
                 else:
                     copied_text = record.text
                 snippet_text = make_snippet(copied_text, intent.terms)
+                facets = facets_for_record(path=record.path, text=record.text, artifacts=artifacts)
                 matches.append(
                     Match(
                         path=record.path,
@@ -73,7 +75,10 @@ def search(
                         snippet=snippet_text,
                         score=round(score, 3),
                         reasons=reasons,
-                        artifacts=artifacts,
+                        artifacts=facets.artifacts,
+                        session=facets.session,
+                        tasks=facets.tasks,
+                        preferences=facets.preferences,
                     )
                 )
                 if len(matches) >= plan.limits.max_matches:

@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from .expansion import expand_query_terms
 from .timeutil import local_day_window
 
 STOPWORDS = {
@@ -47,6 +48,8 @@ class QueryIntent:
     date_window_end: datetime | None = None
     date_reason: str | None = None
     artifact_hints: list[str] = field(default_factory=list)
+    base_terms: list[str] = field(default_factory=list)
+    expansion_reasons: dict[str, list[str]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -54,6 +57,8 @@ class QueryIntent:
             "original": self.original,
             "normalized": self.normalized,
             "terms": self.terms,
+            "base_terms": self.base_terms,
+            "expansion_reasons": self.expansion_reasons,
             "role": self.role,
             "date_window": {
                 "start": self.date_window_start.isoformat() if self.date_window_start else None,
@@ -70,7 +75,16 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
     inferred_role = role or infer_role(normalized)
     start, end, reason = infer_date_window(normalized, now)
     artifact_hints = infer_artifacts(normalized)
-    terms = infer_terms(normalized, artifact_hints)
+    base_terms = infer_terms(normalized, artifact_hints)
+    expanded = expand_query_terms(
+        normalized=normalized,
+        base_terms=base_terms,
+        artifact_hints=artifact_hints,
+        date_window_start=start,
+        date_window_end=end,
+        date_reason=reason,
+    )
+    terms = expanded.terms
     warnings: list[str] = []
     if not terms and not (start and end):
         warnings.append("No concrete terms or date window inferred; search may be broad within selected transcript roots.")
@@ -83,6 +97,8 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
         date_window_end=end,
         date_reason=reason,
         artifact_hints=artifact_hints,
+        base_terms=base_terms,
+        expansion_reasons=expanded.reasons,
         warnings=warnings,
     )
 
