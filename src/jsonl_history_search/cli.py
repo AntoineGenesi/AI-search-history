@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .output import render
 from .query import infer_query
+from .redaction import RedactionContext
 from .scanner import search
 from .sources import Limits, build_source_plan
 from .timeutil import parse_now, timezone_from_args
@@ -44,6 +45,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="False-positive masking manifest for future copied-context search snippets",
     )
     parser.add_argument("--mask-mode", choices=sorted(MASK_MODES), default="production_collapse")
+    parser.add_argument(
+        "--redaction-profile",
+        default=None,
+        help="JSON profile for read-only snippet redaction of common PII/secrets and custom regexes",
+    )
 
 
 def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
@@ -84,7 +90,54 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
             "scope": "future_copied_context_snippets_only",
             "canonical_transcripts_mutated": False,
         }
+    if args.redaction_profile:
+        redaction_path = Path(args.redaction_profile).expanduser()
+        source_plan["redaction"] = _redaction_source_metadata(
+            redaction_path,
+            RedactionContext.from_path(redaction_path),
+        )
     return source_plan, intent, plan
+
+
+def _redaction_source_metadata(path: Path, context: RedactionContext) -> dict:
+    profiles = [name for name in context.stats.profiles if not name.startswith("custom:")]
+    custom_count = sum(1 for name in context.stats.profiles if name.startswith("custom:"))
+    return {
+        "profile_path": str(path),
+        "mode": context.stats.mode,
+        "profiles": sorted(set(profiles)),
+        "custom_count": custom_count,
+        "warnings": list(context.stats.warnings),
+        "scope": "future_copied_context_snippets_only",
+        "canonical_transcripts_mutated": False,
+    }
+
+
+def _mask_context_from_args(args: argparse.Namespace) -> MaskContext | None:
+    if not args.mask_manifest and not args.redaction_profile:
+        return None
+    mask_context = (
+        MaskContext.from_path(Path(args.mask_manifest).expanduser(), args.mask_mode)
+        if args.mask_manifest
+        else MaskContext.disabled(mode=args.mask_mode)
+    )
+    if args.redaction_profile:
+        redaction_context = RedactionContext.from_path(Path(args.redaction_profile).expanduser())
+        mask_context.redaction_context = redaction_context
+        if mask_context.stats is not None:
+            mask_context.stats.redaction = redaction_context.stats.to_dict()
+            for warning in redaction_context.stats.warnings:
+                if warning not in mask_context.stats.warnings:
+                    mask_context.stats.warnings.append(warning)
+    return mask_context
+
+
+def _configuration_warnings(source_plan: dict) -> list[str]:
+    redaction = source_plan.get("redaction")
+    if not isinstance(redaction, dict):
+        return []
+    warnings = redaction.get("warnings")
+    return list(warnings) if isinstance(warnings, list) else []
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,15 +149,11 @@ def main(argv: list[str] | None = None) -> int:
             "searched_files": 0,
             "searched_bytes": 0,
             "groups": [],
-            "warnings": sorted(set(intent.warnings + plan.warnings)),
+            "warnings": sorted(set(intent.warnings + plan.warnings + _configuration_warnings(source_plan))),
             "blind_spots": plan.blind_spots,
         }
     else:
-        mask_context = (
-            MaskContext.from_path(Path(args.mask_manifest).expanduser(), args.mask_mode)
-            if args.mask_manifest
-            else None
-        )
+        mask_context = _mask_context_from_args(args)
         result = search(
             plan,
             intent,
@@ -113,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=mask_context,
         )
         payload = {"source_plan": source_plan, **result}
-        payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings))
+        payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
     print(render(payload, args.format))
     return 0
 
