@@ -6,6 +6,7 @@ from pathlib import Path
 from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
 from .install_validation import validate_install
+from .manifest import build_manifest_report
 from .output import render
 from .query import infer_query
 from .redaction import RedactionContext
@@ -22,6 +23,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
         add_common_args(sub)
+    manifest = subparsers.add_parser("manifest")
+    manifest.add_argument("query", nargs="?", default="")
+    add_common_args(manifest)
+    manifest.add_argument(
+        "--shortlist-limit",
+        type=int,
+        default=None,
+        help="Optional maximum manifest entries to keep in the shortlist report.",
+    )
     forensics = subparsers.add_parser("forensics")
     add_common_args(forensics)
     forensics.add_argument("--commit", default=None)
@@ -205,7 +215,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 1 if eval_payload.get("status") == "invalid_fixture" else 0
     source_plan, intent, plan = payload_from_args(args)
-    if args.command == "plan":
+    if args.command == "manifest":
+        payload = build_manifest_report(
+            plan,
+            intent,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=source_plan["cwd"],
+            shortlist_limit=args.shortlist_limit,
+        )
+        payload["source_plan"] = source_plan
+    elif args.command == "plan":
         payload = {
             "source_plan": source_plan,
             "searched_files": 0,
