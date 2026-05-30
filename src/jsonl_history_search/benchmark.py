@@ -72,6 +72,7 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
 
     seen_categories: set[str] = set()
     seen_failure_modes: set[str] = set()
+    seen_stages: set[str] = set()
     for index, case in enumerate(cases):
         label = case.get("case_id") or f"case[{index}]"
         if not isinstance(case.get("case_id"), str) or not case["case_id"]:
@@ -84,11 +85,12 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
             seen_categories.add(category)
 
         stages = set(case.get("candidate_generation_stages") or [])
-        missing_stages = REQUIRED_STAGES - stages
-        if missing_stages:
-            errors.append(f"{label}: missing broad candidate stages {sorted(missing_stages)}")
-        if stages == {"exact_phrase"}:
-            errors.append(f"{label}: exact-only candidate generation is not allowed")
+        unknown_stages = stages - REQUIRED_STAGES
+        if not stages:
+            errors.append(f"{label}: candidate_generation_stages must be a non-empty observed-stage list")
+        if unknown_stages:
+            errors.append(f"{label}: unknown candidate generation stages {sorted(unknown_stages)}")
+        seen_stages.update(stages)
 
         budgets = case.get("budgets")
         if not isinstance(budgets, dict):
@@ -122,15 +124,44 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
     if missing_categories:
         errors.append(f"missing benchmark categories: {sorted(missing_categories)}")
 
-    missing_failure_modes = REQUIRED_FAILURE_MODES - seen_failure_modes
+    followup = validate_coverage_followup(payload, errors)
+    missing_stages = REQUIRED_STAGES - seen_stages - set(followup.get("candidate_generation_stages", []))
+    if missing_stages:
+        errors.append(f"missing required stage coverage or follow-up markers: {sorted(missing_stages)}")
+
+    missing_failure_modes = REQUIRED_FAILURE_MODES - seen_failure_modes - set(followup.get("failure_modes", []))
     if missing_failure_modes:
-        errors.append(f"missing required failure modes: {sorted(missing_failure_modes)}")
+        errors.append(f"missing required failure modes or follow-up markers: {sorted(missing_failure_modes)}")
 
     private_hits = find_private_pattern_hits(payload)
     for hit in private_hits:
         errors.append(f"private pattern found at {hit}")
 
     return errors
+
+
+def validate_coverage_followup(payload: dict[str, Any], errors: list[str]) -> dict[str, list[str]]:
+    followup = payload.get("coverage_needs_followup")
+    if not isinstance(followup, dict):
+        errors.append("coverage_needs_followup is required")
+        return {"candidate_generation_stages": [], "failure_modes": []}
+
+    stage_items = followup.get("candidate_generation_stages")
+    mode_items = followup.get("failure_modes")
+    if not isinstance(stage_items, list):
+        errors.append("coverage_needs_followup.candidate_generation_stages must be a list")
+        stage_items = []
+    if not isinstance(mode_items, list):
+        errors.append("coverage_needs_followup.failure_modes must be a list")
+        mode_items = []
+
+    unknown_stages = set(stage_items) - REQUIRED_STAGES
+    unknown_modes = set(mode_items) - REQUIRED_FAILURE_MODES
+    if unknown_stages:
+        errors.append(f"unknown follow-up candidate generation stages: {sorted(unknown_stages)}")
+    if unknown_modes:
+        errors.append(f"unknown follow-up failure modes: {sorted(unknown_modes)}")
+    return {"candidate_generation_stages": list(stage_items), "failure_modes": list(mode_items)}
 
 
 def validate_evidence_refs(case: dict[str, Any], label: str, errors: list[str]) -> None:
