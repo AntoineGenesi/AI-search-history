@@ -172,7 +172,7 @@ def build_candidate_rows(search_result: dict) -> list[CandidateRow]:
 def build_timeline(candidates: list[CandidateRow]) -> list[CandidateRow]:
     return sorted(
         candidates,
-        key=lambda item: (timestamp_sort_key(item.timestamp), item.path, item.line),
+        key=lambda item: (timestamp_sort_key(item.timestamp_utc), item.path, item.line),
     )
 
 
@@ -180,9 +180,12 @@ def timestamp_sort_key(value: str | None) -> str:
     if not value:
         return "9999-12-31T23:59:59+00:00"
     try:
-        return datetime.fromisoformat(value).isoformat()
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def timestamp_utc(value: str | None) -> str | None:

@@ -289,8 +289,29 @@ def main(argv: list[str] | None = None) -> int:
     rendered = render(payload, args.format)
     if getattr(args, "report_output", None):
         Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        if "agent_find" in payload:
+            payload = _short_report_written_payload(payload, args.report_output)
+            rendered = render(payload, args.format)
     print(rendered)
     return 0
+
+
+def _short_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["agent_find"]
+    return {
+        "agent_find": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "query": report["query"],
+            "report_written": str(Path(report_output).expanduser()),
+            "candidate_count": report["token_efficiency"]["candidate_count"],
+            "searched_files": report["token_efficiency"]["searched_files"],
+            "searched_bytes": report["token_efficiency"]["searched_bytes"],
+            "top_candidates": report["find_candidates"][:3],
+            "next_search_suggestions": report["next_search_suggestions"],
+            "message": "Full find report written to report_output; stdout is a compact handoff map.",
+        }
+    }
 
 
 if __name__ == "__main__":
