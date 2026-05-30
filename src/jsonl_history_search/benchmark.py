@@ -32,6 +32,7 @@ REQUIRED_FAILURE_MODES = {
     "false_confident_answer",
 }
 REQUIRED_BUDGETS = {"max_tool_calls", "max_files_opened", "max_context_bytes", "target_top_k"}
+VALID_EVIDENCE_STATUSES = {"private_mined", "needs_followup"}
 
 PRIVATE_PATTERNS = [
     re.compile(r"/home/[A-Za-z0-9_.-]+"),
@@ -115,6 +116,7 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
             errors.append(f"{label}: transcript_pattern_paraphrase is required")
         if not isinstance(case.get("sanitized_gold_refs"), list) or not case["sanitized_gold_refs"]:
             errors.append(f"{label}: sanitized_gold_refs are required")
+        validate_evidence_refs(case, label, errors)
 
     missing_categories = REQUIRED_CATEGORIES - seen_categories
     if missing_categories:
@@ -129,6 +131,36 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
         errors.append(f"private pattern found at {hit}")
 
     return errors
+
+
+def validate_evidence_refs(case: dict[str, Any], label: str, errors: list[str]) -> None:
+    status = case.get("evidence_status")
+    if status not in VALID_EVIDENCE_STATUSES:
+        errors.append(f"{label}: evidence_status must be one of {sorted(VALID_EVIDENCE_STATUSES)}")
+        return
+
+    refs = case.get("sanitized_gold_refs")
+    if not isinstance(refs, list):
+        return
+    for ref in refs:
+        if not isinstance(ref, dict):
+            errors.append(f"{label}: sanitized_gold_refs entries must be objects")
+            continue
+        ref_id = ref.get("ref_id")
+        ref_kind = ref.get("ref_kind")
+        if not isinstance(ref_id, str) or not ref_id:
+            errors.append(f"{label}: ref_id is required")
+            continue
+        if "private-evidence-candidates.md#" in ref_id and "#real-" not in ref_id:
+            errors.append(f"{label}: placeholder private evidence ref is not allowed: {ref_id}")
+        if status == "private_mined":
+            if ref_kind != "private_local_path_line":
+                errors.append(f"{label}: private_mined refs must use private_local_path_line")
+            if not ref_id.startswith("private-evidence-candidates.md#real-"):
+                errors.append(f"{label}: private_mined refs must point at a real private evidence ID")
+        if status == "needs_followup":
+            if ref_kind != "followup_required":
+                errors.append(f"{label}: needs_followup refs must use followup_required")
 
 
 def find_private_pattern_hits(value: Any, *, prefix: str = "$") -> list[str]:
