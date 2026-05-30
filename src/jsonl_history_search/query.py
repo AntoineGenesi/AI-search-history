@@ -14,6 +14,7 @@ STOPWORDS = {
     "all",
     "and",
     "before",
+    "did",
     "find",
     "from",
     "i",
@@ -32,6 +33,8 @@ STOPWORDS = {
     "we",
     "were",
     "what",
+    "when",
+    "where",
     "you",
 }
 

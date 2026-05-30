@@ -18,6 +18,8 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "csv": ("spreadsheet", "table"),
     "doc": ("artifact", "docs", "document", "file", "markdown", "report"),
     "docs": ("artifact", "doc", "document", "file", "markdown", "report"),
+    "edit": ("changed", "edited", "modified", "patched", "refactored", "tuned", "updated"),
+    "edited": ("changed", "edit", "modified", "patched", "refactored", "tuned", "updated"),
     "file": ("artifact", "doc", "docs", "output", "path", "report"),
     "html": ("report", "webpage"),
     "implement": ("build", "built", "implemented", "implementation"),
@@ -25,6 +27,7 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "issue": ("bug", "defect", "error", "failure", "fix", "regression"),
     "json": ("jsonl", "structured"),
     "jsonl": ("json", "transcript"),
+    "library": ("module", "package", "system"),
     "markdown": ("doc", "docs", "md", "report"),
     "preference": ("preferences", "prefer", "preferred", "style", "taste"),
     "preferences": ("preference", "prefer", "preferred", "style", "taste"),
@@ -38,6 +41,15 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "searched": ("find", "lookup", "retrieval", "retrieve", "search"),
     "test": ("pytest", "regression", "tests", "verification"),
     "tests": ("pytest", "regression", "test", "verification"),
+}
+
+SEMANTIC_LOCAL: dict[str, tuple[str, ...]] = {
+    "edit": ("change", "patch", "refactor", "tune"),
+    "edited": ("change", "patch", "refactor", "tune"),
+    "library": ("codebase", "module", "source", "subsystem"),
+    "physics": ("collision", "collisions", "engine", "integration", "physics.ts", "rigid-body", "rigidbody"),
+    "skill": ("capability", "practice", "workflow"),
+    "workflow": ("automation", "process", "routine", "sequence"),
 }
 
 PREFERENCE_WORDS = {
@@ -78,20 +90,25 @@ def expand_query_terms(
             return
         reasons.setdefault(cleaned, set()).add(reason)
 
+    if len(normalized) > 2:
+        add(normalized, "exact_phrase")
+
     for term in base_terms:
-        add(term, "base")
+        add(term, "normalized_terms")
 
     for slug in task_slug_variants(normalized):
         add(slug, "task_slug")
     for hint in artifact_hints:
         for term in artifact_variants(hint):
-            add(term, "artifact")
+            add(term, "artifact_path")
         for slug in task_slug_variants(hint):
             add(slug, "task_slug")
 
     for term in list(reasons):
         for synonym in SYNONYMS.get(term, ()):
-            add(synonym, "synonym")
+            add(synonym, "synonym_paraphrase")
+        for semantic_term in SEMANTIC_LOCAL.get(term, ()):
+            add(semantic_term, "semantic_local")
         if term in PREFERENCE_WORDS:
             for preference_term in sorted(PREFERENCE_WORDS):
                 add(preference_term, "preference")

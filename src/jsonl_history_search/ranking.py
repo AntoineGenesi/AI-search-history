@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from .clustering import cluster_matches
 from .query import QueryIntent
 from .records import Record
+
+WORD_RE = re.compile(r"[a-z0-9][a-z0-9_.:/-]*")
+
+TEXT_STAGE_WEIGHTS = {
+    "exact_phrase": 14.0,
+    "artifact_path": 12.0,
+    "normalized_terms": 10.0,
+    "task_slug": 10.0,
+    "preference": 8.0,
+    "synonym_paraphrase": 8.0,
+    "semantic_local": 6.0,
+}
+FUZZY_STAGE_WEIGHT = 7.0
 
 
 @dataclass
@@ -35,8 +49,14 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
     match_terms = active_match_terms(intent)
     for term in match_terms:
         if term.lower() in lowered:
-            score += 10
-            reasons.append(f"text:{term}")
+            stage = stage_for_term(intent, term)
+            score += TEXT_STAGE_WEIGHTS.get(stage, 8.0)
+            reasons.append(f"text:{stage}:{term}")
+    for fuzzy in fuzzy_match_terms(record.text, intent):
+        if any(reason.endswith(f":{fuzzy['query']}") for reason in reasons):
+            continue
+        score += FUZZY_STAGE_WEIGHT
+        reasons.append(f"fuzzy:typo_fuzzy:{fuzzy['query']}~{fuzzy['matched']}")
     if not match_terms:
         score += 1
         reasons.append("bounded-no-term")
@@ -53,7 +73,7 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
     artifacts = artifact_candidates(record.text)
     if intent.artifact_hints and artifacts:
         score += 5
-        reasons.append("artifact")
+        reasons.append("artifact:artifact_path")
     if record.timestamp:
         age_days = max(0.0, (datetime.now(timezone.utc) - record.timestamp.astimezone(timezone.utc)).total_seconds() / 86400)
         score += max(0.0, 3.0 - min(age_days / 30.0, 3.0))
@@ -82,7 +102,9 @@ def should_consider(record: Record, intent: QueryIntent) -> bool:
     terms = active_match_terms(intent)
     if terms:
         lowered = record.text.lower()
-        return any(term.lower() in lowered for term in terms)
+        if any(term.lower() in lowered for term in terms):
+            return True
+        return bool(fuzzy_match_terms(record.text, intent))
     return True
 
 
@@ -94,6 +116,85 @@ def active_match_terms(intent: QueryIntent) -> list[str]:
             continue
         active.append(term)
     return active
+
+
+def stage_for_term(intent: QueryIntent, term: str) -> str:
+    reasons = set(intent.expansion_reasons.get(term, []))
+    for stage in ("exact_phrase", "artifact_path", "normalized_terms", "task_slug", "synonym_paraphrase", "semantic_local", "preference"):
+        if stage in reasons:
+            return stage
+    if "synonym" in reasons:
+        return "synonym_paraphrase"
+    if "artifact" in reasons:
+        return "artifact_path"
+    if "base" in reasons:
+        return "normalized_terms"
+    return "normalized_terms"
+
+
+def fuzzy_match_terms(text: str, intent: QueryIntent, *, limit: int = 8) -> list[dict[str, str]]:
+    query_terms = fuzzy_query_terms(intent)
+    if not query_terms:
+        return []
+    record_tokens = token_set(text)
+    if not record_tokens:
+        return []
+    matches: list[dict[str, str]] = []
+    for query in query_terms:
+        if query in record_tokens:
+            continue
+        best = best_fuzzy_token(query, record_tokens)
+        if best:
+            matches.append({"query": query, "matched": best})
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+def fuzzy_query_terms(intent: QueryIntent) -> list[str]:
+    terms: list[str] = []
+    for term in intent.base_terms:
+        normalized = term.lower()
+        if len(normalized) < 5:
+            continue
+        if not re.fullmatch(r"[a-z0-9_-]+", normalized):
+            continue
+        terms.append(normalized)
+    return sorted(set(terms))
+
+
+def token_set(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in WORD_RE.findall(text.lower()):
+        if len(token) < 4:
+            continue
+        tokens.add(token)
+        for part in re.split(r"[_.:/-]+", token):
+            if len(part) >= 4:
+                tokens.add(part)
+    return tokens
+
+
+def best_fuzzy_token(query: str, tokens: set[str]) -> str | None:
+    threshold = fuzzy_threshold(query)
+    best_token: str | None = None
+    best_score = 0.0
+    for token in tokens:
+        if abs(len(query) - len(token)) > max(2, len(query) // 3):
+            continue
+        score = SequenceMatcher(None, query, token).ratio()
+        if score > best_score:
+            best_score = score
+            best_token = token
+    return best_token if best_token and best_score >= threshold else None
+
+
+def fuzzy_threshold(term: str) -> float:
+    if len(term) <= 5:
+        return 0.86
+    if len(term) <= 8:
+        return 0.82
+    return 0.78
 
 
 def make_snippet(text: str, terms: list[str], context: int = 180) -> str:

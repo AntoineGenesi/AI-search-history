@@ -41,16 +41,19 @@ STRATEGY_PROFILES: dict[str, StrategyProfile] = {
                 "artifact_path",
                 "cwd_project",
                 "date_window",
+                "exact_phrase",
                 "normalized_terms",
                 "role_filter",
                 "semantic_local",
                 "synonym_paraphrase",
+                "typo_fuzzy",
                 "newest_first_shortlist",
             }
         ),
         failure_controls=frozenset(
             {
                 "false_confident_answer",
+                "exact_phrase_miss",
                 "ignored_chat_project_hint",
                 "over_reading",
                 "too_many_tool_calls",
