@@ -12,6 +12,8 @@ def render_text(payload: dict) -> str:
         return render_install_validation_text(payload)
     if "forensics" in payload:
         return render_forensics_text(payload)
+    if "manifest_report" in payload:
+        return render_manifest_text(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_text(payload)
     plan = payload["source_plan"]
@@ -65,6 +67,8 @@ def render_markdown(payload: dict) -> str:
         return render_install_validation_markdown(payload)
     if "forensics" in payload:
         return render_forensics_markdown(payload)
+    if "manifest_report" in payload:
+        return render_manifest_markdown(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_markdown(payload)
     text = render_text(payload)
@@ -226,6 +230,94 @@ def render_install_validation_markdown(payload: dict) -> str:
 
 def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
+
+
+def render_manifest_text(payload: dict) -> str:
+    report = payload["manifest_report"]
+    manifest = report["manifest"]
+    shortlist = report["shortlist"]
+    cost = report["cost_model"]
+    metrics = shortlist["metrics"]
+    lines = [
+        "JSONL History Manifest",
+        f"Entries: {manifest['entry_count']}",
+        f"Build: {cost['build_time_ms']} ms, {manifest['build_metrics'].get('bytes_parsed', 0)} bytes parsed",
+        f"Refresh: {cost['refresh_time_ms']} ms, {manifest['no_change_refresh_metrics'].get('files_reused', 0)} files reused",
+        f"Estimated manifest size: {cost['manifest_disk_bytes']} bytes",
+        (
+            "Shortlist: "
+            f"{metrics['selected_files']}/{metrics['total_files']} files, "
+            f"{metrics['selected_bytes']}/{metrics['total_bytes']} bytes, "
+            f"file reduction={metrics['file_reduction_ratio']}, "
+            f"byte reduction={metrics['byte_reduction_ratio']}"
+        ),
+    ]
+    for entry in shortlist.get("selected_entries", [])[:10]:
+        path = entry["entry"]["path"]
+        reasons = ", ".join(entry.get("reasons") or ["weak-candidate"])
+        lines.append(f"- {path} score={entry['score']} reasons={reasons}")
+    for warning in manifest.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_manifest_markdown(payload: dict) -> str:
+    report = payload["manifest_report"]
+    manifest = report["manifest"]
+    shortlist = report["shortlist"]
+    cost = report["cost_model"]
+    metrics = shortlist["metrics"]
+    lines = [
+        "# JSONL History Manifest",
+        "",
+        f"**Entries:** {manifest['entry_count']}",
+        f"**Build:** {cost['build_time_ms']} ms, {manifest['build_metrics'].get('bytes_parsed', 0)} bytes parsed",
+        f"**Refresh:** {cost['refresh_time_ms']} ms, {manifest['no_change_refresh_metrics'].get('files_reused', 0)} files reused",
+        f"**Estimated manifest size:** {cost['manifest_disk_bytes']} bytes",
+        (
+            f"**Shortlist:** {metrics['selected_files']}/{metrics['total_files']} files, "
+            f"{metrics['selected_bytes']}/{metrics['total_bytes']} bytes, "
+            f"file reduction {metrics['file_reduction_ratio']}, "
+            f"byte reduction {metrics['byte_reduction_ratio']}"
+        ),
+        "",
+        "## Cache Policy",
+        "",
+    ]
+    policy = report.get("cache_policy", {})
+    for key in ("local_only", "optional", "default_search_uses_cache", "invalidation", "privacy"):
+        lines.append(f"- **{key}:** {policy.get(key)}")
+
+    lines.extend(
+        [
+            "",
+            "## Selected Entries",
+            "",
+            "| Score | Path | Date span | Roles | Reasons |",
+            "| ---: | --- | --- | --- | --- |",
+        ]
+    )
+    for item in shortlist.get("selected_entries", [])[:25]:
+        entry = item["entry"]
+        date_span = " to ".join(part for part in [entry.get("date_start"), entry.get("date_end")] if part) or "(unknown)"
+        lines.append(
+            "| "
+            f"{item.get('score')} | "
+            f"{_escape_markdown_table(entry.get('path', ''))} | "
+            f"{_escape_markdown_table(date_span)} | "
+            f"{_escape_markdown_table(', '.join(entry.get('roles') or []) or '(none)')} | "
+            f"{_escape_markdown_table(', '.join(item.get('reasons') or []) or 'weak-candidate')} |"
+        )
+
+    guidance = report.get("guidance", {})
+    lines.extend(["", "## Guidance", ""])
+    for item in guidance.get("ultra_valuable_when", []):
+        lines.append(f"- Ultra valuable: {item}")
+    for item in guidance.get("unnecessary_when", []):
+        lines.append(f"- Usually unnecessary: {item}")
+    if guidance.get("shortlist_note"):
+        lines.append(f"- Note: {guidance['shortlist_note']}")
+    return "\n".join(lines)
 
 
 def render_efficiency_eval_text(payload: dict) -> str:
