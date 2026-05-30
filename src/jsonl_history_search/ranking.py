@@ -90,7 +90,7 @@ def active_match_terms(intent: QueryIntent) -> list[str]:
     active: list[str] = []
     for term in intent.terms:
         reasons = set(intent.expansion_reasons.get(term, []))
-        if reasons and reasons <= {"date_window", "synonym"}:
+        if reasons and reasons <= {"date_window"}:
             continue
         active.append(term)
     return active
