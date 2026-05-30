@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
 from .install_validation import validate_install
 from .output import render
@@ -28,6 +29,25 @@ def build_parser() -> argparse.ArgumentParser:
     forensics.add_argument("--task", default=None)
     forensics.add_argument("--branch", default=None)
     forensics.add_argument("--around", default=None)
+    benchmark = subparsers.add_parser("benchmark")
+    benchmark.add_argument(
+        "--fixture",
+        default="benchmarks/retrieval_gold/sanitized_cases.json",
+        help="Sanitized retrieval benchmark fixture to evaluate.",
+    )
+    benchmark.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    benchmark.add_argument(
+        "--strategy",
+        action="append",
+        choices=("package_search", "helper_script", "raw_rg", "naive_broad_scan"),
+        default=[],
+        help="Strategy to include; may be passed more than once. Defaults to all strategies.",
+    )
+    benchmark.add_argument(
+        "--fail-on-threshold",
+        action="store_true",
+        help="Exit non-zero when large-impact thresholds fail.",
+    )
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     validate.add_argument(
@@ -173,6 +193,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0
+    if args.command == "benchmark":
+        payload = build_efficiency_eval(
+            Path(args.fixture).expanduser(),
+            strategies=tuple(args.strategy) if args.strategy else None,
+        )
+        print(render(payload, args.format))
+        eval_payload = payload["retrieval_efficiency_eval"]
+        thresholds = eval_payload.get("large_impact_thresholds", {})
+        if args.fail_on_threshold and thresholds.get("status") == "fail":
+            return 1
+        return 1 if eval_payload.get("status") == "invalid_fixture" else 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "plan":
         payload = {

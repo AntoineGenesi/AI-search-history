@@ -12,6 +12,8 @@ def render_text(payload: dict) -> str:
         return render_install_validation_text(payload)
     if "forensics" in payload:
         return render_forensics_text(payload)
+    if "retrieval_efficiency_eval" in payload:
+        return render_efficiency_eval_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -63,6 +65,8 @@ def render_markdown(payload: dict) -> str:
         return render_install_validation_markdown(payload)
     if "forensics" in payload:
         return render_forensics_markdown(payload)
+    if "retrieval_efficiency_eval" in payload:
+        return render_efficiency_eval_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -222,3 +226,150 @@ def render_install_validation_markdown(payload: dict) -> str:
 
 def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
+
+
+def render_efficiency_eval_text(payload: dict) -> str:
+    report = payload["retrieval_efficiency_eval"]
+    if report.get("status") == "invalid_fixture":
+        lines = [
+            "Retrieval efficiency benchmark: INVALID FIXTURE",
+            f"Fixture: {report.get('fixture')}",
+        ]
+        lines.extend(f"ERROR: {error}" for error in report.get("fixture_errors", []))
+        return "\n".join(lines)
+
+    thresholds = report.get("large_impact_thresholds", {})
+    lines = [
+        "Retrieval efficiency benchmark",
+        f"Fixture: {report.get('fixture')}",
+        f"Data source: {report.get('data_source')}",
+        f"Threshold status: {str(thresholds.get('status', 'unknown')).upper()}",
+        f"Note: {report.get('measurement_note')}",
+        "Summary:",
+    ]
+    for name, summary in report.get("summary", {}).items():
+        lines.append(
+            "- "
+            f"{name}: hit_rate={summary.get('first_pass_hit_rate')} "
+            f"context_bytes={summary.get('median_prompt_context_bytes')} "
+            f"files={summary.get('median_files_opened')} "
+            f"tool_calls={summary.get('median_tool_calls')} "
+            f"recall@10={summary.get('mean_recall_at_10')}"
+        )
+    if thresholds.get("items"):
+        lines.append("Thresholds:")
+        for item in thresholds["items"]:
+            status = "PASS" if item.get("passed") else "FAIL"
+            lines.append(
+                f"- {status} {item.get('metric')} {item.get('operator')} "
+                f"{item.get('target')} (actual {item.get('actual')})"
+            )
+    followup = report.get("coverage_needs_followup") or {}
+    stages = followup.get("candidate_generation_stages") or []
+    modes = followup.get("failure_modes") or []
+    if stages or modes:
+        lines.append(f"Follow-up stages: {', '.join(stages) if stages else '(none)'}")
+        lines.append(f"Follow-up failure modes: {', '.join(modes) if modes else '(none)'}")
+    return "\n".join(lines)
+
+
+def render_efficiency_eval_markdown(payload: dict) -> str:
+    report = payload["retrieval_efficiency_eval"]
+    if report.get("status") == "invalid_fixture":
+        lines = [
+            "# Retrieval Efficiency Benchmark",
+            "",
+            "**Status:** INVALID FIXTURE",
+            f"**Fixture:** `{report.get('fixture')}`",
+            "",
+            "## Fixture Errors",
+            "",
+        ]
+        lines.extend(f"- {error}" for error in report.get("fixture_errors", []))
+        return "\n".join(lines)
+
+    thresholds = report.get("large_impact_thresholds", {})
+    lines = [
+        "# Retrieval Efficiency Benchmark",
+        "",
+        f"**Status:** {str(report.get('status', 'unknown')).upper()}",
+        f"**Fixture:** `{report.get('fixture')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Threshold status:** {str(thresholds.get('status', 'unknown')).upper()}",
+        "",
+        report.get("measurement_note", ""),
+        "",
+        "## Strategy Summary",
+        "",
+        "| Strategy | First-pass hit rate | Median context bytes | Median tokens | Median files | Median tool calls | Mean recall@10 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for name, summary in report.get("summary", {}).items():
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(name)} | "
+            f"{summary.get('first_pass_hit_rate')} | "
+            f"{summary.get('median_prompt_context_bytes')} | "
+            f"{summary.get('median_estimated_tokens_returned')} | "
+            f"{summary.get('median_files_opened')} | "
+            f"{summary.get('median_tool_calls')} | "
+            f"{summary.get('mean_recall_at_10')} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Large Impact Thresholds",
+            "",
+            "| Status | Metric | Target | Actual |",
+            "| --- | --- | ---: | ---: |",
+        ]
+    )
+    for item in thresholds.get("items", []):
+        status = "PASS" if item.get("passed") else "FAIL"
+        target = f"{item.get('operator')} {item.get('target')}"
+        lines.append(
+            "| "
+            f"{status} | "
+            f"{_escape_markdown_table(str(item.get('metric')))} | "
+            f"{_escape_markdown_table(target)} | "
+            f"{item.get('actual')} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Case Results",
+            "",
+            "| Case | Category | Strategy | Fit | Basis | Context bytes | Files | Tool calls | Missing stages | Unguarded failures |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for case in report.get("cases", []):
+        for result in case.get("strategy_results", []):
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(case.get('case_id', ''))} | "
+                f"{_escape_markdown_table(case.get('category', ''))} | "
+                f"{_escape_markdown_table(result.get('strategy', ''))} | "
+                f"{_escape_markdown_table(result.get('fit', ''))} | "
+                f"{_escape_markdown_table(result.get('metric_basis', ''))} | "
+                f"{result.get('prompt_context_bytes')} | "
+                f"{result.get('files_opened')} | "
+                f"{result.get('tool_calls')} | "
+                f"{_escape_markdown_table(', '.join(result.get('missing_stages') or []) or '(none)')} | "
+                f"{_escape_markdown_table(', '.join(result.get('unguarded_failure_modes') or []) or '(none)')} |"
+            )
+
+    followup = report.get("coverage_needs_followup") or {}
+    stages = followup.get("candidate_generation_stages") or []
+    modes = followup.get("failure_modes") or []
+    if stages or modes:
+        lines.extend(["", "## Follow-Up Coverage", ""])
+        if stages:
+            lines.append(f"- Candidate generation stages: {', '.join(stages)}")
+        if modes:
+            lines.append(f"- Failure modes: {', '.join(modes)}")
+        if followup.get("notes"):
+            lines.append(f"- Notes: {followup['notes']}")
+    return "\n".join(lines)
