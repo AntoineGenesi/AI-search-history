@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .agent_contract import build_agent_find_payload
 from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
 from .install_validation import validate_install
@@ -23,6 +24,20 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
         add_common_args(sub)
+    for name in ("find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"):
+        find = subparsers.add_parser(name)
+        find.add_argument("query", nargs="?", default="")
+        add_common_args(find)
+        find.add_argument(
+            "--include-manifest",
+            action="store_true",
+            help="Include optional local manifest shortlist metadata for no-evidence and source-planning sections.",
+        )
+        find.add_argument(
+            "--report-output",
+            default=None,
+            help="Optional path where the full find report should be written as JSON or Markdown.",
+        )
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
     add_common_args(manifest)
@@ -224,6 +239,33 @@ def main(argv: list[str] | None = None) -> int:
             shortlist_limit=args.shortlist_limit,
         )
         payload["source_plan"] = source_plan
+    elif args.command in {"find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"}:
+        mask_context = _mask_context_from_args(args)
+        result = search(
+            plan,
+            intent,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=source_plan["cwd"],
+            mask_context=mask_context,
+        )
+        result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
+        manifest_report = (
+            build_manifest_report(
+                plan,
+                intent,
+                default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+                cwd=source_plan["cwd"],
+            )
+            if args.include_manifest
+            else None
+        )
+        payload = build_agent_find_payload(
+            source_plan=source_plan,
+            search_result=result,
+            manifest_report=manifest_report,
+            output_format=args.format,
+            report_output=args.report_output,
+        )
     elif args.command == "plan":
         payload = {
             "source_plan": source_plan,
@@ -244,7 +286,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         payload = {"source_plan": source_plan, **result}
         payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
-    print(render(payload, args.format))
+    rendered = render(payload, args.format)
+    if getattr(args, "report_output", None):
+        Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+    print(rendered)
     return 0
 
 

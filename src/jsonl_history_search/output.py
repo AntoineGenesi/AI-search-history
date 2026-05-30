@@ -16,6 +16,8 @@ def render_text(payload: dict) -> str:
         return render_manifest_text(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_text(payload)
+    if "agent_find" in payload:
+        return render_agent_find_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -71,6 +73,8 @@ def render_markdown(payload: dict) -> str:
         return render_manifest_markdown(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_markdown(payload)
+    if "agent_find" in payload:
+        return render_agent_find_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -230,6 +234,86 @@ def render_install_validation_markdown(payload: dict) -> str:
 
 def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
+
+
+def render_agent_find_text(payload: dict) -> str:
+    report = payload["agent_find"]
+    lines = [
+        "JSONL History Find",
+        f"Status: {report.get('status')}",
+        f"Query: {report.get('query', {}).get('original', '')}",
+        (
+            "Scope: "
+            f"{report.get('plan_sources', {}).get('searched_files', 0)} files, "
+            f"{report.get('plan_sources', {}).get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            "Candidates: "
+            f"{report.get('token_efficiency', {}).get('candidate_count', 0)} "
+            f"({report.get('context_budget', {}).get('payload_bytes', 0)} bytes inline)"
+        ),
+    ]
+    for candidate in report.get("find_candidates", [])[:8]:
+        ref = candidate.get("source_ref", {})
+        lines.append(
+            "- "
+            f"{candidate.get('candidate_id')} {candidate.get('confidence')} "
+            f"{ref.get('path')}:{ref.get('line')} "
+            f"{candidate.get('timestamp') or '(no timestamp)'} "
+            f"{candidate.get('role') or ''}: {candidate.get('snippet')}"
+        )
+    if report.get("status") == "no_evidence":
+        no_evidence = report.get("no_evidence_report", {})
+        lines.append(f"No evidence: {no_evidence.get('why_not_confident')}")
+    suggestions = report.get("next_search_suggestions") or []
+    if suggestions:
+        lines.append("Next searches:")
+        lines.extend(f"- {item}" for item in suggestions)
+    return "\n".join(lines)
+
+
+def render_agent_find_markdown(payload: dict) -> str:
+    report = payload["agent_find"]
+    lines = [
+        "# JSONL History Find",
+        "",
+        f"**Status:** {report.get('status')}",
+        f"**Query:** {report.get('query', {}).get('original', '')}",
+        (
+            f"**Scope:** {report.get('plan_sources', {}).get('searched_files', 0)} files, "
+            f"{report.get('plan_sources', {}).get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            f"**Context budget:** {report.get('context_budget', {}).get('payload_bytes', 0)} bytes, "
+            f"~{report.get('context_budget', {}).get('estimated_tokens', 0)} tokens"
+        ),
+        "",
+        "## Candidates",
+        "",
+        "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for candidate in report.get("find_candidates", []):
+        ref = candidate.get("source_ref", {})
+        source = f"{ref.get('path')}:{ref.get('line')}"
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(candidate.get('candidate_id', '')))} | "
+            f"{_escape_markdown_table(str(candidate.get('confidence', '')))} | "
+            f"{_escape_markdown_table(source)} | "
+            f"{_escape_markdown_table(str(candidate.get('timestamp') or ''))} | "
+            f"{_escape_markdown_table(str(candidate.get('role') or ''))} | "
+            f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
+            f"{_escape_markdown_table(str(candidate.get('snippet') or ''))} |"
+        )
+    if report.get("status") == "no_evidence":
+        no_evidence = report.get("no_evidence_report", {})
+        lines.extend(["", "## No Evidence", "", no_evidence.get("why_not_confident", "")])
+    suggestions = report.get("next_search_suggestions") or []
+    if suggestions:
+        lines.extend(["", "## Next Searches", ""])
+        lines.extend(f"- {item}" for item in suggestions)
+    return "\n".join(lines)
 
 
 def render_manifest_text(payload: dict) -> str:
