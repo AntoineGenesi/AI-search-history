@@ -7,6 +7,7 @@ from .agent_contract import build_agent_find_payload
 from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
 from .install_validation import validate_install
+from .lineage import build_lineage_payload
 from .manifest import build_manifest_report
 from .output import render
 from .query import infer_query
@@ -54,6 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
     forensics.add_argument("--task", default=None)
     forensics.add_argument("--branch", default=None)
     forensics.add_argument("--around", default=None)
+    lineage = subparsers.add_parser("compare-project-lineage")
+    lineage.add_argument("query", nargs="?", default="")
+    add_common_args(lineage)
+    lineage.add_argument("--project-root", default=None)
+    lineage.add_argument("--sibling-root", action="append", default=[])
+    lineage.add_argument("--max-sibling-dirs", type=int, default=40)
+    lineage.add_argument("--max-project-files", type=int, default=250)
+    lineage.add_argument("--max-common-files", type=int, default=40)
+    lineage.add_argument("--max-projects", type=int, default=12)
+    lineage.add_argument("--timeline-limit", type=int, default=20)
+    lineage.add_argument("--report-output", default=None)
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument(
         "--fixture",
@@ -218,6 +230,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0
+    if args.command == "compare-project-lineage":
+        payload = build_lineage_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            rendered = render(_short_lineage_report_written_payload(payload, args.report_output), args.format)
+        print(rendered)
+        return 0
     if args.command == "benchmark":
         payload = build_efficiency_eval(
             Path(args.fixture).expanduser(),
@@ -310,6 +330,22 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
             "top_candidates": report["find_candidates"][:3],
             "next_search_suggestions": report["next_search_suggestions"],
             "message": "Full find report written to report_output; stdout is a compact handoff map.",
+        }
+    }
+
+
+def _short_lineage_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["project_lineage"]
+    return {
+        "project_lineage": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "report_written": str(Path(report_output).expanduser()),
+            "candidate_count": len(report.get("candidate_projects", [])),
+            "top_candidates": report.get("candidate_projects", [])[:3],
+            "warnings": payload.get("warnings", []),
+            "next_read": report.get("next_read", [])[:5],
+            "message": "Full lineage report written to report_output; stdout is a compact handoff map.",
         }
     }
 
