@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .forensics import build_forensics_payload
+from .install_validation import validate_install
 from .output import render
 from .query import infer_query
 from .redaction import RedactionContext
@@ -27,6 +28,18 @@ def build_parser() -> argparse.ArgumentParser:
     forensics.add_argument("--task", default=None)
     forensics.add_argument("--branch", default=None)
     forensics.add_argument("--around", default=None)
+    validate = subparsers.add_parser("validate-install")
+    validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
+    validate.add_argument(
+        "--package-root",
+        default=None,
+        help="Package checkout root to validate; defaults to the installed/source package root.",
+    )
+    validate.add_argument(
+        "--codex-home",
+        default=None,
+        help="Optional Codex home whose global jsonl-history-search skill install should be checked read-only.",
+    )
     return parser
 
 
@@ -150,6 +163,13 @@ def _configuration_warnings(source_plan: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "validate-install":
+        payload = validate_install(
+            package_root=Path(args.package_root).expanduser() if args.package_root else None,
+            codex_home=Path(args.codex_home).expanduser() if args.codex_home else None,
+        )
+        print(render(payload, args.format))
+        return 1 if payload["install_validation"]["overall_status"] == "fail" else 0
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0

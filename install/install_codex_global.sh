@@ -11,4 +11,5 @@ chmod +x "$SKILL_DIR/scripts/search_jsonl_history.py"
 
 echo "Installed Codex JSONL history search skill to: $SKILL_DIR"
 echo "Validate with:"
+echo "  PYTHONPATH=\"$ROOT/src\" python3 -m jsonl_history_search.cli validate-install --codex-home \"${CODEX_HOME:-$HOME/.codex}\" --format text"
 echo "  python3 \"$SKILL_DIR/scripts/search_jsonl_history.py\" \"test\" --latest --recent-files 1 --limit 1"

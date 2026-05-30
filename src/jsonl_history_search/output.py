@@ -8,6 +8,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "install_validation" in payload:
+        return render_install_validation_text(payload)
     if "forensics" in payload:
         return render_forensics_text(payload)
     plan = payload["source_plan"]
@@ -57,6 +59,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "install_validation" in payload:
+        return render_install_validation_markdown(payload)
     if "forensics" in payload:
         return render_forensics_markdown(payload)
     text = render_text(payload)
@@ -159,3 +163,62 @@ def render_forensics_markdown(payload: dict) -> str:
         else:
             lines.append(line)
     return "\n".join(lines)
+
+
+def render_install_validation_text(payload: dict) -> str:
+    validation = payload["install_validation"]
+    summary = validation.get("summary", {})
+    lines = [
+        f"Install validation: {str(validation.get('overall_status', 'unknown')).upper()}",
+        (
+            "Checks: "
+            f"{summary.get('pass', 0)} pass, "
+            f"{summary.get('warn', 0)} warn, "
+            f"{summary.get('fail', 0)} fail"
+        ),
+        f"Package root: {validation.get('package_root')}",
+        f"Read-only: {validation.get('read_only')}",
+    ]
+    if validation.get("codex_home"):
+        lines.append(f"Codex home: {validation['codex_home']}")
+    lines.append("Details:")
+    for check in validation.get("checks", []):
+        lines.append(f"- {str(check.get('status', '')).upper()} {check.get('name')}: {check.get('detail')}")
+        for recovery in check.get("recovery", []):
+            lines.append(f"  Recovery: {recovery}")
+    return "\n".join(lines)
+
+
+def render_install_validation_markdown(payload: dict) -> str:
+    validation = payload["install_validation"]
+    summary = validation.get("summary", {})
+    lines = [
+        "# JSONL History Search Install Validation",
+        "",
+        f"**Status:** {str(validation.get('overall_status', 'unknown')).upper()}",
+        (
+            f"**Checks:** {summary.get('pass', 0)} pass, "
+            f"{summary.get('warn', 0)} warn, {summary.get('fail', 0)} fail"
+        ),
+        f"**Package root:** `{validation.get('package_root')}`",
+        f"**Read-only:** {validation.get('read_only')}",
+        "",
+        "| Status | Check | Detail |",
+        "| --- | --- | --- |",
+    ]
+    for check in validation.get("checks", []):
+        lines.append(
+            "| "
+            f"{str(check.get('status', '')).upper()} | "
+            f"{_escape_markdown_table(str(check.get('name', '')))} | "
+            f"{_escape_markdown_table(str(check.get('detail', '')))} |"
+        )
+    suggestions = validation.get("recovery_suggestions") or []
+    if suggestions:
+        lines.extend(["", "## Recovery Suggestions", ""])
+        lines.extend(f"- {item}" for item in suggestions)
+    return "\n".join(lines)
+
+
+def _escape_markdown_table(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
