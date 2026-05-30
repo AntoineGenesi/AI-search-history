@@ -7,13 +7,39 @@ from dataclasses import asdict, dataclass
 CLAIMED = "claimed"
 CHANGED = "changed"
 VERIFIED = "verified"
+PARTIALLY_VERIFIED = "partially_verified"
+FAILED = "failed"
 MERGED = "merged"
+RUNNING = "running"
+BLOCKED = "blocked"
 UNSUPPORTED = "unsupported"
+UNKNOWN = "unknown"
 
-CLAIM_ACTIONS = {CLAIMED, CHANGED, VERIFIED, MERGED, UNSUPPORTED}
+CLAIM_ACTIONS = {
+    CLAIMED,
+    CHANGED,
+    VERIFIED,
+    PARTIALLY_VERIFIED,
+    FAILED,
+    MERGED,
+    RUNNING,
+    BLOCKED,
+    UNSUPPORTED,
+    UNKNOWN,
+}
 
 _MERGED_PATTERNS = [
     re.compile(r"\b(?:merged|merge commit|fast-forward(?:ed)?|landed)\b", re.IGNORECASE),
+]
+_BLOCKED_PATTERNS = [
+    re.compile(r"\b(?:blocked|blocker|blockers|stuck)\b", re.IGNORECASE),
+    re.compile(r"\b(?:waiting|blocked)\s+on\b", re.IGNORECASE),
+    re.compile(r"\b(?:cannot|can't|unable to)\s+(?:continue|proceed|progress)\b", re.IGNORECASE),
+]
+_RUNNING_PATTERNS = [
+    re.compile(r"\b(?:running|in progress|in flight|ongoing)\b", re.IGNORECASE),
+    re.compile(r"\b(?:working|continuing)\s+on\b", re.IGNORECASE),
+    re.compile(r"\b(?:started|starting)\s+(?:work|tests?|pytest|verification)\b", re.IGNORECASE),
 ]
 _VERIFIED_PATTERNS = [
     re.compile(r"\b(?:verified|validated|reviewed)\b", re.IGNORECASE),
@@ -30,7 +56,13 @@ _CLAIMED_PATTERNS = [
     re.compile(r"\b(?:done|complete|completed|finished|ready)\b", re.IGNORECASE),
     re.compile(r"\bI\s+(?:handled|finished|completed)\b", re.IGNORECASE),
 ]
-_NEGATION_RE = re.compile(r"\b(?:cannot|didn't|failed|no|not|never|unverified|without)\b", re.IGNORECASE)
+_NEGATION_RE = re.compile(
+    r"\b(?:"
+    r"cannot|can't|didn't|doesn't|don't|isn't|aren't|wasn't|weren't|"
+    r"failed|no|not|never|unverified|without"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _VERDICT_LABEL_RE = re.compile(
     r"""
@@ -47,7 +79,7 @@ _VERDICT_LABEL_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 _STANDALONE_VERDICT_RE = re.compile(
-    r"^\s*(?P<value>VERIFIED|APPROVED|PASS|PASSED|FAILED|FAIL|REJECTED|BLOCKED|MERGED|UNSUPPORTED)\s*$"
+    r"^\s*(?P<value>VERIFIED|PARTIALLY_VERIFIED|APPROVED|PASS|PASSED|FAILED|FAIL|REJECTED|BLOCKED|MERGED|UNKNOWN|UNSUPPORTED)\s*$"
 )
 
 _VERDICT_ALIASES = {
@@ -55,13 +87,19 @@ _VERDICT_ALIASES = {
     "pass": VERIFIED,
     "passed": VERIFIED,
     "verified": VERIFIED,
+    "partially verified": PARTIALLY_VERIFIED,
+    "partially_verified": PARTIALLY_VERIFIED,
+    "partial": PARTIALLY_VERIFIED,
+    "partial pass": PARTIALLY_VERIFIED,
+    "partial_pass": PARTIALLY_VERIFIED,
     "merged": MERGED,
-    "blocked": UNSUPPORTED,
-    "fail": UNSUPPORTED,
-    "failed": UNSUPPORTED,
-    "needs work": UNSUPPORTED,
-    "needs_work": UNSUPPORTED,
-    "rejected": UNSUPPORTED,
+    "blocked": BLOCKED,
+    "fail": FAILED,
+    "failed": FAILED,
+    "needs work": BLOCKED,
+    "needs_work": BLOCKED,
+    "rejected": FAILED,
+    "unknown": UNKNOWN,
     "unsupported": UNSUPPORTED,
 }
 
@@ -92,6 +130,8 @@ def classify_claim_action(text: str) -> ClaimClassification:
 
     for action, patterns in (
         (MERGED, _MERGED_PATTERNS),
+        (BLOCKED, _BLOCKED_PATTERNS),
+        (RUNNING, _RUNNING_PATTERNS),
         (VERIFIED, _VERIFIED_PATTERNS),
         (CHANGED, _CHANGED_PATTERNS),
         (CLAIMED, _CLAIMED_PATTERNS),
