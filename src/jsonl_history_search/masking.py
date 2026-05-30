@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Tuple
 
+from .redaction import RedactionContext
+
 
 MASK_MODES = {"production_collapse", "production_omit", "debug_full"}
 MASKABLE_OUTCOMES = {"detector_false_positive", "false_positive"}
@@ -71,21 +73,31 @@ class MaskStats:
     skipped: int = 0
     missing_spans: int = 0
     warnings: List[str] = field(default_factory=list)
+    redaction: Optional[dict] = None
 
     def to_dict(self) -> dict:
+        redaction_total = 0
+        redaction_debug_visible = 0
+        redaction_warnings: List[str] = []
+        if self.redaction:
+            redaction_total = int(self.redaction.get("redacted_total", 0))
+            redaction_debug_visible = int(self.redaction.get("debug_visible", 0))
+            redaction_warnings = list(self.redaction.get("warnings", []))
+        warnings = list(dict.fromkeys(list(self.warnings) + redaction_warnings))
         return {
             "mode": self.mode,
             "manifest_path": self.manifest_path,
             "active_context_masked": self.active_context_masked,
             "active_context_collapsed": self.active_context_collapsed,
             "transcript_retained": self.transcript_retained,
-            "debug_visible": self.debug_visible,
+            "debug_visible": self.debug_visible + redaction_debug_visible,
             "skipped": self.skipped,
             "missing_spans": self.missing_spans,
-            "warnings": list(self.warnings),
+            "warnings": warnings,
             "canonical_transcripts_mutated": False,
             "scope": "future_copied_context_snippets_only",
-            "model_input_stripped": self.mode != "debug_full" and self.active_context_masked > 0,
+            "model_input_stripped": (self.mode != "debug_full" and self.active_context_masked > 0) or redaction_total > 0,
+            "redaction": self.redaction,
         }
 
 
@@ -95,6 +107,7 @@ class MaskContext:
     manifest_path: Optional[Path] = None
     entries: Tuple[Entry, ...] = ()
     stats: Optional[MaskStats] = None
+    redaction_context: Optional[RedactionContext] = None
 
     @classmethod
     def disabled(cls, mode: str = "debug_full") -> "MaskContext":
@@ -119,14 +132,14 @@ class MaskContext:
         if self.stats is None:
             self.stats = MaskStats(mode=self.mode, manifest_path=str(self.manifest_path) if self.manifest_path else None)
         if not self.entries:
-            return text
+            return self._redact_text(text)
         if self.mode == "debug_full":
             for entry in self.entries:
                 for span in entry.spans:
                     if _same_source(span, source_path, source_index):
                         self.stats.debug_visible += 1
                         self.stats.transcript_retained += 1
-            return text
+            return self._redact_text(text)
 
         replacements: List[Tuple[int, int, str, Entry]] = []
         for entry in self.entries:
@@ -151,6 +164,18 @@ class MaskContext:
             self.stats.transcript_retained += 1
             if self.mode == "production_collapse":
                 self.stats.active_context_collapsed += 1
+        return self._redact_text(rendered)
+
+    def _redact_text(self, text: str) -> str:
+        if self.redaction_context is None:
+            return text
+        rendered = self.redaction_context.redact_text(text)
+        if self.stats is None:
+            self.stats = MaskStats(mode=self.mode, manifest_path=str(self.manifest_path) if self.manifest_path else None)
+        self.stats.redaction = self.redaction_context.stats.to_dict()
+        for warning in self.redaction_context.stats.warnings:
+            if warning not in self.stats.warnings:
+                self.stats.warnings.append(warning)
         return rendered
 
 
