@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .forensics import build_forensics_payload
 from .output import render
 from .query import infer_query
 from .redaction import RedactionContext
@@ -19,6 +20,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
         add_common_args(sub)
+    forensics = subparsers.add_parser("forensics")
+    add_common_args(forensics)
+    forensics.add_argument("--commit", default=None)
+    forensics.add_argument("--path", default=None)
+    forensics.add_argument("--task", default=None)
+    forensics.add_argument("--branch", default=None)
+    forensics.add_argument("--around", default=None)
     return parser
 
 
@@ -142,6 +150,9 @@ def _configuration_warnings(source_plan: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "forensics":
+        print(render(build_forensics_payload(args), args.format))
+        return 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "plan":
         payload = {

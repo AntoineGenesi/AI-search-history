@@ -17,6 +17,20 @@ class GitChange:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class GitCommit:
+    commit: str
+    commit_time: str
+    author_time: str
+    author: str
+    subject: str
+    decorations: str
+    changed_files: list[dict]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 def _run_git(repo: Path, args: list[str]) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
@@ -45,6 +59,65 @@ def git_root_for(path: str | Path) -> Path | None:
         return None
     root = result.stdout.strip()
     return Path(root).resolve() if root else None
+
+
+def current_branch(repo: str | Path) -> str | None:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(repo_root, ["branch", "--show-current"])
+    if result is None or result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    return branch or None
+
+
+def commit_metadata(repo: str | Path, commit: str) -> GitCommit | None:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(
+        repo_root,
+        ["show", "-s", "--format=%H%x00%cI%x00%aI%x00%an%x00%s%x00%D", commit],
+    )
+    if result is None or result.returncode != 0:
+        return None
+    payload = result.stdout.rstrip("\n")
+    parts = payload.split("\x00", 5)
+    if len(parts) != 6 or not parts[0]:
+        return None
+    return GitCommit(
+        commit=parts[0],
+        commit_time=parts[1],
+        author_time=parts[2],
+        author=parts[3],
+        subject=parts[4],
+        decorations=parts[5],
+        changed_files=commit_changed_files(repo_root, parts[0]),
+    )
+
+
+def commit_changed_files(repo: str | Path, commit: str) -> list[dict]:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(repo_root, ["show", "--format=", "--name-status", "--no-renames", commit])
+    if result is None or result.returncode != 0:
+        return []
+    files: list[dict] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        status, _, path = line.partition("\t")
+        files.append({"status": status, "path": path})
+    return files
+
+
+def branch_metadata(repo: str | Path, branch: str) -> dict | None:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(repo_root, ["rev-parse", "--verify", branch])
+    if result is None or result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    merged = _run_git(repo_root, ["branch", "--merged", branch])
+    merged_branches = []
+    if merged is not None and merged.returncode == 0:
+        merged_branches = [line.strip().lstrip("* ") for line in merged.stdout.splitlines() if line.strip()]
+    return {"name": branch, "head": head, "merged_branches": sorted(set(merged_branches))}
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
