@@ -72,6 +72,7 @@ def build_lineage_payload(args) -> dict:
         sibling_roots=sibling_roots,
         max_dirs=args.max_sibling_dirs,
         max_files=args.max_project_files,
+        target=target,
     )
     query_text = deterministic_lineage_query(target, siblings, args.query)
     intent = infer_query(query_text, now=now)
@@ -122,6 +123,7 @@ def build_lineage_payload(args) -> dict:
             "next_read": next_read(candidates, timeline),
             "speed_accuracy_contract": {
                 "sibling_discovery": "immediate directories under configured sibling roots only",
+                "sibling_ordering": "hint-score first, then newest directory mtime, then name before applying the cap",
                 "max_sibling_dirs": args.max_sibling_dirs,
                 "max_project_files_per_candidate": args.max_project_files,
                 "jsonl_limits": limits.to_dict(),
@@ -167,6 +169,7 @@ def discover_sibling_projects(
     sibling_roots: list[Path],
     max_dirs: int,
     max_files: int,
+    target: ProjectFingerprint | None = None,
 ) -> tuple[list[ProjectFingerprint], list[str]]:
     warnings: list[str] = []
     candidates: list[ProjectFingerprint] = []
@@ -176,7 +179,10 @@ def discover_sibling_projects(
             warnings.append(f"Missing sibling root: {root}")
             continue
         try:
-            children = sorted((child for child in root.iterdir() if child.is_dir()), key=lambda item: item.name.lower())
+            children = sorted(
+                (child for child in root.iterdir() if child.is_dir()),
+                key=lambda item: sibling_discovery_key(item, project_root=project_root, target=target),
+            )
         except OSError as exc:
             warnings.append(f"Could not enumerate sibling root {root}: {exc}")
             continue
@@ -190,6 +196,33 @@ def discover_sibling_projects(
                 warnings.append("Stopped sibling discovery at max sibling directory cap.")
                 return candidates, warnings
     return candidates, warnings
+
+
+def sibling_discovery_key(child: Path, *, project_root: Path, target: ProjectFingerprint | None) -> tuple[float, float, str]:
+    hints = project_hint_tokens(project_root, target)
+    child_name = child.name.lower()
+    child_tokens = tokenise_hint_text(child_name)
+    overlap = len(hints & child_tokens)
+    substring_hits = sum(1 for hint in hints if len(hint) >= 4 and hint in child_name)
+    lineage_hits = len(child_tokens & LINEAGE_WORDS)
+    try:
+        mtime = child.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    hint_score = (overlap * 4) + (substring_hits * 2) + lineage_hits
+    return (-float(hint_score), -mtime, child_name)
+
+
+def project_hint_tokens(project_root: Path, target: ProjectFingerprint | None) -> set[str]:
+    hints = set(tokenise_hint_text(project_root.name))
+    if target is not None:
+        for value in [target.name, *target.package_names, *target.task_slugs[:20]]:
+            hints.update(tokenise_hint_text(value))
+    return {item for item in hints if len(item) >= 3}
+
+
+def tokenise_hint_text(value: str) -> set[str]:
+    return {item for item in re.split(r"[^a-z0-9]+", value.lower()) if item}
 
 
 def package_names_for(path: Path) -> list[str]:

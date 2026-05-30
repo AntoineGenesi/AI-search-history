@@ -31,6 +31,12 @@ REQUIRED_FAILURE_MODES = {
     "no_newest_first_shortlist",
     "false_confident_answer",
 }
+REQUIRED_LINEAGE_RELATIONSHIPS = {
+    "source_project",
+    "extracted_project",
+    "renamed_duplicate",
+    "sibling_project",
+}
 REQUIRED_BUDGETS = {"max_tool_calls", "max_files_opened", "max_context_bytes", "target_top_k"}
 VALID_EVIDENCE_STATUSES = {"private_mined", "needs_followup"}
 
@@ -58,6 +64,10 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
     missing_declared = REQUIRED_STAGES - declared_stages
     if missing_declared:
         errors.append(f"missing declared candidate generation stages: {sorted(missing_declared)}")
+    declared_lineage = set(payload.get("required_lineage_relationships") or [])
+    missing_lineage = REQUIRED_LINEAGE_RELATIONSHIPS - declared_lineage
+    if missing_lineage:
+        errors.append(f"missing declared lineage relationships: {sorted(missing_lineage)}")
 
     privacy = payload.get("privacy")
     if not isinstance(privacy, dict):
@@ -73,6 +83,7 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
     seen_categories: set[str] = set()
     seen_failure_modes: set[str] = set()
     seen_stages: set[str] = set()
+    seen_lineage_relationships: set[str] = set()
     for index, case in enumerate(cases):
         label = case.get("case_id") or f"case[{index}]"
         if not isinstance(case.get("case_id"), str) or not case["case_id"]:
@@ -119,6 +130,7 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
         if not isinstance(case.get("sanitized_gold_refs"), list) or not case["sanitized_gold_refs"]:
             errors.append(f"{label}: sanitized_gold_refs are required")
         validate_evidence_refs(case, label, errors)
+        seen_lineage_relationships.update(validate_lineage_relationships(case, label, errors))
 
     missing_categories = REQUIRED_CATEGORIES - seen_categories
     if missing_categories:
@@ -133,11 +145,42 @@ def validate_benchmark_fixture(payload: dict[str, Any]) -> list[str]:
     if missing_failure_modes:
         errors.append(f"missing required failure modes or follow-up markers: {sorted(missing_failure_modes)}")
 
+    missing_lineage_cases = REQUIRED_LINEAGE_RELATIONSHIPS - seen_lineage_relationships
+    if missing_lineage_cases:
+        errors.append(f"missing lineage relationship fixture coverage: {sorted(missing_lineage_cases)}")
+
     private_hits = find_private_pattern_hits(payload)
     for hit in private_hits:
         errors.append(f"private pattern found at {hit}")
 
     return errors
+
+
+def validate_lineage_relationships(case: dict[str, Any], label: str, errors: list[str]) -> set[str]:
+    relationships = case.get("lineage_relationships")
+    if relationships is None:
+        return set()
+    if not isinstance(relationships, list) or not relationships:
+        errors.append(f"{label}: lineage_relationships must be a non-empty list when present")
+        return set()
+    seen: set[str] = set()
+    for index, relationship in enumerate(relationships):
+        item_label = f"{label}.lineage_relationships[{index}]"
+        if not isinstance(relationship, dict):
+            errors.append(f"{item_label}: entry must be an object")
+            continue
+        relationship_type = relationship.get("relationship_type")
+        if relationship_type not in REQUIRED_LINEAGE_RELATIONSHIPS:
+            errors.append(f"{item_label}: unknown relationship_type {relationship_type!r}")
+            continue
+        seen.add(relationship_type)
+        for key in ("project_role", "evidence_pattern"):
+            if not isinstance(relationship.get(key), str) or not relationship[key]:
+                errors.append(f"{item_label}: {key} is required")
+        confidence = relationship.get("expected_confidence")
+        if confidence not in {"low", "medium", "high"}:
+            errors.append(f"{item_label}: expected_confidence must be low, medium, or high")
+    return seen
 
 
 def validate_coverage_followup(payload: dict[str, Any], errors: list[str]) -> dict[str, list[str]]:
