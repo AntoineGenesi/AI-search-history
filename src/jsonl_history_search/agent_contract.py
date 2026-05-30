@@ -122,7 +122,7 @@ def command_surface() -> dict[str, str]:
     return {
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
         "find-candidates": "Returns compact candidate rows with source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
-        "broaden-query": "Shows exact, normalized, synonym/paraphrase, artifact/path, cwd/project, date-window, role, and future fuzzy/semantic families.",
+        "broaden-query": "Shows exact, normalized, typo/fuzzy, synonym/paraphrase, artifact/path, cwd/project, date-window, role, and local semantic families.",
         "timeline": "Sorts candidate rows by parsed message timestamp with deterministic path/line tie-breaking.",
         "cluster-candidates": "Groups candidates by task, artifact, preference, session, or path for compact AI handoff.",
         "no-evidence-report": "Reports searched scope, excluded scope, weak candidates, warnings, and next safe searches instead of hallucinating.",
@@ -204,14 +204,16 @@ def stages_from_reasons(reasons: list[str]) -> list[str]:
     stages: set[str] = set()
     for reason in reasons:
         if reason.startswith("text:"):
-            stages.add("exact_or_expanded_text")
+            stages.add(stage_from_text_reason(reason))
+        elif reason.startswith("fuzzy:"):
+            stages.add("typo_fuzzy")
         elif reason.startswith("role:"):
             stages.add("role")
         elif reason == "date-window":
             stages.add("date_window")
         elif reason == "cwd":
             stages.add("cwd_project")
-        elif reason == "artifact":
+        elif reason.startswith("artifact"):
             stages.add("artifact_path")
         elif reason == "bounded-no-term":
             stages.add("bounded_no_term")
@@ -219,7 +221,17 @@ def stages_from_reasons(reasons: list[str]) -> list[str]:
 
 
 def primary_stage(stages: list[str]) -> str:
-    for preferred in ("artifact_path", "exact_or_expanded_text", "date_window", "cwd_project", "role"):
+    for preferred in (
+        "exact_phrase",
+        "artifact_path",
+        "normalized_terms",
+        "synonym_paraphrase",
+        "typo_fuzzy",
+        "semantic_local",
+        "date_window",
+        "cwd_project",
+        "role",
+    ):
         if preferred in stages:
             return preferred
     return stages[0] if stages else "unsupported"
@@ -229,14 +241,16 @@ def reason_codes_from_reasons(reasons: list[str]) -> list[str]:
     codes = []
     for reason in reasons:
         if reason.startswith("text:"):
-            codes.append("normalized_term")
+            codes.append(stage_reason_code(stage_from_text_reason(reason)))
+        elif reason.startswith("fuzzy:"):
+            codes.append("typo_fuzzy")
         elif reason.startswith("role:"):
             codes.append("role_match")
         elif reason == "date-window":
             codes.append("date_window")
         elif reason == "cwd":
             codes.append("project_hint")
-        elif reason == "artifact":
+        elif reason.startswith("artifact"):
             codes.append("artifact_path")
         elif reason == "bounded-no-term":
             codes.append("bounded_no_term")
@@ -249,18 +263,53 @@ def matched_terms_from_reasons(reasons: list[str]) -> list[str]:
     terms = []
     for reason in reasons:
         if reason.startswith("text:"):
-            terms.append(reason.split(":", 1)[1])
+            parts = reason.split(":", 2)
+            terms.append(parts[2] if len(parts) == 3 else parts[1])
+        elif reason.startswith("fuzzy:"):
+            parts = reason.split(":", 2)
+            if len(parts) == 3:
+                terms.append(parts[2])
     return sorted(set(terms))
 
 
 def confidence_for_score(score: float, stages: list[str]) -> str:
-    if score >= 22 and ("exact_or_expanded_text" in stages or "artifact_path" in stages):
+    if score >= 22 and ({"exact_phrase", "normalized_terms", "artifact_path"} & set(stages)):
         return "high"
     if score >= 12:
         return "medium"
     if score > 0:
         return "low"
     return "weak"
+
+
+def stage_from_text_reason(reason: str) -> str:
+    parts = reason.split(":", 2)
+    if len(parts) == 3:
+        return normalize_stage(parts[1])
+    return "normalized_terms"
+
+
+def normalize_stage(stage: str) -> str:
+    aliases = {
+        "base": "normalized_terms",
+        "synonym": "synonym_paraphrase",
+        "artifact": "artifact_path",
+        "role_filter": "role",
+    }
+    return aliases.get(stage, stage)
+
+
+def stage_reason_code(stage: str) -> str:
+    codes = {
+        "exact_phrase": "exact_phrase",
+        "normalized_terms": "normalized_term",
+        "synonym_paraphrase": "synonym_paraphrase",
+        "artifact_path": "artifact_path",
+        "semantic_local": "semantic_local",
+        "task_slug": "normalized_term",
+        "preference": "synonym_paraphrase",
+    }
+    return codes.get(stage, stage)
 
 
 def build_plan_sources(source_plan: dict, search_result: dict, manifest_report: dict | None) -> dict:
@@ -312,17 +361,27 @@ def build_broaden_query(query: dict) -> dict:
         "defined_families": [
             "exact",
             "normalized",
+            "typo_fuzzy",
             "synonym_paraphrase",
             "artifact_path",
             "cwd_project",
             "date_window",
             "role",
-            "typo_fuzzy_future",
-            "semantic_local_future",
+            "semantic_local",
         ],
-        "unsupported_stages": {
-            "typo_fuzzy": {"status": "not_run", "reason": "planned for jsh-012"},
-            "semantic_local": {"status": "not_run", "reason": "no embedding backend in jsh-007"},
+        "stage_support": {
+            "typo_fuzzy": {
+                "status": "supported",
+                "method": "bounded local token similarity over query base terms after exact filters miss",
+            },
+            "semantic_local": {
+                "status": "supported",
+                "method": "deterministic local paraphrase/concept expansion; no remote embedding calls",
+            },
+            "semantic_embeddings": {
+                "status": "not_run",
+                "reason": "persistent local embedding backend is reserved for jsh-005",
+            },
         },
     }
 
@@ -428,7 +487,7 @@ def next_search_suggestions(*, status: str, source_plan: dict, candidates: list[
     if not query.get("artifact_hints"):
         suggestions.append("Add a file, task slug, report name, or project folder hint if available.")
     if status == "no_evidence":
-        suggestions.append("Run a broader fuzzy/semantic pass after jsh-012 before declaring permanent no evidence.")
+        suggestions.append("Inspect no_evidence_report and rerun with any extra artifact, project, date, or speaker hint before declaring permanent no evidence.")
     elif len(candidates) > INLINE_CANDIDATE_LIMIT:
         suggestions.append("Use the top clusters or write a report instead of opening every candidate.")
     return suggestions
