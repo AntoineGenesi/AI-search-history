@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+from .clustering import cluster_matches
 from .query import QueryIntent
 from .records import Record
 
@@ -19,6 +20,9 @@ class Match:
     score: float
     reasons: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
+    session: str | None = None
+    tasks: list[str] = field(default_factory=list)
+    preferences: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -28,11 +32,12 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
     score = 0.0
     reasons: list[str] = []
     lowered = record.text.lower()
-    for term in intent.terms:
+    match_terms = active_match_terms(intent)
+    for term in match_terms:
         if term.lower() in lowered:
             score += 10
             reasons.append(f"text:{term}")
-    if not intent.terms:
+    if not match_terms:
         score += 1
         reasons.append("bounded-no-term")
     if intent.role and role_matches(record.role, intent.role):
@@ -74,10 +79,21 @@ def should_consider(record: Record, intent: QueryIntent) -> bool:
         local_ts = record.timestamp.astimezone(intent.date_window_start.tzinfo)
         if not (intent.date_window_start <= local_ts < intent.date_window_end):
             return False
-    if intent.terms:
+    terms = active_match_terms(intent)
+    if terms:
         lowered = record.text.lower()
-        return any(term.lower() in lowered for term in intent.terms)
+        return any(term.lower() in lowered for term in terms)
     return True
+
+
+def active_match_terms(intent: QueryIntent) -> list[str]:
+    active: list[str] = []
+    for term in intent.terms:
+        reasons = set(intent.expansion_reasons.get(term, []))
+        if reasons and reasons <= {"date_window"}:
+            continue
+        active.append(term)
+    return active
 
 
 def make_snippet(text: str, terms: list[str], context: int = 180) -> str:
@@ -98,18 +114,4 @@ def artifact_candidates(text: str) -> list[str]:
 
 
 def group_matches(matches: list[Match]) -> list[dict]:
-    grouped: dict[str, dict] = {}
-    for match in matches:
-        group = grouped.setdefault(
-            match.path,
-            {
-                "path": match.path,
-                "top_score": match.score,
-                "matches": [],
-                "artifacts": [],
-            },
-        )
-        group["top_score"] = max(group["top_score"], match.score)
-        group["matches"].append(match.to_dict())
-        group["artifacts"] = sorted(set(group["artifacts"]) | set(match.artifacts))
-    return sorted(grouped.values(), key=lambda item: item["top_score"], reverse=True)
+    return cluster_matches(matches)
