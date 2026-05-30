@@ -32,13 +32,15 @@ def render_text(payload: dict) -> str:
         lines.append(f"Blind spot: {blind}")
     masking = payload.get("masking")
     if masking:
+        redaction = masking.get("redaction") or {}
         lines.append(
             "Masking: "
             f"{masking.get('mode')} "
             f"masked={masking.get('active_context_masked', 0)} "
             f"collapsed={masking.get('active_context_collapsed', 0)} "
             f"debug_visible={masking.get('debug_visible', 0)} "
-            f"transcript_retained={masking.get('transcript_retained', 0)}"
+            f"transcript_retained={masking.get('transcript_retained', 0)} "
+            f"redacted={redaction.get('redacted_total', 0)}"
         )
     if payload.get("groups"):
         lines.append("Matches:")
