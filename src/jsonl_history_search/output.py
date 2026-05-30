@@ -18,6 +18,8 @@ def render_text(payload: dict) -> str:
         return render_efficiency_eval_text(payload)
     if "agent_find" in payload:
         return render_agent_find_text(payload)
+    if "project_lineage" in payload:
+        return render_project_lineage_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -75,6 +77,8 @@ def render_markdown(payload: dict) -> str:
         return render_efficiency_eval_markdown(payload)
     if "agent_find" in payload:
         return render_agent_find_markdown(payload)
+    if "project_lineage" in payload:
+        return render_project_lineage_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -165,6 +169,63 @@ def render_forensics_text(payload: dict) -> str:
 def render_forensics_markdown(payload: dict) -> str:
     text = render_forensics_text(payload)
     lines = ["# JSONL History Forensics", ""]
+    for line in text.splitlines()[1:]:
+        if line.startswith("- ") or line.startswith("  "):
+            lines.append(line)
+            continue
+        key, sep, value = line.partition(": ")
+        if sep:
+            lines.append(f"**{key}:** {value}")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def render_project_lineage_text(payload: dict) -> str:
+    lineage = payload["project_lineage"]
+    subject = lineage.get("subject_project", {})
+    lines = [
+        "Project Lineage",
+        f"Status: {lineage.get('status')}",
+        f"Subject: {subject.get('name')} ({subject.get('path')})",
+        f"Query: {lineage.get('query') or '(none)'}",
+        f"Candidates: {len(lineage.get('candidate_projects', []))}",
+    ]
+    if lineage.get("report_written"):
+        lines.append(f"Report written: {lineage['report_written']}")
+    for candidate in lineage.get("candidate_projects", [])[:8]:
+        lines.append(
+            "- "
+            f"{candidate.get('candidate_id') or '?'} {candidate.get('name')} "
+            f"score={candidate.get('score')} "
+            f"confidence={candidate.get('confidence')} "
+            f"relationship={candidate.get('relationship_hypothesis')}"
+        )
+        reason_codes = ", ".join(candidate.get("reason_codes", []))
+        if reason_codes:
+            lines.append(f"  Reasons: {reason_codes}")
+        if candidate.get("jsonl_evidence_refs"):
+            ref = candidate["jsonl_evidence_refs"][0]
+            lines.append(f"  First JSONL ref: {ref.get('path')}:{ref.get('line')} {ref.get('timestamp')}")
+    if lineage.get("timeline"):
+        lines.append("Timeline:")
+        for item in lineage["timeline"][:10]:
+            lines.append(
+                f"- {item.get('timestamp_utc') or item.get('timestamp') or '(no timestamp)'} "
+                f"{item.get('path')}:{item.get('line')} {item.get('snippet_or_summary')}"
+            )
+    for warning in payload.get("warnings", []) + lineage.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for blind in payload.get("blind_spots", []):
+        lines.append(f"Blind spot: {blind}")
+    for item in lineage.get("next_read", [])[:5]:
+        lines.append(f"Next read: {item}")
+    return "\n".join(lines)
+
+
+def render_project_lineage_markdown(payload: dict) -> str:
+    text = render_project_lineage_text(payload)
+    lines = ["# Project Lineage", ""]
     for line in text.splitlines()[1:]:
         if line.startswith("- ") or line.startswith("  "):
             lines.append(line)
