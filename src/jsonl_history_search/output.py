@@ -24,6 +24,8 @@ def render_text(payload: dict) -> str:
         return render_skill_audit_text(payload)
     if "structured_tool_events" in payload:
         return render_structured_tool_events_text(payload)
+    if "workflow_repeat_finder" in payload:
+        return render_workflow_repeat_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -87,6 +89,8 @@ def render_markdown(payload: dict) -> str:
         return render_skill_audit_markdown(payload)
     if "structured_tool_events" in payload:
         return render_structured_tool_events_markdown(payload)
+    if "workflow_repeat_finder" in payload:
+        return render_workflow_repeat_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -323,6 +327,103 @@ def render_skill_audit_markdown(payload: dict) -> str:
         for mention in report["non_use_mentions"][:12]:
             ref = mention.get("source_ref", {})
             lines.append(f"- `{ref.get('path')}:{ref.get('line')}` {mention.get('snippet')}")
+    return "\n".join(lines)
+
+
+def render_workflow_repeat_text(payload: dict) -> str:
+    report = payload["workflow_repeat_finder"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "Workflow Repeat Finder",
+        f"Status: {report.get('status')}",
+        f"Query: {report.get('query') or '(none)'}",
+        (
+            "Scope: "
+            f"{efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            "Evidence: "
+            f"{efficiency.get('cluster_count', 0)} clusters, "
+            f"{efficiency.get('suggestion_count', 0)} suggestions, "
+            f"{efficiency.get('rejected_one_off_count', 0)} one-offs rejected"
+        ),
+    ]
+    if report.get("report_written"):
+        lines.append(f"Report written: {report['report_written']}")
+    for cluster in report.get("workflow_clusters", [])[:8]:
+        first = (cluster.get("representative_instances") or [{}])[0].get("source_ref", {})
+        lines.append(
+            "- "
+            f"{cluster.get('cluster_id')} rank={cluster.get('rank')} "
+            f"score={cluster.get('score')} confidence={cluster.get('confidence')} "
+            f"instances={cluster.get('instance_count')} kind={cluster.get('workflow_kind')} "
+            f"{first.get('path')}:{first.get('line')} {cluster.get('label')}"
+        )
+        reasons = ", ".join(cluster.get("reason_codes", [])[:5])
+        if reasons:
+            lines.append(f"  Reasons: {reasons}")
+    for suggestion in report.get("automation_suggestions", [])[:5]:
+        ref = suggestion.get("source_ref", {})
+        lines.append(
+            f"Suggestion: {suggestion.get('classification')} "
+            f"{ref.get('path')}:{ref.get('line')} {suggestion.get('snippet')}"
+        )
+    for warning in payload.get("warnings", []) + report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_workflow_repeat_markdown(payload: dict) -> str:
+    report = payload["workflow_repeat_finder"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "# Workflow Repeat Finder",
+        "",
+        f"**Status:** {report.get('status')}",
+        f"**Query:** {report.get('query') or '(none)'}",
+        (
+            f"**Scope:** {efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            f"**Evidence:** {efficiency.get('cluster_count', 0)} clusters, "
+            f"{efficiency.get('suggestion_count', 0)} suggestions, "
+            f"{efficiency.get('rejected_one_off_count', 0)} one-offs rejected"
+        ),
+        "",
+        "## Workflow Clusters",
+        "",
+        "| Rank | ID | Score | Confidence | Kind | Instances | First Source | Label |",
+        "| ---: | --- | ---: | --- | --- | ---: | --- | --- |",
+    ]
+    for cluster in report.get("workflow_clusters", []):
+        first = (cluster.get("representative_instances") or [{}])[0].get("source_ref", {})
+        source = f"{first.get('path')}:{first.get('line')}"
+        lines.append(
+            "| "
+            f"{cluster.get('rank')} | "
+            f"{_escape_markdown_table(str(cluster.get('cluster_id', '')))} | "
+            f"{cluster.get('score')} | "
+            f"{_escape_markdown_table(str(cluster.get('confidence', '')))} | "
+            f"{_escape_markdown_table(str(cluster.get('workflow_kind', '')))} | "
+            f"{cluster.get('instance_count')} | "
+            f"{_escape_markdown_table(source)} | "
+            f"{_escape_markdown_table(str(cluster.get('label', '')))} |"
+        )
+    if report.get("automation_suggestions"):
+        lines.extend(["", "## Automation Suggestions", ""])
+        for suggestion in report["automation_suggestions"][:12]:
+            ref = suggestion.get("source_ref", {})
+            lines.append(
+                f"- `{suggestion.get('classification')}` `{ref.get('path')}:{ref.get('line')}` "
+                f"{suggestion.get('snippet')}"
+            )
+    if report.get("rejected_one_offs"):
+        lines.extend(["", "## Rejected One-Offs", ""])
+        for one_off in report["rejected_one_offs"][:8]:
+            ref = one_off.get("first_source_ref") or {}
+            lines.append(f"- `{one_off.get('cluster_key')}` `{ref.get('path')}:{ref.get('line')}` {one_off.get('reason')}")
     return "\n".join(lines)
 
 

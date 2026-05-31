@@ -17,6 +17,7 @@ from .skill_audit import build_skill_audit_payload
 from .sources import Limits, build_source_plan
 from .timeutil import parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
+from .workflow_repeat import build_workflow_repeat_payload
 from .masking import MASK_MODES, MaskContext
 
 
@@ -82,6 +83,18 @@ def build_parser() -> argparse.ArgumentParser:
     structured.add_argument("--skill", default=None)
     structured.add_argument("--path", action="append", default=[])
     structured.add_argument("--report-output", default=None)
+    workflow_repeat = subparsers.add_parser("workflow-repeat-finder")
+    workflow_repeat.add_argument("query", nargs="?", default="")
+    add_common_args(workflow_repeat)
+    workflow_repeat.add_argument("--min-instances", type=int, default=2)
+    workflow_repeat.add_argument("--window-records", type=int, default=8)
+    workflow_repeat.add_argument("--cluster-limit", type=int, default=12)
+    workflow_repeat.add_argument(
+        "--no-suggestions",
+        action="store_true",
+        help="Skip bounded prose extraction of prior automation suggestions.",
+    )
+    workflow_repeat.add_argument("--report-output", default=None)
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument(
         "--fixture",
@@ -294,6 +307,27 @@ def main(argv: list[str] | None = None) -> int:
             rendered = render(_short_tool_events_report_written_payload(payload, args.report_output), args.format)
         print(rendered)
         return 0
+    if args.command == "workflow-repeat-finder":
+        source_plan, _intent, plan = payload_from_args(args)
+        payload = build_workflow_repeat_payload(
+            source_plan=source_plan,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            query=args.query,
+            min_instances=args.min_instances,
+            window_records=args.window_records,
+            cluster_limit=args.cluster_limit,
+            include_suggestions=not args.no_suggestions,
+            mask_context=_mask_context_from_args(args),
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            rendered = render(_short_workflow_repeat_report_written_payload(payload, args.report_output), args.format)
+        print(rendered)
+        return 0
     if args.command == "benchmark":
         payload = build_efficiency_eval(
             Path(args.fixture).expanduser(),
@@ -450,6 +484,30 @@ def _short_tool_events_report_written_payload(payload: dict, report_output: str)
             "top_events": report.get("events", [])[:5],
             "warnings": payload.get("warnings", []),
             "message": "Full structured tool-events report written to report_output; stdout is a compact handoff map.",
+        }
+    }
+
+
+def _short_workflow_repeat_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["workflow_repeat_finder"]
+    efficiency = report.get("token_efficiency", {})
+    return {
+        "workflow_repeat_finder": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "query": report.get("query", ""),
+            "report_written": str(Path(report_output).expanduser()),
+            "token_efficiency": {
+                "cluster_count": efficiency.get("cluster_count", 0),
+                "suggestion_count": efficiency.get("suggestion_count", 0),
+                "rejected_one_off_count": efficiency.get("rejected_one_off_count", 0),
+                "searched_files": efficiency.get("searched_files", 0),
+                "searched_bytes": efficiency.get("searched_bytes", 0),
+            },
+            "top_clusters": report.get("workflow_clusters", [])[:3],
+            "automation_suggestions": report.get("automation_suggestions", [])[:3],
+            "warnings": payload.get("warnings", []),
+            "message": "Full workflow-repeat-finder report written to report_output; stdout is a compact handoff map.",
         }
     }
 
