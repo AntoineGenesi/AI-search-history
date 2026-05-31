@@ -10,6 +10,7 @@ from .install_validation import validate_install
 from .lineage import build_lineage_payload
 from .manifest import build_manifest_report
 from .output import render
+from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .query import infer_query
 from .redaction import RedactionContext
 from .scanner import search
@@ -95,6 +96,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip bounded prose extraction of prior automation suggestions.",
     )
     workflow_repeat.add_argument("--report-output", default=None)
+    private_mine = subparsers.add_parser("private-benchmark-mine")
+    add_common_args(private_mine)
+    private_mine.add_argument("--query-family", action="append", default=[])
+    private_mine.add_argument("--query", action="append", default=[], dest="queries")
+    private_mine.add_argument("--target-category", action="append", default=[])
+    private_mine.add_argument("--target-stage", action="append", default=[])
+    private_mine.add_argument("--target-failure-mode", action="append", default=[])
+    private_mine.add_argument(
+        "--fixture",
+        default="benchmarks/retrieval_gold/sanitized_cases.json",
+        help="Sanitized retrieval benchmark fixture to compare against.",
+    )
+    private_mine.add_argument(
+        "--output-dir",
+        default=None,
+        help="Private output directory; defaults to .private/jsh-013/run-YYYYMMDD-HHMMSS.",
+    )
+    private_mine.add_argument("--candidate-limit", type=int, default=100)
+    private_mine.add_argument("--per-query-max-matches", type=int, default=20)
+    private_mine.add_argument("--context-lines", type=int, default=3)
+    private_mine.add_argument("--no-tool-events", action="store_true")
+    private_mine.add_argument("--no-workflow-repeat", action="store_true")
+    private_mine.add_argument(
+        "--write-suggestions",
+        action="store_true",
+        help="Compatibility flag; sanitized suggestions are always written under the private output dir.",
+    )
+    private_mine.add_argument("--report-output", default=None)
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument(
         "--fixture",
@@ -327,6 +356,36 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
             rendered = render(_short_workflow_repeat_report_written_payload(payload, args.report_output), args.format)
         print(rendered)
+        return 0
+    if args.command == "private-benchmark-mine":
+        args.query = " ".join(args.queries)
+        source_plan, _intent, plan = payload_from_args(args)
+        output_dir = (
+            Path(args.output_dir).expanduser()
+            if args.output_dir
+            else Path(".private") / "jsh-013" / f"run-{parse_now(args.now, timezone_from_args(args.timezone, args.timezone_offset)).strftime('%Y%m%d-%H%M%S')}"
+        )
+        payload = build_private_benchmark_mine_payload(
+            source_plan=source_plan,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            fixture_path=Path(args.fixture).expanduser(),
+            output_dir=output_dir,
+            queries=args.queries,
+            query_families=args.query_family,
+            target_categories=args.target_category,
+            target_stages=args.target_stage,
+            target_failure_modes=args.target_failure_mode,
+            candidate_limit=args.candidate_limit,
+            per_query_max_matches=args.per_query_max_matches,
+            context_lines=args.context_lines,
+            include_tool_events=not args.no_tool_events,
+            include_workflow_repeat=not args.no_workflow_repeat,
+            mask_context=_mask_context_from_args(args),
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        print(render(payload, args.format))
         return 0
     if args.command == "benchmark":
         payload = build_efficiency_eval(
