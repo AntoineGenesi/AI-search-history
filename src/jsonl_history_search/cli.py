@@ -13,6 +13,7 @@ from .output import render
 from .query import infer_query
 from .redaction import RedactionContext
 from .scanner import search
+from .skill_audit import build_skill_audit_payload
 from .sources import Limits, build_source_plan
 from .timeutil import parse_now, timezone_from_args
 from .masking import MASK_MODES, MaskContext
@@ -66,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     lineage.add_argument("--max-projects", type=int, default=12)
     lineage.add_argument("--timeline-limit", type=int, default=20)
     lineage.add_argument("--report-output", default=None)
+    skill_audit = subparsers.add_parser("skill-audit")
+    skill_audit.add_argument("skill")
+    add_common_args(skill_audit)
+    skill_audit.add_argument("--pre-window", type=int, default=3)
+    skill_audit.add_argument("--post-window", type=int, default=6)
+    skill_audit.add_argument("--correction-window", type=int, default=12)
+    skill_audit.add_argument("--report-output", default=None)
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument(
         "--fixture",
@@ -238,6 +246,27 @@ def main(argv: list[str] | None = None) -> int:
             rendered = render(_short_lineage_report_written_payload(payload, args.report_output), args.format)
         print(rendered)
         return 0
+    if args.command == "skill-audit":
+        args.query = args.skill
+        source_plan, _intent, plan = payload_from_args(args)
+        payload = build_skill_audit_payload(
+            skill=args.skill,
+            source_plan=source_plan,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            pre_window=args.pre_window,
+            post_window=args.post_window,
+            correction_window=args.correction_window,
+            mask_context=_mask_context_from_args(args),
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            rendered = render(_short_skill_audit_report_written_payload(payload, args.report_output), args.format)
+        print(rendered)
+        return 0
     if args.command == "benchmark":
         payload = build_efficiency_eval(
             Path(args.fixture).expanduser(),
@@ -346,6 +375,25 @@ def _short_lineage_report_written_payload(payload: dict, report_output: str) -> 
             "warnings": payload.get("warnings", []),
             "next_read": report.get("next_read", [])[:5],
             "message": "Full lineage report written to report_output; stdout is a compact handoff map.",
+        }
+    }
+
+
+def _short_skill_audit_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["skill_audit"]
+    efficiency = report.get("token_efficiency", {})
+    return {
+        "skill_audit": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "skill": report["skill"],
+            "report_written": str(Path(report_output).expanduser()),
+            "usage_instance_count": efficiency.get("usage_instance_count", 0),
+            "non_use_mention_count": efficiency.get("non_use_mention_count", 0),
+            "top_usage_instances": report.get("usage_instances", [])[:3],
+            "top_non_use_mentions": report.get("non_use_mentions", [])[:3],
+            "warnings": payload.get("warnings", []),
+            "message": "Full skill audit report written to report_output; stdout is a compact handoff map.",
         }
     }
 
