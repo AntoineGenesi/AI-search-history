@@ -268,7 +268,7 @@ def actual_use_signals(skill: str, item: AuditRecord, following: list[AuditRecor
     lower = text.lower()
     slug = skill_slug(skill)
     signals: list[dict] = []
-    if mentions_skill(skill, text) and is_agent_action_record(item) and looks_like_skill_file_use(skill, lower):
+    if mentions_skill(skill, text) and is_agent_action_record(item) and looks_like_skill_file_use(skill, item):
         signals.append(signal(item, "skill_file_read", "matching skill name and SKILL.md path/content"))
     if mentions_skill(skill, text) and is_agent_action_record(item) and ("/scripts/" in lower or "\\scripts\\" in lower or f"{slug}/scripts" in lower):
         signals.append(signal(item, "skill_helper_invocation", "matching skill helper or script path"))
@@ -286,9 +286,12 @@ def is_agent_action_record(item: AuditRecord) -> bool:
     return item.record.role.lower() in AGENT_ACTION_ROLES
 
 
-def looks_like_skill_file_use(skill: str, lower_text: str) -> bool:
+def looks_like_skill_file_use(skill: str, item: AuditRecord) -> bool:
+    lower_text = item.text.lower()
     if "skill.md" not in lower_text:
         return False
+    if item.record.role.lower() in {"function_call", "tool_call"}:
+        return True
     slug = skill_slug(skill)
     path_patterns = (
         f"/{slug}/skill.md",
@@ -296,12 +299,32 @@ def looks_like_skill_file_use(skill: str, lower_text: str) -> bool:
         f"/{slug.lower()}/skill.md",
         f"\\{slug.lower()}\\skill.md",
     )
-    if any(pattern in lower_text for pattern in path_patterns):
-        return True
-    return bool(
+    has_matching_path = any(pattern in lower_text for pattern in path_patterns)
+    has_read_action = bool(
         re.search(
             r"\b(read|reading|loaded|loading|opened|opening|cat|sed|less|view|viewed)\b.{0,120}\bskill\.md\b",
             lower_text,
+        )
+    )
+    if has_matching_path and has_read_action and not looks_like_skill_non_use_context(lower_text):
+        return True
+    return has_read_action and not looks_like_skill_non_use_context(lower_text)
+
+
+def looks_like_skill_non_use_context(lower_text: str) -> bool:
+    return any(
+        marker in lower_text
+        for marker in (
+            "not using",
+            "do not use",
+            "don't use",
+            "without loading",
+            "docs",
+            "documentation",
+            "install",
+            "roadmap",
+            "planning",
+            "later",
         )
     )
 
