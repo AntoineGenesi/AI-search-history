@@ -273,7 +273,7 @@ def cluster_key(event: ToolEvent) -> tuple[str, str] | None:
     if event.event_type in {"command_run", "test_run", "git_event"} and event.command:
         return (event.event_type, command_family(event.command))
     if event.event_type in {"artifact_write", "review_event", "changed_path"}:
-        family = first_path_family(event)
+        family = path_cluster_family(event)
         return (event.event_type, family) if family else None
     if event.event_type in {"skill_file_read", "skill_helper_invocation"}:
         skill = skill_from_event(event)
@@ -663,6 +663,9 @@ def command_family(command: str) -> str:
             command_name = next((part for part in parts[idx + 2 :] if not part.startswith("-")), module)
             return f"python3 -m {module} {command_name}"
         return f"python3 -m {module}"
+    if first in {"python", "python3"}:
+        script = python_script_arg(parts[1:])
+        return f"{first} {script}" if script else first
     if first in {"pytest", "rg", "grep", "find"}:
         return first
     if first == "git" and len(parts) > 1:
@@ -670,6 +673,36 @@ def command_family(command: str) -> str:
     if first in {"sed", "cat", "nl", "head", "tail"}:
         return first
     return first
+
+
+def python_script_arg(parts: list[str]) -> str | None:
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part in {"-c", "-m"}:
+            skip_next = True
+            continue
+        if part.startswith("-"):
+            continue
+        if part.endswith(".py") or "/" in part:
+            return part
+        return part
+    return None
+
+
+def path_cluster_family(event: ToolEvent) -> str | None:
+    family = first_path_family(event)
+    if not family:
+        return None
+    if event.event_type in {"artifact_write", "review_event"} and event.command and is_broad_artifact_family(family):
+        return f"{family} via {command_family(event.command)}"
+    return family
+
+
+def is_broad_artifact_family(family: str) -> bool:
+    return family in {"reports/*", "*.json", "*.html", "*.csv", "*.txt"}
 
 
 def first_path_family(event: ToolEvent) -> str | None:
