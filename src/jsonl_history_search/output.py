@@ -26,6 +26,8 @@ def render_text(payload: dict) -> str:
         return render_structured_tool_events_text(payload)
     if "workflow_repeat_finder" in payload:
         return render_workflow_repeat_text(payload)
+    if "private_benchmark_mine" in payload:
+        return render_private_benchmark_mine_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -91,6 +93,8 @@ def render_markdown(payload: dict) -> str:
         return render_structured_tool_events_markdown(payload)
     if "workflow_repeat_finder" in payload:
         return render_workflow_repeat_markdown(payload)
+    if "private_benchmark_mine" in payload:
+        return render_private_benchmark_mine_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -424,6 +428,70 @@ def render_workflow_repeat_markdown(payload: dict) -> str:
         for one_off in report["rejected_one_offs"][:8]:
             ref = one_off.get("first_source_ref") or {}
             lines.append(f"- `{one_off.get('cluster_key')}` `{ref.get('path')}:{ref.get('line')}` {one_off.get('reason')}")
+    return "\n".join(lines)
+
+
+def render_private_benchmark_mine_text(payload: dict) -> str:
+    report = payload["private_benchmark_mine"]
+    summary = report.get("candidate_summary", {})
+    coverage = report.get("coverage_gap_report", {})
+    suggestions = report.get("sanitized_fixture_suggestions", {})
+    efficiency = report.get("token_efficiency", {})
+    files = report.get("output_files", {})
+    lines = [
+        "Private Benchmark Mine",
+        f"Status: {report.get('status')}",
+        (
+            "Scope: "
+            f"{efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        f"Candidates: {summary.get('candidate_count', 0)}",
+        f"Suggestions: {suggestions.get('suggested_case_count', 0)}",
+        f"Private triage CSV: {files.get('private_triage_csv')}",
+        f"Coverage gap report: {files.get('coverage_gap_report')}",
+        f"Private report: {files.get('private_report')}",
+    ]
+    if coverage.get("missing_stages"):
+        lines.append(f"Missing stages: {', '.join(coverage['missing_stages'])}")
+    if coverage.get("missing_failure_modes"):
+        lines.append(f"Missing failure modes: {', '.join(coverage['missing_failure_modes'])}")
+    checker = report.get("checker", {})
+    if checker.get("command"):
+        lines.append(f"Checker: {checker['command']}")
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_private_benchmark_mine_markdown(payload: dict) -> str:
+    report = payload["private_benchmark_mine"]
+    summary = report.get("candidate_summary", {})
+    coverage = report.get("coverage_gap_report", {})
+    files = report.get("output_files", {})
+    lines = [
+        "# Private Benchmark Mine",
+        "",
+        f"**Status:** {report.get('status')}",
+        f"**Candidates:** {summary.get('candidate_count', 0)}",
+        f"**Suggestions:** {report.get('sanitized_fixture_suggestions', {}).get('suggested_case_count', 0)}",
+        f"**Private triage CSV:** `{files.get('private_triage_csv')}`",
+        f"**Coverage gap report:** `{files.get('coverage_gap_report')}`",
+        f"**Private report:** `{files.get('private_report')}`",
+        "",
+        "## Coverage Gaps",
+        "",
+    ]
+    for label, values in (
+        ("Missing categories", coverage.get("missing_categories", [])),
+        ("Missing stages", coverage.get("missing_stages", [])),
+        ("Missing failure modes", coverage.get("missing_failure_modes", [])),
+        ("Weak categories", coverage.get("weak_categories", [])),
+    ):
+        lines.append(f"- **{label}:** {', '.join(values) if values else '(none)'}")
+    checker = report.get("checker", {})
+    if checker.get("command"):
+        lines.extend(["", "## Checker", "", f"`{checker['command']}`"])
     return "\n".join(lines)
 
 
