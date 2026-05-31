@@ -22,6 +22,8 @@ def render_text(payload: dict) -> str:
         return render_project_lineage_text(payload)
     if "skill_audit" in payload:
         return render_skill_audit_text(payload)
+    if "structured_tool_events" in payload:
+        return render_structured_tool_events_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -83,6 +85,8 @@ def render_markdown(payload: dict) -> str:
         return render_project_lineage_markdown(payload)
     if "skill_audit" in payload:
         return render_skill_audit_markdown(payload)
+    if "structured_tool_events" in payload:
+        return render_structured_tool_events_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -693,4 +697,95 @@ def render_efficiency_eval_markdown(payload: dict) -> str:
             lines.append(f"- Failure modes: {', '.join(modes)}")
         if followup.get("notes"):
             lines.append(f"- Notes: {followup['notes']}")
+    return "\n".join(lines)
+
+
+def render_structured_tool_events_text(payload: dict) -> str:
+    report = payload["structured_tool_events"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "Structured Tool Events",
+        f"Status: {report.get('status')}",
+        (
+            "Scope: "
+            f"{efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            "Evidence: "
+            f"{efficiency.get('event_count', 0)} events, "
+            f"{efficiency.get('excluded_mention_count', 0)} excluded mentions"
+        ),
+    ]
+    if report.get("report_written"):
+        lines.append(f"Report written: {report['report_written']}")
+    for event in report.get("events", [])[:12]:
+        ref = event.get("source_ref") or {}
+        target_values = [target.get("value") for target in event.get("targets", [])[:3]]
+        suffix = f" targets={', '.join(target_values)}" if target_values else ""
+        command = f" command={event.get('command')}" if event.get("command") else ""
+        lines.append(
+            "- "
+            f"{event.get('event_id')} {event.get('event_type')} "
+            f"{event.get('confidence')} "
+            f"{ref.get('path')}:{ref.get('line')}"
+            f"{command}{suffix}"
+        )
+    for item in report.get("excluded_mentions", [])[:5]:
+        ref = item.get("source_ref") or {}
+        lines.append(f"- excluded {ref.get('path')}:{ref.get('line')} {item.get('reason')}")
+    for warning in payload.get("warnings", []) + report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for blind in payload.get("blind_spots", []):
+        lines.append(f"Blind spot: {blind}")
+    return "\n".join(lines)
+
+
+def render_structured_tool_events_markdown(payload: dict) -> str:
+    report = payload["structured_tool_events"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "# Structured Tool Events",
+        "",
+        f"**Status:** {report.get('status')}",
+        (
+            "**Scope:** "
+            f"{efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            "**Evidence:** "
+            f"{efficiency.get('event_count', 0)} events, "
+            f"{efficiency.get('excluded_mention_count', 0)} excluded mentions"
+        ),
+        "",
+        "## Events",
+        "",
+        "| ID | Type | Confidence | Source | Tool | Command/Targets |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for event in report.get("events", [])[:24]:
+        ref = event.get("source_ref") or {}
+        source = f"{ref.get('path')}:{ref.get('line')}"
+        targets = ", ".join(target.get("value", "") for target in event.get("targets", [])[:3])
+        command = event.get("command") or targets
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(event.get('event_id')))} | "
+            f"{_escape_markdown_table(str(event.get('event_type')))} | "
+            f"{_escape_markdown_table(str(event.get('confidence')))} | "
+            f"{_escape_markdown_table(source)} | "
+            f"{_escape_markdown_table(str(event.get('tool_name') or ''))} | "
+            f"{_escape_markdown_table(str(command or ''))} |"
+        )
+    excluded = report.get("excluded_mentions", [])
+    if excluded:
+        lines.extend(["", "## Excluded Mentions", ""])
+        for item in excluded[:8]:
+            ref = item.get("source_ref") or {}
+            lines.append(f"- {ref.get('path')}:{ref.get('line')} {item.get('reason')}")
+    for warning in payload.get("warnings", []) + report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for blind in payload.get("blind_spots", []):
+        lines.append(f"Blind spot: {blind}")
     return "\n".join(lines)

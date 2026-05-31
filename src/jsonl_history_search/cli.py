@@ -16,6 +16,7 @@ from .scanner import search
 from .skill_audit import build_skill_audit_payload
 from .sources import Limits, build_source_plan
 from .timeutil import parse_now, timezone_from_args
+from .tool_events import build_tool_events_payload
 from .masking import MASK_MODES, MaskContext
 
 
@@ -74,6 +75,13 @@ def build_parser() -> argparse.ArgumentParser:
     skill_audit.add_argument("--post-window", type=int, default=6)
     skill_audit.add_argument("--correction-window", type=int, default=12)
     skill_audit.add_argument("--report-output", default=None)
+    structured = subparsers.add_parser("structured-tool-events")
+    structured.add_argument("query", nargs="?", default="")
+    add_common_args(structured)
+    structured.add_argument("--event-type", action="append", default=[])
+    structured.add_argument("--skill", default=None)
+    structured.add_argument("--path", action="append", default=[])
+    structured.add_argument("--report-output", default=None)
     benchmark = subparsers.add_parser("benchmark")
     benchmark.add_argument(
         "--fixture",
@@ -267,6 +275,25 @@ def main(argv: list[str] | None = None) -> int:
             rendered = render(_short_skill_audit_report_written_payload(payload, args.report_output), args.format)
         print(rendered)
         return 0
+    if args.command == "structured-tool-events":
+        source_plan, _intent, plan = payload_from_args(args)
+        payload = build_tool_events_payload(
+            source_plan=source_plan,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            mask_context=_mask_context_from_args(args),
+            event_types=args.event_type,
+            skill=args.skill,
+            path_globs=args.path,
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            rendered = render(_short_tool_events_report_written_payload(payload, args.report_output), args.format)
+        print(rendered)
+        return 0
     if args.command == "benchmark":
         payload = build_efficiency_eval(
             Path(args.fixture).expanduser(),
@@ -402,6 +429,27 @@ def _short_skill_audit_report_written_payload(payload: dict, report_output: str)
             "top_non_use_mentions": non_use_mentions,
             "warnings": payload.get("warnings", []),
             "message": "Full skill audit report written to report_output; stdout is a compact handoff map.",
+        }
+    }
+
+
+def _short_tool_events_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["structured_tool_events"]
+    efficiency = report.get("token_efficiency", {})
+    return {
+        "structured_tool_events": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "report_written": str(Path(report_output).expanduser()),
+            "token_efficiency": {
+                "event_count": efficiency.get("event_count", 0),
+                "excluded_mention_count": efficiency.get("excluded_mention_count", 0),
+                "searched_files": efficiency.get("searched_files", 0),
+                "searched_bytes": efficiency.get("searched_bytes", 0),
+            },
+            "top_events": report.get("events", [])[:5],
+            "warnings": payload.get("warnings", []),
+            "message": "Full structured tool-events report written to report_output; stdout is a compact handoff map.",
         }
     }
 

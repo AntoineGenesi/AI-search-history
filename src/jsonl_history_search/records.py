@@ -18,6 +18,7 @@ class Record:
     timestamp: datetime | None
     cwd: str | None = None
     raw_timestamp: str | None = None
+    raw: dict[str, Any] | None = None
 
 
 def text_from_item(value: Any) -> str:
@@ -92,4 +93,5 @@ def parse_record(raw: str, *, path: Path, line: int, default_tz) -> Record:
         timestamp=parse_datetime(raw_timestamp, default_tz),
         cwd=str(cwd) if cwd else None,
         raw_timestamp=str(raw_timestamp) if raw_timestamp else None,
+        raw=data,
     )
