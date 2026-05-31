@@ -20,6 +20,8 @@ def render_text(payload: dict) -> str:
         return render_agent_find_text(payload)
     if "project_lineage" in payload:
         return render_project_lineage_text(payload)
+    if "skill_audit" in payload:
+        return render_skill_audit_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -79,6 +81,8 @@ def render_markdown(payload: dict) -> str:
         return render_agent_find_markdown(payload)
     if "project_lineage" in payload:
         return render_project_lineage_markdown(payload)
+    if "skill_audit" in payload:
+        return render_skill_audit_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -235,6 +239,86 @@ def render_project_lineage_markdown(payload: dict) -> str:
             lines.append(f"**{key}:** {value}")
         else:
             lines.append(line)
+    return "\n".join(lines)
+
+
+def render_skill_audit_text(payload: dict) -> str:
+    report = payload["skill_audit"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "Skill Audit",
+        f"Status: {report.get('status')}",
+        f"Skill: {report.get('skill')}",
+        (
+            "Scope: "
+            f"{efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            "Evidence: "
+            f"{efficiency.get('usage_instance_count', 0)} actual-use instances, "
+            f"{efficiency.get('non_use_mention_count', 0)} non-use mentions"
+        ),
+    ]
+    if report.get("report_written"):
+        lines.append(f"Report written: {report['report_written']}")
+    for instance in report.get("usage_instances", [])[:8]:
+        evidence = instance.get("skill_evidence", [{}])[0]
+        ref = evidence.get("source_ref", {})
+        lines.append(
+            "- "
+            f"{instance.get('usage_id')} {instance.get('confidence')} "
+            f"{','.join(instance.get('signal_types', []))} "
+            f"{ref.get('path')}:{ref.get('line')} "
+            f"labels={','.join(instance.get('outcome_labels', []))}"
+        )
+    for mention in report.get("non_use_mentions", [])[:5]:
+        ref = mention.get("source_ref", {})
+        lines.append(f"Non-use: {ref.get('path')}:{ref.get('line')} {mention.get('snippet')}")
+    for warning in payload.get("warnings", []) + report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_skill_audit_markdown(payload: dict) -> str:
+    report = payload["skill_audit"]
+    efficiency = report.get("token_efficiency", {})
+    lines = [
+        "# Skill Audit",
+        "",
+        f"**Status:** {report.get('status')}",
+        f"**Skill:** {report.get('skill')}",
+        (
+            f"**Scope:** {efficiency.get('searched_files', 0)} files, "
+            f"{efficiency.get('searched_bytes', 0)} bytes searched"
+        ),
+        (
+            f"**Evidence:** {efficiency.get('usage_instance_count', 0)} actual-use instances, "
+            f"{efficiency.get('non_use_mention_count', 0)} non-use mentions"
+        ),
+        "",
+        "## Usage Instances",
+        "",
+        "| ID | Confidence | Signals | Source | Labels |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for instance in report.get("usage_instances", []):
+        evidence = instance.get("skill_evidence", [{}])[0]
+        ref = evidence.get("source_ref", {})
+        source = f"{ref.get('path')}:{ref.get('line')}"
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(instance.get('usage_id', '')))} | "
+            f"{_escape_markdown_table(str(instance.get('confidence', '')))} | "
+            f"{_escape_markdown_table(', '.join(instance.get('signal_types', [])))} | "
+            f"{_escape_markdown_table(source)} | "
+            f"{_escape_markdown_table(', '.join(instance.get('outcome_labels', [])))} |"
+        )
+    if report.get("non_use_mentions"):
+        lines.extend(["", "## Non-Use Mentions", ""])
+        for mention in report["non_use_mentions"][:12]:
+            ref = mention.get("source_ref", {})
+            lines.append(f"- `{ref.get('path')}:{ref.get('line')}` {mention.get('snippet')}")
     return "\n".join(lines)
 
 
