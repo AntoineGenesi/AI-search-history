@@ -382,16 +382,24 @@ def _short_lineage_report_written_payload(payload: dict, report_output: str) -> 
 def _short_skill_audit_report_written_payload(payload: dict, report_output: str) -> dict:
     report = payload["skill_audit"]
     efficiency = report.get("token_efficiency", {})
+    usage_instances = report.get("usage_instances", [])[:3]
+    non_use_mentions = report.get("non_use_mentions", [])[:3]
     return {
         "skill_audit": {
             "schema_version": report["schema_version"],
             "status": report["status"],
             "skill": report["skill"],
             "report_written": str(Path(report_output).expanduser()),
-            "usage_instance_count": efficiency.get("usage_instance_count", 0),
-            "non_use_mention_count": efficiency.get("non_use_mention_count", 0),
-            "top_usage_instances": report.get("usage_instances", [])[:3],
-            "top_non_use_mentions": report.get("non_use_mentions", [])[:3],
+            "token_efficiency": {
+                "usage_instance_count": efficiency.get("usage_instance_count", 0),
+                "non_use_mention_count": efficiency.get("non_use_mention_count", 0),
+                "searched_files": efficiency.get("searched_files", 0),
+                "searched_bytes": efficiency.get("searched_bytes", 0),
+            },
+            "usage_instances": usage_instances,
+            "non_use_mentions": non_use_mentions,
+            "top_usage_instances": usage_instances,
+            "top_non_use_mentions": non_use_mentions,
             "warnings": payload.get("warnings", []),
             "message": "Full skill audit report written to report_output; stdout is a compact handoff map.",
         }

@@ -33,6 +33,16 @@ CORRECTION_WORDS = {
 ACCEPTANCE_WORDS = {"accepted", "complete", "completed", "merged", "passes", "verified"}
 ARTIFACT_WORDS = {"artifact", "committed", "docs/", "review artifact", "scratch", "task progress"}
 SUGGESTION_WORDS = {"could use", "install", "mention", "roadmap", "should use", "suggest", "suggested"}
+AGENT_ACTION_ROLES = {
+    "assistant",
+    "assistant_message",
+    "agent_message",
+    "function_call",
+    "function_call_output",
+    "tool",
+    "tool_call",
+    "tool_output",
+}
 
 
 @dataclass(frozen=True)
@@ -258,9 +268,9 @@ def actual_use_signals(skill: str, item: AuditRecord, following: list[AuditRecor
     lower = text.lower()
     slug = skill_slug(skill)
     signals: list[dict] = []
-    if mentions_skill(skill, text) and "skill.md" in lower:
+    if mentions_skill(skill, text) and is_agent_action_record(item) and looks_like_skill_file_use(skill, lower):
         signals.append(signal(item, "skill_file_read", "matching skill name and SKILL.md path/content"))
-    if mentions_skill(skill, text) and ("/scripts/" in lower or "\\scripts\\" in lower or f"{slug}/scripts" in lower):
+    if mentions_skill(skill, text) and is_agent_action_record(item) and ("/scripts/" in lower or "\\scripts\\" in lower or f"{slug}/scripts" in lower):
         signals.append(signal(item, "skill_helper_invocation", "matching skill helper or script path"))
     if (
         item.record.role.lower() in {"assistant", "agent_message", "assistant_message"}
@@ -270,6 +280,30 @@ def actual_use_signals(skill: str, item: AuditRecord, following: list[AuditRecor
     ):
         signals.append(signal(item, "explicit_agent_use_statement", "agent stated skill use with adjacent workflow behavior"))
     return dedupe_signals(signals)
+
+
+def is_agent_action_record(item: AuditRecord) -> bool:
+    return item.record.role.lower() in AGENT_ACTION_ROLES
+
+
+def looks_like_skill_file_use(skill: str, lower_text: str) -> bool:
+    if "skill.md" not in lower_text:
+        return False
+    slug = skill_slug(skill)
+    path_patterns = (
+        f"/{slug}/skill.md",
+        f"\\{slug}\\skill.md",
+        f"/{slug.lower()}/skill.md",
+        f"\\{slug.lower()}\\skill.md",
+    )
+    if any(pattern in lower_text for pattern in path_patterns):
+        return True
+    return bool(
+        re.search(
+            r"\b(read|reading|loaded|loading|opened|opening|cat|sed|less|view|viewed)\b.{0,120}\bskill\.md\b",
+            lower_text,
+        )
+    )
 
 
 def mention_only_signals(skill: str, item: AuditRecord) -> list[str]:
