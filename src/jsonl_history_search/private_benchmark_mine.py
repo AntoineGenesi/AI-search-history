@@ -161,8 +161,6 @@ def build_private_benchmark_mine_payload(
                     candidate,
                     category=category_for_index(len(rows), target_categories),
                     query_family=query_spec["family"],
-                    target_failure_modes=target_failure_modes,
-                    target_stages=target_stages,
                 )
             )
             if len(rows) >= candidate_limit:
@@ -179,8 +177,6 @@ def build_private_benchmark_mine_payload(
                     event.to_dict(),
                     category=category_for_index(len(rows), target_categories),
                     query_family="structured-tool-events",
-                    target_failure_modes=target_failure_modes,
-                    target_stages=target_stages,
                 )
             )
             if len(rows) >= candidate_limit:
@@ -210,8 +206,6 @@ def build_private_benchmark_mine_payload(
                     cluster,
                     category=category_for_index(len(rows), target_categories),
                     query_family="workflow-repeat",
-                    target_failure_modes=target_failure_modes,
-                    target_stages=target_stages,
                 )
             )
             if len(rows) >= candidate_limit:
@@ -230,8 +224,6 @@ def build_private_benchmark_mine_payload(
         fixture_path=fixture_path,
         rows=rows,
         target_categories=target_categories,
-        target_stages=target_stages,
-        target_failure_modes=target_failure_modes,
     )
     coverage = build_coverage_gap_report(
         fixture=fixture,
@@ -351,17 +343,14 @@ def row_from_find_candidate(
     *,
     category: str,
     query_family: str,
-    target_failure_modes: list[str],
-    target_stages: list[str],
 ) -> dict[str, Any]:
     source_ref = candidate.get("source_ref") or {}
     stages = normalize_stages(candidate.get("stages") or [])
-    stages = apply_target_stage_hints(stages, target_stages)
     artifacts = sorted(set((candidate.get("artifacts") or []) + (candidate.get("tasks") or [])))
     return {
         "category": category,
         "stage_hits": stages,
-        "failure_modes": normalize_failure_modes(target_failure_modes),
+        "failure_modes": [],
         "source_kind": "find_candidate",
         "source_path": source_ref.get("path") or candidate.get("path") or "",
         "source_line": int(source_ref.get("line") or candidate.get("line") or 0),
@@ -382,8 +371,6 @@ def row_from_tool_event(
     *,
     category: str,
     query_family: str,
-    target_failure_modes: list[str],
-    target_stages: list[str],
 ) -> dict[str, Any]:
     source_ref = event.get("source_ref") or {}
     artifacts = [target.get("value", "") for target in event.get("targets", []) if isinstance(target, dict)]
@@ -395,11 +382,11 @@ def row_from_tool_event(
         stages.append("cwd_project")
     if event.get("timestamp_utc"):
         stages.append("date_window")
-    stages = apply_target_stage_hints(normalize_stages(stages), target_stages)
+    stages = normalize_stages(stages)
     return {
         "category": category,
         "stage_hits": stages,
-        "failure_modes": normalize_failure_modes(target_failure_modes),
+        "failure_modes": [],
         "source_kind": f"tool_event:{event.get('event_type') or 'unknown'}",
         "source_path": source_ref.get("path") or "",
         "source_line": int(source_ref.get("line") or 0),
@@ -420,13 +407,11 @@ def row_from_workflow_cluster(
     *,
     category: str,
     query_family: str,
-    target_failure_modes: list[str],
-    target_stages: list[str],
 ) -> dict[str, Any]:
     instance = (cluster.get("representative_instances") or [{}])[0]
     source_ref = instance.get("source_ref") or {}
-    stages = apply_target_stage_hints(normalize_stages(["semantic_local", "newest_first_shortlist"]), target_stages)
-    failure_modes = normalize_failure_modes(target_failure_modes or ["broad_recursive_walk", "too_many_tool_calls"])
+    stages = normalize_stages(["semantic_local", "newest_first_shortlist"])
+    failure_modes = workflow_failure_modes(cluster)
     return {
         "category": category,
         "stage_hits": stages,
@@ -454,15 +439,19 @@ def normalize_stages(stages: list[str]) -> list[str]:
     return sorted(stage for stage in set(normalized) if stage in REQUIRED_STAGES)
 
 
-def apply_target_stage_hints(stages: list[str], target_stages: list[str]) -> list[str]:
-    valid_targets = [stage for stage in target_stages if stage in REQUIRED_STAGES]
-    if not valid_targets:
-        return stages
-    return sorted(set(stages) | set(valid_targets))
-
-
 def normalize_failure_modes(modes: list[str]) -> list[str]:
     return sorted(mode for mode in set(modes) if mode in REQUIRED_FAILURE_MODES)
+
+
+def workflow_failure_modes(cluster: dict) -> list[str]:
+    metrics = cluster.get("ranking_metrics") if isinstance(cluster, dict) else {}
+    metrics = metrics if isinstance(metrics, dict) else {}
+    modes: list[str] = []
+    if int(metrics.get("tool_call_cost") or 0) >= 3:
+        modes.append("too_many_tool_calls")
+    if int(metrics.get("manual_repetition") or 0) or int(metrics.get("frequency") or 0) >= 2:
+        modes.append("broad_recursive_walk")
+    return normalize_failure_modes(modes)
 
 
 def category_for_index(index: int, target_categories: list[str]) -> str:
@@ -540,12 +529,10 @@ def build_sanitized_fixture_suggestions(
     fixture_path: Path,
     rows: list[dict[str, Any]],
     target_categories: list[str],
-    target_stages: list[str],
-    target_failure_modes: list[str],
 ) -> dict[str, Any]:
     suggested_cases = []
     for index, row in enumerate(rows[:20], 1):
-        stage = first_or_default(row.get("stage_hits") or target_stages, "normalized_terms")
+        stage = first_or_default(row.get("stage_hits") or [], "normalized_terms")
         category = row.get("category") or first_or_default(target_categories, "success")
         suggested_cases.append(
             {
