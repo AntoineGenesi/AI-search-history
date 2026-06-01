@@ -296,6 +296,34 @@ def render_capability_diagnostic_text(payload: dict) -> str:
         lines.append(f"- root {root.get('kind')}: {root.get('label')} ({state})")
     for rejected in source_plan.get("rejected_roots", [])[:5]:
         lines.append(f"- rejected {rejected.get('label')}: {rejected.get('reason')}")
+    archive = report.get("archive_protection", {})
+    if archive:
+        cap_status = archive.get("cap_status", {})
+        lines.append("Archive protection:")
+        lines.append(
+            "- "
+            f"status={archive.get('status')} "
+            f"protection={archive.get('protection_status')} "
+            f"configured={archive.get('archive_configured')}"
+        )
+        lines.append(
+            "- "
+            f"selected_labels={', '.join(archive.get('selected_source_labels', [])) or '(none)'} "
+            f"estimated_files={archive.get('estimated_selected_file_count', 0)} "
+            f"estimated_bytes={archive.get('estimated_selected_bytes', 0)}"
+        )
+        lines.append(
+            "- "
+            f"caps file={cap_status.get('file', False)} "
+            f"byte={cap_status.get('byte', False)} "
+            f"elapsed={cap_status.get('elapsed', False)}"
+        )
+        for warning in archive.get("mounted_drive_warnings", []):
+            lines.append(f"  Mounted-drive warning: {warning}")
+        for warning in archive.get("privacy_warnings", []):
+            lines.append(f"  Privacy: {warning}")
+        for note in archive.get("duplicate_risk_notes", []):
+            lines.append(f"  Duplicate risk: {note}")
 
     capabilities = report.get("capabilities", {})
     for status in ("available", "degraded", "missing", "blocked", "not_implemented"):
@@ -318,6 +346,13 @@ def render_capability_diagnostic_text(payload: dict) -> str:
     if gates:
         lines.append(f"Benchmark gates: default_promotion_ready={gates.get('default_promotion_ready')}")
         lines.append(f"Gate reason: {gates.get('reason')}")
+    archive_gate = report.get("archive_protection_gate", {})
+    if archive_gate:
+        lines.append(
+            "Archive protection gate: "
+            f"{archive_gate.get('label')} status={archive_gate.get('status')} "
+            f"promotion_ready={archive_gate.get('promotion_ready')}"
+        )
     return "\n".join(lines)
 
 
@@ -356,6 +391,37 @@ def render_capability_diagnostic_markdown(payload: dict) -> str:
         lines.append(f"- {root.get('kind')}: `{root.get('label')}` readable={root.get('readable')}")
     for rejected in source_plan.get("rejected_roots", [])[:5]:
         lines.append(f"- rejected `{rejected.get('label')}`: {rejected.get('reason')}")
+    archive = report.get("archive_protection", {})
+    if archive:
+        cap_status = archive.get("cap_status", {})
+        lines.extend(
+            [
+                "",
+                "## Archive Protection",
+                "",
+                f"- status=`{archive.get('status')}`; protection=`{archive.get('protection_status')}`; configured=`{archive.get('archive_configured')}`",
+                f"- selected source labels: {', '.join(archive.get('selected_source_labels', [])) or '(none)'}",
+                f"- estimated selected files={archive.get('estimated_selected_file_count', 0)}; estimated selected bytes={archive.get('estimated_selected_bytes', 0)}",
+                f"- caps: file=`{cap_status.get('file', False)}`, byte=`{cap_status.get('byte', False)}`, elapsed=`{cap_status.get('elapsed', False)}`",
+            ]
+        )
+        for warning in archive.get("mounted_drive_warnings", []):
+            lines.append(f"- mounted-drive warning: {warning}")
+        for warning in archive.get("privacy_warnings", []):
+            lines.append(f"- privacy: {warning}")
+        for note in archive.get("duplicate_risk_notes", []):
+            lines.append(f"- duplicate risk: {note}")
+    archive_gate = report.get("archive_protection_gate", {})
+    if archive_gate:
+        lines.extend(
+            [
+                "",
+                "## Archive Protection Gate",
+                "",
+                f"- label=`{archive_gate.get('label')}`; status=`{archive_gate.get('status')}`; promotion_ready=`{archive_gate.get('promotion_ready')}`",
+                f"- restore/export smoke: {archive_gate.get('restore_export_acceptance_test')}",
+            ]
+        )
     return "\n".join(lines)
 
 
