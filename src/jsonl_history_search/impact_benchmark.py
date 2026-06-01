@@ -431,9 +431,14 @@ def _literal_candidates(
     doc_index: dict[tuple[str, int], str],
 ) -> tuple[list[LiteralCandidate], int, int, int]:
     if shutil.which("rg"):
-        return _rg_literal_candidates(query, files, doc_index)
+        candidates, files_opened, bytes_scanned, subprocess_calls = _rg_literal_candidates(query, files, doc_index)
+        return _stable_literal_candidates(candidates), files_opened, bytes_scanned, subprocess_calls
     candidates, files_opened, bytes_scanned = _python_literal_candidates(query, files, doc_index)
-    return candidates, files_opened, bytes_scanned, 0
+    return _stable_literal_candidates(candidates), files_opened, bytes_scanned, 0
+
+
+def _stable_literal_candidates(candidates: list[LiteralCandidate]) -> list[LiteralCandidate]:
+    return sorted(candidates, key=lambda item: (item.file_label, item.line, item.doc_id or ""))
 
 
 def _rg_literal_candidates(
