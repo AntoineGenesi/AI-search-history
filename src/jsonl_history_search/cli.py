@@ -28,7 +28,13 @@ from .masking import MASK_MODES, MaskContext
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jsonl-history-search")
+    parser = argparse.ArgumentParser(
+        prog="jsonl-history-search",
+        description=(
+            "JSONL: AI conversation parsing/mining for semantic debugging and "
+            "agent memory/debug workflows."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "search"):
         sub = subparsers.add_parser(name)

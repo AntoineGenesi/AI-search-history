@@ -1,13 +1,13 @@
 ---
 name: jsonl-history-search
-description: Search local Codex and Claude JSONL conversation logs first when the user asks to find prior things they said, past instructions, repeated feedback, previous reports/artifacts, what happened in a session, audit prior work, or recover conversation history. Trigger on phrases like "find all the times I said", "I told you before", "conversation logs", "chat history", "what happened in the past", "audit prior work", "where did we put that report", or "I remember a report".
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, or build semantic-debugging evidence. Trigger on phrases like "find all the times I said", "I told you before", "conversation logs", "chat history", "what happened in the past", "audit prior work", "where did we put that report", or "I remember a report".
 metadata:
-  short-description: Search chat JSONL history first
+  short-description: Mine AI conversation JSONL
 ---
 
-# JSONL History Search
+# JSONL
 
-Use this when the user asks about prior conversations, repeated feedback, old decisions, reports, artifacts, or "what happened". The default source of truth is local JSONL chat logs, then project docs/git as secondary evidence.
+Use this when the user asks about prior conversations, repeated feedback, old decisions, reports, artifacts, semantic debugging, or "what happened". The default source of truth is local AI conversation JSONL logs, then project docs/git as secondary evidence.
 
 ## Search Order
 

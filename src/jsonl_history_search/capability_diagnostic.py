@@ -507,7 +507,7 @@ def _embeddings_capability() -> Capability:
         next_action = "Verify local-only indexing and exact-ref recovery before relying on embedding recall."
     elif installed:
         status = "degraded"
-        next_action = "Dependencies are present, but JSON Search History embedding integration is still owned by jsh-005."
+        next_action = "Dependencies are present, but JSONL embedding recall for conversation mining is still owned by jsh-005."
     else:
         status = "not_implemented"
         next_action = "Use exact/fuzzy/local semantic stages until jsh-005 proves local embeddings."
