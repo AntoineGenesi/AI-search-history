@@ -8,6 +8,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "jsonl_candidate_discovery" in payload:
+        return render_jsonl_candidate_discovery_text(payload)
     if "capability_diagnostic" in payload:
         return render_capability_diagnostic_text(payload)
     if "install_validation" in payload:
@@ -81,6 +83,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "jsonl_candidate_discovery" in payload:
+        return render_jsonl_candidate_discovery_markdown(payload)
     if "capability_diagnostic" in payload:
         return render_capability_diagnostic_markdown(payload)
     if "install_validation" in payload:
@@ -129,6 +133,136 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_jsonl_candidate_discovery_text(payload: dict) -> str:
+    report = payload["jsonl_candidate_discovery"]
+    summary = report.get("summary", {})
+    cap_hits = summary.get("cap_hits", {})
+    lines = [
+        "JSONL Candidate Discovery",
+        f"Status: {report.get('status')}",
+        (
+            "Scope: "
+            f"{summary.get('selected_root_count', 0)} selected roots, "
+            f"{summary.get('rejected_root_count', 0)} rejected roots"
+        ),
+        (
+            "Candidates: "
+            f"{summary.get('candidate_count', 0)} files, "
+            f"{summary.get('candidate_bytes', 0)} bytes"
+        ),
+        (
+            "Cap hits: "
+            f"file={cap_hits.get('file', False)} "
+            f"byte={cap_hits.get('byte', False)} "
+            f"elapsed={cap_hits.get('elapsed', False)}"
+        ),
+    ]
+    for root in report.get("scope", {}).get("selected_roots", []):
+        lines.append(
+            "- selected "
+            f"{root.get('root_label')} {root.get('kind')} "
+            f"known={root.get('known')} recursive={root.get('recursive')} "
+            f"hash={root.get('root_hash')}"
+        )
+    for rejected in report.get("scope", {}).get("rejected_roots", []):
+        lines.append(f"- rejected {rejected.get('root_label')}: {rejected.get('reason')}")
+    for candidate in report.get("candidates", [])[:12]:
+        lines.append(
+            "- "
+            f"{candidate.get('candidate_id')} {candidate.get('root_label')} "
+            f"{candidate.get('source_kind')} {candidate.get('suffix')} "
+            f"size={candidate.get('file_size_bytes')} "
+            f"mtime={candidate.get('mtime_utc')} "
+            f"{candidate.get('path_label')}"
+        )
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for warning in report.get("privacy_warnings", []):
+        lines.append(f"Privacy: {warning}")
+    for item in report.get("scope", {}).get("not_searched_scope", []):
+        lines.append(f"Not searched: {item}")
+    return "\n".join(lines)
+
+
+def render_jsonl_candidate_discovery_markdown(payload: dict) -> str:
+    report = payload["jsonl_candidate_discovery"]
+    summary = report.get("summary", {})
+    cap_hits = summary.get("cap_hits", {})
+    lines = [
+        "# JSONL Candidate Discovery",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        (
+            "**Scope:** "
+            f"{summary.get('selected_root_count', 0)} selected roots, "
+            f"{summary.get('rejected_root_count', 0)} rejected roots"
+        ),
+        (
+            "**Candidates:** "
+            f"{summary.get('candidate_count', 0)} files, "
+            f"{summary.get('candidate_bytes', 0)} bytes"
+        ),
+        (
+            "**Cap hits:** "
+            f"file=`{cap_hits.get('file', False)}`, "
+            f"byte=`{cap_hits.get('byte', False)}`, "
+            f"elapsed=`{cap_hits.get('elapsed', False)}`"
+        ),
+        "",
+        "## Roots",
+        "",
+    ]
+    selected_roots = report.get("scope", {}).get("selected_roots", [])
+    rejected_roots = report.get("scope", {}).get("rejected_roots", [])
+    if selected_roots:
+        lines.extend(["| Label | Kind | Known | Recursive | Hash |", "| --- | --- | --- | --- | --- |"])
+        for root in selected_roots:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(root.get('root_label')))} | "
+                f"{_escape_markdown_table(str(root.get('kind')))} | "
+                f"{root.get('known')} | "
+                f"{root.get('recursive')} | "
+                f"`{_escape_markdown_table(str(root.get('root_hash')))}` |"
+            )
+    else:
+        lines.append("- No selected roots.")
+    if rejected_roots:
+        lines.extend(["", "### Rejected Roots", ""])
+        for rejected in rejected_roots:
+            lines.append(f"- `{rejected.get('root_label')}`: {rejected.get('reason')}")
+    lines.extend(["", "## Candidates", ""])
+    candidates = report.get("candidates", [])
+    if candidates:
+        lines.extend(
+            [
+                "| ID | Root | Source | Type | Size | Mtime UTC | Path label |",
+                "| --- | --- | --- | --- | ---: | --- | --- |",
+            ]
+        )
+        for candidate in candidates[:50]:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(candidate.get('candidate_id')))} | "
+                f"{_escape_markdown_table(str(candidate.get('root_label')))} | "
+                f"{_escape_markdown_table(str(candidate.get('source_kind')))} | "
+                f"{_escape_markdown_table(str(candidate.get('file_type')))} | "
+                f"{candidate.get('file_size_bytes')} | "
+                f"{_escape_markdown_table(str(candidate.get('mtime_utc')))} | "
+                f"`{_escape_markdown_table(str(candidate.get('path_label')))}` |"
+            )
+    else:
+        lines.append("- No candidate files found in selected roots.")
+    if report.get("warnings"):
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in report.get("warnings", []))
+    lines.extend(["", "## Privacy And Limits", ""])
+    lines.extend(f"- {warning}" for warning in report.get("privacy_warnings", []))
+    lines.extend(f"- {item}" for item in report.get("scope", {}).get("not_searched_scope", []))
+    lines.extend(f"- {item}" for item in report.get("limitations", []))
+    return "\n".join(lines)
 
 
 def render_capability_diagnostic_text(payload: dict) -> str:

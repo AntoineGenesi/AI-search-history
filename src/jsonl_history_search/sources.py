@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -116,7 +118,7 @@ def build_source_plan(
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
             resolved = safe_resolve(root)
             danger = dangerous_reason(resolved, cwd)
-            if danger and not allow_arbitrary_root:
+            if danger:
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
                 continue
             kind = known.get(resolved)
@@ -229,6 +231,276 @@ def enumerate_jsonl_files(plan: SourcePlan):
             files_seen += 1
             bytes_seen += size
             yield path, size, warnings
+
+
+def build_jsonl_candidate_discovery(plan: SourcePlan, *, explicit_roots_provided: bool) -> dict:
+    warnings: list[str] = []
+    if not explicit_roots_provided:
+        warnings.append("Discovery requires at least one explicit --root; no default transcript roots were traversed.")
+        return {
+            "jsonl_candidate_discovery": {
+                "schema_version": 1,
+                "status": "no_roots",
+                "summary": discovery_summary(
+                    candidate_count=0,
+                    candidate_bytes=0,
+                    selected_root_count=0,
+                    rejected_root_count=0,
+                    cap_hits=empty_cap_hits(),
+                ),
+                "scope": {
+                    "selected_roots": [],
+                    "rejected_roots": [],
+                    "not_searched_scope": [
+                        "No roots were approved for this discovery run.",
+                        "Default Codex/Claude transcript roots are not searched by discover-jsonl unless passed with --root.",
+                    ],
+                },
+                "candidates": [],
+                "warnings": warnings,
+                "privacy_warnings": discovery_privacy_warnings(),
+                "limits": plan.limits.to_dict(),
+                "limitations": discovery_limitations(),
+            }
+        }
+
+    selected_roots = sanitized_selected_roots(plan)
+    rejected_roots = sanitized_rejected_roots(plan)
+    candidates: list[dict] = []
+    candidate_bytes = 0
+    observed_warnings = list(plan.warnings)
+
+    for path, size, enum_warnings in enumerate_jsonl_files(plan):
+        observed_warnings = list(enum_warnings)
+        candidate_bytes += size
+        candidates.append(
+            {
+                "candidate_id": f"candidate_{len(candidates) + 1:03d}",
+                "root_label": root_label_for_path(path, plan),
+                "source_kind": source_kind_for_path(path, plan),
+                "path_label": path_label(path),
+                "path_hash": path_hash(path),
+                "suffix": path.suffix.lower(),
+                "file_type": "jsonl" if path.suffix.lower() == ".jsonl" else "json",
+                "file_size_bytes": size,
+                "mtime": stat_mtime(path),
+                "mtime_utc": mtime_utc(path),
+            }
+        )
+
+    observed_warnings.extend(plan.warnings)
+    warnings.extend(sanitized_discovery_warnings(observed_warnings, plan))
+    cap_hits = cap_hits_from_warnings(observed_warnings)
+    status = discovery_status(
+        selected_count=len(selected_roots),
+        rejected_count=len(rejected_roots),
+        candidate_count=len(candidates),
+    )
+    return {
+        "jsonl_candidate_discovery": {
+            "schema_version": 1,
+            "status": status,
+            "summary": discovery_summary(
+                candidate_count=len(candidates),
+                candidate_bytes=candidate_bytes,
+                selected_root_count=len(selected_roots),
+                rejected_root_count=len(rejected_roots),
+                cap_hits=cap_hits,
+            ),
+            "scope": {
+                "selected_roots": selected_roots,
+                "rejected_roots": rejected_roots,
+                "not_searched_scope": not_searched_scope(plan, cap_hits),
+            },
+            "candidates": candidates,
+            "warnings": warnings,
+            "privacy_warnings": discovery_privacy_warnings(plan),
+            "limits": plan.limits.to_dict(),
+            "limitations": discovery_limitations(),
+        }
+    }
+
+
+def discovery_status(*, selected_count: int, rejected_count: int, candidate_count: int) -> str:
+    if selected_count == 0 and rejected_count > 0:
+        return "root_rejected"
+    if selected_count == 0:
+        return "no_roots"
+    if candidate_count == 0:
+        return "no_candidates"
+    return "ok"
+
+
+def discovery_summary(
+    *,
+    candidate_count: int,
+    candidate_bytes: int,
+    selected_root_count: int,
+    rejected_root_count: int,
+    cap_hits: dict,
+) -> dict:
+    return {
+        "candidate_count": candidate_count,
+        "candidate_bytes": candidate_bytes,
+        "selected_root_count": selected_root_count,
+        "rejected_root_count": rejected_root_count,
+        "cap_hits": cap_hits,
+    }
+
+
+def empty_cap_hits() -> dict:
+    return {"file": False, "byte": False, "elapsed": False}
+
+
+def cap_hits_from_warnings(warnings: list[str]) -> dict:
+    lowered = "\n".join(warnings).lower()
+    return {
+        "file": "max file cap" in lowered,
+        "byte": "max byte cap" in lowered,
+        "elapsed": "max elapsed cap" in lowered,
+    }
+
+
+def sanitized_selected_roots(plan: SourcePlan) -> list[dict]:
+    roots = []
+    for index, root in enumerate(plan.roots, 1):
+        roots.append(
+            {
+                "root_label": f"root_{index:03d}",
+                "root_hash": path_hash(root.path),
+                "kind": root.kind,
+                "reason": root.reason,
+                "recursive": root.recursive,
+                "known": root.known,
+                "exists": root.path.expanduser().exists(),
+                "scope_label": "selected_root",
+                "privacy_label": "private_root",
+            }
+        )
+    return roots
+
+
+def sanitized_rejected_roots(plan: SourcePlan) -> list[dict]:
+    rejected = []
+    for index, root in enumerate(plan.rejected_roots, 1):
+        rejected.append(
+            {
+                "root_label": f"rejected_root_{index:03d}",
+                "root_hash": hash_text(root.path),
+                "reason": root.reason,
+                "scope_label": "excluded_root",
+            }
+        )
+    return rejected
+
+
+def root_label_for_path(path: Path, plan: SourcePlan) -> str:
+    for index, root in enumerate(plan.roots, 1):
+        base = root.path.expanduser()
+        if base.is_file() and safe_resolve(path) == safe_resolve(base):
+            return f"root_{index:03d}"
+        if base.is_dir() and path_is_inside(path, base):
+            return f"root_{index:03d}"
+    return "root_unknown"
+
+
+def path_label(path: Path) -> str:
+    return f"path:{safe_path_hash(path)[:16]}"
+
+
+def path_hash(path: Path) -> str:
+    return f"sha256:{safe_path_hash(path)}"
+
+
+def safe_path_hash(path: Path) -> str:
+    return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+
+
+def hash_text(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def mtime_utc(path: Path) -> str | None:
+    mtime = stat_mtime(path)
+    if not mtime:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+
+
+def sanitized_discovery_warnings(warnings: list[str], plan: SourcePlan) -> list[str]:
+    sanitized = []
+    for warning in warnings:
+        normalized = sanitize_discovery_warning(warning)
+        if normalized and normalized not in sanitized:
+            sanitized.append(normalized)
+    for root in plan.roots:
+        if is_mounted_drive_path(root.path):
+            mounted = "Selected root is under a mounted drive; discovery is bounded to the explicit root and caps."
+            if mounted not in sanitized:
+                sanitized.append(mounted)
+    for rejected in plan.rejected_roots:
+        if "mounted drive" in rejected.reason:
+            mounted = "Mounted-drive root was rejected before traversal."
+            if mounted not in sanitized:
+                sanitized.append(mounted)
+    return sanitized
+
+
+def sanitize_discovery_warning(warning: str) -> str | None:
+    if not warning:
+        return None
+    if "Arbitrary root enabled" in warning:
+        return "Arbitrary root enabled for an explicit selected root; strict hard caps apply."
+    if "Stopped enumeration at max file cap" in warning:
+        return "Stopped enumeration at max file cap."
+    if "Stopped enumeration at max byte cap" in warning:
+        return "Stopped enumeration at max byte cap."
+    if "Stopped enumeration at max elapsed cap" in warning:
+        return "Stopped enumeration at max elapsed cap."
+    if "Skipped symlink escape" in warning:
+        return "Skipped a symlink escape outside the selected root."
+    if "Could not enumerate" in warning:
+        return "Could not enumerate one selected directory; some candidate files may be missing."
+    return "Discovery warning omitted raw local path details."
+
+
+def is_mounted_drive_path(path: Path) -> bool:
+    return str(safe_resolve(path)).startswith("/mnt/")
+
+
+def discovery_privacy_warnings(plan: SourcePlan | None = None) -> list[str]:
+    warnings = [
+        "Discovery is metadata-only: transcript contents are not opened or parsed.",
+        "Raw local paths, filenames, session IDs, and transcript text are omitted from the discovery payload.",
+        "Candidate discovery only covers explicit approved roots; deleted, unmounted, inaccessible, and unapproved logs remain not searched.",
+    ]
+    if plan and any(is_mounted_drive_path(root.path) for root in plan.roots):
+        warnings.append("Mounted-drive discovery can expose cross-device/private backup shape; keep hard caps narrow.")
+    return warnings
+
+
+def not_searched_scope(plan: SourcePlan, cap_hits: dict) -> list[str]:
+    scope = [
+        "Roots outside this explicit discovery source plan were not searched.",
+        "Deleted, unmounted, inaccessible, and unapproved logs cannot be discovered by this run.",
+    ]
+    if plan.rejected_roots:
+        scope.append("Rejected roots were excluded before traversal.")
+    if any(cap_hits.values()):
+        scope.append("Enumeration stopped at one or more caps; remaining files under selected roots may be undiscovered.")
+    for root in plan.roots:
+        if not root.path.expanduser().exists():
+            scope.append("A selected root was missing or inaccessible.")
+            break
+    return scope
+
+
+def discovery_limitations() -> list[str]:
+    return [
+        "This command finds JSONL candidate files under selected roots; it does not prove all conversation logs exist.",
+        "It does not prove deleted, unmounted, inaccessible, or unapproved logs are absent.",
+        "It does not parse transcript contents or classify sessions by provider beyond source-plan/root metadata.",
+    ]
 
 
 def source_kind_for_path(path: Path, plan: SourcePlan) -> str:
