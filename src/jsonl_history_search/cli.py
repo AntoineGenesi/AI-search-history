@@ -6,6 +6,7 @@ from pathlib import Path
 from .agent_contract import build_agent_find_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
+from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .forensics import build_forensics_payload
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
@@ -221,6 +222,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized impact benchmark report should be written.",
+    )
+    embedding_experiment = subparsers.add_parser("embedding-experiment")
+    add_common_args(embedding_experiment)
+    embedding_experiment.add_argument(
+        "--experiment-mode",
+        choices=("selected_roots", "date_window_subset", "full_approved_local_history", "smoke_synthetic"),
+        default="selected_roots",
+        help="Opt-in embedding experiment scope. Full history requires --approve-full-history.",
+    )
+    embedding_experiment.add_argument(
+        "--backend",
+        choices=("auto", "fastembed", "deterministic"),
+        default="auto",
+        help="Embedding backend to try. auto uses local fastembed when ready, otherwise deterministic fallback.",
+    )
+    embedding_experiment.add_argument("--fastembed-model", default=FASTEMBED_MODEL_ID)
+    embedding_experiment.add_argument("--approve-full-history", action="store_true")
+    embedding_experiment.add_argument("--window-start", default=None)
+    embedding_experiment.add_argument("--window-end", default=None)
+    embedding_experiment.add_argument("--max-records", type=int, default=200)
+    embedding_experiment.add_argument("--top-k", type=int, default=10)
+    embedding_experiment.add_argument("--max-index-disk", type=int, default=2 * 1024 * 1024 * 1024)
+    embedding_experiment.add_argument("--case-limit", type=int, default=10)
+    embedding_experiment.add_argument(
+        "--query",
+        action="append",
+        default=[],
+        dest="queries",
+        help="Optional explicit probe query. Query text is used locally but not echoed in output.",
+    )
+    embedding_experiment.add_argument(
+        "--fixture",
+        default=str(DEFAULT_EMBEDDING_SPIKE_FIXTURE),
+        help="Synthetic sanitized embedding fixture used for default probes or smoke_synthetic mode.",
+    )
+    embedding_experiment.add_argument(
+        "--output-dir",
+        default=None,
+        help="Ignored private output directory for vectors/indexes; must be under .private/.",
+    )
+    embedding_experiment.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized aggregate report should be written.",
     )
     diagnose = subparsers.add_parser("diagnose-capabilities")
     diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -580,6 +625,14 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["impact_benchmark"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture"} else 0
+    if args.command == "embedding-experiment":
+        payload = build_embedding_experiment_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["embedding_experiment"]["status"]
+        return 1 if status in {"root_rejected", "invalid_fixture", "private_output_rejected"} else 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(
