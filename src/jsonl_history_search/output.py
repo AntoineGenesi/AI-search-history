@@ -1112,6 +1112,13 @@ def render_measured_benchmark_text(payload: dict) -> str:
     statuses = aggregate.get("statuses", {})
     if statuses:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
+    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
+        gate = report.get(gate_name) or {}
+        if gate:
+            lines.append(
+                f"{gate_name}: status={gate.get('status')} "
+                f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
+            )
     prefilter = aggregate.get("rg_prefilter") or {}
     if prefilter.get("enabled_rows"):
         lines.append(
@@ -1155,6 +1162,7 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
         f"- Output context bytes: {aggregate.get('output_context_bytes', 0)}",
         f"- Statuses: {', '.join(f'{key}={value}' for key, value in sorted((aggregate.get('statuses') or {}).items())) or '(none)'}",
     ]
+    lines.extend(_benchmark_gate_markdown_lines(report))
     prefilter = aggregate.get("rg_prefilter") or {}
     if prefilter.get("enabled_rows"):
         lines.extend(
@@ -1209,6 +1217,13 @@ def render_impact_benchmark_text(payload: dict) -> str:
     if report.get("fixture_errors"):
         lines.append("Fixture errors:")
         lines.extend(f"- {error}" for error in report.get("fixture_errors", []))
+    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
+        gate = report.get(gate_name) or {}
+        if gate:
+            lines.append(
+                f"{gate_name}: status={gate.get('status')} "
+                f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
+            )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -1262,6 +1277,7 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
     if report.get("fixture_errors"):
         lines.extend(["", "## Fixture Errors", ""])
         lines.extend(f"- {error}" for error in report.get("fixture_errors", []))
+    lines.extend(_benchmark_gate_markdown_lines(report))
     if report.get("summary"):
         lines.extend(
             [
@@ -1324,6 +1340,23 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('candidate_count')} |"
             )
     return "\n".join(lines)
+
+
+def _benchmark_gate_markdown_lines(report: dict) -> list[str]:
+    gates = {
+        "ranking_quality_gate": report.get("ranking_quality_gate"),
+        "rg_prefilter_gate": report.get("rg_prefilter_gate"),
+    }
+    if not any(gates.values()):
+        return []
+    lines = ["", "## Gate Status", ""]
+    lines.extend(["| Gate | Status | Reasons |", "| --- | --- | --- |"])
+    for name, gate in gates.items():
+        if not gate:
+            continue
+        reasons = ", ".join(f"`{reason}`" for reason in gate.get("reasons", [])) or "(none)"
+        lines.append(f"| `{name}` | `{gate.get('status')}` | {reasons} |")
+    return lines
 
 
 def render_efficiency_eval_markdown(payload: dict) -> str:
