@@ -5,7 +5,7 @@ import time
 from .adapters import AdapterReadError, iter_records_for_file
 from .clustering import facets_for_record
 from .query import QueryIntent
-from .ranking import Match, group_matches, make_snippet, score_record, should_consider
+from .ranking import Match, group_matches, is_weak_partial_generic, make_snippet, score_record, should_consider
 from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
 from .masking import MaskContext
 
@@ -22,6 +22,9 @@ def search(
     warnings = list(plan.warnings)
     blind_spots = list(plan.blind_spots)
     matches: list[Match] = []
+    weak_matches: list[Match] = []
+    weak_reservoir_limit = max(1, min(plan.limits.max_matches, max(3, plan.limits.max_matches // 4)))
+    weak_candidates_skipped = 0
     dedupe: set[tuple[str, str, str | None]] = set()
     searched_files = 0
     searched_bytes = 0
@@ -61,22 +64,27 @@ def search(
                     copied_text = record.text
                 snippet_text = make_snippet(copied_text, intent.terms)
                 facets = facets_for_record(path=record.path, text=record.text, artifacts=artifacts)
-                matches.append(
-                    Match(
-                        path=record.path,
-                        line=record.line,
-                        role=record.role,
-                        timestamp=record.timestamp.isoformat() if record.timestamp else None,
-                        cwd=record.cwd,
-                        snippet=snippet_text,
-                        score=round(score, 3),
-                        reasons=reasons,
-                        artifacts=facets.artifacts,
-                        session=facets.session,
-                        tasks=facets.tasks,
-                        preferences=facets.preferences,
-                    )
+                match = Match(
+                    path=record.path,
+                    line=record.line,
+                    role=record.role,
+                    timestamp=record.timestamp.isoformat() if record.timestamp else None,
+                    cwd=record.cwd,
+                    snippet=snippet_text,
+                    score=round(score, 3),
+                    reasons=reasons,
+                    artifacts=facets.artifacts,
+                    session=facets.session,
+                    tasks=facets.tasks,
+                    preferences=facets.preferences,
                 )
+                if is_weak_partial_generic(reasons):
+                    if len(weak_matches) < weak_reservoir_limit:
+                        weak_matches.append(match)
+                    else:
+                        weak_candidates_skipped += 1
+                    continue
+                matches.append(match)
                 if len(matches) >= plan.limits.max_matches:
                     warnings.append("Stopped scanning at max match cap.")
                     stopped = True
@@ -87,7 +95,11 @@ def search(
         if stopped:
             break
 
+    if weak_candidates_skipped:
+        warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
+    matches = (matches + weak_matches)[: plan.limits.max_matches * 2]
     matches.sort(key=lambda item: (item.score, item.timestamp or "", item.path, -item.line), reverse=True)
+    matches = matches[: plan.limits.max_matches]
     payload = {
         "searched_files": searched_files,
         "searched_bytes": searched_bytes,

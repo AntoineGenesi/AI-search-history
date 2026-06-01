@@ -155,7 +155,7 @@ def build_candidate_rows(search_result: dict) -> list[CandidateRow]:
                     cwd=match.get("cwd"),
                     snippet=match.get("snippet") or "",
                     score=float(match.get("score") or 0),
-                    confidence=confidence_for_score(float(match.get("score") or 0), stages),
+                    confidence=confidence_for_score(float(match.get("score") or 0), stages, reasons),
                     matched_terms=matched_terms,
                     stages=stages,
                     primary_stage=primary_stage(stages),
@@ -213,6 +213,14 @@ def stages_from_reasons(reasons: list[str]) -> list[str]:
             stages.add("date_window")
         elif reason == "cwd":
             stages.add("cwd_project")
+        elif reason.startswith("project:"):
+            stages.add("cwd_project")
+        elif reason.startswith("coverage:base_terms:"):
+            stages.add(coverage_stage(reason))
+        elif reason.startswith("phrase:"):
+            stages.add("exact_phrase")
+        elif reason.startswith("penalty:"):
+            stages.add("downgraded_generic")
         elif reason.startswith("artifact"):
             stages.add("artifact_path")
         elif reason == "bounded-no-term":
@@ -223,6 +231,7 @@ def stages_from_reasons(reasons: list[str]) -> list[str]:
 def primary_stage(stages: list[str]) -> str:
     for preferred in (
         "exact_phrase",
+        "base_term_full_coverage",
         "artifact_path",
         "normalized_terms",
         "synonym_paraphrase",
@@ -250,6 +259,14 @@ def reason_codes_from_reasons(reasons: list[str]) -> list[str]:
             codes.append("date_window")
         elif reason == "cwd":
             codes.append("project_hint")
+        elif reason.startswith("project:"):
+            codes.append(reason)
+        elif reason.startswith("coverage:base_terms:"):
+            codes.append(reason)
+        elif reason.startswith("phrase:"):
+            codes.append(reason)
+        elif reason.startswith("penalty:"):
+            codes.append(reason)
         elif reason.startswith("artifact"):
             codes.append("artifact_path")
         elif reason == "bounded-no-term":
@@ -272,8 +289,16 @@ def matched_terms_from_reasons(reasons: list[str]) -> list[str]:
     return sorted(set(terms))
 
 
-def confidence_for_score(score: float, stages: list[str]) -> str:
-    if score >= 22 and ({"exact_phrase", "normalized_terms", "artifact_path"} & set(stages)):
+def confidence_for_score(score: float, stages: list[str], reasons: list[str] | None = None) -> str:
+    stage_set = set(stages)
+    reason_set = set(reasons or [])
+    has_generic_penalty = "penalty:partial_generic_multi_token" in reason_set
+    has_supporting_evidence = bool(
+        {"exact_phrase", "base_term_full_coverage", "artifact_path", "cwd_project"} & stage_set
+    )
+    if has_generic_penalty and not has_supporting_evidence:
+        return "low" if score > 0 else "weak"
+    if score >= 22 and has_supporting_evidence:
         return "high"
     if score >= 12:
         return "medium"
@@ -297,6 +322,21 @@ def normalize_stage(stage: str) -> str:
         "role_filter": "role",
     }
     return aliases.get(stage, stage)
+
+
+def coverage_stage(reason: str) -> str:
+    value = reason.rsplit(":", 1)[-1]
+    try:
+        covered_text, total_text = value.split("/", 1)
+        covered = int(covered_text)
+        total = int(total_text)
+    except ValueError:
+        return "base_term_coverage"
+    if total > 1 and covered == total:
+        return "base_term_full_coverage"
+    if covered > 0:
+        return "base_term_partial_coverage"
+    return "base_term_no_coverage"
 
 
 def stage_reason_code(stage: str) -> str:
