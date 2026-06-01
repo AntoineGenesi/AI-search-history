@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import time
 
+from .adapters import AdapterReadError, iter_records_for_file
 from .clustering import facets_for_record
 from .query import QueryIntent
 from .ranking import Match, group_matches, make_snippet, score_record, should_consider
-from .records import parse_record
-from .sources import SourcePlan, enumerate_jsonl_files
+from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
 from .masking import MaskContext
 
 
@@ -36,18 +36,14 @@ def search(
         warnings = enum_warnings
         searched_files += 1
         searched_bytes += size
+        source_kind = source_kind_for_path(path, plan)
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            warnings.append(f"Could not open {path}: {exc}")
-            continue
-        with handle:
-            for line_number, line in enumerate(handle, 1):
+            records = iter_records_for_file(path, source_kind, default_tz)
+            for record in records:
                 if time.monotonic() - started > plan.limits.max_elapsed:
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
                     break
-                record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
                 if not should_consider(record, intent):
                     continue
                 key = (" ".join(record.text.split()).lower(), record.raw_timestamp)
@@ -85,8 +81,11 @@ def search(
                     warnings.append("Stopped scanning at max match cap.")
                     stopped = True
                     break
-            if stopped:
-                break
+        except AdapterReadError as exc:
+            warnings.append(str(exc))
+            continue
+        if stopped:
+            break
 
     matches.sort(key=lambda item: (item.score, item.timestamp or "", item.path, -item.line), reverse=True)
     payload = {

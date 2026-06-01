@@ -9,8 +9,9 @@ from typing import Iterable
 
 from .agent_contract import estimate_tokens, reduction_ratio
 from .masking import MaskContext
-from .records import Record, parse_record
-from .sources import SourcePlan, enumerate_jsonl_files
+from .adapters import AdapterReadError, iter_records_for_file
+from .records import Record
+from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
 
 
 INLINE_INSTANCE_LIMIT = 8
@@ -138,18 +139,13 @@ def scan_records(plan: SourcePlan, *, default_tz, mask_context: MaskContext | No
         warnings = enum_warnings
         searched_files += 1
         searched_bytes += size
+        source_kind = source_kind_for_path(path, plan)
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            warnings.append(f"Could not open {path}: {exc}")
-            continue
-        with handle:
-            for line_number, line in enumerate(handle, 1):
+            for record in iter_records_for_file(path, source_kind, default_tz):
                 if time.monotonic() - started > plan.limits.max_elapsed:
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
                     break
-                record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
                 copied_text = (
                     mask_context.mask_text(record.text, source_path=record.path, source_index=record.line)
                     if mask_context is not None
@@ -164,8 +160,11 @@ def scan_records(plan: SourcePlan, *, default_tz, mask_context: MaskContext | No
                         sort_key=(stamp or "9999-12-31T23:59:59+00:00", record.path, record.line),
                     )
                 )
-            if stopped:
-                break
+        except AdapterReadError as exc:
+            warnings.append(str(exc))
+            continue
+        if stopped:
+            break
     records.sort(key=lambda item: item.sort_key)
     payload = {
         "records": records,

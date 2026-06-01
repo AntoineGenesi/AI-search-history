@@ -9,11 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from .adapters import AdapterReadError, adapter_for_file, iter_records_for_file
 from .clustering import facets_for_record, session_key
 from .query import QueryIntent, STOPWORDS
 from .ranking import active_match_terms, artifact_candidates, role_matches
 from .records import Record, parse_record
-from .sources import SourcePlan, enumerate_jsonl_files, path_is_inside, stat_mtime, stat_size
+from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path, stat_mtime, stat_size
 
 
 MAX_FINGERPRINT_TERMS = 80
@@ -80,7 +81,8 @@ def build_manifest(plan: SourcePlan, *, default_tz, previous: Manifest | None = 
             files_reused += 1
             continue
         source_kind = source_kind_for_path(path, plan)
-        if old and size >= old.size and old.line_count > 0:
+        adapter = adapter_for_file(path, source_kind)
+        if old and adapter.supports_append_only and size >= old.size and old.line_count > 0:
             entry, parsed = refresh_append_only_entry(path, old, size=size, mtime=mtime, default_tz=default_tz)
             entries.append(entry)
             files_refreshed += 1
@@ -107,11 +109,15 @@ def build_manifest(plan: SourcePlan, *, default_tz, previous: Manifest | None = 
 
 def scan_manifest_entry(path: Path, *, source_kind: str, size: int, mtime: float, default_tz) -> tuple[ManifestEntry, int]:
     accumulator = EntryAccumulator(path=path, source_kind=source_kind, size=size, mtime=mtime)
-    for line_number, line in iter_jsonl_lines(path):
-        accumulator.line_count = line_number
-        record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
-        accumulator.add_record(record)
-    return accumulator.to_entry(refreshed_from="full_scan"), size
+    adapter = adapter_for_file(path, source_kind)
+    try:
+        for record in iter_records_for_file(path, source_kind, default_tz):
+            accumulator.line_count = max(accumulator.line_count, record.line)
+            accumulator.add_record(record)
+    except AdapterReadError:
+        pass
+    refreshed_from = "full_scan" if adapter.line_oriented else "full_scan_whole_file"
+    return accumulator.to_entry(refreshed_from=refreshed_from), size
 
 
 def refresh_append_only_entry(path: Path, old: ManifestEntry, *, size: int, mtime: float, default_tz) -> tuple[ManifestEntry, int]:
@@ -216,21 +222,13 @@ def iter_appended_jsonl_lines(path: Path, *, start_byte: int, start_line: int):
             yield start_line + offset, raw.decode("utf-8", errors="replace")
 
 
-def source_kind_for_path(path: Path, plan: SourcePlan) -> str:
-    for root in plan.roots:
-        base = root.path.expanduser()
-        if base.is_file() and path == base:
-            return root.kind
-        if base.is_dir() and path_is_inside(path, base):
-            return root.kind
-    return "unknown_jsonl"
-
-
 def infer_framework(source_kind: str, path: Path) -> str:
     if source_kind.startswith("codex"):
         return "codex"
     if source_kind.startswith("claude"):
         return "claude"
+    if source_kind == "arbitrary_json_file" or path.suffix == ".json":
+        return "generic_message_array_json"
     if "claude" in str(path):
         return "claude"
     if "codex" in str(path):

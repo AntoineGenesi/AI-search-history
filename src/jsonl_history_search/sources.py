@@ -114,10 +114,10 @@ def build_source_plan(
                 plan.warnings.append(f"Arbitrary root enabled for {root}; strict hard caps apply.")
             plan.roots.append(
                 PlannedRoot(
-                    kind=kind or "arbitrary_jsonl_root",
+                    kind=kind or arbitrary_root_kind(root),
                     path=root,
                     reason="known transcript root" if kind else "explicit arbitrary root override",
-                    recursive=not root.suffix == ".jsonl",
+                    recursive=root.suffix not in {".jsonl", ".json"},
                     known=bool(kind),
                 )
             )
@@ -145,6 +145,12 @@ def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) ->
     if resolved == safe_resolve(claude_home):
         return [claude_home / "projects"]
     return [root]
+
+
+def arbitrary_root_kind(root: Path) -> str:
+    if root.suffix == ".json":
+        return "arbitrary_json_file"
+    return "arbitrary_jsonl_root"
 
 
 def safe_resolve(path: Path) -> Path:
@@ -188,7 +194,7 @@ def enumerate_jsonl_files(plan: SourcePlan):
     for root in plan.roots:
         base = root.path.expanduser()
         if base.is_file():
-            candidates = [base] if base.suffix == ".jsonl" else []
+            candidates = [base] if base.suffix in {".jsonl", ".json"} else []
         elif base.is_dir():
             candidates = iter_directory_jsonl_files(base, plan, started, warnings)
         else:
@@ -210,6 +216,18 @@ def enumerate_jsonl_files(plan: SourcePlan):
             files_seen += 1
             bytes_seen += size
             yield path, size, warnings
+
+
+def source_kind_for_path(path: Path, plan: SourcePlan) -> str:
+    for root in plan.roots:
+        base = root.path.expanduser()
+        if base.is_file() and path == base:
+            return root.kind
+        if base.is_dir() and path_is_inside(path, base):
+            return root.kind
+    if path.suffix == ".json":
+        return "unknown_json"
+    return "unknown_jsonl"
 
 
 def iter_directory_jsonl_files(base: Path, plan: SourcePlan, started: float, warnings: list[str]):
