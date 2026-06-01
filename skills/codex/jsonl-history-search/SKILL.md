@@ -62,4 +62,30 @@ Return:
 - blind spots, such as missing local logs or inaccessible project folders;
 - recommended durable updates if the task is about improving skills/process.
 
+## Semantic Debugging
+
+Use this workflow when the user asks why a bug was introduced, which assumption was wrong, how a later symptom relates to earlier work, or what happened across a task/review/commit.
+
+Accepted handles:
+
+- bug symptom;
+- file/path;
+- commit or commit range;
+- task slug;
+- error message;
+- approximate time.
+
+Route to existing evidence commands instead of inventing a new `semantic-debugger` command:
+
+- fuzzy symptom or remembered wording -> `jsonl-history-search find`;
+- commit/path/task/review provenance -> `jsonl-history-search forensics`;
+- executed actions/tool proof -> `jsonl-history-search structured-tool-events`;
+- derived/sibling project relationship -> `jsonl-history-search compare-project-lineage`;
+- skill behavior -> `jsonl-history-search skill-audit`;
+- repeated automation opportunity -> `jsonl-history-search workflow-repeat-finder`.
+
+Build a packet with `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`. The required timeline phases are user request, agent plan, code change, review outcome, later symptom, and likely wrong assumption.
+
+Keep evidence separate from inference. Never claim root cause unless linked evidence supports it; otherwise say `likely contributing assumption` or `candidate cause`. Treat `jsh-009`, `jsh-010`, and `jsh-011` as the lineage, skill-audit, and workflow-repeat benchmark owners rather than reimplementing those cases inside this workflow.
+
 When the output is substantial, use the `html-report` skill and build a direct-open HTML report with summary-first evidence cards, filters, timelines, and source links.
