@@ -12,6 +12,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .lineage import build_lineage_payload
+from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
@@ -227,6 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized impact benchmark report should be written.",
+    )
+    live_protocol = subparsers.add_parser("benchmark-live-terminal-protocol")
+    live_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    live_protocol.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized live-terminal protocol report should be written.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -630,6 +638,13 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["impact_benchmark"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture"} else 0
+    if args.command == "benchmark-live-terminal-protocol":
+        payload = build_live_terminal_protocol_payload()
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)
