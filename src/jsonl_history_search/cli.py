@@ -190,6 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path where the sanitized measured benchmark report should be written.",
     )
+    measured.add_argument(
+        "--manifest-shortlist",
+        action="store_true",
+        help="Opt in to paired manifest-shortlist planning probes; default search/find behavior is unchanged.",
+    )
     impact = subparsers.add_parser("benchmark-impact")
     add_common_args(impact)
     impact.add_argument(

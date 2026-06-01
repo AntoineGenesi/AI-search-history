@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import load_benchmark_fixture, validate_benchmark_fixture
+from .manifest import Manifest, build_manifest, shortlist_manifest
 from .query import infer_query
 from .scanner import search
-from .sources import Limits, SourcePlan, build_source_plan, dangerous_reason, safe_resolve
+from .sources import Limits, PlannedRoot, SourcePlan, build_source_plan, dangerous_reason, safe_resolve, stat_mtime, stat_size
 from .timeutil import parse_now, timezone_from_args
 
 
@@ -55,6 +56,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         "aggregate": _empty_aggregate(run_id, limits, root_labels, args.case_limit),
         "ranking_quality_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "rg_prefilter_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
+        "manifest_shortlist_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "privacy_contract": _privacy_contract(),
     }
 
@@ -97,6 +99,12 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
             started=started,
         )
 
+    manifest_pair = None
+    if getattr(args, "manifest_shortlist", False):
+        initial_manifest = build_manifest(plan, default_tz=tz)
+        refreshed_manifest = build_manifest(plan, default_tz=tz, previous=initial_manifest)
+        manifest_pair = (initial_manifest, refreshed_manifest)
+
     rows: list[dict[str, Any]] = []
     for probe in probes:
         row = _run_probe(
@@ -107,6 +115,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
             now=now,
             cwd=str(cwd),
             use_rg_prefilter=getattr(args, "rg_prefilter", False),
+            manifest_pair=manifest_pair,
         )
         rows.append(row)
 
@@ -134,6 +143,7 @@ def _run_probe(
     now,
     cwd: str,
     use_rg_prefilter: bool,
+    manifest_pair: tuple[Manifest, Manifest] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     intent = infer_query(probe.query_text, now=now)
@@ -178,6 +188,17 @@ def _run_probe(
         "output_context_bytes": 0,
         "warnings": warnings,
     }
+    manifest_stats = _manifest_shortlist_row_stats(
+        manifest_pair=manifest_pair,
+        intent=intent,
+        plan=plan,
+        default_tz=default_tz,
+        cwd=cwd,
+        baseline_result=result,
+        baseline_candidate_count=candidate_count,
+        use_rg_prefilter=use_rg_prefilter,
+    )
+    row["manifest_shortlist"] = manifest_stats
     row["wall_time_ms"] = row["elapsed_ms"]
     row["output_context_bytes"] = len(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     row["output_bytes"] = row["output_context_bytes"]
@@ -237,6 +258,7 @@ def _aggregate_rows(
         statuses[row["result_status"]] = statuses.get(row["result_status"], 0) + 1
         warnings.update(row.get("warnings", []))
     prefilter = _aggregate_prefilter(rows)
+    manifest = _aggregate_manifest_shortlist(rows)
     return {
         "run_id": run_id,
         "overall_status": "capped" if statuses.get("capped") else "ok",
@@ -262,6 +284,7 @@ def _aggregate_rows(
         "root_labels": root_labels,
         "warnings": sorted(warnings),
         "rg_prefilter": prefilter,
+        "manifest_shortlist": manifest,
     }
 
 
@@ -291,6 +314,7 @@ def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_l
         "root_labels": root_labels,
         "warnings": [],
         "rg_prefilter": _aggregate_prefilter([]),
+        "manifest_shortlist": _aggregate_manifest_shortlist([]),
     }
 
 
@@ -314,6 +338,11 @@ def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[
         "not_evaluated",
         [f"benchmark_status_{status}", "no_benchmark_rows"],
         counters=report["aggregate"].get("required_counters"),
+    )
+    report["manifest_shortlist_gate"] = _gate_status(
+        "not_evaluated",
+        [f"benchmark_status_{status}", "no_benchmark_rows"],
+        counters=_manifest_required_counter_summary([]),
     )
     return {"measured_benchmark": report}
 
@@ -393,10 +422,321 @@ def _aggregate_prefilter(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return aggregate
 
 
+def _manifest_shortlist_row_stats(
+    *,
+    manifest_pair: tuple[Manifest, Manifest] | None,
+    intent,
+    plan: SourcePlan,
+    default_tz,
+    cwd: str,
+    baseline_result: dict[str, Any],
+    baseline_candidate_count: int,
+    use_rg_prefilter: bool,
+) -> dict[str, Any]:
+    if manifest_pair is None:
+        return _manifest_row_disabled("not_enabled")
+
+    initial, refreshed = manifest_pair
+    shortlist = shortlist_manifest(initial, intent, cwd=cwd)
+    metrics = shortlist.get("metrics") or {}
+    build_warnings = _safe_warnings(list(initial.warnings) + list(refreshed.warnings))
+    cap_labels = _cap_hit_labels(build_warnings)
+    base = {
+        "enabled": True,
+        "manifest_status": "ok",
+        "status": "not_evaluated",
+        "build_bytes": int(initial.metrics.get("bytes_parsed", 0)),
+        "build_elapsed_ms": initial.metrics.get("elapsed_ms", 0),
+        "refresh_elapsed_ms": refreshed.metrics.get("elapsed_ms", 0),
+        "selected_files": int(metrics.get("selected_files", 0)),
+        "excluded_files": int(metrics.get("excluded_files", 0)),
+        "selected_bytes": int(metrics.get("selected_bytes", 0)),
+        "excluded_bytes": int(metrics.get("excluded_bytes", 0)),
+        "file_reduction_ratio": float(metrics.get("file_reduction_ratio", 0.0)),
+        "byte_reduction_ratio": float(metrics.get("byte_reduction_ratio", 0.0)),
+        "weak_candidates_retained": int(metrics.get("weak_candidates_retained", 0)),
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "elapsed_ms": 0,
+        "candidate_count": 0,
+        "source_ref_equivalence": "not_evaluated",
+        "no_evidence_scope_equivalence": "not_evaluated",
+        "fallback_reason": None,
+        "caps_hit": bool(cap_labels),
+        "cap_hit_labels": cap_labels,
+        "scope_labels": {
+            "selected": "selected_scope",
+            "searched": "searched_scope",
+            "excluded": "excluded_scope",
+            "not_searched": "not_searched_scope",
+            "weak_candidate": "weak_candidate",
+            "fallback": "fallback",
+            "cap": "cap_hit",
+        },
+    }
+
+    fallback_reason = _manifest_fallback_reason(initial, shortlist)
+    selected_entries = shortlist.get("selected_entries") or []
+    if fallback_reason is None and not _selected_entries_current(selected_entries):
+        fallback_reason = "manifest_stale_or_changed"
+    if fallback_reason is None and not _selected_entries_allowed(selected_entries, plan):
+        fallback_reason = "manifest_selection_rejected"
+
+    if fallback_reason is not None:
+        base.update(
+            {
+                "status": "fallback",
+                "manifest_status": "fallback",
+                "fallback_reason": fallback_reason,
+                "python_opened_files": int(baseline_result.get("searched_files", 0)),
+                "parsed_bytes": int(baseline_result.get("searched_bytes", 0)),
+                "elapsed_ms": 0,
+                "candidate_count": baseline_candidate_count,
+                "source_ref_equivalence": "fallback_not_compared",
+                "no_evidence_scope_equivalence": "fallback_scope_reported",
+            }
+        )
+        return base
+
+    narrowed_plan = _source_plan_from_manifest_selection(plan, selected_entries)
+    started = time.perf_counter()
+    narrowed_result = search(
+        narrowed_plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        use_rg_prefilter=use_rg_prefilter,
+    )
+    manifest_elapsed_ms = _elapsed_ms(started)
+    narrowed_warnings = _safe_warnings(narrowed_result.get("warnings", []))
+    narrowed_cap_labels = _cap_hit_labels(narrowed_warnings)
+    manifest_candidate_count = sum(len(group.get("matches", [])) for group in narrowed_result.get("groups", []))
+    cap_labels = sorted(set(cap_labels + narrowed_cap_labels))
+    base.update(
+        {
+            "status": "planned_scan",
+            "python_opened_files": int(narrowed_result.get("searched_files", 0)),
+            "parsed_bytes": int(narrowed_result.get("searched_bytes", 0)),
+            "elapsed_ms": manifest_elapsed_ms,
+            "candidate_count": manifest_candidate_count,
+            "source_ref_equivalence": _source_ref_equivalence(baseline_result, narrowed_result),
+            "no_evidence_scope_equivalence": _no_evidence_scope_equivalence(
+                baseline_candidate_count=baseline_candidate_count,
+                manifest_candidate_count=manifest_candidate_count,
+                excluded_files=int(metrics.get("excluded_files", 0)),
+            ),
+            "caps_hit": bool(cap_labels),
+            "cap_hit_labels": cap_labels,
+        }
+    )
+    return base
+
+
+def _manifest_row_disabled(reason: str) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "manifest_status": "disabled",
+        "status": "disabled",
+        "build_bytes": 0,
+        "build_elapsed_ms": 0,
+        "refresh_elapsed_ms": 0,
+        "selected_files": 0,
+        "excluded_files": 0,
+        "selected_bytes": 0,
+        "excluded_bytes": 0,
+        "file_reduction_ratio": 0.0,
+        "byte_reduction_ratio": 0.0,
+        "weak_candidates_retained": 0,
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "elapsed_ms": 0,
+        "candidate_count": 0,
+        "source_ref_equivalence": "not_evaluated",
+        "no_evidence_scope_equivalence": "not_evaluated",
+        "fallback_reason": reason,
+        "caps_hit": False,
+        "cap_hit_labels": [],
+        "scope_labels": {},
+    }
+
+
+def _manifest_fallback_reason(manifest: Manifest, shortlist: dict[str, Any]) -> str | None:
+    metrics = shortlist.get("metrics") or {}
+    if manifest is None:
+        return "manifest_absent"
+    if not manifest.entries:
+        return "manifest_empty"
+    if _cap_hit_labels(_safe_warnings(list(manifest.warnings))):
+        return "manifest_build_capped"
+    if int(metrics.get("selected_files", 0)) <= 0:
+        return "manifest_empty_selection"
+    if float(metrics.get("file_reduction_ratio", 0.0)) <= 0.0 and float(metrics.get("byte_reduction_ratio", 0.0)) <= 0.0:
+        return "manifest_unhelpful_no_reduction"
+    return None
+
+
+def _selected_entries_current(selected_entries: list[dict[str, Any]]) -> bool:
+    for item in selected_entries:
+        entry = item.get("entry") if isinstance(item, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        path = Path(str(entry.get("path") or ""))
+        if stat_size(path) != int(entry.get("size", -1)):
+            return False
+        if stat_mtime(path) != float(entry.get("mtime", -1.0)):
+            return False
+    return True
+
+
+def _selected_entries_allowed(selected_entries: list[dict[str, Any]], plan: SourcePlan) -> bool:
+    allowed_paths = {str(path) for path, _size, _warnings in _enumerate_planned_file_tuples(plan)}
+    selected_paths = {str((item.get("entry") or {}).get("path")) for item in selected_entries if isinstance(item, dict)}
+    return selected_paths <= allowed_paths
+
+
+def _enumerate_planned_file_tuples(plan: SourcePlan):
+    from .sources import enumerate_jsonl_files
+
+    yield from enumerate_jsonl_files(plan)
+
+
+def _source_plan_from_manifest_selection(plan: SourcePlan, selected_entries: list[dict[str, Any]]) -> SourcePlan:
+    roots: list[PlannedRoot] = []
+    selected_bytes = 0
+    for item in selected_entries:
+        entry = item.get("entry") or {}
+        path = Path(str(entry.get("path")))
+        selected_bytes += int(entry.get("size", 0))
+        roots.append(
+            PlannedRoot(
+                kind=str(entry.get("source_kind") or "manifest_selected_jsonl"),
+                path=path,
+                reason="manifest shortlist selected file",
+                recursive=False,
+                known=True,
+            )
+        )
+    limits = Limits(
+        max_files=max(1, len(roots)),
+        max_bytes=max(1, selected_bytes),
+        max_matches=plan.limits.max_matches,
+        max_elapsed=plan.limits.max_elapsed,
+    )
+    return SourcePlan(
+        roots=roots,
+        rejected_roots=[],
+        warnings=list(plan.warnings),
+        blind_spots=list(plan.blind_spots),
+        limits=limits,
+    )
+
+
+def _source_ref_equivalence(baseline_result: dict[str, Any], narrowed_result: dict[str, Any]) -> str:
+    baseline_refs = _source_ref_signature(baseline_result)
+    narrowed_refs = _source_ref_signature(narrowed_result)
+    if not baseline_refs and not narrowed_refs:
+        return "equivalent_no_refs"
+    return "equivalent" if baseline_refs == narrowed_refs else "not_equivalent"
+
+
+def _source_ref_signature(result: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for group in result.get("groups", []):
+        for match in group.get("matches", []):
+            path = str(match.get("path", ""))
+            line = str(match.get("line", ""))
+            refs.append(hashlib.sha256(f"{path}:{line}".encode("utf-8")).hexdigest())
+    return refs[:10]
+
+
+def _no_evidence_scope_equivalence(*, baseline_candidate_count: int, manifest_candidate_count: int, excluded_files: int) -> str:
+    if baseline_candidate_count == 0 and manifest_candidate_count == 0:
+        return "equivalent_no_evidence_with_excluded_scope" if excluded_files else "equivalent_no_evidence"
+    if baseline_candidate_count == 0 or manifest_candidate_count == 0:
+        return "not_equivalent"
+    return "not_applicable_found"
+
+
+def _aggregate_manifest_shortlist(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    fallback_reasons: dict[str, int] = {}
+    aggregate = {
+        "enabled_rows": 0,
+        "planned_rows": 0,
+        "fallback_rows": 0,
+        "statuses": statuses,
+        "fallback_reasons": fallback_reasons,
+        "manifest_statuses": {},
+        "build_bytes": 0,
+        "build_elapsed_ms": 0,
+        "refresh_elapsed_ms": 0,
+        "selected_files": 0,
+        "excluded_files": 0,
+        "selected_bytes": 0,
+        "excluded_bytes": 0,
+        "file_reduction_ratio": 0.0,
+        "byte_reduction_ratio": 0.0,
+        "weak_candidates_retained": 0,
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "elapsed_ms": 0,
+        "candidate_count": 0,
+        "source_ref_equivalence": {},
+        "no_evidence_scope_equivalence": {},
+        "caps_hit": False,
+        "cap_hit_labels": [],
+        "required_counters": _manifest_required_counter_summary(rows),
+    }
+    build_counted = False
+    for row in rows:
+        stats = row.get("manifest_shortlist") or {}
+        status = str(stats.get("status") or "missing")
+        statuses[status] = statuses.get(status, 0) + 1
+        manifest_status = str(stats.get("manifest_status") or "missing")
+        aggregate["manifest_statuses"][manifest_status] = aggregate["manifest_statuses"].get(manifest_status, 0) + 1
+        if not stats.get("enabled"):
+            continue
+        aggregate["enabled_rows"] += 1
+        if status == "planned_scan":
+            aggregate["planned_rows"] += 1
+        if status == "fallback":
+            aggregate["fallback_rows"] += 1
+        reason = stats.get("fallback_reason")
+        if reason:
+            fallback_reasons[str(reason)] = fallback_reasons.get(str(reason), 0) + 1
+        if not build_counted:
+            aggregate["build_bytes"] = int(stats.get("build_bytes", 0))
+            aggregate["build_elapsed_ms"] = stats.get("build_elapsed_ms", 0)
+            aggregate["refresh_elapsed_ms"] = stats.get("refresh_elapsed_ms", 0)
+            build_counted = True
+        for key in (
+            "selected_files",
+            "excluded_files",
+            "selected_bytes",
+            "excluded_bytes",
+            "weak_candidates_retained",
+            "python_opened_files",
+            "parsed_bytes",
+            "elapsed_ms",
+            "candidate_count",
+        ):
+            aggregate[key] += int(stats.get(key, 0))
+        source_eq = str(stats.get("source_ref_equivalence") or "missing")
+        no_evidence_eq = str(stats.get("no_evidence_scope_equivalence") or "missing")
+        aggregate["source_ref_equivalence"][source_eq] = aggregate["source_ref_equivalence"].get(source_eq, 0) + 1
+        aggregate["no_evidence_scope_equivalence"][no_evidence_eq] = aggregate["no_evidence_scope_equivalence"].get(no_evidence_eq, 0) + 1
+        aggregate["caps_hit"] = bool(aggregate["caps_hit"] or stats.get("caps_hit"))
+        aggregate["cap_hit_labels"] = sorted(set(aggregate["cap_hit_labels"]) | set(stats.get("cap_hit_labels") or []))
+    aggregate["file_reduction_ratio"] = _ratio(int(aggregate["excluded_files"]), int(aggregate["selected_files"]) + int(aggregate["excluded_files"]))
+    aggregate["byte_reduction_ratio"] = _ratio(int(aggregate["excluded_bytes"]), int(aggregate["selected_bytes"]) + int(aggregate["excluded_bytes"]))
+    return aggregate
+
+
 def _evaluate_gate_statuses(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
     return {
         "ranking_quality_gate": _evaluate_ranking_quality_gate(rows, aggregate),
         "rg_prefilter_gate": _evaluate_rg_prefilter_gate(rows, aggregate),
+        "manifest_shortlist_gate": _evaluate_manifest_shortlist_gate(rows, aggregate),
     }
 
 
@@ -460,6 +800,59 @@ def _evaluate_rg_prefilter_gate(rows: list[dict[str, Any]], aggregate: dict[str,
             "bytes_reduction_ratio": prefilter.get("bytes_reduction_ratio", 0.0),
         },
     )
+
+
+def _evaluate_manifest_shortlist_gate(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
+    counters = (aggregate.get("manifest_shortlist") or {}).get("required_counters") or _manifest_required_counter_summary(rows)
+    if not rows:
+        return _gate_status("not_evaluated", ["no_benchmark_rows"], counters=counters)
+    manifest = aggregate.get("manifest_shortlist") or {}
+    if not manifest.get("enabled_rows"):
+        return _gate_status(
+            "not_evaluated",
+            ["manifest_shortlist_not_enabled"],
+            counters=counters,
+            metrics={"row_count": len(rows)},
+        )
+    source_eq = manifest.get("source_ref_equivalence") or {}
+    no_evidence_eq = manifest.get("no_evidence_scope_equivalence") or {}
+    reasons = [
+        "policy_eligible_aggregate_evidence_unavailable",
+        "sanitized_correctness_review_unavailable",
+        "synthetic_or_local_rows_do_not_prove_promotion",
+    ]
+    if manifest.get("fallback_rows"):
+        reasons.append("manifest_fallback_rows_present")
+    if manifest.get("caps_hit"):
+        reasons.append("cap_hits_present")
+    if source_eq.get("not_equivalent") or no_evidence_eq.get("not_equivalent"):
+        return _gate_status(
+            "fail",
+            ["manifest_equivalence_regression"] + reasons,
+            counters=counters,
+            metrics=_manifest_gate_metrics(manifest),
+        )
+    return _gate_status(
+        "inconclusive",
+        reasons,
+        evaluated_case_count=0,
+        counters=counters,
+        metrics=_manifest_gate_metrics(manifest),
+    )
+
+
+def _manifest_gate_metrics(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled_rows": manifest.get("enabled_rows", 0),
+        "planned_rows": manifest.get("planned_rows", 0),
+        "fallback_rows": manifest.get("fallback_rows", 0),
+        "file_reduction_ratio": manifest.get("file_reduction_ratio", 0.0),
+        "byte_reduction_ratio": manifest.get("byte_reduction_ratio", 0.0),
+        "python_opened_files": manifest.get("python_opened_files", 0),
+        "parsed_bytes": manifest.get("parsed_bytes", 0),
+        "source_ref_equivalence": manifest.get("source_ref_equivalence", {}),
+        "no_evidence_scope_equivalence": manifest.get("no_evidence_scope_equivalence", {}),
+    }
 
 
 def _gate_status(
@@ -543,6 +936,49 @@ def _required_counter_keys() -> tuple[str, ...]:
         "mrr",
         "no_evidence_correct",
         "caps_hit",
+    )
+
+
+def _manifest_required_counter_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in _manifest_required_counter_keys():
+        available = 0
+        unavailable_reasons: set[str] = set()
+        for row in rows:
+            stats = row.get("manifest_shortlist") or {}
+            if stats.get("enabled") and key in stats:
+                available += 1
+            else:
+                unavailable_reasons.add("manifest_shortlist_not_enabled" if not stats.get("enabled") else "counter_not_available")
+        summary[key] = {
+            "available_rows": available,
+            "unavailable_rows": max(0, len(rows) - available),
+            "unavailable_reasons": sorted(unavailable_reasons),
+        }
+    return summary
+
+
+def _manifest_required_counter_keys() -> tuple[str, ...]:
+    return (
+        "manifest_status",
+        "build_bytes",
+        "build_elapsed_ms",
+        "refresh_elapsed_ms",
+        "selected_files",
+        "excluded_files",
+        "selected_bytes",
+        "excluded_bytes",
+        "file_reduction_ratio",
+        "byte_reduction_ratio",
+        "weak_candidates_retained",
+        "python_opened_files",
+        "parsed_bytes",
+        "elapsed_ms",
+        "source_ref_equivalence",
+        "no_evidence_scope_equivalence",
+        "fallback_reason",
+        "caps_hit",
+        "cap_hit_labels",
     )
 
 
@@ -637,6 +1073,8 @@ def _privacy_contract() -> dict[str, Any]:
         "report_requires_explicit_output_path": True,
         "candidate_rows_included": False,
         "root_paths_replaced_with_labels": True,
+        "manifest_shortlist_rows_include_raw_paths": False,
+        "manifest_shortlist_default_search_promotion": False,
     }
 
 
