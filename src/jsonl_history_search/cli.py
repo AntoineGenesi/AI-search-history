@@ -20,7 +20,7 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .scanner import search
 from .skill_audit import build_skill_audit_payload
-from .sources import Limits, build_source_plan
+from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
 from .timeutil import parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
 from .workflow_repeat import build_workflow_repeat_payload
@@ -244,6 +244,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path where a machine-readable diagnostic JSON report should be written.",
     )
+    discovery = subparsers.add_parser("discover-jsonl")
+    discovery.add_argument("--format", choices=("text", "json", "markdown"), default="text")
+    discovery.add_argument("--cwd", default=".")
+    discovery.add_argument("--codex-home", default=None)
+    discovery.add_argument("--claude-home", default=None)
+    discovery.add_argument("--root", action="append", default=[])
+    discovery.add_argument("--max-files", type=int, default=200)
+    discovery.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
+    discovery.add_argument("--max-elapsed", type=float, default=15.0)
+    discovery.add_argument("--allow-arbitrary-root", action="store_true")
+    discovery.add_argument("--hard-cap-files", type=int, default=None)
+    discovery.add_argument("--hard-cap-bytes", type=int, default=None)
+    discovery.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized candidate discovery report should be written.",
+    )
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     validate.add_argument(
@@ -382,6 +399,31 @@ def _configuration_warnings(source_plan: dict) -> list[str]:
     return list(warnings) if isinstance(warnings, list) else []
 
 
+def discovery_payload_from_args(args: argparse.Namespace) -> dict:
+    cwd = Path(args.cwd).expanduser().resolve()
+    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
+    claude_home = Path(args.claude_home).expanduser() if args.claude_home else Path.home() / ".claude"
+    limits = Limits(
+        max_files=args.max_files,
+        max_bytes=args.max_bytes,
+        max_matches=0,
+        max_elapsed=args.max_elapsed,
+        hard_cap_files=args.hard_cap_files,
+        hard_cap_bytes=args.hard_cap_bytes,
+    )
+    if not args.root:
+        return build_jsonl_candidate_discovery(SourcePlan(limits=limits), explicit_roots_provided=False)
+    plan = build_source_plan(
+        cwd=cwd,
+        codex_home=codex_home,
+        claude_home=claude_home,
+        roots=[Path(item).expanduser() for item in args.root],
+        allow_arbitrary_root=args.allow_arbitrary_root,
+        limits=limits,
+    )
+    return build_jsonl_candidate_discovery(plan, explicit_roots_provided=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "validate-install":
@@ -399,6 +441,14 @@ def main(argv: list[str] | None = None) -> int:
         print(render(payload, args.format))
         statuses = payload["capability_diagnostic"]["summary"]
         return 1 if statuses.get("blocked", 0) else 0
+    if args.command == "discover-jsonl":
+        payload = discovery_payload_from_args(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["jsonl_candidate_discovery"]["status"]
+        return 1 if status in {"no_roots", "root_rejected"} else 0
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0
