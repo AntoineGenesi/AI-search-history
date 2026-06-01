@@ -30,6 +30,8 @@ def render_text(payload: dict) -> str:
         return render_workflow_repeat_text(payload)
     if "private_benchmark_mine" in payload:
         return render_private_benchmark_mine_text(payload)
+    if "measured_benchmark" in payload:
+        return render_measured_benchmark_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -99,6 +101,8 @@ def render_markdown(payload: dict) -> str:
         return render_workflow_repeat_markdown(payload)
     if "private_benchmark_mine" in payload:
         return render_private_benchmark_mine_markdown(payload)
+    if "measured_benchmark" in payload:
+        return render_measured_benchmark_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL History Search", ""]
     for line in text.splitlines():
@@ -861,6 +865,91 @@ def render_efficiency_eval_text(payload: dict) -> str:
     embedding_spike = report.get("embedding_spike")
     if embedding_spike:
         lines.extend(render_embedding_spike_text_lines(embedding_spike))
+    return "\n".join(lines)
+
+
+def render_measured_benchmark_text(payload: dict) -> str:
+    report = payload["measured_benchmark"]
+    aggregate = report.get("aggregate", {})
+    lines = [
+        "Measured local benchmark",
+        f"Status: {report.get('status')}",
+        f"Run: {report.get('run_id')}",
+        f"Roots: {', '.join(report.get('root_labels') or []) or '(none)'}",
+        (
+            "Totals: "
+            f"elapsed_ms={aggregate.get('total_elapsed_ms', 0)} "
+            f"searched_files={aggregate.get('searched_files', 0)} "
+            f"searched_bytes={aggregate.get('searched_bytes', 0)} "
+            f"candidates={aggregate.get('candidate_count', 0)} "
+            f"output_context_bytes={aggregate.get('output_context_bytes', 0)}"
+        ),
+    ]
+    statuses = aggregate.get("statuses", {})
+    if statuses:
+        lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
+    for warning in aggregate.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for row in report.get("rows", []):
+        row_id = row.get("case_id") or "(unknown)"
+        lines.append(
+            "- "
+            f"{row_id}: {row.get('result_status')} "
+            f"elapsed_ms={row.get('elapsed_ms')} "
+            f"files={row.get('searched_files')} "
+            f"bytes={row.get('searched_bytes')} "
+            f"candidates={row.get('candidate_count')} "
+            f"context_bytes={row.get('output_context_bytes')}"
+        )
+    return "\n".join(lines)
+
+
+def render_measured_benchmark_markdown(payload: dict) -> str:
+    report = payload["measured_benchmark"]
+    aggregate = report.get("aggregate", {})
+    lines = [
+        "# Measured Local Benchmark",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Run:** `{report.get('run_id')}`",
+        f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
+        "",
+        "## Aggregate",
+        "",
+        f"- Total elapsed ms: {aggregate.get('total_elapsed_ms', 0)}",
+        f"- Searched files: {aggregate.get('searched_files', 0)}",
+        f"- Searched bytes: {aggregate.get('searched_bytes', 0)}",
+        f"- Candidate count: {aggregate.get('candidate_count', 0)}",
+        f"- Output context bytes: {aggregate.get('output_context_bytes', 0)}",
+        f"- Statuses: {', '.join(f'{key}={value}' for key, value in sorted((aggregate.get('statuses') or {}).items())) or '(none)'}",
+    ]
+    if aggregate.get("warnings"):
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- `{warning}`" for warning in aggregate.get("warnings", []))
+    if report.get("rows"):
+        lines.extend(
+            [
+                "",
+                "## Runs",
+                "",
+                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Warnings |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in report.get("rows", []):
+            row_id = row.get("case_id") or ""
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row_id))} | "
+                f"{_escape_markdown_table(str(row.get('query_source', '')))} | "
+                f"{_escape_markdown_table(str(row.get('result_status', '')))} | "
+                f"{row.get('elapsed_ms', 0)} | "
+                f"{row.get('searched_files', 0)} | "
+                f"{row.get('searched_bytes', 0)} | "
+                f"{row.get('candidate_count', 0)} | "
+                f"{row.get('output_context_bytes', 0)} | "
+                f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
+            )
     return "\n".join(lines)
 
 

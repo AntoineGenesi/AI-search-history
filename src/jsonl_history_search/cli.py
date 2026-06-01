@@ -10,6 +10,8 @@ from .forensics import build_forensics_payload
 from .install_validation import validate_install
 from .lineage import build_lineage_payload
 from .manifest import build_manifest_report
+from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
+from .measured_benchmark import build_measured_benchmark_payload
 from .output import render
 from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .query import infer_query
@@ -153,6 +155,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--embedding-spike-fixture",
         default="benchmarks/retrieval_gold/sanitized_embedding_corpus.json",
         help="Synthetic sanitized fixture for --include-embedding-spike.",
+    )
+    measured = subparsers.add_parser("benchmark-measured")
+    add_common_args(measured)
+    measured.add_argument(
+        "--fixture",
+        default=str(DEFAULT_MEASURED_FIXTURE),
+        help="Sanitized retrieval benchmark fixture whose paraphrased cases become measured probes.",
+    )
+    measured.add_argument(
+        "--case-limit",
+        type=int,
+        default=6,
+        help="Maximum number of sanitized fixture cases to run when --query is not supplied.",
+    )
+    measured.add_argument(
+        "--query",
+        action="append",
+        default=[],
+        dest="queries",
+        help="Optional explicit local probe. Query text is used for retrieval but never echoed in output.",
+    )
+    measured.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized measured benchmark report should be written.",
     )
     diagnose = subparsers.add_parser("diagnose-capabilities")
     diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -441,6 +468,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.fail_on_threshold and thresholds.get("status") == "fail":
             return 1
         return 1 if eval_payload.get("status") == "invalid_fixture" else 0
+    if args.command == "benchmark-measured":
+        payload = build_measured_benchmark_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["measured_benchmark"]["status"]
+        return 1 if status in {"no_roots", "root_rejected", "invalid_fixture"} else 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(
