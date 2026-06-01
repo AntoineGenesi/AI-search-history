@@ -144,6 +144,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit non-zero when large-impact thresholds fail.",
     )
+    benchmark.add_argument(
+        "--include-embedding-spike",
+        action="store_true",
+        help="Include the deterministic local fixture vector spike report; no production embeddings are run.",
+    )
+    benchmark.add_argument(
+        "--embedding-spike-fixture",
+        default="benchmarks/retrieval_gold/sanitized_embedding_corpus.json",
+        help="Synthetic sanitized fixture for --include-embedding-spike.",
+    )
     diagnose = subparsers.add_parser("diagnose-capabilities")
     diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     diagnose.add_argument("--cwd", default=".")
@@ -422,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = build_efficiency_eval(
             Path(args.fixture).expanduser(),
             strategies=tuple(args.strategy) if args.strategy else None,
+            include_embedding_spike=args.include_embedding_spike,
+            embedding_fixture_path=Path(args.embedding_spike_fixture).expanduser(),
         )
         print(render(payload, args.format))
         eval_payload = payload["retrieval_efficiency_eval"]

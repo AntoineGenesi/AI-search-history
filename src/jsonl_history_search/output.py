@@ -858,6 +858,9 @@ def render_efficiency_eval_text(payload: dict) -> str:
     if stages or modes:
         lines.append(f"Follow-up stages: {', '.join(stages) if stages else '(none)'}")
         lines.append(f"Follow-up failure modes: {', '.join(modes) if modes else '(none)'}")
+    embedding_spike = report.get("embedding_spike")
+    if embedding_spike:
+        lines.extend(render_embedding_spike_text_lines(embedding_spike))
     return "\n".join(lines)
 
 
@@ -960,7 +963,139 @@ def render_efficiency_eval_markdown(payload: dict) -> str:
             lines.append(f"- Failure modes: {', '.join(modes)}")
         if followup.get("notes"):
             lines.append(f"- Notes: {followup['notes']}")
+    embedding_spike = report.get("embedding_spike")
+    if embedding_spike:
+        lines.extend(render_embedding_spike_markdown_lines(embedding_spike))
     return "\n".join(lines)
+
+
+def render_embedding_spike_text_lines(report: dict) -> list[str]:
+    if report.get("status") == "invalid_fixture":
+        lines = [
+            "Embedding spike: INVALID FIXTURE",
+            f"Fixture: {report.get('fixture')}",
+        ]
+        lines.extend(f"ERROR: {error}" for error in report.get("fixture_errors", []))
+        return lines
+    summary = report.get("summary", {})
+    index_metrics = report.get("index_metrics", {})
+    query_metrics = report.get("query_metrics", {})
+    lines = [
+        "Embedding spike:",
+        f"- Vectorizer: {report.get('vectorizer_id')} ({report.get('vector_kind')})",
+        f"- Production status: {report.get('production_status')}",
+        (
+            "- Index: "
+            f"docs={index_metrics.get('document_count')} "
+            f"features={index_metrics.get('feature_count')} "
+            f"bytes={index_metrics.get('serialized_index_bytes')} "
+            f"index_ms={index_metrics.get('indexing_time_ms')} "
+            f"peak_mem={index_metrics.get('tracemalloc_peak_bytes')}"
+        ),
+        (
+            "- Retrieval: "
+            f"vector_hit_rate={summary.get('vector_first_pass_hit_rate')} "
+            f"baseline_hit_rate={summary.get('baseline_first_pass_hit_rate')} "
+            f"recall@1={summary.get('vector_mean_recall_at_1')} "
+            f"recall@3={summary.get('vector_mean_recall_at_3')} "
+            f"recall@10={summary.get('vector_mean_recall_at_10')} "
+            f"median_query_ms={query_metrics.get('median_query_latency_ms')}"
+        ),
+        (
+            "- Family flags: "
+            f"valuable_vector_better={summary.get('valuable_family_vector_better')} "
+            f"worse_vector_worse={summary.get('worse_family_vector_worse')} "
+            f"expected_matches={summary.get('expected_behavior_matches')}"
+        ),
+    ]
+    return lines
+
+
+def render_embedding_spike_markdown_lines(report: dict) -> list[str]:
+    lines = ["", "## Embedding Spike", ""]
+    if report.get("status") == "invalid_fixture":
+        lines.extend(
+            [
+                "**Status:** INVALID FIXTURE",
+                f"**Fixture:** `{report.get('fixture')}`",
+                "",
+                "### Fixture Errors",
+                "",
+            ]
+        )
+        lines.extend(f"- {error}" for error in report.get("fixture_errors", []))
+        return lines
+    summary = report.get("summary", {})
+    index_metrics = report.get("index_metrics", {})
+    query_metrics = report.get("query_metrics", {})
+    lines.extend(
+        [
+            f"**Vectorizer:** `{report.get('vectorizer_id')}` / `{report.get('vector_kind')}`",
+            f"**Production status:** `{report.get('production_status')}`",
+            "",
+            report.get("measurement_note", ""),
+            "",
+            "### Cost Metrics",
+            "",
+            "| Documents | Features | Serialized bytes | Index ms | Peak memory bytes | Median query ms | Max query ms |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            (
+                "| "
+                f"{index_metrics.get('document_count')} | "
+                f"{index_metrics.get('feature_count')} | "
+                f"{index_metrics.get('serialized_index_bytes')} | "
+                f"{index_metrics.get('indexing_time_ms')} | "
+                f"{index_metrics.get('tracemalloc_peak_bytes')} | "
+                f"{query_metrics.get('median_query_latency_ms')} | "
+                f"{query_metrics.get('max_query_latency_ms')} |"
+            ),
+            "",
+            "### Retrieval Summary",
+            "",
+            "| Vector hit rate | Baseline hit rate | Recall@1 | Recall@3 | Recall@10 | Valuable vector better | Worse vector worse | Expected matches |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            (
+                "| "
+                f"{summary.get('vector_first_pass_hit_rate')} | "
+                f"{summary.get('baseline_first_pass_hit_rate')} | "
+                f"{summary.get('vector_mean_recall_at_1')} | "
+                f"{summary.get('vector_mean_recall_at_3')} | "
+                f"{summary.get('vector_mean_recall_at_10')} | "
+                f"{summary.get('valuable_family_vector_better')} | "
+                f"{summary.get('worse_family_vector_worse')} | "
+                f"{summary.get('expected_behavior_matches')} |"
+            ),
+            "",
+            "### Case Family Results",
+            "",
+            "| Case | Family | Scenario | Effect | Vector rank | Baseline rank |",
+            "| --- | --- | --- | --- | ---: | ---: |",
+        ]
+    )
+    for case in report.get("cases", []):
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(case.get('case_id', ''))} | "
+            f"{_escape_markdown_table(case.get('case_family', ''))} | "
+            f"{_escape_markdown_table(case.get('scenario', ''))} | "
+            f"{_escape_markdown_table(case.get('case_family_effect', ''))} | "
+            f"{case.get('vector', {}).get('gold_rank')} | "
+            f"{case.get('baseline', {}).get('gold_rank')} |"
+        )
+    guidance = report.get("production_guidance", {})
+    if guidance:
+        lines.extend(
+            [
+                "",
+                "### Production Guidance",
+                "",
+                f"- Default live search: `{guidance.get('default_live_search')}`",
+                f"- Storage: `{guidance.get('storage')}`",
+                f"- Exact refs required: `{guidance.get('exact_refs_required')}`",
+                f"- Reason: {guidance.get('reason')}",
+            ]
+        )
+    return lines
 
 
 def render_structured_tool_events_text(payload: dict) -> str:

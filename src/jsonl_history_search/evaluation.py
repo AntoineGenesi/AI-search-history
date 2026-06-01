@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import load_benchmark_fixture, validate_benchmark_fixture
+from .embedding_spike import DEFAULT_EMBEDDING_SPIKE_FIXTURE, build_embedding_spike_eval
 
 
 DEFAULT_FIXTURE = Path("benchmarks/retrieval_gold/sanitized_cases.json")
@@ -134,11 +135,13 @@ def build_efficiency_eval(
     fixture_path: Path = DEFAULT_FIXTURE,
     *,
     strategies: tuple[str, ...] | None = DEFAULT_STRATEGIES,
+    include_embedding_spike: bool = False,
+    embedding_fixture_path: Path = DEFAULT_EMBEDDING_SPIKE_FIXTURE,
 ) -> dict[str, Any]:
     fixture = load_benchmark_fixture(fixture_path)
     errors = validate_benchmark_fixture(fixture)
     if errors:
-        return {
+        payload = {
             "retrieval_efficiency_eval": {
                 "schema_version": 1,
                 "status": "invalid_fixture",
@@ -146,12 +149,15 @@ def build_efficiency_eval(
                 "fixture_errors": errors,
             }
         }
+        if include_embedding_spike:
+            payload["retrieval_efficiency_eval"]["embedding_spike"] = build_embedding_spike_eval(embedding_fixture_path)
+        return payload
 
     profiles = [STRATEGY_PROFILES[name] for name in (strategies or DEFAULT_STRATEGIES)]
     case_results = [evaluate_case(case, profiles) for case in fixture["cases"]]
     summary = summarize_results(case_results, profiles)
     thresholds = evaluate_thresholds(summary)
-    return {
+    report = {
         "retrieval_efficiency_eval": {
             "schema_version": 1,
             "status": "ok",
@@ -171,6 +177,9 @@ def build_efficiency_eval(
             "coverage_needs_followup": fixture.get("coverage_needs_followup", {}),
         }
     }
+    if include_embedding_spike:
+        report["retrieval_efficiency_eval"]["embedding_spike"] = build_embedding_spike_eval(embedding_fixture_path)
+    return report
 
 
 def evaluate_case(case: dict[str, Any], profiles: list[StrategyProfile]) -> dict[str, Any]:
