@@ -1,11 +1,11 @@
 ---
 name: jsonl-history-search
-description: Search local Codex and Claude JSONL conversation logs first for prior user instructions, past decisions, reports, artifacts, or vague references to earlier chats.
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when prior instructions, past decisions, reports, artifacts, vague references, or semantic-debugging evidence are needed.
 ---
 
-# JSONL History Search
+# JSONL
 
-Use the portable CLI as a bounded transcript retrieval tool.
+Use the portable CLI as JSONL's bounded AI conversation mining interface for semantic debugging and agent memory/debug workflows.
 
 ```bash
 jsonl-history-search plan "the thing I told you before" --cwd "$PWD" --format text

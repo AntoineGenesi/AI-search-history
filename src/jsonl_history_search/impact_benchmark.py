@@ -255,7 +255,7 @@ def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str]
         "baseline_contract": {
             "raw_rg_literal": "fixed literal scan over capped fixture files; no JSH query expansion or ranking",
             "terminal_rg_then_open": "fixed literal scan plus bounded top-line file opens; no JSH query expansion or ranking",
-            "package_search": "current JSON Search History infer_query/search path",
+            "package_search": "current JSONL compatibility CLI infer_query/search path",
         },
         "privacy_contract": _privacy_contract(),
         "total_wall_time_ms": _elapsed_ms(started),

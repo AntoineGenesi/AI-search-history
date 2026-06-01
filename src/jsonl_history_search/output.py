@@ -108,7 +108,7 @@ def render_markdown(payload: dict) -> str:
     if "impact_benchmark" in payload:
         return render_impact_benchmark_markdown(payload)
     text = render_text(payload)
-    lines = ["# JSONL History Search", ""]
+    lines = ["# JSONL", ""]
     for line in text.splitlines():
         if line.startswith("- "):
             lines.append(line)
@@ -286,7 +286,7 @@ def render_forensics_text(payload: dict) -> str:
 
 def render_forensics_markdown(payload: dict) -> str:
     text = render_forensics_text(payload)
-    lines = ["# JSONL History Forensics", ""]
+    lines = ["# JSONL Forensics", ""]
     for line in text.splitlines()[1:]:
         if line.startswith("- ") or line.startswith("  "):
             lines.append(line)
@@ -625,7 +625,7 @@ def render_install_validation_markdown(payload: dict) -> str:
     validation = payload["install_validation"]
     summary = validation.get("summary", {})
     lines = [
-        "# JSONL History Search Install Validation",
+        "# JSONL Install Validation",
         "",
         f"**Status:** {str(validation.get('overall_status', 'unknown')).upper()}",
         (
@@ -659,7 +659,7 @@ def _escape_markdown_table(value: str) -> str:
 def render_agent_find_text(payload: dict) -> str:
     report = payload["agent_find"]
     lines = [
-        "JSONL History Find",
+        "JSONL Find",
         f"Status: {report.get('status')}",
         f"Query: {report.get('query', {}).get('original', '')}",
         (
@@ -695,7 +695,7 @@ def render_agent_find_text(payload: dict) -> str:
 def render_agent_find_markdown(payload: dict) -> str:
     report = payload["agent_find"]
     lines = [
-        "# JSONL History Find",
+        "# JSONL Find",
         "",
         f"**Status:** {report.get('status')}",
         f"**Query:** {report.get('query', {}).get('original', '')}",
@@ -743,7 +743,7 @@ def render_manifest_text(payload: dict) -> str:
     cost = report["cost_model"]
     metrics = shortlist["metrics"]
     lines = [
-        "JSONL History Manifest",
+        "JSONL Manifest",
         f"Entries: {manifest['entry_count']}",
         f"Build: {cost['build_time_ms']} ms, {manifest['build_metrics'].get('bytes_parsed', 0)} bytes parsed",
         f"Refresh: {cost['refresh_time_ms']} ms, {manifest['no_change_refresh_metrics'].get('files_reused', 0)} files reused",
@@ -772,7 +772,7 @@ def render_manifest_markdown(payload: dict) -> str:
     cost = report["cost_model"]
     metrics = shortlist["metrics"]
     lines = [
-        "# JSONL History Manifest",
+        "# JSONL Manifest",
         "",
         f"**Entries:** {manifest['entry_count']}",
         f"**Build:** {cost['build_time_ms']} ms, {manifest['build_metrics'].get('bytes_parsed', 0)} bytes parsed",
