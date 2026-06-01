@@ -36,6 +36,8 @@ def render_text(payload: dict) -> str:
         return render_measured_benchmark_text(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_text(payload)
+    if "embedding_experiment" in payload:
+        return render_embedding_experiment_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -111,6 +113,8 @@ def render_markdown(payload: dict) -> str:
         return render_measured_benchmark_markdown(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_markdown(payload)
+    if "embedding_experiment" in payload:
+        return render_embedding_experiment_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL", ""]
     for line in text.splitlines():
@@ -1199,6 +1203,143 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('output_context_bytes', 0)} | "
                 f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
             )
+    return "\n".join(lines)
+
+
+def render_embedding_experiment_text(payload: dict) -> str:
+    report = payload["embedding_experiment"]
+    aggregate = report.get("aggregate", {})
+    index_metrics = report.get("index_metrics") or aggregate.get("index_metrics", {})
+    query_metrics = report.get("query_metrics") or aggregate.get("query_metrics", {})
+    backend = report.get("backend", {})
+    gate = report.get("embedding_recall_gate", {})
+    lines = [
+        "Embedding experiment",
+        f"Status: {report.get('status')}",
+        f"Mode: {report.get('experiment_mode')}",
+        f"Backend: {backend.get('selected')} requested={backend.get('requested')} fallback={backend.get('fallback_used')}",
+        f"Production status: {report.get('production_status')}",
+        (
+            "Index: "
+            f"documents={index_metrics.get('document_count', 0)} "
+            f"build_ms={index_metrics.get('index_build_time_ms', 0)} "
+            f"peak_memory_bytes={index_metrics.get('peak_memory_bytes', 0)} "
+            f"disk_bytes={index_metrics.get('disk_index_size_bytes', 0)} "
+            f"refresh={index_metrics.get('refresh_status')}"
+        ),
+        (
+            "Queries: "
+            f"cases={query_metrics.get('case_count', 0)} "
+            f"median_ms={query_metrics.get('median_query_latency_ms', 0)} "
+            f"p90_ms={query_metrics.get('p90_query_latency_ms', 0)} "
+            f"embedding_candidates={query_metrics.get('candidate_count_total', 0)} "
+            f"baseline_candidates={query_metrics.get('baseline_candidate_count_total', 0)}"
+        ),
+        f"embedding_recall_gate: status={gate.get('status')} reasons={', '.join(gate.get('reasons') or []) or '(none)'}",
+    ]
+    if aggregate.get("cap_hit_labels"):
+        lines.append("Cap hits: " + ", ".join(aggregate.get("cap_hit_labels", [])))
+    for failure in aggregate.get("failure_modes", []):
+        lines.append(f"Failure mode: {failure}")
+    for row in report.get("rows", []):
+        lines.append(
+            "- "
+            f"{row.get('case_id')}: {row.get('case_family')} "
+            f"embedding_candidates={row.get('candidate_count')} "
+            f"baseline_candidates={row.get('baseline_candidate_count')} "
+            f"latency_ms={row.get('query_latency_ms')} "
+            f"protected_regression={row.get('protected_regression')}"
+        )
+    return "\n".join(lines)
+
+
+def render_embedding_experiment_markdown(payload: dict) -> str:
+    report = payload["embedding_experiment"]
+    aggregate = report.get("aggregate", {})
+    index_metrics = report.get("index_metrics") or aggregate.get("index_metrics", {})
+    query_metrics = report.get("query_metrics") or aggregate.get("query_metrics", {})
+    backend = report.get("backend", {})
+    gate = report.get("embedding_recall_gate", {})
+    lines = [
+        "# Embedding Experiment",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Mode:** `{report.get('experiment_mode')}`",
+        f"**Backend:** `{backend.get('selected')}` requested=`{backend.get('requested')}` fallback=`{backend.get('fallback_used')}`",
+        f"**Production status:** `{report.get('production_status')}`",
+        f"**Default live search changed:** `{report.get('default_live_search_changed')}`",
+        "",
+        "## Metrics",
+        "",
+        f"- Documents indexed: {index_metrics.get('document_count', 0)}",
+        f"- Index build ms: {index_metrics.get('index_build_time_ms', 0)}",
+        f"- Peak memory bytes: {index_metrics.get('peak_memory_bytes', 0)}",
+        f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
+        f"- Refresh status: `{index_metrics.get('refresh_status')}`",
+        f"- Refresh/no-change cost ms: {index_metrics.get('refresh_no_change_cost_ms', 0)}",
+        f"- Query cases: {query_metrics.get('case_count', 0)}",
+        f"- Median query ms: {query_metrics.get('median_query_latency_ms', 0)}",
+        f"- P90 query ms: {query_metrics.get('p90_query_latency_ms', 0)}",
+        f"- Embedding candidate count: {query_metrics.get('candidate_count_total', 0)}",
+        f"- Baseline candidate count: {query_metrics.get('baseline_candidate_count_total', 0)}",
+        f"- Protected regressions: {query_metrics.get('protected_regressions', 0)}",
+        "",
+        "## Gate Status",
+        "",
+        "| Gate | Status | Reasons |",
+        "| --- | --- | --- |",
+        (
+            "| `embedding_recall_gate` | "
+            f"`{gate.get('status')}` | "
+            f"{_escape_markdown_table(', '.join(gate.get('reasons') or [])) or '(none)'} |"
+        ),
+    ]
+    if aggregate.get("cap_hit_labels"):
+        lines.extend(["", "## Caps", ""])
+        lines.extend(f"- `{label}`" for label in aggregate.get("cap_hit_labels", []))
+    if aggregate.get("failure_modes"):
+        lines.extend(["", "## Failure Modes", ""])
+        lines.extend(f"- `{failure}`" for failure in aggregate.get("failure_modes", []))
+    selected_roots = report.get("scope", {}).get("selected_roots") or []
+    if selected_roots:
+        lines.extend(["", "## Scope", ""])
+        lines.extend(
+            f"- `{root.get('root_label')}` `{root.get('kind')}` known=`{root.get('known')}`"
+            for root in selected_roots
+        )
+    if report.get("rows"):
+        lines.extend(
+            [
+                "",
+                "## Rows",
+                "",
+                "| Case | Family | Source | Embedding candidates | Baseline candidates | Latency ms | Protected regression |",
+                "| --- | --- | --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in report.get("rows", []):
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                f"{_escape_markdown_table(str(row.get('case_family', '')))} | "
+                f"{_escape_markdown_table(str(row.get('query_source', '')))} | "
+                f"{row.get('candidate_count', 0)} | "
+                f"{row.get('baseline_candidate_count', 0)} | "
+                f"{row.get('query_latency_ms', 0)} | "
+                f"`{row.get('protected_regression')}` |"
+            )
+    lines.extend(["", "## Privacy", ""])
+    privacy = report.get("privacy_contract", {})
+    for key in (
+        "raw_private_text_committed",
+        "private_vectors_committed",
+        "private_indexes_committed",
+        "raw_query_text_committed",
+        "raw_local_paths_committed",
+        "remote_upload",
+        "default_search_promotion",
+    ):
+        lines.append(f"- {key}: `{privacy.get(key)}`")
     return "\n".join(lines)
 
 
