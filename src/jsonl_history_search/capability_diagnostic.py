@@ -136,6 +136,11 @@ def build_capability_diagnostic(args) -> dict[str, Any]:
             "benchmark_gates": {
                 "default_promotion_ready": False,
                 "reason": "Optional backend promotion still needs measured token/tool savings and source-ref equivalence.",
+                "rg_prefilter_gate": {
+                    "status": "unpromoted",
+                    "default_enabled": False,
+                    "required_evidence": "exact/path/slug reductions with equivalent Python-parsed source refs and safe fallback",
+                },
                 "missing_evidence": [
                     "measured_token_savings",
                     "source_ref_equivalence",
@@ -397,17 +402,26 @@ def _benchmark_fixture_capability(fixture: Path) -> Capability:
 
 def _rg_capability() -> Capability:
     path = shutil.which("rg")
+    integration_present = importlib.util.find_spec("jsonl_history_search.rg_prefilter") is not None
     if not path:
         return Capability(
             id="external_text_search_rg",
             name="External text search (`rg`)",
             category="optional_backend",
             status="missing",
-            benefit="Can become a fast exact/path/command prefilter inside planned roots.",
+            benefit="Can optionally prefilter exact/path/slug searches inside planned roots when explicitly enabled.",
             fallback="python_scan",
             expected_slowdown_or_lost_feature="Exact/path searches may parse more selected JSONL bytes.",
             suggested_next_action="Install ripgrep only if exact/path searches are too slow; Python scan remains supported.",
-            details={"binary": "rg", "available": False},
+            details={
+                "binary": "rg",
+                "available": False,
+                "integration_module_present": integration_present,
+                "default_enabled": False,
+                "used_as_final_evidence": False,
+                "promotion_gate": "rg_prefilter_gate",
+                "promotion_status": "unpromoted",
+            },
         )
     version = ""
     status = "available"
@@ -424,11 +438,25 @@ def _rg_capability() -> Capability:
         name="External text search (`rg`)",
         category="optional_backend",
         status=status,
-        benefit="Can become a fast exact/path/command prefilter inside planned roots.",
+        benefit="Can optionally prefilter exact/path/slug searches inside planned roots when explicitly enabled.",
         fallback="python_scan",
         expected_slowdown_or_lost_feature="If unavailable or disabled, exact/path searches use pure Python scanning.",
-        suggested_next_action="No action needed." if status == "available" else "Use Python scan or inspect the rg install.",
-        details={"binary": "rg", "path_present": True, "version": version, "used_as_final_evidence": False},
+        suggested_next_action=(
+            "Use --rg-prefilter only for gated equivalence/reduction checks; Python scan remains the selected backend."
+            if status == "available"
+            else "Use Python scan or inspect the rg install."
+        ),
+        details={
+            "binary": "rg",
+            "path_present": True,
+            "version": version,
+            "integration_module_present": integration_present,
+            "default_enabled": False,
+            "used_as_final_evidence": False,
+            "promotion_gate": "rg_prefilter_gate",
+            "promotion_status": "unpromoted",
+            "eligible_query_scope": "exact_path_or_task_slug_only",
+        },
     )
 
 

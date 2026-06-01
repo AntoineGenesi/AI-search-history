@@ -892,6 +892,14 @@ def render_measured_benchmark_text(payload: dict) -> str:
     statuses = aggregate.get("statuses", {})
     if statuses:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
+    prefilter = aggregate.get("rg_prefilter") or {}
+    if prefilter.get("enabled_rows"):
+        lines.append(
+            "rg_prefilter: "
+            f"files_reduced={prefilter.get('files_reduced', 0)} "
+            f"bytes_reduced={prefilter.get('bytes_reduced', 0)} "
+            f"statuses={prefilter.get('statuses', {})}"
+        )
     for warning in aggregate.get("warnings", []):
         lines.append(f"Warning: {warning}")
     for row in report.get("rows", []):
@@ -927,6 +935,15 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
         f"- Output context bytes: {aggregate.get('output_context_bytes', 0)}",
         f"- Statuses: {', '.join(f'{key}={value}' for key, value in sorted((aggregate.get('statuses') or {}).items())) or '(none)'}",
     ]
+    prefilter = aggregate.get("rg_prefilter") or {}
+    if prefilter.get("enabled_rows"):
+        lines.extend(
+            [
+                f"- rg prefilter files reduced: {prefilter.get('files_reduced', 0)}",
+                f"- rg prefilter bytes reduced: {prefilter.get('bytes_reduced', 0)}",
+                f"- rg prefilter statuses: {', '.join(f'{key}={value}' for key, value in sorted((prefilter.get('statuses') or {}).items())) or '(none)'}",
+            ]
+        )
     if aggregate.get("warnings"):
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- `{warning}`" for warning in aggregate.get("warnings", []))
@@ -984,6 +1001,7 @@ def render_impact_benchmark_text(payload: dict) -> str:
                 f"tool_calls={row.get('median_tool_calls')} "
                 f"subprocess_calls={row.get('median_subprocess_calls')} "
                 f"files={row.get('median_files_opened')} "
+                f"prefilter_files_reduced={row.get('median_prefilter_files_reduced', 0)} "
                 f"context_bytes={row.get('median_output_context_bytes')}"
             )
     for row in report.get("rows", []):
@@ -1030,8 +1048,8 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
                 "",
                 "## Baseline Summary",
                 "",
-                "| Baseline | Hit rate | Recall@1 | Recall@3 | Recall@10 | No-evidence | Wall ms | Tool calls | Subprocess calls | Files | Bytes scanned | Bytes parsed | Context bytes | Candidates |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Baseline | Hit rate | Recall@1 | Recall@3 | Recall@10 | No-evidence | Wall ms | Tool calls | Subprocess calls | Files | Bytes scanned | Bytes parsed | Prefilter files reduced | Prefilter bytes reduced | Context bytes | Candidates |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for name, row in report.get("summary", {}).items():
@@ -1050,6 +1068,8 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('median_files_opened')} | "
                 f"{row.get('median_bytes_scanned')} | "
                 f"{row.get('median_bytes_parsed')} | "
+                f"{row.get('median_prefilter_files_reduced', 0)} | "
+                f"{row.get('median_prefilter_bytes_reduced', 0)} | "
                 f"{row.get('median_output_context_bytes')} | "
                 f"{row.get('median_candidate_count')} |"
             )

@@ -211,7 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument(
         "--baseline",
         action="append",
-        choices=("raw_rg_literal", "terminal_rg_then_open", "package_search"),
+        choices=("raw_rg_literal", "terminal_rg_then_open", "package_search", "package_search_rg_prefilter"),
         default=[],
         help="Baseline to include; may be passed more than once. Defaults to all deterministic baselines.",
     )
@@ -276,6 +276,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-arbitrary-root", action="store_true")
     parser.add_argument("--hard-cap-files", type=int, default=None)
     parser.add_argument("--hard-cap-bytes", type=int, default=None)
+    parser.add_argument(
+        "--rg-prefilter",
+        action="store_true",
+        help="Optionally prefilter already-planned JSONL files with ripgrep before Python JSON parsing.",
+    )
     parser.add_argument(
         "--mask-manifest",
         default=None,
@@ -543,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=source_plan["cwd"],
             mask_context=mask_context,
+            use_rg_prefilter=args.rg_prefilter,
         )
         result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
         manifest_report = (
@@ -579,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=source_plan["cwd"],
             mask_context=mask_context,
+            use_rg_prefilter=args.rg_prefilter,
         )
         payload = {"source_plan": source_plan, **result}
         payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings + _configuration_warnings(source_plan)))

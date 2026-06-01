@@ -20,7 +20,7 @@ from .timeutil import parse_now, timezone_from_args
 
 DEFAULT_FIXTURE = Path("benchmarks/impact_gold/synthetic_cases.json")
 DEFAULT_SYNTHETIC_ROOT = Path("tests/fixtures/impact_benchmark/synthetic_logs")
-DEFAULT_BASELINES = ("raw_rg_literal", "terminal_rg_then_open", "package_search")
+DEFAULT_BASELINES = ("raw_rg_literal", "terminal_rg_then_open", "package_search", "package_search_rg_prefilter")
 VALID_LEGITIMACY = {"synthetic_committed"}
 VALID_OUTCOMES = {"evidence_found", "no_evidence"}
 VALID_FEATURE_FAMILIES = {
@@ -209,6 +209,7 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
                 "raw_rg_literal": _run_raw_rg_literal,
                 "terminal_rg_then_open": _run_terminal_rg_then_open,
                 "package_search": _run_package_search,
+                "package_search_rg_prefilter": _run_package_search_rg_prefilter,
             }[baseline]
             for repeat_index in range(max(1, args.repeat)):
                 rows.append(
@@ -256,6 +257,7 @@ def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str]
             "raw_rg_literal": "fixed literal scan over capped fixture files; no JSH query expansion or ranking",
             "terminal_rg_then_open": "fixed literal scan plus bounded top-line file opens; no JSH query expansion or ranking",
             "package_search": "current JSONL compatibility CLI infer_query/search path",
+            "package_search_rg_prefilter": "optional rg prefilter over capped planned JSONL files, followed by Python JSON parsing for evidence",
         },
         "privacy_contract": _privacy_contract(),
         "total_wall_time_ms": _elapsed_ms(started),
@@ -393,11 +395,62 @@ def _run_package_search(
     args,
     repeat_index: int,
 ) -> dict[str, Any]:
+    return _run_package_search_variant(
+        case=case,
+        files=files,
+        doc_index=doc_index,
+        plan=plan,
+        args=args,
+        repeat_index=repeat_index,
+        baseline="package_search",
+        use_rg_prefilter=False,
+    )
+
+
+def _run_package_search_rg_prefilter(
+    *,
+    case: dict[str, Any],
+    files: list[ImpactFile],
+    doc_index: dict[tuple[str, int], str],
+    plan: SourcePlan,
+    args,
+    repeat_index: int,
+) -> dict[str, Any]:
+    return _run_package_search_variant(
+        case=case,
+        files=files,
+        doc_index=doc_index,
+        plan=plan,
+        args=args,
+        repeat_index=repeat_index,
+        baseline="package_search_rg_prefilter",
+        use_rg_prefilter=True,
+    )
+
+
+def _run_package_search_variant(
+    *,
+    case: dict[str, Any],
+    files: list[ImpactFile],
+    doc_index: dict[tuple[str, int], str],
+    plan: SourcePlan,
+    args,
+    repeat_index: int,
+    baseline: str,
+    use_rg_prefilter: bool,
+) -> dict[str, Any]:
     started = time.perf_counter()
     default_tz = timezone_from_args(args.timezone, args.timezone_offset)
     now = parse_now(args.now, default_tz)
     intent = infer_query(_case_query(case), now=now)
-    result = search(plan, intent, default_tz=default_tz, cwd=str(Path(args.cwd).expanduser().resolve()))
+    result = search(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=str(Path(args.cwd).expanduser().resolve()),
+        use_rg_prefilter=use_rg_prefilter,
+    )
+    prefilter = _prefilter_row_stats(result, enabled=use_rg_prefilter)
     candidates: list[LiteralCandidate] = []
     for group in result.get("groups", []):
         for match in group.get("matches", []):
@@ -412,16 +465,17 @@ def _run_package_search(
             )
     return _row(
         case=case,
-        baseline="package_search",
+        baseline=baseline,
         repeat_index=repeat_index,
         started=started,
         tool_calls=1,
-        subprocess_calls=0,
+        subprocess_calls=1 if prefilter.get("attempted") else 0,
         files_opened=int(result.get("searched_files", 0)),
         bytes_scanned=int(result.get("searched_bytes", 0)),
         bytes_parsed=int(result.get("searched_bytes", 0)),
         output_context_bytes=len(json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
         candidates=candidates,
+        rg_prefilter=prefilter,
     )
 
 
@@ -546,6 +600,7 @@ def _row(
     bytes_parsed: int,
     output_context_bytes: int,
     candidates: list[LiteralCandidate],
+    rg_prefilter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gold = set(case.get("gold_doc_ids") or [])
     candidate_doc_ids = [candidate.doc_id for candidate in candidates if candidate.doc_id]
@@ -575,6 +630,8 @@ def _row(
         "recall_at_10": _recall_at(candidate_doc_ids, gold, 10, expected_no_evidence),
         "no_evidence_correct": no_evidence_correct if expected_no_evidence else None,
         "top_candidate_doc_ids": candidate_doc_ids[:10],
+        "top_candidate_source_refs": _sanitized_source_refs(candidates[:10]),
+        "rg_prefilter": rg_prefilter or _prefilter_row_stats({}, enabled=False),
     }
 
 
@@ -584,6 +641,45 @@ def _recall_at(candidate_doc_ids: list[str], gold: set[str], k: int, expected_no
     if not gold:
         return 0.0
     return round(len(set(candidate_doc_ids[:k]) & gold) / len(gold), 3)
+
+
+def _sanitized_source_refs(candidates: list[LiteralCandidate]) -> list[str]:
+    return [f"{candidate.doc_id or 'unknown'}:{candidate.line}" for candidate in candidates]
+
+
+def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+    stats = result.get("prefilter") if enabled else None
+    if not isinstance(stats, dict):
+        return {
+            "enabled": bool(enabled),
+            "available": None,
+            "attempted": False,
+            "status": "disabled" if not enabled else "not_attempted",
+            "fallback_reason": None,
+            "candidate_files": 0,
+            "candidate_bytes": 0,
+            "matched_files": 0,
+            "matched_bytes": 0,
+            "files_reduced": 0,
+            "bytes_reduced": 0,
+            "files_reduction_ratio": 0.0,
+            "bytes_reduction_ratio": 0.0,
+        }
+    return {
+        "enabled": bool(stats.get("enabled")),
+        "available": stats.get("available"),
+        "attempted": bool(stats.get("attempted")),
+        "status": str(stats.get("status") or "unknown"),
+        "fallback_reason": stats.get("fallback_reason"),
+        "candidate_files": int(stats.get("candidate_files", 0)),
+        "candidate_bytes": int(stats.get("candidate_bytes", 0)),
+        "matched_files": int(stats.get("matched_files", 0)),
+        "matched_bytes": int(stats.get("matched_bytes", 0)),
+        "files_reduced": int(stats.get("files_reduced", 0)),
+        "bytes_reduced": int(stats.get("bytes_reduced", 0)),
+        "files_reduction_ratio": float(stats.get("files_reduction_ratio", 0.0)),
+        "bytes_reduction_ratio": float(stats.get("bytes_reduction_ratio", 0.0)),
+    }
 
 
 def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[str, Any]:
@@ -611,8 +707,46 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             "median_bytes_parsed": _median(row["bytes_parsed"] for row in selected),
             "median_output_context_bytes": _median(row["output_context_bytes"] for row in selected),
             "median_candidate_count": _median(row["candidate_count"] for row in selected),
+            "median_prefilter_files_reduced": _median(row["rg_prefilter"]["files_reduced"] for row in selected),
+            "median_prefilter_bytes_reduced": _median(row["rg_prefilter"]["bytes_reduced"] for row in selected),
+            "median_prefilter_files_reduction_ratio": _median(
+                row["rg_prefilter"]["files_reduction_ratio"] for row in selected
+            ),
+            "median_prefilter_bytes_reduction_ratio": _median(
+                row["rg_prefilter"]["bytes_reduction_ratio"] for row in selected
+            ),
         }
+    if "package_search" in summary and "package_search_rg_prefilter" in summary:
+        summary["package_search_rg_prefilter"]["equivalence_vs_package_search"] = _package_equivalence(rows)
     return summary
+
+
+def _package_equivalence(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    python_rows = {
+        (row["case_id"], row["repeat_index"]): row
+        for row in rows
+        if row["baseline"] == "package_search"
+    }
+    rg_rows = [
+        row
+        for row in rows
+        if row["baseline"] == "package_search_rg_prefilter" and (row["case_id"], row["repeat_index"]) in python_rows
+    ]
+    doc_equivalent = 0
+    ref_equivalent = 0
+    for row in rg_rows:
+        baseline = python_rows[(row["case_id"], row["repeat_index"])]
+        if row["top_candidate_doc_ids"] == baseline["top_candidate_doc_ids"]:
+            doc_equivalent += 1
+        if row["top_candidate_source_refs"] == baseline["top_candidate_source_refs"]:
+            ref_equivalent += 1
+    compared = len(rg_rows)
+    return {
+        "compared_runs": compared,
+        "equivalent_top_candidate_doc_ids": doc_equivalent,
+        "equivalent_top_candidate_source_refs": ref_equivalent,
+        "all_equivalent": bool(compared and doc_equivalent == compared and ref_equivalent == compared),
+    }
 
 
 def _selected_baselines(requested: list[str]) -> tuple[str, ...]:

@@ -4,10 +4,11 @@ import time
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .clustering import facets_for_record
+from .masking import MaskContext
 from .query import QueryIntent
 from .ranking import Match, group_matches, is_weak_partial_generic, make_snippet, score_record, should_consider
+from .rg_prefilter import filter_planned_files
 from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
-from .masking import MaskContext
 
 
 def search(
@@ -17,6 +18,7 @@ def search(
     default_tz,
     cwd: str | None = None,
     mask_context: MaskContext | None = None,
+    use_rg_prefilter: bool = False,
 ) -> dict:
     started = time.monotonic()
     warnings = list(plan.warnings)
@@ -29,14 +31,24 @@ def search(
     searched_files = 0
     searched_bytes = 0
     stopped = False
+    prefilter = None
+    planned_files = []
 
     for enumerated in enumerate_jsonl_files(plan):
+        path, size, enum_warnings = enumerated
+        warnings = enum_warnings
+        planned_files.append((path, size))
+
+    if use_rg_prefilter:
+        prefilter_result = filter_planned_files(plan=plan, intent=intent, files=planned_files, cwd=cwd)
+        prefilter = prefilter_result.stats
+        planned_files = [(item.path, item.size) for item in prefilter_result.files]
+
+    for path, size in planned_files:
         if time.monotonic() - started > plan.limits.max_elapsed:
             warnings.append("Stopped before opening next file at max elapsed cap.")
             stopped = True
             break
-        path, size, enum_warnings = enumerated
-        warnings = enum_warnings
         searched_files += 1
         searched_bytes += size
         source_kind = source_kind_for_path(path, plan)
@@ -113,6 +125,8 @@ def search(
         "warnings": sorted(set(warnings + plan.warnings)),
         "blind_spots": sorted(set(blind_spots)),
     }
+    if prefilter is not None:
+        payload["prefilter"] = prefilter
     if mask_context is not None and mask_context.stats is not None:
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
