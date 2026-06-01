@@ -36,6 +36,8 @@ def render_text(payload: dict) -> str:
         return render_measured_benchmark_text(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_text(payload)
+    if "live_terminal_protocol" in payload:
+        return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
         return render_embedding_experiment_text(payload)
     plan = payload["source_plan"]
@@ -113,6 +115,8 @@ def render_markdown(payload: dict) -> str:
         return render_measured_benchmark_markdown(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_markdown(payload)
+    if "live_terminal_protocol" in payload:
+        return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
         return render_embedding_experiment_markdown(payload)
     text = render_text(payload)
@@ -1588,6 +1592,149 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('output_context_bytes')} | "
                 f"{row.get('candidate_count')} |"
             )
+    return "\n".join(lines)
+
+
+def render_live_terminal_protocol_text(payload: dict) -> str:
+    protocol = payload["live_terminal_protocol"]
+    decision = protocol.get("decision", {})
+    caps = protocol.get("caps", {})
+    lines = [
+        "Live terminal simulation protocol",
+        f"Status: {protocol.get('status')}",
+        f"Data source: {protocol.get('data_source')}",
+        f"Command inert: {protocol.get('command_inert')}",
+        f"Live run performed: {protocol.get('live_run_performed')}",
+        f"Codex spawned: {protocol.get('codex_spawned')}",
+        f"Raw trace parsed: {protocol.get('raw_trace_parsed')}",
+        f"Private logs inspected: {protocol.get('private_logs_inspected')}",
+        f"Decision: {decision.get('live_terminal_simulation_value')}",
+        f"Gate promotion: {decision.get('promotion_rule')}",
+        "Caps:",
+    ]
+    for key in sorted(caps):
+        lines.append(f"- {key}: {caps[key]}")
+    lines.append("Allowlist:")
+    for item in protocol.get("allowlist", []):
+        lines.append(f"- {item.get('command')}: {', '.join(item.get('constraints') or [])}")
+    lines.append("Denylist:")
+    for item in protocol.get("denylist", []):
+        lines.append(f"- {item.get('command')}: {item.get('reason')}")
+    raw_trace = protocol.get("raw_trace_rule", {})
+    lines.append(f"Raw trace directory: {raw_trace.get('directory')}")
+    lines.append(f"Committed raw trace allowed: {raw_trace.get('committed_raw_trace_allowed')}")
+    contract = protocol.get("committed_output_contract", {})
+    lines.append("Allowed committed fields: " + ", ".join(contract.get("allowed_fields") or []))
+    lines.append("Forbidden committed fields: " + ", ".join(contract.get("forbidden_fields") or []))
+    return "\n".join(lines)
+
+
+def render_live_terminal_protocol_markdown(payload: dict) -> str:
+    protocol = payload["live_terminal_protocol"]
+    decision = protocol.get("decision", {})
+    raw_trace = protocol.get("raw_trace_rule", {})
+    opt_in = protocol.get("opt_in_contract", {})
+    output_contract = protocol.get("committed_output_contract", {})
+    reviewer = protocol.get("reviewer_proof_contract", {})
+    template = protocol.get("sanitized_aggregate_template", {})
+    counters = template.get("aggregate_counters", {})
+    lines = [
+        "# JSH-026c Live Terminal Simulation Safety Protocol",
+        "",
+        f"**Status:** `{protocol.get('status')}`",
+        f"**Data source:** `{protocol.get('data_source')}`",
+        f"**Command inert:** `{protocol.get('command_inert')}`",
+        f"**Live run performed:** `{protocol.get('live_run_performed')}`",
+        f"**Codex spawned:** `{protocol.get('codex_spawned')}`",
+        f"**Raw trace parsed:** `{protocol.get('raw_trace_parsed')}`",
+        f"**Private logs inspected:** `{protocol.get('private_logs_inspected')}`",
+        "",
+        "## Decision",
+        "",
+        f"- Live simulation value: `{decision.get('live_terminal_simulation_value')}`",
+        f"- Adds value beyond deterministic baselines: `{decision.get('adds_value_beyond_deterministic_baselines')}`",
+        f"- Promotion rule: {decision.get('promotion_rule')}",
+        f"- Recommended next step: {decision.get('recommended_next_step')}",
+        "",
+        "## Opt-In Contract",
+        "",
+        f"- Future live run requires explicit approval: `{opt_in.get('future_live_run_requires_explicit_approval')}`",
+        f"- Approval scope: `{opt_in.get('approval_scope')}`",
+        f"- Default action: `{opt_in.get('default_action')}`",
+        f"- This command can run simulation: `{opt_in.get('this_command_can_run_simulation')}`",
+        f"- Requires reviewer-approved case IDs before commit: `{opt_in.get('requires_reviewer_approved_case_ids_before_commit')}`",
+        "",
+        "## Caps",
+        "",
+        "| Cap | Value |",
+        "| --- | ---: |",
+    ]
+    for key, value in sorted((protocol.get("caps") or {}).items()):
+        lines.append(f"| `{_escape_markdown_table(str(key))}` | {value} |")
+    lines.extend(
+        [
+            "",
+            "## Allowlist",
+            "",
+            "| Command | Constraints |",
+            "| --- | --- |",
+        ]
+    )
+    for item in protocol.get("allowlist", []):
+        constraints = "; ".join(item.get("constraints") or [])
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(item.get('command')))}` | "
+            f"{_escape_markdown_table(constraints)} |"
+        )
+    lines.extend(["", "## Denylist", "", "| Command | Reason |", "| --- | --- |"])
+    for item in protocol.get("denylist", []):
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(item.get('command')))}` | "
+            f"{_escape_markdown_table(str(item.get('reason')))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Raw Trace Rule",
+            "",
+            f"- Directory: `{raw_trace.get('directory')}`",
+            f"- Git ignored: `{raw_trace.get('git_ignored')}`",
+            f"- Committed raw trace allowed: `{raw_trace.get('committed_raw_trace_allowed')}`",
+            f"- Private trace content allowed in reports: `{raw_trace.get('private_trace_content_allowed_in_reports')}`",
+            f"- Required cleanup review: `{raw_trace.get('required_cleanup_review')}`",
+            "",
+            "## Committed Output Contract",
+            "",
+            "Allowed fields:",
+        ]
+    )
+    lines.extend(f"- `{item}`" for item in output_contract.get("allowed_fields", []))
+    lines.extend(["", "Forbidden fields:"])
+    lines.extend(f"- `{item}`" for item in output_contract.get("forbidden_fields", []))
+    lines.extend(["", f"Report basis: `{output_contract.get('report_basis')}`"])
+    lines.extend(["", "## Reviewer Proof Contract", "", "Required checks:"])
+    lines.extend(f"- `{item}`" for item in reviewer.get("required_checks", []))
+    lines.extend(["", "Reviewer must confirm:"])
+    lines.extend(f"- `{item}`" for item in reviewer.get("must_confirm", []))
+    lines.extend(
+        [
+            "",
+            "## Sanitized Aggregate Template",
+            "",
+            f"- Case count: `{template.get('case_count')}`",
+            f"- Approved by reviewer: `{template.get('approved_by_reviewer')}`",
+            f"- Simulation status: `{template.get('simulation_status')}`",
+            f"- Diagnostic only: `{template.get('diagnostic_only')}`",
+            f"- Gate promotion allowed: `{template.get('gate_promotion_allowed')}`",
+            "",
+            "| Counter | Value |",
+            "| --- | --- |",
+        ]
+    )
+    for key, value in counters.items():
+        lines.append(f"| `{_escape_markdown_table(str(key))}` | `{value}` |")
     return "\n".join(lines)
 
 
