@@ -52,6 +52,8 @@ class PlannedRoot:
             "recursive": self.recursive,
             "known": self.known,
             "estimate": self.estimate,
+            "scope_label": "selected_root",
+            "privacy_label": "private_root",
         }
 
 
@@ -61,7 +63,7 @@ class RejectedRoot:
     reason: str
 
     def to_dict(self) -> dict:
-        return {"path": self.path, "reason": self.reason}
+        return {"path": self.path, "reason": self.reason, "scope_label": "excluded_root"}
 
 
 @dataclass
@@ -79,6 +81,17 @@ class SourcePlan:
             "warnings": self.warnings,
             "blind_spots": self.blind_spots,
             "limits": self.limits.to_dict(),
+            "selected_root_count": len(self.roots),
+            "private_root_count": len(self.roots),
+            "rejected_root_count": len(self.rejected_roots),
+            "scope_terms": [
+                "selected_root",
+                "private_root",
+                "searched_scope",
+                "excluded_scope",
+                "not_searched_scope",
+                "cap_hit",
+            ],
         }
 
 

@@ -658,14 +658,17 @@ def _escape_markdown_table(value: str) -> str:
 
 def render_agent_find_text(payload: dict) -> str:
     report = payload["agent_find"]
+    plan_sources = report.get("plan_sources", {})
+    source_scope = plan_sources.get("source_scope", {})
+    cap_hit = plan_sources.get("cap_hit", {})
     lines = [
         "JSONL Find",
         f"Status: {report.get('status')}",
         f"Query: {report.get('query', {}).get('original', '')}",
         (
             "Scope: "
-            f"{report.get('plan_sources', {}).get('searched_files', 0)} files, "
-            f"{report.get('plan_sources', {}).get('searched_bytes', 0)} bytes searched"
+            f"{plan_sources.get('searched_files', 0)} files, "
+            f"{plan_sources.get('searched_bytes', 0)} bytes searched"
         ),
         (
             "Candidates: "
@@ -673,6 +676,16 @@ def render_agent_find_text(payload: dict) -> str:
             f"({report.get('context_budget', {}).get('payload_bytes', 0)} bytes inline)"
         ),
     ]
+    if source_scope:
+        lines.insert(
+            4,
+            "Source roots: "
+            f"{len(source_scope.get('selected_roots', []))} selected/private, "
+            f"{source_scope.get('excluded_scope', {}).get('rejected_root_count', 0)} excluded, "
+            f"{source_scope.get('not_searched_scope', {}).get('missing_root_count', 0)} missing",
+        )
+    if cap_hit.get("hit"):
+        lines.append(f"Cap hit: {', '.join(cap_hit.get('caps_hit', []))}")
     for candidate in report.get("find_candidates", [])[:8]:
         ref = candidate.get("source_ref", {})
         lines.append(
@@ -684,6 +697,14 @@ def render_agent_find_text(payload: dict) -> str:
         )
     if report.get("status") == "no_evidence":
         no_evidence = report.get("no_evidence_report", {})
+        not_searched = no_evidence.get("not_searched_scope", {})
+        searched = no_evidence.get("searched_scope", {})
+        lines.append(
+            "No-evidence scope: "
+            f"not found in {searched.get('searched_files', 0)} searched files; "
+            f"{not_searched.get('missing_root_count', 0)} missing selected roots; "
+            f"{len(no_evidence.get('excluded_scope', []))} excluded roots"
+        )
         lines.append(f"No evidence: {no_evidence.get('why_not_confident')}")
     suggestions = report.get("next_search_suggestions") or []
     if suggestions:
@@ -694,14 +715,17 @@ def render_agent_find_text(payload: dict) -> str:
 
 def render_agent_find_markdown(payload: dict) -> str:
     report = payload["agent_find"]
+    plan_sources = report.get("plan_sources", {})
+    source_scope = plan_sources.get("source_scope", {})
+    cap_hit = plan_sources.get("cap_hit", {})
     lines = [
         "# JSONL Find",
         "",
         f"**Status:** {report.get('status')}",
         f"**Query:** {report.get('query', {}).get('original', '')}",
         (
-            f"**Scope:** {report.get('plan_sources', {}).get('searched_files', 0)} files, "
-            f"{report.get('plan_sources', {}).get('searched_bytes', 0)} bytes searched"
+            f"**Scope:** {plan_sources.get('searched_files', 0)} files, "
+            f"{plan_sources.get('searched_bytes', 0)} bytes searched"
         ),
         (
             f"**Context budget:** {report.get('context_budget', {}).get('payload_bytes', 0)} bytes, "
@@ -713,6 +737,15 @@ def render_agent_find_markdown(payload: dict) -> str:
         "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if source_scope:
+        lines.insert(
+            5,
+            f"**Source roots:** {len(source_scope.get('selected_roots', []))} selected/private, "
+            f"{source_scope.get('excluded_scope', {}).get('rejected_root_count', 0)} excluded, "
+            f"{source_scope.get('not_searched_scope', {}).get('missing_root_count', 0)} missing",
+        )
+    if cap_hit.get("hit"):
+        lines.extend(["", f"**Cap hit:** {', '.join(cap_hit.get('caps_hit', []))}"])
     for candidate in report.get("find_candidates", []):
         ref = candidate.get("source_ref", {})
         source = f"{ref.get('path')}:{ref.get('line')}"
@@ -728,7 +761,22 @@ def render_agent_find_markdown(payload: dict) -> str:
         )
     if report.get("status") == "no_evidence":
         no_evidence = report.get("no_evidence_report", {})
-        lines.extend(["", "## No Evidence", "", no_evidence.get("why_not_confident", "")])
+        not_searched = no_evidence.get("not_searched_scope", {})
+        searched = no_evidence.get("searched_scope", {})
+        lines.extend(
+            [
+                "",
+                "## No Evidence",
+                "",
+                (
+                    f"Not found in {searched.get('searched_files', 0)} searched files. "
+                    f"Missing selected roots: {not_searched.get('missing_root_count', 0)}. "
+                    f"Excluded roots: {len(no_evidence.get('excluded_scope', []))}."
+                ),
+                "",
+                no_evidence.get("why_not_confident", ""),
+            ]
+        )
     suggestions = report.get("next_search_suggestions") or []
     if suggestions:
         lines.extend(["", "## Next Searches", ""])
