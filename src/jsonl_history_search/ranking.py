@@ -4,6 +4,7 @@ import re
 from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import PurePath
 
 from .clustering import cluster_matches
 from .query import QueryIntent
@@ -48,10 +49,30 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
     lowered = record.text.lower()
     match_terms = active_match_terms(intent)
     for term in match_terms:
-        if term.lower() in lowered:
-            stage = stage_for_term(intent, term)
+        stage = stage_for_term(intent, term)
+        matched = term.lower() in lowered
+        phrase_like = False
+        if not matched and stage == "exact_phrase":
+            phrase_like = phrase_like_match(term, lowered)
+            matched = phrase_like
+        if matched:
             score += TEXT_STAGE_WEIGHTS.get(stage, 8.0)
             reasons.append(f"text:{stage}:{term}")
+            if phrase_like:
+                reasons.append(f"phrase:separator_insensitive:{term}")
+            elif stage == "exact_phrase" and len(term_tokens(term)) > 1:
+                reasons.append(f"phrase:exact:{term}")
+
+    coverage = base_term_coverage(record.text, intent)
+    base_count = len(coverage["base_terms"])
+    covered_count = len(coverage["covered"])
+    if base_count:
+        reasons.append(f"coverage:base_terms:{covered_count}/{base_count}")
+        if covered_count == base_count and base_count > 1:
+            score += 9.0
+        elif covered_count > 1:
+            score += min(6.0, covered_count * 2.0)
+
     for fuzzy in fuzzy_match_terms(record.text, intent):
         if any(reason.endswith(f":{fuzzy['query']}") for reason in reasons):
             continue
@@ -67,17 +88,21 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
         if intent.date_window_start <= record.timestamp.astimezone(intent.date_window_start.tzinfo) < intent.date_window_end:
             score += 8
             reasons.append("date-window")
-    if cwd and record.cwd and cwd in record.cwd:
-        score += 6
-        reasons.append("cwd")
     artifacts = artifact_candidates(record.text)
+    project_score, project_reasons = project_evidence(record, cwd, artifacts)
+    if project_score:
+        score += project_score
+        reasons.extend(project_reasons)
     if intent.artifact_hints and artifacts:
         score += 5
         reasons.append("artifact:artifact_path")
+    if is_partial_generic_multi_token(reasons, intent):
+        score -= 4.0
+        reasons.append("penalty:partial_generic_multi_token")
     if record.timestamp:
         age_days = max(0.0, (datetime.now(timezone.utc) - record.timestamp.astimezone(timezone.utc)).total_seconds() / 86400)
         score += max(0.0, 3.0 - min(age_days / 30.0, 3.0))
-    return score, reasons, artifacts
+    return max(score, 0.0), sorted(set(reasons), key=reasons.index), artifacts
 
 
 def role_matches(actual: str, wanted: str) -> bool:
@@ -103,6 +128,8 @@ def should_consider(record: Record, intent: QueryIntent) -> bool:
     if terms:
         lowered = record.text.lower()
         if any(term.lower() in lowered for term in terms):
+            return True
+        if any(stage_for_term(intent, term) == "exact_phrase" and phrase_like_match(term, lowered) for term in terms):
             return True
         return bool(fuzzy_match_terms(record.text, intent))
     return True
@@ -130,6 +157,126 @@ def stage_for_term(intent: QueryIntent, term: str) -> str:
     if "base" in reasons:
         return "normalized_terms"
     return "normalized_terms"
+
+
+def is_weak_partial_generic(reasons: list[str]) -> bool:
+    reason_set = set(reasons)
+    if "penalty:partial_generic_multi_token" not in reason_set:
+        return False
+    strong_prefixes = (
+        "phrase:",
+        "artifact:",
+        "text:artifact_path:",
+        "text:task_slug:",
+    )
+    return not any(reason.startswith(strong_prefixes) for reason in reason_set)
+
+
+def is_partial_generic_multi_token(reasons: list[str], intent: QueryIntent) -> bool:
+    base_terms = concrete_base_terms(intent)
+    if len(base_terms) < 2 or not has_multi_token_exact_phrase(intent):
+        return False
+    if any(reason.startswith("phrase:") for reason in reasons):
+        return False
+    coverage_reason = next((reason for reason in reasons if reason.startswith("coverage:base_terms:")), "")
+    covered_count, total_count = parse_coverage_reason(coverage_reason)
+    if total_count == len(base_terms) and covered_count == total_count:
+        return False
+    generic_hits = [
+        reason
+        for reason in reasons
+        if reason.startswith("text:normalized_terms:")
+        or reason.startswith("text:synonym_paraphrase:")
+        or reason.startswith("text:semantic_local:")
+        or reason.startswith("fuzzy:typo_fuzzy:")
+    ]
+    return bool(generic_hits)
+
+
+def has_multi_token_exact_phrase(intent: QueryIntent) -> bool:
+    for term in intent.terms:
+        if "exact_phrase" in set(intent.expansion_reasons.get(term, [])) and len(term_tokens(term)) > 1:
+            return True
+    return False
+
+
+def parse_coverage_reason(reason: str) -> tuple[int, int]:
+    if not reason:
+        return 0, 0
+    value = reason.rsplit(":", 1)[-1]
+    try:
+        covered_text, total_text = value.split("/", 1)
+        return int(covered_text), int(total_text)
+    except ValueError:
+        return 0, 0
+
+
+def base_term_coverage(text: str, intent: QueryIntent) -> dict[str, list[str]]:
+    terms = concrete_base_terms(intent)
+    if not terms:
+        return {"base_terms": [], "covered": []}
+    tokens = token_set(text)
+    lowered = text.lower()
+    covered = []
+    for term in terms:
+        normalized = term.lower()
+        if normalized in tokens or normalized in lowered or phrase_like_match(normalized, lowered):
+            covered.append(term)
+    return {"base_terms": terms, "covered": sorted(set(covered))}
+
+
+def concrete_base_terms(intent: QueryIntent) -> list[str]:
+    return sorted({term.lower() for term in intent.base_terms if len(term) > 2})
+
+
+def phrase_like_match(term: str, lowered_text: str) -> bool:
+    tokens = term_tokens(term)
+    if len(tokens) < 2:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"[\W_./:-]+".join(re.escape(token) for token in tokens) + r"(?![a-z0-9])"
+    return re.search(pattern, lowered_text) is not None
+
+
+def term_tokens(term: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", term.lower())
+
+
+def project_evidence(record: Record, cwd: str | None, artifacts: list[str]) -> tuple[float, list[str]]:
+    if not cwd:
+        return 0.0, []
+    reasons: list[str] = []
+    score = 0.0
+    cwd_text = cwd.lower().replace("\\", "/").rstrip("/")
+    record_cwd = (record.cwd or "").lower().replace("\\", "/").rstrip("/")
+    lowered_text = record.text.lower()
+
+    if record_cwd and record_cwd == cwd_text:
+        score += 5.0
+        reasons.extend(["cwd", "project:cwd_exact"])
+    elif record_cwd and cwd_text and record_cwd.startswith(f"{cwd_text}/"):
+        score += 3.0
+        reasons.extend(["cwd", "project:cwd_exact"])
+
+    basename = PurePath(cwd_text).name if cwd_text else ""
+    slug_variants = {basename, basename.replace("-", " "), basename.replace("_", " "), basename.replace("-", "_"), basename.replace("_", "-")}
+    if basename and any(variant and (variant in record_cwd or variant in lowered_text) for variant in slug_variants):
+        score += 2.0
+        reasons.append("project:cwd_basename")
+
+    if task_or_doc_path_evidence(lowered_text, artifacts):
+        score += 3.0
+        reasons.append("project:task_or_doc_path")
+
+    if score > 8.0:
+        score = 8.0
+    return score, sorted(set(reasons), key=reasons.index)
+
+
+def task_or_doc_path_evidence(lowered_text: str, artifacts: list[str]) -> bool:
+    projectish_paths = tuple(artifact for artifact in artifacts if artifact.startswith(("tasks/", "docs/", "reports/", "codex/state/reviews/")))
+    if projectish_paths:
+        return True
+    return bool(re.search(r"\b(?:tasks|docs|reports|codex/state/reviews)/[\w./-]+", lowered_text))
 
 
 def fuzzy_match_terms(text: str, intent: QueryIntent, *, limit: int = 8) -> list[dict[str, str]]:
