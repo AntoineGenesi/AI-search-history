@@ -782,8 +782,8 @@ def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str
 
 def _private_output_dir(raw_output_dir: str | None, now: datetime) -> Path:
     if raw_output_dir:
-        return Path(raw_output_dir).expanduser()
-    return Path(".private") / "jsh-035b" / f"run-{now.strftime('%Y%m%d-%H%M%S')}"
+        return Path(raw_output_dir).expanduser().resolve()
+    return (Path(".private") / "jsh-035b" / f"run-{now.strftime('%Y%m%d-%H%M%S')}").resolve()
 
 
 def _is_ignored_private_path(path: Path) -> bool:
