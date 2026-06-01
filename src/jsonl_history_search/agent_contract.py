@@ -78,7 +78,12 @@ def build_agent_find_payload(
         "status": status,
         "query": source_plan["query"],
         "command_surface": command_surface(),
-        "plan_sources": build_plan_sources(source_plan, search_result, manifest_report),
+        "plan_sources": build_plan_sources(
+            source_plan,
+            search_result,
+            manifest_report,
+            include_source_scope=status == "no_evidence",
+        ),
         "broaden_query": build_broaden_query(source_plan["query"]),
         "find_candidates": candidate_dicts[:INLINE_CANDIDATE_LIMIT],
         "timeline": [candidate.to_dict() for candidate in timeline[:INLINE_CANDIDATE_LIMIT]],
@@ -352,8 +357,18 @@ def stage_reason_code(stage: str) -> str:
     return codes.get(stage, stage)
 
 
-def build_plan_sources(source_plan: dict, search_result: dict, manifest_report: dict | None) -> dict:
+def build_plan_sources(
+    source_plan: dict,
+    search_result: dict,
+    manifest_report: dict | None,
+    *,
+    include_source_scope: bool = False,
+) -> dict:
     sources = source_plan["sources"]
+    cap_hit = cap_hit_status(
+        warnings=list(search_result.get("warnings", []) or sources.get("warnings", [])),
+        limits=sources.get("limits", {}),
+    )
     wrong_root_warnings = [
         item["reason"]
         for item in sources.get("rejected_roots", [])
@@ -370,6 +385,12 @@ def build_plan_sources(source_plan: dict, search_result: dict, manifest_report: 
         "searched_bytes": search_result.get("searched_bytes", 0),
         "ordering": "scanner score desc, timestamp desc; timeline section is timestamp asc",
     }
+    if include_source_scope:
+        source_scope = build_source_scope_summary(source_plan, search_result)
+        payload["source_scope"] = source_scope
+        payload["cap_hit"] = source_scope["cap_hit"]
+    elif cap_hit["hit"]:
+        payload["cap_hit"] = cap_hit
     if manifest_report:
         report = manifest_report.get("manifest_report", {})
         payload["manifest_shortlist"] = {
@@ -490,6 +511,7 @@ def build_no_evidence_report(
             "needed": False,
             "reason": "Candidates were found; inspect find_candidates, timeline, and cluster_candidates.",
         }
+    source_scope = build_source_scope_summary(source_plan, search_result)
     weak_candidates = []
     if manifest_report:
         selected = manifest_report.get("manifest_report", {}).get("shortlist", {}).get("selected_entries", [])
@@ -504,16 +526,120 @@ def build_no_evidence_report(
     return {
         "needed": True,
         "answer": "not_found_yet",
-        "searched_scope": {
-            "roots": source_plan["sources"].get("roots", []),
-            "searched_files": search_result.get("searched_files", 0),
-            "searched_bytes": search_result.get("searched_bytes", 0),
-        },
-        "excluded_scope": source_plan["sources"].get("rejected_roots", []),
+        "answer_scope": "not_found_in_searched_scope",
+        "searched_scope": source_scope["searched_scope"],
+        "excluded_scope": source_scope["excluded_scope"]["rejected_roots"],
+        "excluded_scope_summary": source_scope["excluded_scope"],
+        "not_searched_scope": source_scope["not_searched_scope"],
+        "selected_roots": source_scope["selected_roots"],
+        "private_roots": source_scope["private_roots"],
+        "cap_hit": source_scope["cap_hit"],
         "weak_candidates": weak_candidates,
         "warnings": search_result.get("warnings", []),
         "blind_spots": search_result.get("blind_spots", []),
-        "why_not_confident": "No matching candidate rows survived the current bounded source plan and query stages.",
+        "why_not_confident": (
+            "No matching candidate rows survived the searched scope. "
+            "This does not prove evidence is absent from excluded roots, missing roots, roots outside the source plan, or scope beyond any hit caps."
+        ),
+    }
+
+
+def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
+    sources = source_plan.get("sources", {})
+    roots = list(sources.get("roots", []))
+    rejected_roots = list(sources.get("rejected_roots", []))
+    blind_spots = list(search_result.get("blind_spots", []) or sources.get("blind_spots", []))
+    missing_roots = [root for root in roots if root_is_missing(root, blind_spots)]
+    missing_paths = {root.get("path") for root in missing_roots}
+    searched_roots = [root for root in roots if root.get("path") not in missing_paths]
+    cap_hit = cap_hit_status(
+        warnings=list(search_result.get("warnings", []) or sources.get("warnings", [])),
+        limits=sources.get("limits", {}),
+    )
+    not_searched_notes = [
+        "Roots outside the selected source plan were not searched.",
+    ]
+    if missing_roots:
+        not_searched_notes.append("Some selected roots were missing and were not opened.")
+    if cap_hit["hit"]:
+        not_searched_notes.append("At least one cap stopped enumeration, scanning, or candidate retention before full selected-root coverage.")
+    if rejected_roots:
+        not_searched_notes.append("Rejected roots are listed separately under excluded_scope and were not traversed.")
+    return {
+        "terms": sources.get("scope_terms", []),
+        "selected_roots": [compact_scope_root(root) for root in roots],
+        "private_roots": [compact_scope_root(root) for root in roots if root.get("privacy_label") == "private_root"],
+        "searched_scope": {
+            "roots": [compact_scope_root(root) for root in searched_roots],
+            "searched_files": search_result.get("searched_files", 0),
+            "searched_bytes": search_result.get("searched_bytes", 0),
+            "result_meaning": "not_found_in_this_scope_only" if not search_result.get("groups") else "candidates_found_in_this_scope",
+        },
+        "excluded_scope": {
+            "rejected_roots": [compact_rejected_root(root) for root in rejected_roots],
+            "rejected_root_count": len(rejected_roots),
+            "meaning": "requested roots rejected before traversal by source-planning guards",
+        },
+        "not_searched_scope": {
+            "missing_roots": [compact_scope_root(root) for root in missing_roots],
+            "missing_root_count": len(missing_roots),
+            "cap_limited": cap_hit,
+            "outside_selected_roots": "not searched unless explicitly selected with safe caps",
+            "notes": not_searched_notes,
+        },
+        "cap_hit": cap_hit,
+    }
+
+
+def compact_scope_root(root: dict) -> dict:
+    return {
+        "kind": root.get("kind"),
+        "scope_label": root.get("scope_label", "selected_root"),
+        "privacy_label": root.get("privacy_label", "private_root"),
+        "known": root.get("known"),
+        "reason": root.get("reason"),
+    }
+
+
+def compact_rejected_root(root: dict) -> dict:
+    return {
+        "scope_label": root.get("scope_label", "excluded_root"),
+        "reason": root.get("reason"),
+    }
+
+
+def root_is_missing(root: dict, blind_spots: list[str]) -> bool:
+    path = root.get("path")
+    if not path:
+        return False
+    return any(item.startswith("Missing transcript root:") and path in item for item in blind_spots)
+
+
+def cap_hit_status(*, warnings: list[str], limits: dict) -> dict:
+    caps_hit: set[str] = set()
+    normalized_warnings: set[str] = set()
+    for warning in warnings:
+        lowered = warning.lower()
+        if "max file cap" in lowered:
+            caps_hit.add("max_file_cap")
+            normalized_warnings.add("stopped_at_max_file_cap")
+        if "max byte cap" in lowered:
+            caps_hit.add("max_byte_cap")
+            normalized_warnings.add("stopped_at_max_byte_cap")
+        if "max match cap" in lowered:
+            caps_hit.add("max_match_cap")
+            normalized_warnings.add("stopped_at_max_match_cap")
+        if "max elapsed cap" in lowered:
+            caps_hit.add("max_elapsed_cap")
+            normalized_warnings.add("stopped_at_max_elapsed_cap")
+        if "reservoir-capped" in lowered:
+            caps_hit.add("weak_candidate_reservoir_cap")
+            normalized_warnings.add("weak_candidates_reservoir_capped")
+    return {
+        "hit": bool(caps_hit),
+        "caps_hit": sorted(caps_hit),
+        "normalized_warnings": sorted(normalized_warnings),
+        "limits": limits,
     }
 
 
