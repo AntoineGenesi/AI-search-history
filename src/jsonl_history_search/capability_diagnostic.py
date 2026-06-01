@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -17,7 +18,7 @@ from typing import Any
 from .evaluation import build_efficiency_eval
 from .install_validation import default_package_root, validate_install
 from .records import parse_record
-from .sources import Limits, build_source_plan
+from .sources import Limits, build_source_plan, cap_hits_from_warnings, enumerate_jsonl_files
 
 
 SCHEMA_VERSION = 1
@@ -69,6 +70,7 @@ def build_capability_diagnostic(args) -> dict[str, Any]:
         _core_package_capability(),
         _cli_invocation_capability(),
         _source_planning_capability(source_plan, codex_home=codex_home, claude_home=claude_home),
+        _archive_protection_capability(),
         _safe_root_rejection_capability(cwd=cwd, codex_home=codex_home, claude_home=claude_home),
         _validation_capability(
             validation_checks,
@@ -126,6 +128,12 @@ def build_capability_diagnostic(args) -> dict[str, Any]:
             "capabilities": {capability.id: capability.to_dict() for capability in capabilities},
             "fallback_tiers": _fallback_tiers(),
             "source_plan": _sanitize_source_plan(source_plan, codex_home=codex_home, claude_home=claude_home),
+            "archive_protection": _build_archive_protection_diagnostic(
+                source_plan,
+                codex_home=codex_home,
+                claude_home=claude_home,
+            ),
+            "archive_protection_gate": _archive_protection_gate(),
             "privacy": {
                 "remote_upload": False,
                 "raw_text_cache_by_default": False,
@@ -263,6 +271,30 @@ def _source_planning_capability(source_plan, *, codex_home: Path, claude_home: P
             "rejected_root_count": len(source_plan.rejected_roots),
             "roots": [_root_label(root.path, codex_home=codex_home, claude_home=claude_home) for root in roots],
             "limits": source_plan.limits.to_dict(),
+        },
+    )
+
+
+def _archive_protection_capability() -> Capability:
+    return Capability(
+        id="archive_protection_status",
+        name="Archive/protection planning status",
+        category="future_backend",
+        status="not_implemented",
+        benefit="Can report whether selected transcript sources have archive protection proof before any backup claim.",
+        fallback="diagnostic_only_no_archive_protection",
+        expected_slowdown_or_lost_feature=(
+            "Selected logs remain unprotected from deletion unless a future snapshot/archive command is implemented "
+            "and passes restore/export proof."
+        ),
+        suggested_next_action="Use the archive_protection diagnostic and gate before implementing an opt-in snapshot command.",
+        details={
+            "diagnostic_read_only": True,
+            "archive_writer_present": False,
+            "background_job_present": False,
+            "restore_command_present": False,
+            "promotion_gate": "archive_protection_gate",
+            "protection_status": "not_protected",
         },
     )
 
@@ -654,6 +686,115 @@ def _fallback_tiers() -> list[dict[str, Any]]:
     ]
 
 
+def _build_archive_protection_diagnostic(source_plan, *, codex_home: Path, claude_home: Path) -> dict[str, Any]:
+    selected_sources = [
+        {
+            "label": _root_label(root.path, codex_home=codex_home, claude_home=claude_home),
+            "kind": root.kind,
+            "known": root.known,
+            "recursive": root.recursive,
+            "exists": root.path.exists(),
+            "readable": root.path.exists() and _is_readable(root.path),
+            "mounted_drive": _is_mounted_drive_path(root.path),
+        }
+        for root in source_plan.roots
+    ]
+    estimated_file_count = 0
+    estimated_bytes = 0
+    observed_warnings = list(source_plan.warnings)
+    for _path, size, warnings in enumerate_jsonl_files(source_plan):
+        observed_warnings = list(warnings)
+        estimated_file_count += 1
+        estimated_bytes += size
+    observed_warnings = list(dict.fromkeys(observed_warnings + source_plan.warnings))
+    cap_hits = cap_hits_from_warnings(observed_warnings)
+    mounted_drive_warnings = [
+        (
+            f"{source['label']} is on a mounted drive; future archive snapshots should require explicit confirmation "
+            "because traversal and copy cost can be high."
+        )
+        for source in selected_sources
+        if source["mounted_drive"]
+    ]
+    privacy_warnings = [
+        "Archive/protection is not configured; selected logs are not protected from deletion by JSONL.",
+        "Selected logs means only the approved source-plan roots/files for this run, not every device or backup.",
+        "Future archive snapshots would retain raw private transcripts locally and need explicit opt-in plus restore/export proof.",
+        "This diagnostic emits source labels and aggregate counters only; it does not emit transcript text, session IDs, or raw paths.",
+    ]
+    if not selected_sources:
+        privacy_warnings.append("No selected source labels exist for this run, so no logs can be protected or estimated.")
+    duplicate_risk_notes = [
+        "Duplicate risk is not resolved by this diagnostic; future archive snapshots must detect exact content duplicates and likely mirrored sessions.",
+        "Duplicate detection is bounded to selected source labels and cannot prove all-history or all-device completeness.",
+    ]
+    if len(selected_sources) > 1:
+        duplicate_risk_notes.append(
+            "Multiple selected source labels can contain mirrored conversation copies; future protection proof must deduplicate before claims."
+        )
+    return {
+        "schema_version": 1,
+        "status": "not_configured",
+        "protection_status": "not_protected",
+        "archive_configured": False,
+        "read_only": True,
+        "background_behavior": False,
+        "archive_writer_present": False,
+        "restore_command_present": False,
+        "selected_source_labels": [source["label"] for source in selected_sources],
+        "selected_sources": selected_sources,
+        "estimated_selected_file_count": estimated_file_count,
+        "estimated_selected_bytes": estimated_bytes,
+        "unprotected_estimated_file_count": estimated_file_count,
+        "protected_estimated_file_count": 0,
+        "source_deleted_but_archived_count": None,
+        "source_deleted_but_archived_status": "unknown_without_archive_ledger",
+        "cap_status": cap_hits,
+        "warnings": [_sanitize_diagnostic_warning(warning) for warning in observed_warnings],
+        "mounted_drive_warnings": mounted_drive_warnings,
+        "duplicate_risk_notes": duplicate_risk_notes,
+        "privacy_warnings": privacy_warnings,
+        "not_searched_scope": [
+            "Roots outside the source plan were not inspected.",
+            "Files beyond any file, byte, or elapsed-time cap were not estimated.",
+            "Deleted, unmounted, inaccessible, or unapproved logs cannot be seen by this diagnostic.",
+        ],
+    }
+
+
+def _archive_protection_gate() -> dict[str, Any]:
+    return {
+        "label": "archive_protection_gate",
+        "status": "not_evaluated",
+        "promotion_ready": False,
+        "claim_allowed": False,
+        "required_future_evidence": [
+            "snapshot_write_proof",
+            "hash_verification",
+            "duplicate_detection",
+            "corruption_detection",
+            "source_deleted_but_archived_status",
+            "restore_export_smoke",
+            "elapsed_time",
+            "bytes_copied",
+            "bytes_compressed",
+            "index_bytes",
+            "privacy_checks",
+        ],
+        "restore_export_acceptance_test": (
+            "Create a synthetic selected-root fixture, run a future explicit snapshot, remove or move the source, "
+            "then restore or export the archived records and verify byte/hash/source-ref equivalence without emitting private text."
+        ),
+        "current_blockers": [
+            "no_archive_writer",
+            "no_archive_ledger",
+            "no_restore_or_export_command",
+            "no_snapshot_hash_verification",
+            "no_corruption_detection",
+        ],
+    }
+
+
 def _sanitize_source_plan(source_plan, *, codex_home: Path, claude_home: Path) -> dict[str, Any]:
     return {
         "selected_root_count": len(source_plan.roots),
@@ -674,7 +815,7 @@ def _sanitize_source_plan(source_plan, *, codex_home: Path, claude_home: Path) -
             {"label": _generic_root_label(rejected.path), "reason": rejected.reason}
             for rejected in source_plan.rejected_roots
         ],
-        "warnings": list(source_plan.warnings),
+        "warnings": [_sanitize_diagnostic_warning(item) for item in source_plan.warnings],
         "blind_spots": [_sanitize_blind_spot(item) for item in source_plan.blind_spots],
         "limits": source_plan.limits.to_dict(),
     }
@@ -699,8 +840,8 @@ def _root_label(path: Path, *, codex_home: Path, claude_home: Path) -> str:
 def _generic_root_label(path: str) -> str:
     if path in {"/", "/home", "/mnt", "/mnt/c", "/mnt/d"}:
         return path
-    name = Path(path).name
-    return f"explicit_root:{name or 'root'}"
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+    return f"explicit_root:{digest}"
 
 
 def _sanitize_blind_spot(item: str) -> str:
@@ -708,6 +849,21 @@ def _sanitize_blind_spot(item: str) -> str:
         path = item.split(":", 1)[1].strip()
         return f"Missing transcript root: {_generic_root_label(path)}"
     return item
+
+
+def _sanitize_diagnostic_warning(item: str) -> str:
+    if "Arbitrary root enabled for " in item:
+        return "Arbitrary root enabled for explicit source label; strict hard caps apply."
+    if item.startswith("Skipped symlink escape:"):
+        return "Skipped symlink escape under selected source label."
+    return _sanitize_blind_spot(item)
+
+
+def _is_mounted_drive_path(path: Path) -> bool:
+    text = str(path.expanduser())
+    return text.startswith("/mnt/") or bool(
+        len(text) >= 3 and text[0].isalpha() and text[1] == ":" and text[2] in {"/", "\\"}
+    )
 
 
 def _is_readable(path: Path) -> bool:
