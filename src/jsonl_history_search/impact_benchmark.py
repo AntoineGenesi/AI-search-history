@@ -21,6 +21,7 @@ from .timeutil import parse_now, timezone_from_args
 DEFAULT_FIXTURE = Path("benchmarks/impact_gold/synthetic_cases.json")
 DEFAULT_SYNTHETIC_ROOT = Path("tests/fixtures/impact_benchmark/synthetic_logs")
 DEFAULT_BASELINES = ("raw_rg_literal", "terminal_rg_then_open", "package_search", "package_search_rg_prefilter")
+GATE_STATUSES = {"pass", "fail", "inconclusive", "not_evaluated"}
 VALID_LEGITIMACY = {"synthetic_committed"}
 VALID_OUTCOMES = {"evidence_found", "no_evidence"}
 VALID_FEATURE_FAMILIES = {
@@ -196,11 +197,13 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
 
     selected = _selected_baselines(args.baseline)
     files, enum_warnings = _enumerate_impact_files(plan)
+    cap_hit_labels = _cap_hit_labels(_safe_warnings(enum_warnings))
     if enum_warnings:
         warnings = _safe_warnings(enum_warnings)
         if not explicit_roots:
             warnings = [warning for warning in warnings if warning != "arbitrary_root_enabled_with_hard_caps"]
         base_report["warnings"] = warnings
+        cap_hit_labels = _cap_hit_labels(warnings)
     doc_index = _build_doc_index(files, timezone_from_args(args.timezone, args.timezone_offset))
     rows: list[dict[str, Any]] = []
     for case in fixture["cases"][: args.case_limit if args.case_limit > 0 else None]:
@@ -220,12 +223,16 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
                         plan=plan,
                         args=args,
                         repeat_index=repeat_index,
+                        cap_hit_labels=cap_hit_labels,
                     )
                 )
 
-    base_report["status"] = "ok"
+    base_report["status"] = "capped" if cap_hit_labels else "ok"
+    base_report["caps_hit"] = bool(cap_hit_labels)
+    base_report["cap_hit_labels"] = cap_hit_labels
     base_report["rows"] = rows
     base_report["summary"] = _summarize(rows, selected)
+    base_report.update(_evaluate_gate_statuses(rows, base_report["summary"], base_report.get("warnings", [])))
     base_report["total_wall_time_ms"] = _elapsed_ms(started)
     return {"impact_benchmark": base_report}
 
@@ -240,6 +247,16 @@ def _invalid_report(reason: str, started: float, fixture_errors: list[str] | Non
         "fixture_errors": fixture_errors or [],
         "rows": [],
         "summary": {},
+        "ranking_quality_gate": _gate_status(
+            "not_evaluated",
+            ["benchmark_status_invalid_fixture", "no_benchmark_rows"],
+            evidence_basis="synthetic_committed_only",
+        ),
+        "rg_prefilter_gate": _gate_status(
+            "not_evaluated",
+            ["benchmark_status_invalid_fixture", "no_benchmark_rows"],
+            evidence_basis="synthetic_committed_only",
+        ),
         "privacy_contract": _privacy_contract(),
     }
 
@@ -262,15 +279,32 @@ def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str]
         "privacy_contract": _privacy_contract(),
         "total_wall_time_ms": _elapsed_ms(started),
         "warnings": [],
+        "caps_hit": False,
+        "cap_hit_labels": [],
         "rows": [],
         "summary": {},
+        "ranking_quality_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
+        "rg_prefilter_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
     }
 
 
 def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str], started: float) -> dict[str, Any]:
+    safe_warnings = _safe_warnings(warnings)
     report["status"] = status
     report["total_wall_time_ms"] = _elapsed_ms(started)
-    report["warnings"] = _safe_warnings(warnings)
+    report["warnings"] = safe_warnings
+    report["caps_hit"] = False
+    report["cap_hit_labels"] = _cap_hit_labels(safe_warnings)
+    report["ranking_quality_gate"] = _gate_status(
+        "not_evaluated",
+        [f"benchmark_status_{status}", "no_benchmark_rows"],
+        evidence_basis=report.get("data_source"),
+    )
+    report["rg_prefilter_gate"] = _gate_status(
+        "not_evaluated",
+        [f"benchmark_status_{status}", "no_benchmark_rows"],
+        evidence_basis=report.get("data_source"),
+    )
     return report
 
 
@@ -310,7 +344,14 @@ def _preflight_root_warnings(roots: list[Path], cwd: Path) -> list[str]:
 def _enumerate_impact_files(plan: SourcePlan) -> tuple[list[ImpactFile], list[str]]:
     files: list[ImpactFile] = []
     warnings: list[str] = []
-    for path, size, enum_warnings in enumerate_jsonl_files(plan):
+    iterator = enumerate_jsonl_files(plan)
+    while True:
+        try:
+            path, size, enum_warnings = next(iterator)
+        except StopIteration as stopped:
+            if stopped.value is not None:
+                warnings = list(stopped.value)
+            break
         warnings = list(enum_warnings)
         files.append(ImpactFile(path=path, label=f"file_{len(files) + 1:03d}", size=size))
     return files, warnings
@@ -339,6 +380,7 @@ def _run_raw_rg_literal(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     query = _case_query(case)
@@ -355,6 +397,7 @@ def _run_raw_rg_literal(
         bytes_parsed=0,
         output_context_bytes=sum(candidate.byte_count for candidate in candidates[: plan.limits.max_matches]),
         candidates=candidates[: plan.limits.max_matches],
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -366,6 +409,7 @@ def _run_terminal_rg_then_open(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     query = _case_query(case)
@@ -383,6 +427,7 @@ def _run_terminal_rg_then_open(
         bytes_parsed=0,
         output_context_bytes=opened["context_bytes"],
         candidates=candidates[: plan.limits.max_matches],
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -394,6 +439,7 @@ def _run_package_search(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     return _run_package_search_variant(
         case=case,
@@ -404,6 +450,7 @@ def _run_package_search(
         repeat_index=repeat_index,
         baseline="package_search",
         use_rg_prefilter=False,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -415,6 +462,7 @@ def _run_package_search_rg_prefilter(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     return _run_package_search_variant(
         case=case,
@@ -425,6 +473,7 @@ def _run_package_search_rg_prefilter(
         repeat_index=repeat_index,
         baseline="package_search_rg_prefilter",
         use_rg_prefilter=True,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -438,6 +487,7 @@ def _run_package_search_variant(
     repeat_index: int,
     baseline: str,
     use_rg_prefilter: bool,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     default_tz = timezone_from_args(args.timezone, args.timezone_offset)
@@ -452,9 +502,11 @@ def _run_package_search_variant(
     )
     prefilter = _prefilter_row_stats(result, enabled=use_rg_prefilter)
     candidates: list[LiteralCandidate] = []
+    ranking_reason_label_count = 0
     for group in result.get("groups", []):
         for match in group.get("matches", []):
             doc_id = doc_index.get((match.get("path", ""), int(match.get("line", 0))))
+            ranking_reason_label_count += len(match.get("reasons") or [])
             candidates.append(
                 LiteralCandidate(
                     doc_id=doc_id,
@@ -476,6 +528,8 @@ def _run_package_search_variant(
         output_context_bytes=len(json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
         candidates=candidates,
         rg_prefilter=prefilter,
+        ranking_reason_label_count=ranking_reason_label_count,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -601,13 +655,17 @@ def _row(
     output_context_bytes: int,
     candidates: list[LiteralCandidate],
     rg_prefilter: dict[str, Any] | None = None,
+    ranking_reason_label_count: int = 0,
+    cap_hit_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     gold = set(case.get("gold_doc_ids") or [])
     candidate_doc_ids = [candidate.doc_id for candidate in candidates if candidate.doc_id]
     expected_no_evidence = case["expected_outcome"] == "no_evidence"
     first_pass_hit = bool(candidate_doc_ids and candidate_doc_ids[0] in gold)
     no_evidence_correct = bool(expected_no_evidence and not candidates)
-    return {
+    mrr = _mrr(candidate_doc_ids, gold, expected_no_evidence)
+    labels = sorted(set(cap_hit_labels or []))
+    row = {
         "case_id": case["case_id"],
         "baseline": baseline,
         "repeat_index": repeat_index,
@@ -622,17 +680,25 @@ def _row(
         "files_opened": files_opened,
         "bytes_scanned": bytes_scanned,
         "bytes_parsed": bytes_parsed,
+        "output_bytes": output_context_bytes,
+        "context_bytes": output_context_bytes,
         "output_context_bytes": output_context_bytes,
         "candidate_count": len(candidates),
         "first_pass_hit": first_pass_hit,
         "recall_at_1": _recall_at(candidate_doc_ids, gold, 1, expected_no_evidence),
         "recall_at_3": _recall_at(candidate_doc_ids, gold, 3, expected_no_evidence),
         "recall_at_10": _recall_at(candidate_doc_ids, gold, 10, expected_no_evidence),
+        "mrr": mrr,
         "no_evidence_correct": no_evidence_correct if expected_no_evidence else None,
+        "ranking_reason_label_count": ranking_reason_label_count,
+        "caps_hit": bool(labels),
+        "cap_hit_labels": labels,
         "top_candidate_doc_ids": candidate_doc_ids[:10],
         "top_candidate_source_refs": _sanitized_source_refs(candidates[:10]),
         "rg_prefilter": rg_prefilter or _prefilter_row_stats({}, enabled=False),
     }
+    row["counter_availability"] = _impact_counter_availability(row, expected_no_evidence=expected_no_evidence)
+    return row
 
 
 def _recall_at(candidate_doc_ids: list[str], gold: set[str], k: int, expected_no_evidence: bool) -> float:
@@ -641,6 +707,15 @@ def _recall_at(candidate_doc_ids: list[str], gold: set[str], k: int, expected_no
     if not gold:
         return 0.0
     return round(len(set(candidate_doc_ids[:k]) & gold) / len(gold), 3)
+
+
+def _mrr(candidate_doc_ids: list[str], gold: set[str], expected_no_evidence: bool) -> float | None:
+    if expected_no_evidence:
+        return None
+    for index, doc_id in enumerate(candidate_doc_ids, start=1):
+        if doc_id in gold:
+            return round(1 / index, 3)
+    return 0.0
 
 
 def _sanitized_source_refs(candidates: list[LiteralCandidate]) -> list[str]:
@@ -697,6 +772,7 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             "mean_recall_at_1": _mean(row["recall_at_1"] for row in selected),
             "mean_recall_at_3": _mean(row["recall_at_3"] for row in selected),
             "mean_recall_at_10": _mean(row["recall_at_10"] for row in selected),
+            "mean_mrr": _mean(row["mrr"] for row in selected if row["mrr"] is not None),
             "no_evidence_correct": sum(1 for row in no_evidence_rows if row["no_evidence_correct"]),
             "no_evidence_cases": len(no_evidence_rows),
             "median_wall_time_ms": _median(row["wall_time_ms"] for row in selected),
@@ -707,6 +783,9 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             "median_bytes_parsed": _median(row["bytes_parsed"] for row in selected),
             "median_output_context_bytes": _median(row["output_context_bytes"] for row in selected),
             "median_candidate_count": _median(row["candidate_count"] for row in selected),
+            "median_ranking_reason_label_count": _median(row["ranking_reason_label_count"] for row in selected),
+            "caps_hit_runs": sum(1 for row in selected if row["caps_hit"]),
+            "cap_hit_labels": sorted({label for row in selected for label in row.get("cap_hit_labels", [])}),
             "median_prefilter_files_reduced": _median(row["rg_prefilter"]["files_reduced"] for row in selected),
             "median_prefilter_bytes_reduced": _median(row["rg_prefilter"]["bytes_reduced"] for row in selected),
             "median_prefilter_files_reduction_ratio": _median(
@@ -747,6 +826,198 @@ def _package_equivalence(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "equivalent_top_candidate_source_refs": ref_equivalent,
         "all_equivalent": bool(compared and doc_equivalent == compared and ref_equivalent == compared),
     }
+
+
+def _evaluate_gate_statuses(
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "ranking_quality_gate": _evaluate_ranking_quality_gate(rows, summary, warnings),
+        "rg_prefilter_gate": _evaluate_rg_prefilter_gate(rows, summary, warnings),
+    }
+
+
+def _evaluate_ranking_quality_gate(
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any]:
+    if not rows:
+        return _gate_status("not_evaluated", ["no_benchmark_rows"], evidence_basis="synthetic_committed_only")
+    package_rows = [row for row in rows if row.get("baseline") == "package_search"]
+    if not package_rows:
+        return _gate_status(
+            "not_evaluated",
+            ["package_search_baseline_not_selected"],
+            evidence_basis="synthetic_committed_only",
+            counters=_required_counter_summary(rows),
+        )
+    eligible = [
+        row
+        for row in package_rows
+        if row.get("baseline") == "package_search"
+        and row.get("legitimacy_status") == "verified"
+        and row.get("protected_feature_family") in {"broad_generic", "current_project"}
+    ]
+    reasons: list[str] = []
+    if any(row.get("legitimacy_status") == "synthetic_committed" for row in rows):
+        reasons.append("synthetic_only_evidence_cannot_promote")
+    if not eligible:
+        reasons.append("no_verified_broad_generic_or_current_project_cases")
+    if warnings:
+        reasons.append("benchmark_warnings_present")
+    status = "inconclusive" if reasons else "not_evaluated"
+    return _gate_status(
+        status,
+        reasons or ["gate_rules_not_applicable_to_selected_rows"],
+        evidence_basis="synthetic_committed_only",
+        evaluated_case_count=len({row["case_id"] for row in eligible}),
+        counters=_required_counter_summary(eligible or rows),
+        metrics={
+            "package_first_pass_hit_rate": (summary.get("package_search") or {}).get("first_pass_hit_rate"),
+            "package_mean_mrr": (summary.get("package_search") or {}).get("mean_mrr"),
+            "package_median_candidate_count": (summary.get("package_search") or {}).get("median_candidate_count"),
+            "package_median_ranking_reason_label_count": (summary.get("package_search") or {}).get(
+                "median_ranking_reason_label_count"
+            ),
+        },
+    )
+
+
+def _evaluate_rg_prefilter_gate(
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any]:
+    if not rows:
+        return _gate_status("not_evaluated", ["no_benchmark_rows"], evidence_basis="synthetic_committed_only")
+    rg_rows = [row for row in rows if row.get("baseline") == "package_search_rg_prefilter"]
+    if not rg_rows:
+        return _gate_status(
+            "not_evaluated",
+            ["rg_prefilter_baseline_not_selected"],
+            evidence_basis="synthetic_committed_only",
+            counters=_required_counter_summary(rows),
+        )
+    eligible = [
+        row
+        for row in rg_rows
+        if row.get("legitimacy_status") == "verified"
+        and row.get("protected_feature_family") in {"exact_path", "identifier_heavy"}
+    ]
+    reasons: list[str] = []
+    if any(row.get("legitimacy_status") == "synthetic_committed" for row in rows):
+        reasons.append("synthetic_only_evidence_cannot_promote")
+    if not eligible:
+        reasons.append("no_verified_exact_path_or_identifier_heavy_cases")
+    equivalence = (summary.get("package_search_rg_prefilter") or {}).get("equivalence_vs_package_search")
+    if not equivalence:
+        reasons.append("source_ref_equivalence_not_compared")
+    elif not equivalence.get("all_equivalent"):
+        reasons.append("source_ref_equivalence_failed")
+    if any((row.get("rg_prefilter") or {}).get("available") is False for row in rg_rows):
+        reasons.append("rg_unavailable_for_some_rows")
+    if warnings:
+        reasons.append("benchmark_warnings_present")
+    return _gate_status(
+        "inconclusive",
+        reasons or ["gate_rules_not_applicable_to_selected_rows"],
+        evidence_basis="synthetic_committed_only",
+        evaluated_case_count=len({row["case_id"] for row in eligible}),
+        counters=_required_counter_summary(eligible or rg_rows or rows),
+        metrics={
+            "equivalence_vs_package_search": equivalence,
+            "median_prefilter_files_reduction_ratio": (summary.get("package_search_rg_prefilter") or {}).get(
+                "median_prefilter_files_reduction_ratio"
+            ),
+            "median_prefilter_bytes_reduction_ratio": (summary.get("package_search_rg_prefilter") or {}).get(
+                "median_prefilter_bytes_reduction_ratio"
+            ),
+        },
+    )
+
+
+def _gate_status(
+    status: str,
+    reasons: list[str],
+    *,
+    evidence_basis: str | None = None,
+    evaluated_case_count: int = 0,
+    counters: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if status not in GATE_STATUSES:
+        status = "inconclusive"
+        reasons = ["invalid_gate_status_normalized"] + reasons
+    payload: dict[str, Any] = {
+        "status": status,
+        "reasons": sorted(set(reasons)),
+        "evaluated_case_count": evaluated_case_count,
+    }
+    if evidence_basis:
+        payload["evidence_basis"] = evidence_basis
+    if counters is not None:
+        payload["required_counters"] = counters
+    if metrics is not None:
+        payload["metrics"] = metrics
+    return payload
+
+
+def _impact_counter_availability(row: dict[str, Any], *, expected_no_evidence: bool) -> dict[str, dict[str, str]]:
+    availability: dict[str, dict[str, str]] = {}
+    for key in _required_counter_keys():
+        if key == "mrr" and expected_no_evidence:
+            availability[key] = {"status": "unavailable", "reason": "mrr_not_defined_for_no_evidence_case"}
+        elif key == "no_evidence_correct" and not expected_no_evidence:
+            availability[key] = {"status": "unavailable", "reason": "not_a_no_evidence_case"}
+        elif row.get(key) is None:
+            availability[key] = {"status": "unavailable", "reason": "counter_not_available"}
+        else:
+            availability[key] = {"status": "available"}
+    return availability
+
+
+def _required_counter_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in _required_counter_keys():
+        available = 0
+        unavailable_reasons: set[str] = set()
+        for row in rows:
+            state = (row.get("counter_availability") or {}).get(key) or {}
+            if state.get("status") == "available":
+                available += 1
+            else:
+                unavailable_reasons.add(str(state.get("reason") or "counter_not_available"))
+        summary[key] = {
+            "available_rows": available,
+            "unavailable_rows": max(0, len(rows) - available),
+            "unavailable_reasons": sorted(unavailable_reasons),
+        }
+    return summary
+
+
+def _required_counter_keys() -> tuple[str, ...]:
+    return (
+        "wall_time_ms",
+        "tool_calls",
+        "subprocess_calls",
+        "files_opened",
+        "bytes_scanned",
+        "bytes_parsed",
+        "output_bytes",
+        "context_bytes",
+        "output_context_bytes",
+        "candidate_count",
+        "first_pass_hit",
+        "recall_at_1",
+        "recall_at_3",
+        "recall_at_10",
+        "mrr",
+        "no_evidence_correct",
+        "caps_hit",
+    )
 
 
 def _selected_baselines(requested: list[str]) -> tuple[str, ...]:
@@ -804,6 +1075,18 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
         else:
             safe.append("warning_redacted")
     return sorted(set(safe))
+
+
+def _cap_hit_labels(warnings: list[str]) -> list[str]:
+    labels = set()
+    for warning in warnings:
+        if not warning.startswith("stopped_at_"):
+            continue
+        label = warning[len("stopped_at_") :]
+        if label.endswith("_cap"):
+            label = label[: -len("_cap")]
+        labels.add(label)
+    return sorted(labels)
 
 
 def _privacy_contract() -> dict[str, bool]:
