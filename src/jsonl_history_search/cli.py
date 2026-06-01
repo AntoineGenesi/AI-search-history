@@ -7,6 +7,8 @@ from .agent_contract import build_agent_find_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
+from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
+from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .lineage import build_lineage_payload
 from .manifest import build_manifest_report
@@ -180,6 +182,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized measured benchmark report should be written.",
+    )
+    impact = subparsers.add_parser("benchmark-impact")
+    add_common_args(impact)
+    impact.add_argument(
+        "--fixture",
+        default=str(DEFAULT_IMPACT_FIXTURE),
+        help="Synthetic committed-only impact benchmark fixture to evaluate.",
+    )
+    impact.add_argument(
+        "--case-limit",
+        type=int,
+        default=0,
+        help="Maximum number of impact cases to run; 0 means all cases.",
+    )
+    impact.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Deterministic repeat count per case/baseline.",
+    )
+    impact.add_argument(
+        "--baseline",
+        action="append",
+        choices=("raw_rg_literal", "terminal_rg_then_open", "package_search"),
+        default=[],
+        help="Baseline to include; may be passed more than once. Defaults to all deterministic baselines.",
+    )
+    impact.add_argument("--terminal-open-limit", type=int, default=3)
+    impact.add_argument("--context-lines", type=int, default=2)
+    impact.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized impact benchmark report should be written.",
     )
     diagnose = subparsers.add_parser("diagnose-capabilities")
     diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -476,6 +511,14 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["measured_benchmark"]["status"]
         return 1 if status in {"no_roots", "root_rejected", "invalid_fixture"} else 0
+    if args.command == "benchmark-impact":
+        payload = build_impact_benchmark_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["impact_benchmark"]["status"]
+        return 1 if status in {"root_rejected", "invalid_fixture"} else 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(
