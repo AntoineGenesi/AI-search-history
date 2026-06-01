@@ -1182,7 +1182,7 @@ def render_measured_benchmark_text(payload: dict) -> str:
     statuses = aggregate.get("statuses", {})
     if statuses:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
-    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
+    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate", "manifest_shortlist_gate"):
         gate = report.get(gate_name) or {}
         if gate:
             lines.append(
@@ -1196,6 +1196,17 @@ def render_measured_benchmark_text(payload: dict) -> str:
             f"files_reduced={prefilter.get('files_reduced', 0)} "
             f"bytes_reduced={prefilter.get('bytes_reduced', 0)} "
             f"statuses={prefilter.get('statuses', {})}"
+        )
+    manifest = aggregate.get("manifest_shortlist") or {}
+    if manifest.get("enabled_rows"):
+        lines.append(
+            "manifest_shortlist: "
+            f"planned_rows={manifest.get('planned_rows', 0)} "
+            f"fallback_rows={manifest.get('fallback_rows', 0)} "
+            f"files_reduction_ratio={manifest.get('file_reduction_ratio', 0.0)} "
+            f"bytes_reduction_ratio={manifest.get('byte_reduction_ratio', 0.0)} "
+            f"python_opened_files={manifest.get('python_opened_files', 0)} "
+            f"parsed_bytes={manifest.get('parsed_bytes', 0)}"
         )
     for warning in aggregate.get("warnings", []):
         lines.append(f"Warning: {warning}")
@@ -1240,6 +1251,18 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"- rg prefilter files reduced: {prefilter.get('files_reduced', 0)}",
                 f"- rg prefilter bytes reduced: {prefilter.get('bytes_reduced', 0)}",
                 f"- rg prefilter statuses: {', '.join(f'{key}={value}' for key, value in sorted((prefilter.get('statuses') or {}).items())) or '(none)'}",
+            ]
+        )
+    manifest = aggregate.get("manifest_shortlist") or {}
+    if manifest.get("enabled_rows"):
+        lines.extend(
+            [
+                f"- manifest shortlist planned rows: {manifest.get('planned_rows', 0)}",
+                f"- manifest shortlist fallback rows: {manifest.get('fallback_rows', 0)}",
+                f"- manifest shortlist files reduction ratio: {manifest.get('file_reduction_ratio', 0.0)}",
+                f"- manifest shortlist bytes reduction ratio: {manifest.get('byte_reduction_ratio', 0.0)}",
+                f"- manifest shortlist Python-opened files: {manifest.get('python_opened_files', 0)}",
+                f"- manifest shortlist parsed bytes: {manifest.get('parsed_bytes', 0)}",
             ]
         )
     if aggregate.get("warnings"):
@@ -1553,6 +1576,7 @@ def _benchmark_gate_markdown_lines(report: dict) -> list[str]:
     gates = {
         "ranking_quality_gate": report.get("ranking_quality_gate"),
         "rg_prefilter_gate": report.get("rg_prefilter_gate"),
+        "manifest_shortlist_gate": report.get("manifest_shortlist_gate"),
     }
     if not any(gates.values()):
         return []
