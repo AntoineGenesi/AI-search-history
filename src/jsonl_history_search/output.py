@@ -1206,7 +1206,9 @@ def render_measured_benchmark_text(payload: dict) -> str:
             f"files_reduction_ratio={manifest.get('file_reduction_ratio', 0.0)} "
             f"bytes_reduction_ratio={manifest.get('byte_reduction_ratio', 0.0)} "
             f"python_opened_files={manifest.get('python_opened_files', 0)} "
-            f"parsed_bytes={manifest.get('parsed_bytes', 0)}"
+            f"parsed_bytes={manifest.get('parsed_bytes', 0)} "
+            f"source_ref_equivalence={_compact_counter_map(manifest.get('source_ref_equivalence') or {})} "
+            f"no_evidence_scope_equivalence={_compact_counter_map(manifest.get('no_evidence_scope_equivalence') or {})}"
         )
     for warning in aggregate.get("warnings", []):
         lines.append(f"Warning: {warning}")
@@ -1221,6 +1223,12 @@ def render_measured_benchmark_text(payload: dict) -> str:
             f"candidates={row.get('candidate_count')} "
             f"context_bytes={row.get('output_context_bytes')}"
         )
+        manifest_row = row.get("manifest_shortlist") or {}
+        if manifest_row.get("enabled"):
+            lines[-1] += (
+                f" manifest_source_ref_equivalence={manifest_row.get('source_ref_equivalence')} "
+                f"manifest_no_evidence_scope_equivalence={manifest_row.get('no_evidence_scope_equivalence')}"
+            )
     return "\n".join(lines)
 
 
@@ -1263,6 +1271,8 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"- manifest shortlist bytes reduction ratio: {manifest.get('byte_reduction_ratio', 0.0)}",
                 f"- manifest shortlist Python-opened files: {manifest.get('python_opened_files', 0)}",
                 f"- manifest shortlist parsed bytes: {manifest.get('parsed_bytes', 0)}",
+                f"- manifest shortlist source-ref equivalence: `{_compact_counter_map(manifest.get('source_ref_equivalence') or {})}`",
+                f"- manifest shortlist no-evidence scope equivalence: `{_compact_counter_map(manifest.get('no_evidence_scope_equivalence') or {})}`",
             ]
         )
     if aggregate.get("warnings"):
@@ -1274,12 +1284,13 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 "",
                 "## Runs",
                 "",
-                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Warnings |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Warnings |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
             ]
         )
         for row in report.get("rows", []):
             row_id = row.get("case_id") or ""
+            manifest_row = row.get("manifest_shortlist") or {}
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(row_id))} | "
@@ -1290,9 +1301,17 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('searched_bytes', 0)} | "
                 f"{row.get('candidate_count', 0)} | "
                 f"{row.get('output_context_bytes', 0)} | "
+                f"{_escape_markdown_table(str(manifest_row.get('source_ref_equivalence', '')))} | "
+                f"{_escape_markdown_table(str(manifest_row.get('no_evidence_scope_equivalence', '')))} | "
                 f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
             )
     return "\n".join(lines)
+
+
+def _compact_counter_map(values: dict) -> str:
+    if not values:
+        return "(none)"
+    return ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
 
 
 def render_embedding_experiment_text(payload: dict) -> str:
