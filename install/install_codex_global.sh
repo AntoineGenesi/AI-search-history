@@ -10,6 +10,8 @@ cp -a "$ROOT/scripts/search_jsonl_history.py" "$SKILL_DIR/scripts/search_jsonl_h
 chmod +x "$SKILL_DIR/scripts/search_jsonl_history.py"
 
 echo "Installed Codex JSONL history search skill to: $SKILL_DIR"
+echo "This installed only the Codex skill/helper copy, not the Python package."
+echo "Install the Python CLI separately with: python3 -m venv .venv && . .venv/bin/activate && python -m pip install -e ."
 echo "Validate with:"
 echo "  PYTHONPATH=\"$ROOT/src\" python3 -m jsonl_history_search.cli validate-install --codex-home \"${CODEX_HOME:-$HOME/.codex}\" --format text"
 echo "  python3 \"$SKILL_DIR/scripts/search_jsonl_history.py\" \"test\" --latest --recent-files 1 --limit 1"
