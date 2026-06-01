@@ -13,8 +13,9 @@ from typing import Any, Iterable
 from .agent_contract import estimate_tokens, reduction_ratio
 from .clustering import session_key
 from .masking import MaskContext
-from .records import Record, compact_json, parse_record
-from .sources import SourcePlan, enumerate_jsonl_files
+from .adapters import AdapterReadError, iter_records_for_file
+from .records import Record, compact_json
+from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
 from .tool_events import ToolEvent, normalize_command, scan_tool_events
 
 
@@ -191,18 +192,13 @@ def scan_prose_records(plan: SourcePlan, *, default_tz, mask_context: MaskContex
         warnings = enum_warnings
         searched_files += 1
         searched_bytes += size
+        source_kind = source_kind_for_path(path, plan)
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            warnings.append(f"Could not open {path}: {exc}")
-            continue
-        with handle:
-            for line_number, line in enumerate(handle, 1):
+            for record in iter_records_for_file(path, source_kind, default_tz):
                 if time.monotonic() - started > plan.limits.max_elapsed:
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
                     break
-                record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
                 text = record.text or ""
                 if mask_context is not None:
                     text = mask_context.mask_text(text, source_path=record.path, source_index=record.line)
@@ -216,8 +212,11 @@ def scan_prose_records(plan: SourcePlan, *, default_tz, mask_context: MaskContex
                         sort_key=(stamp or "9999-12-31T23:59:59+00:00", record.path, record.line),
                     )
                 )
-            if stopped:
-                break
+        except AdapterReadError as exc:
+            warnings.append(str(exc))
+            continue
+        if stopped:
+            break
     records.sort(key=lambda row: row.sort_key)
     payload = {
         "records": records,

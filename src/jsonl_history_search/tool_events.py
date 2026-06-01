@@ -14,8 +14,9 @@ from typing import Any
 from .agent_contract import estimate_tokens, reduction_ratio
 from .clustering import session_key
 from .masking import MaskContext
-from .records import Record, compact_json, parse_record, text_from_item
-from .sources import SourcePlan, enumerate_jsonl_files
+from .adapters import AdapterReadError, iter_records_for_file
+from .records import Record, compact_json, text_from_item
+from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
 
 
 SCHEMA_VERSION = 1
@@ -195,18 +196,13 @@ def scan_tool_events(
         warnings = enum_warnings
         searched_files += 1
         searched_bytes += size
+        source_kind = source_kind_for_path(path, plan)
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            warnings.append(f"Could not open {path}: {exc}")
-            continue
-        with handle:
-            for line_number, line in enumerate(handle, 1):
+            for record in iter_records_for_file(path, source_kind, default_tz):
                 if time.monotonic() - started > plan.limits.max_elapsed:
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
                     break
-                record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
                 line_events = detect_events_for_record(record, mask_context=mask_context)
                 for event in line_events:
                     event_counter += 1
@@ -214,8 +210,11 @@ def scan_tool_events(
                     detected_events.append(event)
                 if not line_events:
                     excluded_mentions.extend(excluded_mentions_for_record(record, mask_context=mask_context))
-            if stopped:
-                break
+        except AdapterReadError as exc:
+            warnings.append(str(exc))
+            continue
+        if stopped:
+            break
 
     events = [
         event

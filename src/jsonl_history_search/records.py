@@ -19,6 +19,12 @@ class Record:
     cwd: str | None = None
     raw_timestamp: str | None = None
     raw: dict[str, Any] | None = None
+    source_format: str | None = None
+    record_id: str | None = None
+    parent_id: str | None = None
+    conversation_id: str | None = None
+    unsupported_fields: list[str] | None = None
+    lossy_conversions: list[str] | None = None
 
 
 def text_from_item(value: Any) -> str:
