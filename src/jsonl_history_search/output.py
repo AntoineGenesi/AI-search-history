@@ -804,6 +804,21 @@ def render_manifest_text(payload: dict) -> str:
             f"byte reduction={metrics['byte_reduction_ratio']}"
         ),
     ]
+    duplicate_risk = report.get("duplicate_risk", {})
+    duplicate_summary = duplicate_risk.get("summary", {})
+    lines.append(
+        "Duplicate risk: "
+        f"{duplicate_summary.get('group_count', 0)} groups "
+        f"({duplicate_summary.get('exact_duplicate_groups', 0)} exact, "
+        f"{duplicate_summary.get('likely_mirror_groups', 0)} likely mirror)"
+    )
+    for group in duplicate_risk.get("groups", [])[:5]:
+        labels = ", ".join(group.get("path_labels", [])[:4])
+        lines.append(
+            "- "
+            f"{group.get('risk_type')} {group.get('confidence')} "
+            f"members={group.get('member_count')} paths={labels}"
+        )
     for entry in shortlist.get("selected_entries", [])[:10]:
         path = entry["entry"]["path"]
         reasons = ", ".join(entry.get("reasons") or ["weak-candidate"])
@@ -839,6 +854,29 @@ def render_manifest_markdown(payload: dict) -> str:
     policy = report.get("cache_policy", {})
     for key in ("local_only", "optional", "default_search_uses_cache", "invalidation", "privacy"):
         lines.append(f"- **{key}:** {policy.get(key)}")
+
+    duplicate_risk = report.get("duplicate_risk", {})
+    duplicate_summary = duplicate_risk.get("summary", {})
+    lines.extend(
+        [
+            "",
+            "## Duplicate Risk",
+            "",
+            (
+                f"- **Groups:** {duplicate_summary.get('group_count', 0)} "
+                f"({duplicate_summary.get('exact_duplicate_groups', 0)} exact, "
+                f"{duplicate_summary.get('likely_mirror_groups', 0)} likely mirror)"
+            ),
+        ]
+    )
+    for group in duplicate_risk.get("groups", [])[:10]:
+        labels = ", ".join(group.get("path_labels", [])[:6])
+        lines.append(
+            f"- **{group.get('risk_type')}** `{group.get('confidence')}`; "
+            f"members {group.get('member_count')}; paths {labels}"
+        )
+    for limitation in duplicate_risk.get("limitations", []):
+        lines.append(f"- Limitation: {limitation}")
 
     lines.extend(
         [

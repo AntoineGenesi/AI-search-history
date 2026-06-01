@@ -35,6 +35,8 @@ class ManifestEntry:
     task_hints: list[str] = field(default_factory=list)
     artifact_hints: list[str] = field(default_factory=list)
     term_fingerprints: list[str] = field(default_factory=list)
+    content_hash: str | None = None
+    record_hash: str | None = None
     line_count: int = 0
     record_count: int = 0
     refreshed_from: str = "full_scan"
@@ -117,7 +119,9 @@ def scan_manifest_entry(path: Path, *, source_kind: str, size: int, mtime: float
     except AdapterReadError:
         pass
     refreshed_from = "full_scan" if adapter.line_oriented else "full_scan_whole_file"
-    return accumulator.to_entry(refreshed_from=refreshed_from), size
+    entry = accumulator.to_entry(refreshed_from=refreshed_from)
+    entry.content_hash = content_hash_for_path(path)
+    return entry, size
 
 
 def refresh_append_only_entry(path: Path, old: ManifestEntry, *, size: int, mtime: float, default_tz) -> tuple[ManifestEntry, int]:
@@ -126,7 +130,10 @@ def refresh_append_only_entry(path: Path, old: ManifestEntry, *, size: int, mtim
         accumulator.line_count = line_number
         record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
         accumulator.add_record(record)
-    return accumulator.to_entry(refreshed_from="append_only_refresh"), max(0, size - old.size)
+    entry = accumulator.to_entry(refreshed_from="append_only_refresh")
+    entry.content_hash = content_hash_for_path(path)
+    entry.record_hash = record_hash_for_path(path, source_kind=entry.source_kind, default_tz=default_tz)
+    return entry, max(0, size - old.size)
 
 
 class EntryAccumulator:
@@ -146,6 +153,7 @@ class EntryAccumulator:
         self.term_fingerprints: set[str] = set()
         self.line_count = 0
         self.record_count = 0
+        self._record_digest = hashlib.sha256()
 
     @classmethod
     def from_entry(cls, entry: ManifestEntry, *, size: int, mtime: float) -> "EntryAccumulator":
@@ -167,6 +175,7 @@ class EntryAccumulator:
         if not record.text and not record.role and not record.timestamp:
             return
         self.record_count += 1
+        self._record_digest.update(record_hash_payload(record))
         if record.timestamp is not None:
             self.date_start = min_datetime(self.date_start, record.timestamp)
             self.date_end = max_datetime(self.date_end, record.timestamp)
@@ -195,10 +204,16 @@ class EntryAccumulator:
             task_hints=sorted(self.task_hints),
             artifact_hints=sorted(self.artifact_hints)[:40],
             term_fingerprints=sorted(self.term_fingerprints)[:MAX_FINGERPRINT_TERMS],
+            record_hash=self.record_hash(),
             line_count=self.line_count,
             record_count=self.record_count,
             refreshed_from=refreshed_from,
         )
+
+    def record_hash(self) -> str | None:
+        if self.record_count <= 0:
+            return None
+        return f"sha256:{self._record_digest.hexdigest()}"
 
 
 def iter_jsonl_lines(path: Path):
@@ -248,6 +263,42 @@ def fingerprint_terms(text: str) -> set[str]:
 def fingerprint_term(term: str) -> str:
     digest = hashlib.sha256(term.lower().encode("utf-8")).hexdigest()[:16]
     return f"sha256:{digest}"
+
+
+def content_hash_for_path(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return f"sha256:{digest.hexdigest()}"
+
+
+def record_hash_payload(record: Record) -> bytes:
+    payload = {
+        "role": record.role,
+        "timestamp": record.timestamp.isoformat() if record.timestamp else None,
+        "text": record.text,
+    }
+    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def record_hash_for_path(path: Path, *, source_kind: str, default_tz) -> str | None:
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        for record in iter_records_for_file(path, source_kind, default_tz):
+            if not record.text and not record.role and not record.timestamp:
+                continue
+            count += 1
+            digest.update(record_hash_payload(record))
+    except AdapterReadError:
+        return None
+    if count <= 0:
+        return None
+    return f"sha256:{digest.hexdigest()}"
 
 
 def shortlist_manifest(manifest: Manifest, intent: QueryIntent, *, cwd: str | None = None, limit: int | None = None) -> dict:
@@ -334,6 +385,7 @@ def build_manifest_report(plan: SourcePlan, intent: QueryIntent, *, default_tz, 
     initial = build_manifest(plan, default_tz=default_tz)
     refreshed = build_manifest(plan, default_tz=default_tz, previous=initial)
     shortlist = shortlist_manifest(initial, intent, cwd=cwd, limit=shortlist_limit)
+    duplicate_risk = build_duplicate_risk_report(initial, plan)
     return {
         "manifest_report": {
             "schema_version": 1,
@@ -353,10 +405,163 @@ def build_manifest_report(plan: SourcePlan, intent: QueryIntent, *, default_tz, 
                 "warnings": initial.warnings,
             },
             "shortlist": shortlist,
+            "duplicate_risk": duplicate_risk,
             "cost_model": cost_model(initial, refreshed, shortlist),
             "guidance": guidance(shortlist),
         }
     }
+
+
+def build_duplicate_risk_report(manifest: Manifest, plan: SourcePlan) -> dict:
+    exact_groups = exact_duplicate_groups(manifest.entries, plan)
+    likely_groups = likely_mirror_groups(manifest.entries, plan)
+    groups = exact_groups + likely_groups
+    return {
+        "schema_version": 1,
+        "status": "groups_found" if groups else "no_duplicate_risk_groups",
+        "summary": {
+            "entry_count": len(manifest.entries),
+            "group_count": len(groups),
+            "exact_duplicate_groups": len(exact_groups),
+            "likely_mirror_groups": len(likely_groups),
+        },
+        "groups": groups,
+        "limitations": [
+            "Duplicate-risk reporting only covers entries in the selected manifest source plan.",
+            "Exact duplicates require matching content hashes; likely mirrors require at least two matching parsed records and timestamp spans.",
+            "Likely mirror groups are probabilistic evidence of copied or mirrored sessions, not proof of all-history completeness.",
+        ],
+    }
+
+
+def exact_duplicate_groups(entries: list[ManifestEntry], plan: SourcePlan) -> list[dict]:
+    buckets: dict[tuple[str, int], list[ManifestEntry]] = {}
+    for entry in entries:
+        if not entry.content_hash or entry.record_count <= 0:
+            continue
+        buckets.setdefault((entry.content_hash, entry.size), []).append(entry)
+    groups = []
+    for content_key, grouped in sorted(buckets.items(), key=lambda item: item[0]):
+        if len(grouped) < 2:
+            continue
+        groups.append(
+            duplicate_group_summary(
+                risk_type="exact_duplicate",
+                confidence="high",
+                reason="same content hash and file size across selected manifest entries",
+                group_key=f"exact:{hash_text(':'.join([content_key[0], str(content_key[1])]))}",
+                entries=grouped,
+                plan=plan,
+            )
+        )
+    return groups
+
+
+def likely_mirror_groups(entries: list[ManifestEntry], plan: SourcePlan) -> list[dict]:
+    buckets: dict[tuple[str, int, str | None, str | None], list[ManifestEntry]] = {}
+    for entry in entries:
+        if not entry.record_hash or entry.record_count < 2:
+            continue
+        key = (entry.record_hash, entry.record_count, entry.date_start, entry.date_end)
+        buckets.setdefault(key, []).append(entry)
+    groups = []
+    for record_key, grouped in sorted(buckets.items(), key=lambda item: tuple(str(part) for part in item[0])):
+        content_hashes = {entry.content_hash for entry in grouped if entry.content_hash}
+        if len(grouped) < 2 or len(content_hashes) <= 1:
+            continue
+        groups.append(
+            duplicate_group_summary(
+                risk_type="likely_mirror",
+                confidence="medium",
+                reason="same parsed record hash, record count, and timestamp span with different file content hashes",
+                group_key=f"mirror:{hash_text(':'.join(str(part) for part in record_key))}",
+                entries=grouped,
+                plan=plan,
+            )
+        )
+    return groups
+
+
+def duplicate_group_summary(*, risk_type: str, confidence: str, reason: str, group_key: str, entries: list[ManifestEntry], plan: SourcePlan) -> dict:
+    members = [duplicate_member_summary(entry, plan) for entry in sorted(entries, key=lambda item: safe_path_hash(item.path))]
+    timestamp_starts = [entry.date_start for entry in entries if entry.date_start]
+    timestamp_ends = [entry.date_end for entry in entries if entry.date_end]
+    mtimes = [entry.mtime for entry in entries]
+    line_counts = [entry.line_count for entry in entries]
+    record_counts = [entry.record_count for entry in entries]
+    return {
+        "risk_type": risk_type,
+        "confidence": confidence,
+        "reason": reason,
+        "group_key": group_key,
+        "member_count": len(members),
+        "source_labels": sorted({member["source_label"] for member in members}),
+        "root_labels": sorted({member["root_label"] for member in members}),
+        "path_labels": [member["path_label"] for member in members],
+        "content_hashes": sorted({member["content_hash"] for member in members if member.get("content_hash")}),
+        "record_hashes": sorted({member["record_hash"] for member in members if member.get("record_hash")}),
+        "hashed_session_keys": sorted({member["hashed_session_key"] for member in members if member.get("hashed_session_key")}),
+        "file_size_bytes": sorted({member["file_size_bytes"] for member in members}),
+        "mtime_span": {"start": min(mtimes), "end": max(mtimes)} if mtimes else {"start": None, "end": None},
+        "timestamp_span": {
+            "start": min(timestamp_starts) if timestamp_starts else None,
+            "end": max(timestamp_ends) if timestamp_ends else None,
+        },
+        "line_count_range": {"min": min(line_counts), "max": max(line_counts)} if line_counts else {"min": 0, "max": 0},
+        "record_count_range": {"min": min(record_counts), "max": max(record_counts)} if record_counts else {"min": 0, "max": 0},
+        "members": members,
+    }
+
+
+def duplicate_member_summary(entry: ManifestEntry, plan: SourcePlan) -> dict:
+    path_hash = safe_path_hash(entry.path)
+    return {
+        "source_label": entry.source_kind,
+        "root_label": root_label_for_entry(entry, plan),
+        "path_label": f"path:{path_hash[:16]}",
+        "path_hash": f"sha256:{path_hash}",
+        "file_size_bytes": entry.size,
+        "mtime": entry.mtime,
+        "content_hash": entry.content_hash,
+        "record_hash": entry.record_hash,
+        "hashed_session_key": hash_text(entry.session) if entry.session else None,
+        "timestamp_span": {"start": entry.date_start, "end": entry.date_end},
+        "line_count": entry.line_count,
+        "record_count": entry.record_count,
+    }
+
+
+def root_label_for_entry(entry: ManifestEntry, plan: SourcePlan) -> str:
+    entry_path = Path(entry.path)
+    for index, root in enumerate(plan.roots, 1):
+        root_path = root.path
+        if path_is_under(entry_path, root_path):
+            return f"{root.kind}:selected_root:{index}"
+    return f"{entry.source_kind}:selected_root"
+
+
+def path_is_under(path: Path, root: Path) -> bool:
+    try:
+        resolved_path = path.resolve()
+        resolved_root = root.resolve()
+    except OSError:
+        resolved_path = path.absolute()
+        resolved_root = root.absolute()
+    if resolved_path == resolved_root:
+        return True
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return False
+    return True
+
+
+def safe_path_hash(path: str) -> str:
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
+def hash_text(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def cost_model(initial: Manifest, refreshed: Manifest, shortlist: dict) -> dict:

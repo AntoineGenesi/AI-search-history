@@ -399,6 +399,14 @@ def build_plan_sources(
             "selected_entries": report.get("shortlist", {}).get("selected_entries", [])[:INLINE_CANDIDATE_LIMIT],
             "excluded_entries": report.get("shortlist", {}).get("excluded_entries", [])[:INLINE_CANDIDATE_LIMIT],
         }
+        duplicate_risk = report.get("duplicate_risk")
+        if duplicate_risk:
+            payload["duplicate_risk"] = {
+                "status": duplicate_risk.get("status"),
+                "summary": duplicate_risk.get("summary", {}),
+                "groups": duplicate_risk.get("groups", [])[:INLINE_CANDIDATE_LIMIT],
+                "limitations": duplicate_risk.get("limitations", []),
+            }
     return payload
 
 
