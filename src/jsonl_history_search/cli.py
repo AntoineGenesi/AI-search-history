@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
+from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .forensics import build_forensics_payload
 from .install_validation import validate_install
@@ -142,6 +143,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--fail-on-threshold",
         action="store_true",
         help="Exit non-zero when large-impact thresholds fail.",
+    )
+    diagnose = subparsers.add_parser("diagnose-capabilities")
+    diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
+    diagnose.add_argument("--cwd", default=".")
+    diagnose.add_argument("--codex-home", default=None)
+    diagnose.add_argument("--claude-home", default=None)
+    diagnose.add_argument("--root", action="append", default=[])
+    diagnose.add_argument("--max-files", type=int, default=200)
+    diagnose.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
+    diagnose.add_argument("--max-elapsed", type=float, default=15.0)
+    diagnose.add_argument("--allow-arbitrary-root", action="store_true")
+    diagnose.add_argument("--hard-cap-files", type=int, default=None)
+    diagnose.add_argument("--hard-cap-bytes", type=int, default=None)
+    diagnose.add_argument(
+        "--fixture",
+        default="benchmarks/retrieval_gold/sanitized_cases.json",
+        help="Sanitized benchmark fixture to check for diagnostic readiness.",
+    )
+    diagnose.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where a machine-readable diagnostic JSON report should be written.",
     )
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -285,6 +308,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(render(payload, args.format))
         return 1 if payload["install_validation"]["overall_status"] == "fail" else 0
+    if args.command == "diagnose-capabilities":
+        payload = build_capability_diagnostic(args)
+        if args.report_output:
+            payload["capability_diagnostic"]["report_written"] = str(Path(args.report_output).expanduser())
+            Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+        print(render(payload, args.format))
+        statuses = payload["capability_diagnostic"]["summary"]
+        return 1 if statuses.get("blocked", 0) else 0
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0

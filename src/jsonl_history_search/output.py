@@ -8,6 +8,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "capability_diagnostic" in payload:
+        return render_capability_diagnostic_text(payload)
     if "install_validation" in payload:
         return render_install_validation_text(payload)
     if "forensics" in payload:
@@ -75,6 +77,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "capability_diagnostic" in payload:
+        return render_capability_diagnostic_markdown(payload)
     if "install_validation" in payload:
         return render_install_validation_markdown(payload)
     if "forensics" in payload:
@@ -117,6 +121,96 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_capability_diagnostic_text(payload: dict) -> str:
+    report = payload["capability_diagnostic"]
+    summary = report.get("summary", {})
+    lines = [
+        "Capability Diagnostic",
+        f"Backend: {report.get('backend_selected')} (tier {report.get('fallback_tier')})",
+        "Summary: "
+        f"available={summary.get('available', 0)} "
+        f"degraded={summary.get('degraded', 0)} "
+        f"missing={summary.get('missing', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"not_implemented={summary.get('not_implemented', 0)}",
+    ]
+    if report.get("report_written"):
+        lines.append(f"Report written: {report['report_written']}")
+    source_plan = report.get("source_plan", {})
+    lines.append(
+        "Source plan: "
+        f"{source_plan.get('selected_root_count', 0)} selected, "
+        f"{source_plan.get('rejected_root_count', 0)} rejected, "
+        f"{source_plan.get('missing_root_count', 0)} missing"
+    )
+    for root in source_plan.get("roots", [])[:5]:
+        state = "readable" if root.get("readable") else "missing/unreadable"
+        lines.append(f"- root {root.get('kind')}: {root.get('label')} ({state})")
+    for rejected in source_plan.get("rejected_roots", [])[:5]:
+        lines.append(f"- rejected {rejected.get('label')}: {rejected.get('reason')}")
+
+    capabilities = report.get("capabilities", {})
+    for status in ("available", "degraded", "missing", "blocked", "not_implemented"):
+        items = [item for item in capabilities.values() if item.get("status") == status]
+        if not items:
+            continue
+        heading = "Missing/not implemented" if status == "not_implemented" else status.replace("_", " ").title()
+        lines.append(f"{heading}:")
+        for item in items:
+            lines.append(
+                "- "
+                f"{item.get('id')}: {item.get('name')} | "
+                f"fallback={item.get('fallback')} | "
+                f"next={item.get('suggested_next_action')}"
+            )
+            loss = item.get("expected_slowdown_or_lost_feature")
+            if loss and status != "available":
+                lines.append(f"  Impact: {loss}")
+    gates = report.get("benchmark_gates", {})
+    if gates:
+        lines.append(f"Benchmark gates: default_promotion_ready={gates.get('default_promotion_ready')}")
+        lines.append(f"Gate reason: {gates.get('reason')}")
+    return "\n".join(lines)
+
+
+def render_capability_diagnostic_markdown(payload: dict) -> str:
+    report = payload["capability_diagnostic"]
+    summary = report.get("summary", {})
+    lines = [
+        "# Capability Diagnostic",
+        "",
+        f"**Backend:** {report.get('backend_selected')} (tier {report.get('fallback_tier')})",
+        (
+            "**Summary:** "
+            f"available={summary.get('available', 0)}, "
+            f"degraded={summary.get('degraded', 0)}, "
+            f"missing={summary.get('missing', 0)}, "
+            f"blocked={summary.get('blocked', 0)}, "
+            f"not_implemented={summary.get('not_implemented', 0)}"
+        ),
+    ]
+    if report.get("report_written"):
+        lines.append(f"**Report written:** {report['report_written']}")
+    lines.extend(["", "## Capabilities", ""])
+    for item in report.get("capabilities", {}).values():
+        lines.append(
+            f"- **{item.get('id')}**: `{item.get('status')}`; "
+            f"fallback `{item.get('fallback')}`; {item.get('suggested_next_action')}"
+        )
+    lines.extend(["", "## Source Plan", ""])
+    source_plan = report.get("source_plan", {})
+    lines.append(
+        f"- selected={source_plan.get('selected_root_count', 0)}, "
+        f"rejected={source_plan.get('rejected_root_count', 0)}, "
+        f"missing={source_plan.get('missing_root_count', 0)}"
+    )
+    for root in source_plan.get("roots", [])[:5]:
+        lines.append(f"- {root.get('kind')}: `{root.get('label')}` readable={root.get('readable')}")
+    for rejected in source_plan.get("rejected_roots", [])[:5]:
+        lines.append(f"- rejected `{rejected.get('label')}`: {rejected.get('reason')}")
+    return "\n".join(lines)
 
 
 def render_forensics_text(payload: dict) -> str:
