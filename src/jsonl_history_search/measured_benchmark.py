@@ -103,6 +103,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
             default_tz=tz,
             now=now,
             cwd=str(cwd),
+            use_rg_prefilter=getattr(args, "rg_prefilter", False),
         )
         rows.append(row)
 
@@ -120,10 +121,25 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
     return {"measured_benchmark": base_report}
 
 
-def _run_probe(*, probe: MeasuredProbe, run_id: str, plan: SourcePlan, default_tz, now, cwd: str) -> dict[str, Any]:
+def _run_probe(
+    *,
+    probe: MeasuredProbe,
+    run_id: str,
+    plan: SourcePlan,
+    default_tz,
+    now,
+    cwd: str,
+    use_rg_prefilter: bool,
+) -> dict[str, Any]:
     started = time.perf_counter()
     intent = infer_query(probe.query_text, now=now)
-    result = search(plan, intent, default_tz=default_tz, cwd=cwd)
+    result = search(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        use_rg_prefilter=use_rg_prefilter,
+    )
     warnings = _safe_warnings(result.get("warnings", []))
     candidate_count = sum(len(group.get("matches", [])) for group in result.get("groups", []))
     row = {
@@ -135,6 +151,7 @@ def _run_probe(*, probe: MeasuredProbe, run_id: str, plan: SourcePlan, default_t
         "searched_bytes": int(result.get("searched_bytes", 0)),
         "candidate_count": candidate_count,
         "result_status": _result_status(candidate_count, warnings),
+        "rg_prefilter": _prefilter_row_stats(result, enabled=use_rg_prefilter),
         "output_context_bytes": 0,
         "warnings": warnings,
     }
@@ -192,6 +209,7 @@ def _aggregate_rows(
     for row in rows:
         statuses[row["result_status"]] = statuses.get(row["result_status"], 0) + 1
         warnings.update(row.get("warnings", []))
+    prefilter = _aggregate_prefilter(rows)
     return {
         "run_id": run_id,
         "overall_status": "capped" if statuses.get("capped") else "ok",
@@ -204,6 +222,7 @@ def _aggregate_rows(
         "limits": _limits_payload(limits, case_limit=case_limit),
         "root_labels": root_labels,
         "warnings": sorted(warnings),
+        "rg_prefilter": prefilter,
     }
 
 
@@ -220,6 +239,7 @@ def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_l
         "limits": _limits_payload(limits, case_limit=case_limit),
         "root_labels": root_labels,
         "warnings": [],
+        "rg_prefilter": _aggregate_prefilter([]),
     }
 
 
@@ -234,6 +254,74 @@ def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[
         "warnings": safe,
     }
     return {"measured_benchmark": report}
+
+
+def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+    stats = result.get("prefilter") if enabled else None
+    if not isinstance(stats, dict):
+        return {
+            "enabled": bool(enabled),
+            "available": None,
+            "status": "disabled" if not enabled else "not_attempted",
+            "fallback_reason": None,
+            "candidate_files": 0,
+            "candidate_bytes": 0,
+            "matched_files": 0,
+            "matched_bytes": 0,
+            "files_reduced": 0,
+            "bytes_reduced": 0,
+            "files_reduction_ratio": 0.0,
+            "bytes_reduction_ratio": 0.0,
+        }
+    return {
+        "enabled": bool(stats.get("enabled")),
+        "available": stats.get("available"),
+        "status": str(stats.get("status") or "unknown"),
+        "fallback_reason": stats.get("fallback_reason"),
+        "candidate_files": int(stats.get("candidate_files", 0)),
+        "candidate_bytes": int(stats.get("candidate_bytes", 0)),
+        "matched_files": int(stats.get("matched_files", 0)),
+        "matched_bytes": int(stats.get("matched_bytes", 0)),
+        "files_reduced": int(stats.get("files_reduced", 0)),
+        "bytes_reduced": int(stats.get("bytes_reduced", 0)),
+        "files_reduction_ratio": float(stats.get("files_reduction_ratio", 0.0)),
+        "bytes_reduction_ratio": float(stats.get("bytes_reduction_ratio", 0.0)),
+    }
+
+
+def _aggregate_prefilter(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    fallback_reasons: dict[str, int] = {}
+    aggregate = {
+        "enabled_rows": 0,
+        "available_rows": 0,
+        "statuses": statuses,
+        "fallback_reasons": fallback_reasons,
+        "candidate_files": 0,
+        "candidate_bytes": 0,
+        "matched_files": 0,
+        "matched_bytes": 0,
+        "files_reduced": 0,
+        "bytes_reduced": 0,
+        "files_reduction_ratio": 0.0,
+        "bytes_reduction_ratio": 0.0,
+    }
+    for row in rows:
+        stats = row.get("rg_prefilter") or {}
+        if stats.get("enabled"):
+            aggregate["enabled_rows"] += 1
+        if stats.get("available") is True:
+            aggregate["available_rows"] += 1
+        status = str(stats.get("status") or "missing")
+        statuses[status] = statuses.get(status, 0) + 1
+        reason = stats.get("fallback_reason")
+        if reason:
+            fallback_reasons[str(reason)] = fallback_reasons.get(str(reason), 0) + 1
+        for key in ("candidate_files", "candidate_bytes", "matched_files", "matched_bytes", "files_reduced", "bytes_reduced"):
+            aggregate[key] += int(stats.get(key, 0))
+    aggregate["files_reduction_ratio"] = _ratio(int(aggregate["files_reduced"]), int(aggregate["candidate_files"]))
+    aggregate["bytes_reduction_ratio"] = _ratio(int(aggregate["bytes_reduced"]), int(aggregate["candidate_bytes"]))
+    return aggregate
 
 
 def _limits_payload(limits: Limits, *, case_limit: int) -> dict[str, Any]:
@@ -324,3 +412,7 @@ def _run_id() -> str:
 
 def _elapsed_ms(started: float) -> int:
     return max(0, round((time.perf_counter() - started) * 1000))
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 3) if denominator else 0.0
