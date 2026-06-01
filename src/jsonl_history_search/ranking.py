@@ -165,7 +165,6 @@ def is_weak_partial_generic(reasons: list[str]) -> bool:
         return False
     strong_prefixes = (
         "phrase:",
-        "project:",
         "artifact:",
         "text:artifact_path:",
         "text:task_slug:",

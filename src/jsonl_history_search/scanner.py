@@ -82,6 +82,12 @@ def search(
                     if len(weak_matches) < weak_reservoir_limit:
                         weak_matches.append(match)
                     else:
+                        weakest_index = min(
+                            range(len(weak_matches)),
+                            key=lambda index: match_sort_key(weak_matches[index]),
+                        )
+                        if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
+                            weak_matches[weakest_index] = match
                         weak_candidates_skipped += 1
                     continue
                 matches.append(match)
@@ -98,7 +104,7 @@ def search(
     if weak_candidates_skipped:
         warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
     matches = (matches + weak_matches)[: plan.limits.max_matches * 2]
-    matches.sort(key=lambda item: (item.score, item.timestamp or "", item.path, -item.line), reverse=True)
+    matches.sort(key=match_sort_key, reverse=True)
     matches = matches[: plan.limits.max_matches]
     payload = {
         "searched_files": searched_files,
@@ -111,3 +117,7 @@ def search(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def match_sort_key(match: Match) -> tuple[float, str, str, int]:
+    return (match.score, match.timestamp or "", match.path, -match.line)
