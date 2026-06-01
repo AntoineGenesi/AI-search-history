@@ -197,11 +197,13 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
 
     selected = _selected_baselines(args.baseline)
     files, enum_warnings = _enumerate_impact_files(plan)
+    cap_hit_labels = _cap_hit_labels(_safe_warnings(enum_warnings))
     if enum_warnings:
         warnings = _safe_warnings(enum_warnings)
         if not explicit_roots:
             warnings = [warning for warning in warnings if warning != "arbitrary_root_enabled_with_hard_caps"]
         base_report["warnings"] = warnings
+        cap_hit_labels = _cap_hit_labels(warnings)
     doc_index = _build_doc_index(files, timezone_from_args(args.timezone, args.timezone_offset))
     rows: list[dict[str, Any]] = []
     for case in fixture["cases"][: args.case_limit if args.case_limit > 0 else None]:
@@ -221,10 +223,13 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
                         plan=plan,
                         args=args,
                         repeat_index=repeat_index,
+                        cap_hit_labels=cap_hit_labels,
                     )
                 )
 
-    base_report["status"] = "ok"
+    base_report["status"] = "capped" if cap_hit_labels else "ok"
+    base_report["caps_hit"] = bool(cap_hit_labels)
+    base_report["cap_hit_labels"] = cap_hit_labels
     base_report["rows"] = rows
     base_report["summary"] = _summarize(rows, selected)
     base_report.update(_evaluate_gate_statuses(rows, base_report["summary"], base_report.get("warnings", [])))
@@ -274,6 +279,8 @@ def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str]
         "privacy_contract": _privacy_contract(),
         "total_wall_time_ms": _elapsed_ms(started),
         "warnings": [],
+        "caps_hit": False,
+        "cap_hit_labels": [],
         "rows": [],
         "summary": {},
         "ranking_quality_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
@@ -282,9 +289,12 @@ def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str]
 
 
 def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str], started: float) -> dict[str, Any]:
+    safe_warnings = _safe_warnings(warnings)
     report["status"] = status
     report["total_wall_time_ms"] = _elapsed_ms(started)
-    report["warnings"] = _safe_warnings(warnings)
+    report["warnings"] = safe_warnings
+    report["caps_hit"] = False
+    report["cap_hit_labels"] = _cap_hit_labels(safe_warnings)
     report["ranking_quality_gate"] = _gate_status(
         "not_evaluated",
         [f"benchmark_status_{status}", "no_benchmark_rows"],
@@ -334,7 +344,14 @@ def _preflight_root_warnings(roots: list[Path], cwd: Path) -> list[str]:
 def _enumerate_impact_files(plan: SourcePlan) -> tuple[list[ImpactFile], list[str]]:
     files: list[ImpactFile] = []
     warnings: list[str] = []
-    for path, size, enum_warnings in enumerate_jsonl_files(plan):
+    iterator = enumerate_jsonl_files(plan)
+    while True:
+        try:
+            path, size, enum_warnings = next(iterator)
+        except StopIteration as stopped:
+            if stopped.value is not None:
+                warnings = list(stopped.value)
+            break
         warnings = list(enum_warnings)
         files.append(ImpactFile(path=path, label=f"file_{len(files) + 1:03d}", size=size))
     return files, warnings
@@ -363,6 +380,7 @@ def _run_raw_rg_literal(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     query = _case_query(case)
@@ -379,6 +397,7 @@ def _run_raw_rg_literal(
         bytes_parsed=0,
         output_context_bytes=sum(candidate.byte_count for candidate in candidates[: plan.limits.max_matches]),
         candidates=candidates[: plan.limits.max_matches],
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -390,6 +409,7 @@ def _run_terminal_rg_then_open(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     query = _case_query(case)
@@ -407,6 +427,7 @@ def _run_terminal_rg_then_open(
         bytes_parsed=0,
         output_context_bytes=opened["context_bytes"],
         candidates=candidates[: plan.limits.max_matches],
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -418,6 +439,7 @@ def _run_package_search(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     return _run_package_search_variant(
         case=case,
@@ -428,6 +450,7 @@ def _run_package_search(
         repeat_index=repeat_index,
         baseline="package_search",
         use_rg_prefilter=False,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -439,6 +462,7 @@ def _run_package_search_rg_prefilter(
     plan: SourcePlan,
     args,
     repeat_index: int,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     return _run_package_search_variant(
         case=case,
@@ -449,6 +473,7 @@ def _run_package_search_rg_prefilter(
         repeat_index=repeat_index,
         baseline="package_search_rg_prefilter",
         use_rg_prefilter=True,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -462,6 +487,7 @@ def _run_package_search_variant(
     repeat_index: int,
     baseline: str,
     use_rg_prefilter: bool,
+    cap_hit_labels: list[str] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     default_tz = timezone_from_args(args.timezone, args.timezone_offset)
@@ -503,6 +529,7 @@ def _run_package_search_variant(
         candidates=candidates,
         rg_prefilter=prefilter,
         ranking_reason_label_count=ranking_reason_label_count,
+        cap_hit_labels=cap_hit_labels,
     )
 
 
@@ -1048,6 +1075,18 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
         else:
             safe.append("warning_redacted")
     return sorted(set(safe))
+
+
+def _cap_hit_labels(warnings: list[str]) -> list[str]:
+    labels = set()
+    for warning in warnings:
+        if not warning.startswith("stopped_at_"):
+            continue
+        label = warning[len("stopped_at_") :]
+        if label.endswith("_cap"):
+            label = label[: -len("_cap")]
+        labels.add(label)
+    return sorted(labels)
 
 
 def _privacy_contract() -> dict[str, bool]:
