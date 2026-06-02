@@ -38,6 +38,8 @@ def render_text(payload: dict) -> str:
         return render_measured_benchmark_text(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_text(payload)
+    if "real_history_impact_benchmark" in payload:
+        return render_real_history_impact_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -119,6 +121,8 @@ def render_markdown(payload: dict) -> str:
         return render_measured_benchmark_markdown(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_markdown(payload)
+    if "real_history_impact_benchmark" in payload:
+        return render_real_history_impact_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -1983,6 +1987,145 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('tool_calls')} | "
                 f"{row.get('subprocess_calls')} | "
                 f"{row.get('files_opened')} | "
+                f"{row.get('output_context_bytes')} | "
+                f"{row.get('candidate_count')} |"
+            )
+    return "\n".join(lines)
+
+
+def render_real_history_impact_text(payload: dict) -> str:
+    report = payload["real_history_impact_benchmark"]
+    lines = [
+        "Real-history impact benchmark",
+        f"Status: {report.get('status')}",
+        f"Data source: {report.get('data_source')}",
+        f"Run: {report.get('run_id', '(none)')}",
+        f"Cases: {report.get('case_count', 0)}",
+        f"Roots: {', '.join(report.get('root_labels') or []) or '(none)'}",
+        f"Total wall time ms: {report.get('total_wall_time_ms', 0)}",
+    ]
+    lines.extend(_performance_metric_text_lines(report))
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
+        gate = report.get(gate_name) or {}
+        if gate:
+            lines.append(
+                f"{gate_name}: status={gate.get('status')} "
+                f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
+            )
+    summary = report.get("summary", {})
+    if summary:
+        lines.append("Summary:")
+        for name, row in summary.items():
+            lines.append(
+                "- "
+                f"{name}: hit_rate={row.get('first_pass_hit_rate')} "
+                f"recall@10={row.get('mean_recall_at_10')} "
+                f"mrr={row.get('mean_mrr')} "
+                f"tool_calls={row.get('median_tool_calls')} "
+                f"subprocess_calls={row.get('median_subprocess_calls')} "
+                f"files={row.get('median_files_opened')} "
+                f"records={row.get('median_records_parsed')} "
+                f"bytes_parsed={row.get('median_bytes_parsed')} "
+                f"context_bytes={row.get('median_output_context_bytes')}"
+            )
+    return "\n".join(lines)
+
+
+def render_real_history_impact_markdown(payload: dict) -> str:
+    report = payload["real_history_impact_benchmark"]
+    lines = [
+        "# JSH-049 Real-History Impact Benchmark",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Run:** `{report.get('run_id', '(none)')}`",
+        f"**Cases:** `{report.get('case_count', 0)}` of `{report.get('manifest_case_count', 0)}` manifest cases",
+        f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
+        f"**Total wall time ms:** `{report.get('total_wall_time_ms', 0)}`",
+        f"**Caveat:** {report.get('below_floor_case_count_caveat')}",
+    ]
+    raw = report.get("raw_private_evidence") or {}
+    if report.get("headline_findings"):
+        lines.extend(["", "## Headline Findings", ""])
+        lines.extend(f"- {finding}" for finding in report.get("headline_findings", []))
+    lines.extend(
+        [
+            "",
+            "## Private Evidence",
+            "",
+            f"- Raw per-case evidence stored: `{raw.get('stored')}`",
+            f"- Ignored directory: `{raw.get('directory')}`",
+            f"- Run file label: `{raw.get('run_file_label', '(none)')}`",
+            f"- Committed: `{raw.get('committed')}`",
+        ]
+    )
+    lines.extend(_performance_metric_markdown_lines(report))
+    lines.extend(["", "## Privacy Contract", ""])
+    for key, value in (report.get("privacy_contract") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    if report.get("warnings"):
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- `{warning}`" for warning in report.get("warnings", []))
+    lines.extend(_benchmark_gate_markdown_lines(report))
+    if report.get("summary"):
+        lines.extend(
+            [
+                "",
+                "## Baseline Summary",
+                "",
+                "| Baseline | Hit rate | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Subprocess calls | Files | Records parsed | Bytes scanned | Bytes parsed | Context bytes | Context tokens | Candidates |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for name, row in report.get("summary", {}).items():
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(name))} | "
+                f"{row.get('first_pass_hit_rate')} | "
+                f"{row.get('mean_recall_at_1')} | "
+                f"{row.get('mean_recall_at_3')} | "
+                f"{row.get('mean_recall_at_10')} | "
+                f"{row.get('mean_mrr')} | "
+                f"{row.get('median_wall_time_ms')} | "
+                f"{row.get('median_tool_calls')} | "
+                f"{row.get('median_subprocess_calls')} | "
+                f"{row.get('median_files_opened')} | "
+                f"{row.get('median_records_parsed')} | "
+                f"{row.get('median_bytes_scanned')} | "
+                f"{row.get('median_bytes_parsed')} | "
+                f"{row.get('median_output_context_bytes')} | "
+                f"{row.get('median_output_context_tokens_approx')} | "
+                f"{row.get('median_candidate_count')} |"
+            )
+    if report.get("rows"):
+        lines.extend(
+            [
+                "",
+                "## Case Runs",
+                "",
+                "| Case | Family | Baseline | Outcome | First pass | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Files | Records | Bytes parsed | Context bytes | Candidates |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in report.get("rows", []):
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                f"{_escape_markdown_table(str(row.get('family', '')))} | "
+                f"{_escape_markdown_table(str(row.get('baseline', '')))} | "
+                f"{_escape_markdown_table(str(row.get('expected_outcome', '')))} | "
+                f"{row.get('first_pass_hit')} | "
+                f"{row.get('recall_at_1')} | "
+                f"{row.get('recall_at_3')} | "
+                f"{row.get('recall_at_10')} | "
+                f"{row.get('mrr')} | "
+                f"{row.get('wall_time_ms')} | "
+                f"{row.get('tool_calls')} | "
+                f"{row.get('files_opened')} | "
+                f"{row.get('records_parsed')} | "
+                f"{row.get('bytes_parsed')} | "
                 f"{row.get('output_context_bytes')} | "
                 f"{row.get('candidate_count')} |"
             )

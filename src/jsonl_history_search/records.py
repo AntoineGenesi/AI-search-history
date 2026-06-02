@@ -67,10 +67,14 @@ def parse_record(raw: str, *, path: Path, line: int, default_tz) -> Record:
         raw_timestamp = payload.get("timestamp") or raw_timestamp
         cwd = payload.get("cwd") or payload.get("project") or cwd
         payload_type = payload.get("type")
+        if payload_type == "message" and payload.get("role"):
+            role = payload.get("role")
         if payload_type == "function_call":
             text = f"{payload.get('name') or 'function_call'} {compact_json(payload.get('arguments'))}"
         elif payload_type == "function_call_output":
             text = text_from_item(payload.get("output"))
+        elif payload_type == "message":
+            text = text_from_item(payload.get("content") or payload.get("message"))
         elif payload_type in {"agent_message", "assistant_message", "user_message"}:
             text = text_from_item(payload.get("message") or payload.get("content"))
         elif payload_type in {"turn_context", "session_meta"}:
