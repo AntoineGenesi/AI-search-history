@@ -21,6 +21,8 @@ from .output import render
 from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .query import infer_query
 from .redaction import RedactionContext
+from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
+from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
 from .scanner import search
 from .skill_audit import build_skill_audit_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
@@ -234,6 +236,61 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized impact benchmark report should be written.",
+    )
+    real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
+    add_common_args(real_history_impact)
+    real_history_impact.add_argument(
+        "--manifest",
+        default=str(DEFAULT_REAL_HISTORY_IMPACT_MANIFEST),
+        help="Sanitized reviewed real-history gold manifest.",
+    )
+    real_history_impact.add_argument(
+        "--private-bridge",
+        default=str(DEFAULT_PRIVATE_BRIDGE),
+        help="Ignored private bridge JSON produced by jsh-049a.",
+    )
+    real_history_impact.add_argument(
+        "--case-limit",
+        type=int,
+        default=0,
+        help="Maximum number of reviewed real-history cases to run; 0 means all cases.",
+    )
+    real_history_impact.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat count per case/baseline.",
+    )
+    real_history_impact.add_argument(
+        "--baseline",
+        action="append",
+        choices=(
+            "raw_rg_literal",
+            "terminal_rg_then_open",
+            "manual_newest_first_open",
+            "package_search",
+            "package_search_rg_prefilter",
+        ),
+        default=[],
+        help="Baseline to include; may be passed more than once. Defaults to all real-history impact baselines.",
+    )
+    real_history_impact.add_argument("--terminal-open-limit", type=int, default=3)
+    real_history_impact.add_argument("--manual-open-limit", type=int, default=6)
+    real_history_impact.add_argument("--context-lines", type=int, default=2)
+    real_history_impact.add_argument(
+        "--raw-output-dir",
+        default=str(DEFAULT_RAW_OUTPUT_DIR),
+        help="Ignored directory for raw per-case private run evidence.",
+    )
+    real_history_impact.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    real_history_impact.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
     )
     live_protocol = subparsers.add_parser("benchmark-live-terminal-protocol")
     live_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
@@ -710,6 +767,27 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["impact_benchmark"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture"} else 0
+    if args.command == "benchmark-real-history-impact":
+        payload = build_real_history_impact_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_impact_benchmark"]["status"]
+        return 1 if status in {"root_rejected", "invalid_fixture", "invalid_bridge"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)

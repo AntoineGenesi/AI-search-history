@@ -209,6 +209,56 @@ def impact_benchmark_metrics(report: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def real_history_impact_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    rows = report.get("rows") or []
+    summary = report.get("summary") or {}
+    aggregate = report.get("aggregate") or {}
+    return build_performance_metrics(
+        workload="benchmark_real_history_impact",
+        wall_time_ms=report.get("total_wall_time_ms", 0),
+        phase_durations_ms={
+            "bridge_validation": (report.get("phase_durations_ms") or {}).get("bridge_validation", 0),
+            "source_enumeration": (report.get("phase_durations_ms") or {}).get("source_enumeration", 0),
+            "raw_evidence_write": (report.get("phase_durations_ms") or {}).get("raw_evidence_write", 0),
+            **{
+                f"{name}_median_wall_time": row.get("median_wall_time_ms", 0)
+                for name, row in summary.items()
+                if isinstance(row, dict)
+            },
+        },
+        local_work={
+            "files_opened": sum(_int_or_zero(row.get("files_opened")) for row in rows),
+            "records_parsed": sum(_int_or_zero(row.get("records_parsed")) for row in rows),
+            "bytes_scanned": sum(_int_or_zero(row.get("bytes_scanned")) for row in rows),
+            "bytes_parsed": sum(_int_or_zero(row.get("bytes_parsed")) for row in rows),
+            "tool_calls": sum(_int_or_zero(row.get("tool_calls")) for row in rows),
+            "subprocess_calls": sum(_int_or_zero(row.get("subprocess_calls")) for row in rows),
+            "candidate_count": sum(_int_or_zero(row.get("candidate_count")) for row in rows),
+        },
+        handoff={
+            "output_bytes": sum(_int_or_zero(row.get("output_bytes")) for row in rows),
+            "context_bytes": sum(_int_or_zero(row.get("context_bytes")) for row in rows),
+            "output_context_bytes": sum(_int_or_zero(row.get("output_context_bytes")) for row in rows),
+        },
+        memory=not_measured_memory("rss_not_measured_by_benchmark_real_history_impact"),
+        correctness={
+            "ranking_quality_gate_status": (report.get("ranking_quality_gate") or {}).get("status"),
+            "rg_prefilter_gate_status": (report.get("rg_prefilter_gate") or {}).get("status"),
+            "source_ref_equivalence": aggregate.get("source_ref_equivalence"),
+            "no_evidence_correct": aggregate.get("no_evidence_correct"),
+            "required_counters": {
+                "ranking_quality_gate": (report.get("ranking_quality_gate") or {}).get("required_counters"),
+                "rg_prefilter_gate": (report.get("rg_prefilter_gate") or {}).get("required_counters"),
+            },
+        },
+        tradeoffs=[
+            "This is real private-history aggregate evidence, but committed outputs intentionally omit raw query text, source lines, paths, usernames, and session IDs.",
+            "Parsed/scanned bytes are local tool-work proxies; agent/model handoff bytes and approximate tokens are the model-context impact proxy.",
+            "The run can quantify package/manual tradeoffs, but jsh-049b does not promote ranking, rg prefilter, timestamp, embedding, archive, or sidecar gates.",
+        ],
+    )
+
+
 def embedding_experiment_metrics(report: dict[str, Any]) -> dict[str, Any]:
     aggregate = report.get("aggregate") or {}
     source_metrics = report.get("source_metrics") or aggregate.get("source_metrics") or {}
