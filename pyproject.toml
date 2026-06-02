@@ -9,7 +9,7 @@ description = "JSONL AI conversation mining extension for semantic debugging wor
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
-authors = [{name = "Semantic Linter contributors"}]
+authors = [{name = "JSONL contributors"}]
 
 [project.scripts]
 jsonl-history-search = "jsonl_history_search.cli:main"

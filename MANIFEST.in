@@ -1,0 +1,21 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include benchmarks *.json
+recursive-include docs *.md
+recursive-include install *.sh
+recursive-include scripts *.py
+recursive-include skills *.md
+recursive-include tests *.py
+recursive-include tests/fixtures *
+include reports/jsh-028-open-source-release-readiness.md
+include reports/jsh-032-claim-boundary-and-capability-map.md
+include reports/jsh-033-source-scope-audit-report.md
+include reports/jsh-034d-performance-gate-conclusion-report.md
+include reports/jsh-035d-embedding-decision-report.md
+include reports/jsh-036-archive-protection-plan-diagnostic-and-gate.md
+include reports/jsh-037-retrieval-index-and-sidecar-architecture.md
+include reports/jsh-038-worth-installing-proof-and-public-release-pack.md
+include reports/jsh-039c-release-privacy-checklist-and-final-smoke.md
+include reports/semantic-debugger-question-decision-trees.md
+include reports/html/jsh-038-worth-installing-proof-and-public-release-pack.html

@@ -43,11 +43,12 @@ def validate_install(
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
     root = (package_root or default_package_root()).expanduser().resolve()
+    source_checkout = _is_source_checkout(root)
     checks = [
         _check_cli_import(),
         _check_console_script(root),
-        _check_package_skill(root),
-        _check_package_helpers(root),
+        _check_package_skill(root, source_checkout=source_checkout),
+        _check_package_helpers(root, source_checkout=source_checkout),
         _check_safe_root_rejection(root),
     ]
     checks.extend(_check_redaction_and_fixture_search())
@@ -74,6 +75,13 @@ def validate_install(
 
 def default_package_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _is_source_checkout(package_root: Path) -> bool:
+    return (
+        (package_root / "pyproject.toml").is_file()
+        and (package_root / "src" / "jsonl_history_search").is_dir()
+    )
 
 
 def _check_cli_import() -> ValidationCheck:
@@ -141,7 +149,7 @@ def _pyproject_declares_console_script(package_root: Path) -> bool:
     return 'jsonl-history-search = "jsonl_history_search.cli:main"' in text
 
 
-def _check_package_skill(package_root: Path) -> ValidationCheck:
+def _check_package_skill(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
     path = package_root / "skills" / "codex" / "jsonl-history-search" / "SKILL.md"
     if path.is_file():
         return ValidationCheck(
@@ -150,6 +158,20 @@ def _check_package_skill(package_root: Path) -> ValidationCheck:
             status="pass",
             detail="Package Codex skill file is present.",
             paths=[str(path)],
+        )
+    if not source_checkout:
+        return ValidationCheck(
+            id="package_skill",
+            name="Package Codex skill file",
+            status="warn",
+            detail=(
+                "Package Codex skill file is not present in the installed Python environment. "
+                "This is expected for wheel installs; run from a source checkout to use "
+                "`install/install_codex_global.sh`."
+            ),
+            paths=[str(path)],
+            recovery=["Use a source checkout for optional global Codex skill installation."],
+            metadata={"source_checkout": False},
         )
     return ValidationCheck(
         id="package_skill",
@@ -161,7 +183,7 @@ def _check_package_skill(package_root: Path) -> ValidationCheck:
     )
 
 
-def _check_package_helpers(package_root: Path) -> ValidationCheck:
+def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
     helpers = [
         package_root / "scripts" / "search_jsonl_history.py",
         package_root / "scripts" / "git_jsonl_forensics.py",
@@ -175,6 +197,19 @@ def _check_package_helpers(package_root: Path) -> ValidationCheck:
             status="pass",
             detail="Package helper scripts are present and executable.",
             paths=[str(path) for path in helpers],
+        )
+    if not source_checkout:
+        return ValidationCheck(
+            id="package_helpers",
+            name="Package helper executability",
+            status="warn",
+            detail=(
+                "Checkout helper scripts are not present in the installed Python environment. "
+                "This is expected for wheel installs; the package CLI remains the installed surface."
+            ),
+            paths=[str(path) for path in helpers],
+            recovery=["Use a source checkout if you need helper scripts outside the Python CLI."],
+            metadata={"source_checkout": False},
         )
     recovery = []
     if missing:
