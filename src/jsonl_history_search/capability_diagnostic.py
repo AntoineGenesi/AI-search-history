@@ -287,12 +287,14 @@ def _archive_protection_capability() -> Capability:
             "Selected logs remain unprotected from deletion unless a future snapshot/archive command is implemented "
             "and passes restore/export proof."
         ),
-        suggested_next_action="Use the archive_protection diagnostic and gate before implementing an opt-in snapshot command.",
+        suggested_next_action="Use archive-snapshot-proof only for the committed synthetic fixture; private/local snapshot work remains future-gated.",
         details={
             "diagnostic_read_only": True,
             "archive_writer_present": False,
+            "synthetic_fixture_proof_command_present": True,
             "background_job_present": False,
             "restore_command_present": False,
+            "synthetic_restore_smoke_present": True,
             "promotion_gate": "archive_protection_gate",
             "protection_status": "not_protected",
         },
@@ -391,6 +393,7 @@ def _optional_commands_capability() -> Capability:
         "private-benchmark-mine",
         "benchmark",
         "validate-install",
+        "archive-snapshot-proof",
     }
     missing = sorted(expected - commands)
     return Capability(
