@@ -23,6 +23,7 @@ from .embedding_spike import (
     vectorize_text,
 )
 from .embedding_store import EmbeddingShardStore, StoreConfig, StoredVectorRecord
+from .metric_contract import add_metric_contract, embedding_experiment_metrics
 from .sources import (
     Limits,
     SourcePlan,
@@ -295,6 +296,7 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
     profiler.mark("report_generation", "end")
     report["memory_profile"] = profiler.public(python_peak_bytes=peak_bytes)
     report["root_cause_profile"] = _root_cause_profile(report["memory_profile"])
+    _add_metric_sections(report)
     return {"embedding_experiment": report}
 
 
@@ -1427,7 +1429,11 @@ def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str
     report["privacy_contract"] = _privacy_contract()
     report["production_status"] = "experimental_unpromoted_not_default"
     report["default_live_search_changed"] = False
-    return report
+    return _add_metric_sections(report)
+
+
+def _add_metric_sections(report: dict[str, Any]) -> dict[str, Any]:
+    return add_metric_contract(report, embedding_experiment_metrics(report))
 
 
 def _private_output_dir(raw_output_dir: str | None, now: datetime) -> Path:
