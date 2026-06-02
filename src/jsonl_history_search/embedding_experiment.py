@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import math
+import resource
 import time
 import tracemalloc
 from dataclasses import dataclass
@@ -71,8 +72,57 @@ class ExperimentDocument:
         )
 
 
+class MemoryProfiler:
+    def __init__(self, *, enabled: bool, started: float) -> None:
+        self.enabled = enabled
+        self.started = started
+        self.samples: list[dict[str, Any]] = []
+
+    def mark(self, phase: str, event: str, **counters: Any) -> None:
+        if not self.enabled:
+            return
+        sample = {
+            "phase": phase,
+            "event": event,
+            "elapsed_ms": _elapsed_ms(self.started),
+            "rss_bytes": _current_rss_bytes(),
+            "max_rss_bytes": _max_rss_bytes(),
+        }
+        if tracemalloc.is_tracing():
+            current, peak = tracemalloc.get_traced_memory()
+            sample["tracemalloc_current_bytes"] = int(current)
+            sample["tracemalloc_peak_bytes"] = int(peak)
+        safe_counters = {
+            key: value
+            for key, value in counters.items()
+            if isinstance(value, (int, float, bool)) or value is None or isinstance(value, str)
+        }
+        if safe_counters:
+            sample["counters"] = safe_counters
+        self.samples.append(sample)
+
+    def public(self, *, python_peak_bytes: int | None = None) -> dict[str, Any]:
+        peak_rss = max((int(sample.get("rss_bytes", 0)) for sample in self.samples), default=_current_rss_bytes())
+        max_rss = max((int(sample.get("max_rss_bytes", 0)) for sample in self.samples), default=_max_rss_bytes())
+        return {
+            "enabled": self.enabled,
+            "sample_count": len(self.samples),
+            "samples": self.samples,
+            "peak_observed_rss_bytes": peak_rss,
+            "process_max_rss_bytes": max_rss,
+            "tracemalloc_python_peak_bytes": python_peak_bytes,
+            "tracemalloc_scope": "python_heap_allocations_during_index_build_only",
+            "native_memory_note": (
+                "tracemalloc excludes native ONNX Runtime/FastEmbed allocations, shared libraries, memory arenas, "
+                "and allocator-retained RSS; use rss_bytes/process_max_rss_bytes for native memory behavior."
+            ),
+        }
+
+
 def build_embedding_experiment_payload(args) -> dict[str, Any]:
     started = time.perf_counter()
+    profiler = MemoryProfiler(enabled=bool(getattr(args, "profile_memory", False)), started=started)
+    profiler.mark("experiment", "start")
     tz = timezone_from_args(args.timezone, args.timezone_offset)
     now = parse_now(args.now, tz)
     cwd = Path(args.cwd).expanduser().resolve()
@@ -109,7 +159,14 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
             )
         }
 
+    profiler.mark("source_plan", "start")
     plan = _build_plan_for_mode(args=args, cwd=cwd, limits=limits)
+    profiler.mark(
+        "source_plan",
+        "end",
+        selected_root_count=len(plan.roots),
+        rejected_root_count=len(plan.rejected_roots),
+    )
     if args.experiment_mode != "smoke_synthetic":
         base_report["scope"] = _scope_payload(plan, args)
         if not plan.roots:
@@ -129,7 +186,16 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
     if not probes:
         return {"embedding_experiment": _finish_without_scan(base_report, "no_queries", ["no_query_cases_selected"], started)}
 
-    documents, source_metrics = _load_documents(args=args, plan=plan, default_tz=tz)
+    profiler.mark("document_load", "start")
+    documents, source_metrics = _load_documents(args=args, plan=plan, default_tz=tz, profiler=profiler)
+    profiler.mark(
+        "document_load",
+        "end",
+        document_count=len(documents),
+        candidate_file_count=int(source_metrics.get("candidate_file_count", 0)),
+        candidate_bytes=int(source_metrics.get("candidate_bytes", 0)),
+        text_bytes_estimate=sum(len(doc.text.encode("utf-8", errors="replace")) for doc in documents),
+    )
     base_report["source_metrics"] = source_metrics
     if not documents:
         return {
@@ -142,17 +208,26 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         }
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    profiler.mark("refresh_manifest", "start", document_count=len(documents))
     refresh_metrics = _refresh_metrics(output_dir, documents, args)
-    backend_state = _select_backend(args=args, output_dir=output_dir)
+    profiler.mark("refresh_manifest", "end", document_count=len(documents))
+    profiler.mark("backend_select", "start", backend_requested=args.backend)
+    backend_state = _select_backend(args=args, output_dir=output_dir, profiler=profiler)
+    profiler.mark("backend_select", "end", backend_selected=backend_state["public"]["selected"])
+    onnx_profile = _onnx_profile_status(args=args, backend_state=backend_state)
 
     build_started = time.perf_counter()
     tracemalloc.start()
-    index, index_private_payload = _build_index(documents, backend_state)
+    profiler.mark("index_build", "start", document_count=len(documents))
+    index, index_private_payload = _build_index(documents, backend_state, profiler=profiler)
     _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    profiler.mark("index_build", "end", document_count=len(documents), tracemalloc_peak_bytes=int(peak_bytes))
     tracemalloc.stop()
     index_build_ms = _elapsed_ms(build_started)
 
-    query_rows, query_latencies = _run_queries(probes=probes, documents=documents, index=index, top_k=args.top_k)
+    profiler.mark("query_scan", "start", query_case_count=len(probes))
+    query_rows, query_latencies = _run_queries(probes=probes, documents=documents, index=index, top_k=args.top_k, profiler=profiler)
+    profiler.mark("query_scan", "end", query_case_count=len(probes))
     private_artifacts = _write_private_artifacts(
         output_dir=output_dir,
         run_id=run_id,
@@ -160,6 +235,7 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         documents=documents,
         refresh_metrics=refresh_metrics,
         args=args,
+        profiler=profiler,
     )
     index_size_bytes = int(private_artifacts.get("index_size_bytes", 0))
     cap_labels = sorted(
@@ -179,10 +255,15 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         cap_labels=cap_labels,
         refresh_metrics=refresh_metrics,
     )
+    profiler.mark("report_generation", "start")
+    memory_profile = profiler.public(python_peak_bytes=peak_bytes)
     report = {
         **base_report,
         "status": "capped" if cap_labels else "ok",
         "backend": backend_state["public"],
+        "onnx_profile": onnx_profile,
+        "memory_profile": memory_profile,
+        "root_cause_profile": _root_cause_profile(memory_profile),
         "index_metrics": aggregate["index_metrics"],
         "query_metrics": aggregate["query_metrics"],
         "refresh_metrics": refresh_metrics["public"],
@@ -200,6 +281,9 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         "production_status": "experimental_unpromoted_not_default",
         "default_live_search_changed": False,
     }
+    profiler.mark("report_generation", "end")
+    report["memory_profile"] = profiler.public(python_peak_bytes=peak_bytes)
+    report["root_cause_profile"] = _root_cause_profile(report["memory_profile"])
     return {"embedding_experiment": report}
 
 
@@ -221,7 +305,7 @@ def _build_plan_for_mode(args, cwd: Path, limits: Limits) -> SourcePlan:
     )
 
 
-def _load_documents(args, plan: SourcePlan, default_tz) -> tuple[list[ExperimentDocument], dict[str, Any]]:
+def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler | None = None) -> tuple[list[ExperimentDocument], dict[str, Any]]:
     if args.experiment_mode == "smoke_synthetic":
         payload = load_embedding_fixture(Path(args.fixture).expanduser())
         errors = validate_embedding_fixture(payload)
@@ -262,6 +346,14 @@ def _load_documents(args, plan: SourcePlan, default_tz) -> tuple[list[Experiment
     records_cap_hit = False
 
     for path, size, enum_warnings in enumerate_jsonl_files(plan):
+        if profiler:
+            profiler.mark(
+                "document_enumeration",
+                "file_selected",
+                candidate_file_count=candidate_file_count + 1,
+                candidate_bytes=candidate_bytes + size,
+                document_count=len(documents),
+            )
         warnings = list(enum_warnings)
         candidate_file_count += 1
         candidate_bytes += size
@@ -292,6 +384,8 @@ def _load_documents(args, plan: SourcePlan, default_tz) -> tuple[list[Experiment
                         root_label=root_label,
                     )
                 )
+                if profiler and len(documents) in {1, 10, 50, 100, 250, 500, 1000}:
+                    profiler.mark("record_materialization", "record_checkpoint", document_count=len(documents))
         except AdapterReadError as exc:
             warnings.append(_sanitize_exception(exc))
         if records_cap_hit:
@@ -315,8 +409,8 @@ def _load_documents(args, plan: SourcePlan, default_tz) -> tuple[list[Experiment
     }
 
 
-def _select_backend(args, output_dir: Path) -> dict[str, Any]:
-    fastembed_state = _fastembed_state(args, output_dir)
+def _select_backend(args, output_dir: Path, profiler: MemoryProfiler | None = None) -> dict[str, Any]:
+    fastembed_state = _fastembed_state(args, output_dir, profiler=profiler)
     if args.backend == "fastembed" and fastembed_state.get("model") is not None:
         return {
             "kind": FASTEMBED_BACKEND_ID,
@@ -336,7 +430,7 @@ def _select_backend(args, output_dir: Path) -> dict[str, Any]:
     }
 
 
-def _fastembed_state(args, output_dir: Path) -> dict[str, Any]:
+def _fastembed_state(args, output_dir: Path, profiler: MemoryProfiler | None = None) -> dict[str, Any]:
     if args.backend == "deterministic":
         return _fastembed_public_state(args, "not_requested", download_attempted=False)
     try:
@@ -357,7 +451,11 @@ def _fastembed_state(args, output_dir: Path) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_files_only = not bool(args.allow_model_download)
     try:
+        if profiler:
+            profiler.mark("fastembed_model_session", "constructor_start")
         model = text_embedding(model_name=args.fastembed_model, cache_dir=str(cache_dir), local_files_only=local_files_only)
+        if profiler:
+            profiler.mark("fastembed_model_session", "constructor_end")
     except TypeError:
         if not args.allow_model_download:
             return _fastembed_public_state(
@@ -367,7 +465,11 @@ def _fastembed_state(args, output_dir: Path) -> dict[str, Any]:
                 failure_label="constructor_without_local_files_only",
             )
         try:
+            if profiler:
+                profiler.mark("fastembed_model_session", "constructor_retry_start")
             model = text_embedding(model_name=args.fastembed_model, cache_dir=str(cache_dir))
+            if profiler:
+                profiler.mark("fastembed_model_session", "constructor_retry_end")
         except Exception as exc:  # pragma: no cover - depends on optional local model state
             return _fastembed_public_state(
                 args,
@@ -464,14 +566,39 @@ def _backend_public(requested: str, selected: str, fastembed_state: dict[str, An
     }
 
 
-def _build_index(documents: list[ExperimentDocument], backend_state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _build_index(
+    documents: list[ExperimentDocument],
+    backend_state: dict[str, Any],
+    profiler: MemoryProfiler | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if backend_state["kind"] == FASTEMBED_BACKEND_ID:
-        vectors = _embed_fastembed(backend_state["model"], [doc.text for doc in documents])
+        if profiler:
+            profiler.mark("text_materialization", "start", document_count=len(documents))
+        texts = [doc.text for doc in documents]
+        if profiler:
+            profiler.mark(
+                "text_materialization",
+                "end",
+                document_count=len(documents),
+                text_bytes_estimate=sum(len(text.encode("utf-8", errors="replace")) for text in texts),
+            )
+        vectors = _embed_fastembed(backend_state["model"], texts, profiler=profiler, phase="fastembed_document_batch")
+        if profiler:
+            vector_dim = len(vectors[0]) if vectors else 0
+            profiler.mark(
+                "vector_retention",
+                "start",
+                vector_count=len(vectors),
+                vector_dim=vector_dim,
+                raw_float32_bytes_estimate=len(vectors) * vector_dim * 4,
+            )
         index = {
             "backend": FASTEMBED_BACKEND_ID,
             "model": backend_state["model"],
             "vectors": {doc.doc_id: vector for doc, vector in zip(documents, vectors)},
         }
+        if profiler:
+            profiler.mark("vector_retention", "end", vector_count=len(index["vectors"]))
         private_payload = {
             "schema_version": 1,
             "backend": FASTEMBED_BACKEND_ID,
@@ -481,7 +608,11 @@ def _build_index(documents: list[ExperimentDocument], backend_state: dict[str, A
         }
         return index, private_payload
 
+    if profiler:
+        profiler.mark("deterministic_index", "document_conversion_start", document_count=len(documents))
     embedding_documents = [doc.as_embedding_document() for doc in documents]
+    if profiler:
+        profiler.mark("deterministic_index", "document_conversion_end", document_count=len(documents))
     fixture_index = build_fixture_index(embedding_documents)
     index = {"backend": DETERMINISTIC_BACKEND_ID, **fixture_index}
     private_payload = {
@@ -497,12 +628,31 @@ def _build_index(documents: list[ExperimentDocument], backend_state: dict[str, A
     return index, private_payload
 
 
-def _embed_fastembed(model: Any, texts: list[str]) -> list[list[float]]:
+def _embed_fastembed(
+    model: Any,
+    texts: list[str],
+    profiler: MemoryProfiler | None = None,
+    phase: str = "fastembed_batch",
+) -> list[list[float]]:
     vectors = []
+    if profiler:
+        profiler.mark(phase, "embed_generator_start", input_count=len(texts))
     for vector in model.embed(texts):
         dense = [float(value) for value in vector]
         length = math.sqrt(sum(value * value for value in dense))
         vectors.append([round(value / length, 8) for value in dense] if length else dense)
+        if profiler and len(vectors) in {1, 10, 50, 100, 250, 500, 1000}:
+            profiler.mark(phase, "vector_checkpoint", vector_count=len(vectors), vector_dim=len(dense))
+    if profiler:
+        vector_dim = len(vectors[0]) if vectors else 0
+        profiler.mark(
+            phase,
+            "embed_generator_end",
+            input_count=len(texts),
+            vector_count=len(vectors),
+            vector_dim=vector_dim,
+            raw_float32_bytes_estimate=len(vectors) * vector_dim * 4,
+        )
     return vectors
 
 
@@ -512,10 +662,15 @@ def _run_queries(
     documents: list[ExperimentDocument],
     index: dict[str, Any],
     top_k: int,
+    profiler: MemoryProfiler | None = None,
 ) -> tuple[list[dict[str, Any]], list[int]]:
     rows: list[dict[str, Any]] = []
     latencies: list[int] = []
+    if profiler:
+        profiler.mark("query_baseline_materialization", "start", document_count=len(documents))
     embedding_documents = [doc.as_embedding_document() for doc in documents]
+    if profiler:
+        profiler.mark("query_baseline_materialization", "end", document_count=len(embedding_documents))
     for probe in probes:
         started = time.perf_counter()
         embedding_hits = _rank_embedding(probe.query_text, index)[:top_k]
@@ -588,10 +743,23 @@ def _write_private_artifacts(
     documents: list[ExperimentDocument],
     refresh_metrics: dict[str, Any],
     args,
+    profiler: MemoryProfiler | None = None,
 ) -> dict[str, Any]:
     index_path = output_dir / "embedding-index.private.json"
     manifest_path = output_dir / "resume-manifest.private.json"
-    index_path.write_text(json.dumps(index_payload, indent=2, sort_keys=True), encoding="utf-8")
+    if profiler:
+        profiler.mark("json_serialization", "index_start", document_count=len(documents))
+    index_json = json.dumps(index_payload, indent=2, sort_keys=True)
+    if profiler:
+        profiler.mark(
+            "json_serialization",
+            "index_end",
+            document_count=len(documents),
+            json_bytes=len(index_json.encode("utf-8")),
+        )
+    profiler.mark("private_write", "index_start", document_count=len(documents)) if profiler else None
+    index_path.write_text(index_json, encoding="utf-8")
+    profiler.mark("private_write", "index_end", document_count=len(documents)) if profiler else None
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
@@ -603,7 +771,14 @@ def _write_private_artifacts(
         "refresh": refresh_metrics["private"],
         "raw_text_committed": False,
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    if profiler:
+        profiler.mark("json_serialization", "manifest_start")
+    manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
+    if profiler:
+        profiler.mark("json_serialization", "manifest_end", json_bytes=len(manifest_json.encode("utf-8")))
+    profiler.mark("private_write", "manifest_start") if profiler else None
+    manifest_path.write_text(manifest_json, encoding="utf-8")
+    profiler.mark("private_write", "manifest_end") if profiler else None
     return {
         "scope": "ignored_private_output",
         "index_written": True,
@@ -681,6 +856,191 @@ def _aggregate_rows(
         "caps_hit": bool(cap_labels),
         "cap_hit_labels": sorted(set(cap_labels)),
         "failure_modes": _failure_modes(source_metrics, cap_labels),
+    }
+
+
+def _onnx_profile_status(args, backend_state: dict[str, Any]) -> dict[str, Any]:
+    requested = bool(getattr(args, "enable_onnx_profiling", False))
+    if not requested:
+        return {"requested": False, "status": "not_requested"}
+    if backend_state.get("kind") != FASTEMBED_BACKEND_ID:
+        return {
+            "requested": True,
+            "status": "not_available_backend_not_fastembed",
+            "raw_profile_files_committed": False,
+        }
+    return {
+        "requested": True,
+        "status": "blocked_fastembed_wrapper_session_options_not_exposed",
+        "reason": (
+            "Current FastEmbed construction path accepts model/cache/local-files controls only in this harness. "
+            "It does not expose an ONNX Runtime InferenceSession or SessionOptions hook where enable_profiling "
+            "can be set without relying on private wrapper internals."
+        ),
+        "next_step": "Add ONNX profiling only through a documented public FastEmbed hook or a separate explicit ONNX Runtime backend.",
+        "raw_profile_files_committed": False,
+    }
+
+
+def _root_cause_profile(memory_profile: dict[str, Any]) -> dict[str, Any]:
+    if not memory_profile.get("enabled"):
+        return {"status": "not_profiled", "hypotheses_ranked": []}
+
+    samples = memory_profile.get("samples", [])
+
+    def sample(phase: str, event: str, counter_key: str | None = None, counter_value: Any = None) -> dict[str, Any] | None:
+        for item in samples:
+            if item.get("phase") != phase or item.get("event") != event:
+                continue
+            counters = item.get("counters") or {}
+            if counter_key is not None and counters.get(counter_key) != counter_value:
+                continue
+            return item
+        return None
+
+    def rss(item: dict[str, Any] | None) -> int:
+        return int((item or {}).get("rss_bytes") or 0)
+
+    def counter(item: dict[str, Any] | None, key: str) -> int:
+        value = ((item or {}).get("counters") or {}).get(key) or 0
+        return int(value)
+
+    document_load_end = sample("document_load", "end")
+    model_constructor_end = sample("fastembed_model_session", "constructor_end")
+    embed_start = sample("fastembed_document_batch", "embed_generator_start")
+    first_vector = sample("fastembed_document_batch", "vector_checkpoint", "vector_count", 1)
+    embed_end = sample("fastembed_document_batch", "embed_generator_end")
+    vector_retention_end = sample("vector_retention", "end")
+    json_index_end = sample("json_serialization", "index_end")
+    fastembed_profiled = embed_start is not None and first_vector is not None and embed_end is not None
+
+    peak_rss = int(memory_profile.get("peak_observed_rss_bytes") or 0)
+    tracemalloc_peak = int(memory_profile.get("tracemalloc_python_peak_bytes") or 0)
+    raw_vector_bytes = counter(embed_end, "raw_float32_bytes_estimate")
+    text_bytes = counter(document_load_end, "text_bytes_estimate")
+    index_json_bytes = counter(json_index_end, "json_bytes")
+    embed_native_jump = max(0, rss(first_vector) - rss(embed_start))
+
+    evidence_summary = {
+        "document_count": counter(embed_end, "vector_count"),
+        "text_bytes_estimate": text_bytes,
+        "raw_float32_vector_bytes_estimate": raw_vector_bytes,
+        "index_json_bytes": index_json_bytes,
+        "document_load_end_rss_bytes": rss(document_load_end),
+        "model_constructor_end_rss_bytes": rss(model_constructor_end),
+        "embed_start_rss_bytes": rss(embed_start),
+        "first_vector_checkpoint_rss_bytes": rss(first_vector),
+        "vector_retention_end_rss_bytes": rss(vector_retention_end),
+        "peak_observed_rss_bytes": peak_rss,
+        "tracemalloc_python_peak_bytes": tracemalloc_peak,
+        "embed_start_to_first_vector_rss_delta_bytes": embed_native_jump,
+    }
+
+    if not fastembed_profiled:
+        return {
+            "status": "profiled",
+            "evidence_summary": evidence_summary,
+            "hypotheses_ranked": [
+                {
+                    "rank": 1,
+                    "hypothesis": "fastembed_onnx_not_profiled",
+                    "confidence": "high",
+                    "evidence": "This profile did not run the FastEmbed document-batch path, so it cannot support a FastEmbed/ONNX root-cause claim.",
+                    "evidence_counters": {
+                        "peak_observed_rss_bytes": peak_rss,
+                        "tracemalloc_python_peak_bytes": tracemalloc_peak,
+                    },
+                    "recommended_follow_up": "Run with backend fastembed and RSS profiling before ranking ONNX/FastEmbed causes.",
+                },
+                {
+                    "rank": 2,
+                    "hypothesis": "tracemalloc_only_measurement_is_incomplete",
+                    "confidence": "medium",
+                    "evidence": "Python tracemalloc still only covers Python heap allocations; RSS samples are required for native/runtime memory behavior.",
+                    "evidence_counters": {
+                        "peak_observed_rss_bytes": peak_rss,
+                        "tracemalloc_python_peak_bytes": tracemalloc_peak,
+                    },
+                    "recommended_follow_up": "Keep RSS/native phase samples in future embedding gates; do not use tracemalloc alone.",
+                },
+            ],
+        }
+
+    hypotheses = [
+        {
+            "rank": 1,
+            "hypothesis": "fastembed_onnx_batch_native_allocation",
+            "confidence": "high",
+            "evidence": (
+                "RSS rises during the FastEmbed document batch before Python vector retention dominates; "
+                "tracemalloc remains far below RSS, so native ONNX/FastEmbed allocations are the primary observed cause."
+            ),
+            "evidence_counters": {
+                "embed_start_to_first_vector_rss_delta_bytes": embed_native_jump,
+                "tracemalloc_python_peak_bytes": tracemalloc_peak,
+                "raw_float32_vector_bytes_estimate": raw_vector_bytes,
+            },
+            "recommended_follow_up": "jsh-044b must bound FastEmbed batch/session behavior and measure RSS per batch.",
+        },
+        {
+            "rank": 2,
+            "hypothesis": "current_all_at_once_python_vector_retention",
+            "confidence": "medium",
+            "evidence": (
+                "The current architecture keeps all dense vectors in Python lists and a dict; this is not the main "
+                "500-record RSS jump, but it will scale linearly and should be removed before larger runs."
+            ),
+            "evidence_counters": {
+                "raw_float32_vector_bytes_estimate": raw_vector_bytes,
+                "vector_retention_end_rss_bytes": rss(vector_retention_end),
+            },
+            "recommended_follow_up": "Store vectors in bounded shards and avoid a full in-memory vector dict.",
+        },
+        {
+            "rank": 3,
+            "hypothesis": "json_serialization_secondary_overhead",
+            "confidence": "medium",
+            "evidence": (
+                "JSON serialization produces a multi-MiB private index and a smaller late RSS increase; it is "
+                "secondary at 500 records but wasteful for larger history."
+            ),
+            "evidence_counters": {
+                "index_json_bytes": index_json_bytes,
+                "peak_observed_rss_bytes": peak_rss,
+            },
+            "recommended_follow_up": "Replace monolithic JSON vector dumps with compact appendable shard files.",
+        },
+        {
+            "rank": 4,
+            "hypothesis": "document_text_materialization_not_primary_at_profiled_scale",
+            "confidence": "high",
+            "evidence": (
+                "Document loading and text materialization remain in the tens of MiB while the embed phase reaches GiB RSS."
+            ),
+            "evidence_counters": {
+                "text_bytes_estimate": text_bytes,
+                "document_load_end_rss_bytes": rss(document_load_end),
+            },
+            "recommended_follow_up": "Still stream records in jsh-044b, but treat text loading as a lower-ranked cause.",
+        },
+        {
+            "rank": 5,
+            "hypothesis": "tracemalloc_only_measurement_is_misleading",
+            "confidence": "high",
+            "evidence": (
+                "Python tracemalloc observes only Python heap allocations and misses the native RSS behavior visible here."
+            ),
+            "evidence_counters": {
+                "peak_observed_rss_bytes": peak_rss,
+                "tracemalloc_python_peak_bytes": tracemalloc_peak,
+            },
+            "recommended_follow_up": "Keep RSS/native phase samples in future embedding gates; do not use tracemalloc alone.",
+        },
+    ]
+    return {
+        "status": "profiled",
+        "evidence_summary": evidence_summary,
+        "hypotheses_ranked": hypotheses,
     }
 
 
@@ -946,7 +1306,8 @@ def _privacy_contract() -> dict[str, Any]:
         "private_vectors_committed": False,
         "private_indexes_committed": False,
         "raw_query_text_committed": False,
-        "raw_local_paths_committed": False,
+        "raw_transcript_paths_committed": False,
+        "exact_artifact_paths_may_be_committed": True,
         "private_artifact_storage": "ignored_dot_private_only",
         "remote_upload": False,
         "default_search_promotion": False,
@@ -1011,6 +1372,24 @@ def _file_size(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _current_rss_bytes() -> int:
+    status_path = Path("/proc/self/status")
+    try:
+        for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _max_rss_bytes() -> int:
+    max_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return max_rss * 1024
 
 
 def _median(values: list[int]) -> float:
