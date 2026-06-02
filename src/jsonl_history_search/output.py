@@ -1585,7 +1585,6 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"documents={index_metrics.get('document_count', 0)} "
             f"build_ms={index_metrics.get('index_build_time_ms', 0)} "
             f"peak_memory_bytes={index_metrics.get('peak_memory_bytes', 0)} "
-            f"peak_rss_bytes={(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)} "
             f"disk_bytes={index_metrics.get('disk_index_size_bytes', 0)} "
             f"refresh={index_metrics.get('refresh_status')}"
         ),
@@ -1618,10 +1617,13 @@ def render_embedding_experiment_text(payload: dict) -> str:
         lines.append("Cap hits: " + ", ".join(aggregate.get("cap_hit_labels", [])))
     memory_profile = report.get("memory_profile") or {}
     if memory_profile.get("enabled"):
+        metric_memory = ((report.get("performance_metrics") or {}).get("memory") or {})
         lines.append(
             "Memory profile: "
             f"samples={memory_profile.get('sample_count', 0)} "
             f"peak_rss_bytes={memory_profile.get('peak_observed_rss_bytes', 0)} "
+            f"observed_duration_ms={metric_memory.get('observed_duration_ms', 0)} "
+            f"rss_duration_above_thresholds_ms={metric_memory.get('rss_duration_above_thresholds_ms', {})} "
             f"process_max_rss_bytes={memory_profile.get('process_max_rss_bytes', 0)} "
             f"tracemalloc_python_peak_bytes={memory_profile.get('tracemalloc_python_peak_bytes', 0)}"
         )
@@ -1666,7 +1668,6 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Documents indexed: {index_metrics.get('document_count', 0)}",
         f"- Index build ms: {index_metrics.get('index_build_time_ms', 0)}",
         f"- Peak memory bytes: {index_metrics.get('peak_memory_bytes', 0)}",
-        f"- Peak observed RSS bytes: {(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)}",
         f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
         f"- Vector shard count: {storage.get('shard_count', 0)}",
         f"- Vector shard bytes: {storage.get('vector_bytes', 0)}",
@@ -1708,13 +1709,19 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         lines.extend(f"- `{failure}`" for failure in aggregate.get("failure_modes", []))
     memory_profile = report.get("memory_profile") or {}
     if memory_profile.get("enabled"):
+        metric_memory = ((report.get("performance_metrics") or {}).get("memory") or {})
         lines.extend(
             [
                 "",
                 "## Memory Profile",
                 "",
                 f"- Samples: {memory_profile.get('sample_count', 0)}",
-                f"- Peak observed RSS bytes: {memory_profile.get('peak_observed_rss_bytes', 0)}",
+                (
+                    "- RSS summary: "
+                    f"peak observed bytes `{memory_profile.get('peak_observed_rss_bytes', 0)}`, "
+                    f"observed duration ms `{metric_memory.get('observed_duration_ms', 0)}`, "
+                    f"duration above thresholds ms `{metric_memory.get('rss_duration_above_thresholds_ms', {})}`."
+                ),
                 f"- Process max RSS bytes: {memory_profile.get('process_max_rss_bytes', 0)}",
                 f"- Tracemalloc Python peak bytes: {memory_profile.get('tracemalloc_python_peak_bytes', 0)}",
                 f"- Tracemalloc scope: `{memory_profile.get('tracemalloc_scope')}`",
