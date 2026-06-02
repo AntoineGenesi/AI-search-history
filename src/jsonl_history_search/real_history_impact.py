@@ -166,7 +166,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     base_report["phase_durations_ms"]["raw_evidence_write"] = _elapsed_ms(phase_started)
     base_report["raw_private_evidence"] = {
         "stored": True,
-        "directory": ".private/jsh-049/raw-runs",
+        "storage": "ignored_local_raw_run_artifacts",
         "run_file_label": f"{base_report['run_id']}.json",
         "committed": False,
     }
@@ -201,7 +201,7 @@ def _invalid_report(
         "bridge_validation": _safe_bridge_summary(bridge_report),
         "caps_hit": False,
         "cap_hit_labels": [],
-        "raw_private_evidence": {"stored": False, "directory": ".private/jsh-049/raw-runs", "committed": False},
+        "raw_private_evidence": {"stored": False, "storage": "ignored_local_raw_run_artifacts", "committed": False},
         "rows": [],
         "summary": {},
         "aggregate": {},
@@ -239,7 +239,7 @@ def _base_report(
         "warnings": [],
         "caps_hit": False,
         "cap_hit_labels": [],
-        "raw_private_evidence": {"stored": False, "directory": ".private/jsh-049/raw-runs", "committed": False},
+        "raw_private_evidence": {"stored": False, "storage": "ignored_local_raw_run_artifacts", "committed": False},
         "rows": [],
         "summary": {},
         "aggregate": {},

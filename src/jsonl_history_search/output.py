@@ -2064,7 +2064,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
             "## Private Evidence",
             "",
             f"- Raw per-case evidence stored: `{raw.get('stored')}`",
-            f"- Ignored directory: `{raw.get('directory')}`",
+            f"- Storage: `{raw.get('storage', 'ignored_local_raw_run_artifacts')}`",
             f"- Run file label: `{raw.get('run_file_label', '(none)')}`",
             f"- Committed: `{raw.get('committed')}`",
         ]
