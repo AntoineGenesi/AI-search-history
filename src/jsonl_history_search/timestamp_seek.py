@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,6 +30,7 @@ class TimestampFileTable:
     size: int
     mtime: float
     line_count: int
+    content_hash: str | None = None
     entries: list[TimestampLineEntry] = field(default_factory=list)
     invalid_reason: str | None = None
 
@@ -74,6 +76,7 @@ def build_timestamp_seek_index(
                 size=stat_size(path),
                 mtime=stat_mtime(path),
                 line_count=0,
+                content_hash=None,
                 invalid_reason="non_line_oriented_source",
             )
             continue
@@ -281,19 +284,22 @@ def _build_file_table(path: Path, *, source_kind: str, default_tz, offset_base: 
                 size=stat_size(path),
                 mtime=stat_mtime(path),
                 line_count=0,
+                content_hash=None,
                 invalid_reason="read_error",
             ),
             bytes_read,
         )
+    content_hash, hash_bytes_read = _hash_file_prefix(path, stat_size(path))
     table = TimestampFileTable(
         path=path,
         source_kind=source_kind,
         size=stat_size(path),
         mtime=stat_mtime(path),
         line_count=line_base + len(entries),
+        content_hash=content_hash,
         entries=entries,
     )
-    return table, bytes_read
+    return table, bytes_read + hash_bytes_read
 
 
 def _refresh_file_table(previous: TimestampFileTable, *, default_tz):
@@ -302,8 +308,14 @@ def _refresh_file_table(previous: TimestampFileTable, *, default_tz):
     if previous.invalid_reason:
         return previous, 0, "stale"
     if current_size == previous.size and current_mtime == previous.mtime:
-        return previous, 0, "no_change"
+        current_hash, bytes_read = _hash_file_prefix(previous.path, previous.size)
+        if current_hash == previous.content_hash:
+            return previous, bytes_read, "no_change"
+        return _stale_file_table(previous, current_size=current_size, current_mtime=current_mtime), bytes_read, "stale"
     if current_size > previous.size and current_mtime >= previous.mtime:
+        current_prefix_hash, validation_bytes = _hash_file_prefix(previous.path, previous.size)
+        if current_prefix_hash != previous.content_hash:
+            return _stale_file_table(previous, current_size=current_size, current_mtime=current_mtime), validation_bytes, "stale"
         tail_table, bytes_read = _build_file_table(
             previous.path,
             source_kind=previous.source_kind,
@@ -313,17 +325,42 @@ def _refresh_file_table(previous: TimestampFileTable, *, default_tz):
         )
         tail_table.entries = previous.entries + tail_table.entries
         tail_table.line_count = len(tail_table.entries)
-        return tail_table, bytes_read, "append"
-    stale = TimestampFileTable(
+        return tail_table, validation_bytes + bytes_read, "append"
+    stale = _stale_file_table(previous, current_size=current_size, current_mtime=current_mtime)
+    return stale, 0, "stale"
+
+
+def _stale_file_table(previous: TimestampFileTable, *, current_size: int, current_mtime: float) -> TimestampFileTable:
+    return TimestampFileTable(
         path=previous.path,
         source_kind=previous.source_kind,
         size=current_size,
         mtime=current_mtime,
         line_count=previous.line_count,
+        content_hash=previous.content_hash,
         entries=list(previous.entries),
         invalid_reason="timestamp_index_stale_or_rewritten",
     )
-    return stale, 0, "stale"
+
+
+def _hash_file_prefix(path: Path, size: int) -> tuple[str | None, int]:
+    digest = hashlib.sha256()
+    bytes_read = 0
+    remaining = max(0, size)
+    try:
+        with path.open("rb") as handle:
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                bytes_read += len(chunk)
+                remaining -= len(chunk)
+    except OSError:
+        return None, bytes_read
+    if bytes_read != size:
+        return None, bytes_read
+    return digest.hexdigest(), bytes_read
 
 
 def _selected_tables(index: TimestampSeekIndex, selected_paths: set[str] | None) -> list[TimestampFileTable]:

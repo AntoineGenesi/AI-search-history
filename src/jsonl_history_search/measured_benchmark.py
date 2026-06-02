@@ -44,6 +44,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
     )
     root_items = [Path(item).expanduser() for item in args.root]
     root_labels = [f"root_{index + 1:03d}" for index, _root in enumerate(root_items)]
+    timestamp_seek_enabled = bool(getattr(args, "timestamp_seek_prototype", False))
 
     base_report: dict[str, Any] = {
         "schema_version": 1,
@@ -54,13 +55,21 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         "root_labels": root_labels,
         "limits": _limits_payload(limits, case_limit=args.case_limit),
         "rows": [],
-        "aggregate": _empty_aggregate(run_id, limits, root_labels, args.case_limit),
+        "aggregate": _empty_aggregate(
+            run_id,
+            limits,
+            root_labels,
+            args.case_limit,
+            include_timestamp_seek=timestamp_seek_enabled,
+        ),
         "ranking_quality_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "rg_prefilter_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "manifest_shortlist_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
-        "timestamp_sidecar_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "privacy_contract": _privacy_contract(),
     }
+    if timestamp_seek_enabled:
+        base_report["timestamp_sidecar_gate"] = _gate_status("not_evaluated", ["benchmark_not_run_yet"])
+        base_report["privacy_contract"].update(_timestamp_seek_privacy_contract())
 
     preflight_warnings = _preflight_root_warnings(root_items, cwd)
     if not root_items:
@@ -102,12 +111,12 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         )
 
     manifest_pair = None
-    if getattr(args, "manifest_shortlist", False) or getattr(args, "timestamp_seek_prototype", False):
+    if getattr(args, "manifest_shortlist", False) or timestamp_seek_enabled:
         initial_manifest = build_manifest(plan, default_tz=tz)
         refreshed_manifest = build_manifest(plan, default_tz=tz, previous=initial_manifest)
         manifest_pair = (initial_manifest, refreshed_manifest)
     timestamp_index_pair = None
-    if getattr(args, "timestamp_seek_prototype", False):
+    if timestamp_seek_enabled:
         initial_timestamp_index = build_timestamp_seek_index(plan, default_tz=tz)
         refreshed_timestamp_index = build_timestamp_seek_index(plan, default_tz=tz, previous=initial_timestamp_index)
         timestamp_index_pair = (initial_timestamp_index, refreshed_timestamp_index)
@@ -134,6 +143,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         root_labels=root_labels,
         case_limit=args.case_limit,
         total_elapsed_ms=_elapsed_ms(started),
+        include_timestamp_seek=timestamp_seek_enabled,
     )
     base_report["status"] = aggregate["overall_status"]
     base_report["rows"] = rows
@@ -208,19 +218,20 @@ def _run_probe(
         use_rg_prefilter=use_rg_prefilter,
     )
     row["manifest_shortlist"] = manifest_stats
-    row["timestamp_seek_prototype"] = _timestamp_seek_row_stats(
-        timestamp_index_pair=timestamp_index_pair,
-        manifest_pair=manifest_pair,
-        intent=intent,
-        plan=plan,
-        default_tz=default_tz,
-        cwd=cwd,
-        baseline_result=result,
-        baseline_candidate_count=candidate_count,
-        baseline_parsed_bytes=int(result.get("searched_bytes", 0)),
-        baseline_python_opened_files=int(result.get("searched_files", 0)),
-        manifest_stats=manifest_stats,
-    )
+    if timestamp_index_pair is not None:
+        row["timestamp_seek_prototype"] = _timestamp_seek_row_stats(
+            timestamp_index_pair=timestamp_index_pair,
+            manifest_pair=manifest_pair,
+            intent=intent,
+            plan=plan,
+            default_tz=default_tz,
+            cwd=cwd,
+            baseline_result=result,
+            baseline_candidate_count=candidate_count,
+            baseline_parsed_bytes=int(result.get("searched_bytes", 0)),
+            baseline_python_opened_files=int(result.get("searched_files", 0)),
+            manifest_stats=manifest_stats,
+        )
     row["wall_time_ms"] = row["elapsed_ms"]
     row["output_context_bytes"] = len(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     row["output_bytes"] = row["output_context_bytes"]
@@ -273,6 +284,7 @@ def _aggregate_rows(
     root_labels: list[str],
     case_limit: int,
     total_elapsed_ms: int,
+    include_timestamp_seek: bool,
 ) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     warnings: set[str] = set()
@@ -281,8 +293,7 @@ def _aggregate_rows(
         warnings.update(row.get("warnings", []))
     prefilter = _aggregate_prefilter(rows)
     manifest = _aggregate_manifest_shortlist(rows)
-    timestamp_seek = _aggregate_timestamp_seek(rows)
-    return {
+    aggregate = {
         "run_id": run_id,
         "overall_status": "capped" if statuses.get("capped") else "ok",
         "total_elapsed_ms": total_elapsed_ms,
@@ -308,12 +319,21 @@ def _aggregate_rows(
         "warnings": sorted(warnings),
         "rg_prefilter": prefilter,
         "manifest_shortlist": manifest,
-        "timestamp_seek_prototype": timestamp_seek,
     }
+    if include_timestamp_seek:
+        aggregate["timestamp_seek_prototype"] = _aggregate_timestamp_seek(rows)
+    return aggregate
 
 
-def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_limit: int) -> dict[str, Any]:
-    return {
+def _empty_aggregate(
+    run_id: str,
+    limits: Limits,
+    root_labels: list[str],
+    case_limit: int,
+    *,
+    include_timestamp_seek: bool = False,
+) -> dict[str, Any]:
+    aggregate = {
         "run_id": run_id,
         "overall_status": "pending",
         "total_elapsed_ms": 0,
@@ -339,8 +359,10 @@ def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_l
         "warnings": [],
         "rg_prefilter": _aggregate_prefilter([]),
         "manifest_shortlist": _aggregate_manifest_shortlist([]),
-        "timestamp_seek_prototype": _aggregate_timestamp_seek([]),
     }
+    if include_timestamp_seek:
+        aggregate["timestamp_seek_prototype"] = _aggregate_timestamp_seek([])
+    return aggregate
 
 
 def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[str], started: float) -> dict[str, Any]:
@@ -369,11 +391,12 @@ def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[
         [f"benchmark_status_{status}", "no_benchmark_rows"],
         counters=_manifest_required_counter_summary([]),
     )
-    report["timestamp_sidecar_gate"] = _gate_status(
-        "not_evaluated",
-        [f"benchmark_status_{status}", "no_benchmark_rows"],
-        counters=_timestamp_seek_required_counter_summary([]),
-    )
+    if "timestamp_sidecar_gate" in report:
+        report["timestamp_sidecar_gate"] = _gate_status(
+            "not_evaluated",
+            [f"benchmark_status_{status}", "no_benchmark_rows"],
+            counters=_timestamp_seek_required_counter_summary([]),
+        )
     return {"measured_benchmark": report}
 
 
@@ -1030,12 +1053,14 @@ def _aggregate_timestamp_seek(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _evaluate_gate_statuses(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
-    return {
+    gates = {
         "ranking_quality_gate": _evaluate_ranking_quality_gate(rows, aggregate),
         "rg_prefilter_gate": _evaluate_rg_prefilter_gate(rows, aggregate),
         "manifest_shortlist_gate": _evaluate_manifest_shortlist_gate(rows, aggregate),
-        "timestamp_sidecar_gate": _evaluate_timestamp_sidecar_gate(rows, aggregate),
     }
+    if "timestamp_seek_prototype" in aggregate:
+        gates["timestamp_sidecar_gate"] = _evaluate_timestamp_sidecar_gate(rows, aggregate)
+    return gates
 
 
 def _evaluate_ranking_quality_gate(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
@@ -1473,6 +1498,11 @@ def _privacy_contract() -> dict[str, Any]:
         "root_paths_replaced_with_labels": True,
         "manifest_shortlist_rows_include_raw_paths": False,
         "manifest_shortlist_default_search_promotion": False,
+    }
+
+
+def _timestamp_seek_privacy_contract() -> dict[str, Any]:
+    return {
         "timestamp_seek_rows_include_raw_paths": False,
         "timestamp_seek_rows_include_raw_text": False,
         "timestamp_seek_default_search_promotion": False,

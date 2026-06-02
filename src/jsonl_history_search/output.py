@@ -1428,20 +1428,27 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- `{warning}`" for warning in aggregate.get("warnings", []))
     if report.get("rows"):
-        lines.extend(
-            [
-                "",
-                "## Runs",
-                "",
-                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Timestamp status | Timestamp ordering | Warnings |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
-            ]
-        )
+        include_timestamp_columns = "timestamp_seek_prototype" in aggregate
+        lines.extend(["", "## Runs", ""])
+        if include_timestamp_columns:
+            lines.extend(
+                [
+                    "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Timestamp status | Timestamp ordering | Warnings |",
+                    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Warnings |",
+                    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
+                ]
+            )
         for row in report.get("rows", []):
             row_id = row.get("case_id") or ""
             manifest_row = row.get("manifest_shortlist") or {}
             timestamp_row = row.get("timestamp_seek_prototype") or {}
-            lines.append(
+            line = (
                 "| "
                 f"{_escape_markdown_table(str(row_id))} | "
                 f"{_escape_markdown_table(str(row.get('query_source', '')))} | "
@@ -1453,10 +1460,14 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('output_context_bytes', 0)} | "
                 f"{_escape_markdown_table(str(manifest_row.get('source_ref_equivalence', '')))} | "
                 f"{_escape_markdown_table(str(manifest_row.get('no_evidence_scope_equivalence', '')))} | "
-                f"{_escape_markdown_table(str(timestamp_row.get('status', '')))} | "
-                f"{_escape_markdown_table(str(timestamp_row.get('ordering_equivalence', '')))} | "
-                f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
             )
+            if include_timestamp_columns:
+                line += (
+                    f"{_escape_markdown_table(str(timestamp_row.get('status', '')))} | "
+                    f"{_escape_markdown_table(str(timestamp_row.get('ordering_equivalence', '')))} | "
+                )
+            line += f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
+            lines.append(line)
     return "\n".join(lines)
 
 
