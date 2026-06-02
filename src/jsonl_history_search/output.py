@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from .metric_contract import TOKEN_FORMULA
+
 
 def render_json(payload: dict) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
@@ -1297,6 +1299,7 @@ def render_measured_benchmark_text(payload: dict) -> str:
     statuses = aggregate.get("statuses", {})
     if statuses:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
+    lines.extend(_performance_metric_text_lines(report))
     for gate_name in ("ranking_quality_gate", "rg_prefilter_gate", "manifest_shortlist_gate", "timestamp_sidecar_gate"):
         gate = report.get(gate_name) or {}
         if gate:
@@ -1385,6 +1388,7 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
         f"- Output context bytes: {aggregate.get('output_context_bytes', 0)}",
         f"- Statuses: {', '.join(f'{key}={value}' for key, value in sorted((aggregate.get('statuses') or {}).items())) or '(none)'}",
     ]
+    lines.extend(_performance_metric_markdown_lines(report))
     lines.extend(_benchmark_gate_markdown_lines(report))
     prefilter = aggregate.get("rg_prefilter") or {}
     if prefilter.get("enabled_rows"):
@@ -1477,6 +1481,90 @@ def _compact_counter_map(values: dict) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
 
 
+def _performance_metric_text_lines(report: dict) -> list[str]:
+    metrics = report.get("performance_metrics") or {}
+    if not metrics:
+        return []
+    local_work = metrics.get("local_tool_work") or {}
+    handoff = metrics.get("agent_model_handoff") or {}
+    memory = metrics.get("memory") or {}
+    local_tokens = local_work.get("approximate_token_estimates") or {}
+    handoff_tokens = handoff.get("approximate_token_estimates") or {}
+    lines = [
+        (
+            "Metric contract: "
+            f"approximate_tokens={TOKEN_FORMULA}, tokenizer=none; "
+            "parsed bytes are tool-side work proxies, not direct model token savings"
+        ),
+        (
+            "Performance metrics: "
+            f"wall_time_ms={(metrics.get('timing') or {}).get('wall_time_ms', 0)} "
+            f"bytes_parsed={local_work.get('bytes_parsed', 0)} "
+            f"approx_parsed_tokens={local_tokens.get('bytes_parsed_approx_tokens', 0)} "
+            f"handoff_bytes={handoff.get('output_context_bytes', 0)} "
+            f"approx_handoff_tokens={handoff_tokens.get('output_context_bytes_approx_tokens', 0)}"
+        ),
+    ]
+    if memory.get("status") == "measured":
+        lines.append(
+            "Memory: "
+            f"measured peak_rss_bytes={memory.get('peak_rss_bytes', 0)} "
+            f"observed_duration_ms={memory.get('observed_duration_ms', 0)} "
+            f"rss_duration_above_thresholds_ms={memory.get('rss_duration_above_thresholds_ms', {})}"
+        )
+    else:
+        lines.append(f"Memory: not_measured reason={memory.get('reason', 'rss_not_sampled')}")
+    for tradeoff in metrics.get("tradeoffs") or []:
+        lines.append(f"Tradeoff: {tradeoff}")
+    return lines
+
+
+def _performance_metric_markdown_lines(report: dict) -> list[str]:
+    metrics = report.get("performance_metrics") or {}
+    if not metrics:
+        return []
+    local_work = metrics.get("local_tool_work") or {}
+    handoff = metrics.get("agent_model_handoff") or {}
+    memory = metrics.get("memory") or {}
+    local_tokens = local_work.get("approximate_token_estimates") or {}
+    handoff_tokens = handoff.get("approximate_token_estimates") or {}
+    lines = [
+        "",
+        "## Metric Contract",
+        "",
+        f"- Approximate tokens: `{TOKEN_FORMULA}`, tokenizer=`none`.",
+        "- Parsed/scanned bytes are tool-side work proxies, not direct model token savings.",
+        (
+            "- Local work: "
+            f"bytes parsed `{local_work.get('bytes_parsed', 0)}`, "
+            f"approx parsed tokens `{local_tokens.get('bytes_parsed_approx_tokens', 0)}`, "
+            f"files opened `{local_work.get('files_opened', 0)}`."
+        ),
+        (
+            "- Agent/model handoff: "
+            f"output context bytes `{handoff.get('output_context_bytes', 0)}`, "
+            f"approx handoff tokens `{handoff_tokens.get('output_context_bytes_approx_tokens', 0)}`."
+        ),
+    ]
+    if memory.get("status") == "measured":
+        lines.extend(
+            [
+                (
+                    "- Memory: "
+                    f"`measured`, peak RSS `{memory.get('peak_rss_bytes', 0)}`, "
+                    f"observed duration ms `{memory.get('observed_duration_ms', 0)}`."
+                ),
+                f"- RSS duration above thresholds ms: `{memory.get('rss_duration_above_thresholds_ms', {})}`.",
+            ]
+        )
+    else:
+        lines.append(f"- Memory: `not_measured`, reason `{memory.get('reason', 'rss_not_sampled')}`.")
+    tradeoffs = metrics.get("tradeoffs") or []
+    if tradeoffs:
+        lines.append("- Tradeoff context: " + " ".join(tradeoffs))
+    return lines
+
+
 def render_embedding_experiment_text(payload: dict) -> str:
     report = payload["embedding_experiment"]
     aggregate = report.get("aggregate", {})
@@ -1497,7 +1585,6 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"documents={index_metrics.get('document_count', 0)} "
             f"build_ms={index_metrics.get('index_build_time_ms', 0)} "
             f"peak_memory_bytes={index_metrics.get('peak_memory_bytes', 0)} "
-            f"peak_rss_bytes={(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)} "
             f"disk_bytes={index_metrics.get('disk_index_size_bytes', 0)} "
             f"refresh={index_metrics.get('refresh_status')}"
         ),
@@ -1525,14 +1612,18 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"documents_reused={batching.get('documents_reused', 0)}"
         ),
     ]
+    lines.extend(_performance_metric_text_lines(report))
     if aggregate.get("cap_hit_labels"):
         lines.append("Cap hits: " + ", ".join(aggregate.get("cap_hit_labels", [])))
     memory_profile = report.get("memory_profile") or {}
     if memory_profile.get("enabled"):
+        metric_memory = ((report.get("performance_metrics") or {}).get("memory") or {})
         lines.append(
             "Memory profile: "
             f"samples={memory_profile.get('sample_count', 0)} "
             f"peak_rss_bytes={memory_profile.get('peak_observed_rss_bytes', 0)} "
+            f"observed_duration_ms={metric_memory.get('observed_duration_ms', 0)} "
+            f"rss_duration_above_thresholds_ms={metric_memory.get('rss_duration_above_thresholds_ms', {})} "
             f"process_max_rss_bytes={memory_profile.get('process_max_rss_bytes', 0)} "
             f"tracemalloc_python_peak_bytes={memory_profile.get('tracemalloc_python_peak_bytes', 0)}"
         )
@@ -1577,7 +1668,6 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Documents indexed: {index_metrics.get('document_count', 0)}",
         f"- Index build ms: {index_metrics.get('index_build_time_ms', 0)}",
         f"- Peak memory bytes: {index_metrics.get('peak_memory_bytes', 0)}",
-        f"- Peak observed RSS bytes: {(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)}",
         f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
         f"- Vector shard count: {storage.get('shard_count', 0)}",
         f"- Vector shard bytes: {storage.get('vector_bytes', 0)}",
@@ -1595,17 +1685,22 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Embedding candidate count: {query_metrics.get('candidate_count_total', 0)}",
         f"- Baseline candidate count: {query_metrics.get('baseline_candidate_count_total', 0)}",
         f"- Protected regressions: {query_metrics.get('protected_regressions', 0)}",
-        "",
-        "## Gate Status",
-        "",
-        "| Gate | Status | Reasons |",
-        "| --- | --- | --- |",
-        (
-            "| `embedding_recall_gate` | "
-            f"`{gate.get('status')}` | "
-            f"{_escape_markdown_table(', '.join(gate.get('reasons') or [])) or '(none)'} |"
-        ),
     ]
+    lines.extend(_performance_metric_markdown_lines(report))
+    lines.extend(
+        [
+            "",
+            "## Gate Status",
+            "",
+            "| Gate | Status | Reasons |",
+            "| --- | --- | --- |",
+            (
+                "| `embedding_recall_gate` | "
+                f"`{gate.get('status')}` | "
+                f"{_escape_markdown_table(', '.join(gate.get('reasons') or [])) or '(none)'} |"
+            ),
+        ]
+    )
     if aggregate.get("cap_hit_labels"):
         lines.extend(["", "## Caps", ""])
         lines.extend(f"- `{label}`" for label in aggregate.get("cap_hit_labels", []))
@@ -1614,13 +1709,19 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         lines.extend(f"- `{failure}`" for failure in aggregate.get("failure_modes", []))
     memory_profile = report.get("memory_profile") or {}
     if memory_profile.get("enabled"):
+        metric_memory = ((report.get("performance_metrics") or {}).get("memory") or {})
         lines.extend(
             [
                 "",
                 "## Memory Profile",
                 "",
                 f"- Samples: {memory_profile.get('sample_count', 0)}",
-                f"- Peak observed RSS bytes: {memory_profile.get('peak_observed_rss_bytes', 0)}",
+                (
+                    "- RSS summary: "
+                    f"peak observed bytes `{memory_profile.get('peak_observed_rss_bytes', 0)}`, "
+                    f"observed duration ms `{metric_memory.get('observed_duration_ms', 0)}`, "
+                    f"duration above thresholds ms `{metric_memory.get('rss_duration_above_thresholds_ms', {})}`."
+                ),
                 f"- Process max RSS bytes: {memory_profile.get('process_max_rss_bytes', 0)}",
                 f"- Tracemalloc Python peak bytes: {memory_profile.get('tracemalloc_python_peak_bytes', 0)}",
                 f"- Tracemalloc scope: `{memory_profile.get('tracemalloc_scope')}`",
@@ -1758,6 +1859,7 @@ def render_impact_benchmark_text(payload: dict) -> str:
         f"Roots: {', '.join(report.get('root_labels') or []) or '(none)'}",
         f"Total wall time ms: {report.get('total_wall_time_ms', 0)}",
     ]
+    lines.extend(_performance_metric_text_lines(report))
     for warning in report.get("warnings", []):
         lines.append(f"Warning: {warning}")
     if report.get("fixture_errors"):
@@ -1810,10 +1912,9 @@ def render_impact_benchmark_markdown(payload: dict) -> str:
         f"**Run:** `{report.get('run_id', '(none)')}`",
         f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
         f"**Total wall time ms:** {report.get('total_wall_time_ms', 0)}",
-        "",
-        "## Privacy Contract",
-        "",
     ]
+    lines.extend(_performance_metric_markdown_lines(report))
+    lines.extend(["", "## Privacy Contract", ""])
     privacy = report.get("privacy_contract", {})
     for key, value in privacy.items():
         lines.append(f"- `{key}`: `{value}`")

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import find_private_pattern_hits
+from .metric_contract import add_metric_contract, impact_benchmark_metrics
 from .query import infer_query
 from .records import parse_record
 from .scanner import search
@@ -234,11 +235,12 @@ def build_impact_benchmark_payload(args) -> dict[str, Any]:
     base_report["summary"] = _summarize(rows, selected)
     base_report.update(_evaluate_gate_statuses(rows, base_report["summary"], base_report.get("warnings", [])))
     base_report["total_wall_time_ms"] = _elapsed_ms(started)
+    _add_metric_sections(base_report)
     return {"impact_benchmark": base_report}
 
 
 def _invalid_report(reason: str, started: float, fixture_errors: list[str] | None = None) -> dict[str, Any]:
-    return {
+    report = {
         "schema_version": 1,
         "status": "invalid_fixture",
         "data_source": "synthetic_committed_only",
@@ -259,6 +261,7 @@ def _invalid_report(reason: str, started: float, fixture_errors: list[str] | Non
         ),
         "privacy_contract": _privacy_contract(),
     }
+    return _add_metric_sections(report)
 
 
 def _base_report(fixture: dict[str, Any], limits: Limits, root_labels: list[str], started: float) -> dict[str, Any]:
@@ -305,7 +308,11 @@ def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str
         [f"benchmark_status_{status}", "no_benchmark_rows"],
         evidence_basis=report.get("data_source"),
     )
-    return report
+    return _add_metric_sections(report)
+
+
+def _add_metric_sections(report: dict[str, Any]) -> dict[str, Any]:
+    return add_metric_contract(report, impact_benchmark_metrics(report))
 
 
 def _default_fixture_roots(fixture: dict[str, Any]) -> list[Path]:

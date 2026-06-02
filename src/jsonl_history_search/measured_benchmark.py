@@ -10,6 +10,7 @@ from typing import Any
 
 from .benchmark import load_benchmark_fixture, validate_benchmark_fixture
 from .manifest import Manifest, build_manifest, shortlist_manifest
+from .metric_contract import add_metric_contract, measured_benchmark_metrics
 from .query import infer_query
 from .scanner import search
 from .sources import Limits, PlannedRoot, SourcePlan, build_source_plan, dangerous_reason, safe_resolve, stat_mtime, stat_size
@@ -149,6 +150,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
     base_report["rows"] = rows
     base_report["aggregate"] = aggregate
     base_report.update(_evaluate_gate_statuses(rows, aggregate))
+    _add_metric_sections(base_report)
     return {"measured_benchmark": base_report}
 
 
@@ -397,7 +399,12 @@ def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[
             [f"benchmark_status_{status}", "no_benchmark_rows"],
             counters=_timestamp_seek_required_counter_summary([]),
         )
+    _add_metric_sections(report)
     return {"measured_benchmark": report}
+
+
+def _add_metric_sections(report: dict[str, Any]) -> dict[str, Any]:
+    return add_metric_contract(report, measured_benchmark_metrics(report))
 
 
 def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
