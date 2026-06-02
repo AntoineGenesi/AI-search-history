@@ -1447,6 +1447,7 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"documents={index_metrics.get('document_count', 0)} "
             f"build_ms={index_metrics.get('index_build_time_ms', 0)} "
             f"peak_memory_bytes={index_metrics.get('peak_memory_bytes', 0)} "
+            f"peak_rss_bytes={(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)} "
             f"disk_bytes={index_metrics.get('disk_index_size_bytes', 0)} "
             f"refresh={index_metrics.get('refresh_status')}"
         ),
@@ -1462,6 +1463,18 @@ def render_embedding_experiment_text(payload: dict) -> str:
     ]
     if aggregate.get("cap_hit_labels"):
         lines.append("Cap hits: " + ", ".join(aggregate.get("cap_hit_labels", [])))
+    memory_profile = report.get("memory_profile") or {}
+    if memory_profile.get("enabled"):
+        lines.append(
+            "Memory profile: "
+            f"samples={memory_profile.get('sample_count', 0)} "
+            f"peak_rss_bytes={memory_profile.get('peak_observed_rss_bytes', 0)} "
+            f"process_max_rss_bytes={memory_profile.get('process_max_rss_bytes', 0)} "
+            f"tracemalloc_python_peak_bytes={memory_profile.get('tracemalloc_python_peak_bytes', 0)}"
+        )
+    onnx_profile = report.get("onnx_profile") or {}
+    if onnx_profile.get("requested"):
+        lines.append(f"ONNX profile: status={onnx_profile.get('status')}")
     for failure in aggregate.get("failure_modes", []):
         lines.append(f"Failure mode: {failure}")
     for row in report.get("rows", []):
@@ -1497,6 +1510,7 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Documents indexed: {index_metrics.get('document_count', 0)}",
         f"- Index build ms: {index_metrics.get('index_build_time_ms', 0)}",
         f"- Peak memory bytes: {index_metrics.get('peak_memory_bytes', 0)}",
+        f"- Peak observed RSS bytes: {(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)}",
         f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
         f"- Refresh status: `{index_metrics.get('refresh_status')}`",
         f"- Refresh/no-change cost ms: {index_metrics.get('refresh_no_change_cost_ms', 0)}",
@@ -1523,6 +1537,98 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
     if aggregate.get("failure_modes"):
         lines.extend(["", "## Failure Modes", ""])
         lines.extend(f"- `{failure}`" for failure in aggregate.get("failure_modes", []))
+    memory_profile = report.get("memory_profile") or {}
+    if memory_profile.get("enabled"):
+        lines.extend(
+            [
+                "",
+                "## Memory Profile",
+                "",
+                f"- Samples: {memory_profile.get('sample_count', 0)}",
+                f"- Peak observed RSS bytes: {memory_profile.get('peak_observed_rss_bytes', 0)}",
+                f"- Process max RSS bytes: {memory_profile.get('process_max_rss_bytes', 0)}",
+                f"- Tracemalloc Python peak bytes: {memory_profile.get('tracemalloc_python_peak_bytes', 0)}",
+                f"- Tracemalloc scope: `{memory_profile.get('tracemalloc_scope')}`",
+                f"- Native memory note: {memory_profile.get('native_memory_note')}",
+                "",
+                "| Phase | Event | Elapsed ms | RSS bytes | Max RSS bytes | Counters |",
+                "| --- | --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for sample in memory_profile.get("samples", [])[:80]:
+            counters = sample.get("counters") or {}
+            counter_text = ", ".join(f"{key}={value}" for key, value in sorted(counters.items()))
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(sample.get('phase', '')))} | "
+                f"{_escape_markdown_table(str(sample.get('event', '')))} | "
+                f"{sample.get('elapsed_ms', 0)} | "
+                f"{sample.get('rss_bytes', 0)} | "
+                f"{sample.get('max_rss_bytes', 0)} | "
+                f"{_escape_markdown_table(counter_text)} |"
+            )
+    root_cause_profile = report.get("root_cause_profile") or {}
+    hypotheses = root_cause_profile.get("hypotheses_ranked") or []
+    if hypotheses:
+        lines.extend(
+            [
+                "",
+                "## Root Cause Profile",
+                "",
+                "| Rank | Hypothesis | Confidence | Evidence | Follow-up |",
+                "| ---: | --- | --- | --- | --- |",
+            ]
+        )
+        for item in hypotheses:
+            lines.append(
+                "| "
+                f"{item.get('rank', '')} | "
+                f"{_escape_markdown_table(str(item.get('hypothesis', '')))} | "
+                f"{_escape_markdown_table(str(item.get('confidence', '')))} | "
+                f"{_escape_markdown_table(str(item.get('evidence', '')))} | "
+                f"{_escape_markdown_table(str(item.get('recommended_follow_up', '')))} |"
+            )
+    private_artifact_audit = report.get("private_artifact_audit") or {}
+    audit_items = private_artifact_audit.get("items") or []
+    if audit_items:
+        lines.extend(
+            [
+                "",
+                "## Private Artifact Audit",
+                "",
+                f"- Scope: `{private_artifact_audit.get('scope')}`",
+                f"- Deleted anything: `{private_artifact_audit.get('deleted_anything')}`",
+                f"- Raw transcript paths committed: `{private_artifact_audit.get('raw_transcript_paths_committed')}`",
+                f"- Artifact paths included: `{private_artifact_audit.get('artifact_paths_included')}`",
+                "",
+                "| Label | Path | Size bytes approx | Classification | Reason |",
+                "| --- | --- | ---: | --- | --- |",
+            ]
+        )
+        for item in audit_items:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(item.get('label', '')))} | "
+                f"{_escape_markdown_table(str(item.get('path', '')))} | "
+                f"{item.get('size_bytes_approx', 0)} | "
+                f"{_escape_markdown_table(str(item.get('classification', '')))} | "
+                f"{_escape_markdown_table(str(item.get('reason', '')))} |"
+            )
+    onnx_profile = report.get("onnx_profile") or {}
+    if onnx_profile.get("requested"):
+        lines.extend(
+            [
+                "",
+                "## ONNX Profile",
+                "",
+                f"- Status: `{onnx_profile.get('status')}`",
+                f"- Raw profile files committed: `{onnx_profile.get('raw_profile_files_committed')}`",
+            ]
+        )
+        if onnx_profile.get("reason"):
+            lines.append(f"- Reason: {onnx_profile.get('reason')}")
+        if onnx_profile.get("next_step"):
+            lines.append(f"- Next step: {onnx_profile.get('next_step')}")
     selected_roots = report.get("scope", {}).get("selected_roots") or []
     if selected_roots:
         lines.extend(["", "## Scope", ""])
@@ -1558,7 +1664,8 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         "private_vectors_committed",
         "private_indexes_committed",
         "raw_query_text_committed",
-        "raw_local_paths_committed",
+        "raw_transcript_paths_committed",
+        "exact_artifact_paths_may_be_committed",
         "remote_upload",
         "default_search_promotion",
     ):

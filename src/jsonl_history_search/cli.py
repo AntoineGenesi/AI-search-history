@@ -291,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path where the sanitized aggregate report should be written.",
     )
+    embedding_experiment.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Record committed-safe process RSS/max-RSS samples across embedding experiment phases.",
+    )
+    embedding_experiment.add_argument(
+        "--enable-onnx-profiling",
+        action="store_true",
+        help="Request ONNX Runtime profiling when safely exposed by the selected local backend.",
+    )
     archive_proof = subparsers.add_parser("archive-snapshot-proof")
     add_common_args(archive_proof)
     archive_proof.add_argument(
