@@ -13,6 +13,7 @@ from .manifest import Manifest, build_manifest, shortlist_manifest
 from .query import infer_query
 from .scanner import search
 from .sources import Limits, PlannedRoot, SourcePlan, build_source_plan, dangerous_reason, safe_resolve, stat_mtime, stat_size
+from .timestamp_seek import TimestampSeekIndex, build_timestamp_seek_index, search_with_timestamp_seek
 from .timeutil import parse_now, timezone_from_args
 
 
@@ -43,6 +44,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
     )
     root_items = [Path(item).expanduser() for item in args.root]
     root_labels = [f"root_{index + 1:03d}" for index, _root in enumerate(root_items)]
+    timestamp_seek_enabled = bool(getattr(args, "timestamp_seek_prototype", False))
 
     base_report: dict[str, Any] = {
         "schema_version": 1,
@@ -53,12 +55,21 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         "root_labels": root_labels,
         "limits": _limits_payload(limits, case_limit=args.case_limit),
         "rows": [],
-        "aggregate": _empty_aggregate(run_id, limits, root_labels, args.case_limit),
+        "aggregate": _empty_aggregate(
+            run_id,
+            limits,
+            root_labels,
+            args.case_limit,
+            include_timestamp_seek=timestamp_seek_enabled,
+        ),
         "ranking_quality_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "rg_prefilter_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "manifest_shortlist_gate": _gate_status("not_evaluated", ["benchmark_not_run_yet"]),
         "privacy_contract": _privacy_contract(),
     }
+    if timestamp_seek_enabled:
+        base_report["timestamp_sidecar_gate"] = _gate_status("not_evaluated", ["benchmark_not_run_yet"])
+        base_report["privacy_contract"].update(_timestamp_seek_privacy_contract())
 
     preflight_warnings = _preflight_root_warnings(root_items, cwd)
     if not root_items:
@@ -100,10 +111,15 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         )
 
     manifest_pair = None
-    if getattr(args, "manifest_shortlist", False):
+    if getattr(args, "manifest_shortlist", False) or timestamp_seek_enabled:
         initial_manifest = build_manifest(plan, default_tz=tz)
         refreshed_manifest = build_manifest(plan, default_tz=tz, previous=initial_manifest)
         manifest_pair = (initial_manifest, refreshed_manifest)
+    timestamp_index_pair = None
+    if timestamp_seek_enabled:
+        initial_timestamp_index = build_timestamp_seek_index(plan, default_tz=tz)
+        refreshed_timestamp_index = build_timestamp_seek_index(plan, default_tz=tz, previous=initial_timestamp_index)
+        timestamp_index_pair = (initial_timestamp_index, refreshed_timestamp_index)
 
     rows: list[dict[str, Any]] = []
     for probe in probes:
@@ -116,6 +132,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
             cwd=str(cwd),
             use_rg_prefilter=getattr(args, "rg_prefilter", False),
             manifest_pair=manifest_pair,
+            timestamp_index_pair=timestamp_index_pair,
         )
         rows.append(row)
 
@@ -126,6 +143,7 @@ def build_measured_benchmark_payload(args) -> dict[str, Any]:
         root_labels=root_labels,
         case_limit=args.case_limit,
         total_elapsed_ms=_elapsed_ms(started),
+        include_timestamp_seek=timestamp_seek_enabled,
     )
     base_report["status"] = aggregate["overall_status"]
     base_report["rows"] = rows
@@ -144,6 +162,7 @@ def _run_probe(
     cwd: str,
     use_rg_prefilter: bool,
     manifest_pair: tuple[Manifest, Manifest] | None,
+    timestamp_index_pair: tuple[TimestampSeekIndex, TimestampSeekIndex] | None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     intent = infer_query(probe.query_text, now=now)
@@ -199,6 +218,20 @@ def _run_probe(
         use_rg_prefilter=use_rg_prefilter,
     )
     row["manifest_shortlist"] = manifest_stats
+    if timestamp_index_pair is not None:
+        row["timestamp_seek_prototype"] = _timestamp_seek_row_stats(
+            timestamp_index_pair=timestamp_index_pair,
+            manifest_pair=manifest_pair,
+            intent=intent,
+            plan=plan,
+            default_tz=default_tz,
+            cwd=cwd,
+            baseline_result=result,
+            baseline_candidate_count=candidate_count,
+            baseline_parsed_bytes=int(result.get("searched_bytes", 0)),
+            baseline_python_opened_files=int(result.get("searched_files", 0)),
+            manifest_stats=manifest_stats,
+        )
     row["wall_time_ms"] = row["elapsed_ms"]
     row["output_context_bytes"] = len(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     row["output_bytes"] = row["output_context_bytes"]
@@ -251,6 +284,7 @@ def _aggregate_rows(
     root_labels: list[str],
     case_limit: int,
     total_elapsed_ms: int,
+    include_timestamp_seek: bool,
 ) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     warnings: set[str] = set()
@@ -259,7 +293,7 @@ def _aggregate_rows(
         warnings.update(row.get("warnings", []))
     prefilter = _aggregate_prefilter(rows)
     manifest = _aggregate_manifest_shortlist(rows)
-    return {
+    aggregate = {
         "run_id": run_id,
         "overall_status": "capped" if statuses.get("capped") else "ok",
         "total_elapsed_ms": total_elapsed_ms,
@@ -286,10 +320,20 @@ def _aggregate_rows(
         "rg_prefilter": prefilter,
         "manifest_shortlist": manifest,
     }
+    if include_timestamp_seek:
+        aggregate["timestamp_seek_prototype"] = _aggregate_timestamp_seek(rows)
+    return aggregate
 
 
-def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_limit: int) -> dict[str, Any]:
-    return {
+def _empty_aggregate(
+    run_id: str,
+    limits: Limits,
+    root_labels: list[str],
+    case_limit: int,
+    *,
+    include_timestamp_seek: bool = False,
+) -> dict[str, Any]:
+    aggregate = {
         "run_id": run_id,
         "overall_status": "pending",
         "total_elapsed_ms": 0,
@@ -316,6 +360,9 @@ def _empty_aggregate(run_id: str, limits: Limits, root_labels: list[str], case_l
         "rg_prefilter": _aggregate_prefilter([]),
         "manifest_shortlist": _aggregate_manifest_shortlist([]),
     }
+    if include_timestamp_seek:
+        aggregate["timestamp_seek_prototype"] = _aggregate_timestamp_seek([])
+    return aggregate
 
 
 def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[str], started: float) -> dict[str, Any]:
@@ -344,6 +391,12 @@ def _finish_without_scan(report: dict[str, Any], *, status: str, warnings: list[
         [f"benchmark_status_{status}", "no_benchmark_rows"],
         counters=_manifest_required_counter_summary([]),
     )
+    if "timestamp_sidecar_gate" in report:
+        report["timestamp_sidecar_gate"] = _gate_status(
+            "not_evaluated",
+            [f"benchmark_status_{status}", "no_benchmark_rows"],
+            counters=_timestamp_seek_required_counter_summary([]),
+        )
     return {"measured_benchmark": report}
 
 
@@ -560,6 +613,192 @@ def _manifest_row_disabled(reason: str) -> dict[str, Any]:
     }
 
 
+def _timestamp_seek_row_stats(
+    *,
+    timestamp_index_pair: tuple[TimestampSeekIndex, TimestampSeekIndex] | None,
+    manifest_pair: tuple[Manifest, Manifest] | None,
+    intent,
+    plan: SourcePlan,
+    default_tz,
+    cwd: str,
+    baseline_result: dict[str, Any],
+    baseline_candidate_count: int,
+    baseline_parsed_bytes: int,
+    baseline_python_opened_files: int,
+    manifest_stats: dict[str, Any],
+) -> dict[str, Any]:
+    if timestamp_index_pair is None:
+        return _timestamp_seek_row_disabled("not_enabled")
+
+    initial, refreshed = timestamp_index_pair
+    selected_paths, planning_source, selection_reason = _timestamp_seek_selected_paths(
+        manifest_pair=manifest_pair,
+        intent=intent,
+        plan=plan,
+        cwd=cwd,
+    )
+    build_warnings = _safe_warnings(list(initial.warnings) + list(refreshed.warnings))
+    cap_labels = _cap_hit_labels(build_warnings)
+    base = {
+        "enabled": True,
+        "prototype_status": "ok",
+        "status": "not_evaluated",
+        "planning_source": planning_source,
+        "selection_reason": selection_reason,
+        "build_bytes": int(initial.metrics.get("build_bytes", 0)),
+        "build_elapsed_ms": initial.metrics.get("build_elapsed_ms", 0),
+        "no_change_refresh_elapsed_ms": refreshed.metrics.get("refresh_elapsed_ms", 0),
+        "append_refresh_elapsed_ms": 0,
+        "query_elapsed_ms": 0,
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "records_considered": 0,
+        "sidecar_hits": 0,
+        "sidecar_misses": 0,
+        "fallback_reason": None,
+        "refresh_count": int(refreshed.metrics.get("refresh_count", 0)),
+        "no_change_refresh_count": int(refreshed.metrics.get("no_change_refresh_count", 0)),
+        "append_refresh_count": int(refreshed.metrics.get("append_refresh_count", 0)),
+        "stale_refresh_count": int(refreshed.metrics.get("stale_refresh_count", 0)),
+        "ordering_equivalence": "not_evaluated",
+        "source_ref_equivalence": "not_evaluated",
+        "caps_hit": bool(cap_labels),
+        "cap_hit_labels": cap_labels,
+        "manifest_planned_parsed_bytes": int(manifest_stats.get("parsed_bytes", 0)),
+        "baseline_parsed_bytes": baseline_parsed_bytes,
+        "baseline_python_opened_files": baseline_python_opened_files,
+        "parsed_byte_reduction_ratio_vs_baseline": 0.0,
+        "parsed_byte_reduction_ratio_vs_manifest": 0.0,
+        "source_ref_equivalence_basis": "python_parsed_candidate_lines",
+    }
+
+    fallback_reason = None
+    if not intent.date_window_start or not intent.date_window_end:
+        fallback_reason = "timestamp_window_absent"
+    elif not refreshed.files:
+        fallback_reason = "timestamp_index_absent"
+    elif selected_paths is not None and not selected_paths:
+        fallback_reason = "timestamp_selection_empty"
+
+    if fallback_reason is None:
+        seek_result = search_with_timestamp_seek(
+            refreshed,
+            plan,
+            intent,
+            default_tz=default_tz,
+            cwd=cwd,
+            selected_paths=selected_paths,
+        )
+        fallback_reason = seek_result.get("fallback_reason")
+    else:
+        seek_result = {}
+
+    if fallback_reason is not None:
+        base.update(
+            {
+                "status": "fallback",
+                "prototype_status": "fallback",
+                "fallback_reason": fallback_reason,
+                "python_opened_files": baseline_python_opened_files,
+                "parsed_bytes": baseline_parsed_bytes,
+                "records_considered": baseline_candidate_count,
+                "query_elapsed_ms": int(seek_result.get("elapsed_ms", 0)),
+                "source_ref_equivalence": "fallback_not_compared",
+                "ordering_equivalence": "fallback_not_compared",
+            }
+        )
+        return base
+
+    seek_warnings = _safe_warnings(seek_result.get("warnings", []))
+    cap_labels = sorted(set(cap_labels + _cap_hit_labels(seek_warnings)))
+    base.update(
+        {
+            "status": "planned_seek",
+            "query_elapsed_ms": int(seek_result.get("elapsed_ms", 0)),
+            "python_opened_files": int(seek_result.get("searched_files", 0)),
+            "parsed_bytes": int(seek_result.get("searched_bytes", 0)),
+            "records_considered": int(seek_result.get("records_considered", 0)),
+            "sidecar_hits": int(seek_result.get("sidecar_hits", 0)),
+            "sidecar_misses": int(seek_result.get("sidecar_misses", 0)),
+            "source_ref_equivalence": _source_ref_equivalence(baseline_result, seek_result),
+            "ordering_equivalence": _source_ref_equivalence(baseline_result, seek_result),
+            "caps_hit": bool(cap_labels),
+            "cap_hit_labels": cap_labels,
+        }
+    )
+    base["parsed_byte_reduction_ratio_vs_baseline"] = _ratio(
+        max(0, baseline_parsed_bytes - int(base["parsed_bytes"])),
+        baseline_parsed_bytes,
+    )
+    manifest_bytes = int(manifest_stats.get("parsed_bytes", 0))
+    if manifest_bytes:
+        base["parsed_byte_reduction_ratio_vs_manifest"] = _ratio(
+            max(0, manifest_bytes - int(base["parsed_bytes"])),
+            manifest_bytes,
+        )
+    return base
+
+
+def _timestamp_seek_row_disabled(reason: str) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "prototype_status": "disabled",
+        "status": "disabled",
+        "planning_source": "disabled",
+        "selection_reason": reason,
+        "build_bytes": 0,
+        "build_elapsed_ms": 0,
+        "no_change_refresh_elapsed_ms": 0,
+        "append_refresh_elapsed_ms": 0,
+        "query_elapsed_ms": 0,
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "records_considered": 0,
+        "sidecar_hits": 0,
+        "sidecar_misses": 0,
+        "fallback_reason": reason,
+        "refresh_count": 0,
+        "no_change_refresh_count": 0,
+        "append_refresh_count": 0,
+        "stale_refresh_count": 0,
+        "ordering_equivalence": "not_evaluated",
+        "source_ref_equivalence": "not_evaluated",
+        "caps_hit": False,
+        "cap_hit_labels": [],
+        "manifest_planned_parsed_bytes": 0,
+        "baseline_parsed_bytes": 0,
+        "baseline_python_opened_files": 0,
+        "parsed_byte_reduction_ratio_vs_baseline": 0.0,
+        "parsed_byte_reduction_ratio_vs_manifest": 0.0,
+        "source_ref_equivalence_basis": "disabled",
+    }
+
+
+def _timestamp_seek_selected_paths(
+    *,
+    manifest_pair: tuple[Manifest, Manifest] | None,
+    intent,
+    plan: SourcePlan,
+    cwd: str,
+) -> tuple[set[str] | None, str, str]:
+    if manifest_pair is None:
+        return None, "full_plan", "manifest_not_available"
+    initial, _refreshed = manifest_pair
+    shortlist = shortlist_manifest(initial, intent, cwd=cwd)
+    selected_entries = shortlist.get("selected_entries") or []
+    if not selected_entries:
+        return set(), "manifest_shortlist", "manifest_empty_selection"
+    if not _selected_entries_current(selected_entries):
+        return None, "full_plan", "manifest_stale_or_changed"
+    if not _selected_entries_allowed(selected_entries, plan):
+        return None, "full_plan", "manifest_selection_rejected"
+    return (
+        {str((item.get("entry") or {}).get("path")) for item in selected_entries if isinstance(item, dict)},
+        "manifest_shortlist",
+        "manifest_selected_files",
+    )
+
+
 def _manifest_fallback_reason(manifest: Manifest, shortlist: dict[str, Any]) -> str | None:
     metrics = shortlist.get("metrics") or {}
     if manifest is None:
@@ -732,12 +971,96 @@ def _aggregate_manifest_shortlist(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return aggregate
 
 
+def _aggregate_timestamp_seek(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    fallback_reasons: dict[str, int] = {}
+    parsed_values: list[int] = []
+    elapsed_values: list[int] = []
+    reductions_vs_baseline: list[float] = []
+    reductions_vs_manifest: list[float] = []
+    aggregate = {
+        "enabled_rows": 0,
+        "planned_rows": 0,
+        "fallback_rows": 0,
+        "statuses": statuses,
+        "fallback_reasons": fallback_reasons,
+        "build_bytes": 0,
+        "build_elapsed_ms": 0,
+        "no_change_refresh_elapsed_ms": 0,
+        "append_refresh_elapsed_ms": 0,
+        "query_elapsed_ms": 0,
+        "python_opened_files": 0,
+        "parsed_bytes": 0,
+        "records_considered": 0,
+        "sidecar_hits": 0,
+        "sidecar_misses": 0,
+        "refresh_count": 0,
+        "no_change_refresh_count": 0,
+        "append_refresh_count": 0,
+        "stale_refresh_count": 0,
+        "parsed_bytes_median": 0,
+        "parsed_bytes_p90": 0,
+        "elapsed_ms_median": 0,
+        "elapsed_ms_p90": 0,
+        "parsed_byte_reduction_ratio_vs_baseline_median": 0.0,
+        "parsed_byte_reduction_ratio_vs_manifest_median": 0.0,
+        "ordering_equivalence": {},
+        "source_ref_equivalence": {},
+        "caps_hit": False,
+        "cap_hit_labels": [],
+        "required_counters": _timestamp_seek_required_counter_summary(rows),
+    }
+    build_counted = False
+    for row in rows:
+        stats = row.get("timestamp_seek_prototype") or {}
+        status = str(stats.get("status") or "missing")
+        statuses[status] = statuses.get(status, 0) + 1
+        if not stats.get("enabled"):
+            continue
+        aggregate["enabled_rows"] += 1
+        if status == "planned_seek":
+            aggregate["planned_rows"] += 1
+        if status == "fallback":
+            aggregate["fallback_rows"] += 1
+        reason = stats.get("fallback_reason")
+        if reason:
+            fallback_reasons[str(reason)] = fallback_reasons.get(str(reason), 0) + 1
+        if not build_counted:
+            for key in ("build_bytes", "refresh_count", "no_change_refresh_count", "append_refresh_count", "stale_refresh_count"):
+                aggregate[key] = int(stats.get(key, 0))
+            for key in ("build_elapsed_ms", "no_change_refresh_elapsed_ms", "append_refresh_elapsed_ms"):
+                aggregate[key] = stats.get(key, 0)
+            build_counted = True
+        for key in ("query_elapsed_ms", "python_opened_files", "parsed_bytes", "records_considered", "sidecar_hits", "sidecar_misses"):
+            aggregate[key] += int(stats.get(key, 0))
+        parsed_values.append(int(stats.get("parsed_bytes", 0)))
+        elapsed_values.append(int(stats.get("query_elapsed_ms", 0)))
+        reductions_vs_baseline.append(float(stats.get("parsed_byte_reduction_ratio_vs_baseline", 0.0)))
+        reductions_vs_manifest.append(float(stats.get("parsed_byte_reduction_ratio_vs_manifest", 0.0)))
+        ordering_eq = str(stats.get("ordering_equivalence") or "missing")
+        source_eq = str(stats.get("source_ref_equivalence") or "missing")
+        aggregate["ordering_equivalence"][ordering_eq] = aggregate["ordering_equivalence"].get(ordering_eq, 0) + 1
+        aggregate["source_ref_equivalence"][source_eq] = aggregate["source_ref_equivalence"].get(source_eq, 0) + 1
+        aggregate["caps_hit"] = bool(aggregate["caps_hit"] or stats.get("caps_hit"))
+        aggregate["cap_hit_labels"] = sorted(set(aggregate["cap_hit_labels"]) | set(stats.get("cap_hit_labels") or []))
+    aggregate["parsed_bytes_median"] = _median_int(parsed_values)
+    aggregate["parsed_bytes_p90"] = _p90_int(parsed_values)
+    aggregate["elapsed_ms_median"] = _median_int(elapsed_values)
+    aggregate["elapsed_ms_p90"] = _p90_int(elapsed_values)
+    aggregate["parsed_byte_reduction_ratio_vs_baseline_median"] = _median_float(reductions_vs_baseline)
+    aggregate["parsed_byte_reduction_ratio_vs_manifest_median"] = _median_float(reductions_vs_manifest)
+    return aggregate
+
+
 def _evaluate_gate_statuses(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
-    return {
+    gates = {
         "ranking_quality_gate": _evaluate_ranking_quality_gate(rows, aggregate),
         "rg_prefilter_gate": _evaluate_rg_prefilter_gate(rows, aggregate),
         "manifest_shortlist_gate": _evaluate_manifest_shortlist_gate(rows, aggregate),
     }
+    if "timestamp_seek_prototype" in aggregate:
+        gates["timestamp_sidecar_gate"] = _evaluate_timestamp_sidecar_gate(rows, aggregate)
+    return gates
 
 
 def _evaluate_ranking_quality_gate(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
@@ -852,6 +1175,64 @@ def _manifest_gate_metrics(manifest: dict[str, Any]) -> dict[str, Any]:
         "parsed_bytes": manifest.get("parsed_bytes", 0),
         "source_ref_equivalence": manifest.get("source_ref_equivalence", {}),
         "no_evidence_scope_equivalence": manifest.get("no_evidence_scope_equivalence", {}),
+    }
+
+
+def _evaluate_timestamp_sidecar_gate(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
+    timestamp_seek = aggregate.get("timestamp_seek_prototype") or {}
+    counters = timestamp_seek.get("required_counters") or _timestamp_seek_required_counter_summary(rows)
+    if not rows:
+        return _gate_status("not_evaluated", ["no_benchmark_rows"], counters=counters)
+    if not timestamp_seek.get("enabled_rows"):
+        return _gate_status(
+            "not_evaluated",
+            ["timestamp_seek_prototype_not_enabled"],
+            counters=counters,
+            metrics={"row_count": len(rows)},
+        )
+    ordering_eq = timestamp_seek.get("ordering_equivalence") or {}
+    source_eq = timestamp_seek.get("source_ref_equivalence") or {}
+    reasons = [
+        "policy_eligible_date_timeline_window_evidence_unavailable",
+        "sanitized_correctness_review_unavailable",
+        "synthetic_or_local_rows_do_not_prove_promotion",
+    ]
+    if timestamp_seek.get("fallback_rows"):
+        reasons.append("timestamp_seek_fallback_rows_present")
+    if timestamp_seek.get("caps_hit"):
+        reasons.append("cap_hits_present")
+    if ordering_eq.get("not_equivalent") or source_eq.get("not_equivalent"):
+        return _gate_status(
+            "fail",
+            ["timestamp_seek_equivalence_regression"] + reasons,
+            counters=counters,
+            metrics=_timestamp_seek_gate_metrics(timestamp_seek),
+        )
+    return _gate_status(
+        "inconclusive",
+        reasons,
+        evaluated_case_count=0,
+        counters=counters,
+        metrics=_timestamp_seek_gate_metrics(timestamp_seek),
+    )
+
+
+def _timestamp_seek_gate_metrics(timestamp_seek: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled_rows": timestamp_seek.get("enabled_rows", 0),
+        "planned_rows": timestamp_seek.get("planned_rows", 0),
+        "fallback_rows": timestamp_seek.get("fallback_rows", 0),
+        "parsed_bytes_median": timestamp_seek.get("parsed_bytes_median", 0),
+        "elapsed_ms_median": timestamp_seek.get("elapsed_ms_median", 0),
+        "elapsed_ms_p90": timestamp_seek.get("elapsed_ms_p90", 0),
+        "parsed_byte_reduction_ratio_vs_baseline_median": timestamp_seek.get(
+            "parsed_byte_reduction_ratio_vs_baseline_median", 0.0
+        ),
+        "parsed_byte_reduction_ratio_vs_manifest_median": timestamp_seek.get(
+            "parsed_byte_reduction_ratio_vs_manifest_median", 0.0
+        ),
+        "ordering_equivalence": timestamp_seek.get("ordering_equivalence", {}),
+        "source_ref_equivalence": timestamp_seek.get("source_ref_equivalence", {}),
     }
 
 
@@ -982,6 +1363,48 @@ def _manifest_required_counter_keys() -> tuple[str, ...]:
     )
 
 
+def _timestamp_seek_required_counter_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in _timestamp_seek_required_counter_keys():
+        available = 0
+        unavailable_reasons: set[str] = set()
+        for row in rows:
+            stats = row.get("timestamp_seek_prototype") or {}
+            if stats.get("enabled") and key in stats:
+                available += 1
+            else:
+                unavailable_reasons.add(
+                    "timestamp_seek_prototype_not_enabled" if not stats.get("enabled") else "counter_not_available"
+                )
+        summary[key] = {
+            "available_rows": available,
+            "unavailable_rows": max(0, len(rows) - available),
+            "unavailable_reasons": sorted(unavailable_reasons),
+        }
+    return summary
+
+
+def _timestamp_seek_required_counter_keys() -> tuple[str, ...]:
+    return (
+        "build_bytes",
+        "build_elapsed_ms",
+        "no_change_refresh_elapsed_ms",
+        "append_refresh_elapsed_ms",
+        "query_elapsed_ms",
+        "python_opened_files",
+        "parsed_bytes",
+        "records_considered",
+        "sidecar_hits",
+        "sidecar_misses",
+        "fallback_reason",
+        "refresh_count",
+        "ordering_equivalence",
+        "source_ref_equivalence",
+        "caps_hit",
+        "cap_hit_labels",
+    )
+
+
 def _cap_hit_labels(warnings: list[str]) -> list[str]:
     labels = set()
     for warning in warnings:
@@ -1078,6 +1501,14 @@ def _privacy_contract() -> dict[str, Any]:
     }
 
 
+def _timestamp_seek_privacy_contract() -> dict[str, Any]:
+    return {
+        "timestamp_seek_rows_include_raw_paths": False,
+        "timestamp_seek_rows_include_raw_text": False,
+        "timestamp_seek_default_search_promotion": False,
+    }
+
+
 def _run_id() -> str:
     return f"measured_{uuid.uuid4().hex[:12]}"
 
@@ -1088,3 +1519,31 @@ def _elapsed_ms(started: float) -> int:
 
 def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 3) if denominator else 0.0
+
+
+def _median_int(values: list[int]) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return int(ordered[mid])
+    return int(round((ordered[mid - 1] + ordered[mid]) / 2))
+
+
+def _p90_int(values: list[int]) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * 0.9)))
+    return int(ordered[index])
+
+
+def _median_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(float(ordered[mid]), 3)
+    return round((float(ordered[mid - 1]) + float(ordered[mid])) / 2, 3)

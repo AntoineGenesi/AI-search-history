@@ -197,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to paired manifest-shortlist planning probes; default search/find behavior is unchanged.",
     )
+    measured.add_argument(
+        "--timestamp-seek-prototype",
+        action="store_true",
+        help="Opt in to transient timestamp/byte-offset seek probes; no default or persistent sidecar is created.",
+    )
     impact = subparsers.add_parser("benchmark-impact")
     add_common_args(impact)
     impact.add_argument(
