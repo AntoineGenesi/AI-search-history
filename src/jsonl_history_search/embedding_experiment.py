@@ -338,45 +338,117 @@ def _select_backend(args, output_dir: Path) -> dict[str, Any]:
 
 def _fastembed_state(args, output_dir: Path) -> dict[str, Any]:
     if args.backend == "deterministic":
-        return {"status": "not_requested", "model_id": args.fastembed_model, "download_attempted": False}
+        return _fastembed_public_state(args, "not_requested", download_attempted=False)
     try:
         module = importlib.import_module("fastembed")
     except ImportError:
-        return {"status": "fastembed_local_missing_dependency", "model_id": args.fastembed_model, "download_attempted": False}
+        return _fastembed_public_state(args, "fastembed_local_missing_dependency", download_attempted=False)
     text_embedding = getattr(module, "TextEmbedding", None)
     if text_embedding is None:
-        return {"status": "fastembed_local_missing_dependency", "model_id": args.fastembed_model, "download_attempted": False}
-    cache_dir = output_dir / "model-cache" / "fastembed"
+        return _fastembed_public_state(args, "fastembed_local_missing_dependency", download_attempted=False)
+    cache_dir = _fastembed_cache_dir(args, output_dir)
+    if not _is_ignored_private_path(cache_dir):
+        return _fastembed_public_state(
+            args,
+            "fastembed_local_cache_rejected",
+            download_attempted=False,
+            failure_label="model_cache_dir_must_be_under_dot_private",
+        )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_files_only = not bool(args.allow_model_download)
     try:
-        model = text_embedding(model_name=args.fastembed_model, cache_dir=str(cache_dir), local_files_only=True)
+        model = text_embedding(model_name=args.fastembed_model, cache_dir=str(cache_dir), local_files_only=local_files_only)
     except TypeError:
+        if not args.allow_model_download:
+            return _fastembed_public_state(
+                args,
+                "fastembed_local_model_unavailable",
+                download_attempted=False,
+                failure_label="constructor_without_local_files_only",
+            )
+        try:
+            model = text_embedding(model_name=args.fastembed_model, cache_dir=str(cache_dir))
+        except Exception as exc:  # pragma: no cover - depends on optional local model state
+            return _fastembed_public_state(
+                args,
+                "fastembed_local_model_unavailable",
+                download_attempted=True,
+                failure_label=_sanitize_exception(exc),
+                constructor_local_files_only_control=False,
+            )
         return {
-            "status": "fastembed_local_model_unavailable",
-            "model_id": args.fastembed_model,
-            "download_attempted": False,
-            "failure_label": "constructor_without_local_files_only",
+            **_fastembed_public_state(
+                args,
+                "fastembed_local_ready",
+                download_attempted=True,
+                constructor_local_files_only_control=False,
+            ),
+            "model": model,
         }
     except Exception as exc:  # pragma: no cover - depends on optional local model state
-        return {
-            "status": "fastembed_local_model_unavailable",
-            "model_id": args.fastembed_model,
-            "download_attempted": False,
-            "failure_label": _sanitize_exception(exc),
-        }
+        return _fastembed_public_state(
+            args,
+            "fastembed_local_model_unavailable",
+            download_attempted=bool(args.allow_model_download),
+            failure_label=_sanitize_exception(exc),
+        )
     return {
-        "status": "fastembed_local_ready",
-        "model_id": args.fastembed_model,
-        "download_attempted": False,
-        "cache_scope": "ignored_private_model_cache",
+        **_fastembed_public_state(
+            args,
+            "fastembed_local_ready",
+            download_attempted=bool(args.allow_model_download),
+        ),
         "model": model,
     }
+
+
+def _fastembed_cache_dir(args, output_dir: Path) -> Path:
+    if args.fastembed_cache_dir:
+        return Path(args.fastembed_cache_dir).expanduser().resolve()
+    return (output_dir / "model-cache" / "fastembed").resolve()
+
+
+def _fastembed_public_state(
+    args,
+    status: str,
+    *,
+    download_attempted: bool,
+    failure_label: str | None = None,
+    constructor_local_files_only_control: bool = True,
+) -> dict[str, Any]:
+    state = {
+        "status": status,
+        "model_id": args.fastembed_model,
+        "download_attempted": download_attempted,
+        "model_download_allowed": bool(args.allow_model_download),
+        "local_files_only": not bool(args.allow_model_download),
+        "cache_scope": "ignored_private_model_cache",
+        "constructor_local_files_only_control": constructor_local_files_only_control,
+        "private_text_upload": False,
+        "remote_embedding_api": False,
+    }
+    if failure_label:
+        state["failure_label"] = failure_label
+    return state
 
 
 def _backend_public(requested: str, selected: str, fastembed_state: dict[str, Any], *, fallback_used: bool) -> dict[str, Any]:
     public_fastembed = {
         key: value
         for key, value in fastembed_state.items()
-        if key in {"status", "model_id", "download_attempted", "cache_scope", "failure_label"}
+        if key
+        in {
+            "status",
+            "model_id",
+            "download_attempted",
+            "model_download_allowed",
+            "local_files_only",
+            "cache_scope",
+            "constructor_local_files_only_control",
+            "private_text_upload",
+            "remote_embedding_api",
+            "failure_label",
+        }
     }
     return {
         "requested": requested,

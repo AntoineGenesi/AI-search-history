@@ -251,6 +251,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Embedding backend to try. auto uses local fastembed when ready, otherwise deterministic fallback.",
     )
     embedding_experiment.add_argument("--fastembed-model", default=FASTEMBED_MODEL_ID)
+    embedding_experiment.add_argument(
+        "--allow-model-download",
+        action="store_true",
+        help="Allow the local FastEmbed library to download public model files into the ignored private cache.",
+    )
+    embedding_experiment.add_argument(
+        "--fastembed-cache-dir",
+        default=None,
+        help="Ignored private cache directory for public FastEmbed model files; must be under .private/.",
+    )
     embedding_experiment.add_argument("--approve-full-history", action="store_true")
     embedding_experiment.add_argument("--window-start", default=None)
     embedding_experiment.add_argument("--window-end", default=None)
