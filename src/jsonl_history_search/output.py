@@ -40,6 +40,8 @@ def render_text(payload: dict) -> str:
         return render_impact_benchmark_text(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_text(payload)
+    if "real_history_timestamp_seek_benchmark" in payload:
+        return render_real_history_timestamp_seek_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -123,6 +125,8 @@ def render_markdown(payload: dict) -> str:
         return render_impact_benchmark_markdown(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_markdown(payload)
+    if "real_history_timestamp_seek_benchmark" in payload:
+        return render_real_history_timestamp_seek_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2172,6 +2176,201 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"{row.get('output_context_bytes')} | "
                 f"{row.get('candidate_count')} | "
                 f"{_escape_markdown_table(row_caps)} |"
+            )
+    return "\n".join(lines)
+
+
+def render_real_history_timestamp_seek_text(payload: dict) -> str:
+    report = payload["real_history_timestamp_seek_benchmark"]
+    gate = report.get("timestamp_sidecar_gate") or {}
+    summary = report.get("summary") or {}
+    lines = [
+        "Real-history timestamp seek benchmark",
+        f"Status: {report.get('status')}",
+        f"Data source: {report.get('data_source')}",
+        f"Run: {report.get('run_id', '(none)')}",
+        f"Cases: {report.get('case_count', 0)}",
+        f"Roots: {', '.join(report.get('root_labels') or []) or '(none)'}",
+        f"Total wall time ms: {report.get('total_wall_time_ms', 0)}",
+        (
+            "timestamp_sidecar_gate: "
+            f"status={gate.get('status')} "
+            f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
+        ),
+    ]
+    lines.extend(_performance_metric_text_lines(report))
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    if report.get("headline_findings"):
+        lines.append("Findings:")
+        lines.extend(f"- {finding}" for finding in report.get("headline_findings", []))
+    for mode in ("baseline_full_scan", "manifest_planned_scan", "timestamp_seek"):
+        row = summary.get(mode) or {}
+        if not row:
+            continue
+        lines.append(
+            "- "
+            f"{mode}: runs={row.get('runs')} "
+            f"elapsed_median_ms={row.get('median_elapsed_ms')} "
+            f"elapsed_p90_ms={row.get('p90_elapsed_ms')} "
+            f"files={row.get('median_files_opened')} "
+            f"records={row.get('median_records_parsed')} "
+            f"bytes_parsed={row.get('median_bytes_parsed')} "
+            f"context_bytes={row.get('median_output_context_bytes')} "
+            f"context_tokens={row.get('median_output_context_tokens_approx')} "
+            f"expected_ref_order={row.get('expected_ref_order_status')}"
+        )
+    return "\n".join(lines)
+
+
+def render_real_history_timestamp_seek_markdown(payload: dict) -> str:
+    report = payload["real_history_timestamp_seek_benchmark"]
+    gate = report.get("timestamp_sidecar_gate") or {}
+    raw = report.get("raw_private_evidence") or {}
+    summary = report.get("summary") or {}
+    aggregate = report.get("aggregate") or {}
+    lines = [
+        "# JSH-050 Real-History Timestamp Seek Gate",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Run:** `{report.get('run_id', '(none)')}`",
+        f"**Cases:** `{report.get('case_count', 0)}` of `{report.get('manifest_case_count', 0)}` manifest cases",
+        f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
+        f"**Total wall time ms:** `{report.get('total_wall_time_ms', 0)}`",
+        f"**Caveat:** {report.get('below_floor_case_count_caveat')}",
+    ]
+    if report.get("headline_findings"):
+        lines.extend(["", "## Headline Findings", ""])
+        lines.extend(f"- {finding}" for finding in report.get("headline_findings", []))
+    lines.extend(
+        [
+            "",
+            "## Gate Decision",
+            "",
+            "| Gate | Status | Reasons |",
+            "| --- | --- | --- |",
+            (
+                "| `timestamp_sidecar_gate` | "
+                f"`{gate.get('status')}` | "
+                f"{_escape_markdown_table(', '.join(gate.get('reasons') or [])) or '(none)'} |"
+            ),
+        ]
+    )
+    lines.extend(
+        [
+            "",
+            "## Private Evidence",
+            "",
+            f"- Raw per-case evidence stored: `{raw.get('stored')}`",
+            f"- Storage: `{raw.get('storage', 'ignored_local_raw_run_artifacts')}`",
+            f"- Run file label: `{raw.get('run_file_label', '(none)')}`",
+            f"- Committed: `{raw.get('committed')}`",
+        ]
+    )
+    lines.extend(_performance_metric_markdown_lines(report))
+    lines.extend(
+        [
+            "",
+            "## Mode Summary",
+            "",
+            "| Mode | Runs | Statuses | Elapsed median ms | Elapsed p90 ms | Files median | Records median | Bytes parsed median | Bytes parsed p90 | Context bytes median | Context tokens approx | Expected-ref order | Caps |",
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for mode in ("baseline_full_scan", "manifest_planned_scan", "timestamp_seek"):
+        row = summary.get(mode) or {}
+        if not row:
+            continue
+        lines.append(
+            "| "
+            f"`{mode}` | "
+            f"{row.get('runs')} | "
+            f"{_escape_markdown_table(_compact_counter_map(row.get('status_counts') or {}))} | "
+            f"{row.get('median_elapsed_ms')} | "
+            f"{row.get('p90_elapsed_ms')} | "
+            f"{row.get('median_files_opened')} | "
+            f"{row.get('median_records_parsed')} | "
+            f"{row.get('median_bytes_parsed')} | "
+            f"{row.get('p90_bytes_parsed')} | "
+            f"{row.get('median_output_context_bytes')} | "
+            f"{row.get('median_output_context_tokens_approx')} | "
+            f"{_escape_markdown_table(_compact_counter_map(row.get('expected_ref_order_status') or {}))} | "
+            f"{_escape_markdown_table(', '.join(row.get('cap_hit_labels') or []))} |"
+        )
+    timestamp = summary.get("timestamp_seek") or {}
+    if timestamp:
+        lines.extend(
+            [
+                "",
+                "## Timestamp Seek Reductions",
+                "",
+                f"- Median parsed-byte reduction vs baseline: `{timestamp.get('median_parsed_byte_reduction_ratio_vs_baseline')}`",
+                f"- P90 parsed-byte reduction vs baseline: `{timestamp.get('p90_parsed_byte_reduction_ratio_vs_baseline')}`",
+                f"- Median elapsed reduction vs baseline: `{timestamp.get('median_elapsed_reduction_ratio_vs_baseline')}`",
+                f"- P90 elapsed reduction vs baseline: `{timestamp.get('p90_elapsed_reduction_ratio_vs_baseline')}`",
+                f"- Median parsed-byte reduction vs manifest: `{timestamp.get('median_parsed_byte_reduction_ratio_vs_manifest')}`",
+                f"- P90 parsed-byte reduction vs manifest: `{timestamp.get('p90_parsed_byte_reduction_ratio_vs_manifest')}`",
+                f"- Sidecar hits/misses: `{timestamp.get('sidecar_hits')}` / `{timestamp.get('sidecar_misses')}`",
+                f"- Refresh counts: total `{timestamp.get('refresh_count')}`, no-change `{timestamp.get('no_change_refresh_count')}`, append `{timestamp.get('append_refresh_count')}`, stale `{timestamp.get('stale_refresh_count')}`",
+                f"- Fallback reasons: `{_compact_counter_map(timestamp.get('fallback_reasons') or {})}`",
+                f"- Planning sources: `{_compact_counter_map(timestamp.get('planning_sources') or {})}`",
+            ]
+        )
+    lines.extend(["", "## Equivalence", ""])
+    equivalence = aggregate.get("source_ref_order_equivalence") or {}
+    if equivalence:
+        lines.extend(["| Comparison | Counts |", "| --- | --- |"])
+        for name, counts in equivalence.items():
+            lines.append(f"| `{name}` | `{_escape_markdown_table(_compact_counter_map(counts or {}))}` |")
+    else:
+        lines.append("- No equivalence counters available.")
+    no_evidence = aggregate.get("no_evidence_scope_equivalence") or {}
+    lines.extend(
+        [
+            "",
+            "## No-Evidence Scope",
+            "",
+            f"- Status: `{no_evidence.get('status', 'not_evaluated')}`",
+            f"- Reason: `{no_evidence.get('reason', '(none)')}`",
+            f"- Evaluated rows: `{no_evidence.get('evaluated_rows', 0)}`",
+        ]
+    )
+    lines.extend(["", "## Privacy Contract", ""])
+    for key, value in (report.get("privacy_contract") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    if report.get("warnings"):
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- `{warning}`" for warning in report.get("warnings", []))
+    if report.get("rows"):
+        lines.extend(
+            [
+                "",
+                "## Case Runs",
+                "",
+                "| Case | Repeat | Date window | Baseline expected | Timestamp expected | Timestamp vs baseline | Timestamp status | Files | Records | Bytes parsed | Elapsed ms | Context bytes | Caps |",
+                "| --- | ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in report.get("rows", []):
+            timestamp_row = row.get("timestamp_seek") or {}
+            baseline_row = row.get("baseline_full_scan") or {}
+            eq = row.get("source_ref_order_equivalence") or {}
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                f"{row.get('repeat_index', 0)} | "
+                f"{_escape_markdown_table(str(row.get('date_window_status', '')))} | "
+                f"{_escape_markdown_table(str(baseline_row.get('expected_ref_order_status', '')))} | "
+                f"{_escape_markdown_table(str(timestamp_row.get('expected_ref_order_status', '')))} | "
+                f"{_escape_markdown_table(str(eq.get('timestamp_vs_baseline', '')))} | "
+                f"{_escape_markdown_table(str(timestamp_row.get('status', '')))} | "
+                f"{timestamp_row.get('files_opened', 0)} | "
+                f"{timestamp_row.get('records_parsed', 0)} | "
+                f"{timestamp_row.get('bytes_parsed', 0)} | "
+                f"{timestamp_row.get('elapsed_ms', 0)} | "
+                f"{timestamp_row.get('output_context_bytes', 0)} | "
+                f"{_escape_markdown_table(', '.join(row.get('cap_hit_labels') or []))} |"
             )
     return "\n".join(lines)
 

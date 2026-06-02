@@ -23,6 +23,10 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
 from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
+from .real_history_timestamp_seek import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_TIMESTAMP_MANIFEST
+from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE
+from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
+from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
 from .scanner import search
 from .skill_audit import build_skill_audit_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
@@ -288,6 +292,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path where the sanitized JSON/Markdown report should be written.",
     )
     real_history_impact.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
+    real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
+    add_common_args(real_history_timestamp_seek)
+    real_history_timestamp_seek.add_argument(
+        "--manifest",
+        default=str(DEFAULT_REAL_HISTORY_TIMESTAMP_MANIFEST),
+        help="Sanitized reviewed real-history gold manifest.",
+    )
+    real_history_timestamp_seek.add_argument(
+        "--private-bridge",
+        default=str(DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE),
+        help="Ignored private bridge JSON produced by jsh-049a.",
+    )
+    real_history_timestamp_seek.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat count per selected timestamp-applicable case.",
+    )
+    real_history_timestamp_seek.add_argument(
+        "--raw-output-dir",
+        default=str(DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR),
+        help="Ignored directory for raw per-case private timestamp-seek evidence.",
+    )
+    real_history_timestamp_seek.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    real_history_timestamp_seek.add_argument(
         "--markdown-report-output",
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
@@ -787,6 +824,27 @@ def main(argv: list[str] | None = None) -> int:
             markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
         print(rendered)
         status = payload["real_history_impact_benchmark"]["status"]
+        return 1 if status in {"root_rejected", "invalid_fixture", "invalid_bridge"} else 0
+    if args.command == "benchmark-real-history-timestamp-seek":
+        payload = build_real_history_timestamp_seek_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_timestamp_seek_benchmark"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture", "invalid_bridge"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
