@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
+from .archive_snapshot import build_archive_snapshot_proof_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
@@ -289,6 +290,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized aggregate report should be written.",
+    )
+    archive_proof = subparsers.add_parser("archive-snapshot-proof")
+    add_common_args(archive_proof)
+    archive_proof.add_argument(
+        "--archive-output-dir",
+        required=True,
+        help="Explicit local directory for synthetic archive proof manifest, ledger, and objects.",
+    )
+    archive_proof.add_argument(
+        "--export-output-dir",
+        required=True,
+        help="Explicit local directory for synthetic export/restore smoke output.",
+    )
+    archive_proof.add_argument(
+        "--include-status-probes",
+        action="store_true",
+        help="Write isolated synthetic status probes under the explicit archive output dir.",
+    )
+    archive_proof.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized archive proof report should be written.",
     )
     diagnose = subparsers.add_parser("diagnose-capabilities")
     diagnose.add_argument("--format", choices=("text", "json", "markdown"), default="text")
@@ -663,6 +686,14 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["embedding_experiment"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture", "private_output_rejected"} else 0
+    if args.command == "archive-snapshot-proof":
+        payload = build_archive_snapshot_proof_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["archive_snapshot_proof"]["status"]
+        return 1 if status in {"invalid_request", "proof_failed"} else 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(

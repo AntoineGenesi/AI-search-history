@@ -40,6 +40,8 @@ def render_text(payload: dict) -> str:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
         return render_embedding_experiment_text(payload)
+    if "archive_snapshot_proof" in payload:
+        return render_archive_snapshot_proof_text(payload)
     plan = payload["source_plan"]
     query = plan["query"]
     lines = [
@@ -119,6 +121,8 @@ def render_markdown(payload: dict) -> str:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
         return render_embedding_experiment_markdown(payload)
+    if "archive_snapshot_proof" in payload:
+        return render_archive_snapshot_proof_markdown(payload)
     text = render_text(payload)
     lines = ["# JSONL", ""]
     for line in text.splitlines():
@@ -426,6 +430,113 @@ def render_capability_diagnostic_markdown(payload: dict) -> str:
                 f"- restore/export smoke: {archive_gate.get('restore_export_acceptance_test')}",
             ]
         )
+    return "\n".join(lines)
+
+
+def render_archive_snapshot_proof_text(payload: dict) -> str:
+    report = payload["archive_snapshot_proof"]
+    snapshot = report.get("snapshot", {})
+    gate = report.get("archive_protection_gate", {})
+    duplicate = report.get("duplicate_detection", {})
+    export = report.get("export_restore_smoke", {})
+    hash_verification = report.get("hash_verification", {})
+    lines = [
+        "Archive Snapshot Proof",
+        f"Status: {report.get('status')}",
+        f"Scope: {report.get('scope')}",
+        (
+            "Snapshot: "
+            f"files={snapshot.get('source_file_count', 0)} "
+            f"bytes={snapshot.get('source_bytes', 0)} "
+            f"objects={snapshot.get('archive_object_count', 0)} "
+            f"index_bytes={snapshot.get('index_bytes', 0)}"
+        ),
+        (
+            "Verification: "
+            f"hash={hash_verification.get('status')} "
+            f"export={export.get('status')} "
+            f"duplicates={duplicate.get('status')}"
+        ),
+        (
+            "Gate: "
+            f"{gate.get('label')} status={gate.get('status')} "
+            f"promotion_ready={gate.get('promotion_ready')} "
+            f"claim_allowed={gate.get('claim_allowed')}"
+        ),
+    ]
+    for group in duplicate.get("groups", []):
+        lines.append(f"- duplicate {group.get('group_id')}: {', '.join(group.get('source_ids', []))}")
+    for status, count in sorted((hash_verification.get("status_counts") or {}).items()):
+        lines.append(f"- status {status}: {count}")
+    status_handling = report.get("status_handling", {})
+    for probe in status_handling.get("probes", []):
+        lines.append(
+            "- probe "
+            f"{probe.get('probe')}: expected={probe.get('expected_status')} "
+            f"observed={probe.get('status')} matched={probe.get('matched')}"
+        )
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for error in report.get("errors", []):
+        lines.append(f"Error: {error}")
+    return "\n".join(lines)
+
+
+def render_archive_snapshot_proof_markdown(payload: dict) -> str:
+    report = payload["archive_snapshot_proof"]
+    snapshot = report.get("snapshot", {})
+    gate = report.get("archive_protection_gate", {})
+    duplicate = report.get("duplicate_detection", {})
+    export = report.get("export_restore_smoke", {})
+    hash_verification = report.get("hash_verification", {})
+    lines = [
+        "# Archive Snapshot Proof",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Scope:** `{report.get('scope')}`",
+        f"**Promotion ready:** `{report.get('promotion_ready')}`",
+        "",
+        "## Snapshot",
+        "",
+        f"- files=`{snapshot.get('source_file_count', 0)}`; bytes=`{snapshot.get('source_bytes', 0)}`; objects=`{snapshot.get('archive_object_count', 0)}`",
+        f"- bytes copied=`{snapshot.get('bytes_copied', 0)}`; bytes compressed=`{snapshot.get('bytes_compressed', 0)}`; index bytes=`{snapshot.get('index_bytes', 0)}`",
+        "",
+        "## Verification",
+        "",
+        f"- hash verification=`{hash_verification.get('status')}`",
+        f"- export/restore smoke=`{export.get('status')}`",
+        f"- duplicate detection=`{duplicate.get('status')}` groups=`{duplicate.get('duplicate_group_count', 0)}`",
+        "",
+        "## Status Handling",
+        "",
+    ]
+    probes = report.get("status_handling", {}).get("probes", [])
+    if probes:
+        lines.extend(["| Probe | Expected | Observed | Matched |", "| --- | --- | --- | --- |"])
+        for probe in probes:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(probe.get('probe')))} | "
+                f"{_escape_markdown_table(str(probe.get('expected_status')))} | "
+                f"{_escape_markdown_table(str(probe.get('status')))} | "
+                f"{probe.get('matched')} |"
+            )
+    else:
+        lines.append("- Status probes were not enabled.")
+    lines.extend(
+        [
+            "",
+            "## Archive Protection Gate",
+            "",
+            f"- label=`{gate.get('label')}`; status=`{gate.get('status')}`; promotion_ready=`{gate.get('promotion_ready')}`; claim_allowed=`{gate.get('claim_allowed')}`",
+            f"- evidence basis=`{gate.get('evidence_basis')}`",
+        ]
+    )
+    if gate.get("remaining_blockers"):
+        for blocker in gate["remaining_blockers"]:
+            lines.append(f"- blocker: `{blocker}`")
+    for error in report.get("errors", []):
+        lines.append(f"- error: {error}")
     return "\n".join(lines)
 
 
