@@ -259,6 +259,65 @@ def real_history_impact_metrics(report: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def real_history_timestamp_seek_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    aggregate = report.get("aggregate") or {}
+    modes = aggregate.get("modes") or {}
+    baseline = modes.get("baseline_full_scan") or {}
+    manifest = modes.get("manifest_planned_scan") or {}
+    timestamp = modes.get("timestamp_seek") or {}
+    summary = report.get("summary") or {}
+    return build_performance_metrics(
+        workload="benchmark_real_history_timestamp_seek",
+        wall_time_ms=report.get("total_wall_time_ms", 0),
+        phase_durations_ms={
+            "bridge_validation": (report.get("phase_durations_ms") or {}).get("bridge_validation", 0),
+            "source_enumeration": (report.get("phase_durations_ms") or {}).get("source_enumeration", 0),
+            "manifest_build_and_refresh": (report.get("phase_durations_ms") or {}).get("manifest_build_and_refresh", 0),
+            "timestamp_index_build_and_refresh": (report.get("phase_durations_ms") or {}).get(
+                "timestamp_index_build_and_refresh", 0
+            ),
+            "raw_evidence_write": (report.get("phase_durations_ms") or {}).get("raw_evidence_write", 0),
+            "baseline_median_elapsed": (summary.get("baseline_full_scan") or {}).get("median_elapsed_ms", 0),
+            "manifest_median_elapsed": (summary.get("manifest_planned_scan") or {}).get("median_elapsed_ms", 0),
+            "timestamp_seek_median_elapsed": (summary.get("timestamp_seek") or {}).get("median_elapsed_ms", 0),
+            "timestamp_seek_p90_elapsed": (summary.get("timestamp_seek") or {}).get("p90_elapsed_ms", 0),
+        },
+        local_work={
+            "files_opened": timestamp.get("files_opened", 0),
+            "records_parsed": timestamp.get("records_parsed", 0),
+            "bytes_scanned": timestamp.get("bytes_scanned", 0),
+            "bytes_parsed": timestamp.get("bytes_parsed", 0),
+            "baseline_full_scan_bytes_parsed": baseline.get("bytes_parsed", 0),
+            "manifest_planned_scan_bytes_parsed": manifest.get("bytes_parsed", 0),
+            "timestamp_seek_bytes_parsed": timestamp.get("bytes_parsed", 0),
+            "tool_calls": aggregate.get("runs", 0),
+            "subprocess_calls": 0,
+            "candidate_count": timestamp.get("candidate_count", 0),
+        },
+        handoff={
+            "output_bytes": timestamp.get("output_context_bytes", 0),
+            "context_bytes": timestamp.get("output_context_bytes", 0),
+            "output_context_bytes": timestamp.get("output_context_bytes", 0),
+            "baseline_full_scan_output_context_bytes": baseline.get("output_context_bytes", 0),
+            "manifest_planned_scan_output_context_bytes": manifest.get("output_context_bytes", 0),
+            "timestamp_seek_output_context_bytes": timestamp.get("output_context_bytes", 0),
+        },
+        memory=not_measured_memory("rss_not_measured_by_benchmark_real_history_timestamp_seek"),
+        correctness={
+            "timestamp_sidecar_gate_status": (report.get("timestamp_sidecar_gate") or {}).get("status"),
+            "source_ref_order_equivalence": aggregate.get("source_ref_order_equivalence"),
+            "no_evidence_scope_equivalence": aggregate.get("no_evidence_scope_equivalence"),
+            "fallback_reasons": aggregate.get("fallback_reasons"),
+            "required_counters": aggregate.get("required_counters"),
+        },
+        tradeoffs=[
+            "This is a six-case real private-history timestamp slice, below the older 20-50 case target, so promotion remains conservative.",
+            "Parsed bytes and approximate parsed tokens are local JSONL parser work proxies; direct model-token impact is represented by sanitized handoff bytes/tokens.",
+            "A speed or byte reduction only counts if source-ref/order equivalence and bridge-ref recovery are preserved without caps or fallback-heavy behavior.",
+        ],
+    )
+
+
 def embedding_experiment_metrics(report: dict[str, Any]) -> dict[str, Any]:
     aggregate = report.get("aggregate") or {}
     source_metrics = report.get("source_metrics") or aggregate.get("source_metrics") or {}
