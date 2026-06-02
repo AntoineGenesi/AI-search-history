@@ -130,6 +130,11 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 rows.append(row)
                 raw_rows.append(raw_row)
 
+    row_warnings = [warning for row in rows for warning in row.get("warnings", [])]
+    safe_warnings = _safe_warnings(safe_warnings + row_warnings)
+    cap_hit_labels = sorted({label for row in rows for label in row.get("cap_hit_labels", [])} | set(_cap_hit_labels(safe_warnings)))
+    if safe_warnings:
+        base_report["warnings"] = safe_warnings
     base_report["status"] = "capped" if cap_hit_labels else "ok"
     base_report["caps_hit"] = bool(cap_hit_labels)
     base_report["cap_hit_labels"] = cap_hit_labels
@@ -490,6 +495,8 @@ def _run_package_search_variant(
         cwd=str(Path(args.cwd).expanduser().resolve()),
         use_rg_prefilter=use_rg_prefilter,
     )
+    package_warnings = _safe_warnings(result.get("warnings") or [])
+    row_cap_hit_labels = sorted(set(cap_hit_labels or []) | set(_cap_hit_labels(package_warnings)))
     candidates: list[Candidate] = []
     ranking_reason_label_count = 0
     for group in result.get("groups", []):
@@ -520,9 +527,10 @@ def _run_package_search_variant(
         bytes_parsed=searched_bytes,
         output_context_bytes=len(json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
         candidates=candidates,
-        cap_hit_labels=cap_hit_labels,
+        cap_hit_labels=row_cap_hit_labels,
         rg_prefilter=prefilter,
         ranking_reason_label_count=ranking_reason_label_count,
+        warnings=package_warnings,
         notes=[],
     )
     raw_row["package_result"] = result
@@ -620,6 +628,7 @@ def _row_pair(
     cap_hit_labels: list[str] | None,
     rg_prefilter: dict[str, Any] | None = None,
     ranking_reason_label_count: int = 0,
+    warnings: list[str] | None = None,
     notes: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     expected = {(ref["path"], ref["line"]): ref["ref_id"] for ref in case.get("expected_refs", [])}
@@ -628,7 +637,8 @@ def _row_pair(
     expected_no_evidence = case["expected_outcome"] == "no_evidence"
     first_pass_hit = bool(candidate_ref_ids and candidate_ref_ids[0] in must_ids)
     no_evidence_correct = bool(expected_no_evidence and not candidates)
-    labels = sorted(set(cap_hit_labels or []))
+    row_warnings = _safe_warnings(warnings or [])
+    labels = sorted(set(cap_hit_labels or []) | set(_cap_hit_labels(row_warnings)))
     row = {
         "case_id": case["case_id"],
         "baseline": baseline,
@@ -662,6 +672,7 @@ def _row_pair(
         "ranking_reason_label_count": ranking_reason_label_count,
         "caps_hit": bool(labels),
         "cap_hit_labels": labels,
+        "warnings": row_warnings,
         "rg_prefilter": rg_prefilter or _prefilter_row_stats({}, enabled=False),
         "notes": notes or [],
     }
@@ -784,6 +795,7 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             "median_ranking_reason_label_count": _median(row["ranking_reason_label_count"] for row in selected),
             "caps_hit_runs": sum(1 for row in selected if row["caps_hit"]),
             "cap_hit_labels": sorted({label for row in selected for label in row.get("cap_hit_labels", [])}),
+            "cap_hit_rows_by_label": _cap_hit_row_counts(selected),
             "median_prefilter_files_reduced": _median(row["rg_prefilter"]["files_reduced"] for row in selected),
             "median_prefilter_bytes_reduced": _median(row["rg_prefilter"]["bytes_reduced"] for row in selected),
             "median_prefilter_files_reduction_ratio": _median(
@@ -812,6 +824,12 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_calls": sum(int(row.get("tool_calls") or 0) for row in rows),
         "subprocess_calls": sum(int(row.get("subprocess_calls") or 0) for row in rows),
         "output_context_bytes": sum(int(row.get("output_context_bytes") or 0) for row in rows),
+        "cap_hit_labels": sorted({label for row in rows for label in row.get("cap_hit_labels", [])}),
+        "cap_hit_rows_by_label": _cap_hit_row_counts(rows),
+        "cap_hit_rows_by_baseline": {
+            baseline: _cap_hit_row_counts([row for row in rows if row["baseline"] == baseline])
+            for baseline in sorted({row["baseline"] for row in rows})
+        },
         "source_ref_equivalence": _package_equivalence(rows),
         "no_evidence_correct": {
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
@@ -1083,6 +1101,14 @@ def _counts(values: Any) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _cap_hit_row_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        for label in set(row.get("cap_hit_labels", [])):
+            counts[str(label)] = counts.get(str(label), 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _ceil_div4(value: float | int) -> int:
     return int((int(value) + 3) // 4)
 
@@ -1095,7 +1121,15 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
     safe: list[str] = []
     for warning in warnings:
         lowered = warning.lower()
-        if lowered.startswith(("root_rejected_", "stopped_at_", "missing_root")):
+        if lowered.startswith(
+            (
+                "root_rejected_",
+                "stopped_at_",
+                "missing_root",
+                "arbitrary_root_enabled_with_hard_caps",
+                "weak_partial_candidates_reservoir_capped",
+            )
+        ):
             safe.append(warning)
         elif "arbitrary root enabled" in lowered:
             safe.append("arbitrary_root_enabled_with_hard_caps")
@@ -1105,6 +1139,10 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
             safe.append("stopped_at_max_file_cap")
         elif "max byte cap" in lowered:
             safe.append("stopped_at_max_byte_cap")
+        elif "max match cap" in lowered:
+            safe.append("stopped_at_max_match_cap")
+        elif "weak partial generic candidates were reservoir-capped" in lowered:
+            safe.append("weak_partial_candidates_reservoir_capped")
         elif "dangerous broad root rejected" in lowered:
             safe.append("root_rejected_dangerous_broad_root")
         elif "missing transcript root" in lowered:

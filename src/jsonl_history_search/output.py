@@ -2007,6 +2007,14 @@ def render_real_history_impact_text(payload: dict) -> str:
     lines.extend(_performance_metric_text_lines(report))
     for warning in report.get("warnings", []):
         lines.append(f"Warning: {warning}")
+    if report.get("cap_hit_labels"):
+        lines.append(f"Cap hits: {', '.join(report.get('cap_hit_labels', []))}")
+        cap_counts = (report.get("aggregate") or {}).get("cap_hit_rows_by_label") or {}
+        if cap_counts:
+            lines.append(
+                "Cap-hit rows by label: "
+                + ", ".join(f"{label}={count}" for label, count in sorted(cap_counts.items()))
+            )
     for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
         gate = report.get(gate_name) or {}
         if gate:
@@ -2068,6 +2076,37 @@ def render_real_history_impact_markdown(payload: dict) -> str:
     if report.get("warnings"):
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- `{warning}`" for warning in report.get("warnings", []))
+    if report.get("cap_hit_labels"):
+        aggregate = report.get("aggregate") or {}
+        lines.extend(["", "## Caps", ""])
+        lines.append("Labels: " + ", ".join(f"`{label}`" for label in report.get("cap_hit_labels", [])))
+        label_counts = aggregate.get("cap_hit_rows_by_label") or {}
+        if label_counts:
+            lines.extend(
+                [
+                    "",
+                    "| Cap label | Rows hit |",
+                    "| --- | ---: |",
+                ]
+            )
+            for label, count in sorted(label_counts.items()):
+                lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+        baseline_counts = aggregate.get("cap_hit_rows_by_baseline") or {}
+        if baseline_counts:
+            lines.extend(
+                [
+                    "",
+                    "| Baseline | Cap rows by label |",
+                    "| --- | --- |",
+                ]
+            )
+            for baseline, counts in sorted(baseline_counts.items()):
+                count_text = ", ".join(f"{label}={count}" for label, count in sorted((counts or {}).items()))
+                lines.append(
+                    "| "
+                    f"`{_escape_markdown_table(str(baseline))}` | "
+                    f"{_escape_markdown_table(count_text or '(none)')} |"
+                )
     lines.extend(_benchmark_gate_markdown_lines(report))
     if report.get("summary"):
         lines.extend(
@@ -2075,11 +2114,12 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 "",
                 "## Baseline Summary",
                 "",
-                "| Baseline | Hit rate | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Subprocess calls | Files | Records parsed | Bytes scanned | Bytes parsed | Context bytes | Context tokens | Candidates |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Baseline | Hit rate | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Subprocess calls | Files | Records parsed | Bytes scanned | Bytes parsed | Context bytes | Context tokens | Candidates | Cap rows | Cap labels |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for name, row in report.get("summary", {}).items():
+            cap_labels = ", ".join(row.get("cap_hit_labels") or [])
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(name))} | "
@@ -2097,7 +2137,9 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"{row.get('median_bytes_parsed')} | "
                 f"{row.get('median_output_context_bytes')} | "
                 f"{row.get('median_output_context_tokens_approx')} | "
-                f"{row.get('median_candidate_count')} |"
+                f"{row.get('median_candidate_count')} | "
+                f"{row.get('caps_hit_runs')} | "
+                f"{_escape_markdown_table(cap_labels)} |"
             )
     if report.get("rows"):
         lines.extend(
@@ -2105,11 +2147,12 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 "",
                 "## Case Runs",
                 "",
-                "| Case | Family | Baseline | Outcome | First pass | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Files | Records | Bytes parsed | Context bytes | Candidates |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Case | Family | Baseline | Outcome | First pass | Recall@1 | Recall@3 | Recall@10 | MRR | Wall ms | Tool calls | Files | Records | Bytes parsed | Context bytes | Candidates | Caps |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for row in report.get("rows", []):
+            row_caps = ", ".join(row.get("cap_hit_labels") or [])
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
@@ -2127,7 +2170,8 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"{row.get('records_parsed')} | "
                 f"{row.get('bytes_parsed')} | "
                 f"{row.get('output_context_bytes')} | "
-                f"{row.get('candidate_count')} |"
+                f"{row.get('candidate_count')} | "
+                f"{_escape_markdown_table(row_caps)} |"
             )
     return "\n".join(lines)
 
