@@ -1297,7 +1297,7 @@ def render_measured_benchmark_text(payload: dict) -> str:
     statuses = aggregate.get("statuses", {})
     if statuses:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
-    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate", "manifest_shortlist_gate"):
+    for gate_name in ("ranking_quality_gate", "rg_prefilter_gate", "manifest_shortlist_gate", "timestamp_sidecar_gate"):
         gate = report.get(gate_name) or {}
         if gate:
             lines.append(
@@ -1325,6 +1325,19 @@ def render_measured_benchmark_text(payload: dict) -> str:
             f"source_ref_equivalence={_compact_counter_map(manifest.get('source_ref_equivalence') or {})} "
             f"no_evidence_scope_equivalence={_compact_counter_map(manifest.get('no_evidence_scope_equivalence') or {})}"
         )
+    timestamp_seek = aggregate.get("timestamp_seek_prototype") or {}
+    if timestamp_seek.get("enabled_rows"):
+        lines.append(
+            "timestamp_seek_prototype: "
+            f"planned_rows={timestamp_seek.get('planned_rows', 0)} "
+            f"fallback_rows={timestamp_seek.get('fallback_rows', 0)} "
+            f"parsed_bytes={timestamp_seek.get('parsed_bytes', 0)} "
+            f"records_considered={timestamp_seek.get('records_considered', 0)} "
+            f"sidecar_hits={timestamp_seek.get('sidecar_hits', 0)} "
+            f"sidecar_misses={timestamp_seek.get('sidecar_misses', 0)} "
+            f"ordering_equivalence={_compact_counter_map(timestamp_seek.get('ordering_equivalence') or {})} "
+            f"source_ref_equivalence={_compact_counter_map(timestamp_seek.get('source_ref_equivalence') or {})}"
+        )
     for warning in aggregate.get("warnings", []):
         lines.append(f"Warning: {warning}")
     for row in report.get("rows", []):
@@ -1343,6 +1356,12 @@ def render_measured_benchmark_text(payload: dict) -> str:
             lines[-1] += (
                 f" manifest_source_ref_equivalence={manifest_row.get('source_ref_equivalence')} "
                 f"manifest_no_evidence_scope_equivalence={manifest_row.get('no_evidence_scope_equivalence')}"
+            )
+        timestamp_row = row.get("timestamp_seek_prototype") or {}
+        if timestamp_row.get("enabled"):
+            lines[-1] += (
+                f" timestamp_seek_status={timestamp_row.get('status')} "
+                f"timestamp_ordering_equivalence={timestamp_row.get('ordering_equivalence')}"
             )
     return "\n".join(lines)
 
@@ -1390,6 +1409,21 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"- manifest shortlist no-evidence scope equivalence: `{_compact_counter_map(manifest.get('no_evidence_scope_equivalence') or {})}`",
             ]
         )
+    timestamp_seek = aggregate.get("timestamp_seek_prototype") or {}
+    if timestamp_seek.get("enabled_rows"):
+        lines.extend(
+            [
+                f"- timestamp seek planned rows: {timestamp_seek.get('planned_rows', 0)}",
+                f"- timestamp seek fallback rows: {timestamp_seek.get('fallback_rows', 0)}",
+                f"- timestamp seek parsed bytes: {timestamp_seek.get('parsed_bytes', 0)}",
+                f"- timestamp seek records considered: {timestamp_seek.get('records_considered', 0)}",
+                f"- timestamp seek hits/misses: {timestamp_seek.get('sidecar_hits', 0)}/{timestamp_seek.get('sidecar_misses', 0)}",
+                f"- timestamp seek median parsed bytes: {timestamp_seek.get('parsed_bytes_median', 0)}",
+                f"- timestamp seek p90 elapsed ms: {timestamp_seek.get('elapsed_ms_p90', 0)}",
+                f"- timestamp seek ordering equivalence: `{_compact_counter_map(timestamp_seek.get('ordering_equivalence') or {})}`",
+                f"- timestamp seek source-ref equivalence: `{_compact_counter_map(timestamp_seek.get('source_ref_equivalence') or {})}`",
+            ]
+        )
     if aggregate.get("warnings"):
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- `{warning}`" for warning in aggregate.get("warnings", []))
@@ -1399,13 +1433,14 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 "",
                 "## Runs",
                 "",
-                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Warnings |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
+                "| Probe | Source | Status | Elapsed ms | Files | Bytes | Candidates | Context bytes | Manifest source refs | Manifest no-evidence scope | Timestamp status | Timestamp ordering | Warnings |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- |",
             ]
         )
         for row in report.get("rows", []):
             row_id = row.get("case_id") or ""
             manifest_row = row.get("manifest_shortlist") or {}
+            timestamp_row = row.get("timestamp_seek_prototype") or {}
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(row_id))} | "
@@ -1418,6 +1453,8 @@ def render_measured_benchmark_markdown(payload: dict) -> str:
                 f"{row.get('output_context_bytes', 0)} | "
                 f"{_escape_markdown_table(str(manifest_row.get('source_ref_equivalence', '')))} | "
                 f"{_escape_markdown_table(str(manifest_row.get('no_evidence_scope_equivalence', '')))} | "
+                f"{_escape_markdown_table(str(timestamp_row.get('status', '')))} | "
+                f"{_escape_markdown_table(str(timestamp_row.get('ordering_equivalence', '')))} | "
                 f"{_escape_markdown_table(', '.join(row.get('warnings') or []))} |"
             )
     return "\n".join(lines)
@@ -1988,6 +2025,7 @@ def _benchmark_gate_markdown_lines(report: dict) -> list[str]:
         "ranking_quality_gate": report.get("ranking_quality_gate"),
         "rg_prefilter_gate": report.get("rg_prefilter_gate"),
         "manifest_shortlist_gate": report.get("manifest_shortlist_gate"),
+        "timestamp_sidecar_gate": report.get("timestamp_sidecar_gate"),
     }
     if not any(gates.values()):
         return []
