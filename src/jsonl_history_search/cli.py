@@ -253,6 +253,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     embedding_experiment.add_argument("--fastembed-model", default=FASTEMBED_MODEL_ID)
     embedding_experiment.add_argument(
+        "--fastembed-batch-size",
+        type=int,
+        default=32,
+        help="Maximum number of document texts passed to FastEmbed per local embed call.",
+    )
+    embedding_experiment.add_argument(
         "--allow-model-download",
         action="store_true",
         help="Allow the local FastEmbed library to download public model files into the ignored private cache.",
@@ -266,6 +272,24 @@ def build_parser() -> argparse.ArgumentParser:
     embedding_experiment.add_argument("--window-start", default=None)
     embedding_experiment.add_argument("--window-end", default=None)
     embedding_experiment.add_argument("--max-records", type=int, default=200)
+    embedding_experiment.add_argument(
+        "--shard-size",
+        type=int,
+        default=1000,
+        help="Maximum number of embedding vectors per private binary shard.",
+    )
+    embedding_experiment.add_argument(
+        "--chunk-size-chars",
+        type=int,
+        default=0,
+        help="Optional per-record character chunk size before embedding. Zero disables chunking.",
+    )
+    embedding_experiment.add_argument(
+        "--chunk-overlap-chars",
+        type=int,
+        default=0,
+        help="Optional character overlap between chunks when --chunk-size-chars is enabled.",
+    )
     embedding_experiment.add_argument("--top-k", type=int, default=10)
     embedding_experiment.add_argument("--max-index-disk", type=int, default=2 * 1024 * 1024 * 1024)
     embedding_experiment.add_argument("--case-limit", type=int, default=10)

@@ -1436,6 +1436,8 @@ def render_embedding_experiment_text(payload: dict) -> str:
     query_metrics = report.get("query_metrics") or aggregate.get("query_metrics", {})
     backend = report.get("backend", {})
     gate = report.get("embedding_recall_gate", {})
+    storage = report.get("storage_metrics") or {}
+    batching = report.get("batching") or {}
     lines = [
         "Embedding experiment",
         f"Status: {report.get('status')}",
@@ -1460,6 +1462,20 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"baseline_candidates={query_metrics.get('baseline_candidate_count_total', 0)}"
         ),
         f"embedding_recall_gate: status={gate.get('status')} reasons={', '.join(gate.get('reasons') or []) or '(none)'}",
+        (
+            "Storage: "
+            f"shards={storage.get('shard_count', 0)} "
+            f"vector_bytes={storage.get('vector_bytes', 0)} "
+            f"metadata_bytes={storage.get('metadata_bytes', 0)} "
+            f"manifest_complete={storage.get('manifest_complete')}"
+        ),
+        (
+            "Batching: "
+            f"fastembed_batch_size={batching.get('fastembed_batch_size')} "
+            f"shard_size={batching.get('shard_size')} "
+            f"documents_embedded={batching.get('documents_embedded', 0)} "
+            f"documents_reused={batching.get('documents_reused', 0)}"
+        ),
     ]
     if aggregate.get("cap_hit_labels"):
         lines.append("Cap hits: " + ", ".join(aggregate.get("cap_hit_labels", [])))
@@ -1496,6 +1512,9 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
     query_metrics = report.get("query_metrics") or aggregate.get("query_metrics", {})
     backend = report.get("backend", {})
     gate = report.get("embedding_recall_gate", {})
+    storage = report.get("storage_metrics") or {}
+    batching = report.get("batching") or {}
+    chunking = report.get("chunking") or {}
     lines = [
         "# Embedding Experiment",
         "",
@@ -1512,6 +1531,14 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Peak memory bytes: {index_metrics.get('peak_memory_bytes', 0)}",
         f"- Peak observed RSS bytes: {(report.get('memory_profile') or {}).get('peak_observed_rss_bytes', 0)}",
         f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
+        f"- Vector shard count: {storage.get('shard_count', 0)}",
+        f"- Vector shard bytes: {storage.get('vector_bytes', 0)}",
+        f"- Shard metadata bytes: {storage.get('metadata_bytes', 0)}",
+        f"- FastEmbed batch size: {batching.get('fastembed_batch_size')}",
+        f"- Shard size: {batching.get('shard_size')}",
+        f"- Documents embedded this run: {batching.get('documents_embedded', 0)}",
+        f"- Documents reused from shards: {batching.get('documents_reused', 0)}",
+        f"- Chunking enabled: `{chunking.get('enabled')}`",
         f"- Refresh status: `{index_metrics.get('refresh_status')}`",
         f"- Refresh/no-change cost ms: {index_metrics.get('refresh_no_change_cost_ms', 0)}",
         f"- Query cases: {query_metrics.get('case_count', 0)}",

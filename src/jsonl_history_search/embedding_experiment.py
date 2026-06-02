@@ -17,12 +17,12 @@ from .embedding_spike import (
     DEFAULT_EMBEDDING_SPIKE_FIXTURE,
     EmbeddingDocument,
     RankedHit,
-    build_fixture_index,
     load_embedding_fixture,
     rank_current_package_baseline,
-    rank_vector,
     validate_embedding_fixture,
+    vectorize_text,
 )
+from .embedding_store import EmbeddingShardStore, StoreConfig, StoredVectorRecord
 from .sources import (
     Limits,
     SourcePlan,
@@ -61,6 +61,9 @@ class ExperimentDocument:
     role: str
     cwd: str | None
     root_label: str
+    parent_doc_id: str | None = None
+    chunk_index: int | None = None
+    chunk_count: int | None = None
 
     def as_embedding_document(self) -> EmbeddingDocument:
         return EmbeddingDocument(
@@ -138,6 +141,9 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
     )
     base_report = _base_report(args=args, run_id=run_id, limits=limits, started=started)
 
+    config_errors = _configuration_errors(args)
+    if config_errors:
+        return {"embedding_experiment": _finish_without_scan(base_report, "invalid_config", config_errors, started)}
     if args.experiment_mode not in EXPERIMENT_MODES:
         return {"embedding_experiment": _finish_without_scan(base_report, "invalid_mode", ["invalid_experiment_mode"], started)}
     if not _is_ignored_private_path(output_dir):
@@ -208,9 +214,6 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    profiler.mark("refresh_manifest", "start", document_count=len(documents))
-    refresh_metrics = _refresh_metrics(output_dir, documents, args)
-    profiler.mark("refresh_manifest", "end", document_count=len(documents))
     profiler.mark("backend_select", "start", backend_requested=args.backend)
     backend_state = _select_backend(args=args, output_dir=output_dir, profiler=profiler)
     profiler.mark("backend_select", "end", backend_selected=backend_state["public"]["selected"])
@@ -219,7 +222,13 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
     build_started = time.perf_counter()
     tracemalloc.start()
     profiler.mark("index_build", "start", document_count=len(documents))
-    index, index_private_payload = _build_index(documents, backend_state, profiler=profiler)
+    index, index_private_payload = _build_index(
+        documents,
+        backend_state,
+        output_dir=output_dir,
+        args=args,
+        profiler=profiler,
+    )
     _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
     profiler.mark("index_build", "end", document_count=len(documents), tracemalloc_peak_bytes=int(peak_bytes))
     tracemalloc.stop()
@@ -233,7 +242,6 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         run_id=run_id,
         index_payload=index_private_payload,
         documents=documents,
-        refresh_metrics=refresh_metrics,
         args=args,
         profiler=profiler,
     )
@@ -253,7 +261,7 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         index_size_bytes=index_size_bytes,
         query_latencies=query_latencies,
         cap_labels=cap_labels,
-        refresh_metrics=refresh_metrics,
+        refresh_metrics=index_private_payload["refresh_metrics"],
     )
     profiler.mark("report_generation", "start")
     memory_profile = profiler.public(python_peak_bytes=peak_bytes)
@@ -266,7 +274,10 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         "root_cause_profile": _root_cause_profile(memory_profile),
         "index_metrics": aggregate["index_metrics"],
         "query_metrics": aggregate["query_metrics"],
-        "refresh_metrics": refresh_metrics["public"],
+        "refresh_metrics": index_private_payload["refresh_metrics"]["public"],
+        "storage_metrics": index_private_payload["storage_metrics"],
+        "batching": index_private_payload["batching"],
+        "chunking": index_private_payload["chunking"],
         "private_artifacts": private_artifacts,
         "comparison": {
             "baseline": "current_jsonl_exact_fuzzy_local_semantic",
@@ -305,33 +316,63 @@ def _build_plan_for_mode(args, cwd: Path, limits: Limits) -> SourcePlan:
     )
 
 
+def _configuration_errors(args) -> list[str]:
+    errors: list[str] = []
+    if args.fastembed_batch_size < 1:
+        errors.append("fastembed_batch_size_must_be_positive")
+    if args.shard_size < 1:
+        errors.append("shard_size_must_be_positive")
+    if args.chunk_size_chars < 0:
+        errors.append("chunk_size_chars_must_not_be_negative")
+    if args.chunk_overlap_chars < 0:
+        errors.append("chunk_overlap_chars_must_not_be_negative")
+    if args.chunk_size_chars and args.chunk_overlap_chars >= args.chunk_size_chars:
+        errors.append("chunk_overlap_chars_must_be_less_than_chunk_size_chars")
+    return errors
+
+
+def _chunking_config(args) -> dict[str, Any]:
+    return {
+        "enabled": bool(args.chunk_size_chars),
+        "chunk_size_chars": int(args.chunk_size_chars),
+        "chunk_overlap_chars": int(args.chunk_overlap_chars),
+        "private_metadata_links_chunks_to_source_records": bool(args.chunk_size_chars),
+        "raw_text_committed": False,
+    }
+
+
 def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler | None = None) -> tuple[list[ExperimentDocument], dict[str, Any]]:
     if args.experiment_mode == "smoke_synthetic":
         payload = load_embedding_fixture(Path(args.fixture).expanduser())
         errors = validate_embedding_fixture(payload)
         if errors:
             return [], {"status": "invalid_fixture", "warnings": [f"fixture validation failed: {error}" for error in errors[:5]]}
-        documents = [
-            ExperimentDocument(
-                doc_id=str(item["doc_id"]),
-                text=str(item["text"]),
-                timestamp=_parse_fixture_timestamp(item.get("timestamp")),
-                role=str(item.get("role") or "assistant"),
-                cwd=item.get("cwd"),
-                root_label="synthetic_fixture",
+        documents: list[ExperimentDocument] = []
+        source_items = list(payload.get("documents", []))[: args.max_records]
+        for item in source_items:
+            documents.extend(
+                _documents_for_text(
+                    base_doc_id=str(item["doc_id"]),
+                    text=str(item["text"]),
+                    timestamp=_parse_fixture_timestamp(item.get("timestamp")),
+                    role=str(item.get("role") or "assistant"),
+                    cwd=item.get("cwd"),
+                    root_label="synthetic_fixture",
+                    args=args,
+                )
             )
-            for item in payload.get("documents", [])
-        ][: args.max_records]
         return documents, {
             "status": "ok",
             "data_source": "committed_sanitized_synthetic_fixture",
             "selected_root_count": 0,
             "candidate_file_count": 1,
             "candidate_bytes": 0,
-            "record_count": len(documents),
+            "record_count": len(source_items),
+            "embedding_document_count": len(documents),
+            "chunk_count": max(0, len(documents) - len(source_items)),
             "skipped_records": 0,
-            "records_cap_hit": len(payload.get("documents", [])) > len(documents),
-            "cap_hit_labels": ["max_records"] if len(payload.get("documents", [])) > len(documents) else [],
+            "records_cap_hit": len(payload.get("documents", [])) > len(source_items),
+            "cap_hit_labels": ["max_records"] if len(payload.get("documents", [])) > len(source_items) else [],
             "warnings": [],
         }
 
@@ -340,6 +381,7 @@ def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler
     candidate_file_count = 0
     candidate_bytes = 0
     skipped_records = 0
+    source_record_count = 0
     started = time.perf_counter()
     window_start = _parse_window(args.window_start)
     window_end = _parse_window(args.window_end)
@@ -370,18 +412,20 @@ def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler
                 if not record.text:
                     skipped_records += 1
                     continue
-                if len(documents) >= args.max_records:
+                if source_record_count >= args.max_records:
                     records_cap_hit = True
                     warnings.append("Stopped loading records at max records cap.")
                     break
-                documents.append(
-                    ExperimentDocument(
-                        doc_id=f"doc_{len(documents) + 1:06d}",
+                source_record_count += 1
+                documents.extend(
+                    _documents_for_text(
+                        base_doc_id=f"doc_{source_record_count:06d}",
                         text=record.text,
                         timestamp=record.timestamp,
                         role=record.role,
                         cwd=record.cwd,
                         root_label=root_label,
+                        args=args,
                     )
                 )
                 if profiler and len(documents) in {1, 10, 50, 100, 250, 500, 1000}:
@@ -401,12 +445,69 @@ def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler
         "selected_root_count": len(plan.roots),
         "candidate_file_count": candidate_file_count,
         "candidate_bytes": candidate_bytes,
-        "record_count": len(documents),
+        "record_count": source_record_count,
+        "embedding_document_count": len(documents),
+        "chunk_count": max(0, len(documents) - source_record_count),
         "skipped_records": skipped_records,
         "records_cap_hit": records_cap_hit,
         "cap_hit_labels": sorted(set(cap_labels)),
         "warnings": _safe_warnings(warnings),
     }
+
+
+def _documents_for_text(
+    *,
+    base_doc_id: str,
+    text: str,
+    timestamp: datetime | None,
+    role: str,
+    cwd: str | None,
+    root_label: str,
+    args,
+) -> list[ExperimentDocument]:
+    chunks = _chunk_text(text, args.chunk_size_chars, args.chunk_overlap_chars)
+    if len(chunks) == 1:
+        return [
+            ExperimentDocument(
+                doc_id=base_doc_id,
+                text=chunks[0],
+                timestamp=timestamp,
+                role=role,
+                cwd=cwd,
+                root_label=root_label,
+                parent_doc_id=base_doc_id if args.chunk_size_chars else None,
+                chunk_index=1 if args.chunk_size_chars else None,
+                chunk_count=1 if args.chunk_size_chars else None,
+            )
+        ]
+    return [
+        ExperimentDocument(
+            doc_id=f"{base_doc_id}_chunk_{index + 1:03d}",
+            text=chunk,
+            timestamp=timestamp,
+            role=role,
+            cwd=cwd,
+            root_label=root_label,
+            parent_doc_id=base_doc_id,
+            chunk_index=index + 1,
+            chunk_count=len(chunks),
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    if chunk_size <= 0 or len(text) <= chunk_size:
+        return [text]
+    stride = max(1, chunk_size - chunk_overlap)
+    chunks: list[str] = []
+    for start in range(0, len(text), stride):
+        chunk = text[start : start + chunk_size].strip()
+        if chunk:
+            chunks.append(chunk)
+        if start + chunk_size >= len(text):
+            break
+    return chunks or [text]
 
 
 def _select_backend(args, output_dir: Path, profiler: MemoryProfiler | None = None) -> dict[str, Any]:
@@ -569,61 +670,104 @@ def _backend_public(requested: str, selected: str, fastembed_state: dict[str, An
 def _build_index(
     documents: list[ExperimentDocument],
     backend_state: dict[str, Any],
+    *,
+    output_dir: Path,
+    args,
     profiler: MemoryProfiler | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if backend_state["kind"] == FASTEMBED_BACKEND_ID:
-        if profiler:
-            profiler.mark("text_materialization", "start", document_count=len(documents))
-        texts = [doc.text for doc in documents]
-        if profiler:
-            profiler.mark(
-                "text_materialization",
-                "end",
-                document_count=len(documents),
-                text_bytes_estimate=sum(len(text.encode("utf-8", errors="replace")) for text in texts),
-            )
-        vectors = _embed_fastembed(backend_state["model"], texts, profiler=profiler, phase="fastembed_document_batch")
-        if profiler:
-            vector_dim = len(vectors[0]) if vectors else 0
-            profiler.mark(
-                "vector_retention",
-                "start",
-                vector_count=len(vectors),
-                vector_dim=vector_dim,
-                raw_float32_bytes_estimate=len(vectors) * vector_dim * 4,
-            )
-        index = {
-            "backend": FASTEMBED_BACKEND_ID,
-            "model": backend_state["model"],
-            "vectors": {doc.doc_id: vector for doc, vector in zip(documents, vectors)},
-        }
-        if profiler:
-            profiler.mark("vector_retention", "end", vector_count=len(index["vectors"]))
-        private_payload = {
-            "schema_version": 1,
-            "backend": FASTEMBED_BACKEND_ID,
-            "vectors": index["vectors"],
-            "document_ids": [doc.doc_id for doc in documents],
-            "raw_text_committed": False,
-        }
-        return index, private_payload
+    store = EmbeddingShardStore(output_dir)
+    backend = backend_state["kind"]
+    model_id = args.fastembed_model if backend == FASTEMBED_BACKEND_ID else "deterministic_dense_hash_v1"
+    config = StoreConfig(
+        backend=backend,
+        model_id=model_id,
+        content_fingerprint=_content_fingerprint(documents),
+        document_count=len(documents),
+        shard_size=args.shard_size,
+        batch_size=args.fastembed_batch_size,
+        chunking=_chunking_config(args),
+    )
+    expected_doc_ids = [doc.doc_id for doc in documents]
+    profiler.mark("refresh_manifest", "start", document_count=len(documents)) if profiler else None
+    _previous_manifest, reusable_shards, reusable_count = store.reusable_prefix(config, expected_doc_ids)
+    profiler.mark(
+        "refresh_manifest",
+        "end",
+        document_count=len(documents),
+        reusable_shard_count=len(reusable_shards),
+        reusable_record_count=reusable_count,
+    ) if profiler else None
 
+    shards = list(reusable_shards)
+    shard_buffer: list[StoredVectorRecord] = []
+    embedded_count = 0
+    batch_count = 0
+    raw_vector_bytes = 0
+    next_shard_index = len(shards)
+    batch_size = args.fastembed_batch_size
+    missing_documents = documents[reusable_count:]
+    for batch_index, batch in enumerate(_document_batches(missing_documents, batch_size), start=1):
+        batch_count += 1
+        vectors = _embed_document_batch(batch, backend_state, batch_index=batch_index, profiler=profiler)
+        for doc, vector in zip(batch, vectors):
+            raw_vector_bytes += len(vector) * 4
+            embedded_count += 1
+            shard_buffer.append(
+                StoredVectorRecord(
+                    doc_id=doc.doc_id,
+                    vector=vector,
+                    root_label=doc.root_label,
+                    parent_doc_id=doc.parent_doc_id,
+                    chunk_index=doc.chunk_index,
+                    chunk_count=doc.chunk_count,
+                )
+            )
+            if len(shard_buffer) >= args.shard_size:
+                shard = store.write_shard(next_shard_index, shard_buffer)
+                shards.append(shard)
+                next_shard_index += 1
+                shard_buffer = []
+                store.write_manifest(config, shards, complete=False)
+                if profiler:
+                    profiler.mark("vector_shard_write", "shard_written", shard_count=len(shards), record_count=shard["record_count"])
+    if shard_buffer:
+        shard = store.write_shard(next_shard_index, shard_buffer)
+        shards.append(shard)
+        store.write_manifest(config, shards, complete=False)
+        if profiler:
+            profiler.mark("vector_shard_write", "shard_written", shard_count=len(shards), record_count=shard["record_count"])
+    store.write_manifest(config, shards, complete=sum(int(shard.get("record_count") or 0) for shard in shards) == len(documents))
+    storage_metrics = store.storage_metrics()
+    refresh_metrics = _refresh_metrics_from_store(
+        reusable_count=reusable_count,
+        document_count=len(documents),
+        previous_manifest_found=_previous_manifest is not None,
+    )
     if profiler:
-        profiler.mark("deterministic_index", "document_conversion_start", document_count=len(documents))
-    embedding_documents = [doc.as_embedding_document() for doc in documents]
-    if profiler:
-        profiler.mark("deterministic_index", "document_conversion_end", document_count=len(documents))
-    fixture_index = build_fixture_index(embedding_documents)
-    index = {"backend": DETERMINISTIC_BACKEND_ID, **fixture_index}
+        profiler.mark(
+            "vector_retention",
+            "end",
+            vector_count=embedded_count,
+            reused_vector_count=reusable_count,
+            raw_float32_bytes_estimate=raw_vector_bytes,
+        )
+    index = {"backend": backend, "model": backend_state.get("model"), "store": store}
     private_payload = {
         "schema_version": 1,
-        "backend": DETERMINISTIC_BACKEND_ID,
-        "vectorizer_id": fixture_index["vectorizer_id"],
-        "vector_kind": fixture_index["vector_kind"],
-        "idf": fixture_index["idf"],
-        "vectors": fixture_index["vectors"],
-        "document_ids": [doc.doc_id for doc in documents],
+        "backend": backend,
+        "document_ids": expected_doc_ids,
         "raw_text_committed": False,
+        "storage_metrics": storage_metrics,
+        "refresh_metrics": refresh_metrics,
+        "batching": {
+            "fastembed_batch_size": args.fastembed_batch_size,
+            "shard_size": args.shard_size,
+            "document_batches_embedded": batch_count,
+            "documents_embedded": embedded_count,
+            "documents_reused": reusable_count,
+            "raw_float32_vector_bytes_written": raw_vector_bytes,
+        },
+        "chunking": _chunking_config(args),
     }
     return index, private_payload
 
@@ -633,16 +777,23 @@ def _embed_fastembed(
     texts: list[str],
     profiler: MemoryProfiler | None = None,
     phase: str = "fastembed_batch",
+    batch_index: int | None = None,
 ) -> list[list[float]]:
     vectors = []
     if profiler:
-        profiler.mark(phase, "embed_generator_start", input_count=len(texts))
+        counters = {"input_count": len(texts)}
+        if batch_index is not None:
+            counters["batch_index"] = batch_index
+        profiler.mark(phase, "embed_generator_start", **counters)
     for vector in model.embed(texts):
         dense = [float(value) for value in vector]
         length = math.sqrt(sum(value * value for value in dense))
         vectors.append([round(value / length, 8) for value in dense] if length else dense)
         if profiler and len(vectors) in {1, 10, 50, 100, 250, 500, 1000}:
-            profiler.mark(phase, "vector_checkpoint", vector_count=len(vectors), vector_dim=len(dense))
+            counters = {"vector_count": len(vectors), "vector_dim": len(dense)}
+            if batch_index is not None:
+                counters["batch_index"] = batch_index
+            profiler.mark(phase, "vector_checkpoint", **counters)
     if profiler:
         vector_dim = len(vectors[0]) if vectors else 0
         profiler.mark(
@@ -652,8 +803,54 @@ def _embed_fastembed(
             vector_count=len(vectors),
             vector_dim=vector_dim,
             raw_float32_bytes_estimate=len(vectors) * vector_dim * 4,
+            batch_index=batch_index,
         )
     return vectors
+
+
+def _embed_document_batch(
+    documents: list[ExperimentDocument],
+    backend_state: dict[str, Any],
+    *,
+    batch_index: int,
+    profiler: MemoryProfiler | None = None,
+) -> list[list[float]]:
+    if backend_state["kind"] == FASTEMBED_BACKEND_ID:
+        texts = [doc.text for doc in documents]
+        if profiler:
+            profiler.mark(
+                "text_materialization",
+                "batch",
+                batch_index=batch_index,
+                document_count=len(documents),
+                text_bytes_estimate=sum(len(text.encode("utf-8", errors="replace")) for text in texts),
+            )
+        return _embed_fastembed(
+            backend_state["model"],
+            texts,
+            profiler=profiler,
+            phase="fastembed_document_batch",
+            batch_index=batch_index,
+        )
+    return [_dense_deterministic_vector(doc.text) for doc in documents]
+
+
+def _document_batches(documents: list[ExperimentDocument], batch_size: int) -> Iterable[list[ExperimentDocument]]:
+    for start in range(0, len(documents), batch_size):
+        yield documents[start : start + batch_size]
+
+
+def _dense_deterministic_vector(text: str, dims: int = 64) -> list[float]:
+    vector = [0.0] * dims
+    for feature, weight in vectorize_text(text).items():
+        digest = hashlib.sha256(feature.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % dims
+        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        vector[index] += sign * float(weight)
+    length = math.sqrt(sum(value * value for value in vector))
+    if not length:
+        return vector
+    return [round(value / length, 8) for value in vector]
 
 
 def _run_queries(
@@ -673,7 +870,7 @@ def _run_queries(
         profiler.mark("query_baseline_materialization", "end", document_count=len(embedding_documents))
     for probe in probes:
         started = time.perf_counter()
-        embedding_hits = _rank_embedding(probe.query_text, index)[:top_k]
+        embedding_hits = _rank_embedding(probe.query_text, index, top_k=top_k, profiler=profiler)
         latency_ms = _elapsed_ms(started)
         latencies.append(latency_ms)
         baseline_hits = rank_current_package_baseline(probe.query_text, embedding_documents)[:top_k]
@@ -682,21 +879,27 @@ def _run_queries(
     return rows, latencies
 
 
-def _rank_embedding(query: str, index: dict[str, Any]) -> list[RankedHit]:
+def _rank_embedding(query: str, index: dict[str, Any], *, top_k: int, profiler: MemoryProfiler | None = None) -> list[RankedHit]:
+    store = index.get("store")
+    if not isinstance(store, EmbeddingShardStore):
+        return []
     if index.get("backend") == FASTEMBED_BACKEND_ID:
-        vectors = index.get("vectors") or {}
         model = index.get("model")
         if model is None:
             return []
-        query_vectors = _embed_fastembed(model, [query])
+        if profiler:
+            profiler.mark("query_embedding", "start", backend=FASTEMBED_BACKEND_ID)
+        query_vectors = _embed_fastembed(model, [query], profiler=profiler, phase="fastembed_query_batch", batch_index=1)
         query_vector = query_vectors[0] if query_vectors else []
-        hits = [
-            RankedHit(doc_id=doc_id, score=round(_dense_cosine(query_vector, vector), 6), rank=0)
-            for doc_id, vector in vectors.items()
-        ]
-        hits.sort(key=lambda item: (item.score, item.doc_id), reverse=True)
-        return [RankedHit(doc_id=hit.doc_id, score=hit.score, rank=index + 1) for index, hit in enumerate(hits)]
-    return rank_vector(query, index)
+        if profiler:
+            profiler.mark("query_embedding", "end", backend=FASTEMBED_BACKEND_ID, vector_dim=len(query_vector))
+        return store.rank_dense(query_vector, top_k=top_k, profiler=profiler)
+    if profiler:
+        profiler.mark("query_embedding", "start", backend=DETERMINISTIC_BACKEND_ID)
+    query_vector = _dense_deterministic_vector(query)
+    if profiler:
+        profiler.mark("query_embedding", "end", backend=DETERMINISTIC_BACKEND_ID, vector_dim=len(query_vector))
+    return store.rank_dense(query_vector, top_k=top_k, profiler=profiler)
 
 
 def _row_for_probe(
@@ -741,25 +944,11 @@ def _write_private_artifacts(
     run_id: str,
     index_payload: dict[str, Any],
     documents: list[ExperimentDocument],
-    refresh_metrics: dict[str, Any],
     args,
     profiler: MemoryProfiler | None = None,
 ) -> dict[str, Any]:
-    index_path = output_dir / "embedding-index.private.json"
     manifest_path = output_dir / "resume-manifest.private.json"
-    if profiler:
-        profiler.mark("json_serialization", "index_start", document_count=len(documents))
-    index_json = json.dumps(index_payload, indent=2, sort_keys=True)
-    if profiler:
-        profiler.mark(
-            "json_serialization",
-            "index_end",
-            document_count=len(documents),
-            json_bytes=len(index_json.encode("utf-8")),
-        )
-    profiler.mark("private_write", "index_start", document_count=len(documents)) if profiler else None
-    index_path.write_text(index_json, encoding="utf-8")
-    profiler.mark("private_write", "index_end", document_count=len(documents)) if profiler else None
+    storage_metrics = index_payload["storage_metrics"]
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
@@ -768,7 +957,10 @@ def _write_private_artifacts(
         "document_count": len(documents),
         "root_labels": sorted({doc.root_label for doc in documents}),
         "content_fingerprint": _content_fingerprint(documents),
-        "refresh": refresh_metrics["private"],
+        "refresh": index_payload["refresh_metrics"]["private"],
+        "storage": storage_metrics,
+        "batching": index_payload["batching"],
+        "chunking": index_payload["chunking"],
         "raw_text_committed": False,
     }
     if profiler:
@@ -781,36 +973,45 @@ def _write_private_artifacts(
     profiler.mark("private_write", "manifest_end") if profiler else None
     return {
         "scope": "ignored_private_output",
-        "index_written": True,
+        "index_written": False,
         "resume_manifest_written": True,
+        "sharded_vector_manifest_written": storage_metrics.get("manifest_found", False),
+        "binary_vector_shards_written": storage_metrics.get("shard_count", 0) > 0,
         "raw_text_written": False,
-        "index_size_bytes": _file_size(index_path),
-        "index_file_label": "private_embedding_index_json",
+        "index_size_bytes": int(storage_metrics.get("total_bytes", 0)),
+        "vector_shard_count": storage_metrics.get("shard_count", 0),
+        "vector_bytes": storage_metrics.get("vector_bytes", 0),
+        "metadata_bytes": storage_metrics.get("metadata_bytes", 0),
+        "sharded_manifest_label": "private_embedding_shards_manifest_json",
+        "vector_shard_label": "private_embedding_vector_shards_f32",
         "resume_manifest_label": "private_resume_manifest_json",
     }
 
 
-def _refresh_metrics(output_dir: Path, documents: list[ExperimentDocument], args) -> dict[str, Any]:
-    started = time.perf_counter()
-    manifest_path = output_dir / "resume-manifest.private.json"
-    fingerprint = _content_fingerprint(documents)
-    private = {"previous_manifest_found": False, "content_fingerprint": fingerprint, "no_change": False}
-    public_status = "no_previous_manifest"
-    if manifest_path.exists():
-        private["previous_manifest_found"] = True
-        try:
-            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-            private["no_change"] = previous.get("content_fingerprint") == fingerprint
-            public_status = "no_change" if private["no_change"] else "changed"
-        except (OSError, json.JSONDecodeError):
-            public_status = "previous_manifest_unreadable"
-    elapsed = _elapsed_ms(started)
+def _refresh_metrics_from_store(*, reusable_count: int, document_count: int, previous_manifest_found: bool) -> dict[str, Any]:
+    no_change = document_count > 0 and reusable_count == document_count
+    if no_change:
+        public_status = "no_change"
+    elif reusable_count:
+        public_status = "partial_resume"
+    elif previous_manifest_found:
+        public_status = "changed_or_unusable_manifest"
+    else:
+        public_status = "no_previous_manifest"
+    private = {
+        "previous_manifest_found": previous_manifest_found,
+        "reusable_record_count": reusable_count,
+        "document_count": document_count,
+        "no_change": no_change,
+    }
     return {
         "private": private,
         "public": {
             "status": public_status,
-            "elapsed_ms": elapsed,
-            "scope": "ignored_private_resume_manifest",
+            "elapsed_ms": 0,
+            "scope": "ignored_private_shard_manifest",
+            "reusable_record_count": reusable_count,
+            "document_count": document_count,
         },
     }
 
@@ -836,9 +1037,12 @@ def _aggregate_rows(
             "index_build_time_ms": index_build_ms,
             "peak_memory_bytes": peak_memory_bytes,
             "disk_index_size_bytes": index_size_bytes,
-            "document_count": source_metrics.get("record_count", 0),
+            "document_count": source_metrics.get("embedding_document_count", source_metrics.get("record_count", 0)),
+            "source_record_count": source_metrics.get("record_count", 0),
+            "chunk_count": source_metrics.get("chunk_count", 0),
             "refresh_no_change_cost_ms": refresh_metrics["public"]["elapsed_ms"],
             "refresh_status": refresh_metrics["public"]["status"],
+            "reusable_record_count": refresh_metrics["public"].get("reusable_record_count", 0),
         },
         "query_metrics": {
             "case_count": len(rows),
@@ -910,19 +1114,25 @@ def _root_cause_profile(memory_profile: dict[str, Any]) -> dict[str, Any]:
     embed_start = sample("fastembed_document_batch", "embed_generator_start")
     first_vector = sample("fastembed_document_batch", "vector_checkpoint", "vector_count", 1)
     embed_end = sample("fastembed_document_batch", "embed_generator_end")
+    embed_ends = [
+        item
+        for item in samples
+        if item.get("phase") == "fastembed_document_batch" and item.get("event") == "embed_generator_end"
+    ]
     vector_retention_end = sample("vector_retention", "end")
     json_index_end = sample("json_serialization", "index_end")
     fastembed_profiled = embed_start is not None and first_vector is not None and embed_end is not None
 
     peak_rss = int(memory_profile.get("peak_observed_rss_bytes") or 0)
     tracemalloc_peak = int(memory_profile.get("tracemalloc_python_peak_bytes") or 0)
-    raw_vector_bytes = counter(embed_end, "raw_float32_bytes_estimate")
+    raw_vector_bytes = sum(counter(item, "raw_float32_bytes_estimate") for item in embed_ends) or counter(embed_end, "raw_float32_bytes_estimate")
     text_bytes = counter(document_load_end, "text_bytes_estimate")
     index_json_bytes = counter(json_index_end, "json_bytes")
     embed_native_jump = max(0, rss(first_vector) - rss(embed_start))
 
     evidence_summary = {
-        "document_count": counter(embed_end, "vector_count"),
+        "document_count": sum(counter(item, "vector_count") for item in embed_ends) or counter(embed_end, "vector_count"),
+        "fastembed_batch_count": len(embed_ends),
         "text_bytes_estimate": text_bytes,
         "raw_float32_vector_bytes_estimate": raw_vector_bytes,
         "index_json_bytes": index_json_bytes,
@@ -972,43 +1182,43 @@ def _root_cause_profile(memory_profile: dict[str, Any]) -> dict[str, Any]:
             "hypothesis": "fastembed_onnx_batch_native_allocation",
             "confidence": "high",
             "evidence": (
-                "RSS rises during the FastEmbed document batch before Python vector retention dominates; "
-                "tracemalloc remains far below RSS, so native ONNX/FastEmbed allocations are the primary observed cause."
+                "RSS is sampled inside bounded FastEmbed document batches. If RSS still rises sharply here while "
+                "tracemalloc remains far below RSS, native ONNX/FastEmbed allocation remains the primary risk."
             ),
             "evidence_counters": {
                 "embed_start_to_first_vector_rss_delta_bytes": embed_native_jump,
                 "tracemalloc_python_peak_bytes": tracemalloc_peak,
                 "raw_float32_vector_bytes_estimate": raw_vector_bytes,
             },
-            "recommended_follow_up": "jsh-044b must bound FastEmbed batch/session behavior and measure RSS per batch.",
+            "recommended_follow_up": "Use these per-batch RSS samples in jsh-044c before increasing selected-history scale.",
         },
         {
             "rank": 2,
-            "hypothesis": "current_all_at_once_python_vector_retention",
+            "hypothesis": "python_vector_retention_bounded_by_shard_buffer",
             "confidence": "medium",
             "evidence": (
-                "The current architecture keeps all dense vectors in Python lists and a dict; this is not the main "
-                "500-record RSS jump, but it will scale linearly and should be removed before larger runs."
+                "The current architecture writes dense vectors into private binary shards and keeps only the active "
+                "shard buffer in Python instead of a full document-vector dict."
             ),
             "evidence_counters": {
                 "raw_float32_vector_bytes_estimate": raw_vector_bytes,
                 "vector_retention_end_rss_bytes": rss(vector_retention_end),
             },
-            "recommended_follow_up": "Store vectors in bounded shards and avoid a full in-memory vector dict.",
+            "recommended_follow_up": "Reviewer should verify the live query path ranks via shard files, not an in-memory vector dict.",
         },
         {
             "rank": 3,
-            "hypothesis": "json_serialization_secondary_overhead",
+            "hypothesis": "monolithic_json_vector_serialization_replaced",
             "confidence": "medium",
             "evidence": (
-                "JSON serialization produces a multi-MiB private index and a smaller late RSS increase; it is "
-                "secondary at 500 records but wasteful for larger history."
+                "The prior monolithic JSON vector map is replaced by float32 shard files plus small JSON manifests; "
+                "JSON serialization now covers metadata rather than every vector value."
             ),
             "evidence_counters": {
                 "index_json_bytes": index_json_bytes,
                 "peak_observed_rss_bytes": peak_rss,
             },
-            "recommended_follow_up": "Replace monolithic JSON vector dumps with compact appendable shard files.",
+            "recommended_follow_up": "Track shard vector bytes, metadata bytes, and manifest bytes separately in jsh-044c.",
         },
         {
             "rank": 4,
@@ -1142,7 +1352,15 @@ def _base_report(args, run_id: str, limits: Limits, started: float) -> dict[str,
         "data_source": "committed_sanitized_synthetic_fixture"
         if args.experiment_mode == "smoke_synthetic"
         else "live_local_roots",
-        "limits": {**limits.to_dict(), "max_records": args.max_records, "max_index_disk": args.max_index_disk},
+        "limits": {
+            **limits.to_dict(),
+            "max_records": args.max_records,
+            "max_index_disk": args.max_index_disk,
+            "fastembed_batch_size": args.fastembed_batch_size,
+            "shard_size": args.shard_size,
+            "chunk_size_chars": args.chunk_size_chars,
+            "chunk_overlap_chars": args.chunk_overlap_chars,
+        },
         "scope": {
             "selected_roots": [],
             "rejected_roots": [],
@@ -1279,10 +1497,6 @@ def _protected_regression(case_family: str, embedding_rank: int | None, baseline
     if embedding_rank is None:
         return True
     return embedding_rank > baseline_rank
-
-
-def _dense_cosine(left: list[float], right: list[float]) -> float:
-    return sum(a * b for a, b in zip(left, right))
 
 
 def _content_fingerprint(documents: list[ExperimentDocument]) -> str:
