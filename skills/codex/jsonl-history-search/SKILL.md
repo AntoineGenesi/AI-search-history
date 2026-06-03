@@ -9,6 +9,18 @@ metadata:
 
 Use this when the user asks about prior conversations, repeated feedback, old decisions, reports, artifacts, semantic debugging, or "what happened". The default source of truth is local AI conversation JSONL logs, then project docs/git as secondary evidence.
 
+## Workflow Routing
+
+Trigger JSONL even when the user does not name it. Route these asks first:
+
+| User ask | Workflow | First command |
+| --- | --- | --- |
+| "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction retrieval | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format json` |
+| "Did the agent actually run/edit/test/review X?" | Agent action/proof audit | `jsonl-history-search semantic-debug "did the agent actually run/edit/test/review <thing>" --cwd "$PWD" --format json` |
+| "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `jsonl-history-search semantic-debug "why did this happen?" --task <task-slug> --path <path> --cwd "$PWD" --format json` |
+
+Use `semantic-debug` as the first packet command for these workflows because it returns `question_family`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
+
 ## Search Order
 
 1. For recent/"just now" recovery: newest modified `~/.codex/sessions/**/*.jsonl` files first.
