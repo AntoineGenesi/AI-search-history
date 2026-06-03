@@ -23,6 +23,10 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
 from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
+from .real_history_miss_audit import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_MISS_AUDIT_MANIFEST
+from .real_history_miss_audit import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_MISS_AUDIT_PRIVATE_BRIDGE
+from .real_history_miss_audit import DEFAULT_RAW_RUN as DEFAULT_REAL_HISTORY_MISS_AUDIT_RAW_RUN
+from .real_history_miss_audit import build_real_history_package_miss_audit_payload
 from .real_history_embedding import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_EMBEDDING_MANIFEST
 from .real_history_embedding import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_EMBEDDING_PRIVATE_BRIDGE
 from .real_history_embedding import build_real_history_embedding_payload
@@ -408,6 +412,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     real_history_embedding.add_argument("--profile-memory", action="store_true")
     real_history_embedding.add_argument("--enable-onnx-profiling", action="store_true")
+    real_history_miss_audit = subparsers.add_parser("audit-real-history-package-misses")
+    real_history_miss_audit.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    real_history_miss_audit.add_argument("--cwd", default=".")
+    real_history_miss_audit.add_argument("--timezone", default=None)
+    real_history_miss_audit.add_argument("--timezone-offset", default="+00:00")
+    real_history_miss_audit.add_argument("--now", default=None)
+    real_history_miss_audit.add_argument(
+        "--manifest",
+        default=str(DEFAULT_REAL_HISTORY_MISS_AUDIT_MANIFEST),
+        help="Sanitized reviewed real-history gold manifest.",
+    )
+    real_history_miss_audit.add_argument(
+        "--private-bridge",
+        default=str(DEFAULT_REAL_HISTORY_MISS_AUDIT_PRIVATE_BRIDGE),
+        help="Ignored private bridge JSON produced by jsh-049a.",
+    )
+    real_history_miss_audit.add_argument(
+        "--raw-run",
+        default=str(DEFAULT_REAL_HISTORY_MISS_AUDIT_RAW_RUN),
+        help="Ignored raw jsh-049b benchmark run JSON to audit.",
+    )
+    real_history_miss_audit.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    real_history_miss_audit.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
     live_protocol = subparsers.add_parser("benchmark-live-terminal-protocol")
     live_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
     live_protocol.add_argument(
@@ -986,6 +1021,27 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["real_history_embedding_benchmark"]["status"]
         return 1 if status in {"invalid_fixture", "invalid_bridge", "private_output_rejected"} else 0
+    if args.command == "audit-real-history-package-misses":
+        payload = build_real_history_package_miss_audit_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_package_search_miss_audit"]["status"]
+        return 1 if status in {"invalid_fixture"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)
