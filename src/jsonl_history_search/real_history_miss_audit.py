@@ -132,13 +132,14 @@ def _audit_case(
         cwd=cwd,
     )
     candidate_probe = _candidate_probe(package_row, expected_ref, case.must_find_ref_ids)
+    cap_probe = _cap_probe(package_row)
     scope_probe = _scope_probe(
         expected_ref=expected_ref,
         source_order=source_order,
         enumerated_count=enumerated_count,
         package_row=package_row,
+        cap_probe=cap_probe,
     )
-    cap_probe = _cap_probe(package_row)
     classifications = _failure_classifications(
         source_probe=source_probe,
         query_basis=query_basis,
@@ -304,6 +305,7 @@ def _scope_probe(
     source_order: dict[Path, dict[str, int]],
     enumerated_count: int,
     package_row: dict[str, Any] | None,
+    cap_probe: dict[str, Any],
 ) -> dict[str, Any]:
     if expected_ref is None:
         return {
@@ -322,7 +324,12 @@ def _scope_probe(
     if not selected:
         not_scope = "expected_file_not_selected"
     elif not enumerated:
-        not_scope = "expected_file_not_enumerated_due_byte_cap"
+        if cap_probe.get("enumeration_byte_cap"):
+            not_scope = "expected_file_not_enumerated_due_byte_cap"
+        elif cap_probe.get("elapsed_cap"):
+            not_scope = "expected_file_not_reached_due_elapsed_cap"
+        else:
+            not_scope = "expected_file_not_enumerated_in_selected_scope"
     elif not opened:
         not_scope = "expected_file_enumerated_but_not_opened_before_scan_stop"
     else:
@@ -419,6 +426,10 @@ def _failure_classifications(
         labels.append("expected_record_source_semantics_not_human_high_confidence")
     if scope_probe.get("not_searched_scope") == "expected_file_not_enumerated_due_byte_cap":
         labels.append("expected_file_not_enumerated_due_byte_cap")
+    if scope_probe.get("not_searched_scope") == "expected_file_not_reached_due_elapsed_cap":
+        labels.append("expected_file_not_reached_due_elapsed_cap")
+    if scope_probe.get("not_searched_scope") == "expected_file_not_enumerated_in_selected_scope":
+        labels.append("expected_file_not_enumerated_in_selected_scope")
     if scope_probe.get("not_searched_scope") == "expected_file_enumerated_but_not_opened_before_scan_stop":
         labels.append("expected_file_not_opened_before_scan_stop")
     if not candidate_probe.get("expected_ref_recovered_any_available_list"):
@@ -440,7 +451,7 @@ def _failure_classifications(
     if cap_probe.get("elapsed_cap"):
         labels.append("elapsed_cap_stopped_scan")
     if cap_probe.get("match_cap"):
-        labels.append("match_cap_stopped_collection")
+        labels.append("match_cap_limited_candidate_retention")
     if cap_probe.get("weak_reservoir_cap"):
         labels.append("weak_reservoir_cap_limited_noisy_candidates")
     labels.extend(f"query_basis_{item}" for item in query_basis.get("pathologies", []))
@@ -668,7 +679,7 @@ def _warning_labels(warnings: list[Any]) -> set[str]:
             labels.add("enumeration_byte_cap")
         if "max elapsed cap" in text:
             labels.add("elapsed_cap")
-        if "max match cap" in text:
+        if "max match cap" in text or "candidate_retention_capped_at_max_match_cap" in text:
             labels.add("match_cap")
         if "reservoir-capped" in text:
             labels.add("weak_reservoir_cap")

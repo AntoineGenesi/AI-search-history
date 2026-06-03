@@ -1125,6 +1125,7 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
             (
                 "root_rejected_",
                 "stopped_at_",
+                "candidate_retention_capped_at_max_match_cap",
                 "missing_root",
                 "arbitrary_root_enabled_with_hard_caps",
                 "weak_partial_candidates_reservoir_capped",
@@ -1140,7 +1141,10 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
         elif "max byte cap" in lowered:
             safe.append("stopped_at_max_byte_cap")
         elif "max match cap" in lowered:
-            safe.append("stopped_at_max_match_cap")
+            if "retention-capped" in lowered or "final candidates were capped" in lowered:
+                safe.append("candidate_retention_capped_at_max_match_cap")
+            else:
+                safe.append("stopped_at_max_match_cap")
         elif "weak partial generic candidates were reservoir-capped" in lowered:
             safe.append("weak_partial_candidates_reservoir_capped")
         elif "dangerous broad root rejected" in lowered:
@@ -1157,6 +1161,9 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
 def _cap_hit_labels(warnings: list[str]) -> list[str]:
     labels = set()
     for warning in warnings:
+        if warning == "candidate_retention_capped_at_max_match_cap":
+            labels.add("max_match")
+            continue
         if not warning.startswith("stopped_at_"):
             continue
         label = warning[len("stopped_at_") :]

@@ -635,8 +635,12 @@ def cap_hit_status(*, warnings: list[str], limits: dict) -> dict:
             caps_hit.add("max_byte_cap")
             normalized_warnings.add("stopped_at_max_byte_cap")
         if "max match cap" in lowered:
-            caps_hit.add("max_match_cap")
-            normalized_warnings.add("stopped_at_max_match_cap")
+            if "retention-capped" in lowered or "final candidates were capped" in lowered:
+                caps_hit.add("max_match_retention_cap")
+                normalized_warnings.add("candidate_retention_capped_at_max_match_cap")
+            else:
+                caps_hit.add("max_match_cap")
+                normalized_warnings.add("stopped_at_max_match_cap")
         if "max elapsed cap" in lowered:
             caps_hit.add("max_elapsed_cap")
             normalized_warnings.add("stopped_at_max_elapsed_cap")
