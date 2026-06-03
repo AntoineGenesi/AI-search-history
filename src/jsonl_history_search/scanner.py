@@ -26,6 +26,8 @@ def search(
     matches: list[Match] = []
     weak_matches: list[Match] = []
     weak_reservoir_limit = max(1, min(plan.limits.max_matches, max(3, plan.limits.max_matches // 4)))
+    strong_reservoir_limit = max(1, plan.limits.max_matches)
+    strong_candidates_retention_capped = 0
     weak_candidates_skipped = 0
     dedupe: set[tuple[str, str, str | None]] = set()
     searched_files = 0
@@ -102,20 +104,29 @@ def search(
                             weak_matches[weakest_index] = match
                         weak_candidates_skipped += 1
                     continue
-                matches.append(match)
-                if len(matches) >= plan.limits.max_matches:
-                    warnings.append("Stopped scanning at max match cap.")
-                    stopped = True
-                    break
+                if len(matches) < strong_reservoir_limit:
+                    matches.append(match)
+                    continue
+                weakest_index = min(
+                    range(len(matches)),
+                    key=lambda index: match_sort_key(matches[index]),
+                )
+                if match_sort_key(match) > match_sort_key(matches[weakest_index]):
+                    matches[weakest_index] = match
+                strong_candidates_retention_capped += 1
         except AdapterReadError as exc:
             warnings.append(str(exc))
             continue
         if stopped:
             break
 
+    if strong_candidates_retention_capped:
+        warnings.append("Strong candidates were retention-capped at max match cap before final ranking.")
     if weak_candidates_skipped:
         warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
-    matches = (matches + weak_matches)[: plan.limits.max_matches * 2]
+    matches = matches + weak_matches
+    if len(matches) > plan.limits.max_matches:
+        warnings.append("Final candidates were capped at max match cap after ranking.")
     matches.sort(key=match_sort_key, reverse=True)
     matches = matches[: plan.limits.max_matches]
     payload = {

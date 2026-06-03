@@ -1415,6 +1415,9 @@ def _timestamp_seek_required_counter_keys() -> tuple[str, ...]:
 def _cap_hit_labels(warnings: list[str]) -> list[str]:
     labels = set()
     for warning in warnings:
+        if warning == "candidate_retention_capped_at_max_match_cap":
+            labels.add("max_match")
+            continue
         if not warning.startswith("stopped_at_"):
             continue
         label = warning[len("stopped_at_") :]
@@ -1443,14 +1446,19 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
     safe: list[str] = []
     for warning in warnings:
         lowered = warning.lower()
-        if "max elapsed cap" in lowered:
+        if lowered == "candidate_retention_capped_at_max_match_cap":
+            safe.append("candidate_retention_capped_at_max_match_cap")
+        elif "max elapsed cap" in lowered:
             safe.append("stopped_at_max_elapsed_cap")
         elif "max file cap" in lowered:
             safe.append("stopped_at_max_file_cap")
         elif "max byte cap" in lowered:
             safe.append("stopped_at_max_byte_cap")
         elif "max match cap" in lowered:
-            safe.append("stopped_at_max_match_cap")
+            if "retention-capped" in lowered or "final candidates were capped" in lowered:
+                safe.append("candidate_retention_capped_at_max_match_cap")
+            else:
+                safe.append("stopped_at_max_match_cap")
         elif "dangerous broad root rejected" in lowered:
             safe.append("root_rejected_dangerous_broad_root")
         elif "drive root rejected" in lowered:
@@ -1488,7 +1496,7 @@ def _opaque_warning(warning: str) -> str:
 
 
 def _result_status(candidate_count: int, warnings: list[str]) -> str:
-    if any(item.startswith("stopped_at_max_") for item in warnings):
+    if any(item.startswith("stopped_at_max_") or item == "candidate_retention_capped_at_max_match_cap" for item in warnings):
         return "capped"
     if candidate_count:
         return "found"
