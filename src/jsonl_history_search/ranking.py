@@ -116,9 +116,9 @@ def role_matches(actual: str, wanted: str) -> bool:
 
 
 def should_consider(record: Record, intent: QueryIntent) -> bool:
-    if intent.role and not role_matches(record.role, intent.role):
+    if intent.role and intent.role_filter_explicit and not role_matches(record.role, intent.role):
         return False
-    if intent.date_window_start and intent.date_window_end:
+    if intent.date_window_filter and intent.date_window_start and intent.date_window_end:
         if record.timestamp is None:
             return False
         local_ts = record.timestamp.astimezone(intent.date_window_start.tzinfo)

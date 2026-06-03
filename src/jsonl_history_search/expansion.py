@@ -6,8 +6,11 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 
 
-TASK_SLUG_RE = re.compile(r"\b([a-z]{1,8})[-_ ]?(\d{2,6})(?:[-_]([a-z0-9]{1,20}))?\b")
+TASK_SLUG_RE = re.compile(r"\b([a-z]{1,8})[-_](\d{2,6}[a-z]?)(?:[-_]([a-z0-9]{1,20}))?\b")
 SEPARATED_WORD_RE = re.compile(r"[a-z0-9]+")
+MAX_EXACT_PHRASE_CHARS = 240
+MAX_EXACT_PHRASE_TOKENS = 16
+MAX_EXPANDED_TERMS = 110
 
 SYNONYMS: dict[str, tuple[str, ...]] = {
     "artifact": ("artifacts", "doc", "docs", "file", "output", "report"),
@@ -90,8 +93,8 @@ def expand_query_terms(
             return
         reasons.setdefault(cleaned, set()).add(reason)
 
-    if len(normalized) > 2:
-        add(normalized, "exact_phrase")
+    for phrase in exact_phrase_terms(normalized):
+        add(phrase, "exact_phrase")
 
     for term in base_terms:
         add(term, "normalized_terms")
@@ -104,7 +107,8 @@ def expand_query_terms(
         for slug in task_slug_variants(hint):
             add(slug, "task_slug")
 
-    for term in list(reasons):
+    expansion_seeds = list(base_terms)
+    for term in expansion_seeds:
         for synonym in SYNONYMS.get(term, ()):
             add(synonym, "synonym_paraphrase")
         for semantic_term in SEMANTIC_LOCAL.get(term, ()):
@@ -116,10 +120,52 @@ def expand_query_terms(
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
         add(term, "date_window")
 
+    bounded = bounded_reasons(reasons)
     return ExpansionResult(
-        terms=sorted(reasons),
-        reasons={term: sorted(term_reasons) for term, term_reasons in sorted(reasons.items())},
+        terms=sorted(bounded),
+        reasons={term: sorted(term_reasons) for term, term_reasons in sorted(bounded.items())},
     )
+
+
+def exact_phrase_terms(normalized: str) -> list[str]:
+    phrases: list[str] = []
+    if _eligible_exact_phrase(normalized):
+        phrases.append(normalized)
+    for quoted in re.findall(r'"([^"]+)"|\'([^\']+)\'', normalized):
+        phrase = next((item for item in quoted if item), "")
+        cleaned = " ".join(phrase.split())
+        if _eligible_exact_phrase(cleaned):
+            phrases.append(cleaned)
+    return sorted(set(phrases))
+
+
+def _eligible_exact_phrase(value: str) -> bool:
+    if len(value) <= 2 or len(value) > MAX_EXACT_PHRASE_CHARS:
+        return False
+    tokens = SEPARATED_WORD_RE.findall(value)
+    return 2 <= len(tokens) <= MAX_EXACT_PHRASE_TOKENS
+
+
+def bounded_reasons(reasons: dict[str, set[str]]) -> dict[str, set[str]]:
+    if len(reasons) <= MAX_EXPANDED_TERMS:
+        return reasons
+    ordered = sorted(reasons.items(), key=lambda item: (_reason_priority(item[1]), item[0]))
+    return dict(ordered[:MAX_EXPANDED_TERMS])
+
+
+def _reason_priority(term_reasons: set[str]) -> tuple[int, int]:
+    priority_order = (
+        "exact_phrase",
+        "artifact_path",
+        "task_slug",
+        "preference",
+        "date_window",
+        "normalized_terms",
+        "semantic_local",
+        "synonym_paraphrase",
+    )
+    priority = min((priority_order.index(reason) for reason in term_reasons if reason in priority_order), default=len(priority_order))
+    return priority, len(term_reasons)
 
 
 def task_slug_variants(text: str) -> list[str]:

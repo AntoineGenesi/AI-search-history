@@ -211,6 +211,7 @@ def _apply_around_window(intent: QueryIntent, around):
     intent.date_window_start = around - timedelta(minutes=AROUND_WINDOW_MINUTES)
     intent.date_window_end = around + timedelta(minutes=AROUND_WINDOW_MINUTES)
     intent.date_reason = f"around:{around.isoformat()}"
+    intent.date_window_filter = True
 
 
 def _mask_context_from_args(args) -> MaskContext | None:
