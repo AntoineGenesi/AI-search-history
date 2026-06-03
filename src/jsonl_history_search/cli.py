@@ -23,6 +23,9 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
 from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
+from .real_history_embedding import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_EMBEDDING_MANIFEST
+from .real_history_embedding import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_EMBEDDING_PRIVATE_BRIDGE
+from .real_history_embedding import build_real_history_embedding_payload
 from .real_history_timestamp_seek import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_TIMESTAMP_MANIFEST
 from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE
 from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
@@ -329,6 +332,63 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
     )
+    real_history_embedding = subparsers.add_parser("benchmark-real-history-embedding")
+    add_common_args(real_history_embedding)
+    real_history_embedding.add_argument(
+        "--manifest",
+        default=str(DEFAULT_REAL_HISTORY_EMBEDDING_MANIFEST),
+        help="Sanitized reviewed real-history gold manifest.",
+    )
+    real_history_embedding.add_argument(
+        "--private-bridge",
+        default=str(DEFAULT_REAL_HISTORY_EMBEDDING_PRIVATE_BRIDGE),
+        help="Ignored private bridge JSON produced by jsh-049a.",
+    )
+    real_history_embedding.add_argument(
+        "--case-selector",
+        choices=("embedding_recall", "all_reviewed"),
+        default="embedding_recall",
+        help="Reviewed real-history case subset to evaluate.",
+    )
+    real_history_embedding.add_argument(
+        "--backend",
+        choices=("auto", "fastembed", "deterministic"),
+        default="deterministic",
+        help="Embedding backend to try. Defaults to deterministic for harness proof.",
+    )
+    real_history_embedding.add_argument("--fastembed-model", default=FASTEMBED_MODEL_ID)
+    real_history_embedding.add_argument("--fastembed-batch-size", type=int, default=32)
+    real_history_embedding.add_argument("--allow-model-download", action="store_true")
+    real_history_embedding.add_argument("--fastembed-cache-dir", default=None)
+    real_history_embedding.add_argument(
+        "--baseline-mode",
+        choices=("correctness", "skip"),
+        default="correctness",
+        help="Use correctness for recall comparison; skip is resource-only and remains inconclusive.",
+    )
+    real_history_embedding.add_argument("--case-limit", type=int, default=9)
+    real_history_embedding.add_argument("--top-k", type=int, default=10)
+    real_history_embedding.add_argument("--max-index-disk", type=int, default=2 * 1024 * 1024 * 1024)
+    real_history_embedding.add_argument("--shard-size", type=int, default=1000)
+    real_history_embedding.add_argument("--chunk-size-chars", type=int, default=0)
+    real_history_embedding.add_argument("--chunk-overlap-chars", type=int, default=0)
+    real_history_embedding.add_argument(
+        "--output-dir",
+        default=None,
+        help="Ignored private output directory for vectors/indexes; must be under .private/.",
+    )
+    real_history_embedding.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    real_history_embedding.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
+    real_history_embedding.add_argument("--profile-memory", action="store_true")
+    real_history_embedding.add_argument("--enable-onnx-profiling", action="store_true")
     live_protocol = subparsers.add_parser("benchmark-live-terminal-protocol")
     live_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
     live_protocol.add_argument(
@@ -855,6 +915,27 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["real_history_timestamp_seek_benchmark"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture", "invalid_bridge"} else 0
+    if args.command == "benchmark-real-history-embedding":
+        payload = build_real_history_embedding_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_embedding_benchmark"]["status"]
+        return 1 if status in {"invalid_fixture", "invalid_bridge", "private_output_rejected"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)
