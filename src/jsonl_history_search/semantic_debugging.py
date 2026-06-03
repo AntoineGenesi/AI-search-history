@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from .agent_contract import (
@@ -13,6 +16,7 @@ from .agent_contract import (
 )
 from .claims import classify_claim_action, parse_review_verdict
 from .forensics import build_forensics_payload
+from .query import infer_query
 from .real_history_gold import validate_manifest_file
 from .scanner import search
 from .tool_events import build_tool_events_payload
@@ -104,7 +108,15 @@ def build_semantic_debug_payload(
     uncertainty = build_uncertainty(agent_find, source_scope, tool_report, forensics_payload, family)
     next_reads = build_next_reads(candidates, tool_proof, joins, hints)
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
-    benchmark_gate = build_manifest_gate(Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)))
+    benchmark_gate = build_manifest_evaluation(
+        Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
+        source_plan=source_plan,
+        plan=plan,
+        default_tz=default_tz,
+        mask_context=mask_context,
+        output_format=getattr(args, "format", "json"),
+        use_rg_prefilter=getattr(args, "rg_prefilter", False),
+    )
     candidate_causes = build_candidate_causes(candidates, timeline, tool_proof, joins)
     routes = build_routes(agent_find, source_scope, tool_report, forensics_payload, hints, benchmark_gate)
 
@@ -514,26 +526,58 @@ def build_tradeoff_counters(
     }
 
 
-def build_manifest_gate(path: Path) -> dict[str, Any]:
+def build_manifest_evaluation(
+    path: Path,
+    *,
+    source_plan: dict[str, Any],
+    plan: Any,
+    default_tz: Any,
+    mask_context: Any,
+    output_format: str,
+    use_rg_prefilter: bool,
+) -> dict[str, Any]:
     if not path.exists():
         return {
             "status": "manifest_missing",
             "manifest": str(path),
             "not_searched": True,
+            "evaluation_kind": "not_run",
+            "case_count": 0,
+            "cases": [],
             "caveats": ["sanitized real-history manifest was not available; no private bridge was required or run"],
         }
     validation = validate_manifest_file(path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return {"status": "invalid_manifest", "manifest": str(path), "errors": [str(exc)]}
+        return {"status": "invalid_manifest", "manifest": str(path), "evaluation_kind": "not_run", "case_count": 0, "cases": [], "errors": [str(exc)]}
     cases = payload.get("cases", []) if isinstance(payload, dict) else []
     family_counts = Counter(case.get("family", "unknown") for case in cases if isinstance(case, dict))
     no_evidence_count = sum(1 for case in cases if "no_evidence" in str(case.get("family", "")))
     thin_families = sorted(family for family, count in family_counts.items() if count < 3)
+    started = time.monotonic()
+    case_rows = evaluate_manifest_cases(
+        cases,
+        source_plan=source_plan,
+        plan=plan,
+        default_tz=default_tz,
+        mask_context=mask_context,
+        output_format=output_format,
+        use_rg_prefilter=use_rg_prefilter,
+    ) if validation.ok else []
+    elapsed_values = [int(row["elapsed_ms"]) for row in case_rows]
+    byte_values = [int(row["output_context_bytes"]) for row in case_rows]
+    token_values = [int(row["estimated_output_tokens"]) for row in case_rows]
+    correctness_counts = Counter(row.get("correctness_status", "unknown") for row in case_rows)
+    command_status_counts = Counter(row.get("command_status", "unknown") for row in case_rows)
+    reviewed_count = sum(1 for case in cases if isinstance(case, dict) and case.get("review_status") == "reviewed_real_history_gold")
     return {
-        "status": "coverage_only" if validation.ok else "invalid_manifest",
+        "status": "evaluated_sanitized_manifest" if validation.ok else "invalid_manifest",
         "manifest": str(path),
+        "evaluation_kind": "sanitized_manifest_iteration",
+        "measurement_basis": "runs sanitized ask_pattern_paraphrase values through candidate recovery over the caller-selected source scope; per-case output omits snippets, raw paths, raw private query text, and private bridge refs",
+        "case_count": len(cases),
+        "reviewed_count": reviewed_count,
         "reviewed_case_count": len(cases),
         "below_floor_case_count": len(cases) < 20,
         "old_target_floor": 20,
@@ -541,16 +585,169 @@ def build_manifest_gate(path: Path) -> dict[str, Any]:
         "thin_families": thin_families,
         "missing_families": ["no_evidence"] if no_evidence_count == 0 else [],
         "privacy_contract": "sanitized aggregate only; no raw private text, paths, query wording, session IDs, vectors, indexes, or private bridge refs are required",
-        "correctness_gate": "not_evaluated_without_private_bridge",
+        "correctness_gate": "not_evaluable_without_private_bridge" if correctness_counts.get("not_evaluable_without_private_bridge") else "not_evaluated",
+        "correctness_evaluable_count": sum(count for status, count in correctness_counts.items() if status in {"passed", "failed"}),
+        "correctness_not_evaluable_count": sum(count for status, count in correctness_counts.items() if status.startswith("not_evaluable")),
+        "correctness_pass_count": correctness_counts.get("passed", 0),
+        "correctness_fail_count": correctness_counts.get("failed", 0),
+        "correctness_status_counts": dict(sorted(correctness_counts.items())),
+        "command_status_counts": dict(sorted(command_status_counts.items())),
+        "elapsed_ms": {
+            "total": sum(elapsed_values),
+            "median": median_int(elapsed_values),
+            "p90": percentile_nearest(elapsed_values, 90),
+            "evaluation_total": int(round((time.monotonic() - started) * 1000)),
+        },
+        "output_context_bytes": {
+            "total": sum(byte_values),
+            "median": median_int(byte_values),
+            "p90": percentile_nearest(byte_values, 90),
+        },
+        "estimated_output_tokens": {
+            "total": sum(token_values),
+            "median": median_int(token_values),
+            "p90": percentile_nearest(token_values, 90),
+        },
+        "cases": case_rows,
         "errors": list(validation.errors),
         "caveats": [
             "18 reviewed real-history cases are below the old 20-50 target floor."
             if len(cases) < 20
             else "case count meets the old target floor",
             "No no-evidence family is present in the reviewed manifest." if no_evidence_count == 0 else "no-evidence family present",
-            "This command reports manifest-family coverage, not private-history retrieval correctness.",
+            "Correctness is not evaluable for private sanitized refs without the ignored private bridge.",
         ],
     }
+
+
+def evaluate_manifest_cases(
+    cases: list[Any],
+    *,
+    source_plan: dict[str, Any],
+    plan: Any,
+    default_tz: Any,
+    mask_context: Any,
+    output_format: str,
+    use_rg_prefilter: bool,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    now = parse_source_plan_now(source_plan)
+    for index, case in enumerate(cases, 1):
+        if not isinstance(case, dict):
+            continue
+        query_text, query_basis = sanitized_case_query(case)
+        started = time.monotonic()
+        command_status = "not_run"
+        candidate_count = 0
+        searched_files = 0
+        searched_bytes = 0
+        warning_count = 0
+        try:
+            case_intent = infer_query(query_text, now=now, role=None)
+            case_source_plan = dict(source_plan)
+            case_source_plan["query"] = case_intent.to_dict()
+            case_result = search(
+                plan,
+                case_intent,
+                default_tz=default_tz,
+                cwd=source_plan["cwd"],
+                mask_context=mask_context,
+                use_rg_prefilter=use_rg_prefilter,
+            )
+            case_result["warnings"] = sorted(set(case_result.get("warnings", []) + case_intent.warnings))
+            agent_find = build_agent_find_payload(
+                source_plan=case_source_plan,
+                search_result=case_result,
+                manifest_report=None,
+                output_format=output_format,
+                report_output=None,
+            )["agent_find"]
+            command_status = agent_find.get("status", "unknown")
+            candidate_count = int(agent_find.get("token_efficiency", {}).get("candidate_count", 0) or 0)
+            searched_files = int(agent_find.get("token_efficiency", {}).get("searched_files", 0) or 0)
+            searched_bytes = int(agent_find.get("token_efficiency", {}).get("searched_bytes", 0) or 0)
+            warning_count = len(case_result.get("warnings", []))
+        except Exception:
+            command_status = "evaluation_error"
+        elapsed_ms = int(round((time.monotonic() - started) * 1000))
+        correctness_status, evaluability_status = correctness_for_sanitized_case(case)
+        row = {
+            "case_id": case.get("case_id"),
+            "family": case.get("family"),
+            "evidence_type": case.get("evidence_type"),
+            "expected_outcome": case.get("expected_outcome"),
+            "review_status": case.get("review_status"),
+            "query_basis": query_basis,
+            "elapsed_ms": elapsed_ms,
+            "command": "semantic-debug sanitized-manifest-eval",
+            "command_status": command_status,
+            "evaluability_status": evaluability_status,
+            "correctness_status": correctness_status,
+            "candidate_count": candidate_count,
+            "searched_files": searched_files,
+            "searched_bytes": searched_bytes,
+            "warning_count": warning_count,
+        }
+        row_bytes = len(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        row["output_context_bytes"] = row_bytes
+        row["estimated_output_tokens"] = estimate_tokens(row_bytes)
+        row["case_index"] = index
+        rows.append(row)
+    return rows
+
+
+def sanitized_case_query(case: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if isinstance(case.get("ask_pattern_paraphrase"), str) and case["ask_pattern_paraphrase"].strip():
+        return case["ask_pattern_paraphrase"], {
+            "source": "ask_pattern_paraphrase",
+            "sanitized": True,
+            "paraphrase_only": True,
+            "raw_query_wording_used": False,
+        }
+    fallback = " ".join(
+        str(case.get(key) or "")
+        for key in ("family", "evidence_type", "expected_outcome", "timestamp_label", "window_label")
+    ).strip() or "sanitized manifest case"
+    return fallback, {
+        "source": "sanitized_case_labels",
+        "sanitized": True,
+        "paraphrase_only": True,
+        "raw_query_wording_used": False,
+    }
+
+
+def correctness_for_sanitized_case(case: dict[str, Any]) -> tuple[str, str]:
+    refs = list(case.get("must_find_refs") or case.get("expected_refs") or [])
+    if not refs:
+        return "not_evaluable_no_expected_refs", "not_evaluable_no_expected_refs"
+    if any(is_private_sanitized_ref(ref) for ref in refs if isinstance(ref, dict)):
+        return "not_evaluable_without_private_bridge", "expected_refs_are_private_sanitized_refs"
+    return "not_evaluable_sanitized_refs_only", "no_raw_source_refs_available"
+
+
+def is_private_sanitized_ref(ref: dict[str, Any]) -> bool:
+    ref_kind = str(ref.get("ref_kind") or "")
+    return "private" in ref_kind or "sanitized" in ref_kind
+
+
+def parse_source_plan_now(source_plan: dict[str, Any]) -> datetime:
+    value = str(source_plan.get("now") or "")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.now()
+
+
+def median_int(values: list[int]) -> int:
+    return int(round(median(values))) if values else 0
+
+
+def percentile_nearest(values: list[int], percentile: int) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = int(round((percentile / 100) * (len(ordered) - 1)))
+    return ordered[index]
 
 
 def build_routes(
@@ -564,7 +761,7 @@ def build_routes(
     selected = [
         {"primitive": "find", "reason": "candidate recovery, timeline, source scope, no-evidence fields"},
         {"primitive": "structured-tool-events", "reason": "structured action/tool proof"},
-        {"primitive": "sanitized_manifest_family_gate", "reason": "coverage caveat without private bridge"},
+        {"primitive": "sanitized_manifest_family_gate", "reason": "sanitized manifest-case evaluation without private bridge"},
     ]
     if forensics_payload:
         selected.append({"primitive": "forensics", "reason": "commit/path/task/branch/around hint supplied"})
