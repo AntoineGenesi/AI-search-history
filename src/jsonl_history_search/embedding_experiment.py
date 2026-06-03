@@ -76,6 +76,16 @@ class ExperimentDocument:
         )
 
 
+@dataclass(frozen=True)
+class DocumentPlan:
+    content_fingerprint: str
+    document_count: int
+    source_record_count: int
+    root_labels: tuple[str, ...]
+    expected_doc_ids: tuple[str, ...]
+    source_metrics: dict[str, Any]
+
+
 class MemoryProfiler:
     def __init__(self, *, enabled: bool, started: float) -> None:
         self.enabled = enabled
@@ -193,18 +203,45 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
     if not probes:
         return {"embedding_experiment": _finish_without_scan(base_report, "no_queries", ["no_query_cases_selected"], started)}
 
-    profiler.mark("document_load", "start")
-    documents, source_metrics = _load_documents(args=args, plan=plan, default_tz=tz, profiler=profiler)
-    profiler.mark(
-        "document_load",
-        "end",
-        document_count=len(documents),
-        candidate_file_count=int(source_metrics.get("candidate_file_count", 0)),
-        candidate_bytes=int(source_metrics.get("candidate_bytes", 0)),
-        text_bytes_estimate=sum(len(doc.text.encode("utf-8", errors="replace")) for doc in documents),
+    baseline_mode = str(getattr(args, "baseline_mode", "correctness"))
+    streaming_resource_mode = baseline_mode == "skip" and args.experiment_mode != "smoke_synthetic"
+    documents: list[ExperimentDocument] | None = None
+    if streaming_resource_mode:
+        profiler.mark("document_metadata_scan", "start")
+        document_plan = _scan_document_plan(args=args, plan=plan, default_tz=tz, profiler=profiler)
+        source_metrics = document_plan.source_metrics
+        profiler.mark(
+            "document_metadata_scan",
+            "end",
+            document_count=document_plan.document_count,
+            source_record_count=document_plan.source_record_count,
+            candidate_file_count=int(source_metrics.get("candidate_file_count", 0)),
+            candidate_bytes=int(source_metrics.get("candidate_bytes", 0)),
+        )
+    else:
+        profiler.mark("document_load", "start")
+        loaded_documents, source_metrics = _load_documents(args=args, plan=plan, default_tz=tz, profiler=profiler)
+        documents = loaded_documents
+        document_plan = _document_plan_from_documents(documents, source_metrics)
+        profiler.mark(
+            "document_load",
+            "end",
+            document_count=len(documents),
+            candidate_file_count=int(source_metrics.get("candidate_file_count", 0)),
+            candidate_bytes=int(source_metrics.get("candidate_bytes", 0)),
+            text_bytes_estimate=sum(len(doc.text.encode("utf-8", errors="replace")) for doc in documents),
+        )
+    source_metrics = _source_metrics_with_materialization(source_metrics, baseline_mode=baseline_mode, streaming=streaming_resource_mode)
+    document_plan = DocumentPlan(
+        content_fingerprint=document_plan.content_fingerprint,
+        document_count=document_plan.document_count,
+        source_record_count=document_plan.source_record_count,
+        root_labels=document_plan.root_labels,
+        expected_doc_ids=document_plan.expected_doc_ids,
+        source_metrics=source_metrics,
     )
     base_report["source_metrics"] = source_metrics
-    if not documents:
+    if document_plan.document_count <= 0:
         return {
             "embedding_experiment": _finish_without_scan(
                 base_report,
@@ -222,27 +259,40 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
 
     build_started = time.perf_counter()
     tracemalloc.start()
-    profiler.mark("index_build", "start", document_count=len(documents))
+    profiler.mark("index_build", "start", document_count=document_plan.document_count)
+    document_iterable = (
+        _iter_documents(args=args, plan=plan, default_tz=tz, profiler=profiler)
+        if streaming_resource_mode
+        else iter(documents or [])
+    )
     index, index_private_payload = _build_index(
-        documents,
-        backend_state,
+        document_iterable,
+        document_plan=document_plan,
+        backend_state=backend_state,
         output_dir=output_dir,
         args=args,
         profiler=profiler,
     )
     _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
-    profiler.mark("index_build", "end", document_count=len(documents), tracemalloc_peak_bytes=int(peak_bytes))
+    profiler.mark("index_build", "end", document_count=document_plan.document_count, tracemalloc_peak_bytes=int(peak_bytes))
     tracemalloc.stop()
     index_build_ms = _elapsed_ms(build_started)
 
     profiler.mark("query_scan", "start", query_case_count=len(probes))
-    query_rows, query_latencies = _run_queries(probes=probes, documents=documents, index=index, top_k=args.top_k, profiler=profiler)
+    query_rows, query_latencies = _run_queries(
+        probes=probes,
+        documents=documents,
+        index=index,
+        top_k=args.top_k,
+        baseline_mode=baseline_mode,
+        profiler=profiler,
+    )
     profiler.mark("query_scan", "end", query_case_count=len(probes))
     private_artifacts = _write_private_artifacts(
         output_dir=output_dir,
         run_id=run_id,
         index_payload=index_private_payload,
-        documents=documents,
+        document_plan=document_plan,
         args=args,
         profiler=profiler,
     )
@@ -279,6 +329,8 @@ def build_embedding_experiment_payload(args) -> dict[str, Any]:
         "storage_metrics": index_private_payload["storage_metrics"],
         "batching": index_private_payload["batching"],
         "chunking": index_private_payload["chunking"],
+        "baseline_comparison": _baseline_comparison_payload(baseline_mode),
+        "streaming_enumeration": _streaming_enumeration_payload(streaming_resource_mode, source_metrics),
         "private_artifacts": private_artifacts,
         "comparison": {
             "baseline": "current_jsonl_exact_fuzzy_local_semantic",
@@ -398,7 +450,7 @@ def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler
                 candidate_bytes=candidate_bytes + size,
                 document_count=len(documents),
             )
-        warnings = list(enum_warnings)
+        warnings.extend(enum_warnings)
         candidate_file_count += 1
         candidate_bytes += size
         source_kind = source_kind_for_path(path, plan)
@@ -454,6 +506,199 @@ def _load_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler
         "records_cap_hit": records_cap_hit,
         "cap_hit_labels": sorted(set(cap_labels)),
         "warnings": _safe_warnings(warnings),
+    }
+
+
+def _iter_documents(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler | None = None) -> Iterable[ExperimentDocument]:
+    if args.experiment_mode == "smoke_synthetic":
+        payload = load_embedding_fixture(Path(args.fixture).expanduser())
+        for item in list(payload.get("documents", []))[: args.max_records]:
+            yield from _documents_for_text(
+                base_doc_id=str(item["doc_id"]),
+                text=str(item["text"]),
+                timestamp=_parse_fixture_timestamp(item.get("timestamp")),
+                role=str(item.get("role") or "assistant"),
+                cwd=item.get("cwd"),
+                root_label="synthetic_fixture",
+                args=args,
+            )
+        return
+
+    source_record_count = 0
+    started = time.perf_counter()
+    window_start = _parse_window(args.window_start)
+    window_end = _parse_window(args.window_end)
+    for path, _size, _enum_warnings in enumerate_jsonl_files(plan):
+        source_kind = source_kind_for_path(path, plan)
+        root_label = root_label_for_path(path, plan)
+        try:
+            for record in iter_records_for_file(path, source_kind, default_tz):
+                if time.perf_counter() - started > plan.limits.max_elapsed:
+                    return
+                if args.experiment_mode == "date_window_subset" and not _in_window(record.timestamp, window_start, window_end):
+                    continue
+                if not record.text:
+                    continue
+                if source_record_count >= args.max_records:
+                    return
+                source_record_count += 1
+                yield from _documents_for_text(
+                    base_doc_id=f"doc_{source_record_count:06d}",
+                    text=record.text,
+                    timestamp=record.timestamp,
+                    role=record.role,
+                    cwd=record.cwd,
+                    root_label=root_label,
+                    args=args,
+                )
+                if profiler and source_record_count in {1, 10, 50, 100, 250, 500, 1000}:
+                    profiler.mark("streaming_document_enumeration", "record_checkpoint", source_record_count=source_record_count)
+        except AdapterReadError:
+            continue
+
+
+def _scan_document_plan(args, plan: SourcePlan, default_tz, profiler: MemoryProfiler | None = None) -> DocumentPlan:
+    if args.experiment_mode == "smoke_synthetic":
+        documents, source_metrics = _load_documents(args=args, plan=plan, default_tz=default_tz, profiler=profiler)
+        return _document_plan_from_documents(documents, source_metrics)
+
+    digest = hashlib.sha256()
+    expected_doc_ids: list[str] = []
+    root_labels: set[str] = set()
+    warnings = list(plan.warnings)
+    candidate_file_count = 0
+    candidate_bytes = 0
+    skipped_records = 0
+    source_record_count = 0
+    embedding_document_count = 0
+    started = time.perf_counter()
+    window_start = _parse_window(args.window_start)
+    window_end = _parse_window(args.window_end)
+    records_cap_hit = False
+
+    for path, size, enum_warnings in enumerate_jsonl_files(plan):
+        warnings.extend(enum_warnings)
+        candidate_file_count += 1
+        candidate_bytes += size
+        source_kind = source_kind_for_path(path, plan)
+        root_label = root_label_for_path(path, plan)
+        root_labels.add(root_label)
+        try:
+            for record in iter_records_for_file(path, source_kind, default_tz):
+                if time.perf_counter() - started > plan.limits.max_elapsed:
+                    warnings.append("Stopped loading records at max elapsed cap.")
+                    break
+                if args.experiment_mode == "date_window_subset" and not _in_window(record.timestamp, window_start, window_end):
+                    skipped_records += 1
+                    continue
+                if not record.text:
+                    skipped_records += 1
+                    continue
+                if source_record_count >= args.max_records:
+                    records_cap_hit = True
+                    warnings.append("Stopped loading records at max records cap.")
+                    break
+                source_record_count += 1
+                for doc in _documents_for_text(
+                    base_doc_id=f"doc_{source_record_count:06d}",
+                    text=record.text,
+                    timestamp=record.timestamp,
+                    role=record.role,
+                    cwd=record.cwd,
+                    root_label=root_label,
+                    args=args,
+                ):
+                    embedding_document_count += 1
+                    expected_doc_ids.append(doc.doc_id)
+                    _update_content_fingerprint(digest, doc)
+                if profiler and source_record_count in {1, 10, 50, 100, 250, 500, 1000}:
+                    profiler.mark(
+                        "document_metadata_scan",
+                        "record_checkpoint",
+                        source_record_count=source_record_count,
+                        embedding_document_count=embedding_document_count,
+                    )
+        except AdapterReadError as exc:
+            warnings.append(_sanitize_exception(exc))
+        if records_cap_hit:
+            break
+
+    cap_hits = cap_hits_from_warnings(warnings)
+    cap_labels = [key for key, hit in cap_hits.items() if hit]
+    if records_cap_hit:
+        cap_labels.append("max_records")
+    source_metrics = {
+        "status": "capped" if cap_labels else "ok",
+        "data_source": "live_local_roots",
+        "selected_root_count": len(plan.roots),
+        "candidate_file_count": candidate_file_count,
+        "candidate_bytes": candidate_bytes,
+        "record_count": source_record_count,
+        "embedding_document_count": embedding_document_count,
+        "chunk_count": max(0, embedding_document_count - source_record_count),
+        "skipped_records": skipped_records,
+        "records_cap_hit": records_cap_hit,
+        "cap_hit_labels": sorted(set(cap_labels)),
+        "warnings": _safe_warnings(warnings),
+    }
+    return DocumentPlan(
+        content_fingerprint=f"sha256:{digest.hexdigest()}",
+        document_count=embedding_document_count,
+        source_record_count=source_record_count,
+        root_labels=tuple(sorted(root_labels)),
+        expected_doc_ids=tuple(expected_doc_ids),
+        source_metrics=source_metrics,
+    )
+
+
+def _document_plan_from_documents(documents: list[ExperimentDocument], source_metrics: dict[str, Any]) -> DocumentPlan:
+    return DocumentPlan(
+        content_fingerprint=_content_fingerprint(documents),
+        document_count=len(documents),
+        source_record_count=int(source_metrics.get("record_count", len(documents))),
+        root_labels=tuple(sorted({doc.root_label for doc in documents})),
+        expected_doc_ids=tuple(doc.doc_id for doc in documents),
+        source_metrics=dict(source_metrics),
+    )
+
+
+def _source_metrics_with_materialization(source_metrics: dict[str, Any], *, baseline_mode: str, streaming: bool) -> dict[str, Any]:
+    metrics = dict(source_metrics)
+    metrics["document_enumeration_mode"] = "streaming_two_pass_index_build" if streaming else "materialized_document_list"
+    metrics["documents_retained_for_index_build"] = not streaming
+    metrics["baseline_mode"] = baseline_mode
+    metrics["baseline_documents_materialized"] = baseline_mode == "correctness"
+    metrics["correctness_comparison_available"] = baseline_mode == "correctness"
+    return metrics
+
+
+def _baseline_comparison_payload(baseline_mode: str) -> dict[str, Any]:
+    if baseline_mode == "skip":
+        return {
+            "mode": "skip",
+            "status": "skipped_for_resource_measurement",
+            "baseline_documents_materialized": False,
+            "correctness_comparison_available": False,
+            "gate_claim_allowed": False,
+            "reason": "explicit_baseline_mode_skip",
+        }
+    return {
+        "mode": "correctness",
+        "status": "deterministic_baseline_materialized",
+        "baseline_documents_materialized": True,
+        "correctness_comparison_available": True,
+        "gate_claim_allowed": True,
+        "reason": "default_correctness_mode",
+    }
+
+
+def _streaming_enumeration_payload(streaming: bool, source_metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": streaming,
+        "mode": source_metrics.get("document_enumeration_mode"),
+        "documents_retained_for_index_build": source_metrics.get("documents_retained_for_index_build"),
+        "baseline_documents_materialized": source_metrics.get("baseline_documents_materialized"),
+        "scope": "live_selected_roots_only" if streaming else "default_materialized_or_synthetic",
     }
 
 
@@ -670,9 +915,10 @@ def _backend_public(requested: str, selected: str, fastembed_state: dict[str, An
 
 
 def _build_index(
-    documents: list[ExperimentDocument],
-    backend_state: dict[str, Any],
+    documents: Iterable[ExperimentDocument],
     *,
+    document_plan: DocumentPlan,
+    backend_state: dict[str, Any],
     output_dir: Path,
     args,
     profiler: MemoryProfiler | None = None,
@@ -683,19 +929,19 @@ def _build_index(
     config = StoreConfig(
         backend=backend,
         model_id=model_id,
-        content_fingerprint=_content_fingerprint(documents),
-        document_count=len(documents),
+        content_fingerprint=document_plan.content_fingerprint,
+        document_count=document_plan.document_count,
         shard_size=args.shard_size,
         batch_size=args.fastembed_batch_size,
         chunking=_chunking_config(args),
     )
-    expected_doc_ids = [doc.doc_id for doc in documents]
-    profiler.mark("refresh_manifest", "start", document_count=len(documents)) if profiler else None
+    expected_doc_ids = list(document_plan.expected_doc_ids)
+    profiler.mark("refresh_manifest", "start", document_count=document_plan.document_count) if profiler else None
     _previous_manifest, reusable_shards, reusable_count = store.reusable_prefix(config, expected_doc_ids)
     profiler.mark(
         "refresh_manifest",
         "end",
-        document_count=len(documents),
+        document_count=document_plan.document_count,
         reusable_shard_count=len(reusable_shards),
         reusable_record_count=reusable_count,
     ) if profiler else None
@@ -707,7 +953,7 @@ def _build_index(
     raw_vector_bytes = 0
     next_shard_index = len(shards)
     batch_size = args.fastembed_batch_size
-    missing_documents = documents[reusable_count:]
+    missing_documents = _skip_documents(documents, reusable_count)
     for batch_index, batch in enumerate(_document_batches(missing_documents, batch_size), start=1):
         batch_count += 1
         vectors = _embed_document_batch(batch, backend_state, batch_index=batch_index, profiler=profiler)
@@ -738,11 +984,11 @@ def _build_index(
         store.write_manifest(config, shards, complete=False)
         if profiler:
             profiler.mark("vector_shard_write", "shard_written", shard_count=len(shards), record_count=shard["record_count"])
-    store.write_manifest(config, shards, complete=sum(int(shard.get("record_count") or 0) for shard in shards) == len(documents))
+    store.write_manifest(config, shards, complete=sum(int(shard.get("record_count") or 0) for shard in shards) == document_plan.document_count)
     storage_metrics = store.storage_metrics()
     refresh_metrics = _refresh_metrics_from_store(
         reusable_count=reusable_count,
-        document_count=len(documents),
+        document_count=document_plan.document_count,
         previous_manifest_found=_previous_manifest is not None,
     )
     if profiler:
@@ -837,9 +1083,22 @@ def _embed_document_batch(
     return [_dense_deterministic_vector(doc.text) for doc in documents]
 
 
-def _document_batches(documents: list[ExperimentDocument], batch_size: int) -> Iterable[list[ExperimentDocument]]:
-    for start in range(0, len(documents), batch_size):
-        yield documents[start : start + batch_size]
+def _document_batches(documents: Iterable[ExperimentDocument], batch_size: int) -> Iterable[list[ExperimentDocument]]:
+    batch: list[ExperimentDocument] = []
+    for document in documents:
+        batch.append(document)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _skip_documents(documents: Iterable[ExperimentDocument], skip_count: int) -> Iterable[ExperimentDocument]:
+    for index, document in enumerate(documents):
+        if index < skip_count:
+            continue
+        yield document
 
 
 def _dense_deterministic_vector(text: str, dims: int = 64) -> list[float]:
@@ -858,25 +1117,32 @@ def _dense_deterministic_vector(text: str, dims: int = 64) -> list[float]:
 def _run_queries(
     *,
     probes: list[ExperimentProbe],
-    documents: list[ExperimentDocument],
+    documents: list[ExperimentDocument] | None,
     index: dict[str, Any],
     top_k: int,
+    baseline_mode: str,
     profiler: MemoryProfiler | None = None,
 ) -> tuple[list[dict[str, Any]], list[int]]:
     rows: list[dict[str, Any]] = []
     latencies: list[int] = []
-    if profiler:
+    embedding_documents: list[EmbeddingDocument] | None = None
+    if baseline_mode == "correctness" and documents is not None and profiler:
         profiler.mark("query_baseline_materialization", "start", document_count=len(documents))
-    embedding_documents = [doc.as_embedding_document() for doc in documents]
-    if profiler:
+    if baseline_mode == "correctness" and documents is not None:
+        embedding_documents = [doc.as_embedding_document() for doc in documents]
+    if baseline_mode == "correctness" and documents is not None and profiler:
         profiler.mark("query_baseline_materialization", "end", document_count=len(embedding_documents))
     for probe in probes:
         started = time.perf_counter()
         embedding_hits = _rank_embedding(probe.query_text, index, top_k=top_k, profiler=profiler)
         latency_ms = _elapsed_ms(started)
         latencies.append(latency_ms)
-        baseline_hits = rank_current_package_baseline(probe.query_text, embedding_documents)[:top_k]
-        row = _row_for_probe(probe, embedding_hits, baseline_hits, latency_ms)
+        baseline_hits = (
+            rank_current_package_baseline(probe.query_text, embedding_documents)[:top_k]
+            if embedding_documents is not None
+            else None
+        )
+        row = _row_for_probe(probe, embedding_hits, baseline_hits, latency_ms, baseline_mode=baseline_mode)
         rows.append(row)
     return rows, latencies
 
@@ -907,25 +1173,33 @@ def _rank_embedding(query: str, index: dict[str, Any], *, top_k: int, profiler: 
 def _row_for_probe(
     probe: ExperimentProbe,
     embedding_hits: list[RankedHit],
-    baseline_hits: list[RankedHit],
+    baseline_hits: list[RankedHit] | None,
     query_latency_ms: int,
+    *,
+    baseline_mode: str,
 ) -> dict[str, Any]:
     embedding_rank = _gold_rank(embedding_hits, probe.gold_doc_id)
-    baseline_rank = _gold_rank(baseline_hits, probe.gold_doc_id)
+    baseline_rank = _gold_rank(baseline_hits or [], probe.gold_doc_id) if baseline_hits is not None else None
+    baseline_available = baseline_hits is not None
     return {
         "case_id": probe.case_id,
         "case_family": probe.case_family,
         "query_source": probe.query_source,
         "candidate_count": len(embedding_hits),
-        "baseline_candidate_count": len(baseline_hits),
+        "baseline_candidate_count": len(baseline_hits or []),
         "query_latency_ms": query_latency_ms,
         "embedding": _strategy_metrics(embedding_hits, probe.gold_doc_id),
-        "baseline": _strategy_metrics(baseline_hits, probe.gold_doc_id),
-        "first_pass_delta": _first_pass_delta(embedding_rank, baseline_rank),
-        "protected_regression": _protected_regression(probe.case_family, embedding_rank, baseline_rank),
+        "baseline": _strategy_metrics(baseline_hits or [], probe.gold_doc_id) if baseline_available else _skipped_baseline_metrics(),
+        "baseline_comparison": {
+            "mode": baseline_mode,
+            "status": "available" if baseline_available else "skipped_for_resource_measurement",
+            "correctness_comparison_available": baseline_available,
+        },
+        "first_pass_delta": _first_pass_delta(embedding_rank, baseline_rank) if baseline_available else None,
+        "protected_regression": _protected_regression(probe.case_family, embedding_rank, baseline_rank) if baseline_available else None,
         "gold_available": probe.gold_doc_id is not None,
         "top_embedding_doc_labels": [hit.doc_id for hit in embedding_hits[:3]],
-        "top_baseline_doc_labels": [hit.doc_id for hit in baseline_hits[:3]],
+        "top_baseline_doc_labels": [hit.doc_id for hit in (baseline_hits or [])[:3]],
     }
 
 
@@ -940,12 +1214,23 @@ def _strategy_metrics(hits: list[RankedHit], gold_doc_id: str | None) -> dict[st
     }
 
 
+def _skipped_baseline_metrics() -> dict[str, Any]:
+    return {
+        "status": "skipped_for_resource_measurement",
+        "first_pass_hit": None,
+        "gold_rank": None,
+        "recall_at_1": None,
+        "recall_at_3": None,
+        "recall_at_10": None,
+    }
+
+
 def _write_private_artifacts(
     *,
     output_dir: Path,
     run_id: str,
     index_payload: dict[str, Any],
-    documents: list[ExperimentDocument],
+    document_plan: DocumentPlan,
     args,
     profiler: MemoryProfiler | None = None,
 ) -> dict[str, Any]:
@@ -956,13 +1241,14 @@ def _write_private_artifacts(
         "run_id": run_id,
         "experiment_mode": args.experiment_mode,
         "backend": index_payload.get("backend"),
-        "document_count": len(documents),
-        "root_labels": sorted({doc.root_label for doc in documents}),
-        "content_fingerprint": _content_fingerprint(documents),
+        "document_count": document_plan.document_count,
+        "root_labels": list(document_plan.root_labels),
+        "content_fingerprint": document_plan.content_fingerprint,
         "refresh": index_payload["refresh_metrics"]["private"],
         "storage": storage_metrics,
         "batching": index_payload["batching"],
         "chunking": index_payload["chunking"],
+        "baseline_mode": getattr(args, "baseline_mode", "correctness"),
         "raw_text_committed": False,
     }
     if profiler:
@@ -1049,6 +1335,8 @@ def _aggregate_rows(
         "query_metrics": {
             "case_count": len(rows),
             "gold_case_count": len(gold_rows),
+            "baseline_comparison_mode": source_metrics.get("baseline_mode", "correctness"),
+            "baseline_correctness_available": bool(source_metrics.get("correctness_comparison_available", True)),
             "median_query_latency_ms": _median(query_latencies),
             "p90_query_latency_ms": _p90(query_latencies),
             "candidate_count_total": sum(int(row.get("candidate_count", 0)) for row in rows),
@@ -1258,6 +1546,8 @@ def _root_cause_profile(memory_profile: dict[str, Any]) -> dict[str, Any]:
 
 def _embedding_recall_gate(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> dict[str, Any]:
     query_metrics = aggregate["query_metrics"]
+    if not query_metrics.get("baseline_correctness_available", True):
+        return _gate("inconclusive", ["baseline_comparison_skipped_resource_measurement_only"], query_metrics)
     if aggregate.get("caps_hit"):
         return _gate("inconclusive", ["cap_hits_present"], query_metrics)
     if not query_metrics["gold_case_count"]:
@@ -1362,6 +1652,7 @@ def _base_report(args, run_id: str, limits: Limits, started: float) -> dict[str,
             "shard_size": args.shard_size,
             "chunk_size_chars": args.chunk_size_chars,
             "chunk_overlap_chars": args.chunk_overlap_chars,
+            "baseline_mode": getattr(args, "baseline_mode", "correctness"),
         },
         "scope": {
             "selected_roots": [],
@@ -1508,11 +1799,15 @@ def _protected_regression(case_family: str, embedding_rank: int | None, baseline
 def _content_fingerprint(documents: list[ExperimentDocument]) -> str:
     digest = hashlib.sha256()
     for doc in documents:
-        digest.update(doc.doc_id.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(doc.text.encode("utf-8", errors="replace"))
-        digest.update(b"\0")
+        _update_content_fingerprint(digest, doc)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _update_content_fingerprint(digest, doc: ExperimentDocument) -> None:
+    digest.update(doc.doc_id.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(doc.text.encode("utf-8", errors="replace"))
+    digest.update(b"\0")
 
 
 def _run_id(now: datetime) -> str:
