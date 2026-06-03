@@ -46,6 +46,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_timestamp_seek_text(payload)
     if "real_history_embedding_benchmark" in payload:
         return render_real_history_embedding_text(payload)
+    if "real_history_package_search_miss_audit" in payload:
+        return render_real_history_package_miss_audit_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -135,6 +137,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_timestamp_seek_markdown(payload)
     if "real_history_embedding_benchmark" in payload:
         return render_real_history_embedding_markdown(payload)
+    if "real_history_package_search_miss_audit" in payload:
+        return render_real_history_package_miss_audit_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2265,6 +2269,114 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"{row.get('candidate_count')} | "
                 f"{_escape_markdown_table(row_caps)} |"
             )
+    return "\n".join(lines)
+
+
+def render_real_history_package_miss_audit_text(payload: dict) -> str:
+    report = payload["real_history_package_search_miss_audit"]
+    lines = [
+        "Real-history package search miss audit",
+        f"Status: {report.get('status')}",
+        f"Raw run: {report.get('raw_run_label')}",
+        f"Cases: {report.get('case_count', 0)}",
+        f"Baseline: {report.get('audited_baseline')}",
+    ]
+    cap = report.get("cap_impact") or {}
+    for label in ("enumeration_byte_cap", "elapsed_cap", "match_cap", "weak_reservoir_cap"):
+        lines.append(f"{label}: {(cap.get(label) or {}).get('case_count', 0)} cases")
+    not_searched = cap.get("not_searched_scope") or {}
+    if not_searched:
+        lines.append(
+            "Not-searched scope: "
+            + ", ".join(f"{label}={count}" for label, count in sorted(not_searched.items()))
+        )
+    lines.append("Top failure classifications:")
+    for label, count in list((report.get("failure_classification_counts") or {}).items())[:12]:
+        lines.append(f"- {label}: {count}")
+    lines.append("Rows:")
+    for row in report.get("rows", []):
+        lines.append(
+            "- "
+            f"{row.get('case_id')}: "
+            f"{', '.join(row.get('failure_classifications') or [])}"
+        )
+    return "\n".join(lines)
+
+
+def render_real_history_package_miss_audit_markdown(payload: dict) -> str:
+    report = payload["real_history_package_search_miss_audit"]
+    lines = [
+        "# JSH-058A Real-History Package Search Miss Audit",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Raw run label:** `{report.get('raw_run_label')}`",
+        f"**Raw run id:** `{report.get('raw_run_id')}`",
+        f"**Cases:** `{report.get('case_count', 0)}` of `{report.get('manifest_case_count', 0)}` manifest cases",
+        f"**Audited baseline:** `{report.get('audited_baseline')}`",
+        "",
+        "## Evidence Limits",
+        "",
+    ]
+    for key, value in (report.get("evidence_limits") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Privacy Contract", ""])
+    for key, value in (report.get("privacy_contract") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    cap = report.get("cap_impact") or {}
+    lines.extend(
+        [
+            "",
+            "## Cap Impact",
+            "",
+            "| Cap / scope | Case count |",
+            "| --- | ---: |",
+        ]
+    )
+    for label in ("enumeration_byte_cap", "elapsed_cap", "match_cap", "weak_reservoir_cap"):
+        lines.append(f"| `{label}` | {(cap.get(label) or {}).get('case_count', 0)} |")
+    for label, count in sorted((cap.get("not_searched_scope") or {}).items()):
+        lines.append(f"| `not_searched_scope:{_escape_markdown_table(str(label))}` | {count} |")
+    query = report.get("query_basis_summary") or {}
+    lines.extend(["", "## Query Basis", ""])
+    lines.append(f"- Max private query chars: `{query.get('max_private_query_char_count', 0)}`")
+    lines.append(f"- Max base terms: `{query.get('max_base_term_count', 0)}`")
+    lines.append(f"- Max expanded terms: `{query.get('max_expanded_term_count', 0)}`")
+    if query.get("pathology_counts"):
+        lines.extend(["", "| Query pathology | Cases |", "| --- | ---: |"])
+        for label, count in sorted(query.get("pathology_counts", {}).items()):
+            lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    lines.extend(["", "## Failure Counts", "", "| Classification | Cases |", "| --- | ---: |"])
+    for label, count in (report.get("failure_classification_counts") or {}).items():
+        lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    lines.extend(
+        [
+            "",
+            "## Case Ledger",
+            "",
+            "| Case | Family | Candidates | Scope | Should consider | Rank if reached | Caps | Query pathologies | Failure classifications |",
+            "| --- | --- | ---: | --- | --- | ---: | --- | --- | --- |",
+        ]
+    )
+    for row in report.get("rows", []):
+        scope = (row.get("scope_probe") or {}).get("not_searched_scope")
+        should = (row.get("should_consider_probe") or {}).get("would_pass_should_consider")
+        rank = (row.get("ranking_probe") or {}).get("rank_against_returned_candidates")
+        caps = ", ".join((row.get("cap_probe") or {}).get("cap_hit_labels") or [])
+        query_pathologies = ", ".join((row.get("query_basis") or {}).get("pathologies") or [])
+        classifications = ", ".join(row.get("failure_classifications") or [])
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+            f"{_escape_markdown_table(str(row.get('family', '')))} | "
+            f"{row.get('package_candidate_count', 0)} | "
+            f"`{_escape_markdown_table(str(scope))}` | "
+            f"`{should}` | "
+            f"{rank if rank is not None else ''} | "
+            f"{_escape_markdown_table(caps)} | "
+            f"{_escape_markdown_table(query_pathologies)} | "
+            f"{_escape_markdown_table(classifications)} |"
+        )
     return "\n".join(lines)
 
 
