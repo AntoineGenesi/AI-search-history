@@ -42,6 +42,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_impact_text(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
         return render_real_history_timestamp_seek_text(payload)
+    if "real_history_embedding_benchmark" in payload:
+        return render_real_history_embedding_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -127,6 +129,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_impact_markdown(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
         return render_real_history_timestamp_seek_markdown(payload)
+    if "real_history_embedding_benchmark" in payload:
+        return render_real_history_embedding_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2243,6 +2247,129 @@ def render_real_history_timestamp_seek_text(payload: dict) -> str:
             f"context_tokens={row.get('median_output_context_tokens_approx')} "
             f"expected_ref_order={row.get('expected_ref_order_status')}"
         )
+    return "\n".join(lines)
+
+
+def render_real_history_embedding_text(payload: dict) -> str:
+    report = payload["real_history_embedding_benchmark"]
+    gate = report.get("embedding_recall_gate") or {}
+    query_metrics = report.get("query_metrics") or {}
+    index_metrics = report.get("index_metrics") or {}
+    case_selection = report.get("case_selection") or {}
+    baseline = report.get("baseline_comparison") or {}
+    lines = [
+        "Real-history embedding benchmark",
+        f"Status: {report.get('status')}",
+        f"Data source: {report.get('data_source')}",
+        f"Run: {report.get('run_id', '(none)')}",
+        f"Cases: {case_selection.get('selected_case_count', 0)}",
+        f"Expected embedding cases: {case_selection.get('expected_embedding_recall_case_count', 0)}",
+        f"Backend: {(report.get('backend') or {}).get('selected')}",
+        (
+            "Index: "
+            f"documents={index_metrics.get('document_count', 0)} "
+            f"build_ms={index_metrics.get('index_build_time_ms', 0)} "
+            f"disk_bytes={index_metrics.get('disk_index_size_bytes', 0)}"
+        ),
+        (
+            "Queries: "
+            f"gold_cases={query_metrics.get('gold_case_count', 0)} "
+            f"embedding_first_pass={query_metrics.get('embedding_first_pass_hits', 0)} "
+            f"baseline_first_pass={query_metrics.get('baseline_first_pass_hits', 0)} "
+            f"embedding_recall_at_3={query_metrics.get('embedding_mean_recall_at_3')} "
+            f"baseline_recall_at_3={query_metrics.get('baseline_mean_recall_at_3')}"
+        ),
+        (
+            "Baseline comparison: "
+            f"mode={baseline.get('mode')} "
+            f"status={baseline.get('status')} "
+            f"correctness_available={baseline.get('correctness_comparison_available')}"
+        ),
+        f"embedding_recall_gate: status={gate.get('status')} reasons={', '.join(gate.get('reasons') or []) or '(none)'}",
+    ]
+    lines.extend(_performance_metric_text_lines(report))
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_real_history_embedding_markdown(payload: dict) -> str:
+    report = payload["real_history_embedding_benchmark"]
+    gate = report.get("embedding_recall_gate") or {}
+    query_metrics = report.get("query_metrics") or {}
+    index_metrics = report.get("index_metrics") or {}
+    case_selection = report.get("case_selection") or {}
+    baseline = report.get("baseline_comparison") or {}
+    storage = report.get("storage_metrics") or {}
+    lines = [
+        "# Real-History Embedding Benchmark",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Run:** `{report.get('run_id', '(none)')}`",
+        f"**Selected cases:** `{case_selection.get('selected_case_count', 0)}`",
+        f"**Expected embedding cases:** `{case_selection.get('expected_embedding_recall_case_count', 0)}`",
+        f"**Caveat:** {case_selection.get('below_floor_case_count_caveat')}",
+        f"**Backend:** `{(report.get('backend') or {}).get('selected')}`",
+        "",
+        "## Metrics",
+        "",
+        f"- Documents indexed: {index_metrics.get('document_count', 0)}",
+        f"- Index build ms: {index_metrics.get('index_build_time_ms', 0)}",
+        f"- Disk index bytes: {index_metrics.get('disk_index_size_bytes', 0)}",
+        f"- Vector bytes: {storage.get('vector_bytes', 0)}",
+        f"- Query cases: {query_metrics.get('case_count', 0)}",
+        f"- Gold cases: {query_metrics.get('gold_case_count', 0)}",
+        f"- Embedding first-pass hits: {query_metrics.get('embedding_first_pass_hits', 0)}",
+        f"- Baseline first-pass hits: {query_metrics.get('baseline_first_pass_hits', 0)}",
+        f"- Embedding recall@3: {query_metrics.get('embedding_mean_recall_at_3')}",
+        f"- Baseline recall@3: {query_metrics.get('baseline_mean_recall_at_3')}",
+        f"- Protected regressions: {query_metrics.get('protected_regressions', 0)}",
+        f"- Baseline comparison mode: `{baseline.get('mode')}`",
+        f"- Baseline comparison status: `{baseline.get('status')}`",
+        f"- Correctness comparison available: `{baseline.get('correctness_comparison_available')}`",
+    ]
+    lines.extend(_performance_metric_markdown_lines(report))
+    lines.extend(
+        [
+            "",
+            "## Gate Status",
+            "",
+            "| Gate | Status | Reasons |",
+            "| --- | --- | --- |",
+            (
+                "| `embedding_recall_gate` | "
+                f"`{gate.get('status')}` | "
+                f"{_escape_markdown_table(', '.join(gate.get('reasons') or [])) or '(none)'} |"
+            ),
+        ]
+    )
+    families = case_selection.get("families") or {}
+    if families:
+        lines.extend(["", "## Case Families", ""])
+        for family, count in families.items():
+            lines.append(f"- `{family}`: `{count}`")
+    rows = report.get("rows") or []
+    if rows:
+        lines.extend(
+            [
+                "",
+                "## Rows",
+                "",
+                "| Case | Family | Embedding first pass | Baseline first pass | Candidates | Baseline candidates |",
+                "| --- | --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in rows:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                f"{_escape_markdown_table(str(row.get('case_family', '')))} | "
+                f"{row.get('embedding', {}).get('first_pass_hit')} | "
+                f"{row.get('baseline', {}).get('first_pass_hit')} | "
+                f"{row.get('candidate_count')} | "
+                f"{row.get('baseline_candidate_count')} |"
+            )
     return "\n".join(lines)
 
 

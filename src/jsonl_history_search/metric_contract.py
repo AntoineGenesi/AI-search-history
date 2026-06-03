@@ -368,6 +368,17 @@ def embedding_experiment_metrics(report: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def real_history_embedding_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    metrics = embedding_experiment_metrics(report)
+    metrics["workload"] = "benchmark_real_history_embedding"
+    metrics["tradeoffs"] = [
+        "This harness evaluates reviewed real-history bridge refs but does not include the separate resource scale run required for promotion.",
+        "Committed output uses sanitized case/ref labels only; raw query text, paths, snippets, vectors, and bridge details remain private.",
+        "Embedding promotion requires combining correctness evidence with separate resource evidence and protected-regression coverage.",
+    ]
+    return metrics
+
+
 def _with_byte_token_estimates(values: dict[str, Any], byte_keys: tuple[str, ...]) -> dict[str, Any]:
     output = dict(values)
     token_estimates: dict[str, int] = {}
