@@ -18,6 +18,7 @@ from .manifest import build_manifest_report
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
 from .output import render
+from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .query import infer_query
 from .redaction import RedactionContext
@@ -449,6 +450,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized live-terminal protocol report should be written.",
+    )
+    paired_protocol = subparsers.add_parser("benchmark-paired-agent-protocol")
+    paired_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    paired_protocol.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized paired-agent benchmark protocol report should be written.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1047,6 +1055,15 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         if args.report_output:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+    if args.command == "benchmark-paired-agent-protocol":
+        payload = build_paired_agent_benchmark_protocol_payload()
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0
     if args.command == "embedding-experiment":
