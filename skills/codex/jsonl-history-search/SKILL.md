@@ -75,7 +75,25 @@ Accepted handles:
 - error message;
 - approximate time.
 
-Route to existing evidence commands instead of inventing a new `semantic-debugger` command:
+Prefer the router command first when a compact agent-parseable packet is useful:
+
+```bash
+jsonl-history-search semantic-debug "why did this happen?" --cwd "$PWD" --format json
+```
+
+Add handles when available:
+
+```bash
+jsonl-history-search semantic-debug "did the agent actually do the claimed work?" \
+  --task <task-slug> \
+  --path <path> \
+  --commit <commit> \
+  --around "<timestamp>" \
+  --cwd "$PWD" \
+  --format json
+```
+
+The router composes existing evidence commands:
 
 - fuzzy symptom or remembered wording -> `jsonl-history-search find`;
 - commit/path/task/review provenance -> `jsonl-history-search forensics`;
@@ -84,8 +102,10 @@ Route to existing evidence commands instead of inventing a new `semantic-debugge
 - skill behavior -> `jsonl-history-search skill-audit`;
 - repeated automation opportunity -> `jsonl-history-search workflow-repeat-finder`.
 
-Build a packet with `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`. The required timeline phases are user request, agent plan, code change, review outcome, later symptom, and likely wrong assumption.
+Read `semantic_debug` fields first: `question_family`, `scope`, `routes`, `strongest_candidates`, `timeline`, `tool_action_proof`, `task_review_commit_joins`, `candidate_causes`, `no_evidence`, `uncertainty`, `next_reads`, `token_byte_tradeoffs`, and `claim_boundaries`. The legacy interpretation packet fields are `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`.
 
-Keep evidence separate from inference. Never claim root cause unless linked evidence supports it; otherwise say `likely contributing assumption` or `candidate cause`. Treat `jsh-009`, `jsh-010`, and `jsh-011` as the lineage, skill-audit, and workflow-repeat benchmark owners rather than reimplementing those cases inside this workflow.
+Keep evidence separate from inference. Never claim root cause unless linked evidence supports it; otherwise say `likely contributing assumption` or `candidate cause`. Treat no-evidence as `not_found_in_searched_scope`, not all-history absence. Treat `jsh-009`, `jsh-010`, and `jsh-011` as the lineage, skill-audit, and workflow-repeat benchmark owners rather than reimplementing those cases inside this workflow.
+
+Do not run embeddings, timestamp sidecars, native scanner backends, private benchmark bridges, broad drive scans, or Semantic Linter runtime hooks as part of the default semantic-debug workflow.
 
 When the output is substantial, use the `html-report` skill and build a direct-open HTML report with summary-first evidence cards, filters, timelines, and source links.

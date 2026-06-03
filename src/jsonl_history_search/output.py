@@ -32,6 +32,8 @@ def render_text(payload: dict) -> str:
         return render_structured_tool_events_text(payload)
     if "workflow_repeat_finder" in payload:
         return render_workflow_repeat_text(payload)
+    if "semantic_debug" in payload:
+        return render_semantic_debug_text(payload)
     if "private_benchmark_mine" in payload:
         return render_private_benchmark_mine_text(payload)
     if "measured_benchmark" in payload:
@@ -119,6 +121,8 @@ def render_markdown(payload: dict) -> str:
         return render_structured_tool_events_markdown(payload)
     if "workflow_repeat_finder" in payload:
         return render_workflow_repeat_markdown(payload)
+    if "semantic_debug" in payload:
+        return render_semantic_debug_markdown(payload)
     if "private_benchmark_mine" in payload:
         return render_private_benchmark_mine_markdown(payload)
     if "measured_benchmark" in payload:
@@ -159,6 +163,63 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_semantic_debug_text(payload: dict) -> str:
+    report = payload["semantic_debug"]
+    family = report.get("question_family", {})
+    tradeoffs = report.get("token_byte_tradeoffs", {})
+    lines = [
+        "Semantic Debug",
+        f"Status: {report.get('status')}",
+        f"Query: {report.get('query')}",
+        f"Primary family: {family.get('primary')}",
+        f"Candidates: {len(report.get('strongest_candidates', []))}",
+        f"Structured events: {report.get('tool_action_proof', {}).get('event_count', 0)}",
+        f"Packet bytes/tokens: {tradeoffs.get('packet_basis_bytes', 0)} / {tradeoffs.get('packet_basis_estimated_tokens', 0)}",
+        "Root cause: not claimed",
+    ]
+    if report.get("report_written"):
+        lines.append(f"Report written: {report.get('report_written')}")
+    if report.get("next_reads"):
+        lines.append("Next reads:")
+        for item in report.get("next_reads", [])[:8]:
+            lines.append(f"- {item.get('kind')}: {item.get('target')} ({item.get('reason')})")
+    for item in report.get("uncertainty", [])[:8]:
+        lines.append(f"Uncertainty: {item.get('label')} - {item.get('meaning')}")
+    return "\n".join(lines)
+
+
+def render_semantic_debug_markdown(payload: dict) -> str:
+    report = payload["semantic_debug"]
+    family = report.get("question_family", {})
+    tradeoffs = report.get("token_byte_tradeoffs", {})
+    lines = [
+        "# Semantic Debug",
+        "",
+        f"**Status:** {report.get('status')}",
+        f"**Query:** {report.get('query')}",
+        f"**Primary family:** `{family.get('primary')}`",
+        f"**Root cause:** not claimed",
+        f"**Packet bytes/tokens:** {tradeoffs.get('packet_basis_bytes', 0)} / {tradeoffs.get('packet_basis_estimated_tokens', 0)}",
+        "",
+        "## Strongest Candidates",
+    ]
+    for item in report.get("strongest_candidates", [])[:8]:
+        ref = item.get("source_ref") or {}
+        lines.append(
+            f"- `{item.get('candidate_id')}` {ref.get('path')}:{ref.get('line')} "
+            f"confidence={item.get('confidence')} stages={','.join(item.get('stages', []))}"
+        )
+    lines.append("")
+    lines.append("## Next Reads")
+    for item in report.get("next_reads", [])[:8]:
+        lines.append(f"- `{item.get('kind')}` {item.get('target')} - {item.get('reason')}")
+    lines.append("")
+    lines.append("## Uncertainty")
+    for item in report.get("uncertainty", [])[:8]:
+        lines.append(f"- `{item.get('label')}` {item.get('meaning')}")
+    return "\n".join(lines)
 
 
 def render_jsonl_candidate_discovery_text(payload: dict) -> str:
