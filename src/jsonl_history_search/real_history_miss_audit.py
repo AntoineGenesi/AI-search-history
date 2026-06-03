@@ -17,6 +17,16 @@ DEFAULT_MANIFEST = Path("benchmarks/real_history_gold/sanitized_cases.json")
 DEFAULT_PRIVATE_BRIDGE = Path(".private/jsh-049/bridge.json")
 DEFAULT_RAW_RUN = Path(".private/jsh-049/raw-runs/f1e55694c6cb.json")
 REPORT_KEY = "real_history_package_search_miss_audit"
+PROVENANCE_HANDLE_TERMS = {
+    "artifact",
+    "commit",
+    "handoff",
+    "provenance",
+    "report",
+    "review",
+    "reviewed",
+    "task",
+}
 
 
 @dataclass(frozen=True)
@@ -347,6 +357,7 @@ def _query_basis(intent: QueryIntent, query: str, *, case: AuditCase) -> dict[st
     task_slug_terms = [term for term, reasons in intent.expansion_reasons.items() if "task_slug" in reasons]
     synonym_terms = [term for term, reasons in intent.expansion_reasons.items() if "synonym_paraphrase" in reasons]
     semantic_terms = [term for term, reasons in intent.expansion_reasons.items() if "semantic_local" in reasons]
+    provenance_terms = [term for term in intent.terms if term in PROVENANCE_HANDLE_TERMS]
     pathologies = []
     if len(query) > 1000:
         pathologies.append("very_long_private_query_wording")
@@ -360,7 +371,7 @@ def _query_basis(intent: QueryIntent, query: str, *, case: AuditCase) -> dict[st
         pathologies.append("generic_or_semantic_expansion_noise")
     if "date_timeline" in case.family and intent.date_reason is None:
         pathologies.append("missing_date_window_handle_for_date_timeline_case")
-    if _expects_task_or_artifact_handle(case) and not intent.artifact_hints and not task_slug_terms:
+    if _expects_task_or_artifact_handle(case) and not intent.artifact_hints and not task_slug_terms and not provenance_terms:
         pathologies.append("missing_artifact_task_or_date_handle")
     return {
         "private_query_char_count": len(query),
@@ -372,9 +383,12 @@ def _query_basis(intent: QueryIntent, query: str, *, case: AuditCase) -> dict[st
         "longest_exact_phrase_chars": max((len(term) for term in exact_terms), default=0),
         "artifact_hint_count": len(intent.artifact_hints),
         "task_slug_term_count": len(task_slug_terms),
+        "provenance_term_count": len(provenance_terms),
         "synonym_or_semantic_term_count": len(synonym_terms) + len(semantic_terms),
         "inferred_role": intent.role,
+        "role_filter_explicit": intent.role_filter_explicit,
         "inferred_date_window": intent.date_reason,
+        "date_window_filter": intent.date_window_filter,
         "pathologies": sorted(set(pathologies)),
     }
 
@@ -585,9 +599,9 @@ def _rank_against_returned_candidates(
 
 
 def _should_consider_rejection_basis(record: Record, intent: QueryIntent) -> str:
-    if intent.role and not _role_matches_for_audit(record.role, intent.role):
+    if intent.role and intent.role_filter_explicit and not _role_matches_for_audit(record.role, intent.role):
         return "role_filter_rejected_expected_record"
-    if intent.date_window_start and intent.date_window_end:
+    if intent.date_window_filter and intent.date_window_start and intent.date_window_end:
         if record.timestamp is None:
             return "date_window_rejected_missing_timestamp"
         local_ts = record.timestamp.astimezone(intent.date_window_start.tzinfo)
