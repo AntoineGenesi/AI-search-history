@@ -372,6 +372,15 @@ def build_parser() -> argparse.ArgumentParser:
     embedding_experiment.add_argument("--window-end", default=None)
     embedding_experiment.add_argument("--max-records", type=int, default=200)
     embedding_experiment.add_argument(
+        "--baseline-mode",
+        choices=("correctness", "skip"),
+        default="correctness",
+        help=(
+            "Whether to materialize deterministic baseline documents for correctness comparison. "
+            "Use skip only for explicit resource/scale measurements."
+        ),
+    )
+    embedding_experiment.add_argument(
         "--shard-size",
         type=int,
         default=1000,

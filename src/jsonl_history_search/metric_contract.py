@@ -353,6 +353,8 @@ def embedding_experiment_metrics(report: dict[str, Any]) -> dict[str, Any]:
         correctness={
             "embedding_recall_gate_status": (report.get("embedding_recall_gate") or {}).get("status"),
             "gold_case_count": query_metrics.get("gold_case_count", 0),
+            "baseline_comparison": report.get("baseline_comparison"),
+            "streaming_enumeration": report.get("streaming_enumeration"),
             "embedding_first_pass_hits": query_metrics.get("embedding_first_pass_hits", 0),
             "baseline_first_pass_hits": query_metrics.get("baseline_first_pass_hits", 0),
             "protected_regressions": query_metrics.get("protected_regressions", 0),

@@ -1582,6 +1582,8 @@ def render_embedding_experiment_text(payload: dict) -> str:
     gate = report.get("embedding_recall_gate", {})
     storage = report.get("storage_metrics") or {}
     batching = report.get("batching") or {}
+    baseline_comparison = report.get("baseline_comparison") or {}
+    streaming = report.get("streaming_enumeration") or {}
     lines = [
         "Embedding experiment",
         f"Status: {report.get('status')}",
@@ -1619,6 +1621,18 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"documents_embedded={batching.get('documents_embedded', 0)} "
             f"documents_reused={batching.get('documents_reused', 0)}"
         ),
+        (
+            "Baseline comparison: "
+            f"mode={baseline_comparison.get('mode')} "
+            f"status={baseline_comparison.get('status')} "
+            f"correctness_available={baseline_comparison.get('correctness_comparison_available')}"
+        ),
+        (
+            "Streaming enumeration: "
+            f"enabled={streaming.get('enabled')} "
+            f"mode={streaming.get('mode')} "
+            f"documents_retained_for_index_build={streaming.get('documents_retained_for_index_build')}"
+        ),
     ]
     lines.extend(_performance_metric_text_lines(report))
     if aggregate.get("cap_hit_labels"):
@@ -1647,7 +1661,8 @@ def render_embedding_experiment_text(payload: dict) -> str:
             f"embedding_candidates={row.get('candidate_count')} "
             f"baseline_candidates={row.get('baseline_candidate_count')} "
             f"latency_ms={row.get('query_latency_ms')} "
-            f"protected_regression={row.get('protected_regression')}"
+            f"protected_regression={row.get('protected_regression')} "
+            f"baseline_status={(row.get('baseline_comparison') or {}).get('status')}"
         )
     return "\n".join(lines)
 
@@ -1662,6 +1677,8 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
     storage = report.get("storage_metrics") or {}
     batching = report.get("batching") or {}
     chunking = report.get("chunking") or {}
+    baseline_comparison = report.get("baseline_comparison") or {}
+    streaming = report.get("streaming_enumeration") or {}
     lines = [
         "# Embedding Experiment",
         "",
@@ -1693,6 +1710,12 @@ def render_embedding_experiment_markdown(payload: dict) -> str:
         f"- Embedding candidate count: {query_metrics.get('candidate_count_total', 0)}",
         f"- Baseline candidate count: {query_metrics.get('baseline_candidate_count_total', 0)}",
         f"- Protected regressions: {query_metrics.get('protected_regressions', 0)}",
+        f"- Baseline comparison mode: `{baseline_comparison.get('mode')}`",
+        f"- Baseline comparison status: `{baseline_comparison.get('status')}`",
+        f"- Correctness comparison available: `{baseline_comparison.get('correctness_comparison_available')}`",
+        f"- Streaming enumeration enabled: `{streaming.get('enabled')}`",
+        f"- Streaming enumeration mode: `{streaming.get('mode')}`",
+        f"- Documents retained for index build: `{streaming.get('documents_retained_for_index_build')}`",
     ]
     lines.extend(_performance_metric_markdown_lines(report))
     lines.extend(
