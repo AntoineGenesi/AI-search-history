@@ -48,6 +48,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_embedding_text(payload)
     if "real_history_package_search_miss_audit" in payload:
         return render_real_history_package_miss_audit_text(payload)
+    if "paired_agent_benchmark_protocol" in payload:
+        return render_paired_agent_benchmark_protocol_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -139,6 +141,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_embedding_markdown(payload)
     if "real_history_package_search_miss_audit" in payload:
         return render_real_history_package_miss_audit_markdown(payload)
+    if "paired_agent_benchmark_protocol" in payload:
+        return render_paired_agent_benchmark_protocol_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2732,6 +2736,35 @@ def render_live_terminal_protocol_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_paired_agent_benchmark_protocol_text(payload: dict) -> str:
+    protocol = payload["paired_agent_benchmark_protocol"]
+    identity = protocol.get("protocol_identity", {})
+    complement = protocol.get("complements_live_terminal_protocol", {})
+    trace = protocol.get("trace_contract", {})
+    lines = [
+        "Paired agent benchmark protocol",
+        f"Status: {protocol.get('status')}",
+        f"Command inert: {protocol.get('command_inert')}",
+        f"Dry validation only: {protocol.get('dry_validation_only')}",
+        f"Live paired benchmark run performed: {protocol.get('live_paired_benchmark_run_performed')}",
+        f"Live agents spawned: {protocol.get('live_agents_spawned')}",
+        f"Command: {identity.get('command')}",
+        f"Pilot task: {identity.get('pilot_task')}",
+        f"Case manifest dependency: {identity.get('case_manifest_dependency')}",
+        f"Complements: {complement.get('related_command')} ({complement.get('related_command_role')})",
+        f"Private trace root: {trace.get('private_root')}",
+        "Default/manual prompt template:",
+    ]
+    manual = ((protocol.get("prompt_views") or {}).get("default_manual") or {}).get("prompt_template") or []
+    for item in manual:
+        lines.append(f"- {item}")
+    lines.append("Required side metrics:")
+    for key in ((protocol.get("result_schema") or {}).get("required_side_metrics") or []):
+        lines.append(f"- {key}")
+    lines.append("Missing counter rule: unavailable, never zero")
+    return "\n".join(lines)
+
+
 def render_live_terminal_protocol_markdown(payload: dict) -> str:
     protocol = payload["live_terminal_protocol"]
     decision = protocol.get("decision", {})
@@ -2838,6 +2871,222 @@ def render_live_terminal_protocol_markdown(payload: dict) -> str:
     )
     for key, value in counters.items():
         lines.append(f"| `{_escape_markdown_table(str(key))}` | `{value}` |")
+    return "\n".join(lines)
+
+
+def render_paired_agent_benchmark_protocol_markdown(payload: dict) -> str:
+    protocol = payload["paired_agent_benchmark_protocol"]
+    identity = protocol.get("protocol_identity", {})
+    complement = protocol.get("complements_live_terminal_protocol", {})
+    run_contract = protocol.get("run_contract", {})
+    metric_contract = protocol.get("metric_contract", {})
+    trace = protocol.get("trace_contract", {})
+    output_contract = protocol.get("committed_output_contract", {})
+    reviewer = protocol.get("reviewer_proof_contract", {})
+    template = protocol.get("sanitized_aggregate_template", {})
+    aggregate_by_side = template.get("aggregate_by_side", {})
+    aggregate_comparison = template.get("aggregate_comparison", {})
+    review_template = template.get("review", {})
+    lines = [
+        "# JSH-059b1 Paired Agent Benchmark Protocol And Dry Harness",
+        "",
+        f"**Status:** `{protocol.get('status')}`",
+        f"**Command inert:** `{protocol.get('command_inert')}`",
+        f"**Dry validation only:** `{protocol.get('dry_validation_only')}`",
+        f"**Live paired benchmark run performed:** `{protocol.get('live_paired_benchmark_run_performed')}`",
+        f"**Live agents spawned:** `{protocol.get('live_agents_spawned')}`",
+        f"**Pilot task remains separate:** `{identity.get('pilot_task')}`",
+        f"**Reviewed case manifest dependency:** `{identity.get('case_manifest_dependency')}`",
+        "",
+        "## Scope Boundary",
+        "",
+        f"- This command: `{identity.get('command')}`",
+        f"- Purpose: `{identity.get('purpose')}`",
+        f"- `benchmark-live-terminal-protocol` remains: `{complement.get('related_command_role')}`",
+        f"- This surface adds: `{complement.get('this_command_role')}`",
+        f"- Related command remains inert: `{complement.get('related_command_remains_inert')}`",
+        f"- This command runs the paired pilot by default: `{complement.get('this_command_runs_pilot_by_default')}`",
+        f"- Difference summary: {complement.get('difference_summary')}",
+        "",
+        "## Run Contract",
+        "",
+        f"- Sanitized case IDs required: `{run_contract.get('case_ids_must_be_sanitized')}`",
+        f"- Reviewer-approved case IDs required before commit: `{run_contract.get('reviewer_approved_case_ids_required_before_commit')}`",
+        f"- Run ID format: `{run_contract.get('run_id_format')}`",
+        f"- Default condition: `{run_contract.get('default_condition')}`",
+        f"- Alternate conditions must be labeled: `{run_contract.get('alternate_conditions_must_be_labeled')}`",
+        "",
+        "Dry validation mode:",
+        "",
+        f"- Enabled by default: `{((run_contract.get('dry_validation_mode') or {}).get('enabled_by_default'))}`",
+        f"- Writes private traces: `{((run_contract.get('dry_validation_mode') or {}).get('writes_private_traces'))}`",
+        f"- Writes committed aggregates only when requested: `{((run_contract.get('dry_validation_mode') or {}).get('writes_committed_aggregates_only_when_requested'))}`",
+    ]
+    for item in ((run_contract.get("dry_validation_mode") or {}).get("validates") or []):
+        lines.append(f"- Validates: `{item}`")
+    lines.extend(["", "Cleanup rules:"])
+    for item in run_contract.get("cleanup_rules", []):
+        lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
+            "## Prompt Views",
+            "",
+            "### Shared Case Packet",
+            "",
+            "Allowed sections:",
+        ]
+    )
+    shared_case = (protocol.get("prompt_views") or {}).get("shared_case_packet") or {}
+    lines.extend(f"- `{item}`" for item in shared_case.get("allowed_sections", []))
+    lines.extend(["", "Case packet template:"])
+    lines.extend(f"- {item}" for item in shared_case.get("case_packet_template", []))
+
+    manual = (protocol.get("prompt_views") or {}).get("default_manual") or {}
+    lines.extend(["", "### Default/Manual Side", "", "Allowed sections:"])
+    lines.extend(f"- `{item}`" for item in manual.get("allowed_sections", []))
+    lines.extend(["", "Allowed tools:", "", "| Tool | Purpose |", "| --- | --- |"])
+    for item in manual.get("allowed_tools", []):
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(item.get('tool')))}` | "
+            f"{_escape_markdown_table(str(item.get('purpose')))} |"
+        )
+    lines.extend(["", "Prompt template:"])
+    lines.extend(f"- {item}" for item in manual.get("prompt_template", []))
+    lines.extend(["", "Forbidden benchmark material:"])
+    lines.extend(f"- `{item}`" for item in manual.get("forbidden_material", []))
+
+    assisted = (protocol.get("prompt_views") or {}).get("jsonl_assisted") or {}
+    lines.extend(["", "### JSONL-Assisted Side", "", "Allowed sections:"])
+    lines.extend(f"- `{item}`" for item in assisted.get("allowed_sections", []))
+    lines.extend(["", "Allowed tools:", "", "| Tool | Purpose |", "| --- | --- |"])
+    for item in assisted.get("allowed_tools", []):
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(item.get('tool')))}` | "
+            f"{_escape_markdown_table(str(item.get('purpose')))} |"
+        )
+    lines.extend(["", "Prompt template:"])
+    lines.extend(f"- {item}" for item in assisted.get("prompt_template", []))
+
+    lines.extend(["", "## Caps", "", "| Cap | Value |", "| --- | ---: |"])
+    for key, value in sorted((protocol.get("caps") or {}).items()):
+        lines.append(f"| `{_escape_markdown_table(str(key))}` | {value} |")
+
+    lines.extend(
+        [
+            "",
+            "## Trace Contract",
+            "",
+            f"- Private root: `{trace.get('private_root')}`",
+            f"- Git ignored: `{trace.get('git_ignored')}`",
+            f"- Per-run directory pattern: `{trace.get('per_run_directory_pattern')}`",
+            f"- Committed raw trace allowed: `{trace.get('committed_raw_trace_allowed')}`",
+            f"- Committed trace summary allowed: `{trace.get('committed_trace_summary_allowed')}`",
+            "",
+            "Trace files:",
+        ]
+    )
+    lines.extend(f"- `{item}`" for item in trace.get("trace_files", []))
+
+    contamination = protocol.get("contamination_rules") or {}
+    lines.extend(
+        [
+            "",
+            "## Contamination Labels",
+            "",
+            f"- Default condition requires clean manual blindness: `{contamination.get('default_condition_requires_clean_manual_blindness')}`",
+            "",
+            "| Label | Severity | Counts As Default Condition | Description |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for item in contamination.get("labels", []):
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(item.get('label')))}` | "
+            f"`{_escape_markdown_table(str(item.get('severity')))}` | "
+            f"`{_escape_markdown_table(str(item.get('counts_as_default_condition')) )}` | "
+            f"{_escape_markdown_table(str(item.get('description')))} |"
+        )
+    lines.extend(["", "Notes:"])
+    lines.extend(f"- {item}" for item in contamination.get("notes", []))
+
+    lines.extend(
+        [
+            "",
+            "## Metric Contract",
+            "",
+            f"- Missing counter rule: {metric_contract.get('counter_rule')}",
+            f"- Approximate token formula: `{((metric_contract.get('estimated_metric_rule') or {}).get('formula'))}`",
+            f"- Tokenizer: `{((metric_contract.get('estimated_metric_rule') or {}).get('tokenizer'))}`",
+            f"- Estimate status: `{((metric_contract.get('estimated_metric_rule') or {}).get('status'))}`",
+            f"- Estimate warning: {((metric_contract.get('estimated_metric_rule') or {}).get('warning'))}",
+            "",
+            "Required metrics:",
+        ]
+    )
+    lines.extend(f"- `{item}`" for item in metric_contract.get("required_metrics", []))
+    example_estimates = metric_contract.get("example_estimates") or {}
+    lines.extend(
+        [
+            "",
+            "Example byte-to-token estimates:",
+            f"- output_bytes={example_estimates.get('output_bytes')}, output_tokens~{example_estimates.get('output_bytes_estimated_tokens')}",
+            f"- context_bytes={example_estimates.get('context_bytes')}, context_tokens~{example_estimates.get('context_bytes_estimated_tokens')}",
+        ]
+    )
+
+    result_schema = protocol.get("result_schema") or {}
+    lines.extend(
+        [
+            "",
+            "## Result Schema",
+            "",
+            "Required case fields:",
+        ]
+    )
+    lines.extend(f"- `{item}`" for item in result_schema.get("required_case_fields", []))
+    lines.extend(["", "Required comparison fields:"])
+    lines.extend(f"- `{item}`" for item in result_schema.get("required_comparison_fields", []))
+    lines.extend(["", "Required review fields:"])
+    lines.extend(f"- `{item}`" for item in result_schema.get("required_review_fields", []))
+
+    lines.extend(["", "## Committed Output Contract", "", "Allowed fields:"])
+    lines.extend(f"- `{item}`" for item in output_contract.get("allowed_fields", []))
+    lines.extend(["", "Forbidden fields:"])
+    lines.extend(f"- `{item}`" for item in output_contract.get("forbidden_fields", []))
+    lines.extend(["", f"Report basis: `{output_contract.get('report_basis')}`"])
+
+    lines.extend(["", "## Reviewer Proof Contract", "", "Required checks:"])
+    lines.extend(f"- `{item}`" for item in reviewer.get("required_checks", []))
+    lines.extend(["", "Reviewer must confirm:"])
+    lines.extend(f"- `{item}`" for item in reviewer.get("must_confirm", []))
+
+    lines.extend(
+        [
+            "",
+            "## Sanitized Aggregate Template",
+            "",
+            f"- Run ID: `{template.get('run_id')}`",
+            f"- Case count: `{template.get('case_count')}`",
+            f"- Live run performed: `{template.get('live_run_performed')}`",
+            f"- Pilot claim allowed: `{template.get('pilot_claim_allowed')}`",
+            f"- Default condition: `{template.get('default_condition')}`",
+        ]
+    )
+    for side_name, metrics in aggregate_by_side.items():
+        lines.extend(["", f"### Aggregate Side Template: `{side_name}`", "", "| Metric | Value |", "| --- | --- |"])
+        for key, value in metrics.items():
+            lines.append(f"| `{_escape_markdown_table(str(key))}` | `{_escape_markdown_table(str(value))}` |")
+    lines.extend(["", "### Aggregate Comparison Template", "", "| Field | Value |", "| --- | --- |"])
+    for key, value in aggregate_comparison.items():
+        lines.append(f"| `{_escape_markdown_table(str(key))}` | `{_escape_markdown_table(str(value))}` |")
+    lines.extend(["", "### Review Template", "", "| Field | Value |", "| --- | --- |"])
+    for key, value in review_template.items():
+        lines.append(f"| `{_escape_markdown_table(str(key))}` | `{_escape_markdown_table(str(value))}` |")
     return "\n".join(lines)
 
 
