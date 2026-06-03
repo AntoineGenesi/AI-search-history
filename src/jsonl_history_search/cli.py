@@ -31,6 +31,7 @@ from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_
 from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
 from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
 from .scanner import search
+from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
 from .skill_audit import build_skill_audit_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
 from .timeutil import parse_now, timezone_from_args
@@ -119,6 +120,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip bounded prose extraction of prior automation suggestions.",
     )
     workflow_repeat.add_argument("--report-output", default=None)
+    semantic_debug = subparsers.add_parser("semantic-debug")
+    semantic_debug.add_argument("query", nargs="?", default="")
+    add_common_args(semantic_debug)
+    semantic_debug.add_argument("--task", default=None)
+    semantic_debug.add_argument("--path", default=None)
+    semantic_debug.add_argument("--commit", default=None)
+    semantic_debug.add_argument("--branch", default=None)
+    semantic_debug.add_argument("--around", default=None)
+    semantic_debug.add_argument(
+        "--gold-manifest",
+        default=str(DEFAULT_GOLD_MANIFEST),
+        help="Committed sanitized real-history gold manifest for coverage-only caveats; no private bridge is required.",
+    )
+    semantic_debug.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the full semantic-debug packet should be written.",
+    )
     private_mine = subparsers.add_parser("private-benchmark-mine")
     add_common_args(private_mine)
     private_mine.add_argument("--query-family", action="append", default=[])
@@ -812,6 +831,37 @@ def main(argv: list[str] | None = None) -> int:
         if args.report_output:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
             rendered = render(_short_workflow_repeat_report_written_payload(payload, args.report_output), args.format)
+        print(rendered)
+        return 0
+    if args.command == "semantic-debug":
+        source_plan, intent, plan = payload_from_args(args)
+        payload = build_semantic_debug_payload(
+            args,
+            source_plan=source_plan,
+            intent=intent,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            mask_context=_mask_context_from_args(args),
+            configuration_warnings=_configuration_warnings(source_plan),
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            packet = payload["semantic_debug"]
+            payload = {
+                "semantic_debug": {
+                    "schema_version": packet["schema_version"],
+                    "status": packet["status"],
+                    "query": packet["query"],
+                    "question_family": packet["question_family"],
+                    "report_written": str(Path(args.report_output).expanduser()),
+                    "candidate_count": len(packet["strongest_candidates"]),
+                    "event_count": packet["tool_action_proof"]["event_count"],
+                    "next_reads": packet["next_reads"][:5],
+                    "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
+                }
+            }
+            rendered = render(payload, args.format)
         print(rendered)
         return 0
     if args.command == "private-benchmark-mine":
