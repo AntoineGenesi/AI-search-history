@@ -35,6 +35,10 @@ DRY_RUN_TASK_ID = "jsh-080c-one-case-dry-run-prompt-and-result-skeleton-builder"
 DEFAULT_DRY_RUN_CASE_ID = "jsh-060-case-060c-0018"
 DRY_RUN_ID = "jsh-080c-one-case-dry-run"
 DRY_RUN_RUN_ID = f"{DRY_RUN_ID}-run-skeleton"
+MODEL_VISIBLE_MANUAL_PROMPT_VIEW_IDS = {
+    "prompt_view_scenario_a": "manual-blind-primary",
+    "prompt_view_scenario_a2": "manual-blind-calibration",
+}
 MANUAL_BLIND_HASH_KEYS = (
     "task_prompt",
     "generic_allowed_tools",
@@ -592,7 +596,7 @@ def _build_dry_run_artifacts(
         allowed_sections=list(MANUAL_BLIND_HASH_KEYS),
         source_view_pointer=manual_pointer,
         model_visible_descriptor=_manual_model_visible_descriptor(
-            prompt_view_id=prompt_view_ids["prompt_view_scenario_a"],
+            prompt_view_id=MODEL_VISIBLE_MANUAL_PROMPT_VIEW_IDS["prompt_view_scenario_a"],
             scenario_label=SCENARIO_LABELS[0],
             prompt_hash=manual_hash,
         ),
@@ -628,7 +632,7 @@ def _build_dry_run_artifacts(
         allowed_sections=list(MANUAL_BLIND_HASH_KEYS),
         source_view_pointer=manual_pointer,
         model_visible_descriptor=_manual_model_visible_descriptor(
-            prompt_view_id=prompt_view_ids["prompt_view_scenario_a2"],
+            prompt_view_id=MODEL_VISIBLE_MANUAL_PROMPT_VIEW_IDS["prompt_view_scenario_a2"],
             scenario_label=SCENARIO_LABELS[1],
             prompt_hash=manual_hash,
             calibration_only=True,
