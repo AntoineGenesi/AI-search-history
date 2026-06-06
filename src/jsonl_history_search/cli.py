@@ -9,6 +9,7 @@ from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .forensics import build_forensics_payload
+from .harness_artifacts import DEFAULT_HARNESS_SCHEMA_PATH, build_harness_artifact_validation_payload
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
@@ -457,6 +458,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized paired-agent benchmark protocol report should be written.",
+    )
+    harness_artifacts = subparsers.add_parser("validate-harness-artifacts")
+    harness_artifacts.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    harness_artifacts.add_argument(
+        "--schema",
+        default=str(DEFAULT_HARNESS_SCHEMA_PATH),
+        help="Committed-safe harness artifact schema packet to validate.",
+    )
+    harness_artifacts.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        help="Additional committed-safe harness artifact JSON file to validate; may be repeated.",
+    )
+    harness_artifacts.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized harness artifact validation report should be written.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1066,6 +1085,18 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0
+    if args.command == "validate-harness-artifacts":
+        payload = build_harness_artifact_validation_payload(
+            schema_path=Path(args.schema).expanduser(),
+            artifact_paths=tuple(Path(item).expanduser() for item in args.artifact),
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 1 if payload["harness_artifact_validation"]["status"] == "fail" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)

@@ -50,6 +50,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_package_miss_audit_text(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_text(payload)
+    if "harness_artifact_validation" in payload:
+        return render_harness_artifact_validation_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -143,6 +145,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_package_miss_audit_markdown(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_markdown(payload)
+    if "harness_artifact_validation" in payload:
+        return render_harness_artifact_validation_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2762,6 +2766,79 @@ def render_paired_agent_benchmark_protocol_text(payload: dict) -> str:
     for key in ((protocol.get("result_schema") or {}).get("required_side_metrics") or []):
         lines.append(f"- {key}")
     lines.append("Missing counter rule: unavailable, never zero")
+    return "\n".join(lines)
+
+
+def render_harness_artifact_validation_text(payload: dict) -> str:
+    report = payload["harness_artifact_validation"]
+    summary = report.get("summary", {})
+    lines = [
+        f"Harness artifact validation: {str(report.get('status', 'unknown')).upper()}",
+        f"Mode: {report.get('mode')}",
+        f"Schema path: {report.get('schema_path')}",
+        (
+            "Files: "
+            f"{summary.get('checked_files', 0)} checked, "
+            f"{summary.get('pass', 0)} pass, "
+            f"{summary.get('fail', 0)} fail"
+        ),
+        f"Families: {', '.join(report.get('checked_families', []))}",
+        f"Live benchmark run performed: {report.get('live_benchmark_run_performed')}",
+        f"Missing live counter value: {report.get('missing_live_counter_value')}",
+    ]
+    for result in report.get("results", []):
+        if result.get("errors"):
+            lines.append(f"Errors in {result.get('source_label')}:")
+            lines.extend(f"- {item}" for item in result.get("errors", []))
+    return "\n".join(lines)
+
+
+def render_harness_artifact_validation_markdown(payload: dict) -> str:
+    report = payload["harness_artifact_validation"]
+    summary = report.get("summary", {})
+    lines = [
+        "# JSH-080a Harness Artifact Validation",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Mode:** `{report.get('mode')}`",
+        f"**Schema path:** `{report.get('schema_path')}`",
+        f"**Live benchmark run performed:** `{report.get('live_benchmark_run_performed')}`",
+        f"**Model send performed:** `{report.get('model_send_performed')}`",
+        f"**Codex exec performed:** `{report.get('codex_exec_performed')}`",
+        f"**Docker action performed:** `{report.get('docker_action_performed')}`",
+        f"**Private corpus materialized:** `{report.get('private_corpus_materialized')}`",
+        f"**Claim boundary enforced:** `{report.get('claim_boundary_enforced')}`",
+        f"**Missing live counter value:** `{report.get('missing_live_counter_value')}`",
+        "",
+        "## Summary",
+        "",
+        "| Checked Files | Pass | Fail | Errors | Warnings | Families |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            f"| {summary.get('checked_files', 0)} | "
+            f"{summary.get('pass', 0)} | "
+            f"{summary.get('fail', 0)} | "
+            f"{summary.get('error_count', 0)} | "
+            f"{summary.get('warning_count', 0)} | "
+            f"{report.get('checked_family_count', 0)} |"
+        ),
+        "",
+        "## Families",
+        "",
+    ]
+    lines.extend(f"- `{item}`" for item in report.get("checked_families", []))
+    lines.extend(["", "## Results", "", "| Status | Source | Errors |", "| --- | --- | ---: |"])
+    for result in report.get("results", []):
+        lines.append(
+            "| "
+            f"{str(result.get('status', '')).upper()} | "
+            f"`{_escape_markdown_table(str(result.get('source_label', '')))}` | "
+            f"{len(result.get('errors', []))} |"
+        )
+    for result in report.get("results", []):
+        if result.get("errors"):
+            lines.extend(["", f"### {result.get('source_label')}", ""])
+            lines.extend(f"- {item}" for item in result.get("errors", []))
     return "\n".join(lines)
 
 
