@@ -35,6 +35,13 @@ DRY_RUN_TASK_ID = "jsh-080c-one-case-dry-run-prompt-and-result-skeleton-builder"
 DEFAULT_DRY_RUN_CASE_ID = "jsh-060-case-060c-0018"
 DRY_RUN_ID = "jsh-080c-one-case-dry-run"
 DRY_RUN_RUN_ID = f"{DRY_RUN_ID}-run-skeleton"
+OFFLINE_SCORER_TASK_ID = "jsh-080d-offline-scorer-prototype-for-decision-and-workflow-cases"
+OFFLINE_SCORER_ID = "jsh-080d-offline-scorer"
+OFFLINE_SCORER_RUN_ID = f"{OFFLINE_SCORER_ID}-synthetic-fixture-run"
+OFFLINE_SCORER_ARTIFACT_FILENAMES = {
+    "fixtures": "offline-scorer-fixtures.json",
+    "offline_scorer_output": "offline-scorer-output.json",
+}
 MODEL_VISIBLE_MANUAL_PROMPT_VIEW_IDS = {
     "prompt_view_scenario_a": "manual-blind-primary",
     "prompt_view_scenario_a2": "manual-blind-calibration",
@@ -456,6 +463,223 @@ def build_harness_dry_run_artifacts_payload(
     }
 
 
+def build_harness_offline_scorer_artifacts_payload(
+    *,
+    output_dir: Path,
+    report_output: Path | None = None,
+) -> dict[str, Any]:
+    fixtures = _offline_scorer_fixtures()
+    scored_fixtures = [_score_offline_fixture(fixture) for fixture in fixtures]
+    aggregate_scores = _aggregate_offline_scores(scored_fixtures)
+    reviewer_needed = [
+        item["fixture_id"]
+        for item in scored_fixtures
+        if item["reviewer_needed"]["required"]
+    ]
+
+    offline_scorer_output = _base_artifact("offline_scorer_output")
+    offline_scorer_output.update(
+        {
+            "scorer_output_id": f"{OFFLINE_SCORER_ID}-offline-scorer-output",
+            "run_id": OFFLINE_SCORER_RUN_ID,
+            "offline_scorer_id": OFFLINE_SCORER_ID,
+            "status": "scored_synthetic_fixtures",
+            "scorer_dimensions": list(SCORER_DIMENSIONS),
+            "scores": aggregate_scores,
+            "score_status_summary": {
+                "deterministic_dimension_count": len(SCORER_DIMENSIONS),
+                "deterministic_dimensions": list(SCORER_DIMENSIONS),
+                "live_counter_status": UNAVAILABLE,
+                "live_counter_basis": "not_measured_by_offline_synthetic_scorer",
+            },
+            "fixture_summary": {
+                "fixture_count": len(fixtures),
+                "covered_answer_shapes": sorted({str(item["answer_shape"]) for item in fixtures}),
+                "reviewer_needed_fixture_ids": reviewer_needed,
+                "weak_or_incorrect_source_trail_fixture_ids": [
+                    item["fixture_id"]
+                    for item in scored_fixtures
+                    if item["source_trail_classification"] in {"weak", "incorrect"}
+                ],
+            },
+            "fixture_scores": scored_fixtures,
+            "fixture_file": OFFLINE_SCORER_ARTIFACT_FILENAMES["fixtures"],
+            "scoring_basis": "deterministic_committed_safe_synthetic_fixtures_only",
+            "live_run_boundary": {
+                "live_benchmark_run_performed": False,
+                "six_case_run_performed": False,
+                "model_send_performed": False,
+                "codex_exec_performed": False,
+                "docker_action_performed": False,
+                "network_action_performed": False,
+                "scenario_b_execution_performed": False,
+                "private_corpus_materialized": False,
+                "value_claim_created": False,
+                "winner_claim_created": False,
+                "jsonl_superiority_claim_created": False,
+            },
+        }
+    )
+
+    fixtures_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": OFFLINE_SCORER_TASK_ID,
+        "artifact_kind": "offline_scorer_synthetic_fixture_set",
+        "privacy_layer": "committed_safe_sanitized",
+        "offline_scorer_id": OFFLINE_SCORER_ID,
+        "fixture_count": len(fixtures),
+        "fixtures": fixtures,
+        "live_run_boundary": offline_scorer_output["live_run_boundary"],
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fixture_path = output_dir / OFFLINE_SCORER_ARTIFACT_FILENAMES["fixtures"]
+    scorer_path = output_dir / OFFLINE_SCORER_ARTIFACT_FILENAMES["offline_scorer_output"]
+    write_json_file(fixture_path, fixtures_payload)
+    write_json_file(scorer_path, offline_scorer_output)
+    artifact_paths = {
+        "fixtures": str(fixture_path),
+        "offline_scorer_output": str(scorer_path),
+    }
+
+    validation_payload = build_harness_artifact_validation_payload(artifact_paths=(scorer_path,))
+    validation = validation_payload["harness_artifact_validation"]
+    report_path = None
+    if report_output is not None:
+        report_output.parent.mkdir(parents=True, exist_ok=True)
+        report_output.write_text(
+            render_harness_offline_scorer_report(
+                artifact_paths=artifact_paths,
+                validation_payload=validation_payload,
+                scored_fixtures=scored_fixtures,
+                aggregate_scores=aggregate_scores,
+            ),
+            encoding="utf-8",
+        )
+        report_path = str(report_output)
+
+    return {
+        "harness_offline_scorer_artifacts": {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": OFFLINE_SCORER_TASK_ID,
+            "status": validation["status"],
+            "mode": "non_live_committed_safe_offline_scorer_fixture_build",
+            "run_id": OFFLINE_SCORER_RUN_ID,
+            "output_dir": str(output_dir),
+            "report_output": report_path,
+            "artifact_paths": artifact_paths,
+            "fixture_count": len(fixtures),
+            "scorer_dimensions": list(SCORER_DIMENSIONS),
+            "deterministic_score_status": "scored",
+            "live_counter_status": UNAVAILABLE,
+            "missing_live_counter_value": UNAVAILABLE,
+            "live_benchmark_run_performed": False,
+            "six_case_run_performed": False,
+            "model_send_performed": False,
+            "codex_exec_performed": False,
+            "docker_action_performed": False,
+            "network_action_performed": False,
+            "scenario_b_execution_performed": False,
+            "private_corpus_materialized": False,
+            "claim_boundary_enforced": True,
+            "value_claim_created": False,
+            "winner_claim_created": False,
+            "jsonl_superiority_claim_created": False,
+            "reviewer_needed_fixture_ids": reviewer_needed,
+            "validation_status": validation["status"],
+            "validation_summary": validation["summary"],
+        }
+    }
+
+
+def render_harness_offline_scorer_report(
+    *,
+    artifact_paths: dict[str, str],
+    validation_payload: dict[str, Any],
+    scored_fixtures: list[dict[str, Any]],
+    aggregate_scores: dict[str, dict[str, Any]],
+) -> str:
+    validation = validation_payload["harness_artifact_validation"]
+    summary = validation["summary"]
+    lines = [
+        "# JSH-080d Offline Scorer Prototype For Decision And Workflow Cases",
+        "",
+        f"**Status:** `{validation['status']}`",
+        "**Mode:** `non_live_committed_safe_offline_scorer_fixture_build`",
+        f"**Run ID:** `{OFFLINE_SCORER_RUN_ID}`",
+        "**Live run:** `not_performed`",
+        "**Six-case run:** `not_performed`",
+        "**Scenario B execution:** `not_performed`",
+        "**Model send:** `not_performed`",
+        "**Codex exec:** `not_performed`",
+        "**Docker action:** `not_performed`",
+        "**Network action:** `not_performed`",
+        "**Private corpus materialized:** `false`",
+        "**Winner, speed, token-efficiency, value, or JSONL-superiority claim:** `false`",
+        "",
+        "## Generated Artifacts",
+        "",
+    ]
+    for key in ("fixtures", "offline_scorer_output"):
+        lines.append(f"- `{key}`: `{artifact_paths[key]}`")
+    lines.extend(
+        [
+            "",
+            "## Scorer Semantics",
+            "",
+            "- Fixtures are committed-safe synthetic descriptors, not live model responses.",
+            "- Deterministic scores use a `0.0` to `1.0` scale and include a basis string.",
+            "- Live counters remain the literal `unavailable`; they are not measured or inferred by this scorer.",
+            "- Reviewer-needed flags identify cases where deterministic scoring should not replace independent adjudication.",
+            "",
+            "## Fixture Coverage",
+            "",
+            "| Fixture | Shape | Correctness | Source Trail | Reviewer Needed |",
+            "| --- | --- | ---: | ---: | --- |",
+        ]
+    )
+    for item in scored_fixtures:
+        lines.append(
+            "| "
+            f"`{item['fixture_id']}` | "
+            f"`{item['answer_shape']}` | "
+            f"{item['dimension_scores']['answer_correctness']['score']:.3f} | "
+            f"{item['dimension_scores']['source_trail_quality']['score']:.3f} | "
+            f"`{str(item['reviewer_needed']['required']).lower()}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Aggregate Scores",
+            "",
+            "| Dimension | Status | Score |",
+            "| --- | --- | ---: |",
+        ]
+    )
+    for dimension in SCORER_DIMENSIONS:
+        score = aggregate_scores[dimension]
+        lines.append(f"| `{dimension}` | `{score['status']}` | {score['score']:.3f} |")
+    lines.extend(
+        [
+            "",
+            "## Validation",
+            "",
+            f"- Validator status: `{validation['status']}`",
+            f"- Checked files: `{summary['checked_files']}`",
+            f"- Error count: `{summary['error_count']}`",
+            f"- Warning count: `{summary['warning_count']}`",
+            "",
+            "## Limits",
+            "",
+            "- This report is a scorer prototype proof over synthetic fixtures only.",
+            "- It does not contain a live one-case result, six-case result, runtime metric, or benchmark comparison.",
+            "- It does not claim a default-vs-JSONL winner, speed result, token-efficiency result, value result, or superiority result.",
+            "- Later live-result tasks must feed reviewed result packets into this shape and keep independent reviewer adjudication.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_harness_dry_run_artifacts_report(
     *,
     case_id: str,
@@ -508,6 +732,316 @@ def render_harness_dry_run_artifacts_report(
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def _offline_scorer_fixtures() -> list[dict[str, Any]]:
+    return [
+        {
+            "fixture_id": "synthetic-decision-provenance-correct",
+            "answer_shape": "decision_provenance",
+            "expected_outcome": "correct_with_provenance",
+            "required_findings": [
+                "selected_non_live_trace_harness",
+                "downstream_live_result_tasks_blocked",
+            ],
+            "expected_source_refs": [
+                "safe://review/jsh-075c6h#selected-path",
+                "safe://report/jsh-080#offline-scorer-follow-up",
+            ],
+            "expected_first_pass_ref": "safe://review/jsh-075c6h#selected-path",
+            "expected_no_evidence": False,
+            "expected_workflow_failure": False,
+            "expected_reviewer_needed": False,
+            "answer": {
+                "findings": [
+                    "selected_non_live_trace_harness",
+                    "downstream_live_result_tasks_blocked",
+                ],
+                "cited_source_refs": [
+                    "safe://review/jsh-075c6h#selected-path",
+                    "safe://report/jsh-080#offline-scorer-follow-up",
+                ],
+                "first_pass_source_refs": ["safe://review/jsh-075c6h#selected-path"],
+                "retrieved_context_refs": [
+                    "safe://review/jsh-075c6h#selected-path",
+                    "safe://report/jsh-080#offline-scorer-follow-up",
+                    "safe://task/jsh-080d#acceptance",
+                ],
+                "utilized_source_refs": [
+                    "safe://review/jsh-075c6h#selected-path",
+                    "safe://report/jsh-080#offline-scorer-follow-up",
+                ],
+                "declares_no_evidence": False,
+                "workflow_failure_identified": False,
+                "unsupported_claims": [],
+                "contamination_markers": [],
+                "synthetic_retrieval_steps": 3,
+                "reviewer_needed": False,
+            },
+        },
+        {
+            "fixture_id": "synthetic-workflow-failure-correct",
+            "answer_shape": "workflow_failure",
+            "expected_outcome": "correct_fail_closed",
+            "required_findings": [
+                "live_runner_gate_missing",
+                "do_not_run_benchmark_send",
+            ],
+            "expected_source_refs": [
+                "safe://packet/jsh-075c6h#live-runner-blocked",
+                "safe://task/jsh-080d#non-goals",
+            ],
+            "expected_first_pass_ref": "safe://packet/jsh-075c6h#live-runner-blocked",
+            "expected_no_evidence": False,
+            "expected_workflow_failure": True,
+            "expected_reviewer_needed": False,
+            "answer": {
+                "findings": [
+                    "live_runner_gate_missing",
+                    "do_not_run_benchmark_send",
+                ],
+                "cited_source_refs": [
+                    "safe://packet/jsh-075c6h#live-runner-blocked",
+                    "safe://task/jsh-080d#non-goals",
+                ],
+                "first_pass_source_refs": ["safe://packet/jsh-075c6h#live-runner-blocked"],
+                "retrieved_context_refs": [
+                    "safe://packet/jsh-075c6h#live-runner-blocked",
+                    "safe://task/jsh-080d#non-goals",
+                ],
+                "utilized_source_refs": [
+                    "safe://packet/jsh-075c6h#live-runner-blocked",
+                    "safe://task/jsh-080d#non-goals",
+                ],
+                "declares_no_evidence": False,
+                "workflow_failure_identified": True,
+                "unsupported_claims": [],
+                "contamination_markers": [],
+                "synthetic_retrieval_steps": 2,
+                "reviewer_needed": False,
+            },
+        },
+        {
+            "fixture_id": "synthetic-no-evidence-correct",
+            "answer_shape": "no_evidence",
+            "expected_outcome": "correct_abstention",
+            "required_findings": [],
+            "expected_source_refs": [],
+            "expected_first_pass_ref": None,
+            "expected_no_evidence": True,
+            "expected_workflow_failure": False,
+            "expected_reviewer_needed": False,
+            "answer": {
+                "findings": [],
+                "cited_source_refs": [],
+                "first_pass_source_refs": [],
+                "retrieved_context_refs": [],
+                "utilized_source_refs": [],
+                "declares_no_evidence": True,
+                "workflow_failure_identified": False,
+                "unsupported_claims": [],
+                "contamination_markers": [],
+                "synthetic_retrieval_steps": 1,
+                "reviewer_needed": False,
+            },
+        },
+        {
+            "fixture_id": "synthetic-weak-source-trail-incorrect",
+            "answer_shape": "weak_incorrect_source_trail",
+            "expected_outcome": "incorrect_or_weak_source_trail",
+            "required_findings": [
+                "selected_non_live_trace_harness",
+                "no_value_claim_allowed",
+            ],
+            "expected_source_refs": [
+                "safe://review/jsh-075c6h#selected-path",
+                "safe://task/jsh-080d#claim-boundary",
+            ],
+            "expected_first_pass_ref": "safe://review/jsh-075c6h#selected-path",
+            "expected_no_evidence": False,
+            "expected_workflow_failure": False,
+            "expected_reviewer_needed": True,
+            "answer": {
+                "findings": [
+                    "selected_non_live_trace_harness",
+                    "unsupported_live_value_result",
+                ],
+                "cited_source_refs": [
+                    "safe://task/jsh-080d#acceptance",
+                    "safe://unrelated/synthetic-note",
+                ],
+                "first_pass_source_refs": ["safe://task/jsh-080d#acceptance"],
+                "retrieved_context_refs": [
+                    "safe://task/jsh-080d#acceptance",
+                    "safe://unrelated/synthetic-note",
+                    "safe://review/jsh-075c6h#selected-path",
+                ],
+                "utilized_source_refs": ["safe://unrelated/synthetic-note"],
+                "declares_no_evidence": False,
+                "workflow_failure_identified": False,
+                "unsupported_claims": ["unsupported_live_value_result"],
+                "contamination_markers": [],
+                "synthetic_retrieval_steps": 5,
+                "reviewer_needed": True,
+            },
+        },
+    ]
+
+
+def _score_offline_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
+    answer = _require_object(fixture.get("answer"), f"{fixture.get('fixture_id')}.answer")
+    required_findings = set(_string_list(fixture.get("required_findings")))
+    answer_findings = set(_string_list(answer.get("findings")))
+    expected_sources = set(_string_list(fixture.get("expected_source_refs")))
+    cited_sources = set(_string_list(answer.get("cited_source_refs")))
+    first_pass_sources = set(_string_list(answer.get("first_pass_source_refs")))
+    retrieved_sources = set(_string_list(answer.get("retrieved_context_refs")))
+    utilized_sources = set(_string_list(answer.get("utilized_source_refs")))
+    unsupported_claims = _string_list(answer.get("unsupported_claims"))
+    contamination_markers = _string_list(answer.get("contamination_markers"))
+
+    required_hit_ratio = _ratio(len(required_findings & answer_findings), len(required_findings), empty_value=1.0)
+    unsupported_penalty = min(0.5, 0.25 * len(unsupported_claims))
+    no_evidence_expected = fixture.get("expected_no_evidence") is True
+    no_evidence_ok = answer.get("declares_no_evidence") is no_evidence_expected
+    workflow_expected = fixture.get("expected_workflow_failure") is True
+    workflow_ok = answer.get("workflow_failure_identified") is workflow_expected
+    answer_correctness = _clamp(required_hit_ratio - unsupported_penalty)
+    if not no_evidence_ok:
+        answer_correctness = min(answer_correctness, 0.5)
+    if not workflow_ok:
+        answer_correctness = min(answer_correctness, 0.5)
+
+    expected_hit = _expected_source_ref_score(expected_sources, cited_sources)
+    source_precision = _precision(cited_sources, expected_sources, empty_value=1.0 if not expected_sources else 0.0)
+    source_trail_quality = _round_score((expected_hit + source_precision) / 2)
+    expected_first_pass = fixture.get("expected_first_pass_ref")
+    if expected_first_pass:
+        first_pass_hit = 1.0 if expected_first_pass in first_pass_sources else 0.0
+    else:
+        first_pass_hit = 1.0 if not first_pass_sources else 0.0
+    context_recall = _expected_source_ref_score(expected_sources, retrieved_sources)
+    context_precision = _precision(
+        retrieved_sources,
+        expected_sources,
+        empty_value=1.0 if not expected_sources else 0.0,
+    )
+    utilization_precision = _precision(
+        utilized_sources,
+        expected_sources,
+        empty_value=1.0 if not expected_sources else 0.0,
+    )
+    explored_vs_utilized_gap = (
+        1.0
+        if not retrieved_sources
+        else _round_score(len(utilized_sources & retrieved_sources) / len(retrieved_sources))
+    )
+    no_evidence_abstention = (
+        1.0
+        if no_evidence_ok and (not no_evidence_expected or (not cited_sources and not unsupported_claims))
+        else 0.0
+    )
+    tool_use_efficiency = _round_score(min(1.0, 3 / max(1, int(answer.get("synthetic_retrieval_steps") or 1))))
+    contamination = 1.0 if not contamination_markers else 0.0
+    reviewer_needed_matches = answer.get("reviewer_needed") is fixture.get("expected_reviewer_needed")
+    reviewer_verdict = 1.0 if reviewer_needed_matches else 0.0
+
+    dimension_scores = {
+        "answer_correctness": _score_object(
+            answer_correctness,
+            "required findings, abstention/workflow shape, and unsupported-claim penalty",
+        ),
+        "source_trail_quality": _score_object(
+            source_trail_quality,
+            "expected-source coverage averaged with cited-source precision",
+        ),
+        "expected_source_ref_hit": _score_object(expected_hit, "expected committed-safe source refs cited by answer"),
+        "first_pass_source_hit": _score_object(first_pass_hit, "expected first-pass source ref present in synthetic first pass"),
+        "context_recall_at_k": _score_object(context_recall, "expected source refs present in retrieved context refs"),
+        "context_precision_at_k": _score_object(context_precision, "retrieved context refs that are expected source refs"),
+        "utilization_precision": _score_object(utilization_precision, "utilized source refs that are expected source refs"),
+        "explored_vs_utilized_gap": _score_object(explored_vs_utilized_gap, "share of retrieved refs that were utilized"),
+        "no_evidence_abstention": _score_object(no_evidence_abstention, "abstention correctness for no-evidence fixtures"),
+        "tool_use_efficiency": _score_object(tool_use_efficiency, "synthetic retrieval-step score; no live tool counts used"),
+        "contamination": _score_object(contamination, "committed-safe contamination marker absence"),
+        "reviewer_verdict": _score_object(reviewer_verdict, "reviewer-needed flag matches expected fixture flag"),
+    }
+    source_classification = "adequate"
+    if expected_sources and expected_hit < 1.0:
+        source_classification = "weak"
+    if unsupported_claims or (expected_sources and source_precision == 0.0):
+        source_classification = "incorrect"
+
+    return {
+        "fixture_id": fixture["fixture_id"],
+        "answer_shape": fixture["answer_shape"],
+        "expected_outcome": fixture["expected_outcome"],
+        "dimension_scores": dimension_scores,
+        "source_trail_classification": source_classification,
+        "reviewer_needed": {
+            "required": answer.get("reviewer_needed") is True,
+            "expected": fixture.get("expected_reviewer_needed") is True,
+            "basis": "synthetic answer flagged reviewer_needed and fixture expected flag",
+        },
+        "deterministic": True,
+        "expected_source_refs_hit": sorted(expected_sources & cited_sources),
+        "unexpected_cited_source_refs": sorted(cited_sources - expected_sources),
+        "unsupported_claims": unsupported_claims,
+    }
+
+
+def _aggregate_offline_scores(scored_fixtures: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    aggregate: dict[str, dict[str, Any]] = {}
+    for dimension in SCORER_DIMENSIONS:
+        values = [fixture["dimension_scores"][dimension]["score"] for fixture in scored_fixtures]
+        aggregate[dimension] = _score_object(
+            _round_score(sum(values) / len(values)),
+            f"mean deterministic score across {len(scored_fixtures)} committed-safe synthetic fixtures",
+        )
+    return aggregate
+
+
+def _score_object(score: float, basis: str) -> dict[str, Any]:
+    return {
+        "status": "deterministic",
+        "score": _round_score(score),
+        "scale": "0_to_1",
+        "basis": basis,
+    }
+
+
+def _expected_source_ref_score(expected_sources: set[str], observed_sources: set[str]) -> float:
+    if not expected_sources:
+        return 1.0 if not observed_sources else 0.0
+    return _round_score(len(expected_sources & observed_sources) / len(expected_sources))
+
+
+def _precision(observed_sources: set[str], expected_sources: set[str], *, empty_value: float) -> float:
+    if not observed_sources:
+        return empty_value
+    return _round_score(len(observed_sources & expected_sources) / len(observed_sources))
+
+
+def _ratio(numerator: int, denominator: int, *, empty_value: float) -> float:
+    if denominator == 0:
+        return empty_value
+    return _round_score(numerator / denominator)
+
+
+def _clamp(value: float) -> float:
+    return _round_score(max(0.0, min(1.0, value)))
+
+
+def _round_score(value: float) -> float:
+    return round(float(value), 3)
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("expected list of strings")
+    return [str(item) for item in value]
 
 
 def _build_dry_run_artifacts(
