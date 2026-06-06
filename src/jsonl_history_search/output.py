@@ -52,6 +52,8 @@ def render_text(payload: dict) -> str:
         return render_paired_agent_benchmark_protocol_text(payload)
     if "harness_artifact_validation" in payload:
         return render_harness_artifact_validation_text(payload)
+    if "harness_dry_run_artifacts" in payload:
+        return render_harness_dry_run_artifacts_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -147,6 +149,8 @@ def render_markdown(payload: dict) -> str:
         return render_paired_agent_benchmark_protocol_markdown(payload)
     if "harness_artifact_validation" in payload:
         return render_harness_artifact_validation_markdown(payload)
+    if "harness_dry_run_artifacts" in payload:
+        return render_harness_dry_run_artifacts_markdown(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
@@ -2769,6 +2773,26 @@ def render_paired_agent_benchmark_protocol_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_harness_dry_run_artifacts_text(payload: dict) -> str:
+    report = payload["harness_dry_run_artifacts"]
+    summary = report.get("validation_summary", {})
+    lines = [
+        f"Harness dry-run artifacts: {str(report.get('status', 'unknown')).upper()}",
+        f"Mode: {report.get('mode')}",
+        f"Case: {report.get('case_id')}",
+        f"Output dir: {report.get('output_dir')}",
+        f"Report output: {report.get('report_output') or '(none)'}",
+        f"Validation: {report.get('validation_status')} ({summary.get('checked_files', 0)} files checked)",
+        f"Live benchmark run performed: {report.get('live_benchmark_run_performed')}",
+        f"Model send performed: {report.get('model_send_performed')}",
+        f"Missing live counter value: {report.get('missing_live_counter_value')}",
+        "Artifacts:",
+    ]
+    for key, path in report.get("artifact_paths", {}).items():
+        lines.append(f"- {key}: {path}")
+    return "\n".join(lines)
+
+
 def render_harness_artifact_validation_text(payload: dict) -> str:
     report = payload["harness_artifact_validation"]
     summary = report.get("summary", {})
@@ -2839,6 +2863,43 @@ def render_harness_artifact_validation_markdown(payload: dict) -> str:
         if result.get("errors"):
             lines.extend(["", f"### {result.get('source_label')}", ""])
             lines.extend(f"- {item}" for item in result.get("errors", []))
+    return "\n".join(lines)
+
+
+def render_harness_dry_run_artifacts_markdown(payload: dict) -> str:
+    report = payload["harness_dry_run_artifacts"]
+    summary = report.get("validation_summary", {})
+    lines = [
+        "# JSH-080c Harness Dry-Run Artifacts",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Mode:** `{report.get('mode')}`",
+        f"**Case:** `{report.get('case_id')}`",
+        f"**Output dir:** `{report.get('output_dir')}`",
+        f"**Report output:** `{report.get('report_output')}`",
+        f"**Live benchmark run performed:** `{report.get('live_benchmark_run_performed')}`",
+        f"**Model send performed:** `{report.get('model_send_performed')}`",
+        f"**Scenario B execution performed:** `{report.get('scenario_b_execution_performed')}`",
+        f"**Private corpus materialized:** `{report.get('private_corpus_materialized')}`",
+        f"**Claim boundary enforced:** `{report.get('claim_boundary_enforced')}`",
+        f"**Missing live counter value:** `{report.get('missing_live_counter_value')}`",
+        "",
+        "## Artifacts",
+        "",
+    ]
+    for key, path in report.get("artifact_paths", {}).items():
+        lines.append(f"- `{key}`: `{path}`")
+    lines.extend(
+        [
+            "",
+            "## Validation",
+            "",
+            f"- Status: `{report.get('validation_status')}`",
+            f"- Checked files: `{summary.get('checked_files', 0)}`",
+            f"- Errors: `{summary.get('error_count', 0)}`",
+            f"- Warnings: `{summary.get('warning_count', 0)}`",
+        ]
+    )
     return "\n".join(lines)
 
 
