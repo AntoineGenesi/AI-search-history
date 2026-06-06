@@ -9,7 +9,12 @@ from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .forensics import build_forensics_payload
-from .harness_artifacts import DEFAULT_HARNESS_SCHEMA_PATH, build_harness_artifact_validation_payload
+from .harness_artifacts import (
+    DEFAULT_DRY_RUN_CASE_ID,
+    DEFAULT_HARNESS_SCHEMA_PATH,
+    build_harness_artifact_validation_payload,
+    build_harness_dry_run_artifacts_payload,
+)
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
@@ -476,6 +481,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized harness artifact validation report should be written.",
+    )
+    dry_run_artifacts = subparsers.add_parser("build-harness-dry-run-artifacts")
+    dry_run_artifacts.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    dry_run_artifacts.add_argument(
+        "--case-id",
+        default=DEFAULT_DRY_RUN_CASE_ID,
+        help="Reviewed case id to build; jsh-080c is scoped to the frozen one-case target.",
+    )
+    dry_run_artifacts.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where committed-safe dry-run artifact JSON files are written.",
+    )
+    dry_run_artifacts.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional Markdown report path for the dry-run builder handoff.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1097,6 +1119,15 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 1 if payload["harness_artifact_validation"]["status"] == "fail" else 0
+    if args.command == "build-harness-dry-run-artifacts":
+        payload = build_harness_dry_run_artifacts_payload(
+            case_id=args.case_id,
+            output_dir=Path(args.output_dir).expanduser(),
+            report_output=Path(args.report_output).expanduser() if args.report_output else None,
+        )
+        rendered = render(payload, args.format)
+        print(rendered)
+        return 1 if payload["harness_dry_run_artifacts"]["status"] == "fail" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)

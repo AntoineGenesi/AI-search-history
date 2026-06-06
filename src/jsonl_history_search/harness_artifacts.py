@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,9 @@ from typing import Any
 
 SCHEMA_VERSION = "jsh-080a-harness-artifact-schemas.v1"
 DEFAULT_HARNESS_SCHEMA_PATH = Path("benchmarks/paired_agent/jsh-080a-harness-artifact-schemas.json")
+DEFAULT_PILOT_SELECTION_PATH = Path("benchmarks/paired_agent/jsh-059b2-pilot-selection.json")
+DEFAULT_CASE_PACKETS_PATH = Path("benchmarks/paired_agent/jsh-060-case-packets.json")
+DEFAULT_FIRST_WAVE_BLOCKER_PATH = Path("benchmarks/paired_agent/jsh-070-first-wave-thesis-and-blocker-packet.json")
 UNAVAILABLE = "unavailable"
 
 ARTIFACT_FAMILIES = (
@@ -26,6 +30,28 @@ SCENARIO_LABELS = (
     "scenario_a2_contributor_normal_equal_corpus_no_jsonl_advantage",
     "scenario_b_jsonl_assisted_equal_corpus",
 )
+
+DRY_RUN_TASK_ID = "jsh-080c-one-case-dry-run-prompt-and-result-skeleton-builder"
+DEFAULT_DRY_RUN_CASE_ID = "jsh-060-case-060c-0018"
+DRY_RUN_ID = "jsh-080c-one-case-dry-run"
+DRY_RUN_RUN_ID = f"{DRY_RUN_ID}-run-skeleton"
+MANUAL_BLIND_HASH_KEYS = (
+    "task_prompt",
+    "generic_allowed_tools",
+    "caps",
+    "output_schema",
+    "privacy_rules",
+)
+DRY_RUN_ARTIFACT_FILENAMES = {
+    "case_registry": "case-registry.json",
+    "corpus_manifest": "corpus-manifest.json",
+    "prompt_view_scenario_a": "prompt-view-scenario-a.json",
+    "prompt_view_scenario_a2": "prompt-view-scenario-a2.json",
+    "prompt_view_scenario_b": "prompt-view-scenario-b.json",
+    "result_packet": "result-packet.json",
+    "offline_scorer_output": "offline-scorer-output.json",
+    "reviewer_adjudication_summary": "reviewer-adjudication-summary.json",
+}
 
 TRACE_EVENT_TYPES = (
     "runner_setup",
@@ -213,6 +239,19 @@ def build_live_counter_template() -> dict[str, str]:
     return {key: UNAVAILABLE for key in LIVE_COUNTER_FIELDS}
 
 
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sha256_canonical_json(value: Any) -> str:
+    return f"sha256:{hashlib.sha256(canonical_json_bytes(value)).hexdigest()}"
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def build_harness_artifact_schema_contract() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -312,6 +351,546 @@ def build_harness_artifact_validation_payload(
             "results": [result.to_dict() for result in results],
         }
     }
+
+
+def build_harness_dry_run_artifacts_payload(
+    *,
+    case_id: str = DEFAULT_DRY_RUN_CASE_ID,
+    output_dir: Path,
+    pilot_selection_path: Path = DEFAULT_PILOT_SELECTION_PATH,
+    case_packets_path: Path = DEFAULT_CASE_PACKETS_PATH,
+    first_wave_blocker_path: Path = DEFAULT_FIRST_WAVE_BLOCKER_PATH,
+    report_output: Path | None = None,
+) -> dict[str, Any]:
+    pilot_selection = _load_json_object(pilot_selection_path)
+    case_packets = _load_json_object(case_packets_path)
+    first_wave_blocker = _load_json_object(first_wave_blocker_path)
+
+    selected_case = _find_case_by_id(pilot_selection.get("selected_cases"), case_id, "selected_cases")
+    case_packet = _find_case_by_id(case_packets.get("packets"), case_id, "packets")
+    manual_view = _require_object((case_packet.get("views") or {}).get("manual_default_blind"), "manual_default_blind")
+    jsonl_view = _require_object((case_packet.get("views") or {}).get("jsonl_assisted"), "jsonl_assisted")
+
+    missing_manual_keys = [key for key in MANUAL_BLIND_HASH_KEYS if key not in manual_view]
+    if missing_manual_keys:
+        raise ValueError(f"manual_default_blind missing required keys: {', '.join(missing_manual_keys)}")
+    manual_hash_basis = {key: manual_view[key] for key in MANUAL_BLIND_HASH_KEYS}
+    manual_hash = sha256_canonical_json(manual_hash_basis)
+    scenario_b_descriptor = _scenario_b_descriptor(case_id, case_packets_path, jsonl_view)
+    scenario_b_hash = sha256_canonical_json(scenario_b_descriptor)
+
+    artifacts = _build_dry_run_artifacts(
+        case_id=case_id,
+        output_dir=output_dir,
+        selected_case=selected_case,
+        case_packet=case_packet,
+        manual_hash=manual_hash,
+        scenario_b_hash=scenario_b_hash,
+        scenario_b_descriptor=scenario_b_descriptor,
+        pilot_selection_path=pilot_selection_path,
+        case_packets_path=case_packets_path,
+        first_wave_blocker_path=first_wave_blocker_path,
+        first_wave_blocker=first_wave_blocker,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_paths: dict[str, str] = {}
+    for key, payload in artifacts.items():
+        path = output_dir / DRY_RUN_ARTIFACT_FILENAMES[key]
+        write_json_file(path, payload)
+        artifact_paths[key] = str(path)
+
+    validation_payload = build_harness_artifact_validation_payload(
+        artifact_paths=tuple(Path(path) for path in artifact_paths.values())
+    )
+    report_path = None
+    if report_output is not None:
+        report_output.parent.mkdir(parents=True, exist_ok=True)
+        report_output.write_text(
+            render_harness_dry_run_artifacts_report(
+                case_id=case_id,
+                artifact_paths=artifact_paths,
+                validation_payload=validation_payload,
+                manual_hash=manual_hash,
+                scenario_b_hash=scenario_b_hash,
+            ),
+            encoding="utf-8",
+        )
+        report_path = str(report_output)
+
+    return {
+        "harness_dry_run_artifacts": {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": DRY_RUN_TASK_ID,
+            "status": validation_payload["harness_artifact_validation"]["status"],
+            "mode": "non_live_committed_safe_dry_run_artifact_build",
+            "case_id": case_id,
+            "run_id": DRY_RUN_RUN_ID,
+            "output_dir": str(output_dir),
+            "report_output": report_path,
+            "artifact_paths": artifact_paths,
+            "prompt_hashes": {
+                "scenario_a": manual_hash,
+                "scenario_a2": manual_hash,
+                "scenario_b": scenario_b_hash,
+            },
+            "scenario_a_a2_hash_basis_keys": list(MANUAL_BLIND_HASH_KEYS),
+            "scenario_a2_calibration_only": True,
+            "live_benchmark_run_performed": False,
+            "model_send_performed": False,
+            "codex_exec_performed": False,
+            "docker_action_performed": False,
+            "network_action_performed": False,
+            "scenario_b_execution_performed": False,
+            "private_corpus_materialized": False,
+            "corpus_mutation_performed": False,
+            "claim_boundary_enforced": True,
+            "missing_live_counter_value": UNAVAILABLE,
+            "validation_status": validation_payload["harness_artifact_validation"]["status"],
+            "validation_summary": validation_payload["harness_artifact_validation"]["summary"],
+        }
+    }
+
+
+def render_harness_dry_run_artifacts_report(
+    *,
+    case_id: str,
+    artifact_paths: dict[str, str],
+    validation_payload: dict[str, Any],
+    manual_hash: str,
+    scenario_b_hash: str,
+) -> str:
+    validation = validation_payload["harness_artifact_validation"]
+    summary = validation["summary"]
+    lines = [
+        "# JSH-080c One-Case Dry-Run Prompt And Result Skeleton Builder",
+        "",
+        f"**Status:** `{validation['status']}`",
+        f"**Case:** `{case_id}`",
+        "**Mode:** `non_live_committed_safe_dry_run_artifact_build`",
+        "**Live/model work:** `not_performed`",
+        "**Scenario B execution:** `not_performed`",
+        "**Corpus materialization or mutation:** `not_performed`",
+        "**Result claims:** `false`",
+        "",
+        "## Generated Artifacts",
+        "",
+    ]
+    for key in DRY_RUN_ARTIFACT_FILENAMES:
+        lines.append(f"- `{key}`: `{artifact_paths[key]}`")
+    lines.extend(
+        [
+            "",
+            "## Prompt Hashes",
+            "",
+            f"- Scenario A and A2 blind hash: `{manual_hash}`",
+            f"- Scenario B committed-safe descriptor hash: `{scenario_b_hash}`",
+            "- Scenario A and A2 hash basis fields: `task_prompt`, `generic_allowed_tools`, `caps`, `output_schema`, `privacy_rules`.",
+            "- Scenario A2 is calibration-only and remains separate from Scenario A.",
+            "",
+            "## Validation",
+            "",
+            f"- Validator status: `{validation['status']}`",
+            f"- Checked files: `{summary['checked_files']}`",
+            f"- Error count: `{summary['error_count']}`",
+            f"- Warning count: `{summary['warning_count']}`",
+            "",
+            "## Boundary Notes",
+            "",
+            "- This task built committed-safe skeleton files only.",
+            "- Missing live counters remain the literal `unavailable`.",
+            "- Every claim-boundary flag remains `false`.",
+            "- Downstream live/result tasks, including `jsh-075d`, `jsh-075e`, and `jsh-076`, remain blocked.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _build_dry_run_artifacts(
+    *,
+    case_id: str,
+    output_dir: Path,
+    selected_case: dict[str, Any],
+    case_packet: dict[str, Any],
+    manual_hash: str,
+    scenario_b_hash: str,
+    scenario_b_descriptor: dict[str, Any],
+    pilot_selection_path: Path,
+    case_packets_path: Path,
+    first_wave_blocker_path: Path,
+    first_wave_blocker: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    case_family_id = str(case_packet["family"])
+    corpus_manifest_id = f"{DRY_RUN_ID}-corpus-manifest"
+    prompt_view_ids = {
+        "prompt_view_scenario_a": f"{DRY_RUN_ID}-prompt-view-scenario-a",
+        "prompt_view_scenario_a2": f"{DRY_RUN_ID}-prompt-view-scenario-a2",
+        "prompt_view_scenario_b": f"{DRY_RUN_ID}-prompt-view-scenario-b",
+    }
+    case_pointer = f"{case_packets_path}#/packets[case_id={case_id}]"
+    manual_pointer = f"{case_pointer}/views/manual_default_blind"
+    jsonl_pointer = f"{case_pointer}/views/jsonl_assisted"
+
+    case_registry = _base_artifact("case_registry")
+    case_registry.update(
+        {
+            "registry_id": f"{DRY_RUN_ID}-case-registry",
+            "dry_run_id": DRY_RUN_ID,
+            "selected_case_policy": "fixed_reviewed_one_case_only",
+            "source_artifacts": {
+                "pilot_selection": str(pilot_selection_path),
+                "case_packets": str(case_packets_path),
+                "first_wave_blocker": str(first_wave_blocker_path),
+            },
+            "cases": [
+                {
+                    "case_id": case_id,
+                    "case_family_id": case_family_id,
+                    "candidate_type": selected_case.get("candidate_type"),
+                    "source_batch": selected_case.get("source_batch"),
+                    "difficulty_dimensions": selected_case.get("difficulty_dimensions", []),
+                    "duplicate_label": (selected_case.get("duplicate_metadata") or {}).get("duplicate_label"),
+                    "scenario_labels": list(SCENARIO_LABELS),
+                    "corpus_manifest_id": corpus_manifest_id,
+                    "prompt_view_manifest_ids": list(prompt_view_ids.values()),
+                    "committed_safe_case_pointer": case_pointer,
+                }
+            ],
+        }
+    )
+
+    corpus_manifest = _base_artifact("corpus_manifest")
+    corpus_manifest.update(
+        {
+            "corpus_manifest_id": corpus_manifest_id,
+            "dry_run_id": DRY_RUN_ID,
+            "case_id": case_id,
+            "source_policy": "same_read_only_neutral_committed_safe_manifest_only",
+            "read_only_required": True,
+            "private_payload_materialized": False,
+            "corpus_mutation_performed": False,
+            "content_inventory": {
+                "file_count": UNAVAILABLE,
+                "byte_count": UNAVAILABLE,
+                "inventory_basis": "not_measured_in_non_live_dry_run",
+            },
+            "equal_corpus_access_policy": {
+                "scenario_a": "same_neutral_corpus_manifest_only",
+                "scenario_a2": "same_neutral_corpus_manifest_only",
+                "scenario_b": "same_neutral_corpus_manifest_only",
+                "corpus_materialization_status": "not_performed",
+            },
+            "committed_safe_sources": [str(pilot_selection_path), str(case_packets_path), str(first_wave_blocker_path)],
+        }
+    )
+
+    prompt_a = _prompt_view_artifact(
+        prompt_view_id=prompt_view_ids["prompt_view_scenario_a"],
+        scenario_label=SCENARIO_LABELS[0],
+        prompt_hash=manual_hash,
+        hash_scope="canonical_json_manual_default_blind_five_key_basis",
+        allowed_sections=list(MANUAL_BLIND_HASH_KEYS),
+        source_view_pointer=manual_pointer,
+        model_visible_descriptor=_manual_model_visible_descriptor(
+            prompt_view_id=prompt_view_ids["prompt_view_scenario_a"],
+            scenario_label=SCENARIO_LABELS[0],
+            prompt_hash=manual_hash,
+        ),
+        contamination_scan_input=_contamination_scan_input(
+            scan_id=f"{DRY_RUN_ID}-scenario-a-contamination-scan-input",
+            prompt_hash=manual_hash,
+            forbidden_fields=[
+                "case_id",
+                "candidate_id",
+                "project_stratum_id",
+                "source_cluster_id",
+                "private_packet_id",
+                "jsonl_helper_hints",
+                "task_or_review_state",
+                "prior_result_hints",
+                "local_user_paths",
+                "session_identifiers",
+                "transcript_text",
+            ],
+        ),
+        metadata={
+            "case_id": case_id,
+            "hash_basis_source_pointer": manual_pointer,
+            "hash_basis_keys": list(MANUAL_BLIND_HASH_KEYS),
+            "model_visible_descriptor_excludes_case_metadata": True,
+        },
+    )
+    prompt_a2 = _prompt_view_artifact(
+        prompt_view_id=prompt_view_ids["prompt_view_scenario_a2"],
+        scenario_label=SCENARIO_LABELS[1],
+        prompt_hash=manual_hash,
+        hash_scope="canonical_json_manual_default_blind_five_key_basis_shared_with_scenario_a",
+        allowed_sections=list(MANUAL_BLIND_HASH_KEYS),
+        source_view_pointer=manual_pointer,
+        model_visible_descriptor=_manual_model_visible_descriptor(
+            prompt_view_id=prompt_view_ids["prompt_view_scenario_a2"],
+            scenario_label=SCENARIO_LABELS[1],
+            prompt_hash=manual_hash,
+            calibration_only=True,
+        ),
+        contamination_scan_input=_contamination_scan_input(
+            scan_id=f"{DRY_RUN_ID}-scenario-a2-contamination-scan-input",
+            prompt_hash=manual_hash,
+            forbidden_fields=[
+                "case_id",
+                "candidate_id",
+                "project_stratum_id",
+                "source_cluster_id",
+                "private_packet_id",
+                "jsonl_helper_hints",
+                "task_or_review_state",
+                "prior_result_hints",
+                "local_user_paths",
+                "session_identifiers",
+                "transcript_text",
+            ],
+        ),
+        metadata={
+            "case_id": case_id,
+            "hash_basis_source_pointer": manual_pointer,
+            "hash_basis_keys": list(MANUAL_BLIND_HASH_KEYS),
+            "calibration_only": True,
+            "merged_into_scenario_a": False,
+        },
+    )
+    prompt_b = _prompt_view_artifact(
+        prompt_view_id=prompt_view_ids["prompt_view_scenario_b"],
+        scenario_label=SCENARIO_LABELS[2],
+        prompt_hash=scenario_b_hash,
+        hash_scope="canonical_json_committed_safe_jsonl_assisted_descriptor_only",
+        allowed_sections=["same_case_jsonl_assisted_descriptor", "approved_tools", "private_packet_id"],
+        source_view_pointer=jsonl_pointer,
+        model_visible_descriptor={
+            "prompt_view_id": prompt_view_ids["prompt_view_scenario_b"],
+            "scenario_label": SCENARIO_LABELS[2],
+            "descriptor": scenario_b_descriptor,
+            "prompt_hash_sha256": scenario_b_hash,
+            "prompt_text_committed": False,
+            "private_packet_payload_committed": False,
+        },
+        contamination_scan_input=_contamination_scan_input(
+            scan_id=f"{DRY_RUN_ID}-scenario-b-contamination-scan-input",
+            prompt_hash=scenario_b_hash,
+            forbidden_fields=[
+                "cross_case_packets",
+                "post_hoc_roots",
+                "source_lines",
+                "transcript_text",
+                "model_output_text",
+                "auth_material",
+                "local_user_paths",
+                "scenario_a_outputs",
+                "scenario_a2_outputs",
+            ],
+        ),
+        metadata={
+            "case_id": case_id,
+            "hash_basis_source_pointer": jsonl_pointer,
+            "private_packet_payload_committed": False,
+            "private_packet_payload_hash_sha256": UNAVAILABLE,
+        },
+    )
+
+    result_packet = _base_artifact("result_packet")
+    result_packet.update(
+        {
+            "run_id": DRY_RUN_RUN_ID,
+            "dry_run_id": DRY_RUN_ID,
+            "case_id": case_id,
+            "status": "skeleton_no_live_result",
+            "live_benchmark_run_performed": False,
+            "model_send_performed": False,
+            "scenario_b_execution_performed": False,
+            "scenario_status": {
+                "scenario_a": "not_run_non_live_dry_run_only",
+                "scenario_a2": "not_run_calibration_only",
+                "scenario_b": "not_run_non_live_descriptor_only",
+            },
+            "comparison": {
+                "winner": UNAVAILABLE,
+                "speed_result": UNAVAILABLE,
+                "value_result": UNAVAILABLE,
+                "correctness_result": UNAVAILABLE,
+                "source_hit_result": UNAVAILABLE,
+                "token_efficiency_result": UNAVAILABLE,
+            },
+            "downstream_blockers": {
+                "jsh-075d": "blocked",
+                "jsh-075e": "blocked",
+                "jsh-076": "blocked",
+            },
+        }
+    )
+
+    offline_scorer_output = _base_artifact("offline_scorer_output")
+    offline_scorer_output.update(
+        {
+            "scorer_output_id": f"{DRY_RUN_ID}-offline-scorer-output",
+            "run_id": DRY_RUN_RUN_ID,
+            "dry_run_id": DRY_RUN_ID,
+            "status": "not_run",
+            "scorer_dimensions": list(SCORER_DIMENSIONS),
+            "scores": {dimension: UNAVAILABLE for dimension in SCORER_DIMENSIONS},
+            "input_result_packet": DRY_RUN_ARTIFACT_FILENAMES["result_packet"],
+            "scoring_basis": "no_model_output_or_live_trace_available",
+        }
+    )
+
+    reviewer_summary = _base_artifact("reviewer_adjudication_summary")
+    reviewer_summary.update(
+        {
+            "review_id": f"{DRY_RUN_ID}-reviewer-adjudication-summary",
+            "run_id": DRY_RUN_RUN_ID,
+            "dry_run_id": DRY_RUN_ID,
+            "adjudication_status": "not_adjudicated",
+            "reviewed_live_gate_exists": False,
+            "adjudication": {
+                "reviewer_verdict": UNAVAILABLE,
+                "correctness": UNAVAILABLE,
+                "source_hit": UNAVAILABLE,
+                "residual_risk": [
+                    "non_live_dry_run_only",
+                    "independent_review_required",
+                ],
+            },
+        }
+    )
+
+    claim_boundary = first_wave_blocker.get("result_claim_boundary") or {}
+    result_packet["upstream_claim_boundary_snapshot"] = {
+        "reviewed_clean_live_one_case_result_packet_exists": claim_boundary.get(
+            "reviewed_clean_live_one_case_result_packet_exists", False
+        ),
+        "winner_claim_created": claim_boundary.get("winner_claim_created", False),
+        "correctness_claim_created": claim_boundary.get("correctness_claim_created", False),
+        "source_hit_claim_created": claim_boundary.get("source_hit_claim_created", False),
+        "token_efficiency_claim_created": claim_boundary.get("token_efficiency_claim_created", False),
+    }
+
+    return {
+        "case_registry": case_registry,
+        "corpus_manifest": corpus_manifest,
+        "prompt_view_scenario_a": prompt_a,
+        "prompt_view_scenario_a2": prompt_a2,
+        "prompt_view_scenario_b": prompt_b,
+        "result_packet": result_packet,
+        "offline_scorer_output": offline_scorer_output,
+        "reviewer_adjudication_summary": reviewer_summary,
+    }
+
+
+def _base_artifact(family: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_family": family,
+        "privacy_layer": "committed_safe_sanitized",
+        "live_counters": build_live_counter_template(),
+        "claim_boundary": build_claim_boundary_template(),
+    }
+
+
+def _prompt_view_artifact(
+    *,
+    prompt_view_id: str,
+    scenario_label: str,
+    prompt_hash: str,
+    hash_scope: str,
+    allowed_sections: list[str],
+    source_view_pointer: str,
+    model_visible_descriptor: dict[str, Any],
+    contamination_scan_input: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    artifact = _base_artifact("prompt_view_manifest")
+    artifact.update(
+        {
+            "prompt_view_id": prompt_view_id,
+            "scenario_label": scenario_label,
+            "allowed_sections": allowed_sections,
+            "prompt_text_committed": False,
+            "prompt_hash_sha256": prompt_hash,
+            "prompt_hash_scope": hash_scope,
+            "source_view_pointer": source_view_pointer,
+            "model_visible_prompt_view_descriptor": model_visible_descriptor,
+            "contamination_scan_input": contamination_scan_input,
+            "metadata": metadata,
+        }
+    )
+    return artifact
+
+
+def _manual_model_visible_descriptor(
+    *,
+    prompt_view_id: str,
+    scenario_label: str,
+    prompt_hash: str,
+    calibration_only: bool = False,
+) -> dict[str, Any]:
+    return {
+        "prompt_view_id": prompt_view_id,
+        "scenario_label": scenario_label,
+        "view_kind": "manual_default_blind",
+        "allowed_section_keys": list(MANUAL_BLIND_HASH_KEYS),
+        "prompt_text_committed": False,
+        "prompt_hash_sha256": prompt_hash,
+        "hash_basis_visible": False,
+        "calibration_only": calibration_only,
+    }
+
+
+def _contamination_scan_input(*, scan_id: str, prompt_hash: str, forbidden_fields: list[str]) -> dict[str, Any]:
+    return {
+        "scan_input_id": scan_id,
+        "input_kind": "prompt_view_manifest_descriptor_only",
+        "prompt_hash_sha256": prompt_hash,
+        "prompt_text_available_for_scan": False,
+        "forbidden_model_visible_fields": forbidden_fields,
+        "scan_status": "not_run_input_manifest_only",
+    }
+
+
+def _scenario_b_descriptor(case_id: str, case_packets_path: Path, jsonl_view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "case_id": case_id,
+        "committed_pointer": f"{case_packets_path}#/packets[case_id={case_id}]/views/jsonl_assisted",
+        "private_packet_id": jsonl_view.get("private_packet_id"),
+        "private_packet_payload_committed": False,
+        "private_packet_payload_status": "not_materialized_ignored_private_artifact_only",
+        "private_packet_payload_hash_sha256": UNAVAILABLE,
+        "approved_tools": jsonl_view.get("approved_tools", []),
+        "view_storage": jsonl_view.get("view_storage"),
+        "private_ref_storage": jsonl_view.get("private_ref_storage"),
+    }
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in {path}: {exc}") from exc
+    return _require_object(payload, str(path))
+
+
+def _require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _find_case_by_id(cases: Any, case_id: str, label: str) -> dict[str, Any]:
+    if not isinstance(cases, list):
+        raise ValueError(f"{label} must be a list")
+    matches = [item for item in cases if isinstance(item, dict) and item.get("case_id") == case_id]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one {label} entry for case_id {case_id}, found {len(matches)}")
+    return matches[0]
 
 
 def _artifact_schema_entry(family: str) -> dict[str, Any]:
