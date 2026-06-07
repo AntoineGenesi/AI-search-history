@@ -120,11 +120,23 @@ def build_agent_find_payload(
             "searched_bytes": search_result.get("searched_bytes", 0),
         },
     }
-    return {"agent_find": agent_find, "source_plan": source_plan}
+    handoff = build_source_locator_handoff(
+        source_plan=source_plan,
+        search_result=search_result,
+        candidates=candidate_dicts,
+        next_reads=next_reads_from_candidates(candidates),
+        source_family="local_ai_conversation_jsonl",
+        question_family={
+            "primary": "agent_find",
+        },
+    )
+    agent_find["source_locator_handoff"] = handoff
+    return {"agent_find": agent_find}
 
 
 def command_surface() -> dict[str, str]:
     return {
+        "source-locator-handoff": "Stable handoff field with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
         "find-candidates": "Returns compact candidate rows with source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
         "broaden-query": "Shows exact, normalized, typo/fuzzy, synonym/paraphrase, artifact/path, cwd/project, date-window, role, and local semantic families.",
@@ -408,6 +420,188 @@ def build_plan_sources(
                 "limitations": duplicate_risk.get("limitations", []),
             }
     return payload
+
+
+def build_source_locator_handoff(
+    *,
+    source_plan: dict,
+    search_result: dict,
+    candidates: list[dict[str, Any]] | list[CandidateRow] | None = None,
+    next_reads: list[dict[str, Any]] | None = None,
+    source_family: str = "local_ai_conversation_jsonl",
+    question_family: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the stable agent handoff for deciding where to read next."""
+    source_scope = build_source_scope_summary(source_plan, search_result)
+    sources = source_plan.get("sources", {})
+    cap_hit = compact_handoff_caps(source_scope["cap_hit"])
+    candidate_rows = list(candidates or [])
+    candidate_count = len(candidate_rows) or sum(len(group.get("matches", [])) for group in search_result.get("groups", []))
+    next_read_rows = list(next_reads or [])
+    if not next_read_rows:
+        next_read_rows = next_reads_from_candidates(candidate_rows)
+    return {
+        "schema_version": 1,
+        "source_family": {
+            "primary": source_family,
+            "selected_kinds": sorted({root.get("kind", "unknown") for root in sources.get("roots", [])}),
+        },
+        "question_family": question_family
+        or {
+            "primary": "source_location",
+            "detected_supported": ["source_location", "bounded_no_evidence"],
+        },
+        "selected_roots": source_scope["selected_roots"],
+        "rejected_roots": source_scope["excluded_scope"]["rejected_roots"],
+        "caps": cap_hit,
+        "warnings": sanitized_handoff_messages(search_result.get("warnings", []) or sources.get("warnings", [])),
+        "blind_spots": source_locator_blind_spots(source_scope, search_result, sources),
+        "not_searched_scope": compact_handoff_not_searched_scope(source_scope["not_searched_scope"], cap_hit),
+        "candidate_ordering": {
+            "strategy": "score_desc_timestamp_desc; timeline_timestamp_asc",
+            "candidate_count": candidate_count,
+            "top_candidates": compact_handoff_candidates(candidate_rows),
+        },
+        "next_reads": next_read_rows[:8],
+        "no_evidence_meaning": {
+            "answer_scope": "not_found_in_searched_scope",
+            "not_all_history_absence": True,
+            "meaning": "No match survived selected roots, caps, filters, and parser scope.",
+        },
+        "privacy_boundaries": {
+            "root_metadata_raw_paths_included": False,
+            "raw_private_text_or_bridge_payload_included": False,
+            "vectors_indexes_or_timestamp_sidecars_created": False,
+            "candidate_source_refs_may_point_to_local_transcripts": bool(candidate_count),
+        },
+        "claim_boundaries": {
+            "root_cause_claim": "not_claimed",
+            "no_broad_value_speed_token_user_benefit_or_jsonl_beats_default_claim": True,
+            "measurement_deferred_to": ["jsh-601c", "jsh-601d", "jsh-601e"],
+            "no_evidence_is_scope_limited": True,
+        },
+        "non_default_routes": ["embeddings:not_run", "timestamp_sidecars:not_run", "semantic_linter_runtime:not_used", "private_bridges:not_included", "broad_drive_scans:guarded"],
+    }
+
+
+def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    for candidate in candidates[:5]:
+        if isinstance(candidate, CandidateRow):
+            ref = candidate.source_ref
+            candidate_id = candidate.candidate_id
+        else:
+            ref = candidate.get("source_ref", {})
+            candidate_id = candidate.get("candidate_id")
+        if ref.get("path"):
+            reads.append(
+                {
+                    "kind": "jsonl_source_ref",
+                    "target": str(candidate_id or ""),
+                    "reason": "open candidate source_ref before broad search",
+                }
+            )
+    return reads
+
+
+def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
+    compacted = []
+    for candidate in candidates[:5]:
+        if isinstance(candidate, CandidateRow):
+            compacted.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "rank": candidate.rank,
+                    "timestamp_utc": candidate.timestamp_utc,
+                    "confidence": candidate.confidence,
+                }
+            )
+        else:
+            compacted.append(
+                {
+                    "candidate_id": candidate.get("candidate_id"),
+                    "rank": candidate.get("rank"),
+                    "timestamp_utc": candidate.get("timestamp_utc"),
+                    "confidence": candidate.get("confidence"),
+                }
+            )
+    return compacted
+
+
+def compact_handoff_caps(cap_hit: dict[str, Any]) -> dict[str, Any]:
+    limits = cap_hit.get("limits", {})
+    return {
+        "hit": bool(cap_hit.get("hit")),
+        "caps_hit": list(cap_hit.get("caps_hit", [])),
+        "normalized_warnings": list(cap_hit.get("normalized_warnings", [])),
+        "limits": {
+            "effective_files": limits.get("effective_files"),
+            "effective_bytes": limits.get("effective_bytes"),
+        },
+    }
+
+
+def compact_handoff_not_searched_scope(not_searched: dict[str, Any], caps: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "missing_root_count": not_searched.get("missing_root_count", 0),
+        "missing_roots": list(not_searched.get("missing_roots", [])),
+        "cap_limited": {"hit": caps.get("hit", False), "caps_hit": list(caps.get("caps_hit", []))},
+        "outside_selected_roots": not_searched.get("outside_selected_roots"),
+    }
+
+
+def source_locator_blind_spots(source_scope: dict[str, Any], search_result: dict, sources: dict) -> list[str]:
+    labels: set[str] = set()
+    if not source_scope.get("selected_roots"):
+        labels.add("no_selected_transcript_roots")
+    if source_scope.get("excluded_scope", {}).get("rejected_root_count", 0):
+        labels.add("some_requested_roots_rejected_before_traversal")
+    if source_scope.get("not_searched_scope", {}).get("missing_root_count", 0):
+        labels.add("some_selected_roots_missing_or_inaccessible")
+    if source_scope.get("cap_hit", {}).get("hit"):
+        labels.add("selected_scope_limited_by_caps")
+    if not search_result.get("groups"):
+        labels.add("no_candidates_in_searched_scope")
+    for item in list(search_result.get("blind_spots", []) or sources.get("blind_spots", [])):
+        if "No transcript roots selected" in item:
+            labels.add("no_selected_transcript_roots")
+        elif "Missing transcript root:" in item:
+            labels.add("some_selected_roots_missing_or_inaccessible")
+        else:
+            labels.add("blind_spot_details_sanitized")
+    return sorted(labels)
+
+
+def sanitized_handoff_messages(messages: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for message in messages:
+        value = sanitize_handoff_message(message)
+        if value and value not in sanitized:
+            sanitized.append(value)
+    return sanitized
+
+
+def sanitize_handoff_message(message: str) -> str | None:
+    if not message:
+        return None
+    lowered = message.lower()
+    if "max file cap" in lowered:
+        return "Stopped at max file cap."
+    if "max byte cap" in lowered:
+        return "Stopped at max byte cap."
+    if "max match cap" in lowered or "retention-capped" in lowered:
+        return "Candidate retention or scanning stopped at max match cap."
+    if "max elapsed cap" in lowered:
+        return "Stopped at max elapsed cap."
+    if "reservoir-capped" in lowered:
+        return "Weak-candidate reservoir was capped."
+    if "missing transcript root" in lowered:
+        return "A selected transcript root was missing or inaccessible."
+    if "arbitrary root enabled" in lowered:
+        return "Arbitrary root enabled for an explicit selected root; strict hard caps apply."
+    if "symlink escape" in lowered:
+        return "Skipped a symlink escape outside the selected root."
+    return "Warning details sanitized; inspect full local run output only when privacy boundaries allow it."
 
 
 def build_broaden_query(query: dict) -> dict:

@@ -261,6 +261,14 @@ def build_jsonl_candidate_discovery(plan: SourcePlan, *, explicit_roots_provided
                 "privacy_warnings": discovery_privacy_warnings(),
                 "limits": plan.limits.to_dict(),
                 "limitations": discovery_limitations(),
+                "source_locator_handoff": discovery_source_locator_handoff(
+                    plan,
+                    selected_roots=[],
+                    rejected_roots=[],
+                    candidates=[],
+                    cap_hits=empty_cap_hits(),
+                    warnings=warnings,
+                ),
             }
         }
 
@@ -317,6 +325,14 @@ def build_jsonl_candidate_discovery(plan: SourcePlan, *, explicit_roots_provided
             "privacy_warnings": discovery_privacy_warnings(plan),
             "limits": plan.limits.to_dict(),
             "limitations": discovery_limitations(),
+            "source_locator_handoff": discovery_source_locator_handoff(
+                plan,
+                selected_roots=selected_roots,
+                rejected_roots=rejected_roots,
+                candidates=candidates,
+                cap_hits=cap_hits,
+                warnings=warnings,
+            ),
         }
     }
 
@@ -501,6 +517,96 @@ def discovery_limitations() -> list[str]:
         "It does not prove deleted, unmounted, inaccessible, or unapproved logs are absent.",
         "It does not parse transcript contents or classify sessions by provider beyond source-plan/root metadata.",
     ]
+
+
+def discovery_source_locator_handoff(
+    plan: SourcePlan,
+    *,
+    selected_roots: list[dict],
+    rejected_roots: list[dict],
+    candidates: list[dict],
+    cap_hits: dict,
+    warnings: list[str],
+) -> dict:
+    return {
+        "schema_version": 1,
+        "source_family": {
+            "primary": "jsonl_candidate_discovery",
+            "selected_kinds": sorted({root.get("kind", "unknown") for root in selected_roots}),
+        },
+        "question_family": {
+            "primary": "source_location",
+            "detected_supported": ["candidate_file_discovery", "root_safety", "bounded_not_searched_scope"],
+        },
+        "selected_roots": selected_roots,
+        "rejected_roots": rejected_roots,
+        "caps": {
+            "hit": any(cap_hits.values()),
+            "caps_hit": sorted(name for name, hit in cap_hits.items() if hit),
+            "raw": cap_hits,
+            "limits": plan.limits.to_dict(),
+        },
+        "warnings": warnings,
+        "blind_spots": discovery_handoff_blind_spots(plan, cap_hits, candidates),
+        "not_searched_scope": not_searched_scope(plan, cap_hits),
+        "candidate_ordering": {
+            "strategy": "bounded depth-first explicit-root enumeration; per-directory names sorted newest-ish by descending filename",
+            "candidate_count": len(candidates),
+            "metadata_only": True,
+            "top_candidates": [
+                {
+                    "candidate_id": candidate.get("candidate_id"),
+                    "root_label": candidate.get("root_label"),
+                    "source_kind": candidate.get("source_kind"),
+                    "path_label": candidate.get("path_label"),
+                    "path_hash": candidate.get("path_hash"),
+                    "file_size_bytes": candidate.get("file_size_bytes"),
+                    "mtime_utc": candidate.get("mtime_utc"),
+                }
+                for candidate in candidates[:8]
+            ],
+        },
+        "next_reads": [
+            {
+                "kind": "candidate_jsonl_file",
+                "target": candidate.get("path_label"),
+                "reason": "open this candidate only if its root label and metadata match the source-location question",
+            }
+            for candidate in candidates[:5]
+        ],
+        "no_evidence_meaning": {
+            "answer_scope": "no_candidate_files_found_or_retained_in_discovery_scope",
+            "not_all_history_absence": True,
+            "meaning": "No candidates here means no JSONL files were discovered under the explicit approved roots before caps; other roots, deleted logs, unmounted drives, and transcript contents were not searched.",
+        },
+        "privacy_boundaries": {
+            "metadata_only": True,
+            "raw_local_paths_filenames_session_ids_or_transcript_text_included": False,
+            "raw_private_bridge_payload_included": False,
+            "vectors_indexes_or_timestamp_sidecars_created": False,
+        },
+        "claim_boundaries": {
+            "root_cause_claim": "not_claimed",
+            "no_broad_value_speed_token_user_benefit_or_jsonl_beats_default_claim": True,
+            "measurement_deferred_to": ["jsh-601c", "jsh-601d", "jsh-601e"],
+            "no_evidence_is_scope_limited": True,
+        },
+    }
+
+
+def discovery_handoff_blind_spots(plan: SourcePlan, cap_hits: dict, candidates: list[dict]) -> list[str]:
+    labels: set[str] = set()
+    if not plan.roots:
+        labels.add("no_selected_roots")
+    if plan.rejected_roots:
+        labels.add("some_requested_roots_rejected_before_traversal")
+    if any(cap_hits.values()):
+        labels.add("selected_scope_limited_by_caps")
+    if not candidates:
+        labels.add("no_candidate_files_in_discovery_scope")
+    if any(not root.path.expanduser().exists() for root in plan.roots):
+        labels.add("some_selected_roots_missing_or_inaccessible")
+    return sorted(labels)
 
 
 def source_kind_for_path(path: Path, plan: SourcePlan) -> str:

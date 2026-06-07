@@ -954,6 +954,7 @@ def main(argv: list[str] | None = None) -> int:
                     "report_written": str(Path(args.report_output).expanduser()),
                     "candidate_count": len(packet["strongest_candidates"]),
                     "event_count": packet["tool_action_proof"]["event_count"],
+                    "source_locator_handoff": packet["source_locator_handoff"],
                     "next_reads": packet["next_reads"][:5],
                     "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
                 }
@@ -1245,6 +1246,7 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
             "candidate_count": report["token_efficiency"]["candidate_count"],
             "searched_files": report["token_efficiency"]["searched_files"],
             "searched_bytes": report["token_efficiency"]["searched_bytes"],
+            "source_locator_handoff": report["source_locator_handoff"],
             "top_candidates": report["find_candidates"][:3],
             "next_search_suggestions": report["next_search_suggestions"],
             "message": "Full find report written to report_output; stdout is a compact handoff map.",

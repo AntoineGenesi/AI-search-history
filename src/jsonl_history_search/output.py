@@ -201,6 +201,8 @@ def render_semantic_debug_text(payload: dict) -> str:
     ]
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
+    if report.get("source_locator_handoff"):
+        lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
@@ -223,8 +225,15 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         f"**Root cause:** not claimed",
         f"**Packet bytes/tokens:** {tradeoffs.get('packet_basis_bytes', 0)} / {tradeoffs.get('packet_basis_estimated_tokens', 0)}",
         "",
-        "## Strongest Candidates",
+        "## Source Locator Handoff",
+        "",
     ]
+    if report.get("source_locator_handoff"):
+        lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
+    lines.extend([
+        "",
+        "## Strongest Candidates",
+    ])
     for item in report.get("strongest_candidates", [])[:8]:
         ref = item.get("source_ref") or {}
         lines.append(
@@ -1070,6 +1079,59 @@ def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
 
+def render_source_locator_handoff_text(handoff: dict) -> list[str]:
+    not_searched = handoff.get("not_searched_scope", {})
+    candidate_ordering = handoff.get("candidate_ordering", {})
+    caps = handoff.get("caps", {})
+    no_evidence = handoff.get("no_evidence_meaning", {})
+    lines = [
+        "Source locator handoff:",
+        (
+            "- roots: "
+            f"{len(handoff.get('selected_roots', []))} selected, "
+            f"{len(handoff.get('rejected_roots', []))} rejected, "
+            f"{not_searched.get('missing_root_count', 0)} missing"
+        ),
+        f"- candidates: {candidate_ordering.get('candidate_count', 0)} ordered by {candidate_ordering.get('strategy')}",
+        f"- no-evidence means: {no_evidence.get('answer_scope', 'not_found_in_searched_scope')}",
+    ]
+    if caps.get("hit"):
+        lines.append(f"- caps hit: {', '.join(caps.get('caps_hit', []))}")
+    for item in handoff.get("next_reads", [])[:5]:
+        lines.append(f"- next read: {item.get('kind')} {item.get('target')}")
+    return lines
+
+
+def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
+    not_searched = handoff.get("not_searched_scope", {})
+    candidate_ordering = handoff.get("candidate_ordering", {})
+    caps = handoff.get("caps", {})
+    no_evidence = handoff.get("no_evidence_meaning", {})
+    lines = [
+        (
+            f"- Roots: `{len(handoff.get('selected_roots', []))}` selected, "
+            f"`{len(handoff.get('rejected_roots', []))}` rejected, "
+            f"`{not_searched.get('missing_root_count', 0)}` missing"
+        ),
+        f"- Candidate ordering: `{candidate_ordering.get('strategy')}`",
+        f"- Candidate count: `{candidate_ordering.get('candidate_count', 0)}`",
+        f"- No-evidence meaning: `{no_evidence.get('answer_scope', 'not_found_in_searched_scope')}`",
+    ]
+    if caps.get("hit"):
+        lines.append(f"- Caps hit: `{', '.join(caps.get('caps_hit', []))}`")
+    next_reads = handoff.get("next_reads", [])[:5]
+    if next_reads:
+        lines.extend(["", "| Kind | Target | Reason |", "| --- | --- | --- |"])
+        for item in next_reads:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(item.get('kind', '')))} | "
+                f"{_escape_markdown_table(str(item.get('target', '')))} | "
+                f"{_escape_markdown_table(str(item.get('reason', '')))} |"
+            )
+    return lines
+
+
 def render_agent_find_text(payload: dict) -> str:
     report = payload["agent_find"]
     plan_sources = report.get("plan_sources", {})
@@ -1100,6 +1162,8 @@ def render_agent_find_text(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.append(f"Cap hit: {', '.join(cap_hit.get('caps_hit', []))}")
+    if report.get("source_locator_handoff"):
+        lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", [])[:8]:
         ref = candidate.get("source_ref", {})
         lines.append(
@@ -1160,6 +1224,9 @@ def render_agent_find_markdown(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.extend(["", f"**Cap hit:** {', '.join(cap_hit.get('caps_hit', []))}"])
+    if report.get("source_locator_handoff"):
+        lines.extend(["", "## Source Locator Handoff", ""])
+        lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", []):
         ref = candidate.get("source_ref", {})
         source = f"{ref.get('path')}:{ref.get('line')}"

@@ -11,6 +11,7 @@ from typing import Any
 from .agent_contract import (
     build_agent_find_payload,
     build_source_scope_summary,
+    build_source_locator_handoff,
     estimate_tokens,
     reduction_ratio,
 )
@@ -107,6 +108,14 @@ def build_semantic_debug_payload(
     no_evidence = build_no_evidence_section(agent_find, source_scope, tool_report, forensics_payload)
     uncertainty = build_uncertainty(agent_find, source_scope, tool_report, forensics_payload, family)
     next_reads = build_next_reads(candidates, tool_proof, joins, hints)
+    source_locator_handoff = build_source_locator_handoff(
+        source_plan=source_plan,
+        search_result=result,
+        candidates=candidates,
+        next_reads=next_reads,
+        source_family="local_ai_conversation_jsonl",
+        question_family=compact_handoff_question_family(family),
+    )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
         Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
@@ -127,6 +136,7 @@ def build_semantic_debug_payload(
         "question_family": family,
         "scope": source_scope,
         "routes": routes,
+        "source_locator_handoff": source_locator_handoff,
         "strongest_candidates": candidates,
         "timeline": timeline,
         "tool_action_proof": tool_proof,
@@ -207,6 +217,14 @@ def compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             }
         )
     return compacted
+
+
+def compact_handoff_question_family(family: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "primary": family.get("primary"),
+        "detected_supported": list(family.get("detected_supported", [])),
+        "detected_unsupported": list(family.get("detected_unsupported", [])),
+    }
 
 
 def compact_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
