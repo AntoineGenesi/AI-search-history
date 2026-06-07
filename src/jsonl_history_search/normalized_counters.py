@@ -232,7 +232,7 @@ def build_normalized_counter_row(raw_row: dict[str, Any], *, task_id: str, run_i
         category_values: dict[str, Any] = {}
         for field in fields:
             found, value, source_key = _find_value(flattened, field)
-            if not found or value is None:
+            if not found or value is None or _is_unavailable_literal(value):
                 category_values[field] = unavailable(f"{field} unavailable in source row")
             else:
                 basis = ZERO_MEASURED_BASIS if _is_numeric_zero(value) else None
@@ -382,6 +382,10 @@ def _find_value(flattened: dict[str, Any], field: str) -> tuple[bool, Any, str]:
 
 def _is_numeric_zero(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
+
+
+def _is_unavailable_literal(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {"unavailable", "not_available", "not measured", "not_measured"}
 
 
 def _looks_private_text(text: str) -> bool:
