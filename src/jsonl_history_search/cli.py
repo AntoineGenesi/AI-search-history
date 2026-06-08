@@ -19,6 +19,7 @@ from .harness_artifacts import (
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
+from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
@@ -511,6 +512,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional Markdown report path for the offline scorer handoff.",
+    )
+    inspect_adapter_export = subparsers.add_parser("export-inspect-adapter-proof")
+    inspect_adapter_export.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    inspect_adapter_export.add_argument(
+        "--adjudication",
+        default=str(DEFAULT_X12G_ADJUDICATION_PATH),
+        help="Reviewed committed-safe adjudication JSON to project into the Inspect-compatible shape.",
+    )
+    inspect_adapter_export.add_argument(
+        "--sequence",
+        type=int,
+        default=3,
+        help="Reviewed row sequence to project.",
+    )
+    inspect_adapter_export.add_argument(
+        "--output",
+        required=True,
+        help="Path where the committed-safe Inspect-compatible proof JSON is written.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1150,6 +1169,15 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         print(rendered)
         return 1 if payload["harness_offline_scorer_artifacts"]["status"] == "fail" else 0
+    if args.command == "export-inspect-adapter-proof":
+        payload = write_inspect_compatible_export(
+            output_path=Path(args.output).expanduser(),
+            adjudication_path=Path(args.adjudication).expanduser(),
+            sequence=args.sequence,
+        )
+        rendered = render(payload, args.format)
+        print(rendered)
+        return 1 if payload["status"] != "pass" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)
