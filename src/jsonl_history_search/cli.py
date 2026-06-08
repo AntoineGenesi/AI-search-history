@@ -16,6 +16,7 @@ from .harness_artifacts import (
     build_harness_dry_run_artifacts_payload,
     build_harness_offline_scorer_artifacts_payload,
 )
+from .harness_loop import DEFAULT_MINIMUM_LOOP_CASE_ID, build_harness_minimum_loop_payload
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
@@ -530,6 +531,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         required=True,
         help="Path where the committed-safe Inspect-compatible proof JSON is written.",
+    )
+    minimum_loop = subparsers.add_parser("build-harness-minimum-loop")
+    minimum_loop.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    minimum_loop.add_argument(
+        "--case-id",
+        default=DEFAULT_MINIMUM_LOOP_CASE_ID,
+        help="Reviewed case id for the no-send readiness loop.",
+    )
+    minimum_loop.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where committed-safe loop artifacts are written.",
+    )
+    minimum_loop.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional Markdown report path for the user-facing readiness loop.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1178,6 +1196,15 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         print(rendered)
         return 1 if payload["status"] != "pass" else 0
+    if args.command == "build-harness-minimum-loop":
+        payload = build_harness_minimum_loop_payload(
+            output_dir=Path(args.output_dir).expanduser(),
+            case_id=args.case_id,
+            report_output=Path(args.report_output).expanduser() if args.report_output else None,
+        )
+        rendered = render(payload, args.format)
+        print(rendered)
+        return 1 if payload["harness_minimum_user_facing_loop"]["status"] != "pass" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)
