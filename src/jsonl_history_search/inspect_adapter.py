@@ -40,6 +40,24 @@ def inspect_ai_available() -> bool:
     return importlib.util.find_spec("inspect_ai") is not None
 
 
+def write_inspect_compatible_export(
+    *,
+    output_path: Path,
+    adjudication_path: Path = DEFAULT_X12G_ADJUDICATION_PATH,
+    sequence: int = 3,
+) -> dict[str, Any]:
+    export = build_inspect_compatible_export(
+        adjudication_path=adjudication_path,
+        sequence=sequence,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(export, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return export
+
+
 def build_inspect_compatible_export(
     *,
     adjudication_path: Path = DEFAULT_X12G_ADJUDICATION_PATH,
