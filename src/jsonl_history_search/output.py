@@ -4,6 +4,7 @@ import json
 
 from .metric_contract import TOKEN_FORMULA
 from .harness_loop import render_harness_minimum_loop_report, render_harness_minimum_loop_text
+from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
 
 
 def render_json(payload: dict) -> str:
@@ -59,6 +60,8 @@ def render_text(payload: dict) -> str:
         return render_harness_offline_scorer_artifacts_text(payload)
     if "harness_minimum_user_facing_loop" in payload:
         return render_harness_minimum_loop_text(payload)
+    if "harness_real_run_gate" in payload:
+        return render_real_run_gate_text(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_text(payload)
     if "embedding_experiment" in payload:
@@ -160,6 +163,8 @@ def render_markdown(payload: dict) -> str:
         return render_harness_offline_scorer_artifacts_markdown(payload)
     if "harness_minimum_user_facing_loop" in payload:
         return render_harness_minimum_loop_report(payload)
+    if "harness_real_run_gate" in payload:
+        return render_real_run_gate_report(payload)
     if "live_terminal_protocol" in payload:
         return render_live_terminal_protocol_markdown(payload)
     if "embedding_experiment" in payload:
