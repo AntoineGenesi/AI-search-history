@@ -33,6 +33,11 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
 from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
+from .real_run_gate import (
+    DEFAULT_JSH605_REVIEW_PATH,
+    DEFAULT_JSH605_SUMMARY_PATH,
+    build_real_run_gate_payload,
+)
 from .real_history_miss_audit import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_MISS_AUDIT_MANIFEST
 from .real_history_miss_audit import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_MISS_AUDIT_PRIVATE_BRIDGE
 from .real_history_miss_audit import DEFAULT_RAW_RUN as DEFAULT_REAL_HISTORY_MISS_AUDIT_RAW_RUN
@@ -548,6 +553,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional Markdown report path for the user-facing readiness loop.",
+    )
+    real_run_gate = subparsers.add_parser("build-harness-real-run-gate")
+    real_run_gate.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    real_run_gate.add_argument(
+        "--summary",
+        default=str(DEFAULT_JSH605_SUMMARY_PATH),
+        help="Verified JSH-605 minimum-loop summary JSON.",
+    )
+    real_run_gate.add_argument(
+        "--review",
+        default=str(DEFAULT_JSH605_REVIEW_PATH),
+        help="Verified JSH-605 review artifact.",
+    )
+    real_run_gate.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where the committed-safe real-run gate summary is written.",
+    )
+    real_run_gate.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional Markdown report path for the real-run gate.",
     )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
@@ -1205,6 +1232,16 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         print(rendered)
         return 1 if payload["harness_minimum_user_facing_loop"]["status"] != "pass" else 0
+    if args.command == "build-harness-real-run-gate":
+        payload = build_real_run_gate_payload(
+            summary_path=Path(args.summary).expanduser(),
+            review_path=Path(args.review).expanduser(),
+            output_dir=Path(args.output_dir).expanduser(),
+            report_output=Path(args.report_output).expanduser() if args.report_output else None,
+        )
+        rendered = render(payload, args.format)
+        print(rendered)
+        return 1 if payload["harness_real_run_gate"]["status"] != "pass" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)
