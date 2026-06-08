@@ -42,6 +42,11 @@ def build_harness_minimum_loop_payload(
         "case_readiness": dry_run_payload["status"],
         "scorer_adjudication_readiness": offline_scorer_payload["status"],
         "inspect_export_status": inspect_export["status"],
+        "case_alignment": (
+            "pass"
+            if dry_run_payload["case_id"] == inspect_export["jsonl_row_summary"]["case_id"]
+            else "fail"
+        ),
         "prompt_source_material_readiness": (
             "pass"
             if dry_run_payload["status"] == "pass"
@@ -70,7 +75,11 @@ def build_harness_minimum_loop_payload(
             if inspect_export["inspect_projection"]["scorer_output"]["retained_evidence_refs_preserved"]
             else "fail"
         ),
-        "no_upload_no_broad_claim_gate": "pass",
+        "no_upload_no_broad_claim_gate": (
+            "pass"
+            if _no_upload_no_broad_claim_gate_pass(dry_run_payload, offline_scorer_payload, inspect_export)
+            else "fail"
+        ),
     }
     status = "pass" if all(value == "pass" for value in readiness.values()) else "fail"
     next_action = _next_action(status=status, readiness=readiness)
@@ -136,7 +145,7 @@ def build_harness_minimum_loop_payload(
             "case_alignment": {
                 "dry_run_case_id": dry_run_payload["case_id"],
                 "inspect_export_case_id": inspect_export["jsonl_row_summary"]["case_id"],
-                "pass": dry_run_payload["case_id"] == inspect_export["jsonl_row_summary"]["case_id"],
+                "pass": readiness["case_alignment"] == "pass",
             },
             "next_action": next_action,
         }
@@ -209,6 +218,32 @@ def render_harness_minimum_loop_report(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_harness_minimum_loop_text(payload: dict[str, Any]) -> str:
+    loop = payload["harness_minimum_user_facing_loop"]
+    readiness = loop["readiness"]
+    next_action = loop["next_action"]
+    lines = [
+        "Harness Minimum User-Facing Loop",
+        f"Status: {loop['status']}",
+        f"Case: {loop['case_id']}",
+        f"Mode: {loop['mode']}",
+        "Live/model send: not_performed",
+        "Codex exec: not_performed",
+        "Docker action: not_performed",
+        "Private upload: not_performed",
+    ]
+    for key, value in readiness.items():
+        lines.append(f"Readiness {key}: {value}")
+    lines.extend(
+        [
+            f"Next action: {next_action['action']}",
+            f"Next task: {next_action['task']}",
+            f"Next reason: {next_action['reason']}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _next_action(*, status: str, readiness: dict[str, str]) -> dict[str, Any]:
     if status == "pass":
         return {
@@ -227,6 +262,63 @@ def _next_action(*, status: str, readiness: dict[str, str]) -> dict[str, Any]:
         "task": "jsh-606-minimum-loop-readiness-repair",
         "reason": f"Readiness checks failed: {', '.join(failing)}.",
     }
+
+
+def _no_upload_no_broad_claim_gate_pass(
+    dry_run_payload: dict[str, Any],
+    offline_scorer_payload: dict[str, Any],
+    inspect_export: dict[str, Any],
+) -> bool:
+    dry_run_false_flags = [
+        "live_benchmark_run_performed",
+        "model_send_performed",
+        "codex_exec_performed",
+        "docker_action_performed",
+        "network_action_performed",
+        "scenario_b_execution_performed",
+        "private_corpus_materialized",
+        "corpus_mutation_performed",
+    ]
+    scorer_false_flags = [
+        "live_benchmark_run_performed",
+        "six_case_run_performed",
+        "model_send_performed",
+        "codex_exec_performed",
+        "docker_action_performed",
+        "network_action_performed",
+        "scenario_b_execution_performed",
+        "private_corpus_materialized",
+        "value_claim_created",
+        "winner_claim_created",
+        "jsonl_superiority_claim_created",
+    ]
+    inspect_false_flags = [
+        "live_send_performed",
+        "codex_exec_performed",
+        "docker_action_performed",
+        "private_upload_performed",
+        "winner_claim",
+        "value_claim",
+        "jsonl_superiority_claim",
+        "speed_claim",
+        "token_efficiency_claim",
+    ]
+    sample = inspect_export["inspect_projection"]["dataset_sample"]
+    source_artifact = inspect_export["source_artifact"]
+    result_claim_boundary = inspect_export["inspect_projection"]["result_log_projection"]["claim_boundary"]
+    metadata = sample["metadata"]
+
+    return (
+        dry_run_payload.get("claim_boundary_enforced") is True
+        and all(dry_run_payload.get(flag) is False for flag in dry_run_false_flags)
+        and offline_scorer_payload.get("claim_boundary_enforced") is True
+        and all(offline_scorer_payload.get(flag) is False for flag in scorer_false_flags)
+        and all(result_claim_boundary.get(flag) is False for flag in inspect_false_flags)
+        and sample["input"].get("prompt_payload_committed") is False
+        and metadata.get("raw_final_answer_text_committed") is False
+        and metadata.get("raw_bridge_payload_committed") is False
+        and source_artifact.get("raw_private_payload_read") is False
+    )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
