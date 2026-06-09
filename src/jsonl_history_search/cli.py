@@ -763,9 +763,26 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timezone", default=None)
     parser.add_argument("--timezone-offset", default="+00:00")
     parser.add_argument("--now", default=None)
-    parser.add_argument("--allow-arbitrary-root", action="store_true")
-    parser.add_argument("--hard-cap-files", type=int, default=None)
-    parser.add_argument("--hard-cap-bytes", type=int, default=None)
+    parser.add_argument(
+        "--allow-arbitrary-root",
+        action="store_true",
+        help=(
+            "Permit an explicit non-standard JSONL/JSON root. Requires both "
+            "--hard-cap-files and --hard-cap-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--hard-cap-files",
+        type=int,
+        default=None,
+        help="Required with --allow-arbitrary-root; absolute file cap for arbitrary roots.",
+    )
+    parser.add_argument(
+        "--hard-cap-bytes",
+        type=int,
+        default=None,
+        help="Required with --allow-arbitrary-root; absolute byte cap for arbitrary roots.",
+    )
     parser.add_argument(
         "--rg-prefilter",
         action="store_true",
