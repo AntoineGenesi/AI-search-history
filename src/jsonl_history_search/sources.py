@@ -201,7 +201,7 @@ def path_is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def enumerate_jsonl_files(plan: SourcePlan):
+def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None):
     started = time.monotonic()
     files_seen = 0
     bytes_seen = 0
@@ -211,7 +211,14 @@ def enumerate_jsonl_files(plan: SourcePlan):
         if base.is_file():
             candidates = [base] if base.suffix in {".jsonl", ".json"} else []
         elif base.is_dir():
-            candidates = iter_directory_jsonl_files(base, plan, started, warnings)
+            candidates = iter_directory_jsonl_files(
+                base,
+                plan,
+                started,
+                warnings,
+                source_kind=root.kind,
+                preferred_terms=preferred_terms,
+            )
         else:
             continue
         for path in candidates:
@@ -621,7 +628,15 @@ def source_kind_for_path(path: Path, plan: SourcePlan) -> str:
     return "unknown_jsonl"
 
 
-def iter_directory_jsonl_files(base: Path, plan: SourcePlan, started: float, warnings: list[str]):
+def iter_directory_jsonl_files(
+    base: Path,
+    plan: SourcePlan,
+    started: float,
+    warnings: list[str],
+    *,
+    source_kind: str = "",
+    preferred_terms: list[str] | None = None,
+):
     pending = [base]
     while pending:
         if time.monotonic() - started > plan.limits.max_elapsed:
@@ -647,9 +662,13 @@ def iter_directory_jsonl_files(base: Path, plan: SourcePlan, started: float, war
                     files.append(Path(entry.path))
             except OSError:
                 continue
-        # Per-directory ordering preserves predictable newest-ish traversal for
-        # date-shaped transcript trees without building a whole-root candidate list.
-        files.sort(key=lambda item: item.name, reverse=True)
+        # Default transcript roots preserve predictable newest-ish traversal for
+        # date-shaped trees. Explicit arbitrary roots are usually curated fixture
+        # sets, so prefer filenames matching query terms before applying caps.
+        if source_kind == "arbitrary_jsonl_root":
+            files.sort(key=lambda item: (-filename_preference_score(item, preferred_terms or []), item.name))
+        else:
+            files.sort(key=lambda item: item.name, reverse=True)
         dirs.sort(key=lambda item: item.name)
         pending.extend(reversed(dirs))
         for path in files:
@@ -657,6 +676,35 @@ def iter_directory_jsonl_files(base: Path, plan: SourcePlan, started: float, war
                 warnings.append("Stopped enumeration at max elapsed cap.")
                 return
             yield path
+
+
+def filename_preference_score(path: Path, preferred_terms: list[str]) -> int:
+    if not preferred_terms:
+        return 0
+    name = path.stem.lower()
+    name_tokens = re.findall(r"[a-z0-9]+", name)
+    score = 0
+    for term in preferred_terms:
+        normalized = term.lower()
+        if len(normalized) <= 2:
+            continue
+        if normalized in name:
+            score += 1
+            continue
+        term_stems = filename_term_stems(normalized)
+        if any(stem and stem in token for stem in term_stems for token in name_tokens):
+            score += 1
+    return score
+
+
+def filename_term_stems(term: str) -> list[str]:
+    stems = {term}
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(term) > len(suffix) + 3 and term.endswith(suffix):
+            stems.add(term[: -len(suffix)])
+    if len(term) > 5:
+        stems.add(term[:5])
+    return sorted(stems, key=len, reverse=True)
 
 
 def stat_mtime(path: Path) -> float:
