@@ -36,7 +36,7 @@ def search(
     prefilter = None
     planned_files = []
 
-    for enumerated in enumerate_jsonl_files(plan):
+    for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
         path, size, enum_warnings = enumerated
         warnings = enum_warnings
         planned_files.append((path, size))
