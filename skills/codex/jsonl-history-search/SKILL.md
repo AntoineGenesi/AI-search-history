@@ -105,6 +105,22 @@ jsonl-history-search semantic-debug "did the agent actually do the claimed work?
   --format json
 ```
 
+For approved one-off private fixture roots outside the normal Codex/Claude
+history locations, include hard caps in the first attempt. Do not remove the
+guardrail; if the tool reports that an arbitrary root requires hard caps, retry
+with both caps before changing strategy.
+
+```bash
+jsonl-history-search semantic-debug "what did I tell you before about <topic>" \
+  --root /path/to/approved-jsonl-fixtures \
+  --allow-arbitrary-root \
+  --hard-cap-files 20 \
+  --hard-cap-bytes 200000 \
+  --max-files 20 \
+  --max-bytes 200000 \
+  --format json
+```
+
 The router composes existing evidence commands:
 
 - fuzzy symptom or remembered wording -> `jsonl-history-search find`;

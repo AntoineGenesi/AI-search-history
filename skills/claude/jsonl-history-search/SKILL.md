@@ -50,6 +50,22 @@ jsonl-history-search semantic-debug "did the agent actually do the claimed work?
   --format json
 ```
 
+For approved one-off private fixture roots outside the normal Codex/Claude
+history locations, include hard caps in the first attempt. Do not remove the
+guardrail; if the tool reports that an arbitrary root requires hard caps, retry
+with both caps before changing strategy.
+
+```bash
+jsonl-history-search semantic-debug "what did I tell you before about <topic>" \
+  --root /path/to/approved-jsonl-fixtures \
+  --allow-arbitrary-root \
+  --hard-cap-files 20 \
+  --hard-cap-bytes 200000 \
+  --max-files 20 \
+  --max-bytes 200000 \
+  --format json
+```
+
 Read `semantic_debug` fields first: `question_family`, `source_locator_handoff`, `scope`, `routes`, `strongest_candidates`, `timeline`, `tool_action_proof`, `task_review_commit_joins`, `candidate_causes`, `no_evidence`, `uncertainty`, `next_reads`, `token_byte_tradeoffs`, `sanitized_manifest_gate_evidence`, and `claim_boundaries`. Use `source_locator_handoff.next_reads` and `source_locator_handoff.candidate_ordering.top_candidates` before starting a wider scan. Legacy fixture summaries may still use `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`.
 
 Keep evidence separate from inference. Do not claim root cause unless linked evidence supports it; otherwise use `likely contributing assumption` or `candidate cause`. Treat no-evidence as `not_found_in_searched_scope`, not all-history absence.
