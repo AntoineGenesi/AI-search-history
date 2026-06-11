@@ -28,6 +28,12 @@ Trigger JSONL even when the user does not name it. Route these asks first:
 
 Use `semantic-debug` as the first packet command for these workflows because it returns `source_locator_handoff`, source scope, route choices, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `plan`, `find`, `structured-tool-events`, or `forensics` only for a focused follow-up.
 
+Route quality-sensitive asks to the package before any standalone helper:
+
+- Use `semantic-debug` first for remembered instructions, agent proof, provenance, ambiguous or semantic questions, no-evidence checks, and answer-quality-shaped investigations.
+- Use `find` for a focused fuzzy, typo, synonym, or paraphrase candidate search when the full router packet is unnecessary.
+- Use the helper only for fast operational recovery: latest/today/most-recent lookup, timestamp-window lookup, exact-phrase lookup, or broad-term recovery where the important words are expected to appear in the logs.
+
 ## Semantic Debugging
 
 When the user asks why a bug was introduced, which assumption was wrong, whether an agent actually did claimed work, what prior instruction matters, or how a later symptom relates to earlier work, use the router command first.
