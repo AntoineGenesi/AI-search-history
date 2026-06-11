@@ -146,6 +146,38 @@ RETRIEVAL_MISS_EXPANSION_TERMS = (
     "source",
 )
 
+ACTION_PROOF_AGENT_TERMS = ("agent", "assistant")
+ACTION_PROOF_ACTION_TERMS = ("action", "proof")
+ACTION_PROOF_EXECUTION_TERMS = (
+    "command",
+    "commit",
+    "committed",
+    "execute",
+    "executed",
+    "execution",
+    "implement",
+    "implementation",
+    "pytest",
+    "ran",
+    "run",
+    "test",
+    "tested",
+    "tests",
+)
+ACTION_PROOF_EXPANSION_TERMS = (
+    "action",
+    "agent",
+    "command",
+    "committed",
+    "executed",
+    "implementation",
+    "pytest",
+    "ran",
+    "run",
+    "tested",
+    "tests",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -202,6 +234,10 @@ def expand_query_terms(
         for term in retrieval_miss_failure_terms():
             add(term, "synonym_paraphrase")
 
+    if has_action_proof_intent(normalized, base_terms):
+        for term in action_proof_terms():
+            add(term, "synonym_paraphrase")
+
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
         add(term, "date_window")
 
@@ -254,6 +290,44 @@ def has_retrieval_miss_failure_intent(normalized: str, base_terms: list[str]) ->
 
 def retrieval_miss_failure_terms() -> list[str]:
     return sorted(RETRIEVAL_MISS_EXPANSION_TERMS)
+
+
+def has_action_proof_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    if re.search(r"\b(?:did\s+it\s+)?actually\s+do\s+it\b", normalized):
+        return True
+
+    agent_context = bool(token_context & set(ACTION_PROOF_AGENT_TERMS))
+    action_context = bool(token_context & set(ACTION_PROOF_ACTION_TERMS))
+    execution_context = bool(token_context & set(ACTION_PROOF_EXECUTION_TERMS))
+    command_execution_context = bool(
+        "command" in token_context
+        and (
+            token_context & {"execute", "executed", "execution", "ran", "run"}
+            or re.search(r"\bcommand\s+(?:was\s+)?(?:executed|run)\b", normalized)
+        )
+    )
+    run_execution_context = bool(
+        "run" in token_context
+        and (
+            agent_context
+            or re.search(r"\bwhat\s+did\s+(?:the\s+)?agent\s+run\b", normalized)
+        )
+    )
+
+    return (
+        (agent_context and execution_context)
+        or (action_context and execution_context)
+        or command_execution_context
+        or run_execution_context
+    )
+
+
+def action_proof_terms() -> list[str]:
+    return sorted(ACTION_PROOF_EXPANSION_TERMS)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
