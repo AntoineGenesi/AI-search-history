@@ -5,6 +5,8 @@ import json
 import os
 import hashlib
 import shutil
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +52,7 @@ def validate_install(
         _check_console_script(root),
         _check_package_skill(root, source_checkout=source_checkout),
         _check_package_helpers(root, source_checkout=source_checkout),
+        _check_package_helper_behavior(root, source_checkout=source_checkout),
         _check_safe_root_rejection(root),
     ]
     checks.extend(_check_redaction_and_fixture_search())
@@ -228,6 +231,94 @@ def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) 
         paths=[str(path) for path in helpers],
         recovery=recovery,
     )
+
+
+def _check_package_helper_behavior(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+    helper = package_root / "scripts" / "search_jsonl_history.py"
+    if not source_checkout:
+        return ValidationCheck(
+            id="package_helper_smoke",
+            name="Package helper behavior smoke",
+            status="skip",
+            detail="Package helper behavior smoke is skipped outside a source checkout.",
+            paths=[str(helper)],
+            metadata={"source_checkout": False},
+        )
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        return ValidationCheck(
+            id="package_helper_smoke",
+            name="Package helper behavior smoke",
+            status="skip",
+            detail="Package helper behavior smoke is skipped because the helper is missing or not executable.",
+            paths=[str(helper)],
+            recovery=["Restore executable helper scripts before running the behavior smoke."],
+        )
+
+    query = "restart handoff artifact changed next work plan docs cleanup worktree cleanup"
+    with tempfile.TemporaryDirectory(prefix="jsonl-history-search-helper-") as raw_tmp:
+        tmp = Path(raw_tmp)
+        transcript = tmp / "case.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "role": "user",
+                    "timestamp": "2026-06-11T01:02:03Z",
+                    "text": "handoff document moved into a task worktree; cleanup docs and restart plan changed",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        wrong_root = tmp / "not-json.txt"
+        wrong_root.write_text("not jsonl\n", encoding="utf-8")
+        recovered = _run_helper_json(helper, query, transcript)
+        empty = _run_helper_json(helper, query, wrong_root)
+
+    recovered_ok = (
+        recovered.get("returncode") == 0
+        and recovered.get("payload", {}).get("searched_files") == 1
+        and len(recovered.get("payload", {}).get("matches", [])) == 1
+    )
+    empty_ok = (
+        empty.get("returncode") == 0
+        and empty.get("payload", {}).get("searched_files") == 0
+        and empty.get("payload", {}).get("matches") == []
+    )
+    ok = recovered_ok and empty_ok
+    return ValidationCheck(
+        id="package_helper_smoke",
+        name="Package helper behavior smoke",
+        status="pass" if ok else "fail",
+        detail=(
+            "Package helper recovers non-contiguous broad query terms and does not search cwd for empty roots."
+            if ok
+            else "Package helper behavior smoke failed for broad-query recovery or empty-root handling."
+        ),
+        paths=[str(helper)],
+        recovery=[] if ok else ["Inspect `scripts/search_jsonl_history.py` rg parsing, broad fallback, and empty-root guards."],
+        metadata={
+            "broad_query_recovered": recovered_ok,
+            "empty_root_no_cwd_search": empty_ok,
+            "broad_query_returncode": recovered.get("returncode"),
+            "empty_root_returncode": empty.get("returncode"),
+        },
+    )
+
+
+def _run_helper_json(helper: Path, query: str, root: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        [sys.executable, str(helper), query, "--roots", str(root), "--limit", "5"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    payload: dict[str, Any] = {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        pass
+    return {"returncode": result.returncode, "payload": payload}
 
 
 def _check_safe_root_rejection(package_root: Path) -> ValidationCheck:
