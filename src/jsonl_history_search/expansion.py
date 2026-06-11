@@ -386,6 +386,53 @@ FINAL_ANSWER_SOURCE_HIT_EXPANSION_TERMS = (
     "unavailable",
 )
 
+TASK_COMPLETION_STATE_TASK_CONTEXT_TERMS = (
+    "backlog",
+    "delivery",
+    "deliverable",
+    "deliverables",
+    "queue",
+    "task",
+    "tasks",
+    "todo",
+    "todos",
+)
+TASK_COMPLETION_STATE_COMPLETION_TERMS = (
+    "complete",
+    "completed",
+    "done",
+    "merged",
+    "reviewed",
+    "verified",
+)
+TASK_COMPLETION_STATE_STATE_TERMS = (
+    "backlog",
+    "pending",
+    "queue",
+    "stale",
+    "state",
+    "status",
+    "superseded",
+    "todo",
+    "todos",
+)
+TASK_COMPLETION_STATE_EXPANSION_TERMS = (
+    "backlog",
+    "complete",
+    "completed",
+    "done",
+    "merged",
+    "pending",
+    "queue",
+    "reviewed",
+    "stale",
+    "state",
+    "status",
+    "superseded",
+    "todo",
+    "verified",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -782,6 +829,29 @@ def final_answer_source_hit_quality_terms() -> list[str]:
     return sorted(FINAL_ANSWER_SOURCE_HIT_EXPANSION_TERMS)
 
 
+def has_task_completion_state_mismatch_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    task_delivery_context = bool(token_context & set(TASK_COMPLETION_STATE_TASK_CONTEXT_TERMS))
+    completion_context = bool(token_context & set(TASK_COMPLETION_STATE_COMPLETION_TERMS))
+    state_context = bool(token_context & set(TASK_COMPLETION_STATE_STATE_TERMS))
+    mismatch_or_question_context = bool(
+        token_context & {"already", "still", "mismatch", "mismatched"}
+        or re.search(r"\b(?:why|which)\b", normalized)
+        or re.search(r"\blooks?\s+complete\b", normalized)
+        or re.search(r"\bif\s+it\s+looks?\s+complete\b", normalized)
+        or re.search(r"\bdespite\s+(?:being\s+)?(?:done|complete|completed|reviewed|verified|merged)\b", normalized)
+    )
+
+    return task_delivery_context and completion_context and (state_context or mismatch_or_question_context)
+
+
+def task_completion_state_mismatch_terms() -> list[str]:
+    return sorted(TASK_COMPLETION_STATE_EXPANSION_TERMS)
+
+
 CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_worktree_cleanup_intent, worktree_cleanup_terms),
     ContextualExpansionFamily(has_retrieval_miss_failure_intent, retrieval_miss_failure_terms),
@@ -796,6 +866,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_final_answer_source_hit_quality_intent,
         final_answer_source_hit_quality_terms,
+    ),
+    ContextualExpansionFamily(
+        has_task_completion_state_mismatch_intent,
+        task_completion_state_mismatch_terms,
     ),
 )
 
