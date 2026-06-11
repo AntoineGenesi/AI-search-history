@@ -1259,10 +1259,11 @@ def render_agent_find_text(payload: dict) -> str:
         searched = no_evidence.get("searched_scope", {})
         lines.append(
             "No-evidence scope: "
-            f"not found in {searched.get('searched_files', 0)} searched files; "
+            f"not found in searched scope only ({searched.get('searched_files', 0)} searched files); "
             f"{not_searched.get('missing_root_count', 0)} missing selected roots; "
             f"{len(no_evidence.get('excluded_scope', []))} excluded roots"
         )
+        lines.append("No-evidence boundary: do not treat this as all-history, global, or permanent absence without more search.")
         lines.append(f"No evidence: {no_evidence.get('why_not_confident')}")
     suggestions = report.get("next_search_suggestions") or []
     if suggestions:
@@ -1330,10 +1331,11 @@ def render_agent_find_markdown(payload: dict) -> str:
                 "## No Evidence",
                 "",
                 (
-                    f"Not found in {searched.get('searched_files', 0)} searched files. "
+                    f"Not found in searched scope only ({searched.get('searched_files', 0)} searched files). "
                     f"Missing selected roots: {not_searched.get('missing_root_count', 0)}. "
                     f"Excluded roots: {len(no_evidence.get('excluded_scope', []))}."
                 ),
+                "Do not treat this as all-history, global, or permanent absence without more search.",
                 "",
                 no_evidence.get("why_not_confident", ""),
             ]
