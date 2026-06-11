@@ -348,10 +348,6 @@ HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS = (
     "written",
 )
 
-FINAL_ANSWER_SOURCE_HIT_ANSWER_CONTEXT_TERMS = (
-    "answer",
-    "answers",
-)
 FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
     "available",
     "bad",
@@ -752,10 +748,9 @@ def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list
     base = {term.lower() for term in base_terms}
     token_context = tokens | base
 
+    answer_context = bool(token_context & {"answer", "answers"})
     final_answer_context = bool(
         re.search(r"\bfinal[\s_-]+answers?\b", normalized)
-        or re.search(r"\banswers?[\s_-]+quality\b", normalized)
-        or token_context & set(FINAL_ANSWER_SOURCE_HIT_ANSWER_CONTEXT_TERMS)
     )
     source_hit_context = bool(
         re.search(r"\bsource[\s_-]+hits?\b", normalized)
@@ -768,6 +763,7 @@ def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list
             or re.search(r"\bpreserv(?:e|ed|ation)\b", normalized)
         )
     )
+    facet_or_omission_context = bool(token_context & {"facet", "facets", "omit", "omits", "omitted"})
     quality_or_preservation_context = bool(
         token_context & set(FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS)
         or re.search(r"\bnot\s+(?:good|correct|sufficient)\b", normalized)
@@ -778,6 +774,7 @@ def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list
     return (
         ((final_answer_context or source_hit_context) and quality_or_preservation_context)
         or evidence_preservation_context
+        or (answer_context and facet_or_omission_context)
     )
 
 
