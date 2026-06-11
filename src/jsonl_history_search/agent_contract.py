@@ -498,9 +498,9 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
         else:
             ref = candidate.get("source_ref", {})
             candidate_id = candidate.get("candidate_id")
-        if ref.get("path"):
+        target = source_ref_target(ref)
+        if target:
             source_ref = dict(ref)
-            target = f"{source_ref.get('path')}:{source_ref.get('line')}"
             reads.append(
                 {
                     "kind": "jsonl_source_ref",
@@ -511,6 +511,18 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
                 }
             )
     return reads
+
+
+def source_ref_target(source_ref: dict[str, Any]) -> str | None:
+    path = source_ref.get("path")
+    line = source_ref.get("line")
+    if path and line is not None:
+        return f"{path}:{line}"
+    if path:
+        return str(path)
+    if line is not None:
+        return f"line {line}"
+    return None
 
 
 def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
