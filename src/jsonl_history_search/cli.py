@@ -1392,7 +1392,7 @@ def _short_lineage_report_written_payload(payload: dict, report_output: str) -> 
             "status": report["status"],
             "report_written": str(Path(report_output).expanduser()),
             "candidate_count": len(report.get("candidate_projects", [])),
-            "top_candidates": report.get("candidate_projects", [])[:3],
+            "compact_ai_handoff": report.get("compact_ai_handoff", {}),
             "warnings": payload.get("warnings", []),
             "next_read": report.get("next_read", [])[:5],
             "message": "Full lineage report written to report_output; stdout is a compact handoff map.",
