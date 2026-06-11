@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
+from typing import Callable
 
 
 TASK_SLUG_RE = re.compile(r"\b([a-z]{1,8})[-_](\d{2,6}[a-z]?)(?:[-_]([a-z0-9]{1,20}))?\b")
@@ -306,6 +307,13 @@ class ExpansionResult:
     reasons: dict[str, list[str]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ContextualExpansionFamily:
+    has_intent: Callable[[str, list[str]], bool]
+    terms: Callable[[], list[str]]
+    reason: str = "synonym_paraphrase"
+
+
 def expand_query_terms(
     *,
     normalized: str,
@@ -347,41 +355,7 @@ def expand_query_terms(
             for preference_term in sorted(PREFERENCE_WORDS):
                 add(preference_term, "preference")
 
-    if has_worktree_cleanup_intent(normalized, base_terms):
-        for term in worktree_cleanup_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_retrieval_miss_failure_intent(normalized, base_terms):
-        for term in retrieval_miss_failure_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_source_selection_failure_intent(normalized, base_terms):
-        for term in source_selection_failure_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_action_proof_intent(normalized, base_terms):
-        for term in action_proof_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_change_summary_improvement_intent(normalized, base_terms):
-        for term in change_summary_improvement_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_stale_reference_state_intent(normalized, base_terms):
-        for term in stale_reference_state_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_next_work_handoff_intent(normalized, base_terms):
-        for term in next_work_handoff_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_claim_boundary_intent(normalized, base_terms):
-        for term in claim_boundary_terms():
-            add(term, "synonym_paraphrase")
-
-    if has_process_detour_lesson_intent(normalized, base_terms):
-        for term in process_detour_lesson_terms():
-            add(term, "synonym_paraphrase")
+    apply_contextual_expansion_families(normalized, base_terms, add)
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
         add(term, "date_window")
@@ -658,6 +632,30 @@ def has_process_detour_lesson_intent(normalized: str, base_terms: list[str]) -> 
 
 def process_detour_lesson_terms() -> list[str]:
     return sorted(PROCESS_DETOUR_LESSON_EXPANSION_TERMS)
+
+
+CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
+    ContextualExpansionFamily(has_worktree_cleanup_intent, worktree_cleanup_terms),
+    ContextualExpansionFamily(has_retrieval_miss_failure_intent, retrieval_miss_failure_terms),
+    ContextualExpansionFamily(has_source_selection_failure_intent, source_selection_failure_terms),
+    ContextualExpansionFamily(has_action_proof_intent, action_proof_terms),
+    ContextualExpansionFamily(has_change_summary_improvement_intent, change_summary_improvement_terms),
+    ContextualExpansionFamily(has_stale_reference_state_intent, stale_reference_state_terms),
+    ContextualExpansionFamily(has_next_work_handoff_intent, next_work_handoff_terms),
+    ContextualExpansionFamily(has_claim_boundary_intent, claim_boundary_terms),
+    ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
+)
+
+
+def apply_contextual_expansion_families(
+    normalized: str,
+    base_terms: list[str],
+    add: Callable[[str, str], None],
+) -> None:
+    for family in CONTEXTUAL_EXPANSION_FAMILIES:
+        if family.has_intent(normalized, base_terms):
+            for term in family.terms():
+                add(term, family.reason)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
