@@ -100,6 +100,52 @@ WORKTREE_CLEANUP_ACTION_TERMS = (
     "pruned",
 )
 
+RETRIEVAL_MISS_CONTEXT_TERMS = (
+    "retrieval",
+    "retrieve",
+    "retrieved",
+    "search",
+    "searched",
+    "lookup",
+    "lookups",
+    "no evidence",
+    "no-evidence",
+    "no_evidence",
+)
+RETRIEVAL_MISS_FAILURE_TERMS = (
+    "fail",
+    "failed",
+    "failing",
+    "failure",
+    "miss",
+    "missed",
+    "misses",
+    "missing",
+    "not found",
+    "not-found",
+    "not_found",
+)
+RETRIEVAL_MISS_EXPANSION_TERMS = (
+    "command",
+    "evidence",
+    "fail",
+    "failed",
+    "failure",
+    "lookup",
+    "miss",
+    "missed",
+    "missing",
+    "no evidence",
+    "no-evidence",
+    "no_evidence",
+    "not found",
+    "not-found",
+    "not_found",
+    "retrieval",
+    "search",
+    "source",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -152,6 +198,10 @@ def expand_query_terms(
         for term in worktree_cleanup_terms():
             add(term, "synonym_paraphrase")
 
+    if has_retrieval_miss_failure_intent(normalized, base_terms):
+        for term in retrieval_miss_failure_terms():
+            add(term, "synonym_paraphrase")
+
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
         add(term, "date_window")
 
@@ -182,6 +232,28 @@ def worktree_cleanup_terms() -> list[str]:
             *WORKTREE_CLEANUP_ACTION_TERMS,
         }
     )
+
+
+def has_retrieval_miss_failure_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    context_terms = set(RETRIEVAL_MISS_CONTEXT_TERMS)
+    failure_terms = set(RETRIEVAL_MISS_FAILURE_TERMS)
+    context_intent = bool(
+        tokens & context_terms
+        or base & context_terms
+        or re.search(r"\bno[\s_-]+evidence\b", normalized)
+    )
+    failure_intent = bool(
+        tokens & failure_terms
+        or base & failure_terms
+        or re.search(r"\bnot[\s_-]+found\b", normalized)
+    )
+    return context_intent and failure_intent
+
+
+def retrieval_miss_failure_terms() -> list[str]:
+    return sorted(RETRIEVAL_MISS_EXPANSION_TERMS)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
