@@ -21,6 +21,12 @@ Trigger JSONL even when the user does not name it. Route these asks first:
 
 Use `semantic-debug` as the first packet command for these workflows because it returns `question_family`, `source_locator_handoff`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
 
+Route quality-sensitive asks to the package before the helper:
+
+- Use `semantic-debug` first for remembered instructions, agent proof, provenance, ambiguous or semantic questions, no-evidence checks, and answer-quality-shaped investigations.
+- Use `find` for a focused fuzzy, typo, synonym, or paraphrase candidate search when the full router packet is unnecessary.
+- Use the helper only for fast operational recovery: latest/today/most-recent lookup, timestamp-window lookup, exact-phrase lookup, or broad-term recovery where the important words are expected to appear in the logs.
+
 ## Search Order
 
 1. For recent/"just now" recovery: newest modified `~/.codex/sessions/**/*.jsonl` files first.
@@ -32,7 +38,7 @@ Do not start with normal repo `rg` alone for history questions. The user explici
 
 ## Tooling
 
-Prefer the bundled helper:
+Run the bundled helper only for fast operational recovery, not as the default semantic-debugging path:
 
 ```bash
 python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py "search phrase"
