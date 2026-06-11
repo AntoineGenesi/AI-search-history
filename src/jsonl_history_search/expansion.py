@@ -79,6 +79,27 @@ PREFERENCE_WORDS = {
     "taste",
 }
 
+WORKTREE_CLEANUP_STATUS_TERMS = ("stale", "obsolete", "abandoned")
+WORKTREE_CLEANUP_WORKTREE_TERMS = (
+    "worktree",
+    "worktrees",
+    "checkout",
+    "checkouts",
+    "worker",
+    "worker tree",
+    "worker-tree",
+    "worker_tree",
+)
+WORKTREE_CLEANUP_ACTION_TERMS = (
+    "clean",
+    "cleaned",
+    "cleanup",
+    "remove",
+    "removed",
+    "prune",
+    "pruned",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -127,6 +148,10 @@ def expand_query_terms(
             for preference_term in sorted(PREFERENCE_WORDS):
                 add(preference_term, "preference")
 
+    if has_worktree_cleanup_intent(normalized, base_terms):
+        for term in worktree_cleanup_terms():
+            add(term, "synonym_paraphrase")
+
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
         add(term, "date_window")
 
@@ -134,6 +159,28 @@ def expand_query_terms(
     return ExpansionResult(
         terms=sorted(bounded),
         reasons={term: sorted(term_reasons) for term, term_reasons in sorted(bounded.items())},
+    )
+
+
+def has_worktree_cleanup_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    worktree_intent = bool(
+        tokens & {"worktree", "worktrees", "checkout", "checkouts"}
+        or base & {"worktree", "worktrees", "checkout", "checkouts", "worker-tree", "worker_tree"}
+        or re.search(r"\bworker[\s_-]+tree\b", normalized)
+    )
+    cleanup_intent = bool(tokens & {"clean", "cleaned", "cleanup", "remove", "removed", "prune", "pruned"})
+    return worktree_intent and cleanup_intent
+
+
+def worktree_cleanup_terms() -> list[str]:
+    return sorted(
+        {
+            *WORKTREE_CLEANUP_STATUS_TERMS,
+            *WORKTREE_CLEANUP_WORKTREE_TERMS,
+            *WORKTREE_CLEANUP_ACTION_TERMS,
+        }
     )
 
 
