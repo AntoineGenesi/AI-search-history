@@ -390,6 +390,66 @@ HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS = (
     "written",
 )
 
+FILE_SESSION_PROVENANCE_TARGET_TERMS = (
+    "artifact",
+    "artifacts",
+    "file",
+    "files",
+    "path",
+    "paths",
+)
+FILE_SESSION_PROVENANCE_ACTOR_TERMS = (
+    "agent",
+    "agents",
+    "assistant",
+    "provenance",
+    "responsibility",
+    "responsible",
+    "session",
+    "sessions",
+    "transcript",
+    "transcripts",
+)
+FILE_SESSION_PROVENANCE_CREATION_TERMS = (
+    "create",
+    "created",
+    "creates",
+    "creating",
+    "generate",
+    "generated",
+    "generates",
+    "generating",
+    "save",
+    "saved",
+    "saves",
+    "saving",
+    "write",
+    "writes",
+    "writing",
+    "written",
+    "wrote",
+)
+FILE_SESSION_PROVENANCE_EXPANSION_TERMS = (
+    "artifact",
+    "branch",
+    "command",
+    "commit",
+    "created",
+    "cwd",
+    "diff",
+    "file",
+    "generated",
+    "path",
+    "provenance",
+    "responsible",
+    "saved",
+    "session",
+    "tool",
+    "transcript",
+    "worktree",
+    "wrote",
+)
+
 FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
     "available",
     "bad",
@@ -880,6 +940,35 @@ def handoff_document_location_terms() -> list[str]:
     return sorted(HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS)
 
 
+def has_file_session_provenance_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    target_context = bool(
+        token_context & set(FILE_SESSION_PROVENANCE_TARGET_TERMS)
+        or re.search(r"\b[\w.-]+/[\w./-]+\b", normalized)
+        or re.search(r"\b[\w.-]+\.[a-z0-9]{1,8}\b", normalized)
+    )
+    actor_context = bool(token_context & set(FILE_SESSION_PROVENANCE_ACTOR_TERMS))
+    creation_context = bool(
+        token_context & set(FILE_SESSION_PROVENANCE_CREATION_TERMS)
+        or re.search(r"\b(?:creat|generat|sav|writ)(?:e|ed|es|ing)?\b", normalized)
+    )
+    question_context = bool(
+        re.search(r"\b(?:which|what)\s+(?:session|agent|assistant|transcript)\b", normalized)
+        or re.search(r"\bwho\b", normalized)
+        or re.search(r"\bprovenance\b", normalized)
+        or re.search(r"\bresponsib(?:le|ility)\b", normalized)
+    )
+
+    return target_context and creation_context and (actor_context or re.search(r"\bwho\b", normalized)) and question_context
+
+
+def file_session_provenance_terms() -> list[str]:
+    return sorted(FILE_SESSION_PROVENANCE_EXPANSION_TERMS)
+
+
 def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -994,6 +1083,7 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_promise_vs_committed_intent, promise_vs_committed_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
+    ContextualExpansionFamily(has_file_session_provenance_intent, file_session_provenance_terms),
     ContextualExpansionFamily(
         has_final_answer_source_hit_quality_intent,
         final_answer_source_hit_quality_terms,
