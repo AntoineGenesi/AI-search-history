@@ -535,6 +535,50 @@ TASK_COMPLETION_STATE_EXPANSION_TERMS = (
     "verified",
 )
 
+REVIEW_VERDICT_STATUS_REVIEW_TERMS = (
+    "review",
+    "reviewed",
+    "reviewer",
+)
+REVIEW_VERDICT_STATUS_OUTCOME_TERMS = (
+    "approved",
+    "blocked",
+    "fail",
+    "failed",
+    "partial",
+    "partially",
+    "pass",
+    "rejected",
+    "stop",
+    "stopped",
+    "verified",
+    "verdict",
+)
+REVIEW_VERDICT_STATUS_GATE_TERMS = (
+    "gate",
+    "merge",
+)
+REVIEW_VERDICT_STATUS_EXPANSION_TERMS = (
+    "review",
+    "reviewed",
+    "reviewer",
+    "review artifact",
+    "verdict",
+    "verified",
+    "partially verified",
+    "partially_verified",
+    "partial",
+    "failed",
+    "blocked",
+    "approved",
+    "rejected",
+    "pass",
+    "fail",
+    "status",
+    "merge gate",
+    "gate",
+)
+
 PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
     "before",
     "crash",
@@ -1031,6 +1075,37 @@ def task_completion_state_mismatch_terms() -> list[str]:
     return sorted(TASK_COMPLETION_STATE_EXPANSION_TERMS)
 
 
+def has_review_verdict_status_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    review_context = bool(
+        token_context & set(REVIEW_VERDICT_STATUS_REVIEW_TERMS)
+        or re.search(r"\breview[\s_-]+artifact\b", normalized)
+    )
+    gate_context = bool(
+        token_context & set(REVIEW_VERDICT_STATUS_GATE_TERMS) == set(REVIEW_VERDICT_STATUS_GATE_TERMS)
+        or re.search(r"\bmerge[\s_-]+gate\b", normalized)
+    )
+    outcome_context = bool(
+        token_context & set(REVIEW_VERDICT_STATUS_OUTCOME_TERMS)
+        or re.search(r"\bpartial(?:ly)?[\s_-]+verified\b", normalized)
+    )
+    question_or_verdict_context = bool(
+        re.search(r"\b(?:was|were|is|are|did|does|has|had)\b", normalized)
+        or re.search(r"\bmark(?:ed)?\b", normalized)
+        or token_context & {"status", "verdict"}
+        or gate_context
+    )
+
+    return (review_context or gate_context) and outcome_context and question_or_verdict_context
+
+
+def review_verdict_status_terms() -> list[str]:
+    return sorted(REVIEW_VERDICT_STATUS_EXPANSION_TERMS)
+
+
 def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1091,6 +1166,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_task_completion_state_mismatch_intent,
         task_completion_state_mismatch_terms,
+    ),
+    ContextualExpansionFamily(
+        has_review_verdict_status_intent,
+        review_verdict_status_terms,
     ),
     ContextualExpansionFamily(
         has_pre_crash_incident_context_intent,
