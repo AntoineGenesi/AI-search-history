@@ -1464,8 +1464,7 @@ def _short_workflow_repeat_report_written_payload(payload: dict, report_output: 
                 "searched_files": efficiency.get("searched_files", 0),
                 "searched_bytes": efficiency.get("searched_bytes", 0),
             },
-            "top_clusters": report.get("workflow_clusters", [])[:3],
-            "automation_suggestions": report.get("automation_suggestions", [])[:3],
+            "ai_handoff_packet": report.get("ai_handoff_packet", {}),
             "warnings": payload.get("warnings", []),
             "message": "Full workflow-repeat-finder report written to report_output; stdout is a compact handoff map.",
         }
