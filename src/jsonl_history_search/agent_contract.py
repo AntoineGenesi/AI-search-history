@@ -141,13 +141,13 @@ def build_agent_find_payload(
 
 def command_surface() -> dict[str, str]:
     return {
-        "source-locator-handoff": "Stable handoff field with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
+        "source-locator-handoff": "Inspect this before broad search: stable handoff with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
-        "find-candidates": "Returns compact candidate rows with source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
+        "find-candidates": "Focused fuzzy/typo/synonym/paraphrase candidate recovery with compact source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
         "broaden-query": "Shows exact, normalized, typo/fuzzy, synonym/paraphrase, artifact/path, cwd/project, date-window, role, and local semantic families.",
         "timeline": "Sorts candidate rows by parsed message timestamp with deterministic path/line tie-breaking.",
         "cluster-candidates": "Groups candidates by task, artifact, preference, session, or path for compact AI handoff.",
-        "no-evidence-report": "Reports searched scope, excluded scope, weak candidates, warnings, and next safe searches instead of hallucinating.",
+        "no-evidence-report": "Reports searched-scope-only no-evidence, not all-history/global/permanent absence; includes excluded scope, weak candidates, warnings, and next safe searches.",
     }
 
 
