@@ -16,6 +16,7 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "artifact": ("artifacts", "doc", "docs", "file", "output", "report"),
     "artifacts": ("artifact", "doc", "docs", "file", "output", "report"),
     "bug": ("defect", "error", "failure", "fix", "issue", "regression"),
+    "closeout": ("recap", "summary", "wrap", "wrapup"),
     "cluster": ("clustering", "group", "grouped", "grouping"),
     "clustering": ("cluster", "group", "grouped", "grouping"),
     "csv": ("spreadsheet", "table"),
@@ -47,8 +48,11 @@ SYNONYMS: dict[str, tuple[str, ...]] = {
     "retries": ("attempt", "attempts", "retried", "retry", "retrying"),
     "search": ("find", "lookup", "retrieval", "retrieve"),
     "searched": ("find", "lookup", "retrieval", "retrieve", "search"),
+    "summary": ("closeout", "recap", "wrap", "wrapup"),
     "test": ("pytest", "regression", "tests", "verification"),
     "tests": ("pytest", "regression", "test", "verification"),
+    "wrap": ("closeout", "recap", "summary", "wrapup"),
+    "wrapup": ("closeout", "recap", "summary", "wrap"),
 }
 
 SEMANTIC_LOCAL: dict[str, tuple[str, ...]] = {
@@ -56,6 +60,7 @@ SEMANTIC_LOCAL: dict[str, tuple[str, ...]] = {
     "edited": ("change", "patch", "refactor", "tune"),
     "library": ("codebase", "module", "source", "subsystem"),
     "physics": ("collision", "collisions", "engine", "integration", "physics.ts", "rigid-body", "rigidbody"),
+    "session": ("closeout", "continuation", "handoff", "summary"),
     "skill": ("capability", "practice", "workflow"),
     "workflow": ("automation", "process", "routine", "sequence"),
 }
