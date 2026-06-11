@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from .agent_contract import source_ref_target
 from .metric_contract import TOKEN_FORMULA
 from .harness_loop import render_harness_minimum_loop_report, render_harness_minimum_loop_text
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
@@ -265,7 +266,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     for item in report.get("strongest_candidates", [])[:8]:
         ref = item.get("source_ref") or {}
         lines.append(
-            f"- `{item.get('candidate_id')}` {ref.get('path')}:{ref.get('line')} "
+            f"- `{item.get('candidate_id')}` {source_ref_target(ref) or ''} "
             f"confidence={item.get('confidence')} stages={','.join(item.get('stages', []))}"
         )
     lines.append("")
@@ -1248,7 +1249,7 @@ def render_agent_find_text(payload: dict) -> str:
         lines.append(
             "- "
             f"{candidate.get('candidate_id')} {candidate.get('confidence')} "
-            f"{ref.get('path')}:{ref.get('line')} "
+            f"{source_ref_target(ref) or ''} "
             f"{candidate.get('timestamp') or '(no timestamp)'} "
             f"{candidate.get('role') or ''}: {candidate.get('snippet')}"
         )
@@ -1308,7 +1309,7 @@ def render_agent_find_markdown(payload: dict) -> str:
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", []):
         ref = candidate.get("source_ref", {})
-        source = f"{ref.get('path')}:{ref.get('line')}"
+        source = source_ref_target(ref) or ""
         lines.append(
             "| "
             f"{_escape_markdown_table(str(candidate.get('candidate_id', '')))} | "
