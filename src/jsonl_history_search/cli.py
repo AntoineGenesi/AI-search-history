@@ -1449,7 +1449,7 @@ def _short_tool_events_report_written_payload(payload: dict, report_output: str)
                 "searched_files": efficiency.get("searched_files", 0),
                 "searched_bytes": efficiency.get("searched_bytes", 0),
             },
-            "top_events": report.get("events", [])[:5],
+            "ai_handoff_packet": report.get("ai_handoff_packet", {}),
             "warnings": payload.get("warnings", []),
             "message": "Full structured tool-events report written to report_output; stdout is a compact handoff map.",
         }
