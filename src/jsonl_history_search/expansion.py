@@ -238,6 +238,20 @@ STALE_REFERENCE_STATE_CONTEXT_TERMS = (
     "superseded",
 )
 
+NEXT_WORK_HANDOFF_EXPANSION_TERMS = (
+    "choose",
+    "cleanup",
+    "handoff",
+    "merge",
+    "post-merge",
+    "proceed",
+    "queue",
+    "retrieval",
+    "reviewer",
+    "selected",
+    "worktree",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -304,6 +318,10 @@ def expand_query_terms(
 
     if has_stale_reference_state_intent(normalized, base_terms):
         for term in stale_reference_state_terms():
+            add(term, "synonym_paraphrase")
+
+    if has_next_work_handoff_intent(normalized, base_terms):
+        for term in next_work_handoff_terms():
             add(term, "synonym_paraphrase")
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
@@ -457,6 +475,34 @@ def stale_reference_state_terms() -> list[str]:
             *STALE_REFERENCE_STATE_CONTEXT_TERMS,
         }
     )
+
+
+def has_next_work_handoff_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    next_task_question = bool(
+        "next" in token_context
+        and (
+            re.search(r"\bwhat\s+(?:is|are|was|were)\s+(?:the\s+)?next\s+(?:task|work|step|action)\b", normalized)
+            or re.search(r"\bwhich\s+(?:task|work|step|action)\s+(?:is|are|was|were)\s+next\b", normalized)
+        )
+    )
+    after_this_question = bool(
+        re.search(r"\bwhat\s+(?:should\s+)?happen(?:s|ed)?\s+after\s+this\b", normalized)
+        or re.search(r"\bwhat\s+(?:should\s+)?come(?:s)?\s+after\s+this\b", normalized)
+    )
+    what_next_question = bool(
+        "next" in token_context
+        and re.search(r"\bwhat\s+(?:should\s+)?(?:we|i|you)\s+do\s+next\b", normalized)
+    )
+
+    return next_task_question or after_this_question or what_next_question
+
+
+def next_work_handoff_terms() -> list[str]:
+    return sorted(NEXT_WORK_HANDOFF_EXPANSION_TERMS)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
