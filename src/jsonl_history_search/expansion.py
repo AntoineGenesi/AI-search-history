@@ -549,6 +549,8 @@ REVIEW_VERDICT_STATUS_OUTCOME_TERMS = (
     "partially",
     "pass",
     "rejected",
+    "stop",
+    "stopped",
     "verified",
     "verdict",
 )
