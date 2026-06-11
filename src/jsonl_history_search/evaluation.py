@@ -73,9 +73,22 @@ STRATEGY_PROFILES: dict[str, StrategyProfile] = {
     "helper_script": StrategyProfile(
         name="helper_script",
         label="Helper script",
-        description="The legacy scripts/search_jsonl_history.py helper with newest-first and exact/substring filtering.",
-        stages=frozenset({"artifact_path", "cwd_project", "date_window", "newest_first_shortlist", "role_filter"}),
-        failure_controls=frozenset({"over_reading", "too_many_tool_calls"}),
+        description=(
+            "The global-skill scripts/search_jsonl_history.py helper with newest-first, timestamp windows, "
+            "role aliases, exact phrase search, broad term-coverage fallback, and explicit empty-root warnings."
+        ),
+        stages=frozenset(
+            {
+                "artifact_path",
+                "cwd_project",
+                "date_window",
+                "exact_phrase",
+                "newest_first_shortlist",
+                "normalized_terms",
+                "role_filter",
+            }
+        ),
+        failure_controls=frozenset({"exact_phrase_miss", "over_reading", "too_many_tool_calls"}),
         tool_call_multiplier=1.0,
         file_multiplier=1.15,
         parsed_byte_multiplier=1.1,
