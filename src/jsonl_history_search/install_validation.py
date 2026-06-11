@@ -5,9 +5,9 @@ import json
 import os
 import hashlib
 import shutil
-import subprocess
 import sys
 import tempfile
+from subprocess import PIPE, run as run_subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -306,11 +306,11 @@ def _check_package_helper_behavior(package_root: Path, *, source_checkout: bool 
 
 
 def _run_helper_json(helper: Path, query: str, root: Path) -> dict[str, Any]:
-    result = subprocess.run(
+    result = run_subprocess(
         [sys.executable, str(helper), query, "--roots", str(root), "--limit", "5"],
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=PIPE,
+        stderr=PIPE,
         check=False,
     )
     payload: dict[str, Any] = {}
