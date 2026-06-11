@@ -95,7 +95,12 @@ def build_agent_find_payload(
             search_result=search_result,
             manifest_report=manifest_report,
         ),
-        "next_search_suggestions": next_search_suggestions(status=status, source_plan=source_plan, candidates=candidates),
+        "next_search_suggestions": next_search_suggestions(
+            status=status,
+            source_plan=source_plan,
+            search_result=search_result,
+            candidates=candidates,
+        ),
         "report_policy": report_policy(
             candidate_count=len(candidates),
             context_bytes=context_bytes,
@@ -861,7 +866,13 @@ def cap_hit_status(*, warnings: list[str], limits: dict) -> dict:
     }
 
 
-def next_search_suggestions(*, status: str, source_plan: dict, candidates: list[CandidateRow]) -> list[str]:
+def next_search_suggestions(
+    *,
+    status: str,
+    source_plan: dict,
+    candidates: list[CandidateRow],
+    search_result: dict | None = None,
+) -> list[str]:
     suggestions: list[str] = []
     query = source_plan.get("query", {})
     if not query.get("date_window", {}).get("start"):
@@ -871,6 +882,13 @@ def next_search_suggestions(*, status: str, source_plan: dict, candidates: list[
     if not query.get("artifact_hints"):
         suggestions.append("Add a file, task slug, report name, or project folder hint if available.")
     if status == "no_evidence":
+        source_scope = build_source_scope_summary(source_plan, search_result or {})
+        if source_scope["not_searched_scope"].get("missing_root_count", 0):
+            suggestions.append("Resolve missing selected roots or rerun with an available transcript root before relying on no-evidence.")
+        if source_scope["excluded_scope"].get("rejected_root_count", 0):
+            suggestions.append("Inspect rejected/excluded roots and rerun with an allowed safe root if that source was intended.")
+        if source_scope["cap_hit"].get("hit"):
+            suggestions.append("Raise safe caps or narrow the query/source scope before treating this no-evidence result as meaningful.")
         suggestions.append("Inspect no_evidence_report and rerun with any extra artifact, project, date, or speaker hint before declaring permanent no evidence.")
     elif len(candidates) > INLINE_CANDIDATE_LIMIT:
         suggestions.append("Use the top clusters or write a report instead of opening every candidate.")
