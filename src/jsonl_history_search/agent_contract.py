@@ -515,14 +515,25 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
 
 def source_ref_target(source_ref: dict[str, Any]) -> str | None:
     path = source_ref.get("path")
-    line = source_ref.get("line")
-    if path and line is not None:
+    line = normalized_source_ref_line(source_ref.get("line"))
+    if path and line:
         return f"{path}:{line}"
     if path:
         return str(path)
-    if line is not None:
+    if line:
         return f"line {line}"
     return None
+
+
+def normalized_source_ref_line(line: Any) -> str | None:
+    if line is None:
+        return None
+    if isinstance(line, str):
+        normalized = line.strip()
+        if normalized.lower() in {"", "none", "null"}:
+            return None
+        return normalized
+    return str(line)
 
 
 def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
