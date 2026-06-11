@@ -146,6 +146,20 @@ RETRIEVAL_MISS_EXPANSION_TERMS = (
     "source",
 )
 
+SOURCE_SELECTION_FAILURE_EXPANSION_TERMS = (
+    "candidate",
+    "dropped",
+    "expected",
+    "file",
+    "opened",
+    "opening",
+    "relevant",
+    "retention",
+    "root",
+    "row",
+    "selected",
+)
+
 ACTION_PROOF_AGENT_TERMS = ("agent", "assistant")
 ACTION_PROOF_ACTION_TERMS = ("action", "proof")
 ACTION_PROOF_EXECUTION_TERMS = (
@@ -320,6 +334,10 @@ def expand_query_terms(
         for term in retrieval_miss_failure_terms():
             add(term, "synonym_paraphrase")
 
+    if has_source_selection_failure_intent(normalized, base_terms):
+        for term in source_selection_failure_terms():
+            add(term, "synonym_paraphrase")
+
     if has_action_proof_intent(normalized, base_terms):
         for term in action_proof_terms():
             add(term, "synonym_paraphrase")
@@ -392,6 +410,33 @@ def has_retrieval_miss_failure_intent(normalized: str, base_terms: list[str]) ->
 
 def retrieval_miss_failure_terms() -> list[str]:
     return sorted(RETRIEVAL_MISS_EXPANSION_TERMS)
+
+
+def has_source_selection_failure_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    source_selection_context = bool(
+        re.search(r"\bsource[\s_-]+selection\b", normalized)
+        or ("source" in token_context and token_context & {"selection", "selected", "selecting"})
+    )
+    failure_context = bool(
+        token_context & {"fail", "failed", "failure", "failing"}
+        or re.search(r"\bwhy\s+did\s+source[\s_-]+selection\s+fail\b", normalized)
+    )
+    question_context = bool(
+        re.search(r"\bwhy\s+did\b", normalized)
+        or re.search(r"\bwhat\s+(?:caused|made)\b", normalized)
+        or "failure" in token_context
+        or "fail" in token_context
+    )
+
+    return source_selection_context and failure_context and question_context
+
+
+def source_selection_failure_terms() -> list[str]:
+    return sorted(SOURCE_SELECTION_FAILURE_EXPANSION_TERMS)
 
 
 def has_action_proof_intent(normalized: str, base_terms: list[str]) -> bool:
