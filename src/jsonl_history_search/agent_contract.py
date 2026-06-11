@@ -516,8 +516,12 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                 {
                     "candidate_id": candidate.candidate_id,
                     "rank": candidate.rank,
+                    "source_ref": candidate.source_ref,
                     "timestamp_utc": candidate.timestamp_utc,
                     "confidence": candidate.confidence,
+                    "stage": candidate.primary_stage,
+                    "score": candidate.score,
+                    "reason_codes": candidate.reason_codes[:8],
                 }
             )
         else:
@@ -525,8 +529,12 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                 {
                     "candidate_id": candidate.get("candidate_id"),
                     "rank": candidate.get("rank"),
+                    "source_ref": candidate.get("source_ref"),
                     "timestamp_utc": candidate.get("timestamp_utc"),
                     "confidence": candidate.get("confidence"),
+                    "stage": candidate.get("stage"),
+                    "score": candidate.get("score"),
+                    "reason_codes": list(candidate.get("reason_codes", []))[:8],
                 }
             )
     return compacted
