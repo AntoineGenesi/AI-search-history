@@ -178,6 +178,45 @@ ACTION_PROOF_EXPANSION_TERMS = (
     "tests",
 )
 
+CHANGE_SUMMARY_ADD_OR_CHANGE_ACTION_TERMS = (
+    "add",
+    "added",
+    "change",
+    "changed",
+    "changes",
+    "fixed",
+    "implement",
+    "implemented",
+)
+CHANGE_SUMMARY_TOOL_CONTEXT_TERMS = (
+    "expansion",
+    "helper",
+    "jsonl",
+    "output",
+    "package",
+    "query",
+    "queries",
+    "ranking",
+    "retrieval",
+    "scanner",
+    "search",
+    "tool",
+    "tools",
+    "wording",
+)
+CHANGE_SUMMARY_EXPANSION_TERMS = (
+    "added",
+    "fixed",
+    "implemented",
+    "improved",
+    "output",
+    "recover",
+    "recovered",
+    "recovers",
+    "tool",
+    "wording",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -236,6 +275,10 @@ def expand_query_terms(
 
     if has_action_proof_intent(normalized, base_terms):
         for term in action_proof_terms():
+            add(term, "synonym_paraphrase")
+
+    if has_change_summary_improvement_intent(normalized, base_terms):
+        for term in change_summary_improvement_terms():
             add(term, "synonym_paraphrase")
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
@@ -328,6 +371,34 @@ def has_action_proof_intent(normalized: str, base_terms: list[str]) -> bool:
 
 def action_proof_terms() -> list[str]:
     return sorted(ACTION_PROOF_EXPANSION_TERMS)
+
+
+def has_change_summary_improvement_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    if re.search(r"\bwhat\s+did\s+we\s+improve\b", normalized):
+        return True
+
+    improvement_intent = bool(token_context & {"improve", "improved", "improvement", "improvements"})
+    add_or_change_action_intent = bool(token_context & set(CHANGE_SUMMARY_ADD_OR_CHANGE_ACTION_TERMS))
+    tool_work_context = bool(token_context & set(CHANGE_SUMMARY_TOOL_CONTEXT_TERMS))
+    summary_question = bool(
+        re.search(r"\bwhat\s+changed\b", normalized)
+        or re.search(r"\bwhat\s+improvements?\b", normalized)
+        or re.search(r"\bwhat\s+(?:was|were)\s+(?:added|implemented|fixed|improved)\b", normalized)
+    )
+
+    if summary_question and (improvement_intent or tool_work_context):
+        return True
+    if improvement_intent and add_or_change_action_intent:
+        return True
+    return improvement_intent and tool_work_context
+
+
+def change_summary_improvement_terms() -> list[str]:
+    return sorted(CHANGE_SUMMARY_EXPANSION_TERMS)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
