@@ -72,8 +72,18 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
         add_common_args(sub)
+    find_descriptions = {
+        "find": (
+            "Focused fuzzy/typo/synonym/paraphrase candidate recovery when the "
+            "full semantic-debug router packet is unnecessary."
+        ),
+        "no-evidence-report": (
+            "Report searched-scope-only no-evidence; this is not all-history, "
+            "global, or permanent absence."
+        ),
+    }
     for name in ("find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"):
-        find = subparsers.add_parser(name)
+        find = subparsers.add_parser(name, description=find_descriptions.get(name))
         find.add_argument("query", nargs="?", default="")
         add_common_args(find)
         find.add_argument(
@@ -139,7 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip bounded prose extraction of prior automation suggestions.",
     )
     workflow_repeat.add_argument("--report-output", default=None)
-    semantic_debug = subparsers.add_parser("semantic-debug")
+    semantic_debug = subparsers.add_parser(
+        "semantic-debug",
+        description=(
+            "Front door for remembered instructions, agent proof, "
+            "provenance/semantic debugging, no-evidence checks, and "
+            "answer-quality investigations. Inspect source_locator_handoff, "
+            "next_reads, and claim boundaries before broad search."
+        ),
+    )
     semantic_debug.add_argument("query", nargs="?", default="")
     add_common_args(semantic_debug)
     semantic_debug.add_argument("--task", default=None)
