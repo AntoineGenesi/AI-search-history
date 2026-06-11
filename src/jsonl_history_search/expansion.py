@@ -300,6 +300,54 @@ PROCESS_DETOUR_LESSON_EXPANSION_TERMS = (
     "tool",
 )
 
+HANDOFF_DOCUMENT_LOCATION_DOCUMENT_TERMS = (
+    "artifact",
+    "artifacts",
+    "doc",
+    "docs",
+    "document",
+    "documents",
+    "file",
+    "handoff",
+    "handover",
+    "note",
+    "notes",
+    "report",
+    "reports",
+)
+HANDOFF_DOCUMENT_LOCATION_CONTEXT_TERMS = (
+    "branch",
+    "checkout",
+    "location",
+    "main",
+    "parent",
+    "path",
+    "placed",
+    "placement",
+    "provenance",
+    "put",
+    "retained",
+    "stored",
+    "where",
+    "worktree",
+    "worktrees",
+    "written",
+    "wrote",
+)
+HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS = (
+    "artifact",
+    "branch",
+    "checkout",
+    "location",
+    "main",
+    "parent",
+    "path",
+    "retained",
+    "where",
+    "worktree",
+    "written",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -634,6 +682,29 @@ def process_detour_lesson_terms() -> list[str]:
     return sorted(PROCESS_DETOUR_LESSON_EXPANSION_TERMS)
 
 
+def has_handoff_document_location_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    document_context = bool(
+        token_context & set(HANDOFF_DOCUMENT_LOCATION_DOCUMENT_TERMS)
+        or re.search(r"\bnext[\s_-]+session\b", normalized)
+    )
+    location_context = bool(
+        token_context & set(HANDOFF_DOCUMENT_LOCATION_CONTEXT_TERMS)
+        or re.search(r"\bwhere\s+(?:did|is|was|were)\b", normalized)
+        or re.search(r"\b(?:main|parent)[\s_-]+checkout\b", normalized)
+        or re.search(r"\btask[\s_-]+branch\b", normalized)
+    )
+
+    return document_context and location_context
+
+
+def handoff_document_location_terms() -> list[str]:
+    return sorted(HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS)
+
+
 CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_worktree_cleanup_intent, worktree_cleanup_terms),
     ContextualExpansionFamily(has_retrieval_miss_failure_intent, retrieval_miss_failure_terms),
@@ -644,6 +715,7 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_next_work_handoff_intent, next_work_handoff_terms),
     ContextualExpansionFamily(has_claim_boundary_intent, claim_boundary_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
+    ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
 )
 
 
