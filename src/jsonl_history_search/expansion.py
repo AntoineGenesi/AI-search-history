@@ -279,6 +279,48 @@ CLAIM_BOUNDARY_QUALITY_TERMS = (
     "value",
 )
 
+PROMISE_VS_COMMITTED_PROMISE_TERMS = (
+    "claim",
+    "claimed",
+    "claims",
+    "plan",
+    "planned",
+    "plans",
+    "promise",
+    "promised",
+    "said",
+    "say",
+)
+PROMISE_VS_COMMITTED_DELIVERY_TERMS = (
+    "actual",
+    "change",
+    "changed",
+    "changes",
+    "commit",
+    "committed",
+    "diff",
+    "implemented",
+    "patch",
+    "patched",
+)
+PROMISE_VS_COMMITTED_EXPANSION_TERMS = (
+    "actual",
+    "claim",
+    "claimed",
+    "commit",
+    "committed",
+    "changed",
+    "diff",
+    "gap",
+    "implemented",
+    "patch",
+    "planned",
+    "promise",
+    "promised",
+    "said",
+    "unsupported",
+)
+
 PROCESS_DETOUR_LESSON_EXPANSION_TERMS = (
     "anchored",
     "candidate",
@@ -732,6 +774,36 @@ def claim_boundary_terms() -> list[str]:
     return sorted({*CLAIM_BOUNDARY_CLAIM_TERMS, *CLAIM_BOUNDARY_QUALITY_TERMS})
 
 
+def has_promise_vs_committed_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    promise_context = bool(
+        token_context & set(PROMISE_VS_COMMITTED_PROMISE_TERMS)
+        or re.search(r"\b(?:what\s+)?(?:did|was)\s+.*\b(?:promise|promised|claim|claimed|say|said|planned)\b", normalized)
+    )
+    delivery_context = bool(
+        token_context & set(PROMISE_VS_COMMITTED_DELIVERY_TERMS)
+        or re.search(r"\bgot[\s_-]+committed\b", normalized)
+        or re.search(r"\bactual[\s_-]+(?:diff|change|changes|commit|commits|implementation|patch)\b", normalized)
+    )
+    contrast_context = bool(
+        re.search(r"\bversus\b|\bvs\.?\b", normalized)
+        or re.search(r"\bcompared\s+(?:with|to)\b", normalized)
+        or re.search(r"\binstead\s+of\b", normalized)
+        or re.search(r"\bgap\s+between\b", normalized)
+        or re.search(r"\bgot[\s_-]+committed\b", normalized)
+        or re.search(r"\bactual[\s_-]+(?:diff|change|changes|commit|commits|implementation|patch)\b", normalized)
+    )
+
+    return promise_context and delivery_context and contrast_context
+
+
+def promise_vs_committed_terms() -> list[str]:
+    return sorted(PROMISE_VS_COMMITTED_EXPANSION_TERMS)
+
+
 def has_process_detour_lesson_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -861,6 +933,7 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_stale_reference_state_intent, stale_reference_state_terms),
     ContextualExpansionFamily(has_next_work_handoff_intent, next_work_handoff_terms),
     ContextualExpansionFamily(has_claim_boundary_intent, claim_boundary_terms),
+    ContextualExpansionFamily(has_promise_vs_committed_intent, promise_vs_committed_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
     ContextualExpansionFamily(
