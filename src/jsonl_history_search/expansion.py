@@ -348,6 +348,44 @@ HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS = (
     "written",
 )
 
+FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
+    "available",
+    "bad",
+    "correct",
+    "correctness",
+    "facet",
+    "facets",
+    "good",
+    "missing",
+    "omit",
+    "omits",
+    "omitted",
+    "partial",
+    "preservation",
+    "preserve",
+    "preserved",
+    "quality",
+    "sufficient",
+    "unavailable",
+)
+FINAL_ANSWER_SOURCE_HIT_EXPANSION_TERMS = (
+    "available",
+    "correctness",
+    "facet",
+    "facets",
+    "final answer",
+    "final-answer",
+    "missing",
+    "omitted",
+    "partial",
+    "preservation",
+    "preserved",
+    "quality",
+    "source hit",
+    "source-hit",
+    "unavailable",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -705,6 +743,45 @@ def handoff_document_location_terms() -> list[str]:
     return sorted(HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS)
 
 
+def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    answer_context = bool(token_context & {"answer", "answers"})
+    final_answer_context = bool(
+        re.search(r"\bfinal[\s_-]+answers?\b", normalized)
+    )
+    source_hit_context = bool(
+        re.search(r"\bsource[\s_-]+hits?\b", normalized)
+        or ("source" in token_context and token_context & {"hit", "hits"})
+    )
+    evidence_preservation_context = bool(
+        "evidence" in token_context
+        and (
+            token_context & {"preserve", "preserved", "preservation"}
+            or re.search(r"\bpreserv(?:e|ed|ation)\b", normalized)
+        )
+    )
+    facet_or_omission_context = bool(token_context & {"facet", "facets", "omit", "omits", "omitted"})
+    quality_or_preservation_context = bool(
+        token_context & set(FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS)
+        or re.search(r"\bnot\s+(?:good|correct|sufficient)\b", normalized)
+        or re.search(r"\bwasn['’]?t\s+(?:good|correct|sufficient)\b", normalized)
+        or re.search(r"\bdid(?:n['’]?t| not)\s+preserve\b", normalized)
+    )
+
+    return (
+        ((final_answer_context or source_hit_context) and quality_or_preservation_context)
+        or evidence_preservation_context
+        or (answer_context and facet_or_omission_context)
+    )
+
+
+def final_answer_source_hit_quality_terms() -> list[str]:
+    return sorted(FINAL_ANSWER_SOURCE_HIT_EXPANSION_TERMS)
+
+
 CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_worktree_cleanup_intent, worktree_cleanup_terms),
     ContextualExpansionFamily(has_retrieval_miss_failure_intent, retrieval_miss_failure_terms),
@@ -716,6 +793,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_claim_boundary_intent, claim_boundary_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
+    ContextualExpansionFamily(
+        has_final_answer_source_hit_quality_intent,
+        final_answer_source_hit_quality_terms,
+    ),
 )
 
 
