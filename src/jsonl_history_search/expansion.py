@@ -278,6 +278,27 @@ CLAIM_BOUNDARY_QUALITY_TERMS = (
     "value",
 )
 
+PROCESS_DETOUR_LESSON_EXPANSION_TERMS = (
+    "anchored",
+    "candidate",
+    "concrete",
+    "coordinator",
+    "hours",
+    "improvement",
+    "improvements",
+    "jsonl",
+    "lesson",
+    "process",
+    "process only",
+    "process-only",
+    "process_only",
+    "product",
+    "queue",
+    "reseeding",
+    "selection",
+    "tool",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -356,6 +377,10 @@ def expand_query_terms(
 
     if has_claim_boundary_intent(normalized, base_terms):
         for term in claim_boundary_terms():
+            add(term, "synonym_paraphrase")
+
+    if has_process_detour_lesson_intent(normalized, base_terms):
+        for term in process_detour_lesson_terms():
             add(term, "synonym_paraphrase")
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
@@ -598,6 +623,41 @@ def has_claim_boundary_intent(normalized: str, base_terms: list[str]) -> bool:
 
 def claim_boundary_terms() -> list[str]:
     return sorted({*CLAIM_BOUNDARY_CLAIM_TERMS, *CLAIM_BOUNDARY_QUALITY_TERMS})
+
+
+def has_process_detour_lesson_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    waste_time_question = bool(
+        re.search(
+            r"\bwhy\s+(?:did|was|were)\s+(?:it|this|that)\s+"
+            r"(?:waste|wasted|wasting)\s+(?:time|hours?)\b",
+            normalized,
+        )
+    )
+    bad_retrospective_question = bool(re.fullmatch(r"why\s+(?:was|is)\s+(?:it|this|that)\s+bad", normalized))
+    bare_lesson_question = bool(
+        re.fullmatch(r"what\s+did\s+(?:we|i|you)\s+learn", normalized)
+        or re.fullmatch(r"what\s+was\s+the\s+lesson", normalized)
+    )
+    process_detour_context = bool(
+        token_context & {"detour", "process", "queue", "reseeding"}
+        or re.search(r"\bprocess[\s_-]+only\b", normalized)
+    )
+    question_context = bool(
+        re.search(r"\b(?:what|why)\b", normalized)
+        and token_context & {"bad", "learn", "lesson", "waste", "wasted"}
+    )
+
+    return waste_time_question or bad_retrospective_question or bare_lesson_question or (
+        process_detour_context and question_context
+    )
+
+
+def process_detour_lesson_terms() -> list[str]:
+    return sorted(PROCESS_DETOUR_LESSON_EXPANSION_TERMS)
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
