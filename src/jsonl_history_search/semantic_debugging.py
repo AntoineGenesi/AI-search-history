@@ -128,6 +128,17 @@ def build_semantic_debug_payload(
     )
     candidate_causes = build_candidate_causes(candidates, timeline, tool_proof, joins)
     routes = build_routes(agent_find, source_scope, tool_report, forensics_payload, hints, benchmark_gate)
+    final_answer_contract = build_final_answer_source_use_contract(
+        status=agent_find["status"],
+        candidates=candidates,
+        source_locator_handoff=source_locator_handoff,
+        tool_proof=tool_proof,
+        joins=joins,
+        no_evidence=no_evidence,
+        uncertainty=uncertainty,
+        hints=hints,
+        source_scope=source_scope,
+    )
 
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -145,6 +156,7 @@ def build_semantic_debug_payload(
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
         "next_reads": next_reads,
+        "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
         "claim_boundaries": {
@@ -506,6 +518,77 @@ def build_next_reads(
     if hints.get("path") and not any(read.get("target") == hints["path"] for read in reads):
         reads.append({"kind": "hint_path", "target": hints["path"] or "", "reason": "caller supplied path hint"})
     return dedupe_dicts(reads)[:12]
+
+
+def build_final_answer_source_use_contract(
+    *,
+    status: str,
+    candidates: list[dict[str, Any]],
+    source_locator_handoff: dict[str, Any],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    no_evidence: dict[str, Any],
+    uncertainty: list[dict[str, str]],
+    hints: dict[str, str | None],
+    source_scope: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_refs = [
+        candidate.get("source_ref")
+        for candidate in candidates[:5]
+        if isinstance(candidate.get("source_ref"), dict) and candidate.get("source_ref", {}).get("path")
+    ]
+    next_reads = list(source_locator_handoff.get("next_reads") or [])[:8]
+    hint_obligations = [
+        {"hint": key, "value": value, "requirement": "address this supplied handle in the final answer or say it was not resolved"}
+        for key, value in hints.items()
+        if value
+    ]
+    required_actions = [
+        "Use source refs from strongest_candidates and source_locator_handoff.next_reads before answering when they exist.",
+        "State which evidence supports the answer and which parts remain inference.",
+        "Preserve uncertainty labels instead of smoothing them into a stronger claim.",
+        "Do not claim root cause, exhaustive all-history absence, JSONL superiority, speed, value, or token-efficiency unless separate reviewed evidence supports it.",
+    ]
+    evidence_inputs = {
+        "strongest_candidate_source_refs": candidate_refs,
+        "source_locator_next_reads": next_reads,
+        "structured_tool_event_count": tool_proof.get("event_count", 0),
+        "task_review_join_status": joins.get("status"),
+        "uncertainty_labels": [item.get("label") for item in uncertainty],
+    }
+    if status == "no_evidence":
+        required_actions.insert(0, "Answer with `not_found_in_searched_scope`, not global absence.")
+        required_actions.append("Name not-searched, missing, or cap-limited scope before concluding no evidence.")
+        answer_scope = "not_found_in_searched_scope"
+        source_use_required = False
+    else:
+        required_actions.insert(0, "Use or cite at least one source ref before making a factual or provenance claim.")
+        if tool_proof.get("events"):
+            required_actions.append("Use structured tool/action proof for claims about what an agent actually ran, edited, tested, or reviewed.")
+        if joins.get("status") == "joined":
+            required_actions.append("Use task/review/commit joins for provenance claims before relying on transcript snippets alone.")
+        answer_scope = "source_backed_answer_required"
+        source_use_required = bool(candidate_refs or next_reads or tool_proof.get("events") or joins.get("status") == "joined")
+    return {
+        "status": "active",
+        "answer_scope": answer_scope,
+        "source_use_required": source_use_required,
+        "required_actions": required_actions,
+        "hint_obligations": hint_obligations,
+        "evidence_inputs": evidence_inputs,
+        "no_evidence_scope": {
+            "answer_scope": no_evidence.get("answer_scope"),
+            "searched_scope": no_evidence.get("searched_scope"),
+            "not_searched_scope": no_evidence.get("not_searched_scope"),
+            "cap_hit": source_scope.get("cap_hit"),
+        },
+        "claim_boundaries": {
+            "root_cause_claim": "not_claimed",
+            "global_absence_claim": "not_allowed",
+            "jsonl_value_speed_or_token_efficiency_claim": "not_allowed_without_separate_reviewed_evidence",
+            "evidence_vs_inference_required": True,
+        },
+    }
 
 
 def build_tradeoff_counters(

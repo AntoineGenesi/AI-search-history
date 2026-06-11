@@ -213,6 +213,13 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
+    contract = report.get("final_answer_source_use_contract")
+    if contract:
+        lines.append("Final Answer Contract:")
+        lines.append(f"- answer_scope: {contract.get('answer_scope')}")
+        lines.append(f"- source_use_required: {contract.get('source_use_required')}")
+        for action in contract.get("required_actions", [])[:5]:
+            lines.append(f"- {action}")
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
@@ -240,6 +247,17 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ]
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
+    contract = report.get("final_answer_source_use_contract")
+    if contract:
+        lines.extend([
+            "",
+            "## Final Answer Contract",
+            "",
+            f"- `answer_scope`: `{contract.get('answer_scope')}`",
+            f"- `source_use_required`: `{contract.get('source_use_required')}`",
+        ])
+        for action in contract.get("required_actions", [])[:6]:
+            lines.append(f"- {action}")
     lines.extend([
         "",
         "## Strongest Candidates",
