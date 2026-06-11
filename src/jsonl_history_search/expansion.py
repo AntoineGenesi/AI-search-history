@@ -252,6 +252,18 @@ NEXT_WORK_HANDOFF_EXPANSION_TERMS = (
     "worktree",
 )
 
+CLAIM_BOUNDARY_CLAIM_TERMS = ("claim", "claimed", "claims", "overclaim", "overclaimed")
+CLAIM_BOUNDARY_QUALITY_TERMS = (
+    "answer",
+    "evidence",
+    "reviewed",
+    "speed",
+    "token efficiency",
+    "token-efficiency",
+    "unsupported",
+    "value",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -322,6 +334,10 @@ def expand_query_terms(
 
     if has_next_work_handoff_intent(normalized, base_terms):
         for term in next_work_handoff_terms():
+            add(term, "synonym_paraphrase")
+
+    if has_claim_boundary_intent(normalized, base_terms):
+        for term in claim_boundary_terms():
             add(term, "synonym_paraphrase")
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
@@ -503,6 +519,40 @@ def has_next_work_handoff_intent(normalized: str, base_terms: list[str]) -> bool
 
 def next_work_handoff_terms() -> list[str]:
     return sorted(NEXT_WORK_HANDOFF_EXPANSION_TERMS)
+
+
+def has_claim_boundary_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    overclaim_intent = bool(
+        token_context & {"overclaim", "overclaimed", "overclaims", "overclaiming"}
+        or re.search(r"\bover[\s_-]*claim(?:ed|s|ing)?\b", normalized)
+    )
+    if overclaim_intent:
+        return True
+
+    claim_intent = bool(
+        token_context & {"claim", "claimed", "claims", "claiming"}
+        or re.search(r"\bclaim[\s_-]+boundar(?:y|ies)\b", normalized)
+    )
+    boundary_intent = bool(
+        token_context & {"boundary", "boundaries", "evidence", "reviewed", "unsupported"}
+        or re.search(r"\bnot[\s_-]+allowed\b", normalized)
+        or re.search(r"\bwithout\s+(?:separate\s+)?reviewed\s+evidence\b", normalized)
+        or re.search(r"\bnot\s+(?:backed|supported|allowed)\b", normalized)
+    )
+    question_context = bool(
+        re.search(r"\b(?:what|which)\s+(?:claim|claims)\b", normalized)
+        or re.search(r"\b(?:what|which)\s+(?:was|were|is|are)\s+.*\bclaim", normalized)
+    )
+
+    return claim_intent and boundary_intent and (question_context or "boundary" in token_context or "boundaries" in token_context)
+
+
+def claim_boundary_terms() -> list[str]:
+    return sorted({*CLAIM_BOUNDARY_CLAIM_TERMS, *CLAIM_BOUNDARY_QUALITY_TERMS})
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
