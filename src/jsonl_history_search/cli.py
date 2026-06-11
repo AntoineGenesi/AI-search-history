@@ -986,7 +986,7 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         if args.report_output:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
-            rendered = render(_short_skill_audit_report_written_payload(payload, args.report_output), args.format)
+            rendered = render(_short_skill_audit_report_written_payload(payload, args.report_output, args.format), args.format)
         print(rendered)
         return 0
     if args.command == "structured-tool-events":
@@ -1400,30 +1400,38 @@ def _short_lineage_report_written_payload(payload: dict, report_output: str) -> 
     }
 
 
-def _short_skill_audit_report_written_payload(payload: dict, report_output: str) -> dict:
+def _short_skill_audit_report_written_payload(payload: dict, report_output: str, output_format: str = "json") -> dict:
     report = payload["skill_audit"]
     efficiency = report.get("token_efficiency", {})
-    usage_instances = report.get("usage_instances", [])[:3]
-    non_use_mentions = report.get("non_use_mentions", [])[:3]
+    compact = {
+        "schema_version": report["schema_version"],
+        "status": report["status"],
+        "skill": report["skill"],
+        "report_written": str(Path(report_output).expanduser()),
+        "token_efficiency": {
+            "usage_instance_count": efficiency.get("usage_instance_count", 0),
+            "non_use_mention_count": efficiency.get("non_use_mention_count", 0),
+            "searched_files": efficiency.get("searched_files", 0),
+            "searched_bytes": efficiency.get("searched_bytes", 0),
+        },
+        "warnings": payload.get("warnings", []),
+        "message": "Full skill audit report written to report_output; stdout is a compact handoff map.",
+    }
+    if output_format == "json":
+        compact["ai_handoff_packet"] = report.get("ai_handoff_packet", {})
+    else:
+        usage_instances = report.get("usage_instances", [])[:3]
+        non_use_mentions = report.get("non_use_mentions", [])[:3]
+        compact.update(
+            {
+                "usage_instances": usage_instances,
+                "non_use_mentions": non_use_mentions,
+                "top_usage_instances": usage_instances,
+                "top_non_use_mentions": non_use_mentions,
+            }
+        )
     return {
-        "skill_audit": {
-            "schema_version": report["schema_version"],
-            "status": report["status"],
-            "skill": report["skill"],
-            "report_written": str(Path(report_output).expanduser()),
-            "token_efficiency": {
-                "usage_instance_count": efficiency.get("usage_instance_count", 0),
-                "non_use_mention_count": efficiency.get("non_use_mention_count", 0),
-                "searched_files": efficiency.get("searched_files", 0),
-                "searched_bytes": efficiency.get("searched_bytes", 0),
-            },
-            "usage_instances": usage_instances,
-            "non_use_mentions": non_use_mentions,
-            "top_usage_instances": usage_instances,
-            "top_non_use_mentions": non_use_mentions,
-            "warnings": payload.get("warnings", []),
-            "message": "Full skill audit report written to report_output; stdout is a compact handoff map.",
-        }
+        "skill_audit": compact
     }
 
 
