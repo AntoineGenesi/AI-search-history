@@ -14,6 +14,7 @@ from .agent_contract import (
     build_source_locator_handoff,
     estimate_tokens,
     reduction_ratio,
+    source_ref_target,
 )
 from .claims import classify_claim_action, parse_review_verdict
 from .forensics import build_forensics_payload
@@ -502,12 +503,14 @@ def build_next_reads(
     reads: list[dict[str, str]] = []
     for candidate in candidates[:5]:
         ref = candidate.get("source_ref") or {}
-        if ref.get("path"):
-            reads.append({"kind": "jsonl_source_ref", "target": f"{ref.get('path')}:{ref.get('line')}", "reason": "confirm candidate snippet in source context"})
+        target = source_ref_target(ref)
+        if target:
+            reads.append({"kind": "jsonl_source_ref", "target": target, "reason": "confirm candidate snippet in source context"})
     for event in tool_proof.get("events", [])[:4]:
         ref = event.get("source_ref") or {}
-        if ref.get("path"):
-            reads.append({"kind": "tool_event_source_ref", "target": f"{ref.get('path')}:{ref.get('line')}", "reason": "confirm structured action proof"})
+        target = source_ref_target(ref)
+        if target:
+            reads.append({"kind": "tool_event_source_ref", "target": target, "reason": "confirm structured action proof"})
     for item in joins.get("review_evidence", [])[:4]:
         if item.get("path"):
             reads.append({"kind": "task_or_review_artifact", "target": item["path"], "reason": "confirm task/review verdict and claim-action classification"})
