@@ -1036,6 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
                     "candidate_count": len(packet["strongest_candidates"]),
                     "event_count": packet["tool_action_proof"]["event_count"],
                     "source_locator_handoff": packet["source_locator_handoff"],
+                    "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
                     "next_reads": packet["next_reads"][:5],
                     "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
                 }
