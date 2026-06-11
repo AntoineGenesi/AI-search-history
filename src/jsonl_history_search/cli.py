@@ -1374,6 +1374,7 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
             "candidate_count": report["token_efficiency"]["candidate_count"],
             "searched_files": report["token_efficiency"]["searched_files"],
             "searched_bytes": report["token_efficiency"]["searched_bytes"],
+            "command_surface": report["command_surface"],
             "source_locator_handoff": report["source_locator_handoff"],
             "top_candidates": report["find_candidates"][:3],
             "next_search_suggestions": report["next_search_suggestions"],
