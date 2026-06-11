@@ -475,6 +475,24 @@ TASK_COMPLETION_STATE_EXPANSION_TERMS = (
     "verified",
 )
 
+PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
+    "before",
+    "crash",
+    "crashed",
+    "failure",
+    "interrupted",
+    "restart",
+    "resume",
+    "traceback",
+    "stderr",
+    "error",
+    "last",
+    "previous",
+    "session",
+    "context",
+    "timeline",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -924,6 +942,46 @@ def task_completion_state_mismatch_terms() -> list[str]:
     return sorted(TASK_COMPLETION_STATE_EXPANSION_TERMS)
 
 
+def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    temporal_context = bool(
+        token_context & {"before", "last", "previous"}
+        or re.search(r"\bpre[\s_-]+(?:crash|failure|interruption|restart)\b", normalized)
+    )
+    incident_context = bool(
+        token_context
+        & {
+            "crash",
+            "crashed",
+            "failure",
+            "interrupted",
+            "restart",
+            "resume",
+            "traceback",
+            "stderr",
+            "error",
+        }
+        or re.search(r"\bcrash(?:ed|es|ing)?\b", normalized)
+        or re.search(r"\brestart(?:ed|s|ing)?\b", normalized)
+        or re.search(r"\binterruption\b|\binterrupt(?:ed|s|ing)?\b", normalized)
+        or re.search(r"\bresume(?:d|s|ing)?\b", normalized)
+    )
+    question_or_context = bool(
+        token_context & {"context", "timeline"}
+        or re.search(r"\bwhat\s+happened\b", normalized)
+        or re.search(r"\bwhat\s+(?:was|were)\s+(?:the\s+)?context\b", normalized)
+    )
+
+    return temporal_context and incident_context and question_or_context
+
+
+def pre_crash_incident_context_terms() -> list[str]:
+    return sorted(PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS)
+
+
 CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_worktree_cleanup_intent, worktree_cleanup_terms),
     ContextualExpansionFamily(has_retrieval_miss_failure_intent, retrieval_miss_failure_terms),
@@ -943,6 +1001,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_task_completion_state_mismatch_intent,
         task_completion_state_mismatch_terms,
+    ),
+    ContextualExpansionFamily(
+        has_pre_crash_incident_context_intent,
+        pre_crash_incident_context_terms,
     ),
 )
 
