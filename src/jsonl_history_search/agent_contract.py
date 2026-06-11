@@ -494,10 +494,14 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
             ref = candidate.get("source_ref", {})
             candidate_id = candidate.get("candidate_id")
         if ref.get("path"):
+            source_ref = dict(ref)
+            target = f"{source_ref.get('path')}:{source_ref.get('line')}"
             reads.append(
                 {
                     "kind": "jsonl_source_ref",
-                    "target": str(candidate_id or ""),
+                    "target": target,
+                    "candidate_id": str(candidate_id or ""),
+                    "source_ref": source_ref,
                     "reason": "open candidate source_ref before broad search",
                 }
             )
