@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import hashlib
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -53,7 +54,7 @@ def validate_install(
     ]
     checks.extend(_check_redaction_and_fixture_search())
     if codex_home is not None:
-        checks.extend(_check_global_codex_install(codex_home.expanduser()))
+        checks.extend(_check_global_codex_install(codex_home.expanduser(), root, source_checkout=source_checkout))
 
     counts = _status_counts(checks)
     failed = counts.get("fail", 0) > 0
@@ -405,20 +406,14 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
         return checks
 
 
-def _check_global_codex_install(codex_home: Path) -> list[ValidationCheck]:
+def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_checkout: bool = True) -> list[ValidationCheck]:
     skill = codex_home / "skills" / "jsonl-history-search" / "SKILL.md"
     helper = codex_home / "skills" / "jsonl-history-search" / "scripts" / "search_jsonl_history.py"
+    package_skill = package_root / "skills" / "codex" / "jsonl-history-search" / "SKILL.md"
+    package_helper = package_root / "scripts" / "search_jsonl_history.py"
     checks: list[ValidationCheck] = []
     if skill.is_file():
-        checks.append(
-            ValidationCheck(
-                id="global_skill",
-                name="Global Codex skill file",
-                status="pass",
-                detail="Global Codex skill file is present.",
-                paths=[str(skill)],
-            )
-        )
+        checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, source_checkout=source_checkout))
     else:
         checks.append(
             ValidationCheck(
@@ -431,15 +426,7 @@ def _check_global_codex_install(codex_home: Path) -> list[ValidationCheck]:
             )
         )
     if helper.is_file() and os.access(helper, os.X_OK):
-        checks.append(
-            ValidationCheck(
-                id="global_helper",
-                name="Global Codex helper executability",
-                status="pass",
-                detail="Global Codex helper is present and executable.",
-                paths=[str(helper)],
-            )
-        )
+        checks.append(_global_copy_check("global_helper", "Global Codex helper script", helper, package_helper, source_checkout=source_checkout))
     else:
         checks.append(
             ValidationCheck(
@@ -452,6 +439,61 @@ def _check_global_codex_install(codex_home: Path) -> list[ValidationCheck]:
             )
         )
     return checks
+
+
+def _global_copy_check(
+    check_id: str,
+    name: str,
+    installed: Path,
+    packaged: Path,
+    *,
+    source_checkout: bool,
+) -> ValidationCheck:
+    paths = [str(installed)]
+    if not source_checkout or not packaged.is_file():
+        return ValidationCheck(
+            id=check_id,
+            name=name,
+            status="pass",
+            detail=f"{name} is present.",
+            paths=paths,
+            metadata={"source_checkout": source_checkout},
+        )
+
+    paths.append(str(packaged))
+    installed_hash = _sha256_file(installed)
+    packaged_hash = _sha256_file(packaged)
+    metadata = {
+        "installed_sha256": installed_hash,
+        "package_sha256": packaged_hash,
+        "matches_package": installed_hash == packaged_hash,
+    }
+    if installed_hash == packaged_hash:
+        return ValidationCheck(
+            id=check_id,
+            name=name,
+            status="pass",
+            detail=f"{name} matches the package checkout copy.",
+            paths=paths,
+            metadata=metadata,
+        )
+    return ValidationCheck(
+        id=check_id,
+        name=name,
+        status="fail",
+        detail=f"{name} is installed but stale relative to the package checkout copy.",
+        paths=paths,
+        recovery=["Run `bash install/install_codex_global.sh` from the package root to refresh the global Codex skill/helper."],
+        metadata=metadata,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _status_counts(checks: list[ValidationCheck]) -> dict[str, int]:
