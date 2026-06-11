@@ -217,6 +217,27 @@ CHANGE_SUMMARY_EXPANSION_TERMS = (
     "wording",
 )
 
+STALE_REFERENCE_STATE_STATUS_TERMS = ("stale", "old", "obsolete", "superseded")
+STALE_REFERENCE_STATE_REFERENCE_TERMS = (
+    "mention",
+    "mentioned",
+    "reference",
+    "referenced",
+    "referencing",
+)
+STALE_REFERENCE_STATE_CONTEXT_TERMS = (
+    "active",
+    "active-state",
+    "handoff",
+    "old",
+    "obsolete",
+    "pointer",
+    "queue",
+    "referenced",
+    "state",
+    "superseded",
+)
+
 
 @dataclass
 class ExpansionResult:
@@ -279,6 +300,10 @@ def expand_query_terms(
 
     if has_change_summary_improvement_intent(normalized, base_terms):
         for term in change_summary_improvement_terms():
+            add(term, "synonym_paraphrase")
+
+    if has_stale_reference_state_intent(normalized, base_terms):
+        for term in stale_reference_state_terms():
             add(term, "synonym_paraphrase")
 
     for term in date_window_terms(date_window_start, date_window_end, date_reason):
@@ -399,6 +424,39 @@ def has_change_summary_improvement_intent(normalized: str, base_terms: list[str]
 
 def change_summary_improvement_terms() -> list[str]:
     return sorted(CHANGE_SUMMARY_EXPANSION_TERMS)
+
+
+def has_stale_reference_state_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    stale_status_intent = bool(token_context & set(STALE_REFERENCE_STATE_STATUS_TERMS))
+    reference_intent = bool(
+        token_context & set(STALE_REFERENCE_STATE_REFERENCE_TERMS)
+        or re.search(r"\breferenc(?:e|ed|ing)\b", normalized)
+    )
+    state_context = bool(
+        token_context & {"active", "handoff", "pointer", "queue", "state"}
+        or re.search(r"\bactive[\s_-]+state\b", normalized)
+    )
+    question_or_contrast = bool(
+        re.search(r"\b(?:what|which)\s+(?:was|were|is|are)\b", normalized)
+        or re.search(r"\bstill\s+(?:mentioned|referenced)\b", normalized)
+        or re.search(r"\b(?:stale|old|obsolete|superseded)\s+but\s+(?:still\s+)?(?:mentioned|referenced)\b", normalized)
+    )
+
+    return stale_status_intent and reference_intent and (state_context or question_or_contrast)
+
+
+def stale_reference_state_terms() -> list[str]:
+    return sorted(
+        {
+            *STALE_REFERENCE_STATE_STATUS_TERMS,
+            *STALE_REFERENCE_STATE_REFERENCE_TERMS,
+            *STALE_REFERENCE_STATE_CONTEXT_TERMS,
+        }
+    )
 
 
 def exact_phrase_terms(normalized: str) -> list[str]:
