@@ -1107,6 +1107,33 @@ def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
 
+def _format_handoff_source_ref(candidate: dict) -> str:
+    ref = candidate.get("source_ref") or {}
+    path = ref.get("path")
+    line = ref.get("line")
+    if path and line is not None:
+        return f"{path}:{line}"
+    if path:
+        return str(path)
+    if line is not None:
+        return f"line {line}"
+    return ""
+
+
+def _format_handoff_reason_codes(candidate: dict) -> str:
+    reason_codes = candidate.get("reason_codes") or []
+    return ", ".join(str(item) for item in reason_codes if item is not None)
+
+
+def _format_handoff_score(candidate: dict) -> str:
+    score = candidate.get("score")
+    if isinstance(score, float):
+        return f"{score:.3f}".rstrip("0").rstrip(".")
+    if score is None:
+        return ""
+    return str(score)
+
+
 def render_source_locator_handoff_text(handoff: dict) -> list[str]:
     not_searched = handoff.get("not_searched_scope", {})
     candidate_ordering = handoff.get("candidate_ordering", {})
@@ -1125,6 +1152,17 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
     ]
     if caps.get("hit"):
         lines.append(f"- caps hit: {', '.join(caps.get('caps_hit', []))}")
+    top_candidates = candidate_ordering.get("top_candidates") or []
+    for candidate in top_candidates[:5]:
+        bits = [
+            f"id={candidate.get('candidate_id') or ''}",
+            f"source={_format_handoff_source_ref(candidate)}",
+            f"confidence={candidate.get('confidence') or ''}",
+            f"stage={candidate.get('stage') or ''}",
+            f"score={_format_handoff_score(candidate)}",
+            f"reasons={_format_handoff_reason_codes(candidate)}",
+        ]
+        lines.append(f"- top candidate: {' '.join(bits)}")
     for item in handoff.get("next_reads", [])[:5]:
         lines.append(f"- next read: {item.get('kind')} {item.get('target')}")
     return lines
@@ -1147,6 +1185,19 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
     ]
     if caps.get("hit"):
         lines.append(f"- Caps hit: `{', '.join(caps.get('caps_hit', []))}`")
+    top_candidates = candidate_ordering.get("top_candidates") or []
+    if top_candidates:
+        lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
+        for candidate in top_candidates[:5]:
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(candidate.get('candidate_id') or ''))} | "
+                f"{_escape_markdown_table(_format_handoff_source_ref(candidate))} | "
+                f"{_escape_markdown_table(str(candidate.get('confidence') or ''))} | "
+                f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
+                f"{_escape_markdown_table(_format_handoff_score(candidate))} | "
+                f"{_escape_markdown_table(_format_handoff_reason_codes(candidate))} |"
+            )
     next_reads = handoff.get("next_reads", [])[:5]
     if next_reads:
         lines.extend(["", "| Kind | Target | Reason |", "| --- | --- | --- |"])
