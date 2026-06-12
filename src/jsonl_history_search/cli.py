@@ -589,6 +589,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional ignored raw JSH-707 failed-attempt run JSON used only for safe probe counters.",
     )
     opened_progress_diagnostic.add_argument(
+        "--jsh709-benchmark-report",
+        default=None,
+        help="Optional committed sanitized JSH-709 benchmark report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh709-miss-audit-report",
+        default=None,
+        help="Optional committed sanitized JSH-709 miss-audit report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh709-raw-run",
+        default=None,
+        help="Optional ignored raw JSH-709 run JSON used only for safe opt-in counter fields.",
+    )
+    opened_progress_diagnostic.add_argument(
         "--report-output",
         default=None,
         help="Optional path where the sanitized JSON/Markdown report should be written.",
