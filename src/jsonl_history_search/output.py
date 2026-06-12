@@ -2708,6 +2708,10 @@ def render_real_history_remaining_miss_diagnostic_text(payload: dict) -> str:
         f"Dedupe measured cause count: {summary.get('dedupe_measured_cause_count', 0)}",
         f"Would pass should_consider: {summary.get('would_pass_should_consider_count', 0)}",
         f"Rank-if-reached 1: {summary.get('rank_if_reached_1_count', 0)}",
+        f"Instrumented expected-ref evidence: {summary.get('instrumented_expected_ref_available_count', 0)}",
+        f"Line reached before stop: {summary.get('expected_record_line_reached_before_elapsed_stop_count', 0)}",
+        f"Pre-final present: {summary.get('expected_record_present_in_pre_final_candidate_state_count', 0)}",
+        f"Final surfacing loss: {summary.get('final_output_ref_surfacing_loss_count', 0)}",
         f"Repair supported: {decision.get('repair_supported_by_jsh702')}",
         f"Headline: {decision.get('headline')}",
     ]
@@ -2722,7 +2726,7 @@ def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str
     baseline = report.get("canonical_baseline") or {}
     decision = report.get("decision") or {}
     lines = [
-        "# JSH-702 Remaining Miss Loss-Point Diagnostic",
+        "# Remaining Miss Loss-Point Diagnostic",
         "",
         f"**Status:** `{report.get('status')}`",
         f"**Data source:** `{report.get('data_source')}`",
@@ -2749,6 +2753,15 @@ def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str
         f"| would pass should_consider | {summary.get('would_pass_should_consider_count', 0)} |",
         f"| rank-if-reached = 1 | {summary.get('rank_if_reached_1_count', 0)} |",
         f"| pre-final internal candidate lists available | {summary.get('pre_final_internal_candidate_list_available_count', 0)} |",
+        f"| instrumented expected-ref evidence available | {summary.get('instrumented_expected_ref_available_count', 0)} |",
+        f"| expected file opened before scan stop | {summary.get('expected_file_opened_before_scan_stop_instrumented_count', 0)} |",
+        f"| expected record line reached before elapsed stop | {summary.get('expected_record_line_reached_before_elapsed_stop_count', 0)} |",
+        f"| expected record present before reservoir retention | {summary.get('expected_record_present_before_reservoir_retention_count', 0)} |",
+        f"| expected record present in pre-final candidate state | {summary.get('expected_record_present_in_pre_final_candidate_state_count', 0)} |",
+        f"| expected record present in final candidate groups | {summary.get('expected_record_present_in_final_candidate_groups_count', 0)} |",
+        f"| expected ref present in sanitized top refs | {summary.get('sanitized_top_candidate_refs_present_count', 0)} |",
+        f"| pre-final retention loss | {summary.get('pre_final_retention_loss_count', 0)} |",
+        f"| final output/ref surfacing loss | {summary.get('final_output_ref_surfacing_loss_count', 0)} |",
         f"| elapsed cap | {summary.get('elapsed_cap_count', 0)} |",
         f"| match cap | {summary.get('match_cap_count', 0)} |",
         f"| weak reservoir cap | {summary.get('weak_reservoir_cap_count', 0)} |",
@@ -2760,6 +2773,11 @@ def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str
     ]
     for label, count in (summary.get("path_safe_loss_point_counts") or {}).items():
         lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    lines.extend(["", "## Next Repair Candidate Counts", "", "| Candidate | Cases |", "| --- | ---: |"])
+    for label, count in (summary.get("next_repair_candidate_counts") or {}).items():
+        lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    if not summary.get("next_repair_candidate_counts"):
+        lines.append("| `(none)` | 0 |")
     lines.extend(["", "## Query/Source-Planning Signals", "", "| Signal | Cases |", "| --- | ---: |"])
     for label, count in (summary.get("query_pathology_counts") or {}).items():
         lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
@@ -2786,26 +2804,31 @@ def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str
             "",
             "## Case Ledger",
             "",
-            "| Case | Family | Loss bucket | Opened | Should consider | Rank if reached | Dedupe | Weak reservoir | Query signals |",
-            "| --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
+            "| Case | Family | Loss bucket | Selected | Queued | Opened | Line reached | Candidate path | Pre-final status | Final surfaced | Files opened | Bytes parsed | Handoff bytes | Next repair candidate | Query signals |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
         ]
     )
     for row in report.get("rows", []):
         scope = row.get("expected_file_scope") or {}
-        should = row.get("should_consider_and_rank_evidence") or {}
-        dedupe = row.get("dedupe_evidence") or {}
-        cap = row.get("cap_and_pressure_evidence") or {}
         query = row.get("query_source_planning_signal") or {}
+        inst = row.get("instrumented_expected_ref_evidence") or {}
+        cost = row.get("cost_evidence") or {}
         lines.append(
             "| "
             f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
             f"{_escape_markdown_table(str(row.get('family', '')))} | "
             f"`{_escape_markdown_table(str(row.get('path_safe_loss_point_bucket', '')))}` | "
-            f"`{scope.get('opened_before_scan_stop')}` | "
-            f"`{should.get('would_pass_should_consider')}` | "
-            f"{should.get('rank_if_reached') if should.get('rank_if_reached') is not None else ''} | "
-            f"{dedupe.get('candidate_records_deduped', 0)} | "
-            f"`{cap.get('weak_reservoir_noise_pressure')}` | "
+            f"`{inst.get('expected_file_selected_by_source_plan')}` | "
+            f"`{inst.get('expected_file_queued_for_scan')}` | "
+            f"`{inst.get('expected_file_opened_before_scan_stop')}` | "
+            f"`{inst.get('expected_record_line_reached_before_elapsed_stop')}` | "
+            f"`{_escape_markdown_table(str(inst.get('candidate_path_label')))}` | "
+            f"`{_escape_markdown_table(str(inst.get('kept_or_dropped_before_pre_final')))}` | "
+            f"`{inst.get('sanitized_top_candidate_refs_present') or inst.get('expected_record_present_in_final_candidate_groups')}` | "
+            f"{cost.get('files_opened', 0)} | "
+            f"{cost.get('bytes_parsed', 0)} | "
+            f"{cost.get('handoff_bytes', 0)} | "
+            f"`{_escape_markdown_table(str(row.get('next_repair_candidate')))}` | "
             f"{_escape_markdown_table(', '.join(query.get('pathology_labels') or []))} |"
         )
     return "\n".join(lines)
