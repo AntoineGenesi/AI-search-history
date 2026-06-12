@@ -45,6 +45,13 @@ from .real_history_miss_audit import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_MI
 from .real_history_miss_audit import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_MISS_AUDIT_PRIVATE_BRIDGE
 from .real_history_miss_audit import DEFAULT_RAW_RUN as DEFAULT_REAL_HISTORY_MISS_AUDIT_RAW_RUN
 from .real_history_miss_audit import build_real_history_package_miss_audit_payload
+from .real_history_remaining_miss_diagnostic import (
+    DEFAULT_BENCHMARK_REPORT as DEFAULT_REAL_HISTORY_REMAINING_MISS_BENCHMARK_REPORT,
+)
+from .real_history_remaining_miss_diagnostic import (
+    DEFAULT_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_REMAINING_MISS_AUDIT_REPORT,
+)
+from .real_history_remaining_miss_diagnostic import build_real_history_remaining_miss_diagnostic_payload
 from .real_history_embedding import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_EMBEDDING_MANIFEST
 from .real_history_embedding import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_EMBEDDING_PRIVATE_BRIDGE
 from .real_history_embedding import build_real_history_embedding_payload
@@ -506,6 +513,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path where the sanitized JSON/Markdown report should be written.",
     )
     real_history_miss_audit.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
+    remaining_miss_diagnostic = subparsers.add_parser("diagnose-real-history-remaining-misses")
+    remaining_miss_diagnostic.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    remaining_miss_diagnostic.add_argument(
+        "--benchmark-report",
+        default=str(DEFAULT_REAL_HISTORY_REMAINING_MISS_BENCHMARK_REPORT),
+        help="Committed sanitized JSH-700 benchmark report JSON.",
+    )
+    remaining_miss_diagnostic.add_argument(
+        "--miss-audit-report",
+        default=str(DEFAULT_REAL_HISTORY_REMAINING_MISS_AUDIT_REPORT),
+        help="Committed sanitized JSH-700 miss-audit report JSON.",
+    )
+    remaining_miss_diagnostic.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    remaining_miss_diagnostic.add_argument(
         "--markdown-report-output",
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
@@ -1262,6 +1291,27 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["real_history_package_search_miss_audit"]["status"]
         return 1 if status in {"invalid_fixture"} else 0
+    if args.command == "diagnose-real-history-remaining-misses":
+        payload = build_real_history_remaining_miss_diagnostic_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_remaining_miss_loss_point_diagnostic"]["status"]
+        return 1 if status in {"incomplete"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)
