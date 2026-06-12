@@ -579,6 +579,27 @@ COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS = (
     "why",
 )
 
+BRANCH_MERGE_SURROUNDING_CONVERSATION_EXPANSION_TERMS = (
+    "adjacent",
+    "after",
+    "around",
+    "before",
+    "branch",
+    "chat",
+    "context",
+    "conversation",
+    "merge",
+    "merge commit",
+    "merged",
+    "nearby",
+    "post-merge",
+    "provenance",
+    "review",
+    "session",
+    "surrounding",
+    "timeline",
+)
+
 FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
     "available",
     "bad",
@@ -1257,6 +1278,37 @@ def commit_user_request_provenance_terms() -> list[str]:
     return sorted(COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS)
 
 
+def has_branch_merge_surrounding_conversation_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    branch_context = bool(
+        token_context & {"branch", "branches"}
+        or re.search(r"\btask[\s_-]+branch(?:es)?\b", normalized)
+    )
+    merge_commit_context = bool(re.search(r"\bmerge[\s_-]+commit\b", normalized))
+    merge_context = bool(
+        token_context & {"merge", "merged", "merges", "merging"}
+        or merge_commit_context
+        or re.search(r"\bpost[\s_-]+merge\b", normalized)
+    )
+    surrounding_context = bool(
+        token_context & {"surrounding", "around", "nearby", "adjacent"}
+        or re.search(r"\bbefore\s+and\s+after\b", normalized)
+        or {"before", "after"} <= token_context
+    )
+    conversation_context = bool(
+        token_context & {"chat", "chats", "context", "conversation", "conversations", "session", "sessions"}
+    )
+
+    return ((branch_context and merge_context) or merge_commit_context) and surrounding_context and conversation_context
+
+
+def branch_merge_surrounding_conversation_terms() -> list[str]:
+    return sorted(BRANCH_MERGE_SURROUNDING_CONVERSATION_EXPANSION_TERMS)
+
+
 def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1438,6 +1490,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_commit_user_request_provenance_intent,
         commit_user_request_provenance_terms,
+    ),
+    ContextualExpansionFamily(
+        has_branch_merge_surrounding_conversation_intent,
+        branch_merge_surrounding_conversation_terms,
     ),
     ContextualExpansionFamily(
         has_final_answer_source_hit_quality_intent,
