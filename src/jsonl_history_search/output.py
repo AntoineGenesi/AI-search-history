@@ -45,6 +45,8 @@ def render_text(payload: dict) -> str:
         return render_measured_benchmark_text(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_text(payload)
+    if "mechanism_eval" in payload:
+        return render_mechanism_eval_text(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_text(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
@@ -150,6 +152,8 @@ def render_markdown(payload: dict) -> str:
         return render_measured_benchmark_markdown(payload)
     if "impact_benchmark" in payload:
         return render_impact_benchmark_markdown(payload)
+    if "mechanism_eval" in payload:
+        return render_mechanism_eval_markdown(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_markdown(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
@@ -2232,6 +2236,74 @@ def render_impact_benchmark_text(payload: dict) -> str:
             f"no_evidence_correct={row.get('no_evidence_correct')} "
             f"candidates={row.get('candidate_count')} "
             f"context_bytes={row.get('output_context_bytes')}"
+        )
+    return "\n".join(lines)
+
+
+def render_mechanism_eval_text(payload: dict) -> str:
+    report = payload["mechanism_eval"]
+    gate = report.get("mechanism_eval_gate", {})
+    metadata = report.get("metadata_discovery", {})
+    lines = [
+        "Mechanism eval",
+        f"Status: {report.get('status')}",
+        f"Data source: {report.get('data_source')}",
+        f"Gate: {gate.get('status')} ({', '.join(gate.get('reasons') or [])})",
+        f"Metadata candidates: {metadata.get('candidate_count', 0)}",
+        "Promotion: unpromoted tiny synthetic slice; no default search, sidecar, ranking, token-efficiency, final-answer-quality, or product-value claim.",
+    ]
+    for row in report.get("rows", []):
+        prefilter = row.get("rg_prefilter") or {}
+        lines.append(
+            "- "
+            f"{row.get('case_id')}/{row.get('baseline')}: "
+            f"status={row.get('case_status')} "
+            f"source_ref={row.get('source_ref_status')} "
+            f"files={row.get('searched_files')} "
+            f"bytes={row.get('searched_bytes')} "
+            f"needle_policy={prefilter.get('needle_policy')} "
+            f"needle_count={prefilter.get('needle_count')} "
+            f"metadata_candidates={row.get('metadata_candidate_count')}"
+        )
+    return "\n".join(lines)
+
+
+def render_mechanism_eval_markdown(payload: dict) -> str:
+    report = payload["mechanism_eval"]
+    gate = report.get("mechanism_eval_gate", {})
+    lines = [
+        "# Tiny Retrieval Mechanism Eval",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Gate:** `{gate.get('status')}`",
+        "",
+        "This is an unpromoted synthetic slice. It does not enable default `rg`, generated metadata, sidecars, indexes, ranking changes, token-efficiency claims, final-answer-quality claims, or product-value claims.",
+        "",
+        "## Gate Reasons",
+    ]
+    lines.extend(f"- `{reason}`" for reason in gate.get("reasons", []))
+    metadata = report.get("metadata_discovery", {})
+    lines.extend(
+        [
+            "",
+            "## Metadata Discovery",
+            f"- Status: `{metadata.get('status')}`",
+            f"- Candidate count: `{metadata.get('candidate_count', 0)}`",
+            f"- Candidate kinds: {', '.join(f'`{kind}`' for kind in metadata.get('candidate_kinds', [])) or '(none)'}",
+            "",
+            "## Rows",
+            "| case | baseline | case status | source-ref status | searched files | searched bytes | needle policy | needle count | metadata candidates |",
+            "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: |",
+        ]
+    )
+    for row in report.get("rows", []):
+        prefilter = row.get("rg_prefilter") or {}
+        lines.append(
+            "| "
+            f"`{row.get('case_id')}` | `{row.get('baseline')}` | `{row.get('case_status')}` | "
+            f"`{row.get('source_ref_status')}` | {row.get('searched_files')} | {row.get('searched_bytes')} | "
+            f"`{prefilter.get('needle_policy')}` | {prefilter.get('needle_count')} | {row.get('metadata_candidate_count')} |"
         )
     return "\n".join(lines)
 
