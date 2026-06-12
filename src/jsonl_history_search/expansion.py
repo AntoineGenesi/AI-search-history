@@ -456,6 +456,45 @@ HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS = (
     "written",
 )
 
+HTML_REPORT_NAME_MEMORY_ARTIFACT_TERMS = (
+    "artifact",
+    "artifacts",
+    "html",
+    "html report",
+    "report",
+    "reports",
+)
+HTML_REPORT_NAME_MEMORY_NAME_TERMS = (
+    "file name",
+    "filename",
+    "location",
+    "name",
+    "path",
+    "title",
+)
+HTML_REPORT_NAME_MEMORY_VAGUE_TERMS = (
+    "earlier",
+    "previous",
+    "prior",
+    "remember",
+    "remembered",
+    "that",
+)
+HTML_REPORT_NAME_MEMORY_OUTPUT_TERMS = (
+    "html file",
+    "output",
+    "output path",
+    "report output",
+    "reports html",
+    "reports/html",
+)
+HTML_REPORT_NAME_MEMORY_EXPANSION_TERMS = (
+    *HTML_REPORT_NAME_MEMORY_ARTIFACT_TERMS,
+    *HTML_REPORT_NAME_MEMORY_NAME_TERMS,
+    *HTML_REPORT_NAME_MEMORY_VAGUE_TERMS,
+    *HTML_REPORT_NAME_MEMORY_OUTPUT_TERMS,
+)
+
 FILE_SESSION_PROVENANCE_TARGET_TERMS = (
     "artifact",
     "artifacts",
@@ -1653,6 +1692,36 @@ def handoff_document_location_terms() -> list[str]:
     return sorted(HANDOFF_DOCUMENT_LOCATION_EXPANSION_TERMS)
 
 
+def has_html_report_name_memory_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    artifact_context = bool(
+        token_context & set(HTML_REPORT_NAME_MEMORY_ARTIFACT_TERMS)
+        or re.search(r"\bhtml[\s_-]+reports?\b", normalized)
+    )
+    name_context = bool(
+        token_context & set(HTML_REPORT_NAME_MEMORY_NAME_TERMS)
+        or re.search(r"\bfile[\s_-]+names?\b", normalized)
+    )
+    vague_memory_context = bool(
+        token_context & set(HTML_REPORT_NAME_MEMORY_VAGUE_TERMS)
+        or re.search(r"\bwhat\s+was\s+(?:the\s+)?(?:name|title|filename|path)\s+of\s+that\b", normalized)
+        or re.search(r"\b(?:that|earlier|previous|prior|remembered?)\s+.*\b(?:html|report|artifact)\b", normalized)
+    )
+    question_or_memory_context = bool(
+        re.search(r"\b(?:what|which|where)\b", normalized)
+        or token_context & {"remember", "remembered", "earlier", "previous", "prior"}
+    )
+
+    return artifact_context and name_context and vague_memory_context and question_or_memory_context
+
+
+def html_report_name_memory_terms() -> list[str]:
+    return sorted(set(HTML_REPORT_NAME_MEMORY_EXPANSION_TERMS))
+
+
 def has_file_session_provenance_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -2159,6 +2228,7 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_promise_vs_committed_intent, promise_vs_committed_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
+    ContextualExpansionFamily(has_html_report_name_memory_intent, html_report_name_memory_terms),
     ContextualExpansionFamily(has_file_session_provenance_intent, file_session_provenance_terms),
     ContextualExpansionFamily(
         has_pre_change_file_path_mention_intent,
