@@ -1010,6 +1010,69 @@ LINTER_PHASE_INAPPROPRIATE_FIRE_EXPANSION_TERMS = (
     "unwanted",
 )
 
+COORDINATOR_WORKFLOW_NOISY_LABEL_LABEL_TERMS = (
+    "classification",
+    "classifications",
+    "classified",
+    "label",
+    "labeled",
+    "labels",
+    "tag",
+    "tagged",
+    "tags",
+)
+COORDINATOR_WORKFLOW_NOISY_LABEL_NOISE_TERMS = (
+    "false positive",
+    "false-positive",
+    "false_positive",
+    "noise",
+    "noisy",
+    "spurious",
+)
+COORDINATOR_WORKFLOW_NOISY_LABEL_WORKFLOW_TERMS = (
+    "coordination",
+    "coordinator",
+    "orchestration",
+    "plan",
+    "planner",
+    "planning",
+    "workflow",
+    "workflows",
+)
+COORDINATOR_WORKFLOW_NOISY_LABEL_LINTER_TERMS = (
+    "intervention",
+    "interventions",
+    "linter",
+    "semantic linter",
+    "steering",
+)
+COORDINATOR_WORKFLOW_NOISY_LABEL_EXPANSION_TERMS = (
+    "classification",
+    "classifications",
+    "classified",
+    "coordination",
+    "coordinator",
+    "false positive",
+    "false-positive",
+    "intervention",
+    "interventions",
+    "label",
+    "labels",
+    "linter",
+    "noise",
+    "noisy",
+    "orchestration",
+    "planner",
+    "planning",
+    "semantic linter",
+    "spurious",
+    "steering",
+    "tag",
+    "tags",
+    "workflow",
+    "workflows",
+)
+
 PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
     "before",
     "crash",
@@ -1791,6 +1854,58 @@ def linter_phase_inappropriate_fire_terms() -> list[str]:
     )
 
 
+def has_coordinator_workflow_noisy_label_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    label_context = bool(
+        token_context & set(COORDINATOR_WORKFLOW_NOISY_LABEL_LABEL_TERMS)
+        or re.search(r"\bclassif(?:y|ied|ication|ications)\b", normalized)
+        or re.search(r"\blabel(?:ed|s)?\b", normalized)
+        or re.search(r"\btag(?:ged|s)?\b", normalized)
+    )
+    noise_context = bool(
+        token_context & set(COORDINATOR_WORKFLOW_NOISY_LABEL_NOISE_TERMS)
+        or re.search(r"\bfalse[\s_-]+positives?\b", normalized)
+        or re.search(r"\bspurious\b", normalized)
+        or re.search(r"\bnois(?:e|y)\b", normalized)
+    )
+    workflow_context = bool(
+        token_context & set(COORDINATOR_WORKFLOW_NOISY_LABEL_WORKFLOW_TERMS)
+        or re.search(r"\bcoordinat(?:or|ion|ing)\b", normalized)
+        or re.search(r"\borchestrat(?:e|ed|es|ing|ion)\b", normalized)
+        or re.search(r"\bplann(?:er|ing)\b", normalized)
+    )
+    linter_context = bool(
+        token_context & set(COORDINATOR_WORKFLOW_NOISY_LABEL_LINTER_TERMS)
+        or re.search(r"\bsemantic[\s_-]+linter\b", normalized)
+        or re.search(r"\bintervention(?:s)?\b", normalized)
+        or re.search(r"\bsteer(?:ing|ed|s)?\b", normalized)
+    )
+    question_context = bool(
+        re.search(r"\b(?:which|what)\s+(?:label|labels|classification|classifications|tag|tags)\b", normalized)
+        or re.search(r"\b(?:which|what)\b.*\b(?:noisy|noise|false[\s_-]+positive|spurious)\b", normalized)
+        or re.search(r"\b(?:noisy|spurious|false[\s_-]+positive)\b.*\b(?:label|labels|classification|tag|tags)\b", normalized)
+    )
+
+    explicit_three_sided = label_context and noise_context and workflow_context
+    linter_backed = linter_context and label_context and (noise_context or workflow_context)
+    return (explicit_three_sided or linter_backed) and question_context
+
+
+def coordinator_workflow_noisy_label_terms() -> list[str]:
+    return sorted(
+        {
+            *COORDINATOR_WORKFLOW_NOISY_LABEL_LABEL_TERMS,
+            *COORDINATOR_WORKFLOW_NOISY_LABEL_NOISE_TERMS,
+            *COORDINATOR_WORKFLOW_NOISY_LABEL_WORKFLOW_TERMS,
+            *COORDINATOR_WORKFLOW_NOISY_LABEL_LINTER_TERMS,
+            *COORDINATOR_WORKFLOW_NOISY_LABEL_EXPANSION_TERMS,
+        }
+    )
+
+
 def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1883,6 +1998,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_linter_phase_inappropriate_fire_intent,
         linter_phase_inappropriate_fire_terms,
+    ),
+    ContextualExpansionFamily(
+        has_coordinator_workflow_noisy_label_intent,
+        coordinator_workflow_noisy_label_terms,
     ),
     ContextualExpansionFamily(
         has_pre_crash_incident_context_intent,
