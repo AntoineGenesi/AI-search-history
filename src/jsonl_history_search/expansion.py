@@ -676,6 +676,71 @@ BRANCH_MERGE_SURROUNDING_CONVERSATION_EXPANSION_TERMS = (
     "timeline",
 )
 
+FINAL_DECISION_AFTER_DELIBERATION_FINALITY_TERMS = (
+    "final",
+    "last",
+    "settle",
+    "settled",
+    "ultimate",
+    "ultimately",
+)
+FINAL_DECISION_AFTER_DELIBERATION_DECISION_TERMS = (
+    "conclusion",
+    "conclusions",
+    "decision",
+    "decisions",
+    "outcome",
+    "outcomes",
+    "resolution",
+    "resolutions",
+    "resolved",
+)
+FINAL_DECISION_AFTER_DELIBERATION_DISCUSSION_TERMS = (
+    "back and forth",
+    "back-and-forth",
+    "back_and_forth",
+    "debate",
+    "debated",
+    "debates",
+    "discussion",
+    "discussions",
+    "iteration",
+    "iterations",
+)
+FINAL_DECISION_AFTER_DELIBERATION_CONVERSATION_TERMS = (
+    "chat",
+    "chats",
+    "context",
+    "conversation",
+    "conversations",
+    "session",
+    "thread",
+    "threads",
+    "transcript",
+)
+FINAL_DECISION_AFTER_DELIBERATION_EXPANSION_TERMS = (
+    "back and forth",
+    "back-and-forth",
+    "back_and_forth",
+    "chat",
+    "conclusion",
+    "context",
+    "conversation",
+    "debate",
+    "decision",
+    "discussion",
+    "final",
+    "iteration",
+    "last",
+    "outcome",
+    "resolution",
+    "resolved",
+    "session",
+    "settled",
+    "thread",
+    "transcript",
+)
+
 FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
     "available",
     "bad",
@@ -1641,6 +1706,39 @@ def branch_merge_surrounding_conversation_terms() -> list[str]:
     return sorted(BRANCH_MERGE_SURROUNDING_CONVERSATION_EXPANSION_TERMS)
 
 
+def has_final_decision_after_deliberation_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    finality_context = bool(
+        token_context & set(FINAL_DECISION_AFTER_DELIBERATION_FINALITY_TERMS)
+        or re.search(r"\b(?:final|last|settled|ultimate)\s+(?:decision|resolution|conclusion|outcome)s?\b", normalized)
+    )
+    decision_context = bool(
+        token_context & set(FINAL_DECISION_AFTER_DELIBERATION_DECISION_TERMS)
+        or re.search(r"\b(?:decision|resolution|conclusion|outcome)s?\b", normalized)
+    )
+    discussion_context = bool(
+        token_context & set(FINAL_DECISION_AFTER_DELIBERATION_DISCUSSION_TERMS)
+        or re.search(r"\bback[\s_-]+and[\s_-]+forth\b", normalized)
+        or re.search(r"\bdebate(?:d|s)?\b", normalized)
+        or re.search(r"\bdiscuss(?:ed|ion|ions)?\b", normalized)
+        or re.search(r"\biterat(?:e|ed|ion|ions)\b", normalized)
+    )
+    conversation_context = bool(token_context & set(FINAL_DECISION_AFTER_DELIBERATION_CONVERSATION_TERMS))
+    question_or_memory_context = bool(
+        re.search(r"\b(?:what|which|where|when|how)\b", normalized)
+        or conversation_context
+    )
+
+    return finality_context and decision_context and discussion_context and question_or_memory_context
+
+
+def final_decision_after_deliberation_terms() -> list[str]:
+    return sorted(FINAL_DECISION_AFTER_DELIBERATION_EXPANSION_TERMS)
+
+
 def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1966,6 +2064,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_branch_merge_surrounding_conversation_intent,
         branch_merge_surrounding_conversation_terms,
+    ),
+    ContextualExpansionFamily(
+        has_final_decision_after_deliberation_intent,
+        final_decision_after_deliberation_terms,
     ),
     ContextualExpansionFamily(
         has_final_answer_source_hit_quality_intent,
