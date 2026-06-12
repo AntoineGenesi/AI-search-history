@@ -579,6 +579,57 @@ REVIEW_VERDICT_STATUS_EXPANSION_TERMS = (
     "gate",
 )
 
+INTERVENTION_EFFECT_CONTEXT_TERMS = (
+    "intervention",
+    "interventions",
+    "steering",
+    "suppression",
+)
+INTERVENTION_EFFECT_OUTCOME_TERMS = (
+    "after",
+    "behavior",
+    "behaviour",
+    "before",
+    "change",
+    "changed",
+    "corrected",
+    "effect",
+    "effects",
+    "false-positive",
+    "false positive",
+    "help",
+    "helped",
+    "ignored",
+    "noise",
+    "noisy",
+    "outcome",
+    "side-effect",
+    "side effect",
+    "signal",
+)
+INTERVENTION_EFFECT_EXPANSION_TERMS = (
+    "intervention",
+    "interventions",
+    "changed",
+    "behavior",
+    "behaviour",
+    "steering",
+    "suppression",
+    "false positive",
+    "false-positive",
+    "noise",
+    "noisy",
+    "signal",
+    "outcome",
+    "before",
+    "after",
+    "corrected",
+    "ignored",
+    "helped",
+    "side effect",
+    "side-effect",
+)
+
 PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
     "before",
     "crash",
@@ -1106,6 +1157,34 @@ def review_verdict_status_terms() -> list[str]:
     return sorted(REVIEW_VERDICT_STATUS_EXPANSION_TERMS)
 
 
+def has_intervention_effect_noise_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    intervention_context = bool(
+        token_context & set(INTERVENTION_EFFECT_CONTEXT_TERMS)
+        or re.search(r"\bsteer(?:ing|ed|s)?\b", normalized)
+        or re.search(r"\bsuppress(?:ion|ed|es|ing)?\b", normalized)
+    )
+    outcome_context = bool(
+        token_context & set(INTERVENTION_EFFECT_OUTCOME_TERMS)
+        or re.search(r"\bfalse[\s_-]+positives?\b", normalized)
+        or re.search(r"\bbefore[\s_-]+after\b", normalized)
+        or re.search(r"\bside[\s_-]+effects?\b", normalized)
+        or re.search(r"\bbehaviou?r\b", normalized)
+        or re.search(r"\bchang(?:e|ed|es|ing)\b", normalized)
+        or re.search(r"\bhelp(?:ed|s|ing)?\b", normalized)
+        or re.search(r"\bignor(?:e|ed|es|ing)\b", normalized)
+    )
+
+    return intervention_context and outcome_context
+
+
+def intervention_effect_noise_terms() -> list[str]:
+    return sorted(INTERVENTION_EFFECT_EXPANSION_TERMS)
+
+
 def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1170,6 +1249,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_review_verdict_status_intent,
         review_verdict_status_terms,
+    ),
+    ContextualExpansionFamily(
+        has_intervention_effect_noise_intent,
+        intervention_effect_noise_terms,
     ),
     ContextualExpansionFamily(
         has_pre_crash_incident_context_intent,
