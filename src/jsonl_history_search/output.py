@@ -55,6 +55,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_embedding_text(payload)
     if "real_history_package_search_miss_audit" in payload:
         return render_real_history_package_miss_audit_text(payload)
+    if "real_history_remaining_miss_loss_point_diagnostic" in payload:
+        return render_real_history_remaining_miss_diagnostic_text(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_text(payload)
     if "harness_artifact_validation" in payload:
@@ -162,6 +164,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_embedding_markdown(payload)
     if "real_history_package_search_miss_audit" in payload:
         return render_real_history_package_miss_audit_markdown(payload)
+    if "real_history_remaining_miss_loss_point_diagnostic" in payload:
+        return render_real_history_remaining_miss_diagnostic_markdown(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_markdown(payload)
     if "harness_artifact_validation" in payload:
@@ -2687,6 +2691,122 @@ def render_real_history_package_miss_audit_markdown(payload: dict) -> str:
             f"{_escape_markdown_table(caps)} | "
             f"{_escape_markdown_table(query_pathologies)} | "
             f"{_escape_markdown_table(classifications)} |"
+        )
+    return "\n".join(lines)
+
+
+def render_real_history_remaining_miss_diagnostic_text(payload: dict) -> str:
+    report = payload["real_history_remaining_miss_loss_point_diagnostic"]
+    summary = report.get("summary") or {}
+    decision = report.get("decision") or {}
+    lines = [
+        "Real-history remaining miss loss-point diagnostic",
+        f"Status: {report.get('status')}",
+        f"Baseline run: {(report.get('canonical_baseline') or {}).get('benchmark_run_id')}",
+        f"Absent final refs: {summary.get('absent_final_ref_case_count', 0)}",
+        f"Date-timeline only: {summary.get('all_absent_refs_are_date_timeline_user_ask')}",
+        f"Dedupe measured cause count: {summary.get('dedupe_measured_cause_count', 0)}",
+        f"Would pass should_consider: {summary.get('would_pass_should_consider_count', 0)}",
+        f"Rank-if-reached 1: {summary.get('rank_if_reached_1_count', 0)}",
+        f"Repair supported: {decision.get('repair_supported_by_jsh702')}",
+        f"Headline: {decision.get('headline')}",
+    ]
+    for label, count in (summary.get("path_safe_loss_point_counts") or {}).items():
+        lines.append(f"- {label}: {count}")
+    return "\n".join(lines)
+
+
+def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str:
+    report = payload["real_history_remaining_miss_loss_point_diagnostic"]
+    summary = report.get("summary") or {}
+    baseline = report.get("canonical_baseline") or {}
+    decision = report.get("decision") or {}
+    lines = [
+        "# JSH-702 Remaining Miss Loss-Point Diagnostic",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        f"**Canonical benchmark run:** `{baseline.get('benchmark_run_id')}`",
+        f"**Audited baseline:** `{baseline.get('audited_baseline')}`",
+        f"**Package search result:** `{baseline.get('package_search_first_pass_hits')}/{baseline.get('package_search_first_pass_cases')}` first-pass hits",
+        "",
+        "## Headline",
+        "",
+        decision.get("headline") or "",
+        "",
+        f"- Repair supported by JSH-702 alone: `{decision.get('repair_supported_by_jsh702')}`",
+        f"- Reason: {decision.get('reason')}",
+        f"- Next step: {decision.get('recommended_next_step')}",
+        "",
+        "## Summary Counters",
+        "",
+        "| Counter | Value |",
+        "| --- | ---: |",
+        f"| absent final expected refs | {summary.get('absent_final_ref_case_count', 0)} |",
+        f"| date-timeline family only | {summary.get('all_absent_refs_are_date_timeline_user_ask')} |",
+        f"| candidate_records_deduped == 0 | {summary.get('candidate_records_deduped_zero_count', 0)} |",
+        f"| dedupe measured cause | {summary.get('dedupe_measured_cause_count', 0)} |",
+        f"| would pass should_consider | {summary.get('would_pass_should_consider_count', 0)} |",
+        f"| rank-if-reached = 1 | {summary.get('rank_if_reached_1_count', 0)} |",
+        f"| pre-final internal candidate lists available | {summary.get('pre_final_internal_candidate_list_available_count', 0)} |",
+        f"| elapsed cap | {summary.get('elapsed_cap_count', 0)} |",
+        f"| match cap | {summary.get('match_cap_count', 0)} |",
+        f"| weak reservoir cap | {summary.get('weak_reservoir_cap_count', 0)} |",
+        "",
+        "## Loss-Point Buckets",
+        "",
+        "| Bucket | Cases |",
+        "| --- | ---: |",
+    ]
+    for label, count in (summary.get("path_safe_loss_point_counts") or {}).items():
+        lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    lines.extend(["", "## Query/Source-Planning Signals", "", "| Signal | Cases |", "| --- | ---: |"])
+    for label, count in (summary.get("query_pathology_counts") or {}).items():
+        lines.append(f"| `{_escape_markdown_table(str(label))}` | {count} |")
+    if not summary.get("query_pathology_counts"):
+        lines.append("| `(none)` | 0 |")
+    lines.extend(["", "## Evidence Limits", ""])
+    for key, value in (report.get("evidence_limits") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Behavior Boundary", ""])
+    for key, value in (report.get("behavior_boundary") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Privacy Contract", ""])
+    for key, value in (report.get("privacy_contract") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    auxiliary = report.get("auxiliary_private_evidence") or {}
+    lines.extend(
+        [
+            "",
+            "## Auxiliary Evidence",
+            "",
+            f"- Raw run label: `{auxiliary.get('raw_run_label')}`",
+            f"- Used: `{auxiliary.get('used')}`",
+            f"- Reason: {auxiliary.get('reason')}",
+            "",
+            "## Case Ledger",
+            "",
+            "| Case | Family | Loss bucket | Opened | Should consider | Rank if reached | Dedupe | Weak reservoir | Query signals |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
+        ]
+    )
+    for row in report.get("rows", []):
+        scope = row.get("expected_file_scope") or {}
+        should = row.get("should_consider_and_rank_evidence") or {}
+        dedupe = row.get("dedupe_evidence") or {}
+        cap = row.get("cap_and_pressure_evidence") or {}
+        query = row.get("query_source_planning_signal") or {}
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+            f"{_escape_markdown_table(str(row.get('family', '')))} | "
+            f"`{_escape_markdown_table(str(row.get('path_safe_loss_point_bucket', '')))}` | "
+            f"`{scope.get('opened_before_scan_stop')}` | "
+            f"`{should.get('would_pass_should_consider')}` | "
+            f"{should.get('rank_if_reached') if should.get('rank_if_reached') is not None else ''} | "
+            f"{dedupe.get('candidate_records_deduped', 0)} | "
+            f"`{cap.get('weak_reservoir_noise_pressure')}` | "
+            f"{_escape_markdown_table(', '.join(query.get('pathology_labels') or []))} |"
         )
     return "\n".join(lines)
 
