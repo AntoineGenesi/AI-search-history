@@ -1021,14 +1021,22 @@ def _package_equivalence(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _evaluate_gate_statuses(rows: list[dict[str, Any]], summary: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
-    reasons = ["jsh_049b_does_not_promote_feature_gates", "real_history_case_count_below_old_floor_20"]
+    evaluated_case_count = len({row["case_id"] for row in rows})
+    case_count_reason = (
+        "real_history_case_count_below_old_floor_20"
+        if evaluated_case_count < 20
+        else "real_history_case_count_within_old_20_50_target_band"
+        if evaluated_case_count <= 50
+        else "real_history_case_count_above_old_20_50_target_band"
+    )
+    reasons = ["jsh_049b_does_not_promote_feature_gates", case_count_reason]
     if warnings:
         reasons.append("benchmark_warnings_or_caps_present")
     return {
         "ranking_quality_gate": _gate_status(
             "inconclusive" if rows else "not_evaluated",
             reasons if rows else ["no_benchmark_rows"],
-            evaluated_case_count=len({row["case_id"] for row in rows}),
+            evaluated_case_count=evaluated_case_count,
             counters=_required_counter_summary(rows),
             metrics={
                 "package_first_pass_hit_rate": (summary.get("package_search") or {}).get("first_pass_hit_rate"),
