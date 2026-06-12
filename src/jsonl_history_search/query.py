@@ -202,8 +202,6 @@ def infer_role(normalized: str) -> str | None:
 
 def infer_date_window(normalized: str, now: datetime):
     today = now.date()
-    if re.search(r"\btoday\b", normalized):
-        return (*local_day_window(today, now.tzinfo), "today")
     if "yesterday" in normalized:
         return (*local_day_window(today - timedelta(days=1), now.tzinfo), "yesterday")
     if "last night" in normalized:
@@ -231,8 +229,6 @@ def infer_date_window(normalized: str, now: datetime):
 
 def infer_date_window_filter(normalized: str, reason: str | None) -> bool:
     if reason is None:
-        return False
-    if reason == "today":
         return False
     if reason in DATE_METADATA_REASONS:
         return False
