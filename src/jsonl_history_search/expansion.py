@@ -267,6 +267,72 @@ NEXT_WORK_HANDOFF_EXPANSION_TERMS = (
     "worktree",
 )
 
+NEXT_CODEX_SESSION_CONTEXT_SESSION_TERMS = (
+    "codex",
+    "continuation",
+    "continue",
+    "continuing",
+    "future",
+    "next session",
+    "next-session",
+    "resume",
+    "resuming",
+    "session",
+)
+NEXT_CODEX_SESSION_CONTEXT_KNOW_TERMS = (
+    "aware",
+    "context",
+    "know",
+    "remember",
+    "should know",
+)
+NEXT_CODEX_SESSION_CONTEXT_ACTIVE_TERMS = (
+    "active",
+    "active state",
+    "active-state",
+    "current",
+    "progress",
+    "state",
+    "status",
+    "task",
+)
+NEXT_CODEX_SESSION_CONTEXT_BLOCKER_TERMS = (
+    "blocked",
+    "blocker",
+    "blockers",
+    "caveat",
+    "caveats",
+    "constraint",
+    "constraints",
+    "risk",
+    "risks",
+)
+NEXT_CODEX_SESSION_CONTEXT_DECISION_TERMS = (
+    "decided",
+    "decision",
+    "decisions",
+    "outcome",
+    "resolution",
+    "selected",
+)
+NEXT_CODEX_SESSION_CONTEXT_HANDOFF_TERMS = (
+    "closeout",
+    "handoff",
+    "handoff note",
+    "handoff notes",
+    "handover",
+    "notes",
+    "summary",
+)
+NEXT_CODEX_SESSION_CONTEXT_EXPANSION_TERMS = (
+    *NEXT_CODEX_SESSION_CONTEXT_SESSION_TERMS,
+    *NEXT_CODEX_SESSION_CONTEXT_KNOW_TERMS,
+    *NEXT_CODEX_SESSION_CONTEXT_ACTIVE_TERMS,
+    *NEXT_CODEX_SESSION_CONTEXT_BLOCKER_TERMS,
+    *NEXT_CODEX_SESSION_CONTEXT_DECISION_TERMS,
+    *NEXT_CODEX_SESSION_CONTEXT_HANDOFF_TERMS,
+)
+
 CLAIM_BOUNDARY_CLAIM_TERMS = ("claim", "claimed", "claims", "overclaim", "overclaimed")
 CLAIM_BOUNDARY_QUALITY_TERMS = (
     "answer",
@@ -1421,6 +1487,50 @@ def next_work_handoff_terms() -> list[str]:
     return sorted(NEXT_WORK_HANDOFF_EXPANSION_TERMS)
 
 
+def has_next_codex_session_context_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    next_session_context = bool(
+        re.search(r"\bnext[\s_-]+(?:codex[\s_-]+)?session\b", normalized)
+        or re.search(r"\bfuture[\s_-]+(?:codex[\s_-]+)?session\b", normalized)
+        or ({"codex", "session"} <= tokens and "next" in tokens)
+    )
+    codex_continuation_context = bool(
+        "codex" in tokens
+        and (
+            tokens & {"continue", "continued", "continues", "continuing", "continuation", "resume", "resuming"}
+            or re.search(r"\bbefore\s+continu(?:e|ing)\b", normalized)
+        )
+    )
+    session_continuation_context = bool(
+        tokens & {"session", "sessions"}
+        and tokens & {"continue", "continued", "continues", "continuing", "continuation", "resume", "resuming"}
+    )
+    knowledge_context = bool(
+        token_context & set(NEXT_CODEX_SESSION_CONTEXT_KNOW_TERMS)
+        or re.search(r"\bshould\s+.*\bknow\b", normalized)
+        or re.search(r"\bneed(?:s|ed)?\s+.*\bcontext\b", normalized)
+        or re.search(r"\bkeep\s+in\s+mind\b", normalized)
+    )
+    question_or_continuation_context = bool(
+        re.search(r"\b(?:what|which|where|when|how)\b", normalized)
+        or re.search(r"\bbefore\s+continu(?:e|ing)\b", normalized)
+        or tokens & {"continue", "continued", "continues", "continuing", "continuation", "resume", "resuming"}
+    )
+
+    return (
+        (next_session_context or codex_continuation_context or session_continuation_context)
+        and knowledge_context
+        and question_or_continuation_context
+    )
+
+
+def next_codex_session_context_terms() -> list[str]:
+    return sorted(set(NEXT_CODEX_SESSION_CONTEXT_EXPANSION_TERMS))
+
+
 def has_claim_boundary_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -2044,6 +2154,7 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_change_summary_improvement_intent, change_summary_improvement_terms),
     ContextualExpansionFamily(has_stale_reference_state_intent, stale_reference_state_terms),
     ContextualExpansionFamily(has_next_work_handoff_intent, next_work_handoff_terms),
+    ContextualExpansionFamily(has_next_codex_session_context_intent, next_codex_session_context_terms),
     ContextualExpansionFamily(has_claim_boundary_intent, claim_boundary_terms),
     ContextualExpansionFamily(has_promise_vs_committed_intent, promise_vs_committed_terms),
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
