@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
-from typing import Callable
+from typing import Any, Callable
 
 
 TASK_SLUG_RE = re.compile(r"\b([a-z]{1,8})[-_](\d{2,6}[a-z]?)(?:[-_]([a-z0-9]{1,20}))?\b")
@@ -1275,6 +1275,13 @@ class ContextualExpansionFamily:
     reason: str = "synonym_paraphrase"
 
 
+LOCAL_OR_PROPER_NOUN_AUDIT_TERMS = (
+    "codex",
+    "jsonl",
+    "semantic linter",
+)
+
+
 def expand_query_terms(
     *,
     normalized: str,
@@ -2283,6 +2290,222 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
         pre_crash_incident_context_terms,
     ),
 )
+
+
+CONTEXTUAL_EXPANSION_FAMILY_METADATA: dict[str, dict[str, str]] = {
+    "has_worktree_cleanup_intent": {
+        "name": "worktree_cleanup",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_retrieval_miss_failure_intent": {
+        "name": "retrieval_miss_failure",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+    "has_source_selection_failure_intent": {
+        "name": "source_selection_failure",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+    "has_action_proof_intent": {
+        "name": "action_proof",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_change_summary_improvement_intent": {
+        "name": "change_summary_improvement",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_stale_reference_state_intent": {
+        "name": "stale_reference_state",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_next_work_handoff_intent": {
+        "name": "next_work_handoff",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_next_codex_session_context_intent": {
+        "name": "next_codex_session_context",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_claim_boundary_intent": {
+        "name": "claim_boundary",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+    "has_promise_vs_committed_intent": {
+        "name": "promise_vs_committed",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_process_detour_lesson_intent": {
+        "name": "process_detour_lesson",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "local_lesson_risk",
+        "overfit_risk": "high",
+        "generated_metadata_role": "candidate_replacement",
+    },
+    "has_handoff_document_location_intent": {
+        "name": "handoff_document_location",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_html_report_name_memory_intent": {
+        "name": "html_report_name_memory",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_file_session_provenance_intent": {
+        "name": "file_session_provenance",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_pre_change_file_path_mention_intent": {
+        "name": "pre_change_file_path_mention",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_commit_user_request_provenance_intent": {
+        "name": "commit_user_request_provenance",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_revert_fix_feedback_source_intent": {
+        "name": "revert_fix_feedback_source",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_branch_merge_surrounding_conversation_intent": {
+        "name": "branch_merge_surrounding_conversation",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_final_decision_after_deliberation_intent": {
+        "name": "final_decision_after_deliberation",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+    "has_final_answer_source_hit_quality_intent": {
+        "name": "final_answer_source_hit_quality",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+    "has_task_completion_state_mismatch_intent": {
+        "name": "task_completion_state_mismatch",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_review_verdict_status_intent": {
+        "name": "review_verdict_status",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "low",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_intervention_effect_noise_intent": {
+        "name": "intervention_effect_noise",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_suppression_hidden_failure_intent": {
+        "name": "suppression_hidden_failure",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_linter_phase_inappropriate_fire_intent": {
+        "name": "linter_phase_inappropriate_fire",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_coordinator_workflow_noisy_label_intent": {
+        "name": "coordinator_workflow_noisy_label",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "workflow_specific",
+        "overfit_risk": "medium",
+        "generated_metadata_role": "candidate_supplement",
+    },
+    "has_pre_crash_incident_context_intent": {
+        "name": "pre_crash_incident_context",
+        "mechanism": "bounded_query_expansion",
+        "core_scope": "core_generic",
+        "overfit_risk": "low",
+        "generated_metadata_role": "none",
+    },
+}
+
+
+def contextual_expansion_family_audit() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for family in CONTEXTUAL_EXPANSION_FAMILIES:
+        intent_name = family.has_intent.__name__
+        metadata = CONTEXTUAL_EXPANSION_FAMILY_METADATA[intent_name]
+        terms = family.terms()
+        flagged_terms = [
+            term
+            for term in terms
+            if any(audit_term in term for audit_term in LOCAL_OR_PROPER_NOUN_AUDIT_TERMS)
+        ]
+        rows.append(
+            {
+                **metadata,
+                "intent": intent_name,
+                "reason": family.reason,
+                "term_count": len(terms),
+                "flagged_local_or_proper_terms": tuple(sorted(flagged_terms)),
+            }
+        )
+    return rows
 
 
 def apply_contextual_expansion_families(
