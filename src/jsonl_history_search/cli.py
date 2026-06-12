@@ -25,6 +25,8 @@ from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compa
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
+from .mechanism_eval import DEFAULT_FIXTURE as DEFAULT_MECHANISM_EVAL_FIXTURE
+from .mechanism_eval import build_mechanism_eval_payload
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
 from .output import render
@@ -306,6 +308,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized impact benchmark report should be written.",
+    )
+    mechanism_eval = subparsers.add_parser("mechanism-eval")
+    add_common_args(mechanism_eval)
+    mechanism_eval.add_argument(
+        "--fixture",
+        default=str(DEFAULT_MECHANISM_EVAL_FIXTURE),
+        help="Synthetic committed-only fixture for the tiny mechanism eval.",
+    )
+    mechanism_eval.add_argument(
+        "--case-limit",
+        type=int,
+        default=3,
+        help="Maximum number of fixture cases to run; 0 means all cases.",
+    )
+    mechanism_eval.add_argument("--metadata-min-count", type=int, default=1)
+    mechanism_eval.add_argument("--metadata-max-candidates", type=int, default=40)
+    mechanism_eval.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized mechanism eval report should be written.",
     )
     real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
     add_common_args(real_history_impact)
@@ -1142,6 +1164,14 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
         print(rendered)
         status = payload["impact_benchmark"]["status"]
+        return 1 if status in {"root_rejected", "invalid_fixture"} else 0
+    if args.command == "mechanism-eval":
+        payload = build_mechanism_eval_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["mechanism_eval"]["status"]
         return 1 if status in {"root_rejected", "invalid_fixture"} else 0
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)
