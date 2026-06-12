@@ -4,6 +4,12 @@ import argparse
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
+from .agent_loop_cost import (
+    DEFAULT_CASE_SELECTION_PATH as DEFAULT_AGENT_LOOP_CASE_SELECTION_PATH,
+    DEFAULT_OUTPUT_PATH as DEFAULT_AGENT_LOOP_CONTRACT_OUTPUT_PATH,
+    build_agent_loop_cost_contract_payload,
+    write_agent_loop_cost_contract,
+)
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
@@ -626,6 +632,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the sanitized paired-agent benchmark protocol report should be written.",
+    )
+    agent_loop_contract = subparsers.add_parser("benchmark-agent-loop-contract")
+    agent_loop_contract.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    agent_loop_contract.add_argument(
+        "--case-selection",
+        default=str(DEFAULT_AGENT_LOOP_CASE_SELECTION_PATH),
+        help="Committed sanitized JSH-724 held-out case selection ledger.",
+    )
+    agent_loop_contract.add_argument(
+        "--output",
+        default=None,
+        help=f"Optional JSON artifact path; default for committed artifact is {DEFAULT_AGENT_LOOP_CONTRACT_OUTPUT_PATH}.",
+    )
+    agent_loop_contract.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional rendered report path for the no-send route/counter contract.",
     )
     harness_artifacts = subparsers.add_parser("validate-harness-artifacts")
     harness_artifacts.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
@@ -1416,6 +1439,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "benchmark-paired-agent-protocol":
         payload = build_paired_agent_benchmark_protocol_payload()
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+    if args.command == "benchmark-agent-loop-contract":
+        case_selection = Path(args.case_selection).expanduser()
+        if args.output:
+            payload = write_agent_loop_cost_contract(Path(args.output).expanduser(), case_selection)
+        else:
+            payload = build_agent_loop_cost_contract_payload(case_selection)
         rendered = render(payload, args.format)
         if args.report_output:
             output_path = Path(args.report_output).expanduser()

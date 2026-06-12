@@ -29,6 +29,8 @@ def render_text(payload: dict) -> str:
         return render_efficiency_eval_text(payload)
     if "agent_find" in payload:
         return render_agent_find_text(payload)
+    if "agent_loop_cost_contract" in payload:
+        return render_agent_loop_cost_contract_text(payload)
     if "project_lineage" in payload:
         return render_project_lineage_text(payload)
     if "skill_audit" in payload:
@@ -140,6 +142,8 @@ def render_markdown(payload: dict) -> str:
         return render_efficiency_eval_markdown(payload)
     if "agent_find" in payload:
         return render_agent_find_markdown(payload)
+    if "agent_loop_cost_contract" in payload:
+        return render_agent_loop_cost_contract_markdown(payload)
     if "project_lineage" in payload:
         return render_project_lineage_markdown(payload)
     if "skill_audit" in payload:
@@ -228,6 +232,51 @@ def render_generated_metadata_discovery_text(payload: dict) -> str:
             f"- {candidate['kind']} {candidate['label']} "
             f"({candidate['confidence']}, entries={evidence['entry_count']}, raw_values={evidence['raw_value_count']})"
         )
+    return "\n".join(lines)
+
+
+def render_agent_loop_cost_contract_text(payload: dict) -> str:
+    report = payload["agent_loop_cost_contract"]
+    lanes = ", ".join(lane["lane_id"] for lane in report["strategy_lanes"])
+    return "\n".join(
+        [
+            "Agent Loop Route/Counter Contract",
+            f"Status: {report['status']}",
+            f"Cases: {report['held_out_case_count']}",
+            f"Lanes: {lanes}",
+            f"Prompt materializations: {report['prompt_materialization']['materialization_count']}",
+            f"Contract hash: {report['prompt_hash_stability']['contract_hash_sha256']}",
+            "No-send: live_model_sends_performed=false; adjudication_performed=false",
+        ]
+    )
+
+
+def render_agent_loop_cost_contract_markdown(payload: dict) -> str:
+    report = payload["agent_loop_cost_contract"]
+    lines = [
+        "# Agent Loop Route/Counter Contract",
+        "",
+        f"**Status:** {report['status']}",
+        f"**Cases:** {report['held_out_case_count']}",
+        f"**Prompt materializations:** {report['prompt_materialization']['materialization_count']}",
+        f"**Contract hash:** `{report['prompt_hash_stability']['contract_hash_sha256']}`",
+        "",
+        "## Lanes",
+    ]
+    for lane in report["strategy_lanes"]:
+        package = "live JSONL required" if lane["jsonl_package_available"] else "JSONL unavailable"
+        lines.append(f"- `{lane['lane_id']}`: {lane['strategy_family']}; {package}")
+    lines.extend(
+        [
+            "",
+            "## Counter Buckets",
+            "- `local_tool_work`",
+            "- `model_facing_context_input`",
+            "- `full_agent_loop_cost`",
+            "",
+            "Missing counters are literal `unavailable`; this artifact performs no live model sends and no adjudication.",
+        ]
+    )
     return "\n".join(lines)
 
 
