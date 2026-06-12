@@ -450,6 +450,70 @@ FILE_SESSION_PROVENANCE_EXPANSION_TERMS = (
     "wrote",
 )
 
+COMMIT_USER_REQUEST_PROVENANCE_CHANGE_TERMS = (
+    "change",
+    "changed",
+    "code",
+    "commit",
+    "committed",
+    "diff",
+    "patch",
+)
+COMMIT_USER_REQUEST_PROVENANCE_REQUEST_TERMS = (
+    "ask",
+    "asked",
+    "instruction",
+    "instructions",
+    "prompt",
+    "request",
+    "requests",
+    "user",
+)
+COMMIT_USER_REQUEST_PROVENANCE_CONVERSATION_TERMS = (
+    "chat",
+    "chats",
+    "conversation",
+    "conversations",
+)
+COMMIT_USER_REQUEST_PROVENANCE_CAUSALITY_TERMS = (
+    "because",
+    "behind",
+    "cause",
+    "caused",
+    "causes",
+    "causing",
+    "feedback",
+    "happen",
+    "happened",
+    "happens",
+    "provenance",
+    "reason",
+    "reasons",
+)
+COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS = (
+    "ask",
+    "cause",
+    "caused",
+    "change",
+    "changed",
+    "chat",
+    "code",
+    "commit",
+    "committed",
+    "conversation",
+    "diff",
+    "feedback",
+    "instruction",
+    "patch",
+    "prompt",
+    "provenance",
+    "reason",
+    "request",
+    "source",
+    "user",
+    "why",
+)
+
 FINAL_ANSWER_SOURCE_HIT_QUALITY_CONTEXT_TERMS = (
     "available",
     "bad",
@@ -1064,6 +1128,33 @@ def file_session_provenance_terms() -> list[str]:
     return sorted(FILE_SESSION_PROVENANCE_EXPANSION_TERMS)
 
 
+def has_commit_user_request_provenance_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    change_context = bool(
+        token_context & set(COMMIT_USER_REQUEST_PROVENANCE_CHANGE_TERMS)
+        or re.search(r"\bcode[\s_-]+chang(?:e|ed|es|ing)\b", normalized)
+    )
+    request_context = bool(
+        token_context & set(COMMIT_USER_REQUEST_PROVENANCE_REQUEST_TERMS)
+        or re.search(r"\buser[\s_-]+requests?\b", normalized)
+    )
+    conversation_context = bool(token_context & set(COMMIT_USER_REQUEST_PROVENANCE_CONVERSATION_TERMS))
+    causality_context = bool(
+        token_context & set(COMMIT_USER_REQUEST_PROVENANCE_CAUSALITY_TERMS)
+        or re.search(r"\bwhy\s+did\s+(?:this\s+)?code\s+chang(?:e|ed|es|ing)?\b", normalized)
+        or re.search(r"\bwhy\s+did\s+(?:this\s+)?(?:commit|diff|patch)\s+happen\b", normalized)
+    )
+
+    return change_context and (request_context or conversation_context or causality_context)
+
+
+def commit_user_request_provenance_terms() -> list[str]:
+    return sorted(COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS)
+
+
 def has_final_answer_source_hit_quality_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1238,6 +1329,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
     ContextualExpansionFamily(has_file_session_provenance_intent, file_session_provenance_terms),
+    ContextualExpansionFamily(
+        has_commit_user_request_provenance_intent,
+        commit_user_request_provenance_terms,
+    ),
     ContextualExpansionFamily(
         has_final_answer_source_hit_quality_intent,
         final_answer_source_hit_quality_terms,
