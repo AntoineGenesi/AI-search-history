@@ -23,6 +23,8 @@ def render_text(payload: dict) -> str:
         return render_forensics_text(payload)
     if "manifest_report" in payload:
         return render_manifest_text(payload)
+    if "generated_metadata_discovery" in payload:
+        return render_generated_metadata_discovery_text(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_text(payload)
     if "agent_find" in payload:
@@ -126,6 +128,8 @@ def render_markdown(payload: dict) -> str:
         return render_forensics_markdown(payload)
     if "manifest_report" in payload:
         return render_manifest_markdown(payload)
+    if "generated_metadata_discovery" in payload:
+        return render_generated_metadata_discovery_markdown(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_markdown(payload)
     if "agent_find" in payload:
@@ -194,6 +198,71 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_generated_metadata_discovery_text(payload: dict) -> str:
+    report = payload["generated_metadata_discovery"]
+    summary = report["summary"]
+    lines = [
+        "Generated Metadata Discovery",
+        f"Status: {report['status']}",
+        f"Mode: {report['mode']}",
+        f"Candidates: {summary['candidate_count']}",
+        "Promotion: report-only prototype; no default search, sidecar, watcher, ranking, or token-efficiency claim.",
+    ]
+    for candidate in report["candidates"][:10]:
+        evidence = candidate["evidence"]
+        lines.append(
+            f"- {candidate['kind']} {candidate['label']} "
+            f"({candidate['confidence']}, entries={evidence['entry_count']}, raw_values={evidence['raw_value_count']})"
+        )
+    return "\n".join(lines)
+
+
+def render_generated_metadata_discovery_markdown(payload: dict) -> str:
+    report = payload["generated_metadata_discovery"]
+    lines = [
+        "# Generated Metadata Discovery",
+        "",
+        f"**Status:** {report['status']}",
+        f"**Mode:** {report['mode']}",
+        "",
+        "This is a report-only prototype. It does not enable default generated metadata, sidecars, watchers, ranking changes, or token-efficiency claims.",
+        "",
+        "## Candidates",
+    ]
+    if not report["candidates"]:
+        lines.append("- None above the selected threshold.")
+    for candidate in report["candidates"]:
+        evidence = candidate["evidence"]
+        shapes = ", ".join(evidence.get("example_shapes", [])[:3]) or "none"
+        lines.append(
+            f"- `{candidate['kind']}` `{candidate['label']}`: "
+            f"{candidate['confidence']}; entries={evidence['entry_count']}; "
+            f"raw_values={evidence['raw_value_count']}; shapes={shapes}"
+        )
+    privacy = report["privacy_contract"]
+    promotion = report["promotion_boundary"]
+    lines.extend(
+        [
+            "",
+            "## Privacy And Promotion Boundary",
+            f"- Raw private text committed: `{privacy['raw_private_text_committed']}`",
+            f"- Raw source paths committed: `{privacy['raw_source_paths_committed']}`",
+            f"- Raw values exposed: `{privacy['raw_values_exposed']}`",
+            f"- Default search uses generated metadata: `{promotion['default_search_uses_generated_metadata']}`",
+            f"- Sidecar or index created: `{promotion['sidecar_or_index_created']}`",
+            f"- Token-efficiency claim: `{promotion['token_efficiency_claimed']}`",
+            f"- Ranking or product-value claim: `{promotion['ranking_or_product_value_claimed']}`",
+        ]
+    )
+    assessment = report["mechanism_assessment"]
+    lines.extend(["", "## Learning", f"- Status: `{assessment['status']}`"])
+    for item in assessment.get("what_worked", []):
+        lines.append(f"- Worked: {item}")
+    for item in assessment.get("what_failed_or_is_unknown", []):
+        lines.append(f"- Unknown: {item}")
+    return "\n".join(lines)
 
 
 def render_semantic_debug_text(payload: dict) -> str:

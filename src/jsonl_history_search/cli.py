@@ -9,6 +9,7 @@ from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .forensics import build_forensics_payload
+from .generated_metadata import build_generated_metadata_discovery_report
 from .harness_artifacts import (
     DEFAULT_DRY_RUN_CASE_ID,
     DEFAULT_HARNESS_SCHEMA_PATH,
@@ -105,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional maximum manifest entries to keep in the shortlist report.",
     )
+    metadata_discovery = subparsers.add_parser("metadata-discovery")
+    metadata_discovery.add_argument("query", nargs="?", default="")
+    add_common_args(metadata_discovery)
+    metadata_discovery.add_argument("--min-count", type=int, default=1)
+    metadata_discovery.add_argument("--max-candidates", type=int, default=40)
+    metadata_discovery.add_argument("--report-output", default=None)
     forensics = subparsers.add_parser("forensics")
     add_common_args(forensics)
     forensics.add_argument("--commit", default=None)
@@ -957,6 +964,20 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["jsonl_candidate_discovery"]["status"]
         return 1 if status in {"no_roots", "root_rejected"} else 0
+    if args.command == "metadata-discovery":
+        _source_plan, _intent, plan = payload_from_args(args)
+        payload = build_generated_metadata_discovery_report(
+            plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            min_count=args.min_count,
+            max_candidates=args.max_candidates,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["generated_metadata_discovery"]["status"]
+        return 1 if status in {"root_rejected"} else 0
     if args.command == "forensics":
         print(render(build_forensics_payload(args), args.format))
         return 0
