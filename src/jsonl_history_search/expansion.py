@@ -927,6 +927,89 @@ SUPPRESSION_HIDDEN_FAILURE_EXPANSION_TERMS = (
     "true-positive",
 )
 
+LINTER_PHASE_INAPPROPRIATE_FIRE_LINTER_TERMS = (
+    "callout",
+    "callouts",
+    "intervention",
+    "interventions",
+    "linter",
+    "semantic linter",
+    "steering",
+)
+LINTER_PHASE_INAPPROPRIATE_FIRE_FIRED_TERMS = (
+    "alert",
+    "alerted",
+    "call",
+    "called",
+    "fire",
+    "fired",
+    "flag",
+    "flagged",
+    "trigger",
+    "triggered",
+)
+LINTER_PHASE_INAPPROPRIATE_FIRE_PHASE_TERMS = (
+    "coordinator",
+    "coordination",
+    "orchestration",
+    "plan",
+    "planner",
+    "planning",
+    "set up",
+    "setup",
+)
+LINTER_PHASE_INAPPROPRIATE_FIRE_JUDGMENT_TERMS = (
+    "early",
+    "inappropriate",
+    "not appropriate",
+    "premature",
+    "prematurely",
+    "should not",
+    "should-not",
+    "should_not",
+    "shouldn't",
+)
+LINTER_PHASE_INAPPROPRIATE_FIRE_NOISE_TERMS = (
+    "false positive",
+    "false-positive",
+    "false_positive",
+    "noise",
+    "noisy",
+    "spurious",
+    "unwanted",
+)
+LINTER_PHASE_INAPPROPRIATE_FIRE_EXPANSION_TERMS = (
+    "alert",
+    "callout",
+    "callouts",
+    "coordinator",
+    "coordination",
+    "early",
+    "false positive",
+    "false-positive",
+    "fired",
+    "flagged",
+    "inappropriate",
+    "intervention",
+    "interventions",
+    "linter",
+    "noise",
+    "noisy",
+    "orchestration",
+    "planning",
+    "premature",
+    "prematurely",
+    "semantic linter",
+    "set up",
+    "setup",
+    "should not",
+    "should-not",
+    "spurious",
+    "steering",
+    "triggered",
+    "unwanted",
+)
+
 PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
     "before",
     "crash",
@@ -1659,6 +1742,55 @@ def suppression_hidden_failure_terms() -> list[str]:
     )
 
 
+def has_linter_phase_inappropriate_fire_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    linter_context = bool(
+        token_context & set(LINTER_PHASE_INAPPROPRIATE_FIRE_LINTER_TERMS)
+        or re.search(r"\bsemantic[\s_-]+linter\b", normalized)
+        or re.search(r"\bcall[\s_-]?outs?\b", normalized)
+    )
+    fired_context = bool(
+        token_context & set(LINTER_PHASE_INAPPROPRIATE_FIRE_FIRED_TERMS)
+        or re.search(r"\btrigger(?:ed|ing|s)?\b", normalized)
+        or re.search(r"\bfir(?:e|ed|ing|es)\b", normalized)
+        or re.search(r"\bflag(?:ged|ging|s)?\b", normalized)
+    )
+    phase_context = bool(
+        token_context & set(LINTER_PHASE_INAPPROPRIATE_FIRE_PHASE_TERMS)
+        or re.search(r"\bset[\s_-]+up\b", normalized)
+        or re.search(r"\bcoordinat(?:or|ion|ing)\b", normalized)
+        or re.search(r"\bplann(?:er|ing)\b", normalized)
+    )
+    judgment_or_noise_context = bool(
+        token_context
+        & (
+            set(LINTER_PHASE_INAPPROPRIATE_FIRE_JUDGMENT_TERMS)
+            | set(LINTER_PHASE_INAPPROPRIATE_FIRE_NOISE_TERMS)
+        )
+        or re.search(r"\bshould(?:\s+not|n't)\b", normalized)
+        or re.search(r"\bnot[\s_-]+appropriate\b", normalized)
+        or re.search(r"\bfalse[\s_-]+positives?\b", normalized)
+    )
+
+    return linter_context and fired_context and phase_context and judgment_or_noise_context
+
+
+def linter_phase_inappropriate_fire_terms() -> list[str]:
+    return sorted(
+        {
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_LINTER_TERMS,
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_FIRED_TERMS,
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_PHASE_TERMS,
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_JUDGMENT_TERMS,
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_NOISE_TERMS,
+            *LINTER_PHASE_INAPPROPRIATE_FIRE_EXPANSION_TERMS,
+        }
+    )
+
+
 def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1747,6 +1879,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_suppression_hidden_failure_intent,
         suppression_hidden_failure_terms,
+    ),
+    ContextualExpansionFamily(
+        has_linter_phase_inappropriate_fire_intent,
+        linter_phase_inappropriate_fire_terms,
     ),
     ContextualExpansionFamily(
         has_pre_crash_incident_context_intent,
