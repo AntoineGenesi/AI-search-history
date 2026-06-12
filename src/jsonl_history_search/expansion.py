@@ -1877,21 +1877,13 @@ def has_coordinator_workflow_noisy_label_intent(normalized: str, base_terms: lis
         or re.search(r"\borchestrat(?:e|ed|es|ing|ion)\b", normalized)
         or re.search(r"\bplann(?:er|ing)\b", normalized)
     )
-    linter_context = bool(
-        token_context & set(COORDINATOR_WORKFLOW_NOISY_LABEL_LINTER_TERMS)
-        or re.search(r"\bsemantic[\s_-]+linter\b", normalized)
-        or re.search(r"\bintervention(?:s)?\b", normalized)
-        or re.search(r"\bsteer(?:ing|ed|s)?\b", normalized)
-    )
     question_context = bool(
         re.search(r"\b(?:which|what)\s+(?:label|labels|classification|classifications|tag|tags)\b", normalized)
         or re.search(r"\b(?:which|what)\b.*\b(?:noisy|noise|false[\s_-]+positive|spurious)\b", normalized)
         or re.search(r"\b(?:noisy|spurious|false[\s_-]+positive)\b.*\b(?:label|labels|classification|tag|tags)\b", normalized)
     )
 
-    explicit_three_sided = label_context and noise_context and workflow_context
-    linter_backed = linter_context and label_context and (noise_context or workflow_context)
-    return (explicit_three_sided or linter_backed) and question_context
+    return label_context and noise_context and workflow_context and question_context
 
 
 def coordinator_workflow_noisy_label_terms() -> list[str]:
