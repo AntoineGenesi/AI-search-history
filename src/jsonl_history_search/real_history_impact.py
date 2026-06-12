@@ -533,6 +533,8 @@ def _run_package_search_variant(
         warnings=package_warnings,
         notes=[],
     )
+    row["scan_order"] = _scan_order_row(result)
+    raw_row["sanitized_row"] = row
     raw_row["package_result"] = result
     return row, raw_row
 
@@ -694,6 +696,15 @@ def _row_pair(
     return row, raw_row
 
 
+def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "strategy": str(result.get("scan_order_strategy") or "unknown"),
+        "planned_files_count": int(result.get("planned_files_count") or 0),
+        "opened_files_count": int(result.get("opened_files_count") or result.get("searched_files") or 0),
+        "raw_paths_included": False,
+    }
+
+
 def _recall_at(candidate_ref_ids: list[str], must_ids: set[str], k: int, expected_no_evidence: bool) -> float:
     if expected_no_evidence:
         return 1.0 if not candidate_ref_ids else 0.0
@@ -849,9 +860,16 @@ def _headline_findings(
     manual = summary.get("manual_newest_first_open") or {}
     rg = summary.get("package_search_rg_prefilter") or {}
     if package:
-        findings.append(
-            "package_search returned compact handoff packets but did not recover the sanitized bridge refs in this bounded real-history run"
-        )
+        package_hits = int(package.get("first_pass_hits", 0) or 0)
+        package_cases = int(package.get("cases", 0) or 0)
+        if package_hits:
+            findings.append(
+                f"package_search recovered {package_hits}/{package_cases} sanitized bridge refs in this bounded real-history run"
+            )
+        else:
+            findings.append(
+                "package_search returned compact handoff packets but did not recover the sanitized bridge refs in this bounded real-history run"
+            )
     if raw:
         findings.append(
             f"raw_rg_literal recovered {raw.get('first_pass_hits', 0)}/{raw.get('cases', 0)} cases with zero parsed bytes but only works for exact literal overlap"

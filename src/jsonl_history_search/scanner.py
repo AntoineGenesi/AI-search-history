@@ -8,7 +8,10 @@ from .masking import MaskContext
 from .query import QueryIntent
 from .ranking import Match, group_matches, is_weak_partial_generic, make_snippet, score_record, should_consider
 from .rg_prefilter import filter_planned_files
-from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path
+from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
+
+
+SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc"
 
 
 def search(
@@ -41,10 +44,14 @@ def search(
         warnings = enum_warnings
         planned_files.append((path, size))
 
+    planned_files = order_planned_files_for_scan(planned_files, intent)
+    planned_files_count = len(planned_files)
+
     if use_rg_prefilter:
         prefilter_result = filter_planned_files(plan=plan, intent=intent, files=planned_files, cwd=cwd)
         prefilter = prefilter_result.stats
         planned_files = [(item.path, item.size) for item in prefilter_result.files]
+        planned_files = order_planned_files_for_scan(planned_files, intent)
 
     for path, size in planned_files:
         if time.monotonic() - started > plan.limits.max_elapsed:
@@ -132,6 +139,9 @@ def search(
     payload = {
         "searched_files": searched_files,
         "searched_bytes": searched_bytes,
+        "scan_order_strategy": SCAN_ORDER_STRATEGY,
+        "planned_files_count": planned_files_count,
+        "opened_files_count": searched_files,
         "groups": group_matches(matches),
         "warnings": sorted(set(warnings + plan.warnings)),
         "blind_spots": sorted(set(blind_spots)),
@@ -142,6 +152,18 @@ def search(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def order_planned_files_for_scan(planned_files: list[tuple], intent: QueryIntent) -> list[tuple]:
+    return sorted(
+        planned_files,
+        key=lambda item: (
+            -int(stat_mtime(item[0])),
+            -filename_preference_score(item[0], intent.base_terms),
+            item[1],
+            str(item[0]),
+        ),
+    )
 
 
 def match_sort_key(match: Match) -> tuple[float, str, str, int]:
