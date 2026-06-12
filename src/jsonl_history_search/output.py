@@ -2842,6 +2842,7 @@ def render_real_history_opened_file_progress_diagnostic_text(payload: dict) -> s
     report = payload["real_history_opened_file_progress_displacement_diagnostic"]
     summary = report.get("summary") or {}
     decision = report.get("decision") or {}
+    compared = report.get("compared_runs") or {}
     lines = [
         "Real-history opened-file progress displacement diagnostic",
         f"Status: {report.get('status')}",
@@ -2852,14 +2853,23 @@ def render_real_history_opened_file_progress_diagnostic_text(payload: dict) -> s
         f"Opened date-timeline misses: {summary.get('canonical_opened_date_timeline_miss_count')}",
         f"Headline: {decision.get('headline')}",
     ]
+    if "jsh709_fresh" in compared:
+        lines.append(
+            "JSH-709 fresh package_search: "
+            f"{summary.get('jsh709_fresh_package_search_first_pass_hits')}/18; "
+            f"Recall@10={summary.get('jsh709_fresh_package_search_recall_at_10')}; "
+            f"MRR={summary.get('jsh709_fresh_package_search_mrr')}"
+        )
     for row in report.get("rows", []):
         displacement = row.get("candidate_displacement") or {}
+        fresh = row.get("jsh709_outcome") or {}
         lines.append(
             "- "
             f"{row.get('case_id')}: "
             f"{', '.join(displacement.get('displacement_labels') or [])}; "
             f"records_delta={displacement.get('records_read_delta')}; "
-            f"probe_records={displacement.get('line_window_probe_records_added_in_jsh707')}"
+            f"probe_records={displacement.get('line_window_probe_records_added_in_jsh707')}; "
+            f"jsh709={', '.join(fresh.get('outcome_labels') or [])}"
         )
     return "\n".join(lines)
 
@@ -2877,17 +2887,22 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
         "",
         "## Compared Runs",
         "",
-        "| Run | ID | Package search | Recall/MRR |",
-        "| --- | --- | ---: | ---: |",
+        "| Run | ID | Package search | Recall@10 | MRR | Caps elapsed/match/weak | Audit opened/not-reached/absent-final | Median opened/bytes/handoff |",
+        "| --- | --- | ---: | ---: | ---: | --- | --- | --- |",
     ]
-    for label in ("jsh706", "jsh707_failed"):
+    run_labels = ["jsh706", "jsh707_failed"] + (["jsh709_fresh"] if "jsh709_fresh" in compared else [])
+    for label in run_labels:
         run = compared.get(label) or {}
         lines.append(
             "| "
             f"`{label}` | "
             f"`{_escape_markdown_table(str(run.get('run_id')))}` | "
             f"{run.get('package_search_first_pass_hits')}/{run.get('package_search_cases')} | "
-            f"{run.get('package_search_recall_mrr')} |"
+            f"{run.get('package_search_recall_at_10')} | "
+            f"{run.get('package_search_mrr', run.get('package_search_recall_mrr'))} | "
+            f"{run.get('elapsed_cap_rows')}/{run.get('match_cap_rows')}/{run.get('weak_reservoir_cap_rows')} | "
+            f"{run.get('audit_expected_file_opened_rows')}/{run.get('audit_expected_record_line_not_reached_rows')}/{run.get('audit_expected_ref_absent_final_rows')} | "
+            f"{run.get('median_files_opened')}/{run.get('median_bytes_parsed')}/{run.get('median_handoff_bytes')} |"
         )
     lines.extend(
         [
@@ -2899,6 +2914,7 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
             f"- Repair supported by this diagnostic: `{decision.get('repair_supported_by_this_diagnostic')}`",
             f"- Reject retrying blind midpoint/positional probing: `{decision.get('reject_retrying_blind_midpoint_or_positional_line_window_probe')}`",
             f"- Next step: {decision.get('recommended_next_step')}",
+            f"- Recommended next repair task: `{(decision.get('recommended_next_repair_task') or {}).get('title')}`",
             "",
             "## Summary Counters",
             "",
@@ -2912,6 +2928,24 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
             f"| regressed cases with JSH-707 midpoint probe records | {summary.get('regressed_cases_with_jsh707_midpoint_probe_records', 0)} |",
             f"| canonical opened date-timeline miss count | {summary.get('canonical_opened_date_timeline_miss_count', 0)} |",
             f"| canonical opened date-timeline misses opened-not-reached in both runs | {summary.get('canonical_opened_date_timeline_misses_opened_not_reached_in_both_runs', 0)} |",
+        ]
+    )
+    if "jsh709_fresh" in compared:
+        lines.extend(
+            [
+                f"| JSH-709 fresh package_search first-pass hits | {summary.get('jsh709_fresh_package_search_first_pass_hits', 0)} |",
+                f"| JSH-709 fresh Recall@10 | {summary.get('jsh709_fresh_package_search_recall_at_10', 0)} |",
+                f"| JSH-709 fresh MRR | {summary.get('jsh709_fresh_package_search_mrr', 0)} |",
+                f"| JSH-709 elapsed/match/weak-reservoir cap rows | {summary.get('jsh709_elapsed_cap_rows', 0)}/{summary.get('jsh709_match_cap_rows', 0)}/{summary.get('jsh709_weak_reservoir_cap_rows', 0)} |",
+                f"| JSH-709 audit opened/not-reached/absent-final rows | {summary.get('jsh709_audit_expected_file_opened_rows', 0)}/{summary.get('jsh709_audit_expected_record_line_not_reached_rows', 0)}/{summary.get('jsh709_audit_expected_ref_absent_final_rows', 0)} |",
+                f"| JSH-709 median opened/bytes/handoff | {summary.get('jsh709_median_files_opened', 0)}/{summary.get('jsh709_median_bytes_parsed', 0)}/{summary.get('jsh709_median_handoff_bytes', 0)} |",
+                f"| JSH-709 selected/opened/reached/final expected refs | {summary.get('jsh709_selected_expected_file_count', 0)}/{summary.get('jsh709_opened_expected_file_count', 0)}/{summary.get('jsh709_reached_expected_record_line_count', 0)}/{summary.get('jsh709_final_output_present_count', 0)} |",
+                f"| JSH-709 measured progress cases/records | {summary.get('jsh709_cases_with_measured_opened_file_progress', 0)}/{summary.get('jsh709_opened_file_progress_record_count', 0)} |",
+                f"| JSH-709 opened-but-not-reached rows | {summary.get('jsh709_opened_but_not_reached_count', 0)} |",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "## Evidence Limits",
             "",
@@ -2930,19 +2964,24 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
             "",
             "## Case Comparison",
             "",
-            "| Case | Role | 706 hit | 707 hit | 706 opened/reached/final | 707 opened/reached/final | 706 opened files | 707 opened files | 706 records | 707 records | 707 probe records/files | 706 phase | 707 phase | Displacement labels |",
-            "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |",
+            "| Case | Role | 706 hit | 707 hit | 709 hit | 706 opened/reached/final | 707 opened/reached/final | 709 opened/reached/final | 706 opened files | 707 opened files | 709 opened files | 706 records | 707 records | 709 records | 707 probe records/files | 706 phase | 707 phase | 709 phase | Displacement labels | JSH-709 labels |",
+            "| --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in report.get("rows", []):
         j706 = row.get("jsh706") or {}
         j707 = row.get("jsh707_failed") or {}
+        j709 = row.get("jsh709_fresh") or {}
         ref706 = j706.get("expected_ref") or {}
         ref707 = j707.get("expected_ref") or {}
+        ref709 = j709.get("expected_ref") or {}
         displacement = row.get("candidate_displacement") or {}
         labels = ", ".join(displacement.get("displacement_labels") or [])
+        outcome = row.get("jsh709_outcome") or {}
+        outcome_labels = ", ".join(outcome.get("outcome_labels") or [])
         phase706 = _phase_summary(ref706)
         phase707 = _phase_summary(ref707)
+        phase709 = _phase_summary(ref709)
         probe = j707.get("line_window_probe") or {}
         lines.append(
             "| "
@@ -2950,16 +2989,22 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
             f"`{_escape_markdown_table(str(row.get('case_role', '')))}` | "
             f"{j706.get('first_pass_hit')} | "
             f"{j707.get('first_pass_hit')} | "
+            f"{j709.get('first_pass_hit', '')} | "
             f"{_bool_triplet(ref706)} | "
             f"{_bool_triplet(ref707)} | "
+            f"{_bool_triplet(ref709) if j709 else ''} | "
             f"{j706.get('opened_files_count', 0)} | "
             f"{j707.get('opened_files_count', 0)} | "
+            f"{j709.get('opened_files_count', '')} | "
             f"{j706.get('records_read_total', 0)} | "
             f"{j707.get('records_read_total', 0)} | "
+            f"{j709.get('records_read_total', '')} | "
             f"{probe.get('probe_records', 0)}/{probe.get('probe_files', 0)} | "
             f"{_escape_markdown_table(phase706)} | "
             f"{_escape_markdown_table(phase707)} | "
+            f"{_escape_markdown_table(phase709) if j709 else ''} | "
             f"{_escape_markdown_table(labels)} |"
+            f" {_escape_markdown_table(outcome_labels)} |"
         )
     lines.extend(
         [
@@ -2971,7 +3016,8 @@ def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) 
         ]
     )
     for row in report.get("rows", []):
-        for run_key in ("jsh706", "jsh707_failed"):
+        row_run_keys = ["jsh706", "jsh707_failed"] + (["jsh709_fresh"] if "jsh709_fresh" in row else [])
+        for run_key in row_run_keys:
             run = row.get(run_key) or {}
             for item in run.get("opened_file_progress") or []:
                 records = item.get("records_read")
