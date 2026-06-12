@@ -424,6 +424,8 @@ def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, 
             "bytes_reduced": 0,
             "files_reduction_ratio": 0.0,
             "bytes_reduction_ratio": 0.0,
+            "needle_policy": None,
+            "needle_count": 0,
         }
     return {
         "enabled": bool(stats.get("enabled")),
@@ -439,6 +441,8 @@ def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, 
         "bytes_reduced": int(stats.get("bytes_reduced", 0)),
         "files_reduction_ratio": float(stats.get("files_reduction_ratio", 0.0)),
         "bytes_reduction_ratio": float(stats.get("bytes_reduction_ratio", 0.0)),
+        "needle_policy": str(stats.get("needle_policy")) if stats.get("needle_policy") is not None else None,
+        "needle_count": int(stats.get("needle_count", 0)),
     }
 
 
