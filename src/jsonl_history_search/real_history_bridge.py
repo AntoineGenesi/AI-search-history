@@ -13,7 +13,8 @@ from .real_history_gold import validate_manifest
 BRIDGE_SCHEMA_VERSION = 1
 EXPECTED_REVIEW_STATUS = "reviewed_real_history_gold"
 EXPECTED_SPEAKER_ORIGIN = "human_user"
-EXPECTED_CASE_COUNT = 18
+HISTORICAL_ORIGINAL_CASE_COUNT = 18
+
 
 @dataclass(frozen=True)
 class BridgeValidationResult:
@@ -52,10 +53,11 @@ def validate_bridge(manifest: dict[str, Any], bridge: dict[str, Any]) -> BridgeV
         if case.get("review_status") == EXPECTED_REVIEW_STATUS
         and case.get("downstream_applicability", {}).get("impact_benchmark") is True
     ]
-    if len(manifest_cases) != EXPECTED_CASE_COUNT:
-        errors.append(f"manifest must contain exactly {EXPECTED_CASE_COUNT} cases for this bridge")
-    if len(benchmark_cases) != EXPECTED_CASE_COUNT:
-        errors.append(f"manifest must contain exactly {EXPECTED_CASE_COUNT} benchmarkable reviewed cases")
+    expected_case_count = len(manifest_cases)
+    if expected_case_count == 0:
+        errors.append("manifest must contain at least one case for this bridge")
+    if len(benchmark_cases) != expected_case_count:
+        errors.append("every manifest case must be benchmarkable and reviewed for this bridge")
 
     manifest_by_case_id: dict[str, dict[str, Any]] = {}
     for index, case in enumerate(manifest_cases):
@@ -192,7 +194,8 @@ def validate_bridge(manifest: dict[str, Any], bridge: dict[str, Any]) -> BridgeV
             "status": "ok" if not errors else "rejected",
             "manifest_case_count": len(manifest_cases),
             "benchmarkable_reviewed_case_count": len(benchmark_cases),
-            "expected_case_count": EXPECTED_CASE_COUNT,
+            "expected_case_count": expected_case_count,
+            "historical_original_case_count": HISTORICAL_ORIGINAL_CASE_COUNT,
             "bridge_case_count": len(bridge_cases),
             "accepted_case_count": status_counts.get("accepted", 0),
             "quarantined_case_count": status_counts.get("quarantined", 0),
@@ -203,7 +206,7 @@ def validate_bridge(manifest: dict[str, Any], bridge: dict[str, Any]) -> BridgeV
             "query_text_check_counts": dict(sorted(query_text_checks.items())),
             "rejection_counts": dict(sorted(rejection_counts.items())),
             "error_count": len(errors),
-            "below_floor_case_count_caveat": "18 reviewed cases is below the old 20-50 target floor.",
+            "case_count_floor_status": _case_count_floor_status(expected_case_count),
             "privacy_contract": {
                 "raw_private_text_committed": False,
                 "raw_private_paths_committed": False,
@@ -268,6 +271,14 @@ def _case_report(manifest_case: dict[str, Any], status: str, bridge_ref_count: i
 
 def _normalize_text(value: str) -> str:
     return "\n".join(line.rstrip() for line in value.strip().splitlines()).strip()
+
+
+def _case_count_floor_status(case_count: int) -> str:
+    if case_count < 20:
+        return "below_old_20_50_target_floor"
+    if case_count <= 50:
+        return "within_old_20_50_target_band"
+    return "above_old_20_50_target_band"
 
 
 def render_bridge_json(report: dict[str, Any]) -> str:
