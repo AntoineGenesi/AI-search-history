@@ -52,6 +52,13 @@ from .real_history_remaining_miss_diagnostic import (
     DEFAULT_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_REMAINING_MISS_AUDIT_REPORT,
 )
 from .real_history_remaining_miss_diagnostic import build_real_history_remaining_miss_diagnostic_payload
+from .real_history_opened_file_progress_diagnostic import (
+    DEFAULT_JSH706_BENCHMARK_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_BENCHMARK,
+    DEFAULT_JSH706_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_AUDIT,
+    DEFAULT_JSH707_BENCHMARK_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH707_BENCHMARK,
+    DEFAULT_JSH707_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH707_AUDIT,
+    build_real_history_opened_file_progress_diagnostic_payload,
+)
 from .real_history_embedding import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_EMBEDDING_MANIFEST
 from .real_history_embedding import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_EMBEDDING_PRIVATE_BRIDGE
 from .real_history_embedding import build_real_history_embedding_payload
@@ -545,6 +552,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path where the sanitized JSON/Markdown report should be written.",
     )
     remaining_miss_diagnostic.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
+    opened_progress_diagnostic = subparsers.add_parser("diagnose-real-history-opened-file-progress")
+    opened_progress_diagnostic.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    opened_progress_diagnostic.add_argument(
+        "--jsh706-benchmark-report",
+        default=str(DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_BENCHMARK),
+        help="Committed sanitized JSH-706 benchmark report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh706-miss-audit-report",
+        default=str(DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_AUDIT),
+        help="Committed sanitized JSH-706 miss-audit report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh707-benchmark-report",
+        default=str(DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH707_BENCHMARK),
+        help="Committed sanitized JSH-707 failed-attempt benchmark report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh707-miss-audit-report",
+        default=str(DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH707_AUDIT),
+        help="Committed sanitized JSH-707 failed-attempt miss-audit report JSON.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh706-raw-run",
+        default=None,
+        help="Optional ignored raw JSH-706 run JSON used only for safe counter fields.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--jsh707-raw-run",
+        default=None,
+        help="Optional ignored raw JSH-707 failed-attempt run JSON used only for safe probe counters.",
+    )
+    opened_progress_diagnostic.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown report should be written.",
+    )
+    opened_progress_diagnostic.add_argument(
         "--markdown-report-output",
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
@@ -1321,6 +1370,27 @@ def main(argv: list[str] | None = None) -> int:
             markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
         print(rendered)
         status = payload["real_history_remaining_miss_loss_point_diagnostic"]["status"]
+        return 1 if status in {"incomplete"} else 0
+    if args.command == "diagnose-real-history-opened-file-progress":
+        payload = build_real_history_opened_file_progress_diagnostic_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_opened_file_progress_displacement_diagnostic"]["status"]
         return 1 if status in {"incomplete"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()

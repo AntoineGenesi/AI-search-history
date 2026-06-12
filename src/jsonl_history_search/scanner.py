@@ -86,7 +86,7 @@ def search(
             if not item["opened"]:
                 searched_files += 1
                 searched_bytes += size
-                _mark_expected_file_opened(expected_diag, path)
+                _mark_opened_file_progress(expected_diag, item, path, searched_files)
                 source_kind = source_kind_for_path(path, plan)
                 item["records"] = iter_records_for_file(path, source_kind, default_tz)
                 item["opened"] = True
@@ -103,23 +103,33 @@ def search(
                     exhausted = True
                     break
                 records_read += 1
+                _mark_opened_file_record_read(expected_diag, item)
                 expected_state = _expected_state_for_record(expected_diag, record)
                 if expected_state is not None:
                     expected_state["expected_record_line_reached_before_elapsed_stop"] = True
+                    expected_state["expected_file_records_read_before_stop"] = int(item.get("records_read") or 0)
+                    expected_state["expected_file_progress_bucket"] = _records_read_bucket(
+                        int(item.get("records_read") or 0)
+                    )
                 if not should_consider(record, intent):
                     records_rejected_by_should_consider += 1
                     if expected_state is not None:
                         expected_state["would_pass_should_consider"] = False
                         expected_state["pre_reservoir_status"] = "rejected_by_should_consider"
+                        expected_state["should_consider_phase_label"] = "rejected_by_should_consider"
+                        expected_state["drop_phase_label"] = "should_consider_drop"
                     continue
                 if expected_state is not None:
                     expected_state["would_pass_should_consider"] = True
+                    expected_state["should_consider_phase_label"] = "passed_should_consider"
                 key = dedupe_key_for_record(record)
                 if key in dedupe:
                     candidate_records_deduped += 1
                     if expected_state is not None:
                         expected_state["deduped_before_scoring"] = True
                         expected_state["pre_reservoir_status"] = "deduped_before_scoring"
+                        expected_state["dedupe_phase_label"] = "deduped_before_scoring"
+                        expected_state["drop_phase_label"] = "dedupe_drop"
                     continue
                 dedupe.add(key)
                 candidate_records_scored += 1
@@ -127,6 +137,7 @@ def search(
                 if expected_state is not None:
                     expected_state["expected_record_present_before_reservoir_retention"] = True
                     expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
+                    expected_state["dedupe_phase_label"] = "not_deduped"
                 if mask_context is not None:
                     copied_text = mask_context.mask_text(
                         record.text,
@@ -156,6 +167,8 @@ def search(
                         expected_state["candidate_strength"] = "weak"
                     if len(weak_matches) < weak_reservoir_limit:
                         weak_matches.append(match)
+                        if expected_state is not None:
+                            expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
                     else:
                         weakest_index = min(
                             range(len(weak_matches)),
@@ -163,12 +176,19 @@ def search(
                         )
                         if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
                             weak_matches[weakest_index] = match
+                            if expected_state is not None:
+                                expected_state["reservoir_phase_label"] = "weak_reservoir_replaced_existing_candidate"
+                        elif expected_state is not None:
+                            expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
+                            expected_state["drop_phase_label"] = "weak_reservoir_drop"
                         weak_candidates_skipped += 1
                     continue
                 if expected_state is not None:
                     expected_state["candidate_strength"] = "strong"
                 if len(matches) < strong_reservoir_limit:
                     matches.append(match)
+                    if expected_state is not None:
+                        expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
                     continue
                 weakest_index = min(
                     range(len(matches)),
@@ -176,6 +196,11 @@ def search(
                 )
                 if match_sort_key(match) > match_sort_key(matches[weakest_index]):
                     matches[weakest_index] = match
+                    if expected_state is not None:
+                        expected_state["reservoir_phase_label"] = "strong_reservoir_replaced_existing_candidate"
+                elif expected_state is not None:
+                    expected_state["reservoir_phase_label"] = "strong_reservoir_cap_drop"
+                    expected_state["drop_phase_label"] = "strong_reservoir_drop"
                 strong_candidates_retention_capped += 1
         except AdapterReadError as exc:
             warnings.append(str(exc))
@@ -238,6 +263,10 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
             "ref_id": str(ref.get("ref_id") or f"expected_ref_{index:03d}"),
             "_path": str(path),
             "_line": line,
+            "expected_file_label": None,
+            "expected_file_open_order": None,
+            "expected_file_records_read_before_stop": 0,
+            "expected_file_progress_bucket": "not_opened",
             "expected_file_selected_by_source_plan": False,
             "expected_file_queued_for_scan": False,
             "expected_file_opened_before_scan_stop": False,
@@ -249,6 +278,11 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
             "expected_record_present_in_final_candidate_refs": False,
             "expected_record_present_in_final_candidate_groups": False,
             "candidate_strength": None,
+            "should_consider_phase_label": "not_reached",
+            "dedupe_phase_label": "not_reached",
+            "reservoir_phase_label": "not_reached",
+            "final_cap_phase_label": "not_reached",
+            "drop_phase_label": None,
             "pre_reservoir_status": "not_reached",
             "pre_final_status": "not_reached",
             "final_status": "not_reached",
@@ -258,7 +292,7 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
         by_file.setdefault(state["_path"], []).append(state)
     if not refs:
         return None
-    return {"refs": refs, "by_ref": by_ref, "by_file": by_file}
+    return {"refs": refs, "by_ref": by_ref, "by_file": by_file, "opened_files": [], "opened_by_path": {}}
 
 
 def _mark_expected_files_selected(expected_diag: dict | None, planned_files: list[tuple]) -> None:
@@ -277,15 +311,45 @@ def _mark_expected_files_queued(expected_diag: dict | None, planned_files: list[
         state["expected_file_queued_for_scan"] = state["_path"] in queued_paths
 
 
-def _mark_expected_file_opened(expected_diag: dict | None, path) -> None:
+def _mark_opened_file_progress(expected_diag: dict | None, item: dict, path, opened_order: int) -> None:
     if expected_diag is None:
         return
+    item["file_label"] = f"opened_file_{opened_order:03d}"
+    item["opened_order"] = opened_order
+    item["records_read"] = 0
+    progress = {
+        "file_label": item["file_label"],
+        "opened_order": opened_order,
+        "records_read": 0,
+        "records_read_bucket": "0",
+        "expected_ref_file": str(path) in expected_diag["by_file"],
+        "_path": str(path),
+    }
+    expected_diag["opened_files"].append(progress)
+    expected_diag["opened_by_path"][str(path)] = progress
     for state in expected_diag["by_file"].get(str(path), []):
+        state["expected_file_label"] = item["file_label"]
+        state["expected_file_open_order"] = opened_order
         state["expected_file_opened_before_scan_stop"] = True
+        state["expected_file_progress_bucket"] = "0"
         if state["pre_reservoir_status"] == "not_reached":
             state["pre_reservoir_status"] = "file_opened_record_line_not_reached"
             state["pre_final_status"] = "file_opened_record_line_not_reached"
             state["final_status"] = "file_opened_record_line_not_reached"
+
+
+def _mark_opened_file_record_read(expected_diag: dict | None, item: dict) -> None:
+    if expected_diag is None:
+        return
+    item["records_read"] = int(item.get("records_read") or 0) + 1
+    progress = expected_diag["opened_by_path"].get(str(item["path"]))
+    if progress is None:
+        return
+    progress["records_read"] = int(item["records_read"])
+    progress["records_read_bucket"] = _records_read_bucket(int(item["records_read"]))
+    for state in expected_diag["by_file"].get(str(item["path"]), []):
+        state["expected_file_records_read_before_stop"] = int(item["records_read"])
+        state["expected_file_progress_bucket"] = progress["records_read_bucket"]
 
 
 def _expected_state_for_record(expected_diag: dict | None, record) -> dict | None:
@@ -306,6 +370,9 @@ def _mark_expected_pre_final_candidates(expected_diag: dict | None, candidates: 
             state["pre_final_status"] = "present_in_pre_final_candidate_state"
         elif state["expected_record_present_before_reservoir_retention"]:
             state["pre_final_status"] = "dropped_by_reservoir_retention"
+            if state["reservoir_phase_label"] in {"not_reached", "strong_reservoir_retained", "weak_reservoir_retained"}:
+                state["reservoir_phase_label"] = "reservoir_retention_drop"
+            state["drop_phase_label"] = state["drop_phase_label"] or "reservoir_drop"
         elif state["deduped_before_scoring"]:
             state["pre_final_status"] = "deduped_before_scoring"
         elif state["would_pass_should_consider"] is False:
@@ -325,16 +392,23 @@ def _mark_expected_final_candidates(expected_diag: dict | None, candidates: list
         state["expected_record_present_in_final_candidate_groups"] = present
         if present:
             state["final_status"] = "present_in_final_candidate_groups"
+            state["final_cap_phase_label"] = "present_in_final_output"
         elif state["expected_record_present_in_pre_final_candidate_state"]:
             state["final_status"] = "lost_between_pre_final_and_final_output"
+            state["final_cap_phase_label"] = "final_cap_drop"
+            state["drop_phase_label"] = state["drop_phase_label"] or "final_cap_drop"
         elif state["expected_record_present_before_reservoir_retention"]:
             state["final_status"] = "dropped_before_final_candidates"
+            state["final_cap_phase_label"] = "absent_before_final_candidates"
         elif state["deduped_before_scoring"]:
             state["final_status"] = "deduped_before_scoring"
+            state["final_cap_phase_label"] = "dedupe_drop"
         elif state["would_pass_should_consider"] is False:
             state["final_status"] = "rejected_by_should_consider"
+            state["final_cap_phase_label"] = "should_consider_drop"
         elif state["expected_record_line_reached_before_elapsed_stop"]:
             state["final_status"] = "line_reached_but_not_scored"
+            state["final_cap_phase_label"] = "line_reached_but_not_scored"
 
 
 def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
@@ -350,6 +424,10 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
         public_refs.append(
             {
                 "ref_id": state["ref_id"],
+                "expected_file_label": state["expected_file_label"],
+                "expected_file_open_order": state["expected_file_open_order"],
+                "expected_file_records_read_before_stop": int(state["expected_file_records_read_before_stop"]),
+                "expected_file_progress_bucket": state["expected_file_progress_bucket"],
                 "expected_file_selected_by_source_plan": bool(state["expected_file_selected_by_source_plan"]),
                 "expected_file_queued_for_scan": bool(state["expected_file_queued_for_scan"]),
                 "expected_file_opened_before_scan_stop": bool(state["expected_file_opened_before_scan_stop"]),
@@ -372,6 +450,11 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
                     state["expected_record_present_in_final_candidate_groups"]
                 ),
                 "candidate_strength": state["candidate_strength"],
+                "should_consider_phase_label": state["should_consider_phase_label"],
+                "dedupe_phase_label": state["dedupe_phase_label"],
+                "reservoir_phase_label": state["reservoir_phase_label"],
+                "final_cap_phase_label": state["final_cap_phase_label"],
+                "drop_phase_label": state["drop_phase_label"],
                 "pre_reservoir_status": state["pre_reservoir_status"],
                 "pre_final_status": state["pre_final_status"],
                 "final_status": state["final_status"],
@@ -397,8 +480,33 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
         "final_candidate_group_present_count": sum(
             1 for ref in public_refs if ref["expected_record_present_in_final_candidate_groups"]
         ),
+        "opened_file_count": len(expected_diag["opened_files"]),
+        "opened_files": [
+            {
+                "file_label": item["file_label"],
+                "opened_order": int(item["opened_order"]),
+                "records_read": int(item["records_read"]),
+                "records_read_bucket": item["records_read_bucket"],
+                "expected_ref_file": bool(item["expected_ref_file"]),
+            }
+            for item in expected_diag["opened_files"]
+        ],
         "refs": public_refs,
     }
+
+
+def _records_read_bucket(records_read: int) -> str:
+    if records_read <= 0:
+        return "0"
+    if records_read <= 128:
+        return "1-128"
+    if records_read <= 512:
+        return "129-512"
+    if records_read <= 2048:
+        return "513-2048"
+    if records_read <= 8192:
+        return "2049-8192"
+    return "8193_plus"
 
 
 def order_planned_files_for_scan(planned_files: list[tuple], intent: QueryIntent) -> list[tuple]:

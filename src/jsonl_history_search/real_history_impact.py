@@ -726,6 +726,10 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
         refs.append(
             {
                 "ref_id": str(ref.get("ref_id") or ""),
+                "expected_file_label": ref.get("expected_file_label"),
+                "expected_file_open_order": ref.get("expected_file_open_order"),
+                "expected_file_records_read_before_stop": int(ref.get("expected_file_records_read_before_stop") or 0),
+                "expected_file_progress_bucket": str(ref.get("expected_file_progress_bucket") or "unknown"),
                 "expected_file_selected_by_source_plan": bool(ref.get("expected_file_selected_by_source_plan")),
                 "expected_file_queued_for_scan": bool(ref.get("expected_file_queued_for_scan")),
                 "expected_file_opened_before_scan_stop": bool(ref.get("expected_file_opened_before_scan_stop")),
@@ -748,9 +752,27 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                     ref.get("expected_record_present_in_final_candidate_groups")
                 ),
                 "candidate_strength": ref.get("candidate_strength"),
+                "should_consider_phase_label": str(ref.get("should_consider_phase_label") or "unknown"),
+                "dedupe_phase_label": str(ref.get("dedupe_phase_label") or "unknown"),
+                "reservoir_phase_label": str(ref.get("reservoir_phase_label") or "unknown"),
+                "final_cap_phase_label": str(ref.get("final_cap_phase_label") or "unknown"),
+                "drop_phase_label": ref.get("drop_phase_label"),
                 "pre_reservoir_status": str(ref.get("pre_reservoir_status") or "unknown"),
                 "pre_final_status": str(ref.get("pre_final_status") or "unknown"),
                 "final_status": str(ref.get("final_status") or "unknown"),
+            }
+        )
+    opened_files = []
+    for item in diagnostics.get("opened_files") or []:
+        if not isinstance(item, dict):
+            continue
+        opened_files.append(
+            {
+                "file_label": str(item.get("file_label") or ""),
+                "opened_order": int(item.get("opened_order") or 0),
+                "records_read": int(item.get("records_read") or 0),
+                "records_read_bucket": str(item.get("records_read_bucket") or "unknown"),
+                "expected_ref_file": bool(item.get("expected_ref_file")),
             }
         )
     return {
@@ -758,6 +780,8 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
         "raw_paths_included": False,
         "line_numbers_included": False,
         "ref_count": int(diagnostics.get("ref_count") or len(refs)),
+        "opened_file_count": int(diagnostics.get("opened_file_count") or len(opened_files)),
+        "opened_files": opened_files,
         "line_reached_count": int(diagnostics.get("line_reached_count") or 0),
         "pre_reservoir_present_count": int(diagnostics.get("pre_reservoir_present_count") or 0),
         "pre_final_present_count": int(diagnostics.get("pre_final_present_count") or 0),

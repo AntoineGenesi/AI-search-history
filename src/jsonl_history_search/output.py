@@ -57,6 +57,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_package_miss_audit_text(payload)
     if "real_history_remaining_miss_loss_point_diagnostic" in payload:
         return render_real_history_remaining_miss_diagnostic_text(payload)
+    if "real_history_opened_file_progress_displacement_diagnostic" in payload:
+        return render_real_history_opened_file_progress_diagnostic_text(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_text(payload)
     if "harness_artifact_validation" in payload:
@@ -166,6 +168,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_package_miss_audit_markdown(payload)
     if "real_history_remaining_miss_loss_point_diagnostic" in payload:
         return render_real_history_remaining_miss_diagnostic_markdown(payload)
+    if "real_history_opened_file_progress_displacement_diagnostic" in payload:
+        return render_real_history_opened_file_progress_diagnostic_markdown(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_markdown(payload)
     if "harness_artifact_validation" in payload:
@@ -2832,6 +2836,183 @@ def render_real_history_remaining_miss_diagnostic_markdown(payload: dict) -> str
             f"{_escape_markdown_table(', '.join(query.get('pathology_labels') or []))} |"
         )
     return "\n".join(lines)
+
+
+def render_real_history_opened_file_progress_diagnostic_text(payload: dict) -> str:
+    report = payload["real_history_opened_file_progress_displacement_diagnostic"]
+    summary = report.get("summary") or {}
+    decision = report.get("decision") or {}
+    lines = [
+        "Real-history opened-file progress displacement diagnostic",
+        f"Status: {report.get('status')}",
+        f"JSH-706 package_search: {summary.get('jsh706_package_search_first_pass_hits')}/18",
+        f"JSH-707 failed package_search: {summary.get('jsh707_failed_package_search_first_pass_hits')}/18",
+        f"Delta: {summary.get('package_search_first_pass_hit_delta')}",
+        f"Regressed cases: {summary.get('regressed_case_count')}",
+        f"Opened date-timeline misses: {summary.get('canonical_opened_date_timeline_miss_count')}",
+        f"Headline: {decision.get('headline')}",
+    ]
+    for row in report.get("rows", []):
+        displacement = row.get("candidate_displacement") or {}
+        lines.append(
+            "- "
+            f"{row.get('case_id')}: "
+            f"{', '.join(displacement.get('displacement_labels') or [])}; "
+            f"records_delta={displacement.get('records_read_delta')}; "
+            f"probe_records={displacement.get('line_window_probe_records_added_in_jsh707')}"
+        )
+    return "\n".join(lines)
+
+
+def render_real_history_opened_file_progress_diagnostic_markdown(payload: dict) -> str:
+    report = payload["real_history_opened_file_progress_displacement_diagnostic"]
+    summary = report.get("summary") or {}
+    decision = report.get("decision") or {}
+    compared = report.get("compared_runs") or {}
+    lines = [
+        "# Opened-File Progress And Candidate Displacement Diagnostic",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Data source:** `{report.get('data_source')}`",
+        "",
+        "## Compared Runs",
+        "",
+        "| Run | ID | Package search | Recall/MRR |",
+        "| --- | --- | ---: | ---: |",
+    ]
+    for label in ("jsh706", "jsh707_failed"):
+        run = compared.get(label) or {}
+        lines.append(
+            "| "
+            f"`{label}` | "
+            f"`{_escape_markdown_table(str(run.get('run_id')))}` | "
+            f"{run.get('package_search_first_pass_hits')}/{run.get('package_search_cases')} | "
+            f"{run.get('package_search_recall_mrr')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Headline",
+            "",
+            decision.get("headline") or "",
+            "",
+            f"- Repair supported by this diagnostic: `{decision.get('repair_supported_by_this_diagnostic')}`",
+            f"- Reject retrying blind midpoint/positional probing: `{decision.get('reject_retrying_blind_midpoint_or_positional_line_window_probe')}`",
+            f"- Next step: {decision.get('recommended_next_step')}",
+            "",
+            "## Summary Counters",
+            "",
+            "| Counter | Value |",
+            "| --- | ---: |",
+            f"| JSH-706 package_search first-pass hits | {summary.get('jsh706_package_search_first_pass_hits', 0)} |",
+            f"| JSH-707 failed package_search first-pass hits | {summary.get('jsh707_failed_package_search_first_pass_hits', 0)} |",
+            f"| package_search first-pass hit delta | {summary.get('package_search_first_pass_hit_delta', 0)} |",
+            f"| regressed case count | {summary.get('regressed_case_count', 0)} |",
+            f"| regressed cases opened but not reached in JSH-707 | {summary.get('regressed_cases_opened_but_not_reached_in_jsh707', 0)} |",
+            f"| regressed cases with JSH-707 midpoint probe records | {summary.get('regressed_cases_with_jsh707_midpoint_probe_records', 0)} |",
+            f"| canonical opened date-timeline miss count | {summary.get('canonical_opened_date_timeline_miss_count', 0)} |",
+            f"| canonical opened date-timeline misses opened-not-reached in both runs | {summary.get('canonical_opened_date_timeline_misses_opened_not_reached_in_both_runs', 0)} |",
+            "",
+            "## Evidence Limits",
+            "",
+        ]
+    )
+    for key, value in (report.get("evidence_limits") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Behavior Boundary", ""])
+    for key, value in (report.get("behavior_boundary") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Privacy Contract", ""])
+    for key, value in (report.get("privacy_contract") or {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(
+        [
+            "",
+            "## Case Comparison",
+            "",
+            "| Case | Role | 706 hit | 707 hit | 706 opened/reached/final | 707 opened/reached/final | 706 opened files | 707 opened files | 706 records | 707 records | 707 probe records/files | 706 phase | 707 phase | Displacement labels |",
+            "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |",
+        ]
+    )
+    for row in report.get("rows", []):
+        j706 = row.get("jsh706") or {}
+        j707 = row.get("jsh707_failed") or {}
+        ref706 = j706.get("expected_ref") or {}
+        ref707 = j707.get("expected_ref") or {}
+        displacement = row.get("candidate_displacement") or {}
+        labels = ", ".join(displacement.get("displacement_labels") or [])
+        phase706 = _phase_summary(ref706)
+        phase707 = _phase_summary(ref707)
+        probe = j707.get("line_window_probe") or {}
+        lines.append(
+            "| "
+            f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+            f"`{_escape_markdown_table(str(row.get('case_role', '')))}` | "
+            f"{j706.get('first_pass_hit')} | "
+            f"{j707.get('first_pass_hit')} | "
+            f"{_bool_triplet(ref706)} | "
+            f"{_bool_triplet(ref707)} | "
+            f"{j706.get('opened_files_count', 0)} | "
+            f"{j707.get('opened_files_count', 0)} | "
+            f"{j706.get('records_read_total', 0)} | "
+            f"{j707.get('records_read_total', 0)} | "
+            f"{probe.get('probe_records', 0)}/{probe.get('probe_files', 0)} | "
+            f"{_escape_markdown_table(phase706)} | "
+            f"{_escape_markdown_table(phase707)} | "
+            f"{_escape_markdown_table(labels)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Opened-File Progress Ledger",
+            "",
+            "| Case | Run | File label | Order | Records read | Bucket | Expected ref file | Counter status |",
+            "| --- | --- | --- | ---: | ---: | --- | --- | --- |",
+        ]
+    )
+    for row in report.get("rows", []):
+        for run_key in ("jsh706", "jsh707_failed"):
+            run = row.get(run_key) or {}
+            for item in run.get("opened_file_progress") or []:
+                records = item.get("records_read")
+                lines.append(
+                    "| "
+                    f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                    f"`{run_key}` | "
+                    f"`{_escape_markdown_table(str(item.get('file_label', '')))}` | "
+                    f"{item.get('opened_order', 0)} | "
+                    f"{records if records is not None else ''} | "
+                    f"`{_escape_markdown_table(str(item.get('records_read_bucket', '')))}` | "
+                    f"`{item.get('expected_ref_file')}` | "
+                    f"`{_escape_markdown_table(str(item.get('counter_status', '')))}` |"
+                )
+    lines.extend(["", "## Measured Explanations", ""])
+    for row in report.get("rows", []):
+        displacement = row.get("candidate_displacement") or {}
+        lines.append(
+            f"- `{_escape_markdown_table(str(row.get('case_id', '')))}`: "
+            f"{displacement.get('measured_explanation')}"
+        )
+    return "\n".join(lines)
+
+
+def _bool_triplet(ref: dict) -> str:
+    return (
+        f"opened={ref.get('opened')}, "
+        f"reached={ref.get('reached')}, "
+        f"final={ref.get('final_output_status')}"
+    )
+
+
+def _phase_summary(ref: dict) -> str:
+    return (
+        f"strength={ref.get('candidate_strength')}; "
+        f"pre_reservoir={ref.get('pre_reservoir_status')}; "
+        f"pre_final={ref.get('pre_final_status')}; "
+        f"final={ref.get('final_candidate_status')}; "
+        f"reservoir={ref.get('reservoir_phase_label')}; "
+        f"final_cap={ref.get('final_cap_phase_label')}"
+    )
 
 
 def render_real_history_timestamp_seek_text(payload: dict) -> str:
