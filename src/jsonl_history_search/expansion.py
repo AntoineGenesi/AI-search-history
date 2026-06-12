@@ -450,6 +450,71 @@ FILE_SESSION_PROVENANCE_EXPANSION_TERMS = (
     "wrote",
 )
 
+PRE_CHANGE_FILE_PATH_MENTION_CONVERSATION_TERMS = (
+    "chat",
+    "chats",
+    "conversation",
+    "conversations",
+    "session",
+    "sessions",
+)
+PRE_CHANGE_FILE_PATH_MENTION_REFERENCE_TERMS = (
+    "mention",
+    "mentioned",
+    "mentions",
+    "reference",
+    "referenced",
+    "references",
+    "referencing",
+)
+PRE_CHANGE_FILE_PATH_MENTION_TARGET_TERMS = (
+    "file",
+    "files",
+    "path",
+    "paths",
+)
+PRE_CHANGE_FILE_PATH_MENTION_TEMPORAL_TERMS = (
+    "before",
+    "prior",
+    "previous",
+    "earlier",
+)
+PRE_CHANGE_FILE_PATH_MENTION_CHANGE_TERMS = (
+    "change",
+    "changed",
+    "changes",
+    "diff",
+    "edit",
+    "edited",
+    "git",
+    "modified",
+    "patch",
+    "patched",
+)
+PRE_CHANGE_FILE_PATH_MENTION_EXPANSION_TERMS = (
+    "before",
+    "changed",
+    "chat",
+    "conversation",
+    "diff",
+    "edited",
+    "earlier",
+    "file",
+    "file path",
+    "git",
+    "mentioned",
+    "modified",
+    "patch",
+    "patched",
+    "path",
+    "previous",
+    "prior",
+    "provenance",
+    "referenced",
+    "session",
+    "source",
+)
+
 COMMIT_USER_REQUEST_PROVENANCE_CHANGE_TERMS = (
     "change",
     "changed",
@@ -1128,6 +1193,43 @@ def file_session_provenance_terms() -> list[str]:
     return sorted(FILE_SESSION_PROVENANCE_EXPANSION_TERMS)
 
 
+def has_pre_change_file_path_mention_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    conversation_context = bool(token_context & set(PRE_CHANGE_FILE_PATH_MENTION_CONVERSATION_TERMS))
+    reference_context = bool(
+        token_context & set(PRE_CHANGE_FILE_PATH_MENTION_REFERENCE_TERMS)
+        or re.search(r"\bmention(?:ed|s|ing)?\b", normalized)
+        or re.search(r"\breferenc(?:e|ed|es|ing)\b", normalized)
+    )
+    target_context = bool(
+        token_context & set(PRE_CHANGE_FILE_PATH_MENTION_TARGET_TERMS)
+        or re.search(r"\bfile[\s_-]+paths?\b", normalized)
+        or re.search(r"\b[\w.-]+/[\w./-]+\b", normalized)
+        or re.search(r"\b[\w.-]+\.[a-z0-9]{1,8}\b", normalized)
+    )
+    temporal_context = bool(
+        token_context & set(PRE_CHANGE_FILE_PATH_MENTION_TEMPORAL_TERMS)
+        or re.search(r"\bearlier\s+than\b", normalized)
+    )
+    change_context = bool(
+        token_context & set(PRE_CHANGE_FILE_PATH_MENTION_CHANGE_TERMS)
+        or re.search(r"\bchang(?:e|ed|es|ing)\b", normalized)
+        or re.search(r"\bmodif(?:y|ied|ies|ying)\b", normalized)
+        or re.search(r"\bedit(?:ed|s|ing)?\b", normalized)
+        or re.search(r"\bpatch(?:ed|es|ing)?\b", normalized)
+        or re.search(r"\bgit[\s_-]+diff\b", normalized)
+    )
+
+    return conversation_context and reference_context and target_context and temporal_context and change_context
+
+
+def pre_change_file_path_mention_terms() -> list[str]:
+    return sorted(PRE_CHANGE_FILE_PATH_MENTION_EXPANSION_TERMS)
+
+
 def has_commit_user_request_provenance_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1329,6 +1431,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(has_process_detour_lesson_intent, process_detour_lesson_terms),
     ContextualExpansionFamily(has_handoff_document_location_intent, handoff_document_location_terms),
     ContextualExpansionFamily(has_file_session_provenance_intent, file_session_provenance_terms),
+    ContextualExpansionFamily(
+        has_pre_change_file_path_mention_intent,
+        pre_change_file_path_mention_terms,
+    ),
     ContextualExpansionFamily(
         has_commit_user_request_provenance_intent,
         commit_user_request_provenance_terms,
