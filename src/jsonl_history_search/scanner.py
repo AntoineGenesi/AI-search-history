@@ -14,6 +14,8 @@ from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_scor
 
 SCAN_RECORD_QUANTUM = 512
 SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc_record_quantum_round_robin"
+DEDUPLICATION_STRATEGY = "normalized_text_timestamp_cwd_source_ref_scope_preserving_arbitrary_refs"
+CONTENT_MIRROR_SOURCE_KINDS = {"codex_history", "codex_sessions"}
 
 
 def search(
@@ -34,7 +36,11 @@ def search(
     strong_reservoir_limit = max(1, plan.limits.max_matches)
     strong_candidates_retention_capped = 0
     weak_candidates_skipped = 0
-    dedupe: set[tuple[str, str | None]] = set()
+    dedupe: set[tuple[str, ...]] = set()
+    records_read = 0
+    records_rejected_by_should_consider = 0
+    candidate_records_deduped = 0
+    candidate_records_scored = 0
     searched_files = 0
     searched_bytes = 0
     stopped = False
@@ -91,12 +97,16 @@ def search(
                 except StopIteration:
                     exhausted = True
                     break
+                records_read += 1
                 if not should_consider(record, intent):
+                    records_rejected_by_should_consider += 1
                     continue
-                key = (" ".join(record.text.split()).lower(), record.raw_timestamp)
+                key = dedupe_key_for_record(record)
                 if key in dedupe:
+                    candidate_records_deduped += 1
                     continue
                 dedupe.add(key)
+                candidate_records_scored += 1
                 score, reasons, artifacts = score_record(record, intent, cwd)
                 if mask_context is not None:
                     copied_text = mask_context.mask_text(
@@ -168,6 +178,11 @@ def search(
         "scan_record_quantum": SCAN_RECORD_QUANTUM,
         "planned_files_count": planned_files_count,
         "opened_files_count": searched_files,
+        "records_read": records_read,
+        "records_rejected_by_should_consider": records_rejected_by_should_consider,
+        "candidate_records_scored": candidate_records_scored,
+        "candidate_records_deduped": candidate_records_deduped,
+        "dedupe_strategy": DEDUPLICATION_STRATEGY,
         "groups": group_matches(matches),
         "warnings": sorted(set(warnings + plan.warnings)),
         "blind_spots": sorted(set(blind_spots)),
@@ -190,6 +205,26 @@ def order_planned_files_for_scan(planned_files: list[tuple], intent: QueryIntent
             str(item[0]),
         ),
     )
+
+
+def dedupe_key_for_record(record) -> tuple[str, ...]:
+    normalized_text = " ".join(record.text.split()).lower()
+    source_scope = dedupe_source_scope(record)
+    return (
+        normalized_text,
+        record.raw_timestamp or "",
+        record.cwd or "",
+        source_scope,
+    )
+
+
+def dedupe_source_scope(record) -> str:
+    source_format = record.source_format or ""
+    if source_format in CONTENT_MIRROR_SOURCE_KINDS:
+        return "codex_history_session_content_mirror"
+    if record.record_id:
+        return f"record_id:{source_format}:{record.conversation_id or ''}:{record.record_id}"
+    return f"source_ref:{source_format}:{record.path}:{record.line}"
 
 
 def match_sort_key(match: Match) -> tuple[float, str, str, int]:

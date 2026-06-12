@@ -702,6 +702,11 @@ def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
         "record_quantum": int(result.get("scan_record_quantum") or 0),
         "planned_files_count": int(result.get("planned_files_count") or 0),
         "opened_files_count": int(result.get("opened_files_count") or result.get("searched_files") or 0),
+        "records_read": int(result.get("records_read") or 0),
+        "records_rejected_by_should_consider": int(result.get("records_rejected_by_should_consider") or 0),
+        "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
+        "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
+        "dedupe_strategy": str(result.get("dedupe_strategy") or "unknown"),
         "raw_paths_included": False,
     }
 

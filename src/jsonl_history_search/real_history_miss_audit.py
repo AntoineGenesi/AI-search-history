@@ -95,6 +95,7 @@ def build_real_history_package_miss_audit_payload(args) -> dict[str, Any]:
             "final_raw_candidate_refs_checked": True,
             "final_package_result_groups_checked": True,
             "sanitized_top_candidate_refs_checked": True,
+            "sanitized_scanner_dedupe_and_reach_counters_checked": True,
         },
         "source_scope": {
             "selected_expected_file_count": len(source_order),
@@ -133,6 +134,7 @@ def _audit_case(
     )
     candidate_probe = _candidate_probe(package_row, expected_ref, case.must_find_ref_ids)
     cap_probe = _cap_probe(package_row)
+    scanner_diagnostics = _scanner_diagnostics_probe(package_row)
     scope_probe = _scope_probe(
         expected_ref=expected_ref,
         source_order=source_order,
@@ -147,6 +149,7 @@ def _audit_case(
         candidate_probe=candidate_probe,
         scope_probe=scope_probe,
         cap_probe=cap_probe,
+        scanner_diagnostics=scanner_diagnostics,
         package_row=package_row,
     )
     return {
@@ -166,6 +169,7 @@ def _audit_case(
         "should_consider_probe": ranking_probe["should_consider_probe"],
         "ranking_probe": ranking_probe["ranking_probe"],
         "cap_probe": cap_probe,
+        "scanner_diagnostics": scanner_diagnostics,
         "query_basis": query_basis,
         "failure_classifications": classifications,
     }
@@ -359,6 +363,26 @@ def _cap_probe(package_row: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _scanner_diagnostics_probe(package_row: dict[str, Any] | None) -> dict[str, Any]:
+    result = (package_row or {}).get("package_result") or {}
+    sanitized = (package_row or {}).get("sanitized_row") or {}
+    scan_order = sanitized.get("scan_order") if isinstance(sanitized.get("scan_order"), dict) else {}
+    return {
+        "records_read": int(result.get("records_read") or scan_order.get("records_read") or 0),
+        "records_rejected_by_should_consider": int(
+            result.get("records_rejected_by_should_consider")
+            or scan_order.get("records_rejected_by_should_consider")
+            or 0
+        ),
+        "candidate_records_scored": int(result.get("candidate_records_scored") or scan_order.get("candidate_records_scored") or 0),
+        "candidate_records_deduped": int(
+            result.get("candidate_records_deduped") or scan_order.get("candidate_records_deduped") or 0
+        ),
+        "dedupe_strategy": str(result.get("dedupe_strategy") or scan_order.get("dedupe_strategy") or "unknown"),
+        "raw_paths_included": False,
+    }
+
+
 def _query_basis(intent: QueryIntent, query: str, *, case: AuditCase) -> dict[str, Any]:
     exact_terms = [term for term, reasons in intent.expansion_reasons.items() if "exact_phrase" in reasons]
     task_slug_terms = [term for term, reasons in intent.expansion_reasons.items() if "task_slug" in reasons]
@@ -408,6 +432,7 @@ def _failure_classifications(
     candidate_probe: dict[str, Any],
     scope_probe: dict[str, Any],
     cap_probe: dict[str, Any],
+    scanner_diagnostics: dict[str, Any],
     package_row: dict[str, Any] | None,
 ) -> list[str]:
     labels: list[str] = []
@@ -434,6 +459,8 @@ def _failure_classifications(
         labels.append("expected_file_not_opened_before_scan_stop")
     if not candidate_probe.get("expected_ref_recovered_any_available_list"):
         labels.append("expected_ref_absent_from_final_package_candidate_lists")
+        if scanner_diagnostics.get("candidate_records_deduped"):
+            labels.append("candidate_dedupe_seen_before_final_output")
     if (candidate_probe.get("sanitized_top_candidate_refs") or {}).get("expected_ref_present") is False:
         labels.append("output_filtering_or_ref_matching_did_not_surface_expected_ref")
     should_probe = ranking_probe["should_consider_probe"]
