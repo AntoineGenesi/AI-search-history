@@ -12,8 +12,8 @@ from .rg_prefilter import filter_planned_files
 from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
 
 
-SCAN_RECORD_QUANTUM = 512
-SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc_record_quantum_round_robin"
+SCAN_RECORD_QUANTUM = 128
+SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc_record_quantum_128_round_robin"
 DEDUPLICATION_STRATEGY = "normalized_text_timestamp_cwd_source_ref_scope_preserving_arbitrary_refs"
 CONTENT_MIRROR_SOURCE_KINDS = {"codex_history", "codex_sessions"}
 
