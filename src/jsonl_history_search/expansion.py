@@ -856,6 +856,77 @@ INTERVENTION_EFFECT_EXPANSION_TERMS = (
     "side-effect",
 )
 
+SUPPRESSION_HIDDEN_FAILURE_SUPPRESSION_TERMS = (
+    "mask",
+    "masked",
+    "masking",
+    "suppressed",
+    "suppression",
+    "suppressions",
+)
+SUPPRESSION_HIDDEN_FAILURE_HIDDEN_TERMS = (
+    "cover up",
+    "cover-up",
+    "covered up",
+    "covered-up",
+    "hidden",
+    "hide",
+    "hiding",
+    "miss",
+    "missed",
+    "misses",
+)
+SUPPRESSION_HIDDEN_FAILURE_TRUE_FAILURE_TERMS = (
+    "actual failure",
+    "false negative",
+    "false-negative",
+    "real failure",
+    "true failure",
+    "true-positive",
+)
+SUPPRESSION_HIDDEN_FAILURE_EVIDENCE_TERMS = (
+    "evidence",
+    "proof",
+    "review",
+    "reviewed",
+    "source",
+    "trace",
+)
+SUPPRESSION_HIDDEN_FAILURE_LINTER_TERMS = (
+    "intervention",
+    "interventions",
+    "linter",
+    "semantic linter",
+    "steering",
+)
+SUPPRESSION_HIDDEN_FAILURE_EXPANSION_TERMS = (
+    "actual failure",
+    "cover up",
+    "cover-up",
+    "covered up",
+    "covered-up",
+    "evidence",
+    "false negative",
+    "false-negative",
+    "hidden",
+    "intervention",
+    "linter",
+    "mask",
+    "masked",
+    "masking",
+    "missed",
+    "proof",
+    "real failure",
+    "reviewed",
+    "semantic linter",
+    "source",
+    "suppressed",
+    "suppression",
+    "trace",
+    "true failure",
+    "true-positive",
+)
+
 PRE_CRASH_INCIDENT_CONTEXT_EXPANSION_TERMS = (
     "before",
     "crash",
@@ -1545,6 +1616,49 @@ def intervention_effect_noise_terms() -> list[str]:
     return sorted(INTERVENTION_EFFECT_EXPANSION_TERMS)
 
 
+def has_suppression_hidden_failure_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    suppression_context = bool(
+        token_context & set(SUPPRESSION_HIDDEN_FAILURE_SUPPRESSION_TERMS)
+        or re.search(r"\bsuppress(?:ion|ions|ed|es|ing)?\b", normalized)
+        or re.search(r"\bmask(?:ed|ing|s)?\b", normalized)
+    )
+    hidden_context = bool(
+        token_context & set(SUPPRESSION_HIDDEN_FAILURE_HIDDEN_TERMS)
+        or re.search(r"\b(?:cover|covered)[\s_-]+up\b", normalized)
+        or re.search(r"\bhid(?:e|den|ing)\b", normalized)
+        or re.search(r"\bmiss(?:ed|es|ing)?\b", normalized)
+    )
+    true_failure_context = bool(
+        token_context & {"false-negative", "true-positive"}
+        or re.search(r"\bfalse[\s_-]+negatives?\b", normalized)
+        or re.search(r"\btrue[\s_-]+positives?\b", normalized)
+        or re.search(r"\b(?:real|true|actual|legitimate)[\s_-]+fail(?:ure|ures|ed|s)?\b", normalized)
+        or (
+            re.search(r"\bfail(?:ure|ures|ed|s)?\b", normalized)
+            and token_context & {"real", "true", "actual", "legitimate"}
+        )
+    )
+
+    return suppression_context and hidden_context and true_failure_context
+
+
+def suppression_hidden_failure_terms() -> list[str]:
+    return sorted(
+        {
+            *SUPPRESSION_HIDDEN_FAILURE_SUPPRESSION_TERMS,
+            *SUPPRESSION_HIDDEN_FAILURE_HIDDEN_TERMS,
+            *SUPPRESSION_HIDDEN_FAILURE_TRUE_FAILURE_TERMS,
+            *SUPPRESSION_HIDDEN_FAILURE_EVIDENCE_TERMS,
+            *SUPPRESSION_HIDDEN_FAILURE_LINTER_TERMS,
+            *SUPPRESSION_HIDDEN_FAILURE_EXPANSION_TERMS,
+        }
+    )
+
+
 def has_pre_crash_incident_context_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1629,6 +1743,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_intervention_effect_noise_intent,
         intervention_effect_noise_terms,
+    ),
+    ContextualExpansionFamily(
+        has_suppression_hidden_failure_intent,
+        suppression_hidden_failure_terms,
     ),
     ContextualExpansionFamily(
         has_pre_crash_incident_context_intent,
