@@ -2254,6 +2254,7 @@ def render_mechanism_eval_text(payload: dict) -> str:
     ]
     for row in report.get("rows", []):
         prefilter = row.get("rg_prefilter") or {}
+        supplement = row.get("metadata_supplement") or {}
         lines.append(
             "- "
             f"{row.get('case_id')}/{row.get('baseline')}: "
@@ -2263,7 +2264,9 @@ def render_mechanism_eval_text(payload: dict) -> str:
             f"bytes={row.get('searched_bytes')} "
             f"needle_policy={prefilter.get('needle_policy')} "
             f"needle_count={prefilter.get('needle_count')} "
-            f"metadata_candidates={row.get('metadata_candidate_count')}"
+            f"metadata_candidates={row.get('metadata_candidate_count')} "
+            f"supplement_terms={supplement.get('term_count', 0)} "
+            f"supplement_outcome={row.get('metadata_supplement_outcome')}"
         )
     return "\n".join(lines)
 
@@ -2293,17 +2296,19 @@ def render_mechanism_eval_markdown(payload: dict) -> str:
             f"- Candidate kinds: {', '.join(f'`{kind}`' for kind in metadata.get('candidate_kinds', [])) or '(none)'}",
             "",
             "## Rows",
-            "| case | baseline | case status | source-ref status | searched files | searched bytes | needle policy | needle count | metadata candidates |",
-            "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: |",
+            "| case | baseline | case status | source-ref status | searched files | searched bytes | needle policy | needle count | metadata candidates | supplement terms | supplement outcome |",
+            "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |",
         ]
     )
     for row in report.get("rows", []):
         prefilter = row.get("rg_prefilter") or {}
+        supplement = row.get("metadata_supplement") or {}
         lines.append(
             "| "
             f"`{row.get('case_id')}` | `{row.get('baseline')}` | `{row.get('case_status')}` | "
             f"`{row.get('source_ref_status')}` | {row.get('searched_files')} | {row.get('searched_bytes')} | "
-            f"`{prefilter.get('needle_policy')}` | {prefilter.get('needle_count')} | {row.get('metadata_candidate_count')} |"
+            f"`{prefilter.get('needle_policy')}` | {prefilter.get('needle_count')} | {row.get('metadata_candidate_count')} | "
+            f"{supplement.get('term_count', 0)} | `{row.get('metadata_supplement_outcome')}` |"
         )
     return "\n".join(lines)
 
