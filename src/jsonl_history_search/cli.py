@@ -325,6 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
     mechanism_eval.add_argument("--metadata-min-count", type=int, default=1)
     mechanism_eval.add_argument("--metadata-max-candidates", type=int, default=40)
     mechanism_eval.add_argument(
+        "--include-metadata-supplement",
+        action="store_true",
+        help="Add an opt-in report-only baseline that supplements the query with sanitized generated metadata kind/label terms.",
+    )
+    mechanism_eval.add_argument(
         "--report-output",
         default=None,
         help="Optional path where the sanitized mechanism eval report should be written.",

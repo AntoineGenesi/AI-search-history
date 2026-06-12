@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from .timeutil import parse_now, timezone_from_args
 
 
 DEFAULT_BASELINES = ("package_search", "package_search_rg_prefilter")
+METADATA_SUPPLEMENT_BASELINE = "package_search_metadata_supplement"
+SAFE_METADATA_TERM_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,48}")
 
 
 def build_mechanism_eval_payload(args) -> dict[str, Any]:
@@ -66,9 +69,10 @@ def build_mechanism_eval_payload(args) -> dict[str, Any]:
     )["generated_metadata_discovery"]
     metadata_summary = _metadata_summary(metadata)
     rows = []
+    baselines = _selected_baselines(args)
     cases = fixture["cases"][: args.case_limit if args.case_limit > 0 else None]
     for case in cases:
-        for baseline in DEFAULT_BASELINES:
+        for baseline in baselines:
             rows.append(
                 _run_search_row(
                     case=case,
@@ -79,6 +83,7 @@ def build_mechanism_eval_payload(args) -> dict[str, Any]:
                     metadata_summary=metadata_summary,
                 )
             )
+    _annotate_metadata_supplement_outcomes(rows)
     report = _base_report(fixture, limits, started)
     report["status"] = "ok"
     report["source_summary"] = {
@@ -112,7 +117,11 @@ def _base_report(fixture: dict[str, Any], limits: Limits, started: float) -> dic
         "baselines": {
             "package_search": "current Python JSONL package search path",
             "package_search_rg_prefilter": "optional rg prefilter before the same Python JSONL evidence parser",
-            "generated_metadata": "report-only candidate counters; not consumed by search or ranking",
+            "generated_metadata": "report-only candidate counters; not consumed by default search or ranking",
+            METADATA_SUPPLEMENT_BASELINE: (
+                "opt-in tiny-eval baseline that appends sanitized generated metadata kind/label terms to the query "
+                "before calling the same Python JSONL package search path"
+            ),
         },
         "privacy_contract": {
             "raw_private_text_committed": False,
@@ -200,6 +209,12 @@ def _metadata_summary(report: dict[str, Any]) -> dict[str, Any]:
             }
             for candidate in candidates[:5]
         ],
+        "supplement": {
+            "term_count": len(_metadata_supplement_terms(report)),
+            "terms_are_sanitized_kind_label_only": True,
+            "raw_values_used": False,
+            "source_paths_used": False,
+        },
         "promotion_boundary": report.get("promotion_boundary", {}),
     }
 
@@ -215,7 +230,16 @@ def _run_search_row(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     default_tz = timezone_from_args(args.timezone, args.timezone_offset)
-    intent = infer_query(_case_query(case), now=parse_now(args.now, default_tz))
+    query_text = _case_query(case)
+    supplement_terms = _metadata_supplement_terms_for_baseline(baseline, metadata_summary)
+    metadata_supplement = _metadata_supplement_for_baseline(
+        baseline,
+        metadata_summary,
+        term_count=len(supplement_terms),
+    )
+    if metadata_supplement["enabled"] and supplement_terms:
+        query_text = f"{query_text} {' '.join(supplement_terms)}"
+    intent = infer_query(query_text, now=parse_now(args.now, default_tz))
     use_rg = baseline == "package_search_rg_prefilter"
     result = search(
         plan,
@@ -257,6 +281,8 @@ def _run_search_row(
         "metadata_candidate_count": metadata_summary["candidate_count"],
         "metadata_candidate_kinds": metadata_summary["candidate_kinds"],
         "metadata_status": metadata_summary["status"],
+        "metadata_supplement": metadata_supplement,
+        "metadata_supplement_outcome": "not_applicable",
         "rg_prefilter": _sanitize_prefilter(result.get("prefilter") if use_rg else None, enabled=use_rg),
     }
     row["case_status"] = _case_status(row)
@@ -265,6 +291,70 @@ def _run_search_row(
 
 def _case_query(case: dict[str, Any]) -> str:
     return str((case.get("allowed_query_wordings") or [""])[0])
+
+
+def _selected_baselines(args) -> tuple[str, ...]:
+    if bool(getattr(args, "include_metadata_supplement", False)):
+        return DEFAULT_BASELINES + (METADATA_SUPPLEMENT_BASELINE,)
+    return DEFAULT_BASELINES
+
+
+def _metadata_supplement_terms_for_baseline(baseline: str, metadata_summary: dict[str, Any]) -> list[str]:
+    if baseline != METADATA_SUPPLEMENT_BASELINE:
+        return []
+    return _metadata_supplement_terms_from_summary(metadata_summary)
+
+
+def _metadata_supplement_for_baseline(
+    baseline: str,
+    metadata_summary: dict[str, Any],
+    *,
+    term_count: int,
+) -> dict[str, Any]:
+    enabled = baseline == METADATA_SUPPLEMENT_BASELINE
+    return {
+        "enabled": enabled,
+        "term_count": term_count,
+        "candidate_count": metadata_summary.get("candidate_count", 0) if enabled else 0,
+        "candidate_kinds": metadata_summary.get("candidate_kinds", []) if enabled else [],
+        "terms_source": "sanitized_generated_metadata_kind_and_label" if enabled else None,
+        "terms_emitted": False,
+        "raw_values_used": False,
+        "source_paths_used": False,
+    }
+
+
+def _metadata_supplement_terms(report: dict[str, Any]) -> list[str]:
+    candidates = report.get("candidates", [])
+    summary = {"top_candidates": candidates[:5]}
+    return _metadata_supplement_terms_from_summary(summary)
+
+
+def _metadata_supplement_terms_from_summary(metadata_summary: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for candidate in metadata_summary.get("top_candidates", []):
+        for raw in (candidate.get("kind"), candidate.get("label")):
+            for term in _safe_metadata_terms(raw):
+                if term not in seen:
+                    seen.add(term)
+                    terms.append(term)
+                if len(terms) >= 12:
+                    return terms
+    return terms
+
+
+def _safe_metadata_terms(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    normalized = value.lower().replace("_", " ").replace("/", " ")
+    matches = SAFE_METADATA_TERM_RE.findall(normalized)
+    safe = []
+    for match in matches:
+        term = match.strip(".-_")
+        if len(term) >= 2:
+            safe.append(term)
+    return safe
 
 
 def _top_doc_ids(result: dict[str, Any], doc_index: dict[tuple[str, int], str]) -> list[str]:
@@ -323,7 +413,7 @@ def _case_status(row: dict[str, Any]) -> str:
 
 def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    for baseline in DEFAULT_BASELINES:
+    for baseline in DEFAULT_BASELINES + (METADATA_SUPPLEMENT_BASELINE,):
         selected = [row for row in rows if row["baseline"] == baseline]
         if not selected:
             continue
@@ -336,8 +426,62 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "total_searched_bytes": sum(row["searched_bytes"] for row in selected),
             "rg_needle_policy_counts": _policy_counts(selected),
             "metadata_candidate_count_max": max((row["metadata_candidate_count"] for row in selected), default=0),
+            "metadata_supplement_term_count_max": max(
+                (row.get("metadata_supplement", {}).get("term_count", 0) for row in selected),
+                default=0,
+            ),
+            "metadata_supplement_outcome_counts": _outcome_counts(selected),
         }
     return summary
+
+
+def _annotate_metadata_supplement_outcomes(rows: list[dict[str, Any]]) -> None:
+    baseline_by_case = {
+        row["case_id"]: row
+        for row in rows
+        if row.get("baseline") == "package_search"
+    }
+    for row in rows:
+        if row.get("baseline") != METADATA_SUPPLEMENT_BASELINE:
+            row["metadata_supplement_outcome"] = "not_applicable"
+            continue
+        baseline = baseline_by_case.get(row["case_id"])
+        row["metadata_supplement_outcome"] = _metadata_supplement_outcome(baseline, row)
+
+
+def _metadata_supplement_outcome(baseline: dict[str, Any] | None, supplemented: dict[str, Any]) -> str:
+    if baseline is None:
+        return "inconclusive"
+    if supplemented.get("metadata_supplement", {}).get("term_count", 0) <= 0:
+        return "inconclusive"
+    baseline_rank = _status_rank(baseline.get("case_status"))
+    supplement_rank = _status_rank(supplemented.get("case_status"))
+    if baseline_rank < 0 or supplement_rank < 0:
+        return "inconclusive"
+    if supplement_rank > baseline_rank:
+        return "helped"
+    if supplement_rank < baseline_rank:
+        return "harmed"
+    baseline_quality = (baseline.get("recall_at_1", 0.0), baseline.get("recall_at_3", 0.0))
+    supplement_quality = (supplemented.get("recall_at_1", 0.0), supplemented.get("recall_at_3", 0.0))
+    if supplement_quality > baseline_quality:
+        return "helped"
+    if supplement_quality < baseline_quality:
+        return "harmed"
+    return "neutral"
+
+
+def _status_rank(status: Any) -> int:
+    return {"fail": 0, "partial": 1, "pass": 2}.get(str(status), -1)
+
+
+def _outcome_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        outcome = row.get("metadata_supplement_outcome")
+        if outcome in {"helped", "neutral", "harmed", "inconclusive"}:
+            counts[str(outcome)] = counts.get(str(outcome), 0) + 1
+    return counts
 
 
 def _policy_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -357,6 +501,8 @@ def _mechanism_gate(rows: list[dict[str, Any]], metadata_summary: dict[str, Any]
         reasons.append("metadata_candidates_absent_or_below_threshold")
     if any(row["baseline"] == "package_search_rg_prefilter" for row in rows):
         reasons.append("rg_prefilter_measured_only_as_optional_variant")
+    if any(row["baseline"] == METADATA_SUPPLEMENT_BASELINE for row in rows):
+        reasons.append("metadata_supplement_measured_only_as_opt_in_variant")
     return {
         "status": "inconclusive",
         "reasons": reasons,
