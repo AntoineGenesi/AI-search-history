@@ -699,6 +699,7 @@ def _row_pair(
 def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "strategy": str(result.get("scan_order_strategy") or "unknown"),
+        "record_quantum": int(result.get("scan_record_quantum") or 0),
         "planned_files_count": int(result.get("planned_files_count") or 0),
         "opened_files_count": int(result.get("opened_files_count") or result.get("searched_files") or 0),
         "raw_paths_included": False,

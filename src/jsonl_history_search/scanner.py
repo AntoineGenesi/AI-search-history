@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import time
 
 from .adapters import AdapterReadError, iter_records_for_file
@@ -11,7 +12,8 @@ from .rg_prefilter import filter_planned_files
 from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
 
 
-SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc"
+SCAN_RECORD_QUANTUM = 512
+SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc_record_quantum_round_robin"
 
 
 def search(
@@ -32,7 +34,7 @@ def search(
     strong_reservoir_limit = max(1, plan.limits.max_matches)
     strong_candidates_retention_capped = 0
     weak_candidates_skipped = 0
-    dedupe: set[tuple[str, str, str | None]] = set()
+    dedupe: set[tuple[str, str | None]] = set()
     searched_files = 0
     searched_bytes = 0
     stopped = False
@@ -53,20 +55,41 @@ def search(
         planned_files = [(item.path, item.size) for item in prefilter_result.files]
         planned_files = order_planned_files_for_scan(planned_files, intent)
 
-    for path, size in planned_files:
+    scan_queue = deque(
+        {
+            "path": path,
+            "size": size,
+            "records": None,
+            "opened": False,
+        }
+        for path, size in planned_files
+    )
+    while scan_queue:
+        item = scan_queue.popleft()
         if time.monotonic() - started > plan.limits.max_elapsed:
             warnings.append("Stopped before opening next file at max elapsed cap.")
             stopped = True
             break
-        searched_files += 1
-        searched_bytes += size
-        source_kind = source_kind_for_path(path, plan)
+        path = item["path"]
+        size = item["size"]
         try:
-            records = iter_records_for_file(path, source_kind, default_tz)
-            for record in records:
+            if not item["opened"]:
+                searched_files += 1
+                searched_bytes += size
+                source_kind = source_kind_for_path(path, plan)
+                item["records"] = iter_records_for_file(path, source_kind, default_tz)
+                item["opened"] = True
+            records = item["records"]
+            exhausted = False
+            for _ in range(SCAN_RECORD_QUANTUM):
                 if time.monotonic() - started > plan.limits.max_elapsed:
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
+                    break
+                try:
+                    record = next(records)
+                except StopIteration:
+                    exhausted = True
                     break
                 if not should_consider(record, intent):
                     continue
@@ -126,6 +149,8 @@ def search(
             continue
         if stopped:
             break
+        if not exhausted:
+            scan_queue.append(item)
 
     if strong_candidates_retention_capped:
         warnings.append("Strong candidates were retention-capped at max match cap before final ranking.")
@@ -140,6 +165,7 @@ def search(
         "searched_files": searched_files,
         "searched_bytes": searched_bytes,
         "scan_order_strategy": SCAN_ORDER_STRATEGY,
+        "scan_record_quantum": SCAN_RECORD_QUANTUM,
         "planned_files_count": planned_files_count,
         "opened_files_count": searched_files,
         "groups": group_matches(matches),
