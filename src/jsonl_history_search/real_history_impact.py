@@ -494,6 +494,7 @@ def _run_package_search_variant(
         default_tz=default_tz,
         cwd=str(Path(args.cwd).expanduser().resolve()),
         use_rg_prefilter=use_rg_prefilter,
+        expected_ref_diagnostics=case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None,
     )
     package_warnings = _safe_warnings(result.get("warnings") or [])
     row_cap_hit_labels = sorted(set(cap_hit_labels or []) | set(_cap_hit_labels(package_warnings)))
@@ -534,6 +535,9 @@ def _run_package_search_variant(
         notes=[],
     )
     row["scan_order"] = _scan_order_row(result)
+    expected_diagnostics = _expected_ref_diagnostics_row(result)
+    if expected_diagnostics is not None:
+        row["expected_ref_diagnostics"] = expected_diagnostics
     raw_row["sanitized_row"] = row
     raw_row["package_result"] = result
     return row, raw_row
@@ -708,6 +712,58 @@ def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "dedupe_strategy": str(result.get("dedupe_strategy") or "unknown"),
         "raw_paths_included": False,
+    }
+
+
+def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | None:
+    diagnostics = result.get("expected_ref_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return None
+    refs = []
+    for ref in diagnostics.get("refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        refs.append(
+            {
+                "ref_id": str(ref.get("ref_id") or ""),
+                "expected_file_selected_by_source_plan": bool(ref.get("expected_file_selected_by_source_plan")),
+                "expected_file_queued_for_scan": bool(ref.get("expected_file_queued_for_scan")),
+                "expected_file_opened_before_scan_stop": bool(ref.get("expected_file_opened_before_scan_stop")),
+                "expected_record_line_reached_before_elapsed_stop": bool(
+                    ref.get("expected_record_line_reached_before_elapsed_stop")
+                ),
+                "line_reach_status": str(ref.get("line_reach_status") or "unknown"),
+                "would_pass_should_consider": ref.get("would_pass_should_consider"),
+                "deduped_before_scoring": bool(ref.get("deduped_before_scoring")),
+                "expected_record_present_before_reservoir_retention": bool(
+                    ref.get("expected_record_present_before_reservoir_retention")
+                ),
+                "expected_record_present_in_pre_final_candidate_state": bool(
+                    ref.get("expected_record_present_in_pre_final_candidate_state")
+                ),
+                "expected_record_present_in_final_candidate_refs": bool(
+                    ref.get("expected_record_present_in_final_candidate_refs")
+                ),
+                "expected_record_present_in_final_candidate_groups": bool(
+                    ref.get("expected_record_present_in_final_candidate_groups")
+                ),
+                "candidate_strength": ref.get("candidate_strength"),
+                "pre_reservoir_status": str(ref.get("pre_reservoir_status") or "unknown"),
+                "pre_final_status": str(ref.get("pre_final_status") or "unknown"),
+                "final_status": str(ref.get("final_status") or "unknown"),
+            }
+        )
+    return {
+        "enabled": bool(diagnostics.get("enabled")),
+        "raw_paths_included": False,
+        "line_numbers_included": False,
+        "ref_count": int(diagnostics.get("ref_count") or len(refs)),
+        "line_reached_count": int(diagnostics.get("line_reached_count") or 0),
+        "pre_reservoir_present_count": int(diagnostics.get("pre_reservoir_present_count") or 0),
+        "pre_final_present_count": int(diagnostics.get("pre_final_present_count") or 0),
+        "final_candidate_ref_present_count": int(diagnostics.get("final_candidate_ref_present_count") or 0),
+        "final_candidate_group_present_count": int(diagnostics.get("final_candidate_group_present_count") or 0),
+        "refs": refs,
     }
 
 

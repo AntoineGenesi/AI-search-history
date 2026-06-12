@@ -90,8 +90,11 @@ def build_real_history_package_miss_audit_payload(args) -> dict[str, Any]:
         "audited_baseline": "package_search",
         "privacy_contract": _privacy_contract(),
         "evidence_limits": {
-            "pre_final_internal_candidate_list_available": False,
-            "pre_final_internal_candidate_list_reason": "raw_run_does_not_store_pre_filter_or_pre_reservoir_package_candidate_lists",
+            "pre_reservoir_candidate_state_available": _expected_ref_diagnostics_available(rows),
+            "pre_final_internal_candidate_list_available": _expected_ref_diagnostics_available(rows),
+            "pre_final_internal_candidate_list_reason": (
+                "available_only_when_raw_run_contains_opt_in_expected_ref_diagnostics"
+            ),
             "final_raw_candidate_refs_checked": True,
             "final_package_result_groups_checked": True,
             "sanitized_top_candidate_refs_checked": True,
@@ -170,6 +173,7 @@ def _audit_case(
         "ranking_probe": ranking_probe["ranking_probe"],
         "cap_probe": cap_probe,
         "scanner_diagnostics": scanner_diagnostics,
+        "package_cost": _package_cost_probe(package_row),
         "query_basis": query_basis,
         "failure_classifications": classifications,
     }
@@ -276,8 +280,11 @@ def _candidate_probe(
     expected_ref: ExpectedRef | None,
     must_find_ref_ids: tuple[str, ...],
 ) -> dict[str, Any]:
+    expected_diagnostic = _expected_ref_diagnostic_for(package_row, expected_ref)
     if package_row is None or expected_ref is None:
         return {
+            "expected_record_line": {"available": False, "reached_before_elapsed_stop": None},
+            "pre_reservoir_candidate_state": {"available": False, "expected_ref_present": None},
             "pre_final_internal_candidates": {"available": False, "expected_ref_present": None},
             "final_raw_candidate_refs": {"available": False, "expected_ref_present": None},
             "final_package_result_groups": {"available": False, "expected_ref_present": None},
@@ -289,16 +296,48 @@ def _candidate_probe(
     final_groups = _package_groups_contain(package_row.get("package_result"), expected_ref)
     sanitized_ids = (((package_row.get("sanitized_row") or {}).get("top_candidate_ref_ids")) or [])
     sanitized = expected_ref.ref_id in sanitized_ids
+    diagnostic_available = expected_diagnostic is not None
     return {
+        "expected_record_line": {
+            "available": diagnostic_available,
+            "reached_before_elapsed_stop": (
+                bool(expected_diagnostic.get("expected_record_line_reached_before_elapsed_stop"))
+                if expected_diagnostic
+                else None
+            ),
+            "status": expected_diagnostic.get("line_reach_status") if expected_diagnostic else None,
+        },
+        "pre_reservoir_candidate_state": {
+            "available": diagnostic_available,
+            "expected_ref_present": (
+                bool(expected_diagnostic.get("expected_record_present_before_reservoir_retention"))
+                if expected_diagnostic
+                else None
+            ),
+            "status": expected_diagnostic.get("pre_reservoir_status") if expected_diagnostic else None,
+        },
         "pre_final_internal_candidates": {
-            "available": False,
-            "expected_ref_present": None,
-            "reason": "raw_run_does_not_store_pre_filter_or_pre_reservoir_package_candidate_lists",
+            "available": diagnostic_available,
+            "expected_ref_present": (
+                bool(expected_diagnostic.get("expected_record_present_in_pre_final_candidate_state"))
+                if expected_diagnostic
+                else None
+            ),
+            "status": expected_diagnostic.get("pre_final_status") if expected_diagnostic else None,
+            "reason": None
+            if diagnostic_available
+            else "raw_run_does_not_store_pre_filter_or_pre_reservoir_package_candidate_lists",
         },
         "final_raw_candidate_refs": {"available": True, "expected_ref_present": bool(final_raw)},
         "final_package_result_groups": {"available": True, "expected_ref_present": bool(final_groups)},
         "sanitized_top_candidate_refs": {"available": True, "expected_ref_present": bool(sanitized)},
-        "expected_ref_recovered_any_available_list": bool(final_raw or final_groups or sanitized),
+        "expected_ref_recovered_any_available_list": bool(
+            final_raw
+            or final_groups
+            or sanitized
+            or (expected_diagnostic or {}).get("expected_record_present_in_final_candidate_refs")
+            or (expected_diagnostic or {}).get("expected_record_present_in_final_candidate_groups")
+        ),
         "must_find_ref_count": len(must_find_ref_ids),
     }
 
@@ -379,6 +418,7 @@ def _scanner_diagnostics_probe(package_row: dict[str, Any] | None) -> dict[str, 
             result.get("candidate_records_deduped") or scan_order.get("candidate_records_deduped") or 0
         ),
         "dedupe_strategy": str(result.get("dedupe_strategy") or scan_order.get("dedupe_strategy") or "unknown"),
+        "expected_ref_diagnostics": _public_expected_ref_diagnostics(result.get("expected_ref_diagnostics")),
         "raw_paths_included": False,
     }
 
@@ -461,6 +501,21 @@ def _failure_classifications(
         labels.append("expected_ref_absent_from_final_package_candidate_lists")
         if scanner_diagnostics.get("candidate_records_deduped"):
             labels.append("candidate_dedupe_seen_before_final_output")
+    expected_line = candidate_probe.get("expected_record_line") or {}
+    pre_reservoir = candidate_probe.get("pre_reservoir_candidate_state") or {}
+    pre_final = candidate_probe.get("pre_final_internal_candidates") or {}
+    if expected_line.get("available") and expected_line.get("reached_before_elapsed_stop") is False:
+        labels.append("expected_record_line_not_reached_before_elapsed_stop")
+    if pre_reservoir.get("available") and pre_reservoir.get("expected_ref_present") is False:
+        labels.append("expected_record_absent_before_reservoir_retention")
+    if pre_final.get("available") and pre_final.get("expected_ref_present") is False:
+        labels.append("expected_record_absent_from_pre_final_candidate_state")
+    if (
+        pre_final.get("available")
+        and pre_final.get("expected_ref_present") is True
+        and (candidate_probe.get("final_package_result_groups") or {}).get("expected_ref_present") is False
+    ):
+        labels.append("expected_record_lost_between_pre_final_and_final_output")
     if (candidate_probe.get("sanitized_top_candidate_refs") or {}).get("expected_ref_present") is False:
         labels.append("output_filtering_or_ref_matching_did_not_surface_expected_ref")
     should_probe = ranking_probe["should_consider_probe"]
@@ -604,6 +659,71 @@ def _match_is_ref(match: dict[str, Any], expected_ref: ExpectedRef) -> bool:
     return match.get("path") == str(expected_ref.path) and match.get("line") == expected_ref.line
 
 
+def _expected_ref_diagnostic_for(package_row: dict[str, Any] | None, expected_ref: ExpectedRef | None) -> dict[str, Any] | None:
+    if package_row is None or expected_ref is None:
+        return None
+    candidates = [
+        (((package_row.get("package_result") or {}).get("expected_ref_diagnostics") or {}).get("refs") or []),
+        (((package_row.get("sanitized_row") or {}).get("expected_ref_diagnostics") or {}).get("refs") or []),
+    ]
+    for refs in candidates:
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("ref_id") == expected_ref.ref_id:
+                return ref
+    return None
+
+
+def _public_expected_ref_diagnostics(diagnostics: Any) -> dict[str, Any]:
+    if not isinstance(diagnostics, dict):
+        return {"available": False, "raw_paths_included": False, "line_numbers_included": False, "refs": []}
+    refs = []
+    for ref in diagnostics.get("refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        refs.append(
+            {
+                "ref_id": str(ref.get("ref_id") or ""),
+                "expected_file_selected_by_source_plan": bool(ref.get("expected_file_selected_by_source_plan")),
+                "expected_file_queued_for_scan": bool(ref.get("expected_file_queued_for_scan")),
+                "expected_file_opened_before_scan_stop": bool(ref.get("expected_file_opened_before_scan_stop")),
+                "expected_record_line_reached_before_elapsed_stop": bool(
+                    ref.get("expected_record_line_reached_before_elapsed_stop")
+                ),
+                "line_reach_status": str(ref.get("line_reach_status") or "unknown"),
+                "expected_record_present_before_reservoir_retention": bool(
+                    ref.get("expected_record_present_before_reservoir_retention")
+                ),
+                "expected_record_present_in_pre_final_candidate_state": bool(
+                    ref.get("expected_record_present_in_pre_final_candidate_state")
+                ),
+                "expected_record_present_in_final_candidate_refs": bool(
+                    ref.get("expected_record_present_in_final_candidate_refs")
+                ),
+                "expected_record_present_in_final_candidate_groups": bool(
+                    ref.get("expected_record_present_in_final_candidate_groups")
+                ),
+                "candidate_strength": ref.get("candidate_strength"),
+                "pre_reservoir_status": str(ref.get("pre_reservoir_status") or "unknown"),
+                "pre_final_status": str(ref.get("pre_final_status") or "unknown"),
+                "final_status": str(ref.get("final_status") or "unknown"),
+            }
+        )
+    return {
+        "available": bool(diagnostics.get("enabled")),
+        "raw_paths_included": False,
+        "line_numbers_included": False,
+        "ref_count": int(diagnostics.get("ref_count") or len(refs)),
+        "line_reached_count": int(diagnostics.get("line_reached_count") or 0),
+        "pre_reservoir_present_count": int(diagnostics.get("pre_reservoir_present_count") or 0),
+        "pre_final_present_count": int(diagnostics.get("pre_final_present_count") or 0),
+        "final_candidate_ref_present_count": int(diagnostics.get("final_candidate_ref_present_count") or 0),
+        "final_candidate_group_present_count": int(diagnostics.get("final_candidate_group_present_count") or 0),
+        "refs": refs,
+    }
+
+
 def _returned_candidate_count(package_row: dict[str, Any] | None) -> int:
     return len(_iter_package_matches((package_row or {}).get("package_result")))
 
@@ -738,6 +858,27 @@ def _query_basis_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _classification_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     counts = Counter(label for row in rows for label in row.get("failure_classifications", []))
     return dict(sorted(counts.items()))
+
+
+def _package_cost_probe(package_row: dict[str, Any] | None) -> dict[str, int]:
+    sanitized = (package_row or {}).get("sanitized_row") or {}
+    return {
+        "files_opened": int(sanitized.get("files_opened") or 0),
+        "bytes_parsed": int(sanitized.get("bytes_parsed") or sanitized.get("bytes_scanned") or 0),
+        "handoff_bytes": int(
+            sanitized.get("output_context_bytes")
+            or sanitized.get("context_bytes")
+            or sanitized.get("output_bytes")
+            or 0
+        ),
+    }
+
+
+def _expected_ref_diagnostics_available(rows: list[dict[str, Any]]) -> bool:
+    return any(
+        ((row.get("scanner_diagnostics") or {}).get("expected_ref_diagnostics") or {}).get("available")
+        for row in rows
+    )
 
 
 def _expects_task_or_artifact_handle(case: AuditCase) -> bool:
