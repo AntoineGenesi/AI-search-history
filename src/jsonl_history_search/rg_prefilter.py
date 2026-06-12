@@ -41,6 +41,8 @@ def filter_planned_files(
         return RgPrefilterResult(files=planned, stats=stats)
 
     needles = _prefilter_needles(intent)
+    stats["needle_policy"] = "literal_anchors"
+    stats["needle_count"] = len(needles)
     if not needles:
         stats.update({"status": "fallback", "fallback_reason": "ineligible_query"})
         return RgPrefilterResult(files=planned, stats=stats)
@@ -127,6 +129,8 @@ def _base_stats(planned: list[PlannedFile]) -> dict:
         "bytes_reduced": 0,
         "files_reduction_ratio": 0.0,
         "bytes_reduction_ratio": 0.0,
+        "needle_policy": None,
+        "needle_count": 0,
         "used_as_final_evidence": False,
     }
 
@@ -149,22 +153,14 @@ def _reduction_stats(planned: list[PlannedFile], matched: list[PlannedFile]) -> 
 
 
 def _prefilter_needles(intent: QueryIntent) -> list[str]:
-    anchors = []
+    anchors: set[str] = set()
     for value in [*intent.artifact_hints, *intent.base_terms, *intent.terms]:
-        item = value.strip()
-        if item and _literal_prefilter_eligible(item):
-            anchors.append(item)
-    if not anchors and _literal_prefilter_eligible(intent.normalized):
-        anchors.append(intent.normalized)
-    if not anchors:
-        return []
-
-    needles: set[str] = set()
-    for value in [intent.normalized, *intent.base_terms, *intent.terms, *intent.artifact_hints, *anchors]:
         item = " ".join(value.strip().split())
-        if _fixed_term_safe(item):
-            needles.add(item)
-    return sorted(needles, key=lambda item: (-len(item), item))
+        if item and _literal_prefilter_eligible(item):
+            anchors.add(item)
+    if not anchors and _literal_prefilter_eligible(intent.normalized):
+        anchors.add(" ".join(intent.normalized.strip().split()))
+    return sorted(anchors, key=lambda item: (-len(item), item))
 
 
 def _literal_prefilter_eligible(value: str) -> bool:
