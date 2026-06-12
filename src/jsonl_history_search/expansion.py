@@ -579,6 +579,82 @@ COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS = (
     "why",
 )
 
+REVERT_FIX_FEEDBACK_SOURCE_CHANGE_TERMS = (
+    "fix",
+    "fixed",
+    "fixes",
+    "repair",
+    "repaired",
+    "repairs",
+    "revert",
+    "reverted",
+    "reverts",
+    "rollback",
+    "rolled back",
+    "rolled-back",
+)
+REVERT_FIX_FEEDBACK_SOURCE_USER_TERMS = (
+    "feedback",
+    "request",
+    "requested",
+    "user",
+    "user feedback",
+    "user request",
+)
+REVERT_FIX_FEEDBACK_SOURCE_AGENT_TERMS = (
+    "agent",
+    "agent review",
+    "self review",
+    "self-review",
+    "self_review",
+    "self-reviewing",
+    "self-reviewed",
+)
+REVERT_FIX_FEEDBACK_SOURCE_PROVENANCE_TERMS = (
+    "because",
+    "based",
+    "based on",
+    "cause",
+    "caused",
+    "provenance",
+    "reason",
+    "source",
+    "why",
+)
+REVERT_FIX_FEEDBACK_SOURCE_COMMIT_TERMS = (
+    "change",
+    "commit",
+    "committed",
+    "diff",
+    "patch",
+    "patched",
+)
+REVERT_FIX_FEEDBACK_SOURCE_EXPANSION_TERMS = (
+    "agent",
+    "agent review",
+    "based on",
+    "cause",
+    "commit",
+    "diff",
+    "feedback",
+    "fix",
+    "fixed",
+    "patch",
+    "provenance",
+    "reason",
+    "repair",
+    "repaired",
+    "revert",
+    "reverted",
+    "self review",
+    "self-review",
+    "self_review",
+    "source",
+    "user",
+    "user feedback",
+    "user request",
+)
+
 BRANCH_MERGE_SURROUNDING_CONVERSATION_EXPANSION_TERMS = (
     "adjacent",
     "after",
@@ -1278,6 +1354,45 @@ def commit_user_request_provenance_terms() -> list[str]:
     return sorted(COMMIT_USER_REQUEST_PROVENANCE_EXPANSION_TERMS)
 
 
+def has_revert_fix_feedback_source_intent(normalized: str, base_terms: list[str]) -> bool:
+    tokens = set(SEPARATED_WORD_RE.findall(normalized))
+    base = {term.lower() for term in base_terms}
+    token_context = tokens | base
+
+    change_context = bool(
+        token_context & set(REVERT_FIX_FEEDBACK_SOURCE_CHANGE_TERMS)
+        or re.search(r"\broll(?:ed)?[\s_-]+back\b", normalized)
+    )
+    user_context = bool(
+        token_context & set(REVERT_FIX_FEEDBACK_SOURCE_USER_TERMS)
+        or re.search(r"\buser[\s_-]+(?:feedback|requests?)\b", normalized)
+    )
+    agent_context = bool(
+        token_context & set(REVERT_FIX_FEEDBACK_SOURCE_AGENT_TERMS)
+        or re.search(r"\bself[\s_-]+review(?:ed|ing)?\b", normalized)
+        or re.search(r"\bagent[\s_-]+review\b", normalized)
+    )
+    provenance_context = bool(
+        token_context & set(REVERT_FIX_FEEDBACK_SOURCE_PROVENANCE_TERMS)
+        or re.search(r"\bbased\s+on\b", normalized)
+    )
+    commit_context = bool(token_context & set(REVERT_FIX_FEEDBACK_SOURCE_COMMIT_TERMS))
+    question_context = bool(
+        re.search(r"\b(?:was|were|is|are|did|does|why|what)\b", normalized)
+        or provenance_context
+    )
+
+    source_side_context = user_context or agent_context
+    comparison_context = user_context and agent_context
+    return change_context and source_side_context and question_context and (
+        provenance_context or commit_context or comparison_context
+    )
+
+
+def revert_fix_feedback_source_terms() -> list[str]:
+    return sorted(REVERT_FIX_FEEDBACK_SOURCE_EXPANSION_TERMS)
+
+
 def has_branch_merge_surrounding_conversation_intent(normalized: str, base_terms: list[str]) -> bool:
     tokens = set(SEPARATED_WORD_RE.findall(normalized))
     base = {term.lower() for term in base_terms}
@@ -1490,6 +1605,10 @@ CONTEXTUAL_EXPANSION_FAMILIES: tuple[ContextualExpansionFamily, ...] = (
     ContextualExpansionFamily(
         has_commit_user_request_provenance_intent,
         commit_user_request_provenance_terms,
+    ),
+    ContextualExpansionFamily(
+        has_revert_fix_feedback_source_intent,
+        revert_fix_feedback_source_terms,
     ),
     ContextualExpansionFamily(
         has_branch_merge_surrounding_conversation_intent,
