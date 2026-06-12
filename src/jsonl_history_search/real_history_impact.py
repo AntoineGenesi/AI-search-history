@@ -67,7 +67,8 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     manifest = _read_json(manifest_path)
     bridge = _read_json(bridge_path)
     case_bundle = _case_bundle(manifest, bridge)
-    bundle_errors = _case_bundle_errors(case_bundle)
+    manifest_case_count = _manifest_case_count(manifest)
+    bundle_errors = _case_bundle_errors(case_bundle, expected_case_count=manifest_case_count)
     if bundle_errors:
         report = _invalid_report("case_bundle_invalid", started, bridge_result.report, bundle_errors)
         report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
@@ -79,6 +80,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     root_labels = [f"root_{index + 1:03d}" for index, _root in enumerate(roots)]
     base_report = _base_report(
         selected_cases=selected_cases,
+        manifest_case_count=manifest_case_count,
         limits=limits,
         root_labels=root_labels,
         started=started,
@@ -188,7 +190,7 @@ def _invalid_report(
         "data_source": "private_real_history_sanitized_aggregate",
         "manifest_case_count": 0,
         "case_count": 0,
-        "below_floor_case_count_caveat": "18 reviewed cases is below the old 20-50 target floor.",
+        "case_count_floor_status": _case_count_floor_status(0),
         "root_labels": [],
         "limits": {},
         "baseline_contract": _baseline_contract(),
@@ -214,6 +216,7 @@ def _invalid_report(
 def _base_report(
     *,
     selected_cases: list[dict[str, Any]],
+    manifest_case_count: int,
     limits: Limits,
     root_labels: list[str],
     started: float,
@@ -224,10 +227,11 @@ def _base_report(
         "run_id": uuid.uuid4().hex[:12],
         "status": "pending",
         "data_source": "private_real_history_sanitized_aggregate",
-        "manifest_case_count": 18,
+        "manifest_case_count": manifest_case_count,
         "case_count": len(selected_cases),
         "case_families": sorted({case["family"] for case in selected_cases}),
-        "below_floor_case_count_caveat": "18 reviewed cases is below the old 20-50 target floor.",
+        "historical_original_case_count": 18,
+        "case_count_floor_status": _case_count_floor_status(manifest_case_count),
         "root_labels": root_labels,
         "limits": limits.to_dict(),
         "baseline_contract": _baseline_contract(),
@@ -268,6 +272,19 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("JSON root must be an object")
     return payload
+
+
+def _manifest_case_count(manifest: dict[str, Any]) -> int:
+    cases = manifest.get("cases")
+    return len(cases) if isinstance(cases, list) else 0
+
+
+def _case_count_floor_status(case_count: int) -> str:
+    if case_count < 20:
+        return "below_old_20_50_target_floor"
+    if case_count <= 50:
+        return "within_old_20_50_target_band"
+    return "above_old_20_50_target_band"
 
 
 def _case_bundle(manifest: dict[str, Any], bridge: dict[str, Any]) -> list[dict[str, Any]]:
@@ -315,10 +332,10 @@ def _case_bundle(manifest: dict[str, Any], bridge: dict[str, Any]) -> list[dict[
     return sorted(bundle, key=lambda item: str(item["case_id"]))
 
 
-def _case_bundle_errors(cases: list[dict[str, Any]]) -> list[str]:
+def _case_bundle_errors(cases: list[dict[str, Any]], *, expected_case_count: int) -> list[str]:
     errors = []
-    if len(cases) != 18:
-        errors.append("case_bundle_must_have_18_cases")
+    if len(cases) != expected_case_count:
+        errors.append("case_bundle_must_match_manifest_case_count")
     for case in cases:
         if not case.get("query_text"):
             errors.append(f"{case.get('case_id')}: missing_private_query_text")
@@ -1142,7 +1159,8 @@ def _safe_bridge_summary(report: dict[str, Any] | None) -> dict[str, Any]:
         "query_text_check_counts",
         "rejection_counts",
         "error_count",
-        "below_floor_case_count_caveat",
+        "historical_original_case_count",
+        "case_count_floor_status",
         "privacy_contract",
     }
     return {key: payload.get(key) for key in sorted(allowed) if key in payload}

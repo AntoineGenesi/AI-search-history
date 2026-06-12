@@ -2467,7 +2467,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
         f"**Cases:** `{report.get('case_count', 0)}` of `{report.get('manifest_case_count', 0)}` manifest cases",
         f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
         f"**Total wall time ms:** `{report.get('total_wall_time_ms', 0)}`",
-        f"**Caveat:** {report.get('below_floor_case_count_caveat')}",
+        f"**Case-count floor status:** `{report.get('case_count_floor_status', report.get('below_floor_case_count_caveat'))}`",
     ]
     raw = report.get("raw_private_evidence") or {}
     if report.get("headline_findings"):
