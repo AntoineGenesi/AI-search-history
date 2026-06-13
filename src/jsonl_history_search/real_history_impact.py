@@ -15,6 +15,7 @@ from .query import infer_query
 from .real_history_bridge import validate_bridge_files
 from .scanner import search
 from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
+from .structural_sidecar import build_structural_sidecar_index, search_with_structural_sidecar
 from .timeutil import parse_now, timezone_from_args
 
 
@@ -109,6 +110,19 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         base_report["warnings"] = safe_warnings
 
     selected = _selected_baselines(args.baseline)
+    structural_sidecar_index = None
+    if "package_search_structural_sidecar" in selected:
+        phase_started = time.perf_counter()
+        structural_sidecar_index = build_structural_sidecar_index(
+            plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        )
+        base_report["phase_durations_ms"]["structural_sidecar_index_build"] = _elapsed_ms(phase_started)
+        base_report["structural_sidecar_index"] = {
+            **structural_sidecar_index.sanitized_summary(),
+            "build_bytes": int(structural_sidecar_index.metrics.get("build_bytes", 0)),
+            "build_elapsed_ms": structural_sidecar_index.metrics.get("build_elapsed_ms", 0.0),
+        }
     rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
     for case in selected_cases:
@@ -119,16 +133,20 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 "manual_newest_first_open": _run_manual_newest_first_open,
                 "package_search": _run_package_search,
                 "package_search_rg_prefilter": _run_package_search_rg_prefilter,
+                "package_search_structural_sidecar": _run_package_search_structural_sidecar,
             }[baseline]
             for repeat_index in range(max(1, args.repeat)):
-                row, raw_row = runner(
-                    case=case,
-                    files=files,
-                    plan=plan,
-                    args=args,
-                    repeat_index=repeat_index,
-                    cap_hit_labels=cap_hit_labels,
-                )
+                runner_kwargs = {
+                    "case": case,
+                    "files": files,
+                    "plan": plan,
+                    "args": args,
+                    "repeat_index": repeat_index,
+                    "cap_hit_labels": cap_hit_labels,
+                }
+                if baseline == "package_search_structural_sidecar":
+                    runner_kwargs["structural_sidecar_index"] = structural_sidecar_index
+                row, raw_row = runner(**runner_kwargs)
                 rows.append(row)
                 raw_rows.append(raw_row)
 
@@ -490,6 +508,64 @@ def _run_package_search_rg_prefilter(**kwargs) -> tuple[dict[str, Any], dict[str
     return _run_package_search_variant(baseline="package_search_rg_prefilter", use_rg_prefilter=True, **kwargs)
 
 
+def _run_package_search_structural_sidecar(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
+    case = kwargs["case"]
+    args = kwargs["args"]
+    plan = kwargs["plan"]
+    index = kwargs.get("structural_sidecar_index")
+    started = time.perf_counter()
+    default_tz = timezone_from_args(args.timezone, args.timezone_offset)
+    now = parse_now(args.now, default_tz)
+    intent = infer_query(str(case["query_text"]), now=now)
+    if index is None:
+        index = build_structural_sidecar_index(plan, default_tz=default_tz)
+    result = search_with_structural_sidecar(
+        index,
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=str(Path(args.cwd).expanduser().resolve()),
+    )
+    structural_warnings = _safe_warnings(result.get("warnings") or [])
+    row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(structural_warnings)))
+    candidates: list[Candidate] = []
+    ranking_reason_label_count = 0
+    for group in result.get("groups", []):
+        for match in group.get("matches", []):
+            path_value = match.get("path")
+            line_value = match.get("line")
+            ranking_reason_label_count += len(match.get("reasons") or [])
+            candidates.append(
+                Candidate(
+                    path=Path(path_value) if isinstance(path_value, str) else None,
+                    line=int(line_value) if isinstance(line_value, int) else None,
+                    byte_count=len(json.dumps(match, ensure_ascii=False).encode("utf-8")),
+                )
+            )
+    row, raw_row = _row_pair(
+        case=case,
+        baseline="package_search_structural_sidecar",
+        repeat_index=kwargs["repeat_index"],
+        started=started,
+        tool_calls=1,
+        subprocess_calls=0,
+        files_opened=int(result.get("searched_files", 0)),
+        records_parsed=int(result.get("records_considered", 0)),
+        bytes_scanned=int(result.get("searched_bytes", 0)),
+        bytes_parsed=int(result.get("searched_bytes", 0)),
+        output_context_bytes=len(json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+        candidates=candidates,
+        cap_hit_labels=row_cap_hit_labels,
+        ranking_reason_label_count=ranking_reason_label_count,
+        warnings=structural_warnings,
+        notes=["opt_in_structural_codex_claude_sidecar_probe"],
+    )
+    row["structural_sidecar"] = _structural_sidecar_row_stats(result)
+    raw_row["sanitized_row"] = row
+    raw_row["structural_sidecar_result"] = result
+    return row, raw_row
+
+
 def _run_package_search_variant(
     *,
     baseline: str,
@@ -729,6 +805,33 @@ def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "dedupe_strategy": str(result.get("dedupe_strategy") or "unknown"),
         "raw_paths_included": False,
+    }
+
+
+def _structural_sidecar_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    query_profile = result.get("query_profile") if isinstance(result.get("query_profile"), dict) else {}
+    return {
+        "enabled": True,
+        "status": str(result.get("status") or "unknown"),
+        "fallback_reason": result.get("fallback_reason"),
+        "candidate_file_count": int(result.get("candidate_files") or 0),
+        "candidate_entry_count": int(result.get("candidate_entries") or 0),
+        "opened_file_count": int(result.get("searched_files") or 0),
+        "records_considered": int(result.get("records_considered") or 0),
+        "records_rejected_by_should_consider": int(result.get("records_rejected_by_should_consider") or 0),
+        "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
+        "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
+        "searched_bytes": int(result.get("searched_bytes") or 0),
+        "query_profile": query_profile,
+        "index_version": summary.get("version"),
+        "indexed_entry_count": summary.get("indexed_entry_count"),
+        "indexed_file_count": summary.get("indexed_file_count"),
+        "event_family_counts": summary.get("event_family_counts") or {},
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
     }
 
 
@@ -1181,6 +1284,7 @@ def _baseline_contract() -> dict[str, str]:
         "manual_newest_first_open": "modeled no-extension newest-first file-open workflow over identical selected roots; parses opened files and counts full-file handoff cost",
         "package_search": "current JSONL infer_query/search path over the same selected roots and caps",
         "package_search_rg_prefilter": "optional rg prefilter where eligible, followed by Python JSON parsing for evidence; fallback is labeled per row",
+        "package_search_structural_sidecar": "opt-in structural Codex/Claude JSONL sidecar probe; indexes sanitized event/role/timestamp/session tags plus offsets, then passes reopened records through the existing ranking path",
     }
 
 
