@@ -11,6 +11,9 @@ from typing import Any
 SCHEMA_VERSION = "jsh-725-agent-loop-route-counter-contract.v1"
 SOURCE_REF_RETENTION_SCHEMA_VERSION = "jsh-748a-held-out-loop-source-ref-retention-contract.v1"
 RETAINED_TRACE_COUNTER_SCHEMA_VERSION = "jsh-756-held-out-retained-trace-counters.v1"
+JSH773_BUDGETED_HYBRID_CONTRACT_SCHEMA_VERSION = (
+    "jsh-773-no-send-held-out-budgeted-hybrid-lane-contract.v1"
+)
 DEFAULT_CASE_SELECTION_PATH = Path("benchmarks/paired_agent/jsh-724-held-out-agent-loop-case-selection.json")
 DEFAULT_OUTPUT_PATH = Path("benchmarks/paired_agent/jsh-725-agent-loop-route-counter-contract.json")
 DEFAULT_SOURCE_REF_RETENTION_OUTPUT_PATH = Path(
@@ -19,6 +22,12 @@ DEFAULT_SOURCE_REF_RETENTION_OUTPUT_PATH = Path(
 DEFAULT_RETAINED_TRACE_COUNTER_OUTPUT_PATH = Path("benchmarks/paired_agent/jsh-756-held-out-retained-trace-counters.json")
 DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH = Path(
     "reports/jsh-756-offline-retained-trace-counter-extractor-for-held-out-loop.md"
+)
+DEFAULT_JSH773_BUDGETED_HYBRID_CONTRACT_OUTPUT_PATH = Path(
+    "benchmarks/paired_agent/jsh-773-no-send-held-out-budgeted-hybrid-lane-contract.json"
+)
+DEFAULT_JSH773_BUDGETED_HYBRID_CONTRACT_REPORT_PATH = Path(
+    "reports/jsh-773-no-send-held-out-budgeted-hybrid-lane-contract.md"
 )
 DEFAULT_JSH747_PACKET_PATH = Path(
     "benchmarks/paired_agent/jsh-747-adjudicate-jsh-743-repaired-route-live-trace-after-protocol-reclassification.json"
@@ -40,6 +49,7 @@ LANES = (
     "raw_rg",
     "package_search",
     "package_search_rg_prefilter",
+    "package_search_structural_hybrid_budgeted",
 )
 
 LOCAL_TOOL_COUNTERS = (
@@ -91,6 +101,12 @@ FORBIDDEN_MATERIAL = (
 PACKAGE_COMMANDS = (
     "python3 -m jsonl_history_search.cli find",
     "python3 -m jsonl_history_search.cli semantic-debug",
+)
+
+JSH773_NEXT_ACTION = (
+    "add_no_send_installed_helper_surface_for_package_search_structural_hybrid_budgeted_"
+    "then_materialize_heldout-agent-action-proof-001_package_search_and_"
+    "package_search_structural_hybrid_budgeted_rows"
 )
 
 SOURCE_REF_RETENTION_FIELDS = (
@@ -538,6 +554,171 @@ def write_retained_trace_counter_packet(
     return payload
 
 
+def build_jsh773_budgeted_hybrid_contract_payload(
+    case_selection_path: Path = DEFAULT_CASE_SELECTION_PATH,
+) -> dict[str, Any]:
+    base = build_agent_loop_cost_contract_payload(case_selection_path)["agent_loop_cost_contract"]
+    target_case_id = "heldout-agent-action-proof-001"
+    target_lanes = ("package_search", "package_search_structural_hybrid_budgeted")
+    proof_rows = {
+        (row["case_id"], row["lane_id"]): row for row in base["prompt_materialization"]["proof_rows"]
+    }
+    target_prompt_rows = []
+    for lane_id in target_lanes:
+        row = proof_rows[(target_case_id, lane_id)]
+        target_prompt_rows.append(
+            {
+                "row_id": f"{target_case_id}::{lane_id}",
+                "case_id": target_case_id,
+                "lane_id": lane_id,
+                "prompt_view_bytes": row["prompt_view_bytes"],
+                "prompt_view_hash_sha256": row["prompt_view_hash_sha256"],
+                "prompt_text_committed": False,
+                "raw_prompt_text_committed": False,
+                "private_materialization_required_for_next_task": True,
+                "leakage_scan_expected_forbidden_count": row["leakage_scan_expected_forbidden_count"],
+            }
+        )
+
+    contract = {
+        "schema_version": JSH773_BUDGETED_HYBRID_CONTRACT_SCHEMA_VERSION,
+        "task_id": "JSH-773",
+        "artifact_kind": "no_send_held_out_budgeted_hybrid_lane_contract",
+        "created_date": "2026-06-14",
+        "status": "blocked_missing_installed_helper_surface",
+        "source_contracts": {
+            "jsh_724_case_selection_source": str(case_selection_path),
+            "jsh_725_route_counter_contract_builder": "src/jsonl_history_search/agent_loop_cost.py",
+            "jsh_725_schema_version": base["schema_version"],
+            "jsh_748a_source_ref_retention_schema": SOURCE_REF_RETENTION_SCHEMA_VERSION,
+            "jsh_756_retained_trace_counter_schema": RETAINED_TRACE_COUNTER_SCHEMA_VERSION,
+            "jsh_772_gap_report": "benchmarks/paired_agent/jsh-772-held-out-agent-loop-budgeted-hybrid-slice.json",
+        },
+        "no_send_boundary": {
+            "live_sends_performed": False,
+            "send_capable_codex_exec_run": False,
+            "private_upload_performed": False,
+            "auth_or_profile_runner_proof_run": False,
+            "new_live_route_gate_created": False,
+            "offline_contract_artifact_only": True,
+        },
+        "lane_eligibility": {
+            "eligible_held_out_agent_loop_lanes": [lane["lane_id"] for lane in base["strategy_lanes"]],
+            "target_lanes": list(target_lanes),
+            "package_search_structural_hybrid_budgeted_eligible": True,
+            "budgeted_lane_prompt_materialized_in_jsh_725": any(
+                row["case_id"] == target_case_id and row["lane_id"] == "package_search_structural_hybrid_budgeted"
+                for row in base["prompt_materialization"]["proof_rows"]
+            ),
+            "package_search_structural_hybrid_budgeted_installed_helper_surface_available": False,
+            "row_materialization_preflight_ready": False,
+            "blocker": (
+                "find and semantic-debug do not expose package_search_structural_hybrid_budgeted behavior, "
+                "and benchmark-real-history-impact is a private-bridge benchmark harness command rather than "
+                "an agent-loop installed helper surface"
+            ),
+            "default_promotion": False,
+        },
+        "target_rows": [_jsh773_target_row_contract(target_case_id, lane_id) for lane_id in target_lanes],
+        "prompt_materialization": {
+            "prompt_text_committed": False,
+            "raw_prompt_text_committed": False,
+            "hash_algorithm": base["prompt_materialization"]["hash_algorithm"],
+            "target_prompt_rows": target_prompt_rows,
+        },
+        "installed_package_helper_invocation_proof": {
+            "applies_to_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
+            "must_occur_after_prompt_start": True,
+            "installed_live_jsonl_required": True,
+            "allowed_entrypoints_by_lane": {
+                "package_search": list(PACKAGE_COMMANDS),
+                "package_search_structural_hybrid_budgeted": [],
+            },
+            "missing_entrypoint_surface_by_lane": {
+                "package_search": False,
+                "package_search_structural_hybrid_budgeted": True,
+            },
+            "required_proof_fields_per_row": [
+                "prompt_start_marker_hash_or_timestamp",
+                "validate_install_result_after_prompt_start",
+                "package_or_helper_command_argv_sha256_after_prompt_start",
+                "package_or_helper_entrypoint_name",
+                "package_or_helper_exit_status",
+                "command_log_row_hash",
+            ],
+            "coordinator_precomputed_packets_allowed": False,
+            "coordinator_precomputed_packets_forbidden": True,
+            "private_case_notes_source_maps_or_answer_keys_allowed": False,
+            "benchmark_harness_commands_not_accepted_as_agent_loop_helper_surface": [
+                "python3 -m jsonl_history_search.cli benchmark-real-history-impact --baseline package_search_structural_hybrid_budgeted"
+            ],
+        },
+        "row_capture_contract": {
+            "required_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
+            "required_per_row_fields": [
+                "row_id",
+                "case_id",
+                "lane_id",
+                "prompt_view_bytes",
+                "prompt_view_hash_sha256",
+                "installed_package_helper_invocation_proof",
+                "final_answer_correctness",
+                "evidence_source_correctness",
+                "source_ref_retention_quality",
+                "cost_buckets",
+                "privacy_flags",
+            ],
+            "quality_fields": [
+                "final_answer_correctness",
+                "evidence_source_correctness",
+                "source_ref_retention_quality",
+            ],
+            "cost_buckets": [
+                "local_tool_work",
+                "model_facing_context_input",
+                "full_agent_loop_cost",
+            ],
+            "missing_values_literal": UNAVAILABLE,
+            "zero_policy": "zero is valid only when directly measured as zero; unavailable is required for missing or uninstrumented counters",
+        },
+        "cost_bucket_schema": _counter_schema(),
+        "source_ref_retention_quality": _source_ref_retention_quality_contract(),
+        "privacy_contract": _jsh773_privacy_flags(),
+        "contract_hash_sha256": _sha256(
+            {
+                "schema_version": JSH773_BUDGETED_HYBRID_CONTRACT_SCHEMA_VERSION,
+                "target_prompt_rows": target_prompt_rows,
+                "target_rows": [_jsh773_target_row_contract(target_case_id, lane_id) for lane_id in target_lanes],
+                "row_capture_contract": {
+                    "required_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
+                    "missing_values_literal": UNAVAILABLE,
+                },
+            }
+        ),
+        "selected_next_value_producing_action": JSH773_NEXT_ACTION,
+    }
+    return {"jsh773_no_send_budgeted_hybrid_lane_contract": contract}
+
+
+def write_jsh773_budgeted_hybrid_contract(
+    output_path: Path = DEFAULT_JSH773_BUDGETED_HYBRID_CONTRACT_OUTPUT_PATH,
+    case_selection_path: Path = DEFAULT_CASE_SELECTION_PATH,
+) -> dict[str, Any]:
+    payload = build_jsh773_budgeted_hybrid_contract_payload(case_selection_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(
+            payload["jsh773_no_send_budgeted_hybrid_lane_contract"],
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _retained_file_evidence(root: Path) -> dict[str, Any]:
     return {name: _file_stats(root / name) for name in RETAINED_TRACE_ALLOWED_FILES}
 
@@ -970,6 +1151,28 @@ def _lane_contract(lane: str) -> dict[str, Any]:
                 "rg_prefilter": True,
             }
         )
+    elif lane == "package_search_structural_hybrid_budgeted":
+        base.update(
+            {
+                "strategy_family": "jsonl_assisted_structural_hybrid_budgeted",
+                "runnable_in_jsh_726": False,
+                "allowed_tools": [],
+                "route_instructions": [
+                    "Validate the installed/live JSONL package inside the isolated run.",
+                    "Blocked until a no-send installed helper surface exposes budgeted structural hybrid behavior.",
+                    "Do not use benchmark-real-history-impact as the agent-loop helper surface; it is a private-bridge benchmark harness command.",
+                    "Do not consume coordinator-precomputed packets or private source maps.",
+                ],
+                "jsonl_package_available": True,
+                "rg_prefilter": False,
+                "structural_hybrid_budgeted": True,
+                "budget_gate_required": True,
+                "installed_helper_surface_available": False,
+                "missing_helper_surface_blocker": (
+                    "find and semantic-debug currently do not expose package_search_structural_hybrid_budgeted behavior"
+                ),
+            }
+        )
     else:
         raise ValueError(f"unknown lane: {lane}")
     return base
@@ -1160,6 +1363,53 @@ def _prompt_materialization(case: dict[str, Any], lane: dict[str, Any]) -> dict[
         "prompt_text_committed": False,
         "private_materialization_required_for_jsh_726": True,
         "leakage_scan_expected_forbidden_count": 0,
+    }
+
+
+def _jsh773_target_row_contract(case_id: str, lane_id: str) -> dict[str, Any]:
+    return {
+        "row_id": f"{case_id}::{lane_id}",
+        "case_id": case_id,
+        "lane_id": lane_id,
+        "row_status": "contract_defined_not_measured",
+        "prompt_hash_materialization_required": True,
+        "installed_package_helper_invocation_proof": {
+            "required": lane_id == "package_search",
+            "must_occur_after_prompt_start": True,
+            "validate_install_after_prompt_start_required": True,
+            "package_or_helper_command_after_prompt_start_required": lane_id == "package_search",
+            "argv_text_committed": False,
+            "argv_sha256_required": True,
+            "raw_tool_output_committed": False,
+            "coordinator_precomputed_packet_allowed": False,
+            "missing_installed_helper_surface": lane_id == "package_search_structural_hybrid_budgeted",
+        },
+        "final_answer_correctness": UNAVAILABLE,
+        "evidence_source_correctness": UNAVAILABLE,
+        "source_ref_retention_quality": {
+            field: UNAVAILABLE for field in SOURCE_REF_RETENTION_FIELDS
+        },
+        "cost_buckets": {
+            "local_tool_work": {field: UNAVAILABLE for field in LOCAL_TOOL_COUNTERS},
+            "model_facing_context_input": {field: UNAVAILABLE for field in MODEL_FACING_COUNTERS},
+            "full_agent_loop_cost": {field: UNAVAILABLE for field in FULL_AGENT_LOOP_COUNTERS},
+        },
+        "privacy_flags": _jsh773_privacy_flags(),
+    }
+
+
+def _jsh773_privacy_flags() -> dict[str, bool]:
+    return {
+        "committed_artifact_contains_raw_private_text": False,
+        "committed_artifact_contains_raw_prompt_text": False,
+        "committed_artifact_contains_source_windows": False,
+        "committed_artifact_contains_answer_keys": False,
+        "committed_artifact_contains_expected_refs": False,
+        "committed_artifact_contains_private_paths": False,
+        "committed_artifact_contains_absolute_private_paths": False,
+        "committed_artifact_contains_session_ids": False,
+        "committed_artifact_contains_raw_tool_output": False,
+        "committed_artifact_contains_coordinator_precomputed_packets": False,
     }
 
 
