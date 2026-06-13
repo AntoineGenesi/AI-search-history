@@ -21,6 +21,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "latest_user_messages" in payload:
+        return render_latest_user_messages_text(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_text(payload)
     if "capability_diagnostic" in payload:
@@ -140,6 +142,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "latest_user_messages" in payload:
+        return render_latest_user_messages_markdown(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_markdown(payload)
     if "capability_diagnostic" in payload:
@@ -234,6 +238,62 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_latest_user_messages_text(payload: dict) -> str:
+    report = payload["latest_user_messages"]
+    summary = report["summary"]
+    lines = [
+        "Latest User Messages",
+        f"Status: {report['status']}",
+        f"Lookup: {report['lookup']}",
+        f"Sort: {report['sort_strategy']}",
+        (
+            "Searched: "
+            f"{summary['searched_files']} files, {summary['records_read']} records, "
+            f"{summary['candidate_user_message_count']} user candidates, "
+            f"{summary['deduped_mirror_count']} deduped mirrors"
+        ),
+    ]
+    for warning in report["sources"].get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    for message in report["messages"]:
+        lines.append(
+            f"- {message['local_timestamp']} {message['source_kind']} "
+            f"{message['source_identifier']} {message['source_ref']}: {message['snippet']}"
+        )
+    return "\n".join(lines)
+
+
+def render_latest_user_messages_markdown(payload: dict) -> str:
+    report = payload["latest_user_messages"]
+    summary = report["summary"]
+    lines = [
+        "# Latest User Messages",
+        "",
+        f"**Status:** {report['status']}",
+        f"**Lookup:** {report['lookup']}",
+        f"**Sort:** {report['sort_strategy']}",
+        (
+            f"**Searched:** {summary['searched_files']} files, "
+            f"{summary['records_read']} records, "
+            f"{summary['candidate_user_message_count']} user candidates, "
+            f"{summary['deduped_mirror_count']} deduped mirrors"
+        ),
+        "",
+    ]
+    warnings = report["sources"].get("warnings", [])
+    if warnings:
+        lines.append("## Warnings")
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
+    lines.append("## Messages")
+    for message in report["messages"]:
+        lines.append(
+            f"- `{message['local_timestamp']}` `{message['source_kind']}` "
+            f"`{message['source_identifier']}` `{message['source_ref']}`: {message['snippet']}"
+        )
+    return "\n".join(lines)
 
 
 def render_generated_metadata_discovery_text(payload: dict) -> str:

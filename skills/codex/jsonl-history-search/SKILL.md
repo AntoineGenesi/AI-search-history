@@ -16,10 +16,11 @@ Trigger JSONL even when the user does not name it. Route these asks first:
 | User ask | Workflow | First command |
 | --- | --- | --- |
 | "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction retrieval | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format json` |
+| "What did I just say?" "Find my last message." "Recent messages." "Since my last message." | Deterministic latest user-message lookup | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
 | "Did the agent actually run/edit/test/review X?" | Agent action/proof audit | `jsonl-history-search semantic-debug "did the agent actually run/edit/test/review <thing>" --cwd "$PWD" --format json` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `jsonl-history-search semantic-debug "why did this happen?" --task <task-slug> --path <path> --cwd "$PWD" --format json` |
 
-Use `semantic-debug` as the first packet command for these workflows because it returns `question_family`, `source_locator_handoff`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
+Use `latest-user-messages` first for last/recent user-message wording. It sorts high-confidence Codex user messages by normalized timestamp and does not use semantic search, phrase matching, query expansion, or score ranking. Use `semantic-debug` as the first packet command for the other workflows because it returns `question_family`, `source_locator_handoff`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
 
 Route quality-sensitive asks to the package before the helper:
 
@@ -51,7 +52,14 @@ python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py "ht
 python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py "interactive html" --roots ~/.codex ~/.claude
 ```
 
-For "just now", "latest", "most recent", or side-conversation recovery, search newest-first and constrain by role when possible:
+For "what did I just say", "find my last message", "recent messages", or "since my last message", use deterministic user-message recency first. Do not search for the literal phrase from the user's question.
+
+```bash
+jsonl-history-search latest-user-messages --format json --max-matches 10
+python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py --latest-user-messages --limit 10 --context 500
+```
+
+For other "just now", "latest", "most recent", or side-conversation recovery where you need a particular phrase, search newest-first and constrain by role when possible:
 
 ```bash
 python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py "acceptance criteria" --latest --today --role agent_message --context 500 --limit 10
