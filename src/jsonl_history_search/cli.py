@@ -7,8 +7,12 @@ from .agent_contract import build_agent_find_payload
 from .agent_loop_cost import (
     DEFAULT_CASE_SELECTION_PATH as DEFAULT_AGENT_LOOP_CASE_SELECTION_PATH,
     DEFAULT_OUTPUT_PATH as DEFAULT_AGENT_LOOP_CONTRACT_OUTPUT_PATH,
+    DEFAULT_RETAINED_TRACE_COUNTER_OUTPUT_PATH,
+    DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH,
     build_agent_loop_cost_contract_payload,
+    build_retained_trace_counter_payload,
     write_agent_loop_cost_contract,
+    write_retained_trace_counter_packet,
 )
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .capability_diagnostic import build_capability_diagnostic
@@ -649,6 +653,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional rendered report path for the no-send route/counter contract.",
+    )
+    retained_trace_counters = subparsers.add_parser("extract-retained-trace-counters")
+    retained_trace_counters.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    retained_trace_counters.add_argument(
+        "--trace-root",
+        required=True,
+        help="Local retained row trace directory. The path is read offline and is not written to the packet.",
+    )
+    retained_trace_counters.add_argument(
+        "--jsh747-packet",
+        default=None,
+        help="Optional sanitized JSH-747 packet path used for reviewed source-ref/cost labels.",
+    )
+    retained_trace_counters.add_argument(
+        "--output",
+        default=None,
+        help=f"Optional JSON artifact path; default for committed artifact is {DEFAULT_RETAINED_TRACE_COUNTER_OUTPUT_PATH}.",
+    )
+    retained_trace_counters.add_argument(
+        "--report-output",
+        default=None,
+        help=f"Optional rendered report path; default for committed report is {DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH}.",
     )
     harness_artifacts = subparsers.add_parser("validate-harness-artifacts")
     harness_artifacts.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
@@ -1457,6 +1483,20 @@ def main(argv: list[str] | None = None) -> int:
             output_path = Path(args.report_output).expanduser()
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+    if args.command == "extract-retained-trace-counters":
+        trace_root = Path(args.trace_root).expanduser()
+        jsh747_packet = Path(args.jsh747_packet).expanduser() if args.jsh747_packet else None
+        output = Path(args.output).expanduser() if args.output else DEFAULT_RETAINED_TRACE_COUNTER_OUTPUT_PATH
+        if jsh747_packet is None:
+            payload = write_retained_trace_counter_packet(output, trace_root)
+        else:
+            payload = write_retained_trace_counter_packet(output, trace_root, jsh747_packet)
+        rendered = render(payload, args.format)
+        report_output = Path(args.report_output).expanduser() if args.report_output else DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH
+        report_output.parent.mkdir(parents=True, exist_ok=True)
+        report_output.write_text(render(payload, "markdown"), encoding="utf-8")
         print(rendered)
         return 0
     if args.command == "validate-harness-artifacts":

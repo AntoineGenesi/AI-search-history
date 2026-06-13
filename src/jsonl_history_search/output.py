@@ -31,6 +31,8 @@ def render_text(payload: dict) -> str:
         return render_agent_find_text(payload)
     if "agent_loop_cost_contract" in payload:
         return render_agent_loop_cost_contract_text(payload)
+    if "retained_trace_counters" in payload:
+        return render_retained_trace_counters_text(payload)
     if "project_lineage" in payload:
         return render_project_lineage_text(payload)
     if "skill_audit" in payload:
@@ -144,6 +146,8 @@ def render_markdown(payload: dict) -> str:
         return render_agent_find_markdown(payload)
     if "agent_loop_cost_contract" in payload:
         return render_agent_loop_cost_contract_markdown(payload)
+    if "retained_trace_counters" in payload:
+        return render_retained_trace_counters_markdown(payload)
     if "project_lineage" in payload:
         return render_project_lineage_markdown(payload)
     if "skill_audit" in payload:
@@ -275,6 +279,106 @@ def render_agent_loop_cost_contract_markdown(payload: dict) -> str:
             "- `full_agent_loop_cost`",
             "",
             "Missing counters are literal `unavailable`; this artifact performs no live model sends and no adjudication.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_retained_trace_counters_text(payload: dict) -> str:
+    report = payload["retained_trace_counters"]
+    buckets = report["counter_buckets"]
+    local = buckets["local_tool_work"]
+    model = buckets["model_facing_context_input"]
+    loop = buckets["full_agent_loop_cost"]
+    return "\n".join(
+        [
+            f"Row: {report['scope']['row_id']}",
+            f"Tool calls: {local['tool_calls']['value']}",
+            f"Command count: {local['command_count']['value']}",
+            f"Codex exec events: {loop['codex_exec_event_count']['value']}",
+            f"Prompt bytes: {model['prompt_input_bytes']['value']}",
+            f"Tool stdout bytes shown: {model['tool_stdout_bytes_shown']['value']}",
+            f"Final answer bytes: {loop['final_answer_bytes']['value']}",
+            f"Model input tokens: {loop['model_input_tokens']['value']}",
+            f"Runtime JSONL lines: {local['retained_runtime_jsonl_line_count']['value']}",
+            f"Next: {report['selected_next_value_producing_action']}",
+        ]
+    )
+
+
+def render_retained_trace_counters_markdown(payload: dict) -> str:
+    report = payload["retained_trace_counters"]
+    buckets = report["counter_buckets"]
+    local = buckets["local_tool_work"]
+    model = buckets["model_facing_context_input"]
+    loop = buckets["full_agent_loop_cost"]
+    source = buckets["source_ref_retention_quality"]
+    lines = [
+        "# JSH-756 Offline Retained-Trace Counter Extractor",
+        "",
+        "## Value Status",
+        "",
+        "- Tool behavior improved: no.",
+        "- Harness capability improved: yes; reusable offline retained-trace counter extraction is now available.",
+        "- Benchmark/live eval run: no live eval or send-capable run.",
+        "- New numbers produced: yes; sanitized counters for one reviewed held-out row.",
+        "- Current blocker: only one clean held-out final-answer row exists, and cross-lane held-out comparison remains unavailable.",
+        f"- Next value-producing action: `{report['selected_next_value_producing_action']}`.",
+        "",
+        "## Scope",
+        "",
+        f"- Row: `{report['scope']['row_id']}`.",
+        "- Extraction type: offline retained local artifacts only.",
+        "- No live sends, send-capable `codex exec`, private upload, JSH-748b/c/d resumption, scanner/ranking/rg/sidecar/embedding/generated-metadata tuning, or final-answer readjudication.",
+        "",
+        "## Extracted Counters",
+        "",
+        "| Bucket | Counter | Value | Source |",
+        "| --- | --- | ---: | --- |",
+    ]
+    rows = [
+        ("local_tool_work", "tool_calls", local["tool_calls"]),
+        ("local_tool_work", "subprocess_calls", local["subprocess_calls"]),
+        ("local_tool_work", "command_count", local["command_count"]),
+        ("local_tool_work", "stdout_bytes", local["stdout_bytes"]),
+        ("local_tool_work", "stderr_bytes", local["stderr_bytes"]),
+        ("local_tool_work", "elapsed_wall_time_seconds", local["elapsed_wall_time_seconds"]),
+        ("model_facing_context_input", "prompt_input_bytes", model["prompt_input_bytes"]),
+        ("model_facing_context_input", "tool_stdout_bytes_shown", model["tool_stdout_bytes_shown"]),
+        ("model_facing_context_input", "opened_context_bytes_shown", model["opened_context_bytes_shown"]),
+        ("model_facing_context_input", "total_model_facing_input_bytes", model["total_model_facing_input_bytes"]),
+        ("full_agent_loop_cost", "codex_exec_prompt_sends_performed", loop["codex_exec_prompt_sends_performed"]),
+        ("full_agent_loop_cost", "live_model_sends_performed", loop["live_model_sends_performed"]),
+        ("full_agent_loop_cost", "retries_performed", loop["retries_performed"]),
+        ("full_agent_loop_cost", "final_answer_bytes", loop["final_answer_bytes"]),
+        ("full_agent_loop_cost", "model_input_tokens", loop["model_input_tokens"]),
+        ("full_agent_loop_cost", "cached_input_tokens", loop["cached_input_tokens"]),
+        ("full_agent_loop_cost", "model_output_tokens", loop["model_output_tokens"]),
+        ("full_agent_loop_cost", "reasoning_output_tokens", loop["reasoning_output_tokens"]),
+        ("full_agent_loop_cost", "observable_turn_context_events", loop["observable_turn_context_events"]),
+        ("full_agent_loop_cost", "observable_search_attempt_proxy_count", loop["observable_search_attempt_proxy_count"]),
+    ]
+    for bucket, name, counter in rows:
+        lines.append(f"| `{bucket}` | `{name}` | `{counter['value']}` | {counter['source']} |")
+    lines.extend(
+        [
+            "",
+            "## Runtime JSONL Retention",
+            "",
+            f"- Manifest runtime JSONL count: `{report['input_evidence']['runtime_jsonl_evidence']['manifest_runtime_session_jsonl_count']}`.",
+            f"- Locally readable runtime JSONL line count: `{local['retained_runtime_jsonl_line_count']['value']}`.",
+            "- Runtime session IDs and private paths are not committed.",
+            "",
+            "## Source-Ref Retention Quality",
+            "",
+            f"- Durable committed-safe source IDs in final answer: `{source['durable_committed_safe_source_id_refs']['value']}`.",
+            f"- Retained private trace mapping: `{source['retained_private_trace_mapping']['value']}`.",
+            f"- Temporary sandbox refs present: `{source['temporary_sandbox_refs']['value']}`.",
+            "",
+            "## Privacy Boundary",
+            "",
+            "- The packet/report commit only source IDs, counts, byte counts, hashes, availability labels, and provenance labels.",
+            "- They do not commit raw private transcript text, raw prompt/final-answer text, raw source snippets, raw private paths, session IDs, source windows, answer keys, expected refs, private bridge payloads, or evaluator-only raw material.",
         ]
     )
     return "\n".join(lines)
