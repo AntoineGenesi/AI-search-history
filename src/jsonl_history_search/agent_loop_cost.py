@@ -101,7 +101,12 @@ FORBIDDEN_MATERIAL = (
 PACKAGE_COMMANDS = (
     "python3 -m jsonl_history_search.cli find",
     "python3 -m jsonl_history_search.cli semantic-debug",
-    "python3 -m jsonl_history_search.cli benchmark-impact --baseline package_search_structural_hybrid_budgeted",
+)
+
+JSH773_NEXT_ACTION = (
+    "add_no_send_installed_helper_surface_for_package_search_structural_hybrid_budgeted_"
+    "then_materialize_heldout-agent-action-proof-001_package_search_and_"
+    "package_search_structural_hybrid_budgeted_rows"
 )
 
 SOURCE_REF_RETENTION_FIELDS = (
@@ -580,7 +585,7 @@ def build_jsh773_budgeted_hybrid_contract_payload(
         "task_id": "JSH-773",
         "artifact_kind": "no_send_held_out_budgeted_hybrid_lane_contract",
         "created_date": "2026-06-14",
-        "status": "no_send_contract_ready",
+        "status": "blocked_missing_installed_helper_surface",
         "source_contracts": {
             "jsh_724_case_selection_source": str(case_selection_path),
             "jsh_725_route_counter_contract_builder": "src/jsonl_history_search/agent_loop_cost.py",
@@ -605,6 +610,13 @@ def build_jsh773_budgeted_hybrid_contract_payload(
                 row["case_id"] == target_case_id and row["lane_id"] == "package_search_structural_hybrid_budgeted"
                 for row in base["prompt_materialization"]["proof_rows"]
             ),
+            "package_search_structural_hybrid_budgeted_installed_helper_surface_available": False,
+            "row_materialization_preflight_ready": False,
+            "blocker": (
+                "find and semantic-debug do not expose package_search_structural_hybrid_budgeted behavior, "
+                "and benchmark-real-history-impact is a private-bridge benchmark harness command rather than "
+                "an agent-loop installed helper surface"
+            ),
             "default_promotion": False,
         },
         "target_rows": [_jsh773_target_row_contract(target_case_id, lane_id) for lane_id in target_lanes],
@@ -618,7 +630,14 @@ def build_jsh773_budgeted_hybrid_contract_payload(
             "applies_to_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
             "must_occur_after_prompt_start": True,
             "installed_live_jsonl_required": True,
-            "allowed_entrypoints": list(PACKAGE_COMMANDS),
+            "allowed_entrypoints_by_lane": {
+                "package_search": list(PACKAGE_COMMANDS),
+                "package_search_structural_hybrid_budgeted": [],
+            },
+            "missing_entrypoint_surface_by_lane": {
+                "package_search": False,
+                "package_search_structural_hybrid_budgeted": True,
+            },
             "required_proof_fields_per_row": [
                 "prompt_start_marker_hash_or_timestamp",
                 "validate_install_result_after_prompt_start",
@@ -630,6 +649,9 @@ def build_jsh773_budgeted_hybrid_contract_payload(
             "coordinator_precomputed_packets_allowed": False,
             "coordinator_precomputed_packets_forbidden": True,
             "private_case_notes_source_maps_or_answer_keys_allowed": False,
+            "benchmark_harness_commands_not_accepted_as_agent_loop_helper_surface": [
+                "python3 -m jsonl_history_search.cli benchmark-real-history-impact --baseline package_search_structural_hybrid_budgeted"
+            ],
         },
         "row_capture_contract": {
             "required_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
@@ -673,11 +695,7 @@ def build_jsh773_budgeted_hybrid_contract_payload(
                 },
             }
         ),
-        "selected_next_value_producing_action": (
-            "bounded_no_send_row_materialization_preflight_for_"
-            "heldout-agent-action-proof-001_package_search_and_"
-            "package_search_structural_hybrid_budgeted_against_jsh773_contract"
-        ),
+        "selected_next_value_producing_action": JSH773_NEXT_ACTION,
     }
     return {"jsh773_no_send_budgeted_hybrid_lane_contract": contract}
 
@@ -1137,21 +1155,22 @@ def _lane_contract(lane: str) -> dict[str, Any]:
         base.update(
             {
                 "strategy_family": "jsonl_assisted_structural_hybrid_budgeted",
-                "allowed_tools": [
-                    "python3 -m jsonl_history_search.cli benchmark-impact --baseline package_search_structural_hybrid_budgeted",
-                    "python3 -m jsonl_history_search.cli find",
-                    "python3 -m jsonl_history_search.cli semantic-debug",
-                ],
+                "runnable_in_jsh_726": False,
+                "allowed_tools": [],
                 "route_instructions": [
                     "Validate the installed/live JSONL package inside the isolated run.",
-                    "Call the budgeted structural hybrid package/helper after prompt start using only prompt-visible case fields.",
-                    "Use the structural supplement only through the reviewed budget gate; do not promote it as default.",
+                    "Blocked until a no-send installed helper surface exposes budgeted structural hybrid behavior.",
+                    "Do not use benchmark-real-history-impact as the agent-loop helper surface; it is a private-bridge benchmark harness command.",
                     "Do not consume coordinator-precomputed packets or private source maps.",
                 ],
                 "jsonl_package_available": True,
                 "rg_prefilter": False,
                 "structural_hybrid_budgeted": True,
                 "budget_gate_required": True,
+                "installed_helper_surface_available": False,
+                "missing_helper_surface_blocker": (
+                    "find and semantic-debug currently do not expose package_search_structural_hybrid_budgeted behavior"
+                ),
             }
         )
     else:
@@ -1355,14 +1374,15 @@ def _jsh773_target_row_contract(case_id: str, lane_id: str) -> dict[str, Any]:
         "row_status": "contract_defined_not_measured",
         "prompt_hash_materialization_required": True,
         "installed_package_helper_invocation_proof": {
-            "required": True,
+            "required": lane_id == "package_search",
             "must_occur_after_prompt_start": True,
             "validate_install_after_prompt_start_required": True,
-            "package_or_helper_command_after_prompt_start_required": True,
+            "package_or_helper_command_after_prompt_start_required": lane_id == "package_search",
             "argv_text_committed": False,
             "argv_sha256_required": True,
             "raw_tool_output_committed": False,
             "coordinator_precomputed_packet_allowed": False,
+            "missing_installed_helper_surface": lane_id == "package_search_structural_hybrid_budgeted",
         },
         "final_answer_correctness": UNAVAILABLE,
         "evidence_source_correctness": UNAVAILABLE,
