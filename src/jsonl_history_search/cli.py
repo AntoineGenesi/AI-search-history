@@ -51,6 +51,16 @@ from .real_history_benchmark_drift import (
     DEFAULT_BEFORE_REPORT as DEFAULT_REAL_HISTORY_DRIFT_BEFORE_REPORT,
     build_real_history_benchmark_drift_payload,
 )
+from .real_history_post_jsh763_date_timeline_diagnostic import (
+    DEFAULT_BENCHMARK as DEFAULT_POST_JSH763_DATE_TIMELINE_BENCHMARK,
+    DEFAULT_JSH711_REPORT as DEFAULT_POST_JSH763_DATE_TIMELINE_JSH711_REPORT,
+    DEFAULT_JSH721_REPORT as DEFAULT_POST_JSH763_DATE_TIMELINE_JSH721_REPORT,
+    DEFAULT_JSH722_REPORT as DEFAULT_POST_JSH763_DATE_TIMELINE_JSH722_REPORT,
+    DEFAULT_MARKDOWN_OUTPUT as DEFAULT_POST_JSH763_DATE_TIMELINE_MARKDOWN_OUTPUT,
+    DEFAULT_OUTPUT as DEFAULT_POST_JSH763_DATE_TIMELINE_OUTPUT,
+    DEFAULT_RAW_RUN as DEFAULT_POST_JSH763_DATE_TIMELINE_RAW_RUN,
+    build_post_jsh763_date_timeline_diagnostic_payload,
+)
 from .real_run_gate import (
     DEFAULT_JSH605_REVIEW_PATH,
     DEFAULT_JSH605_SUMMARY_PATH,
@@ -649,6 +659,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--markdown-report-output",
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
+    )
+    post_jsh763_date_timeline = subparsers.add_parser("diagnose-post-jsh763-date-timeline-misses")
+    post_jsh763_date_timeline.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    post_jsh763_date_timeline.add_argument(
+        "--benchmark",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_BENCHMARK),
+        help="Committed JSH-763 real-history benchmark JSON artifact.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--raw-run",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_RAW_RUN),
+        help="Ignored JSH-763 raw run JSON used only locally for coarse depth/query labels.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--jsh711-report",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_JSH711_REPORT),
+        help="Committed JSH-711 prior negative-learning report.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--jsh721-report",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_JSH721_REPORT),
+        help="Committed JSH-721 timestamp-window decision report.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--jsh722-report",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_JSH722_REPORT),
+        help="Committed JSH-722 auditable timestamp-window decision report.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--report-output",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_OUTPUT),
+        help="Path where the sanitized JSON report should be written.",
+    )
+    post_jsh763_date_timeline.add_argument(
+        "--markdown-report-output",
+        default=str(DEFAULT_POST_JSH763_DATE_TIMELINE_MARKDOWN_OUTPUT),
+        help="Path for the sanitized Markdown companion report.",
     )
     live_protocol = subparsers.add_parser("benchmark-live-terminal-protocol")
     live_protocol.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
@@ -1504,6 +1551,20 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["real_history_benchmark_drift_comparator"]["status"]
         return 1 if status in {"incomplete", "invalid_artifact"} else 0
+    if args.command == "diagnose-post-jsh763-date-timeline-misses":
+        payload = build_post_jsh763_date_timeline_diagnostic_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(render(payload, "json"), encoding="utf-8")
+        if args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["post_jsh763_date_timeline_miss_depth_diagnostic"]["status"]
+        return 1 if status in {"incomplete"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)

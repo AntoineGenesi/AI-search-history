@@ -9,6 +9,10 @@ from .real_history_benchmark_drift import (
     render_real_history_benchmark_drift_markdown,
     render_real_history_benchmark_drift_text,
 )
+from .real_history_post_jsh763_date_timeline_diagnostic import (
+    render_post_jsh763_date_timeline_diagnostic_markdown,
+    render_post_jsh763_date_timeline_diagnostic_text,
+)
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
 
 
@@ -69,6 +73,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_opened_file_progress_diagnostic_text(payload)
     if "real_history_benchmark_drift_comparator" in payload:
         return render_real_history_benchmark_drift_text(payload)
+    if "post_jsh763_date_timeline_miss_depth_diagnostic" in payload:
+        return render_post_jsh763_date_timeline_diagnostic_text(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_text(payload)
     if "harness_artifact_validation" in payload:
@@ -186,6 +192,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_opened_file_progress_diagnostic_markdown(payload)
     if "real_history_benchmark_drift_comparator" in payload:
         return render_real_history_benchmark_drift_markdown(payload)
+    if "post_jsh763_date_timeline_miss_depth_diagnostic" in payload:
+        return render_post_jsh763_date_timeline_diagnostic_markdown(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_markdown(payload)
     if "harness_artifact_validation" in payload:
