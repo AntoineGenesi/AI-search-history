@@ -407,6 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
             "package_search",
             "package_search_rg_prefilter",
             "package_search_structural_sidecar",
+            "package_search_structural_hybrid",
         ),
         default=[],
         help="Baseline to include; may be passed more than once. Defaults to all real-history impact baselines.",

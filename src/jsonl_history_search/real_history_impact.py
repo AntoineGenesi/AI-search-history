@@ -111,7 +111,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
 
     selected = _selected_baselines(args.baseline)
     structural_sidecar_index = None
-    if "package_search_structural_sidecar" in selected:
+    if any(baseline in selected for baseline in ("package_search_structural_sidecar", "package_search_structural_hybrid")):
         phase_started = time.perf_counter()
         structural_sidecar_index = build_structural_sidecar_index(
             plan,
@@ -134,6 +134,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 "package_search": _run_package_search,
                 "package_search_rg_prefilter": _run_package_search_rg_prefilter,
                 "package_search_structural_sidecar": _run_package_search_structural_sidecar,
+                "package_search_structural_hybrid": _run_package_search_structural_hybrid,
             }[baseline]
             for repeat_index in range(max(1, args.repeat)):
                 runner_kwargs = {
@@ -144,7 +145,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                     "repeat_index": repeat_index,
                     "cap_hit_labels": cap_hit_labels,
                 }
-                if baseline == "package_search_structural_sidecar":
+                if baseline in {"package_search_structural_sidecar", "package_search_structural_hybrid"}:
                     runner_kwargs["structural_sidecar_index"] = structural_sidecar_index
                 row, raw_row = runner(**runner_kwargs)
                 rows.append(row)
@@ -573,6 +574,77 @@ def _run_package_search_structural_sidecar(**kwargs) -> tuple[dict[str, Any], di
     return row, raw_row
 
 
+def _run_package_search_structural_hybrid(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
+    case = kwargs["case"]
+    args = kwargs["args"]
+    plan = kwargs["plan"]
+    index = kwargs.get("structural_sidecar_index")
+    started = time.perf_counter()
+    default_tz = timezone_from_args(args.timezone, args.timezone_offset)
+    now = parse_now(args.now, default_tz)
+    intent = infer_query(str(case["query_text"]), now=now)
+    expected_refs = case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None
+    package_result = search(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=str(Path(args.cwd).expanduser().resolve()),
+        use_rg_prefilter=False,
+        expected_ref_diagnostics=expected_refs,
+    )
+    if index is None:
+        index = build_structural_sidecar_index(plan, default_tz=default_tz)
+    structural_result = search_with_structural_sidecar(
+        index,
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=str(Path(args.cwd).expanduser().resolve()),
+        expected_ref_diagnostics=expected_refs,
+    )
+    hybrid_result = _hybrid_package_structural_result(
+        package_result,
+        structural_result,
+        supplement_limit=max(10, plan.limits.max_matches // 2),
+    )
+    warnings = _safe_warnings((package_result.get("warnings") or []) + (structural_result.get("warnings") or []))
+    row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(warnings)))
+    candidates, ranking_reason_label_count = _candidates_from_groups(hybrid_result.get("groups", []))
+    package_searched_bytes = int(package_result.get("searched_bytes", 0))
+    structural_searched_bytes = int(structural_result.get("searched_bytes", 0))
+    row, raw_row = _row_pair(
+        case=case,
+        baseline="package_search_structural_hybrid",
+        repeat_index=kwargs["repeat_index"],
+        started=started,
+        tool_calls=2,
+        subprocess_calls=0,
+        files_opened=int(package_result.get("searched_files", 0)) + int(structural_result.get("searched_files", 0)),
+        records_parsed=_estimated_package_records_parsed(
+            kwargs["files"],
+            package_searched_bytes,
+            _prefilter_row_stats({}, enabled=False),
+            False,
+        )
+        + int(structural_result.get("records_considered", 0)),
+        bytes_scanned=package_searched_bytes + structural_searched_bytes,
+        bytes_parsed=package_searched_bytes + structural_searched_bytes,
+        output_context_bytes=len(json.dumps(hybrid_result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+        candidates=candidates,
+        cap_hit_labels=row_cap_hit_labels,
+        ranking_reason_label_count=ranking_reason_label_count,
+        warnings=warnings,
+        notes=["opt_in_package_preserving_structural_supplement_probe"],
+    )
+    row["structural_hybrid"] = _structural_hybrid_row_stats(hybrid_result)
+    expected_diagnostics = _expected_ref_diagnostics_row(package_result)
+    if expected_diagnostics is not None:
+        row["expected_ref_diagnostics"] = expected_diagnostics
+    raw_row["sanitized_row"] = row
+    raw_row["hybrid_result"] = hybrid_result
+    return row, raw_row
+
+
 def _run_package_search_variant(
     *,
     baseline: str,
@@ -641,6 +713,99 @@ def _run_package_search_variant(
     raw_row["sanitized_row"] = row
     raw_row["package_result"] = result
     return row, raw_row
+
+
+def _candidates_from_groups(groups: list[dict[str, Any]]) -> tuple[list[Candidate], int]:
+    candidates: list[Candidate] = []
+    ranking_reason_label_count = 0
+    for group in groups:
+        for match in group.get("matches", []):
+            path_value = match.get("path")
+            line_value = match.get("line")
+            ranking_reason_label_count += len(match.get("reasons") or [])
+            candidates.append(
+                Candidate(
+                    path=Path(path_value) if isinstance(path_value, str) else None,
+                    line=int(line_value) if isinstance(line_value, int) else None,
+                    byte_count=len(json.dumps(match, ensure_ascii=False).encode("utf-8")),
+                )
+            )
+    return candidates, ranking_reason_label_count
+
+
+def _hybrid_package_structural_result(
+    package_result: dict[str, Any],
+    structural_result: dict[str, Any],
+    *,
+    supplement_limit: int,
+) -> dict[str, Any]:
+    package_groups = list(package_result.get("groups") or [])
+    package_keys = _match_keys(package_groups)
+    structural_supplement: list[dict[str, Any]] = []
+    for match in _flat_matches(structural_result.get("groups") or []):
+        key = _match_key(match)
+        if key in package_keys:
+            continue
+        structural_supplement.append(match)
+        package_keys.add(key)
+        if len(structural_supplement) >= supplement_limit:
+            break
+    groups = list(package_groups)
+    if structural_supplement:
+        groups.append(
+            {
+                "group_key": "structural_sidecar_supplement",
+                "matches": structural_supplement,
+                "source": "package_search_structural_hybrid",
+            }
+        )
+    return {
+        "status": "planned_package_structural_hybrid",
+        "strategy": "package_first_bounded_structural_supplement",
+        "groups": groups,
+        "package_candidate_count": sum(len(group.get("matches") or []) for group in package_groups),
+        "structural_supplement_candidate_count": len(structural_supplement),
+        "supplement_limit": supplement_limit,
+        "searched_files": int(package_result.get("searched_files", 0)) + int(structural_result.get("searched_files", 0)),
+        "searched_bytes": int(package_result.get("searched_bytes", 0)) + int(structural_result.get("searched_bytes", 0)),
+        "package_searched_bytes": int(package_result.get("searched_bytes", 0)),
+        "structural_searched_bytes": int(structural_result.get("searched_bytes", 0)),
+        "package_warnings": _safe_warnings(package_result.get("warnings") or []),
+        "structural_warnings": _safe_warnings(structural_result.get("warnings") or []),
+        "privacy": {
+            "raw_paths_included_in_summary": False,
+            "raw_text_included_in_summary": False,
+            "expected_refs_used_for_retrieval": False,
+        },
+    }
+
+
+def _flat_matches(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [match for group in groups for match in group.get("matches", []) if isinstance(match, dict)]
+
+
+def _match_keys(groups: list[dict[str, Any]]) -> set[tuple[str, int]]:
+    return {_match_key(match) for match in _flat_matches(groups)}
+
+
+def _match_key(match: dict[str, Any]) -> tuple[str, int]:
+    return (str(match.get("path") or ""), int(match.get("line") or 0))
+
+
+def _structural_hybrid_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "status": str(result.get("status") or "unknown"),
+        "strategy": str(result.get("strategy") or "unknown"),
+        "package_candidate_count": int(result.get("package_candidate_count") or 0),
+        "structural_supplement_candidate_count": int(result.get("structural_supplement_candidate_count") or 0),
+        "supplement_limit": int(result.get("supplement_limit") or 0),
+        "package_searched_bytes": int(result.get("package_searched_bytes") or 0),
+        "structural_searched_bytes": int(result.get("structural_searched_bytes") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "expected_refs_used_for_retrieval": False,
+    }
 
 
 def _literal_candidates(query: str, files: list[RealHistoryFile]) -> tuple[list[Candidate], int, int, int]:
@@ -1284,6 +1449,7 @@ def _headline_findings(
     raw = summary.get("raw_rg_literal") or {}
     manual = summary.get("manual_newest_first_open") or {}
     rg = summary.get("package_search_rg_prefilter") or {}
+    hybrid = summary.get("package_search_structural_hybrid") or {}
     if package:
         package_hits = int(package.get("first_pass_hits", 0) or 0)
         package_cases = int(package.get("cases", 0) or 0)
@@ -1307,6 +1473,10 @@ def _headline_findings(
     if equivalence and int(equivalence.get("compared_runs") or 0) > 0:
         findings.append(
             "package_search_rg_prefilter preserved source-ref equivalence versus package_search, but most rows fell back or had no reduction"
+        )
+    if hybrid:
+        findings.append(
+            f"package_search_structural_hybrid recovered {hybrid.get('first_pass_hits', 0)}/{hybrid.get('cases', 0)} cases as an opt-in package-preserving structural supplement"
         )
     if cap_hit_labels:
         findings.append(f"cap hits affected this run: {', '.join(cap_hit_labels)}")
@@ -1504,6 +1674,7 @@ def _baseline_contract() -> dict[str, str]:
         "package_search": "current JSONL infer_query/search path over the same selected roots and caps",
         "package_search_rg_prefilter": "optional rg prefilter where eligible, followed by Python JSON parsing for evidence; fallback is labeled per row",
         "package_search_structural_sidecar": "opt-in structural Codex/Claude JSONL sidecar probe; indexes sanitized event/role/timestamp/session tags plus offsets, then passes reopened records through the existing ranking path",
+        "package_search_structural_hybrid": "opt-in package-preserving hybrid probe; keeps package candidates first and appends a bounded non-duplicate structural sidecar supplement",
     }
 
 
