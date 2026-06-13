@@ -98,6 +98,8 @@ FORBIDDEN_MATERIAL = (
     "adjudication_notes",
 )
 
+VALIDATE_INSTALL_COMMAND = "python3 -m jsonl_history_search.cli validate-install --format json"
+
 PACKAGE_COMMANDS = (
     "python3 -m jsonl_history_search.cli find",
     "python3 -m jsonl_history_search.cli semantic-debug",
@@ -649,9 +651,8 @@ def build_jsh773_budgeted_hybrid_contract_payload(
             "coordinator_precomputed_packets_allowed": False,
             "coordinator_precomputed_packets_forbidden": True,
             "private_case_notes_source_maps_or_answer_keys_allowed": False,
-            "benchmark_harness_commands_not_accepted_as_agent_loop_helper_surface": [
-                "python3 -m jsonl_history_search.cli benchmark-real-history-impact --baseline package_search_structural_hybrid_budgeted"
-            ],
+            "benchmark_harness_commands_not_accepted_as_agent_loop_helper_surface": True,
+            "benchmark_harness_command_text_visible_to_agent": False,
         },
         "row_capture_contract": {
             "required_rows": [f"{target_case_id}::{lane_id}" for lane_id in target_lanes],
@@ -1126,10 +1127,16 @@ def _lane_contract(lane: str) -> dict[str, Any]:
                     "python3 -m jsonl_history_search.cli semantic-debug",
                 ],
                 "route_instructions": [
-                    "Validate the installed/live JSONL package inside the isolated run.",
-                    "Call the JSONL package/helper after prompt start using only prompt-visible case fields.",
+                    f"After prompt start, run `{VALIDATE_INSTALL_COMMAND}` and retain the result before search.",
+                    f"Then run `{PACKAGE_COMMANDS[0]}` as the required package/search helper using only prompt-visible case fields.",
+                    "The secondary package helper is allowed only if needed after the required package/search helper.",
                     "Do not consume coordinator-precomputed packets or private source maps.",
                 ],
+                "helper_contract": _helper_contract(
+                    required_command=PACKAGE_COMMANDS[0],
+                    allowed_commands=PACKAGE_COMMANDS,
+                    forbidden_agent_loop_helper_surfaces=[],
+                ),
                 "jsonl_package_available": True,
                 "rg_prefilter": False,
             }
@@ -1143,10 +1150,18 @@ def _lane_contract(lane: str) -> dict[str, Any]:
                     "python3 -m jsonl_history_search.cli semantic-debug --rg-prefilter",
                 ],
                 "route_instructions": [
-                    "Validate the installed/live JSONL package inside the isolated run.",
+                    f"After prompt start, run `{VALIDATE_INSTALL_COMMAND}` and retain the result before search.",
                     "Use package search with opt-in rg prefilter only inside the run.",
                     "Do not consume coordinator-precomputed packets or private source maps.",
                 ],
+                "helper_contract": _helper_contract(
+                    required_command="python3 -m jsonl_history_search.cli find --rg-prefilter",
+                    allowed_commands=(
+                        "python3 -m jsonl_history_search.cli find --rg-prefilter",
+                        "python3 -m jsonl_history_search.cli semantic-debug --rg-prefilter",
+                    ),
+                    forbidden_agent_loop_helper_surfaces=[],
+                ),
                 "jsonl_package_available": True,
                 "rg_prefilter": True,
             }
@@ -1158,13 +1173,21 @@ def _lane_contract(lane: str) -> dict[str, Any]:
                 "runnable_in_jsh_726": True,
                 "allowed_tools": list(BUDGETED_HYBRID_PACKAGE_COMMANDS),
                 "route_instructions": [
-                    "Validate the installed/live JSONL package inside the isolated run.",
-                    "Use the opt-in no-send installed helper surface for budgeted structural hybrid behavior.",
+                    f"After prompt start, run `{VALIDATE_INSTALL_COMMAND}` and retain the result before search.",
+                    f"Then run `{BUDGETED_HYBRID_PACKAGE_COMMANDS[0]}` as the required budgeted structural hybrid helper.",
                     "Run normal package search first; use structural sidecar supplement only when package candidate count is at or below 10.",
                     "Limit structural supplement matches to 10.",
-                    "Do not use benchmark-real-history-impact as the agent-loop helper surface; it is a private-bridge benchmark harness command.",
+                    "Do not use benchmark harness or private-bridge CLI commands as agent-loop helper surfaces or command suggestions.",
                     "Do not consume coordinator-precomputed packets or private source maps.",
                 ],
+                "helper_contract": _helper_contract(
+                    required_command=BUDGETED_HYBRID_PACKAGE_COMMANDS[0],
+                    allowed_commands=BUDGETED_HYBRID_PACKAGE_COMMANDS,
+                    forbidden_agent_loop_helper_surfaces=[
+                        "benchmark_harness_commands",
+                        "private_bridge_commands",
+                    ],
+                ),
                 "jsonl_package_available": True,
                 "rg_prefilter": False,
                 "structural_hybrid_budgeted": True,
@@ -1176,6 +1199,24 @@ def _lane_contract(lane: str) -> dict[str, Any]:
     else:
         raise ValueError(f"unknown lane: {lane}")
     return base
+
+
+def _helper_contract(
+    *,
+    required_command: str,
+    allowed_commands: tuple[str, ...],
+    forbidden_agent_loop_helper_surfaces: list[str],
+) -> dict[str, Any]:
+    return {
+        "validate_install_command": VALIDATE_INSTALL_COMMAND,
+        "validate_install_after_prompt_start_required": True,
+        "required_command_after_prompt_start": required_command,
+        "allowed_commands_after_prompt_start": list(allowed_commands),
+        "required_command_must_be_invoked_before_final_answer": True,
+        "coordinator_precomputed_packets_allowed": False,
+        "forbidden_agent_loop_helper_surfaces": forbidden_agent_loop_helper_surfaces,
+        "raw_tool_output_committed": False,
+    }
 
 
 def _counter_schema() -> dict[str, Any]:
@@ -1335,15 +1376,18 @@ def _leakage_gates() -> dict[str, Any]:
     }
 
 
-def _prompt_materialization(case: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
-    prompt_view = {
+def build_agent_loop_prompt_view(case: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
+    lane_view = {
+        "lane_id": lane["lane_id"],
+        "strategy_family": lane["strategy_family"],
+        "allowed_tools": lane["allowed_tools"],
+        "route_instructions": lane["route_instructions"],
+    }
+    if "helper_contract" in lane:
+        lane_view["helper_contract"] = lane["helper_contract"]
+    return {
         "case": {field: case[field] for field in lane["allowed_prompt_case_fields"]},
-        "lane": {
-            "lane_id": lane["lane_id"],
-            "strategy_family": lane["strategy_family"],
-            "allowed_tools": lane["allowed_tools"],
-            "route_instructions": lane["route_instructions"],
-        },
+        "lane": lane_view,
         "output_contract": {
             "answer": "source_backed_answer_or_explicit_uncertainty",
             "source_refs": "refs_found_by_this_lane_only",
@@ -1355,6 +1399,10 @@ def _prompt_materialization(case: dict[str, Any], lane: dict[str, Any]) -> dict[
         },
         "forbidden": lane["forbidden_material"],
     }
+
+
+def _prompt_materialization(case: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
+    prompt_view = build_agent_loop_prompt_view(case, lane)
     return {
         "case_id": case["case_id"],
         "lane_id": lane["lane_id"],
