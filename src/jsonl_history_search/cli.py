@@ -46,6 +46,11 @@ from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
 from .real_history_impact import DEFAULT_PRIVATE_BRIDGE, DEFAULT_RAW_OUTPUT_DIR, build_real_history_impact_payload
+from .real_history_benchmark_drift import (
+    DEFAULT_AFTER_REPORT as DEFAULT_REAL_HISTORY_DRIFT_AFTER_REPORT,
+    DEFAULT_BEFORE_REPORT as DEFAULT_REAL_HISTORY_DRIFT_BEFORE_REPORT,
+    build_real_history_benchmark_drift_payload,
+)
 from .real_run_gate import (
     DEFAULT_JSH605_REVIEW_PATH,
     DEFAULT_JSH605_SUMMARY_PATH,
@@ -619,6 +624,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path where the sanitized JSON/Markdown report should be written.",
     )
     opened_progress_diagnostic.add_argument(
+        "--markdown-report-output",
+        default=None,
+        help="Optional path for the sanitized Markdown companion report.",
+    )
+    benchmark_drift = subparsers.add_parser("compare-real-history-benchmark-drift")
+    benchmark_drift.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    benchmark_drift.add_argument(
+        "--before",
+        default=str(DEFAULT_REAL_HISTORY_DRIFT_BEFORE_REPORT),
+        help="Earlier committed-safe real-history impact benchmark JSON artifact.",
+    )
+    benchmark_drift.add_argument(
+        "--after",
+        default=str(DEFAULT_REAL_HISTORY_DRIFT_AFTER_REPORT),
+        help="Later committed-safe real-history impact benchmark JSON artifact.",
+    )
+    benchmark_drift.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the sanitized JSON/Markdown comparator report should be written.",
+    )
+    benchmark_drift.add_argument(
         "--markdown-report-output",
         default=None,
         help="Optional path for the sanitized Markdown companion report.",
@@ -1456,6 +1483,27 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["real_history_opened_file_progress_displacement_diagnostic"]["status"]
         return 1 if status in {"incomplete"} else 0
+    if args.command == "compare-real-history-benchmark-drift":
+        payload = build_real_history_benchmark_drift_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+            markdown_path = (
+                Path(args.markdown_report_output).expanduser()
+                if args.markdown_report_output
+                else output_path.with_suffix(".md")
+            )
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        elif args.markdown_report_output:
+            markdown_path = Path(args.markdown_report_output).expanduser()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        status = payload["real_history_benchmark_drift_comparator"]["status"]
+        return 1 if status in {"incomplete", "invalid_artifact"} else 0
     if args.command == "benchmark-live-terminal-protocol":
         payload = build_live_terminal_protocol_payload()
         rendered = render(payload, args.format)

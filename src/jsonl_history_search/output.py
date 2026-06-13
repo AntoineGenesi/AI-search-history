@@ -5,6 +5,10 @@ import json
 from .agent_contract import source_ref_target
 from .metric_contract import TOKEN_FORMULA
 from .harness_loop import render_harness_minimum_loop_report, render_harness_minimum_loop_text
+from .real_history_benchmark_drift import (
+    render_real_history_benchmark_drift_markdown,
+    render_real_history_benchmark_drift_text,
+)
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
 
 
@@ -63,6 +67,8 @@ def render_text(payload: dict) -> str:
         return render_real_history_remaining_miss_diagnostic_text(payload)
     if "real_history_opened_file_progress_displacement_diagnostic" in payload:
         return render_real_history_opened_file_progress_diagnostic_text(payload)
+    if "real_history_benchmark_drift_comparator" in payload:
+        return render_real_history_benchmark_drift_text(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_text(payload)
     if "harness_artifact_validation" in payload:
@@ -178,6 +184,8 @@ def render_markdown(payload: dict) -> str:
         return render_real_history_remaining_miss_diagnostic_markdown(payload)
     if "real_history_opened_file_progress_displacement_diagnostic" in payload:
         return render_real_history_opened_file_progress_diagnostic_markdown(payload)
+    if "real_history_benchmark_drift_comparator" in payload:
+        return render_real_history_benchmark_drift_markdown(payload)
     if "paired_agent_benchmark_protocol" in payload:
         return render_paired_agent_benchmark_protocol_markdown(payload)
     if "harness_artifact_validation" in payload:
