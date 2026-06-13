@@ -22,6 +22,15 @@ from .ranking import (
 )
 from .records import Record, parse_record
 from .scanner import match_sort_key
+from .scanner import (
+    _init_expected_ref_diagnostics,
+    _mark_expected_final_candidates,
+    _mark_expected_pre_final_candidates,
+    _mark_opened_file_progress,
+    _mark_opened_file_record_read,
+    _public_expected_ref_diagnostics,
+    _records_read_bucket,
+)
 from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path, stat_mtime, stat_size
 from .tool_events import detect_events_for_record
 
@@ -153,6 +162,7 @@ def search_with_structural_sidecar(
     default_tz,
     cwd: str | None,
     selected_paths: set[str] | None = None,
+    expected_ref_diagnostics: list[dict] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     warnings = list(index.warnings) + list(plan.warnings)
@@ -170,6 +180,9 @@ def search_with_structural_sidecar(
     candidate_records_scored = 0
     candidate_records_deduped = 0
     source_kinds: set[str] = set()
+    expected_diag = _init_structural_expected_ref_diagnostics(expected_ref_diagnostics)
+    _mark_structural_expected_indexed(expected_diag, index)
+    _mark_structural_expected_candidates(expected_diag, candidate_entries)
 
     for table, entries in candidate_entries:
         fallback_reason = _table_fallback_reason(table)
@@ -183,8 +196,11 @@ def search_with_structural_sidecar(
             )
         try:
             with table.path.open("rb") as handle:
+                opened_order = len(opened_paths) + 1
                 opened_paths.add(str(table.path))
                 source_kinds.add(table.source_kind)
+                progress_item = {"path": table.path}
+                _mark_opened_file_progress(expected_diag, progress_item, table.path, opened_order)
                 for entry in entries:
                     if time.perf_counter() - started > plan.limits.max_elapsed:
                         warnings.append("Stopped structural sidecar at max elapsed cap.")
@@ -193,6 +209,7 @@ def search_with_structural_sidecar(
                     raw = handle.read(entry.byte_length)
                     searched_bytes += len(raw)
                     records_considered += 1
+                    _mark_opened_file_record_read(expected_diag, progress_item)
                     record = parse_record(
                         raw.decode("utf-8", errors="replace"),
                         path=table.path,
@@ -200,20 +217,50 @@ def search_with_structural_sidecar(
                         default_tz=default_tz,
                     )
                     record.source_format = entry.source_kind
+                    expected_state = _structural_expected_state_for_entry(expected_diag, table.path, entry.line)
+                    if expected_state is not None:
+                        expected_state["expected_record_line_reached_before_elapsed_stop"] = True
+                        expected_state["expected_file_records_read_before_stop"] = int(
+                            progress_item.get("records_read") or 0
+                        )
+                        expected_state["expected_file_progress_bucket"] = _records_read_bucket(
+                            int(progress_item.get("records_read") or 0)
+                        )
                     if not should_consider(record, intent):
                         records_rejected_by_should_consider += 1
+                        if expected_state is not None:
+                            expected_state["would_pass_should_consider"] = False
+                            expected_state["pre_reservoir_status"] = "rejected_by_should_consider"
+                            expected_state["should_consider_phase_label"] = "rejected_by_should_consider"
+                            expected_state["drop_phase_label"] = "should_consider_drop"
                         continue
+                    if expected_state is not None:
+                        expected_state["would_pass_should_consider"] = True
+                        expected_state["should_consider_phase_label"] = "passed_should_consider"
                     key = _dedupe_key(record)
                     if key in dedupe:
                         candidate_records_deduped += 1
+                        if expected_state is not None:
+                            expected_state["deduped_before_scoring"] = True
+                            expected_state["pre_reservoir_status"] = "deduped_before_scoring"
+                            expected_state["dedupe_phase_label"] = "deduped_before_scoring"
+                            expected_state["drop_phase_label"] = "dedupe_drop"
                         continue
                     dedupe.add(key)
                     candidate_records_scored += 1
                     score, reasons, artifacts = score_record(record, intent, cwd)
+                    if expected_state is not None:
+                        expected_state["expected_record_present_before_reservoir_retention"] = True
+                        expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
+                        expected_state["dedupe_phase_label"] = "not_deduped"
                     match = _materialize_match(record, score, reasons, artifacts, intent)
                     if is_weak_partial_generic(reasons):
+                        if expected_state is not None:
+                            expected_state["candidate_strength"] = "weak"
                         if len(weak_matches) < weak_reservoir_limit:
                             weak_matches.append(match)
+                            if expected_state is not None:
+                                expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
                         else:
                             weakest_index = min(
                                 range(len(weak_matches)),
@@ -221,8 +268,18 @@ def search_with_structural_sidecar(
                             )
                             if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
                                 weak_matches[weakest_index] = match
+                                if expected_state is not None:
+                                    expected_state["reservoir_phase_label"] = (
+                                        "weak_reservoir_replaced_existing_candidate"
+                                    )
+                            elif expected_state is not None:
+                                expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
+                                expected_state["drop_phase_label"] = "weak_reservoir_drop"
                             weak_candidates_skipped += 1
                         continue
+                    if expected_state is not None:
+                        expected_state["candidate_strength"] = "strong"
+                        expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
                     matches.append(match)
                     if len(matches) >= plan.limits.max_matches:
                         warnings.append("Stopped structural sidecar at max match cap.")
@@ -233,10 +290,12 @@ def search_with_structural_sidecar(
     if weak_candidates_skipped:
         warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
     matches = (matches + weak_matches)[: plan.limits.max_matches * 2]
+    _mark_expected_pre_final_candidates(expected_diag, matches)
     matches.sort(key=match_sort_key, reverse=True)
     matches = matches[: plan.limits.max_matches]
+    _mark_expected_final_candidates(expected_diag, matches)
     candidate_entry_count = sum(len(entries) for _table, entries in candidate_entries)
-    return {
+    payload = {
         "status": "planned_structural_seek",
         "fallback_reason": None,
         "query_profile": _sanitized_query_profile(query_profile),
@@ -263,6 +322,107 @@ def search_with_structural_sidecar(
         "warnings": sorted(set(warnings)),
         "elapsed_ms": _elapsed_ms(started),
     }
+    if expected_diag is not None:
+        payload["expected_ref_diagnostics"] = _public_structural_expected_ref_diagnostics(expected_diag)
+    return payload
+
+
+def _init_structural_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | None:
+    expected_diag = _init_expected_ref_diagnostics(expected_refs)
+    if expected_diag is None:
+        return None
+    for state in expected_diag["refs"]:
+        state["expected_file_indexed_by_structural_sidecar"] = False
+        state["expected_record_indexed_by_structural_sidecar"] = False
+        state["expected_file_selected_as_candidate_file"] = False
+        state["expected_record_selected_as_candidate_entry"] = False
+        state["structural_candidate_status"] = "not_selected"
+    return expected_diag
+
+
+def _mark_structural_expected_indexed(expected_diag: dict | None, index: StructuralSidecarIndex) -> None:
+    if expected_diag is None:
+        return
+    for state in expected_diag["refs"]:
+        table = index.files.get(state["_path"])
+        state["expected_file_indexed_by_structural_sidecar"] = table is not None and not table.invalid_reason
+        state["expected_record_indexed_by_structural_sidecar"] = bool(
+            table is not None and any(entry.line == state["_line"] for entry in table.entries)
+        )
+
+
+def _mark_structural_expected_candidates(
+    expected_diag: dict | None,
+    candidate_entries: list[tuple[StructuralFileTable, list[StructuralLineEntry]]],
+) -> None:
+    if expected_diag is None:
+        return
+    candidate_file_paths = {str(table.path) for table, _entries in candidate_entries}
+    candidate_record_keys = {
+        (str(table.path), entry.line)
+        for table, entries in candidate_entries
+        for entry in entries
+    }
+    for state in expected_diag["refs"]:
+        path = state["_path"]
+        key = (path, state["_line"])
+        state["expected_file_selected_by_source_plan"] = bool(state["expected_file_indexed_by_structural_sidecar"])
+        state["expected_file_queued_for_scan"] = path in candidate_file_paths
+        state["expected_file_selected_as_candidate_file"] = path in candidate_file_paths
+        state["expected_record_selected_as_candidate_entry"] = key in candidate_record_keys
+        if key in candidate_record_keys:
+            state["structural_candidate_status"] = "expected_record_selected_as_candidate_entry"
+        elif path in candidate_file_paths:
+            state["structural_candidate_status"] = "expected_file_selected_but_record_not_candidate"
+        elif state["expected_record_indexed_by_structural_sidecar"]:
+            state["structural_candidate_status"] = "expected_record_indexed_but_not_candidate"
+        elif state["expected_file_indexed_by_structural_sidecar"]:
+            state["structural_candidate_status"] = "expected_file_indexed_but_record_not_indexed"
+        else:
+            state["structural_candidate_status"] = "expected_file_not_indexed"
+
+
+def _structural_expected_state_for_entry(expected_diag: dict | None, path: Path, line: int) -> dict | None:
+    if expected_diag is None:
+        return None
+    return expected_diag["by_ref"].get((str(path), int(line)))
+
+
+def _public_structural_expected_ref_diagnostics(expected_diag: dict) -> dict:
+    public = _public_expected_ref_diagnostics(expected_diag)
+    indexed_count = 0
+    candidate_file_count = 0
+    candidate_entry_count = 0
+    by_ref_id = {state["ref_id"]: state for state in expected_diag["refs"]}
+    for ref in public["refs"]:
+        state = by_ref_id.get(ref["ref_id"]) or {}
+        ref["expected_file_indexed_by_structural_sidecar"] = bool(
+            state.get("expected_file_indexed_by_structural_sidecar")
+        )
+        ref["expected_record_indexed_by_structural_sidecar"] = bool(
+            state.get("expected_record_indexed_by_structural_sidecar")
+        )
+        ref["expected_file_selected_as_candidate_file"] = bool(
+            state.get("expected_file_selected_as_candidate_file")
+        )
+        ref["expected_record_selected_as_candidate_entry"] = bool(
+            state.get("expected_record_selected_as_candidate_entry")
+        )
+        ref["structural_candidate_status"] = str(state.get("structural_candidate_status") or "unknown")
+        indexed_count += int(ref["expected_record_indexed_by_structural_sidecar"])
+        candidate_file_count += int(ref["expected_file_selected_as_candidate_file"])
+        candidate_entry_count += int(ref["expected_record_selected_as_candidate_entry"])
+    public.update(
+        {
+            "structural_sidecar_enabled": True,
+            "indexed_expected_record_count": indexed_count,
+            "candidate_file_expected_ref_count": candidate_file_count,
+            "candidate_entry_expected_ref_count": candidate_entry_count,
+            "raw_paths_included": False,
+            "line_numbers_included": False,
+        }
+    )
+    return public
 
 
 def _build_file_table(path: Path, *, source_kind: str, default_tz) -> tuple[StructuralFileTable, int]:

@@ -2622,6 +2622,15 @@ def render_real_history_impact_text(payload: dict) -> str:
                 f"bytes_parsed={row.get('median_bytes_parsed')} "
                 f"context_bytes={row.get('median_output_context_bytes')}"
             )
+    diagnostic = report.get("structural_sidecar_diagnostic") or {}
+    if diagnostic:
+        decision = diagnostic.get("decision") or {}
+        lines.append(
+            "structural_sidecar_diagnostic: "
+            f"misses={diagnostic.get('structural_misses')} "
+            f"stages={diagnostic.get('miss_stage_counts')} "
+            f"next={decision.get('next_value_action')}"
+        )
     return "\n".join(lines)
 
 
@@ -2692,6 +2701,52 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                     f"{_escape_markdown_table(count_text or '(none)')} |"
                 )
     lines.extend(_benchmark_gate_markdown_lines(report))
+    diagnostic = report.get("structural_sidecar_diagnostic") or {}
+    if diagnostic:
+        decision = diagnostic.get("decision") or {}
+        lines.extend(
+            [
+                "",
+                "## Structural Sidecar Diagnostic",
+                "",
+                f"- Basis: `{diagnostic.get('basis')}`",
+                f"- Structural cases: `{diagnostic.get('structural_cases')}`",
+                f"- Structural misses: `{diagnostic.get('structural_misses')}`",
+                f"- Comparison counts: `{diagnostic.get('comparison_counts')}`",
+                f"- Miss stage counts: `{diagnostic.get('miss_stage_counts')}`",
+                f"- Repair family: `{decision.get('repair_family')}`",
+                f"- Next value action: `{decision.get('next_value_action')}`",
+                f"- Default promotion supported: `{decision.get('default_promotion_supported')}`",
+                f"- Token savings claim supported: `{decision.get('token_savings_claim_supported')}`",
+                f"- Full agent-loop cost: `{(diagnostic.get('cost_buckets') or {}).get('full_agent_loop_cost')}`",
+                "",
+                "### Structural Miss/Comparison Rows",
+                "",
+                "| Case | Class | Stage | Indexed | Candidate file | Candidate entry | Opened | Line reached | Candidate | Pre-final | Final | Structural bytes | Package bytes | Structural context | Package context |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in diagnostic.get("rows", []):
+            structural_ref = row.get("structural_expected_ref") or {}
+            cost = row.get("cost") or {}
+            lines.append(
+                "| "
+                f"{_escape_markdown_table(str(row.get('case_id', '')))} | "
+                f"{_escape_markdown_table(str(row.get('comparison_class', '')))} | "
+                f"{_escape_markdown_table(str(row.get('stage', '')))} | "
+                f"{structural_ref.get('indexed_record')} | "
+                f"{structural_ref.get('candidate_file_selected')} | "
+                f"{structural_ref.get('candidate_entry_selected')} | "
+                f"{structural_ref.get('opened')} | "
+                f"{structural_ref.get('record_line_reached')} | "
+                f"{structural_ref.get('candidate_created')} | "
+                f"{structural_ref.get('retained_pre_final')} | "
+                f"{structural_ref.get('final_kept')} | "
+                f"{cost.get('structural_bytes_parsed')} | "
+                f"{cost.get('package_bytes_parsed')} | "
+                f"{cost.get('structural_output_context_bytes')} | "
+                f"{cost.get('package_output_context_bytes')} |"
+            )
     if report.get("summary"):
         lines.extend(
             [

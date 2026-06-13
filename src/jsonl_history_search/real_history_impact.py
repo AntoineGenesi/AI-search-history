@@ -161,6 +161,9 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     base_report["rows"] = rows
     base_report["summary"] = _summarize(rows, selected)
     base_report["aggregate"] = _aggregate(rows)
+    structural_diagnostic = _structural_sidecar_diagnostic(rows)
+    if structural_diagnostic is not None:
+        base_report["structural_sidecar_diagnostic"] = structural_diagnostic
     base_report["headline_findings"] = _headline_findings(base_report["summary"], base_report["aggregate"], cap_hit_labels)
     base_report.update(_evaluate_gate_statuses(rows, base_report["summary"], base_report.get("warnings", [])))
 
@@ -525,6 +528,7 @@ def _run_package_search_structural_sidecar(**kwargs) -> tuple[dict[str, Any], di
         intent,
         default_tz=default_tz,
         cwd=str(Path(args.cwd).expanduser().resolve()),
+        expected_ref_diagnostics=case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None,
     )
     structural_warnings = _safe_warnings(result.get("warnings") or [])
     row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(structural_warnings)))
@@ -561,6 +565,9 @@ def _run_package_search_structural_sidecar(**kwargs) -> tuple[dict[str, Any], di
         notes=["opt_in_structural_codex_claude_sidecar_probe"],
     )
     row["structural_sidecar"] = _structural_sidecar_row_stats(result)
+    expected_diagnostics = _expected_ref_diagnostics_row(result)
+    if expected_diagnostics is not None:
+        row["expected_ref_diagnostics"] = expected_diagnostics
     raw_row["sanitized_row"] = row
     raw_row["structural_sidecar_result"] = result
     return row, raw_row
@@ -880,6 +887,23 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                 "pre_reservoir_status": str(ref.get("pre_reservoir_status") or "unknown"),
                 "pre_final_status": str(ref.get("pre_final_status") or "unknown"),
                 "final_status": str(ref.get("final_status") or "unknown"),
+                "expected_file_indexed_by_structural_sidecar": _optional_bool(
+                    ref.get("expected_file_indexed_by_structural_sidecar")
+                ),
+                "expected_record_indexed_by_structural_sidecar": _optional_bool(
+                    ref.get("expected_record_indexed_by_structural_sidecar")
+                ),
+                "expected_file_selected_as_candidate_file": _optional_bool(
+                    ref.get("expected_file_selected_as_candidate_file")
+                ),
+                "expected_record_selected_as_candidate_entry": _optional_bool(
+                    ref.get("expected_record_selected_as_candidate_entry")
+                ),
+                "structural_candidate_status": (
+                    str(ref.get("structural_candidate_status"))
+                    if ref.get("structural_candidate_status") is not None
+                    else None
+                ),
             }
         )
     opened_files = []
@@ -907,8 +931,18 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
         "pre_final_present_count": int(diagnostics.get("pre_final_present_count") or 0),
         "final_candidate_ref_present_count": int(diagnostics.get("final_candidate_ref_present_count") or 0),
         "final_candidate_group_present_count": int(diagnostics.get("final_candidate_group_present_count") or 0),
+        "structural_sidecar_enabled": bool(diagnostics.get("structural_sidecar_enabled")),
+        "indexed_expected_record_count": int(diagnostics.get("indexed_expected_record_count") or 0),
+        "candidate_file_expected_ref_count": int(diagnostics.get("candidate_file_expected_ref_count") or 0),
+        "candidate_entry_expected_ref_count": int(diagnostics.get("candidate_entry_expected_ref_count") or 0),
         "refs": refs,
     }
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
 
 
 def _recall_at(candidate_ref_ids: list[str], must_ids: set[str], k: int, expected_no_evidence: bool) -> float:
@@ -1055,6 +1089,191 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _structural_sidecar_diagnostic(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    structural_rows = {
+        (row["case_id"], row["repeat_index"]): row
+        for row in rows
+        if row["baseline"] == "package_search_structural_sidecar"
+    }
+    if not structural_rows:
+        return None
+    package_rows = {
+        (row["case_id"], row["repeat_index"]): row
+        for row in rows
+        if row["baseline"] == "package_search"
+    }
+    diagnostic_rows = []
+    for key, structural in sorted(structural_rows.items()):
+        package = package_rows.get(key)
+        ref = _first_expected_ref_diag(structural)
+        package_ref = _first_expected_ref_diag(package) if package else {}
+        structural_hit = bool(structural.get("first_pass_hit"))
+        package_hit = bool(package.get("first_pass_hit")) if package else None
+        diagnostic_rows.append(
+            {
+                "case_id": structural["case_id"],
+                "family": structural.get("family"),
+                "structural_first_pass_hit": structural_hit,
+                "package_first_pass_hit": package_hit,
+                "comparison_class": _structural_comparison_class(structural_hit, package_hit),
+                "stage": _structural_stage_from_ref(ref),
+                "structural_expected_ref": {
+                    "indexed_file": ref.get("expected_file_indexed_by_structural_sidecar"),
+                    "indexed_record": ref.get("expected_record_indexed_by_structural_sidecar"),
+                    "candidate_file_selected": ref.get("expected_file_selected_as_candidate_file"),
+                    "candidate_entry_selected": ref.get("expected_record_selected_as_candidate_entry"),
+                    "opened": ref.get("expected_file_opened_before_scan_stop"),
+                    "record_line_reached": ref.get("expected_record_line_reached_before_elapsed_stop"),
+                    "candidate_created": ref.get("expected_record_present_before_reservoir_retention"),
+                    "should_consider": ref.get("would_pass_should_consider"),
+                    "scored": ref.get("expected_record_present_before_reservoir_retention"),
+                    "retained_pre_final": ref.get("expected_record_present_in_pre_final_candidate_state"),
+                    "final_kept": ref.get("expected_record_present_in_final_candidate_refs"),
+                    "structural_candidate_status": ref.get("structural_candidate_status"),
+                    "should_consider_phase_label": ref.get("should_consider_phase_label"),
+                    "dedupe_phase_label": ref.get("dedupe_phase_label"),
+                    "reservoir_phase_label": ref.get("reservoir_phase_label"),
+                    "final_cap_phase_label": ref.get("final_cap_phase_label"),
+                },
+                "package_expected_ref": {
+                    "opened": package_ref.get("expected_file_opened_before_scan_stop"),
+                    "record_line_reached": package_ref.get("expected_record_line_reached_before_elapsed_stop"),
+                    "candidate_created": package_ref.get("expected_record_present_before_reservoir_retention"),
+                    "retained_pre_final": package_ref.get("expected_record_present_in_pre_final_candidate_state"),
+                    "final_kept": package_ref.get("expected_record_present_in_final_candidate_refs"),
+                    "line_reach_status": package_ref.get("line_reach_status"),
+                    "reservoir_phase_label": package_ref.get("reservoir_phase_label"),
+                    "final_cap_phase_label": package_ref.get("final_cap_phase_label"),
+                },
+                "cost": {
+                    "structural_files": int(structural.get("files_opened") or 0),
+                    "package_files": int(package.get("files_opened") or 0) if package else None,
+                    "structural_records": structural.get("records_parsed"),
+                    "package_records": package.get("records_parsed") if package else None,
+                    "structural_bytes_parsed": int(structural.get("bytes_parsed") or 0),
+                    "package_bytes_parsed": int(package.get("bytes_parsed") or 0) if package else None,
+                    "structural_output_context_bytes": int(structural.get("output_context_bytes") or 0),
+                    "package_output_context_bytes": (
+                        int(package.get("output_context_bytes") or 0) if package else None
+                    ),
+                    "structural_wall_time_ms": int(structural.get("wall_time_ms") or 0),
+                    "package_wall_time_ms": int(package.get("wall_time_ms") or 0) if package else None,
+                    "structural_cap_labels": list(structural.get("cap_hit_labels") or []),
+                    "package_cap_labels": list(package.get("cap_hit_labels") or []) if package else [],
+                },
+            }
+        )
+    misses = [row for row in diagnostic_rows if not row["structural_first_pass_hit"]]
+    comparison_counts = _counts(row["comparison_class"] for row in diagnostic_rows)
+    stage_counts = _counts(row["stage"] for row in misses)
+    decision = _structural_diagnostic_decision(diagnostic_rows, stage_counts)
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "basis": "same_run_sanitized_rows_with_expected_ref_diagnostics",
+        "structural_cases": len(diagnostic_rows),
+        "structural_misses": len(misses),
+        "comparison_counts": comparison_counts,
+        "miss_stage_counts": stage_counts,
+        "cost_buckets": {
+            "local_tool_work": "files, records, bytes parsed/scanned, elapsed time",
+            "model_facing_context_proxy": "output_context_bytes from benchmark result payloads",
+            "full_agent_loop_cost": "unavailable in this first-pass offline benchmark",
+        },
+        "privacy": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "line_numbers_included": False,
+            "raw_session_ids_included": False,
+            "expected_refs_used_for_retrieval": False,
+        },
+        "rows": diagnostic_rows,
+        "decision": decision,
+    }
+
+
+def _first_expected_ref_diag(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not row:
+        return {}
+    diagnostics = row.get("expected_ref_diagnostics") or {}
+    refs = diagnostics.get("refs") or []
+    return refs[0] if refs and isinstance(refs[0], dict) else {}
+
+
+def _structural_comparison_class(structural_hit: bool, package_hit: bool | None) -> str:
+    if package_hit is None:
+        return "package_not_run"
+    if structural_hit and package_hit:
+        return "both_hit"
+    if structural_hit and not package_hit:
+        return "structural_only_hit"
+    if package_hit:
+        return "package_only_hit"
+    return "both_miss"
+
+
+def _structural_stage_from_ref(ref: dict[str, Any]) -> str:
+    if not ref:
+        return "expected_ref_diagnostic_unavailable"
+    if ref.get("expected_record_present_in_final_candidate_refs"):
+        return "final_kept"
+    if ref.get("expected_record_present_in_pre_final_candidate_state"):
+        return "dropped_before_final_output"
+    if ref.get("expected_record_present_before_reservoir_retention"):
+        return "dropped_before_pre_final_retention"
+    if ref.get("deduped_before_scoring"):
+        return "deduped_before_scoring"
+    if ref.get("would_pass_should_consider") is False:
+        return "rejected_by_should_consider"
+    if ref.get("expected_record_line_reached_before_elapsed_stop"):
+        return "line_reached_but_not_scored"
+    if ref.get("expected_file_opened_before_scan_stop"):
+        return "opened_expected_file_but_line_not_reached"
+    if ref.get("expected_record_selected_as_candidate_entry"):
+        return "candidate_entry_selected_but_not_reached"
+    if ref.get("expected_file_selected_as_candidate_file"):
+        return "candidate_file_selected_but_record_not_candidate"
+    if ref.get("expected_record_indexed_by_structural_sidecar"):
+        return "indexed_record_not_selected"
+    if ref.get("expected_file_indexed_by_structural_sidecar"):
+        return "indexed_file_without_expected_record"
+    return "expected_file_not_indexed"
+
+
+def _structural_diagnostic_decision(
+    rows: list[dict[str, Any]],
+    stage_counts: dict[str, int],
+) -> dict[str, Any]:
+    package_only = sum(1 for row in rows if row["comparison_class"] == "package_only_hit")
+    structural_only = sum(1 for row in rows if row["comparison_class"] == "structural_only_hit")
+    next_action = "jsh-770-package-plus-structural-hybrid-candidate-routing-probe"
+    rationale = (
+        "Structural sidecar recovers at least one package miss while package still recovers multiple "
+        "structural misses; a hybrid probe is the next bounded behavior test."
+    )
+    if structural_only == 0:
+        next_action = "pivot_to_agent_loop_cost_benchmark_or_non_sidecar_retrieval_repair"
+        rationale = "Structural sidecar does not add unique first-pass recall in this diagnostic surface."
+    elif package_only == 0:
+        next_action = "consider_structural_sidecar_promotion_gate_after_held_out_validation"
+        rationale = "Structural sidecar has no package-only losses in this diagnostic surface."
+    if stage_counts.get("indexed_record_not_selected", 0) or stage_counts.get("candidate_file_selected_but_record_not_candidate", 0):
+        repair_family = "candidate_routing_or_candidate_entry_retention"
+    elif stage_counts.get("opened_expected_file_but_line_not_reached", 0):
+        repair_family = "within_file_record_selection_window"
+    elif stage_counts.get("dropped_before_pre_final_retention", 0) or stage_counts.get("dropped_before_final_output", 0):
+        repair_family = "retention_or_final_truncation"
+    else:
+        repair_family = "hybrid_package_structural_routing"
+    return {
+        "repair_family": repair_family,
+        "next_value_action": next_action,
+        "rationale": rationale,
+        "default_promotion_supported": False,
+        "token_savings_claim_supported": False,
+    }
+
+
 def _headline_findings(
     summary: dict[str, Any],
     aggregate: dict[str, Any],
@@ -1085,7 +1304,7 @@ def _headline_findings(
             f"manual_newest_first_open recovered {manual.get('first_pass_hits', 0)}/{manual.get('cases', 0)} cases while handing off full opened-file content"
         )
     equivalence = rg.get("equivalence_vs_package_search") or aggregate.get("source_ref_equivalence") or {}
-    if equivalence:
+    if equivalence and int(equivalence.get("compared_runs") or 0) > 0:
         findings.append(
             "package_search_rg_prefilter preserved source-ref equivalence versus package_search, but most rows fell back or had no reduction"
         )
