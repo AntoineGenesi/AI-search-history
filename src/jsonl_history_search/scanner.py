@@ -138,35 +138,12 @@ def search(
                     expected_state["expected_record_present_before_reservoir_retention"] = True
                     expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
                     expected_state["dedupe_phase_label"] = "not_deduped"
-                if mask_context is not None:
-                    copied_text = mask_context.mask_text(
-                        record.text,
-                        source_path=record.path,
-                        source_index=record.line,
-                    )
-                else:
-                    copied_text = record.text
-                snippet_text = make_snippet(copied_text, intent.terms)
-                facets = facets_for_record(path=record.path, text=record.text, artifacts=artifacts)
-                match = Match(
-                    path=record.path,
-                    line=record.line,
-                    role=record.role,
-                    timestamp=record.timestamp.isoformat() if record.timestamp else None,
-                    cwd=record.cwd,
-                    snippet=snippet_text,
-                    score=round(score, 3),
-                    reasons=reasons,
-                    artifacts=facets.artifacts,
-                    session=facets.session,
-                    tasks=facets.tasks,
-                    preferences=facets.preferences,
-                )
+                candidate_sort_key = match_candidate_sort_key(record, score)
                 if is_weak_partial_generic(reasons):
                     if expected_state is not None:
                         expected_state["candidate_strength"] = "weak"
                     if len(weak_matches) < weak_reservoir_limit:
-                        weak_matches.append(match)
+                        weak_matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
                         if expected_state is not None:
                             expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
                     else:
@@ -174,8 +151,10 @@ def search(
                             range(len(weak_matches)),
                             key=lambda index: match_sort_key(weak_matches[index]),
                         )
-                        if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
-                            weak_matches[weakest_index] = match
+                        if candidate_sort_key > match_sort_key(weak_matches[weakest_index]):
+                            weak_matches[weakest_index] = _materialize_match(
+                                record, score, reasons, artifacts, intent, mask_context
+                            )
                             if expected_state is not None:
                                 expected_state["reservoir_phase_label"] = "weak_reservoir_replaced_existing_candidate"
                         elif expected_state is not None:
@@ -186,7 +165,7 @@ def search(
                 if expected_state is not None:
                     expected_state["candidate_strength"] = "strong"
                 if len(matches) < strong_reservoir_limit:
-                    matches.append(match)
+                    matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
                     continue
@@ -194,8 +173,10 @@ def search(
                     range(len(matches)),
                     key=lambda index: match_sort_key(matches[index]),
                 )
-                if match_sort_key(match) > match_sort_key(matches[weakest_index]):
-                    matches[weakest_index] = match
+                if candidate_sort_key > match_sort_key(matches[weakest_index]):
+                    matches[weakest_index] = _materialize_match(
+                        record, score, reasons, artifacts, intent, mask_context
+                    )
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_replaced_existing_candidate"
                 elif expected_state is not None:
@@ -539,6 +520,49 @@ def dedupe_source_scope(record) -> str:
     if record.record_id:
         return f"record_id:{source_format}:{record.conversation_id or ''}:{record.record_id}"
     return f"source_ref:{source_format}:{record.path}:{record.line}"
+
+
+def _materialize_match(
+    record,
+    score: float,
+    reasons: list[str],
+    artifacts: list[str],
+    intent: QueryIntent,
+    mask_context: MaskContext | None,
+) -> Match:
+    if mask_context is not None:
+        copied_text = mask_context.mask_text(
+            record.text,
+            source_path=record.path,
+            source_index=record.line,
+        )
+    else:
+        copied_text = record.text
+    snippet_text = make_snippet(copied_text, intent.terms)
+    facets = facets_for_record(path=record.path, text=record.text, artifacts=artifacts)
+    return Match(
+        path=record.path,
+        line=record.line,
+        role=record.role,
+        timestamp=record.timestamp.isoformat() if record.timestamp else None,
+        cwd=record.cwd,
+        snippet=snippet_text,
+        score=round(score, 3),
+        reasons=reasons,
+        artifacts=facets.artifacts,
+        session=facets.session,
+        tasks=facets.tasks,
+        preferences=facets.preferences,
+    )
+
+
+def match_candidate_sort_key(record, score: float) -> tuple[float, str, str, int]:
+    return (
+        round(score, 3),
+        record.timestamp.isoformat() if record.timestamp else "",
+        record.path,
+        -record.line,
+    )
 
 
 def match_sort_key(match: Match) -> tuple[float, str, str, int]:
