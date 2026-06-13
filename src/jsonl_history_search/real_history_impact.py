@@ -15,6 +15,10 @@ from .query import infer_query
 from .real_history_bridge import validate_bridge_files
 from .scanner import search
 from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
+from .structural_hybrid import (
+    hybrid_package_structural_result as _shared_hybrid_package_structural_result,
+    structural_supplement_gate as _shared_structural_supplement_gate,
+)
 from .structural_sidecar import build_structural_sidecar_index, search_with_structural_sidecar
 from .timeutil import parse_now, timezone_from_args
 
@@ -787,74 +791,22 @@ def _hybrid_package_structural_result(
     supplement_limit: int,
     gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    gate = gate or {"supplement_enabled": True, "gate_reason": "ungated", "gate_candidate_threshold": None}
-    package_groups = list(package_result.get("groups") or [])
-    package_keys = _match_keys(package_groups)
-    effective_structural_result = structural_result if gate["supplement_enabled"] else None
-    structural_supplement: list[dict[str, Any]] = []
-    if effective_structural_result is not None:
-        for match in _flat_matches(effective_structural_result.get("groups") or []):
-            key = _match_key(match)
-            if key in package_keys:
-                continue
-            structural_supplement.append(match)
-            package_keys.add(key)
-            if len(structural_supplement) >= supplement_limit:
-                break
-    groups = list(package_groups)
-    if structural_supplement:
-        groups.append(
-            {
-                "group_key": "structural_sidecar_supplement",
-                "matches": structural_supplement,
-                "source": "package_search_structural_hybrid",
-            }
-        )
-    return {
-        "status": "planned_package_structural_hybrid",
-        "strategy": "package_first_bounded_structural_supplement",
-        "gate": gate,
-        "groups": groups,
-        "package_candidate_count": sum(len(group.get("matches") or []) for group in package_groups),
-        "structural_supplement_candidate_count": len(structural_supplement),
-        "supplement_limit": supplement_limit,
-        "searched_files": int(package_result.get("searched_files", 0))
-        + int((effective_structural_result or {}).get("searched_files", 0)),
-        "searched_bytes": int(package_result.get("searched_bytes", 0))
-        + int((effective_structural_result or {}).get("searched_bytes", 0)),
-        "package_searched_bytes": int(package_result.get("searched_bytes", 0)),
-        "structural_searched_bytes": int((effective_structural_result or {}).get("searched_bytes", 0)),
-        "package_warnings": _safe_warnings(package_result.get("warnings") or []),
-        "structural_warnings": _safe_warnings((effective_structural_result or {}).get("warnings") or []),
-        "privacy": {
-            "raw_paths_included_in_summary": False,
-            "raw_text_included_in_summary": False,
-            "expected_refs_used_for_retrieval": False,
-        },
-    }
+    result = _shared_hybrid_package_structural_result(
+        package_result,
+        structural_result,
+        supplement_limit=supplement_limit,
+        gate=gate,
+    )
+    result["package_warnings"] = _safe_warnings(result.get("package_warnings") or [])
+    result["structural_warnings"] = _safe_warnings(result.get("structural_warnings") or [])
+    return result
 
 
 def _structural_supplement_gate(*, package_candidate_count: int, threshold: int | None) -> dict[str, Any]:
-    if threshold is None:
-        return {
-            "supplement_enabled": True,
-            "gate_reason": "ungated",
-            "gate_candidate_threshold": None,
-            "package_candidate_count": package_candidate_count,
-            "oracle_inputs_used": False,
-        }
-    enabled = package_candidate_count <= threshold
-    return {
-        "supplement_enabled": enabled,
-        "gate_reason": (
-            "package_candidate_count_at_or_below_threshold"
-            if enabled
-            else "package_candidate_count_above_threshold"
-        ),
-        "gate_candidate_threshold": threshold,
-        "package_candidate_count": package_candidate_count,
-        "oracle_inputs_used": False,
-    }
+    return _shared_structural_supplement_gate(
+        package_candidate_count=package_candidate_count,
+        threshold=threshold,
+    )
 
 
 def _flat_matches(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

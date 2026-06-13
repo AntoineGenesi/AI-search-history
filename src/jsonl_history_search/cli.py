@@ -95,6 +95,7 @@ from .scanner import search
 from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
 from .skill_audit import build_skill_audit_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
+from .structural_hybrid import search_structural_hybrid_budgeted
 from .timeutil import parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
 from .workflow_repeat import build_workflow_repeat_payload
@@ -138,6 +139,20 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Optional path where the full find report should be written as JSON or Markdown.",
         )
+    structural_hybrid = subparsers.add_parser(
+        "find-structural-hybrid-budgeted",
+        description=(
+            "Opt-in no-send installed helper for package-first search with a "
+            "budgeted structural sidecar supplement."
+        ),
+    )
+    structural_hybrid.add_argument("query", nargs="?", default="")
+    add_common_args(structural_hybrid)
+    structural_hybrid.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the full budgeted structural hybrid find report should be written.",
+    )
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
     add_common_args(manifest)
@@ -1694,6 +1709,35 @@ def main(argv: list[str] | None = None) -> int:
             shortlist_limit=args.shortlist_limit,
         )
         payload["source_plan"] = source_plan
+    elif args.command == "find-structural-hybrid-budgeted":
+        mask_context = _mask_context_from_args(args)
+        result = search_structural_hybrid_budgeted(
+            plan,
+            intent,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=source_plan["cwd"],
+            mask_context=mask_context,
+        )
+        result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
+        payload = build_agent_find_payload(
+            source_plan=source_plan,
+            search_result=result,
+            manifest_report=None,
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        payload["agent_find"]["structural_hybrid_budgeted"] = {
+            "command_surface": result["command_surface"],
+            "status": result["status"],
+            "strategy": result["strategy"],
+            "gate": result["gate"],
+            "package_candidate_count": result["package_candidate_count"],
+            "structural_supplement_candidate_count": result["structural_supplement_candidate_count"],
+            "supplement_limit": result["supplement_limit"],
+            "package_searched_bytes": result["package_searched_bytes"],
+            "structural_searched_bytes": result["structural_searched_bytes"],
+            "privacy": result["privacy"],
+        }
     elif args.command in {"find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"}:
         mask_context = _mask_context_from_args(args)
         result = search(
