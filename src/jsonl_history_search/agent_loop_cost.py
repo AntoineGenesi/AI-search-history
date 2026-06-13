@@ -519,7 +519,7 @@ def build_retained_trace_counter_payload(
             "evaluator_only_raw_material_committed": False,
         },
         "unavailable_policy": "unobserved counters remain literal unavailable, not zero",
-        "selected_next_value_producing_action": "review_jsh_756_counter_packet_then_select_next_value_step",
+        "selected_next_value_producing_action": "plan_next_clean_held_out_measurement_row_using_jsh_756_counter_packet",
     }
     return {"retained_trace_counters": packet}
 
