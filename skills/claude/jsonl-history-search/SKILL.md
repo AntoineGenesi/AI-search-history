@@ -23,16 +23,25 @@ Trigger JSONL even when the user does not name it. Route these asks first:
 | User ask | Workflow | First command |
 | --- | --- | --- |
 | "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction retrieval | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format json` |
+| "What did I just say?" "Find my last message." "Recent messages." "Since my last message." | Deterministic latest user-message lookup | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
 | "Did the agent actually run/edit/test/review X?" | Agent action/proof audit | `jsonl-history-search semantic-debug "did the agent actually run/edit/test/review <thing>" --cwd "$PWD" --format json` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `jsonl-history-search semantic-debug "why did this happen?" --task <task-slug> --path <path> --cwd "$PWD" --format json` |
 
-Use `semantic-debug` as the first packet command for these workflows because it returns `source_locator_handoff`, source scope, route choices, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `plan`, `find`, `structured-tool-events`, or `forensics` only for a focused follow-up.
+Use `latest-user-messages` first for last/recent user-message wording. It sorts high-confidence Codex user messages by normalized timestamp and does not use semantic search, phrase matching, query expansion, or score ranking. Use `semantic-debug` as the first packet command for the other workflows because it returns `source_locator_handoff`, source scope, route choices, candidates, timeline, structured tool/action proof, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. Drop to `plan`, `find`, `structured-tool-events`, or `forensics` only for a focused follow-up.
 
 Route quality-sensitive asks to the package before any standalone helper:
 
 - Use `semantic-debug` first for remembered instructions, agent proof, provenance, ambiguous or semantic questions, no-evidence checks, and answer-quality-shaped investigations.
+- Use `latest-user-messages` first for "last message", "what did I just say", "recent messages", and "since my last message"; do not run semantic or phrase search for those intents.
 - Use `find` for a focused fuzzy, typo, synonym, or paraphrase candidate search when the full router packet is unnecessary.
 - Use the helper only for fast operational recovery: latest/today/most-recent lookup, timestamp-window lookup, exact-phrase lookup, or broad-term recovery where the important words are expected to appear in the logs.
+
+For last/recent user-message lookup:
+
+```bash
+jsonl-history-search latest-user-messages --format json --max-matches 10
+python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py --latest-user-messages --limit 10 --context 500
+```
 
 ## Semantic Debugging
 

@@ -32,6 +32,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
+from .latest_user_messages import build_latest_user_messages_payload
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
@@ -152,6 +153,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the full budgeted structural hybrid find report should be written.",
+    )
+    latest_user = subparsers.add_parser(
+        "latest-user-messages",
+        description=(
+            "Deterministic newest-first lookup for high-confidence Codex user "
+            "messages. This does not use semantic search or phrase ranking."
+        ),
+    )
+    add_common_args(latest_user)
+    latest_user.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum user messages to return; defaults to --max-matches.",
+    )
+    latest_user.add_argument(
+        "--snippet-chars",
+        type=int,
+        default=500,
+        help="Maximum characters of each message snippet to include; 0 keeps the full text.",
     )
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
@@ -1699,6 +1720,10 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["archive_snapshot_proof"]["status"]
         return 1 if status in {"invalid_request", "proof_failed"} else 0
+    if args.command == "latest-user-messages":
+        payload = build_latest_user_messages_payload(args)
+        print(render(payload, args.format))
+        return 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(
