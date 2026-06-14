@@ -15,9 +15,10 @@ from .structural_sidecar import (
 
 BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD = 10
 BUDGETED_HYBRID_SUPPLEMENT_LIMIT = 10
-BUDGETED_HYBRID_RECORD_WINDOW_RADIUS = 2
-BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE = 12
-BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL = 60
+BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE = "intent_structural"
+BUDGETED_HYBRID_RECORD_WINDOW_RADIUS = 0
+BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE = 0
+BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL = 0
 
 
 def search_structural_hybrid_budgeted(
@@ -30,6 +31,7 @@ def search_structural_hybrid_budgeted(
     structural_sidecar_index: StructuralSidecarIndex | None = None,
     gate_candidate_threshold: int = BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD,
     supplement_limit: int = BUDGETED_HYBRID_SUPPLEMENT_LIMIT,
+    candidate_selection_profile: str = BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE,
     record_window_radius: int = BUDGETED_HYBRID_RECORD_WINDOW_RADIUS,
     record_window_max_extra_entries_per_file: int = BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE,
     record_window_max_extra_entries_total: int = BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL,
@@ -59,6 +61,7 @@ def search_structural_hybrid_budgeted(
             default_tz=default_tz,
             cwd=cwd,
             expected_ref_diagnostics=expected_ref_diagnostics,
+            candidate_selection_profile=candidate_selection_profile,
             record_window_radius=record_window_radius,
             record_window_max_extra_entries_per_file=record_window_max_extra_entries_per_file,
             record_window_max_extra_entries_total=record_window_max_extra_entries_total,
@@ -78,6 +81,7 @@ def search_structural_hybrid_budgeted(
             "record_window_max_extra_entries_total": max(0, int(record_window_max_extra_entries_total or 0)),
             "oracle_inputs_used": False,
         },
+        candidate_selection_profile=candidate_selection_profile,
     )
     result["warnings"] = sorted(
         set((package_result.get("warnings") or []) + ((structural_result or {}).get("warnings") or []))
@@ -92,6 +96,7 @@ def search_structural_hybrid_budgeted(
         "live_send_capable": False,
         "private_bridge_required": False,
         "expected_refs_required": False,
+        "candidate_selection_profile": candidate_selection_profile,
     }
     if package_result.get("expected_ref_diagnostics") is not None:
         result["expected_ref_diagnostics"] = package_result["expected_ref_diagnostics"]
@@ -105,6 +110,7 @@ def hybrid_package_structural_result(
     supplement_limit: int,
     gate: dict[str, Any] | None = None,
     record_window_config: dict[str, Any] | None = None,
+    candidate_selection_profile: str = "default",
 ) -> dict[str, Any]:
     gate = gate or {"supplement_enabled": True, "gate_reason": "ungated", "gate_candidate_threshold": None}
     package_groups = list(package_result.get("groups") or [])
@@ -138,12 +144,14 @@ def hybrid_package_structural_result(
         "package_candidate_count": sum(len(group.get("matches") or []) for group in package_groups),
         "structural_supplement_candidate_count": len(structural_supplement),
         "supplement_limit": supplement_limit,
+        "candidate_selection_profile": candidate_selection_profile,
         "searched_files": int(package_result.get("searched_files", 0))
         + int((effective_structural_result or {}).get("searched_files", 0)),
         "searched_bytes": int(package_result.get("searched_bytes", 0))
         + int((effective_structural_result or {}).get("searched_bytes", 0)),
         "package_searched_bytes": int(package_result.get("searched_bytes", 0)),
         "structural_searched_bytes": int((effective_structural_result or {}).get("searched_bytes", 0)),
+        "structural_records_considered": int((effective_structural_result or {}).get("records_considered", 0)),
         "record_window": record_window,
         "record_window_enabled": bool(record_window["record_window_enabled"]),
         "record_window_radius": int(record_window["record_window_radius"]),
