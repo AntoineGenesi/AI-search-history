@@ -17,6 +17,7 @@ from .scanner import search
 from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
 from .structural_hybrid import (
     hybrid_package_structural_result as _shared_hybrid_package_structural_result,
+    search_structural_hybrid_budgeted,
     structural_supplement_gate as _shared_structural_supplement_gate,
 )
 from .structural_sidecar import build_structural_sidecar_index, search_with_structural_sidecar
@@ -601,13 +602,60 @@ def _run_package_search_structural_hybrid(**kwargs) -> tuple[dict[str, Any], dic
 
 
 def _run_package_search_structural_hybrid_budgeted(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
-    return _run_package_search_structural_hybrid_variant(
-        baseline="package_search_structural_hybrid_budgeted",
-        gate_candidate_threshold=10,
-        supplement_limit=10,
-        note="opt_in_budgeted_structural_supplement_probe",
-        **kwargs,
+    case = kwargs["case"]
+    args = kwargs["args"]
+    plan = kwargs["plan"]
+    index = kwargs.get("structural_sidecar_index")
+    started = time.perf_counter()
+    default_tz = timezone_from_args(args.timezone, args.timezone_offset)
+    now = parse_now(args.now, default_tz)
+    intent = infer_query(str(case["query_text"]), now=now)
+    expected_refs = case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None
+    hybrid_result = search_structural_hybrid_budgeted(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=str(Path(args.cwd).expanduser().resolve()),
+        structural_sidecar_index=index,
+        expected_ref_diagnostics=expected_refs,
     )
+    warnings = _safe_warnings(hybrid_result.get("warnings") or [])
+    row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(warnings)))
+    candidates, ranking_reason_label_count = _candidates_from_groups(hybrid_result.get("groups", []))
+    package_searched_bytes = int(hybrid_result.get("package_searched_bytes", 0))
+    structural_searched_bytes = int(hybrid_result.get("structural_searched_bytes", 0))
+    gate = hybrid_result.get("gate") or {}
+    row, raw_row = _row_pair(
+        case=case,
+        baseline="package_search_structural_hybrid_budgeted",
+        repeat_index=kwargs["repeat_index"],
+        started=started,
+        tool_calls=2 if gate.get("supplement_enabled") else 1,
+        subprocess_calls=0,
+        files_opened=int(hybrid_result.get("searched_files", 0)),
+        records_parsed=_estimated_package_records_parsed(
+            kwargs["files"],
+            package_searched_bytes,
+            _prefilter_row_stats({}, enabled=False),
+            False,
+        )
+        + int(hybrid_result.get("record_window_entry_count") or 0),
+        bytes_scanned=package_searched_bytes + structural_searched_bytes,
+        bytes_parsed=package_searched_bytes + structural_searched_bytes,
+        output_context_bytes=len(json.dumps(hybrid_result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+        candidates=candidates,
+        cap_hit_labels=row_cap_hit_labels,
+        ranking_reason_label_count=ranking_reason_label_count,
+        warnings=warnings,
+        notes=["opt_in_budgeted_structural_supplement_probe"],
+    )
+    row["structural_hybrid"] = _structural_hybrid_row_stats(hybrid_result)
+    expected_diagnostics = _expected_ref_diagnostics_row(hybrid_result)
+    if expected_diagnostics is not None:
+        row["expected_ref_diagnostics"] = expected_diagnostics
+    raw_row["sanitized_row"] = row
+    raw_row["hybrid_result"] = hybrid_result
+    return row, raw_row
 
 
 def _run_package_search_structural_hybrid_variant(
@@ -822,6 +870,7 @@ def _match_key(match: dict[str, Any]) -> tuple[str, int]:
 
 
 def _structural_hybrid_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+    record_window = result.get("record_window") if isinstance(result.get("record_window"), dict) else {}
     return {
         "enabled": True,
         "status": str(result.get("status") or "unknown"),
@@ -833,6 +882,17 @@ def _structural_hybrid_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "supplement_enabled": bool((result.get("gate") or {}).get("supplement_enabled")),
         "package_searched_bytes": int(result.get("package_searched_bytes") or 0),
         "structural_searched_bytes": int(result.get("structural_searched_bytes") or 0),
+        "record_window": record_window,
+        "record_window_enabled": bool(result.get("record_window_enabled")),
+        "record_window_radius": int(result.get("record_window_radius") or 0),
+        "record_window_seed_entry_count": int(result.get("record_window_seed_entry_count") or 0),
+        "record_window_extra_entry_count": int(result.get("record_window_extra_entry_count") or 0),
+        "record_window_entry_count": int(result.get("record_window_entry_count") or 0),
+        "record_window_max_extra_entries_per_file": int(
+            result.get("record_window_max_extra_entries_per_file") or 0
+        ),
+        "record_window_max_extra_entries_total": int(result.get("record_window_max_extra_entries_total") or 0),
+        "oracle_inputs_used": False,
         "raw_paths_included": False,
         "raw_text_included": False,
         "expected_refs_used_for_retrieval": False,
