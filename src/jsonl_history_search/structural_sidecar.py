@@ -163,6 +163,7 @@ def search_with_structural_sidecar(
     cwd: str | None,
     selected_paths: set[str] | None = None,
     expected_ref_diagnostics: list[dict] | None = None,
+    candidate_selection_profile: str = "default",
     record_window_radius: int = 0,
     record_window_max_extra_entries_per_file: int = 0,
     record_window_max_extra_entries_total: int = 0,
@@ -170,7 +171,13 @@ def search_with_structural_sidecar(
     started = time.perf_counter()
     warnings = list(index.warnings) + list(plan.warnings)
     query_profile = _query_profile(intent)
-    seed_candidate_entries = _candidate_entries(index, query_profile, selected_paths=selected_paths)
+    normalized_candidate_selection_profile = _candidate_selection_profile(candidate_selection_profile)
+    seed_candidate_entries = _candidate_entries(
+        index,
+        query_profile,
+        selected_paths=selected_paths,
+        candidate_selection_profile=normalized_candidate_selection_profile,
+    )
     candidate_entries, record_window_stats = _expand_record_window_entries(
         seed_candidate_entries,
         radius=record_window_radius,
@@ -203,6 +210,7 @@ def search_with_structural_sidecar(
                 index=index,
                 query_profile=query_profile,
                 record_window_stats=record_window_stats,
+                candidate_selection_profile=normalized_candidate_selection_profile,
             )
         try:
             with table.path.open("rb") as handle:
@@ -309,6 +317,7 @@ def search_with_structural_sidecar(
         "status": "planned_structural_seek",
         "fallback_reason": None,
         "query_profile": _sanitized_query_profile(query_profile),
+        "candidate_selection_profile": normalized_candidate_selection_profile,
         "candidate_files": len(candidate_entries),
         "candidate_entries": candidate_entry_count,
         "searched_files": len(opened_paths),
@@ -329,6 +338,7 @@ def search_with_structural_sidecar(
             records_considered=records_considered,
             source_kinds=source_kinds,
             record_window_stats=record_window_stats,
+            candidate_selection_profile=normalized_candidate_selection_profile,
         ),
         "privacy": _privacy_payload(),
         "warnings": sorted(set(warnings)),
@@ -520,6 +530,7 @@ def _candidate_entries(
     query_profile: dict[str, Any],
     *,
     selected_paths: set[str] | None,
+    candidate_selection_profile: str = "default",
 ) -> list[tuple[StructuralFileTable, list[StructuralLineEntry]]]:
     candidates: list[tuple[StructuralFileTable, list[tuple[tuple[int, int, int, int], StructuralLineEntry]]]] = []
     query_terms: set[str] = set(query_profile["lexical_terms"])
@@ -531,7 +542,12 @@ def _candidate_entries(
         session_seen: set[str] = set()
         for entry in table.entries:
             lexical_overlap = len(entry.lexical_terms & query_terms)
-            structural_overlap = len(entry.structural_tags & query_tags)
+            structural_overlap = _structural_overlap(
+                entry,
+                query_tags,
+                query_profile,
+                candidate_selection_profile=candidate_selection_profile,
+            )
             event_bonus = len(entry.event_families & set(query_profile["event_families"]))
             if not lexical_overlap and not structural_overlap and not event_bonus:
                 continue
@@ -540,11 +556,60 @@ def _candidate_entries(
             score = (structural_overlap + event_bonus, lexical_overlap, diversity_bonus, -entry.line)
             scored_entries.append((score, entry))
         if scored_entries:
-            scored_entries.sort(key=lambda item: item[0], reverse=True)
-            candidates.append((table, scored_entries[: max(1, min(MAX_ENTRIES_PER_FILE, len(scored_entries)))]))
+            selected_entries = _select_scored_entries(
+                scored_entries,
+                query_profile,
+                candidate_selection_profile=candidate_selection_profile,
+            )
+            candidates.append((table, selected_entries))
     candidates.sort(key=lambda item: (item[1][0][0], len(item[1])), reverse=True)
     candidates = candidates[:MAX_CANDIDATE_FILES]
     return [(table, [entry for _score, entry in entries]) for table, entries in candidates]
+
+
+def _select_scored_entries(
+    scored_entries: list[tuple[tuple[int, int, int, int], StructuralLineEntry]],
+    query_profile: dict[str, Any],
+    *,
+    candidate_selection_profile: str,
+) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
+    limit = max(1, min(MAX_ENTRIES_PER_FILE, len(scored_entries)))
+    if candidate_selection_profile != "intent_structural" or not _use_intent_structural_order(query_profile):
+        scored_entries.sort(key=lambda item: item[0], reverse=True)
+        return scored_entries[:limit]
+
+    query_tags = set(query_profile["structural_tags"])
+    prefer_timestamp = bool(query_profile.get("date_reason")) or bool(query_profile.get("date_window_present"))
+    preferred_role_tag = f"role:{_safe_tag(str(query_profile.get('role') or ''))}" if query_profile.get("role") else None
+
+    def sort_key(item: tuple[tuple[int, int, int, int], StructuralLineEntry]) -> tuple[int, int, int, int, int, int]:
+        base_score, entry = item
+        timestamp_match = int(prefer_timestamp and entry.timestamp_bucket == "timestamp_present")
+        role_match = int(bool(preferred_role_tag and preferred_role_tag in entry.structural_tags))
+        structural_overlap = len(entry.structural_tags & query_tags)
+        return (
+            timestamp_match,
+            role_match,
+            structural_overlap + base_score[0],
+            base_score[1],
+            base_score[2],
+            entry.line,
+        )
+
+    scored_entries.sort(key=sort_key, reverse=True)
+    return scored_entries[:limit]
+
+
+def _candidate_selection_profile(value: str | None) -> str:
+    if value == "intent_structural":
+        return "intent_structural"
+    return "default"
+
+
+def _use_intent_structural_order(query_profile: dict[str, Any]) -> bool:
+    if query_profile.get("date_reason") or query_profile.get("date_window_present"):
+        return True
+    return bool(query_profile.get("role"))
 
 
 def _expand_record_window_entries(
@@ -628,12 +693,21 @@ def _query_profile(intent: QueryIntent) -> dict[str, Any]:
     if any(term in {"report", "artifact", "task", "file", "wrote", "created"} for term in terms):
         event_families.add("artifact")
         structural_tags.add("event_family:artifact")
-    if "date" in terms or "timeline" in terms or re.search(r"\bwhen\b", lower_terms):
+    if (
+        "date" in terms
+        or "timeline" in terms
+        or re.search(r"\bwhen\b", lower_terms)
+    ):
         structural_tags.add("time:timestamp_present")
     return {
         "lexical_terms": terms,
         "structural_tags": structural_tags,
         "event_families": event_families,
+        "role": intent.role,
+        "role_filter_explicit": intent.role_filter_explicit,
+        "date_reason": intent.date_reason,
+        "date_window_present": intent.date_window_start is not None or intent.date_window_end is not None,
+        "date_window_filter": intent.date_window_filter,
     }
 
 
@@ -642,8 +716,33 @@ def _sanitized_query_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "lexical_term_count": len(profile["lexical_terms"]),
         "structural_tags": sorted(profile["structural_tags"]),
         "event_families": sorted(profile["event_families"]),
+        "role": profile.get("role"),
+        "role_filter_explicit": bool(profile.get("role_filter_explicit")),
+        "date_reason": profile.get("date_reason"),
+        "date_window_present": bool(profile.get("date_window_present")),
+        "date_window_filter": bool(profile.get("date_window_filter")),
         "raw_query_text_included": False,
     }
+
+
+def _structural_overlap(
+    entry: StructuralLineEntry,
+    query_tags: set[str],
+    query_profile: dict[str, Any],
+    *,
+    candidate_selection_profile: str,
+) -> int:
+    overlap = len(entry.structural_tags & query_tags)
+    if candidate_selection_profile != "intent_structural":
+        return overlap
+    role = query_profile.get("role")
+    if role and f"role:{_safe_tag(str(role))}" in entry.structural_tags:
+        overlap += 1
+    if (query_profile.get("date_reason") or query_profile.get("date_window_present")) and (
+        entry.timestamp_bucket == "timestamp_present"
+    ):
+        overlap += 1
+    return overlap
 
 
 def _lexical_terms(text: str) -> set[str]:
@@ -771,12 +870,14 @@ def _fallback_payload(
     index: StructuralSidecarIndex,
     query_profile: dict[str, Any],
     record_window_stats: dict[str, Any] | None = None,
+    candidate_selection_profile: str = "default",
 ) -> dict[str, Any]:
     record_window_stats = record_window_stats or _default_record_window_stats()
     return {
         "status": "fallback_required",
         "fallback_reason": reason,
         "query_profile": _sanitized_query_profile(query_profile),
+        "candidate_selection_profile": candidate_selection_profile,
         "candidate_files": 0,
         "candidate_entries": 0,
         "searched_files": 0,
@@ -811,10 +912,12 @@ def _search_summary(
     records_considered: int,
     source_kinds: set[str],
     record_window_stats: dict[str, Any],
+    candidate_selection_profile: str,
 ) -> dict[str, Any]:
     return {
         **index.sanitized_summary(),
         "query_profile": _sanitized_query_profile(query_profile),
+        "candidate_selection_profile": candidate_selection_profile,
         "candidate_file_count": candidate_file_count,
         "candidate_entry_count": candidate_entry_count,
         "opened_file_count": opened_file_count,
