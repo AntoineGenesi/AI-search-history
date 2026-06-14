@@ -198,7 +198,13 @@ def search_with_structural_sidecar(
     source_kinds: set[str] = set()
     expected_diag = _init_structural_expected_ref_diagnostics(expected_ref_diagnostics)
     _mark_structural_expected_indexed(expected_diag, index)
-    _mark_structural_expected_candidates(expected_diag, candidate_entries)
+    _mark_structural_expected_candidates(
+        expected_diag,
+        index,
+        query_profile,
+        candidate_entries,
+        candidate_selection_profile=normalized_candidate_selection_profile,
+    )
 
     for table, entries in candidate_entries:
         fallback_reason = _table_fallback_reason(table)
@@ -271,6 +277,8 @@ def search_with_structural_sidecar(
                         expected_state["expected_record_present_before_reservoir_retention"] = True
                         expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
                         expected_state["dedupe_phase_label"] = "not_deduped"
+                        expected_state["score_label_count"] = len(reasons)
+                        expected_state["artifact_label_count"] = len(artifacts)
                     match = _materialize_match(record, score, reasons, artifacts, intent)
                     if is_weak_partial_generic(reasons):
                         if expected_state is not None:
@@ -308,8 +316,10 @@ def search_with_structural_sidecar(
     if weak_candidates_skipped:
         warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
     matches = (matches + weak_matches)[: plan.limits.max_matches * 2]
+    _mark_structural_expected_pre_sort_rank(expected_diag, matches)
     _mark_expected_pre_final_candidates(expected_diag, matches)
     matches.sort(key=match_sort_key, reverse=True)
+    _mark_structural_expected_final_rank(expected_diag, matches, max_matches=plan.limits.max_matches)
     matches = matches[: plan.limits.max_matches]
     _mark_expected_final_candidates(expected_diag, matches)
     candidate_entry_count = sum(len(entries) for _table, entries in candidate_entries)
@@ -359,6 +369,22 @@ def _init_structural_expected_ref_diagnostics(expected_refs: list[dict] | None) 
         state["expected_file_selected_as_candidate_file"] = False
         state["expected_record_selected_as_candidate_entry"] = False
         state["structural_candidate_status"] = "not_selected"
+        state["candidate_file_rank_label"] = None
+        state["candidate_file_entry_count_bucket"] = None
+        state["candidate_entry_rank_label"] = None
+        state["candidate_entry_rank_bucket"] = None
+        state["candidate_entry_selection_reason"] = None
+        state["candidate_entry_score_profile"] = None
+        state["candidate_entry_selection_limit"] = MAX_ENTRIES_PER_FILE
+        state["candidate_file_selection_limit"] = MAX_CANDIDATE_FILES
+        state["candidate_file_truncation_label"] = "not_evaluated"
+        state["candidate_entry_truncation_label"] = "not_evaluated"
+        state["score_label_count"] = None
+        state["artifact_label_count"] = None
+        state["pre_final_rank_label"] = None
+        state["pre_final_rank_bucket"] = None
+        state["final_rank_label"] = None
+        state["final_rank_bucket"] = None
     return expected_diag
 
 
@@ -375,23 +401,55 @@ def _mark_structural_expected_indexed(expected_diag: dict | None, index: Structu
 
 def _mark_structural_expected_candidates(
     expected_diag: dict | None,
+    index: StructuralSidecarIndex,
+    query_profile: dict[str, Any],
     candidate_entries: list[tuple[StructuralFileTable, list[StructuralLineEntry]]],
+    *,
+    candidate_selection_profile: str,
 ) -> None:
     if expected_diag is None:
         return
-    candidate_file_paths = {str(table.path) for table, _entries in candidate_entries}
-    candidate_record_keys = {
-        (str(table.path), entry.line)
-        for table, entries in candidate_entries
-        for entry in entries
-    }
+    candidate_file_paths: dict[str, tuple[int, int]] = {}
+    candidate_record_keys: dict[tuple[str, int], tuple[int, int]] = {}
+    for file_rank, (table, entries) in enumerate(candidate_entries, start=1):
+        candidate_file_paths[str(table.path)] = (file_rank, len(entries))
+        for entry_rank, entry in enumerate(entries, start=1):
+            candidate_record_keys[(str(table.path), entry.line)] = (file_rank, entry_rank)
     for state in expected_diag["refs"]:
         path = state["_path"]
         key = (path, state["_line"])
+        table = index.files.get(path)
+        candidate_file_rank = candidate_file_paths.get(path)
+        candidate_entry_rank = candidate_record_keys.get(key)
         state["expected_file_selected_by_source_plan"] = bool(state["expected_file_indexed_by_structural_sidecar"])
         state["expected_file_queued_for_scan"] = path in candidate_file_paths
         state["expected_file_selected_as_candidate_file"] = path in candidate_file_paths
         state["expected_record_selected_as_candidate_entry"] = key in candidate_record_keys
+        if candidate_file_rank is not None:
+            rank, entry_count = candidate_file_rank
+            state["candidate_file_rank_label"] = _rank_label("candidate_file", rank)
+            state["candidate_file_entry_count_bucket"] = _count_bucket(entry_count)
+            state["candidate_file_truncation_label"] = "selected_within_file_limit"
+        elif state["expected_file_indexed_by_structural_sidecar"]:
+            state["candidate_file_truncation_label"] = "not_selected_by_candidate_file_ranking"
+        if candidate_entry_rank is not None:
+            _file_rank, rank = candidate_entry_rank
+            state["candidate_entry_rank_label"] = _rank_label("candidate_entry", rank)
+            state["candidate_entry_rank_bucket"] = _rank_bucket(rank)
+            state["candidate_entry_selection_reason"] = "selected_within_entry_limit"
+            state["candidate_entry_truncation_label"] = "selected_within_entry_limit"
+        elif table is not None:
+            entry = next((item for item in table.entries if item.line == state["_line"]), None)
+            if entry is not None:
+                reason, profile = _candidate_entry_nonselection_reason(
+                    table,
+                    entry,
+                    query_profile,
+                    candidate_selection_profile=candidate_selection_profile,
+                )
+                state["candidate_entry_selection_reason"] = reason
+                state["candidate_entry_score_profile"] = profile
+                state["candidate_entry_truncation_label"] = reason
         if key in candidate_record_keys:
             state["structural_candidate_status"] = "expected_record_selected_as_candidate_entry"
         elif path in candidate_file_paths:
@@ -408,6 +466,40 @@ def _structural_expected_state_for_entry(expected_diag: dict | None, path: Path,
     if expected_diag is None:
         return None
     return expected_diag["by_ref"].get((str(path), int(line)))
+
+
+def _mark_structural_expected_pre_sort_rank(expected_diag: dict | None, candidates: list[Match]) -> None:
+    if expected_diag is None:
+        return
+    candidate_ranks = {(str(match.path), int(match.line)): rank for rank, match in enumerate(candidates, start=1)}
+    for state in expected_diag["refs"]:
+        rank = candidate_ranks.get((state["_path"], state["_line"]))
+        if rank is None:
+            continue
+        state["pre_final_rank_label"] = _rank_label("pre_final_candidate", rank)
+        state["pre_final_rank_bucket"] = _rank_bucket(rank)
+
+
+def _mark_structural_expected_final_rank(
+    expected_diag: dict | None,
+    sorted_candidates: list[Match],
+    *,
+    max_matches: int,
+) -> None:
+    if expected_diag is None:
+        return
+    candidate_ranks = {
+        (str(match.path), int(match.line)): rank for rank, match in enumerate(sorted_candidates, start=1)
+    }
+    for state in expected_diag["refs"]:
+        rank = candidate_ranks.get((state["_path"], state["_line"]))
+        if rank is None:
+            continue
+        state["final_rank_label"] = _rank_label("final_candidate", rank)
+        state["final_rank_bucket"] = _rank_bucket(rank)
+        if rank > max_matches:
+            state["final_cap_phase_label"] = "final_cap_drop"
+            state["drop_phase_label"] = state["drop_phase_label"] or "final_cap_drop"
 
 
 def _public_structural_expected_ref_diagnostics(expected_diag: dict) -> dict:
@@ -431,6 +523,22 @@ def _public_structural_expected_ref_diagnostics(expected_diag: dict) -> dict:
             state.get("expected_record_selected_as_candidate_entry")
         )
         ref["structural_candidate_status"] = str(state.get("structural_candidate_status") or "unknown")
+        ref["candidate_file_rank_label"] = state.get("candidate_file_rank_label")
+        ref["candidate_file_entry_count_bucket"] = state.get("candidate_file_entry_count_bucket")
+        ref["candidate_entry_rank_label"] = state.get("candidate_entry_rank_label")
+        ref["candidate_entry_rank_bucket"] = state.get("candidate_entry_rank_bucket")
+        ref["candidate_entry_selection_reason"] = state.get("candidate_entry_selection_reason")
+        ref["candidate_entry_score_profile"] = state.get("candidate_entry_score_profile")
+        ref["candidate_entry_selection_limit"] = int(state.get("candidate_entry_selection_limit") or 0)
+        ref["candidate_file_selection_limit"] = int(state.get("candidate_file_selection_limit") or 0)
+        ref["candidate_file_truncation_label"] = str(state.get("candidate_file_truncation_label") or "unknown")
+        ref["candidate_entry_truncation_label"] = str(state.get("candidate_entry_truncation_label") or "unknown")
+        ref["score_label_count"] = state.get("score_label_count")
+        ref["artifact_label_count"] = state.get("artifact_label_count")
+        ref["pre_final_rank_label"] = state.get("pre_final_rank_label")
+        ref["pre_final_rank_bucket"] = state.get("pre_final_rank_bucket")
+        ref["final_rank_label"] = state.get("final_rank_label")
+        ref["final_rank_bucket"] = state.get("final_rank_bucket")
         indexed_count += int(ref["expected_record_indexed_by_structural_sidecar"])
         candidate_file_count += int(ref["expected_file_selected_as_candidate_file"])
         candidate_entry_count += int(ref["expected_record_selected_as_candidate_entry"])
@@ -445,6 +553,162 @@ def _public_structural_expected_ref_diagnostics(expected_diag: dict) -> dict:
         }
     )
     return public
+
+
+def _candidate_entry_nonselection_reason(
+    table: StructuralFileTable,
+    expected_entry: StructuralLineEntry,
+    query_profile: dict[str, Any],
+    *,
+    candidate_selection_profile: str,
+) -> tuple[str, dict[str, Any]]:
+    query_terms: set[str] = set(query_profile["lexical_terms"])
+    query_tags: set[str] = set(query_profile["structural_tags"])
+    query_event_families: set[str] = set(query_profile["event_families"])
+    entry_score = _candidate_entry_base_score(
+        expected_entry,
+        query_terms=query_terms,
+        query_tags=query_tags,
+        query_event_families=query_event_families,
+        query_profile=query_profile,
+        candidate_selection_profile=candidate_selection_profile,
+        diversity_bonus=1,
+    )
+    profile = _safe_candidate_entry_score_profile(expected_entry, entry_score)
+    if entry_score[0] == 0 and entry_score[1] == 0:
+        return "no_candidate_signal_for_entry", profile
+
+    scored_entries: list[tuple[tuple[int, int, int, int], StructuralLineEntry]] = []
+    session_seen: set[str] = set()
+    for entry in table.entries:
+        diversity_bonus = 0 if entry.session_hash in session_seen else 1
+        session_seen.add(entry.session_hash)
+        score = _candidate_entry_base_score(
+            entry,
+            query_terms=query_terms,
+            query_tags=query_tags,
+            query_event_families=query_event_families,
+            query_profile=query_profile,
+            candidate_selection_profile=candidate_selection_profile,
+            diversity_bonus=diversity_bonus,
+        )
+        if score[0] or score[1]:
+            scored_entries.append((score, entry))
+    ordered = _ordered_scored_entries_for_profile(
+        scored_entries,
+        query_profile,
+        candidate_selection_profile=candidate_selection_profile,
+    )
+    rank = next((index for index, (_score, entry) in enumerate(ordered, start=1) if entry.line == expected_entry.line), None)
+    if rank is None:
+        return "candidate_entry_rank_not_reconstructed", profile
+    profile = {**profile, "reconstructed_entry_rank_bucket": _rank_bucket(rank)}
+    if rank > MAX_ENTRIES_PER_FILE:
+        return "per_file_entry_limit_drop", profile
+    return "not_selected_after_candidate_file_limit_or_tie_order", profile
+
+
+def _candidate_entry_base_score(
+    entry: StructuralLineEntry,
+    *,
+    query_terms: set[str],
+    query_tags: set[str],
+    query_event_families: set[str],
+    query_profile: dict[str, Any],
+    candidate_selection_profile: str,
+    diversity_bonus: int,
+) -> tuple[int, int, int, int]:
+    lexical_overlap = len(entry.lexical_terms & query_terms)
+    structural_overlap = _structural_overlap(
+        entry,
+        query_tags,
+        query_profile,
+        candidate_selection_profile=candidate_selection_profile,
+    )
+    event_bonus = len(entry.event_families & query_event_families)
+    return (structural_overlap + event_bonus, lexical_overlap, diversity_bonus, -entry.line)
+
+
+def _ordered_scored_entries_for_profile(
+    scored_entries: list[tuple[tuple[int, int, int, int], StructuralLineEntry]],
+    query_profile: dict[str, Any],
+    *,
+    candidate_selection_profile: str,
+) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
+    ordered = list(scored_entries)
+    if candidate_selection_profile != "intent_structural" or not _use_intent_structural_order(query_profile):
+        ordered.sort(key=lambda item: item[0], reverse=True)
+        return ordered
+
+    query_tags = set(query_profile["structural_tags"])
+    prefer_timestamp = bool(query_profile.get("date_reason")) or bool(query_profile.get("date_window_present"))
+    preferred_role_tag = f"role:{_safe_tag(str(query_profile.get('role') or ''))}" if query_profile.get("role") else None
+
+    def sort_key(item: tuple[tuple[int, int, int, int], StructuralLineEntry]) -> tuple[int, int, int, int, int, int]:
+        base_score, entry = item
+        timestamp_match = int(prefer_timestamp and entry.timestamp_bucket == "timestamp_present")
+        role_match = int(bool(preferred_role_tag and preferred_role_tag in entry.structural_tags))
+        structural_overlap = len(entry.structural_tags & query_tags)
+        return (
+            timestamp_match,
+            role_match,
+            structural_overlap + base_score[0],
+            base_score[1],
+            base_score[2],
+            entry.line,
+        )
+
+    ordered.sort(key=sort_key, reverse=True)
+    return ordered
+
+
+def _safe_candidate_entry_score_profile(
+    entry: StructuralLineEntry,
+    score: tuple[int, int, int, int],
+) -> dict[str, Any]:
+    return {
+        "structural_event_score": int(score[0]),
+        "lexical_overlap_count": int(score[1]),
+        "diversity_bonus": int(score[2]),
+        "timestamp_bucket": entry.timestamp_bucket,
+        "role_bucket": entry.role_bucket,
+        "message_type": entry.message_type,
+        "event_family_count": len(entry.event_families),
+        "structural_tag_count": len(entry.structural_tags),
+        "raw_text_included": False,
+        "raw_paths_included": False,
+        "line_numbers_included": False,
+    }
+
+
+def _rank_label(prefix: str, rank: int) -> str:
+    return f"{prefix}_{rank:03d}"
+
+
+def _rank_bucket(rank: int | None) -> str | None:
+    if rank is None:
+        return None
+    if rank <= 10:
+        return "001-010"
+    if rank <= 40:
+        return "011-040"
+    if rank <= 80:
+        return "041-080"
+    if rank <= 160:
+        return "081-160"
+    return "161_plus"
+
+
+def _count_bucket(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count <= 10:
+        return "1-10"
+    if count <= 40:
+        return "11-40"
+    if count <= 80:
+        return "41-80"
+    return "81_plus"
 
 
 def _build_file_table(path: Path, *, source_kind: str, default_tz) -> tuple[StructuralFileTable, int]:

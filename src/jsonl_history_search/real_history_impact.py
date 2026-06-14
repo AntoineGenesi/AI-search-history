@@ -1162,6 +1162,22 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                     if ref.get("structural_candidate_status") is not None
                     else None
                 ),
+                "candidate_file_rank_label": ref.get("candidate_file_rank_label"),
+                "candidate_file_entry_count_bucket": ref.get("candidate_file_entry_count_bucket"),
+                "candidate_entry_rank_label": ref.get("candidate_entry_rank_label"),
+                "candidate_entry_rank_bucket": ref.get("candidate_entry_rank_bucket"),
+                "candidate_entry_selection_reason": ref.get("candidate_entry_selection_reason"),
+                "candidate_entry_score_profile": ref.get("candidate_entry_score_profile"),
+                "candidate_entry_selection_limit": int(ref.get("candidate_entry_selection_limit") or 0),
+                "candidate_file_selection_limit": int(ref.get("candidate_file_selection_limit") or 0),
+                "candidate_file_truncation_label": str(ref.get("candidate_file_truncation_label") or "unknown"),
+                "candidate_entry_truncation_label": str(ref.get("candidate_entry_truncation_label") or "unknown"),
+                "score_label_count": ref.get("score_label_count"),
+                "artifact_label_count": ref.get("artifact_label_count"),
+                "pre_final_rank_label": ref.get("pre_final_rank_label"),
+                "pre_final_rank_bucket": ref.get("pre_final_rank_bucket"),
+                "final_rank_label": ref.get("final_rank_label"),
+                "final_rank_bucket": ref.get("final_rank_bucket"),
             }
         )
     opened_files = []
