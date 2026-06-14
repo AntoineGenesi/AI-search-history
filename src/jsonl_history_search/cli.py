@@ -1761,6 +1761,15 @@ def main(argv: list[str] | None = None) -> int:
             "supplement_limit": result["supplement_limit"],
             "package_searched_bytes": result["package_searched_bytes"],
             "structural_searched_bytes": result["structural_searched_bytes"],
+            "record_window": result["record_window"],
+            "record_window_enabled": result["record_window_enabled"],
+            "record_window_radius": result["record_window_radius"],
+            "record_window_seed_entry_count": result["record_window_seed_entry_count"],
+            "record_window_extra_entry_count": result["record_window_extra_entry_count"],
+            "record_window_entry_count": result["record_window_entry_count"],
+            "record_window_max_extra_entries_per_file": result["record_window_max_extra_entries_per_file"],
+            "record_window_max_extra_entries_total": result["record_window_max_extra_entries_total"],
+            "oracle_inputs_used": result["oracle_inputs_used"],
             "privacy": result["privacy"],
         }
     elif args.command in {"find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"}:

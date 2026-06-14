@@ -15,6 +15,9 @@ from .structural_sidecar import (
 
 BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD = 10
 BUDGETED_HYBRID_SUPPLEMENT_LIMIT = 10
+BUDGETED_HYBRID_RECORD_WINDOW_RADIUS = 2
+BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE = 12
+BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL = 60
 
 
 def search_structural_hybrid_budgeted(
@@ -27,6 +30,9 @@ def search_structural_hybrid_budgeted(
     structural_sidecar_index: StructuralSidecarIndex | None = None,
     gate_candidate_threshold: int = BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD,
     supplement_limit: int = BUDGETED_HYBRID_SUPPLEMENT_LIMIT,
+    record_window_radius: int = BUDGETED_HYBRID_RECORD_WINDOW_RADIUS,
+    record_window_max_extra_entries_per_file: int = BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE,
+    record_window_max_extra_entries_total: int = BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL,
     expected_ref_diagnostics: list[dict] | None = None,
 ) -> dict[str, Any]:
     package_result = search(
@@ -53,12 +59,25 @@ def search_structural_hybrid_budgeted(
             default_tz=default_tz,
             cwd=cwd,
             expected_ref_diagnostics=expected_ref_diagnostics,
+            record_window_radius=record_window_radius,
+            record_window_max_extra_entries_per_file=record_window_max_extra_entries_per_file,
+            record_window_max_extra_entries_total=record_window_max_extra_entries_total,
         )
     result = hybrid_package_structural_result(
         package_result,
         structural_result,
         supplement_limit=supplement_limit,
         gate=gate,
+        record_window_config={
+            "record_window_configured_enabled": int(record_window_radius or 0) > 0,
+            "record_window_radius": max(0, int(record_window_radius or 0)),
+            "record_window_max_extra_entries_per_file": max(
+                0,
+                int(record_window_max_extra_entries_per_file or 0),
+            ),
+            "record_window_max_extra_entries_total": max(0, int(record_window_max_extra_entries_total or 0)),
+            "oracle_inputs_used": False,
+        },
     )
     result["warnings"] = sorted(
         set((package_result.get("warnings") or []) + ((structural_result or {}).get("warnings") or []))
@@ -74,6 +93,8 @@ def search_structural_hybrid_budgeted(
         "private_bridge_required": False,
         "expected_refs_required": False,
     }
+    if package_result.get("expected_ref_diagnostics") is not None:
+        result["expected_ref_diagnostics"] = package_result["expected_ref_diagnostics"]
     return result
 
 
@@ -83,6 +104,7 @@ def hybrid_package_structural_result(
     *,
     supplement_limit: int,
     gate: dict[str, Any] | None = None,
+    record_window_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gate = gate or {"supplement_enabled": True, "gate_reason": "ungated", "gate_candidate_threshold": None}
     package_groups = list(package_result.get("groups") or [])
@@ -107,6 +129,7 @@ def hybrid_package_structural_result(
                 "source": "package_search_structural_hybrid",
             }
         )
+    record_window = _record_window_stats(effective_structural_result, config=record_window_config)
     return {
         "status": "planned_package_structural_hybrid",
         "strategy": "package_first_bounded_structural_supplement",
@@ -121,6 +144,15 @@ def hybrid_package_structural_result(
         + int((effective_structural_result or {}).get("searched_bytes", 0)),
         "package_searched_bytes": int(package_result.get("searched_bytes", 0)),
         "structural_searched_bytes": int((effective_structural_result or {}).get("searched_bytes", 0)),
+        "record_window": record_window,
+        "record_window_enabled": bool(record_window["record_window_enabled"]),
+        "record_window_radius": int(record_window["record_window_radius"]),
+        "record_window_seed_entry_count": int(record_window["record_window_seed_entry_count"]),
+        "record_window_extra_entry_count": int(record_window["record_window_extra_entry_count"]),
+        "record_window_entry_count": int(record_window["record_window_entry_count"]),
+        "record_window_max_extra_entries_per_file": int(record_window["record_window_max_extra_entries_per_file"]),
+        "record_window_max_extra_entries_total": int(record_window["record_window_max_extra_entries_total"]),
+        "oracle_inputs_used": False,
         "package_warnings": list(package_result.get("warnings") or []),
         "structural_warnings": list((effective_structural_result or {}).get("warnings") or []),
         "privacy": {
@@ -164,3 +196,38 @@ def _match_keys(groups: list[dict[str, Any]]) -> set[tuple[str, int]]:
 
 def _match_key(match: dict[str, Any]) -> tuple[str, int]:
     return (str(match.get("path") or ""), int(match.get("line") or 0))
+
+
+def _record_window_stats(
+    structural_result: dict[str, Any] | None,
+    *,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = config or {}
+    source = structural_result or {}
+    radius = int(source.get("record_window_radius") or config.get("record_window_radius") or 0)
+    per_file_cap = int(
+        source.get("record_window_max_extra_entries_per_file")
+        or config.get("record_window_max_extra_entries_per_file")
+        or 0
+    )
+    total_cap = int(
+        source.get("record_window_max_extra_entries_total")
+        or config.get("record_window_max_extra_entries_total")
+        or 0
+    )
+    return {
+        "record_window_configured_enabled": bool(config.get("record_window_configured_enabled", radius > 0)),
+        "record_window_enabled": bool(source.get("record_window_enabled", False)),
+        "record_window_radius": radius,
+        "record_window_seed_entry_count": int(source.get("record_window_seed_entry_count") or 0),
+        "record_window_extra_entry_count": int(source.get("record_window_extra_entry_count") or 0),
+        "record_window_entry_count": int(source.get("record_window_entry_count") or 0),
+        "record_window_max_extra_entries_per_file": per_file_cap,
+        "record_window_max_extra_entries_total": total_cap,
+        "record_window_extra_entries_capped": bool(source.get("record_window_extra_entries_capped", False)),
+        "oracle_inputs_used": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+    }

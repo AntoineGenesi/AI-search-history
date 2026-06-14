@@ -163,11 +163,20 @@ def search_with_structural_sidecar(
     cwd: str | None,
     selected_paths: set[str] | None = None,
     expected_ref_diagnostics: list[dict] | None = None,
+    record_window_radius: int = 0,
+    record_window_max_extra_entries_per_file: int = 0,
+    record_window_max_extra_entries_total: int = 0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     warnings = list(index.warnings) + list(plan.warnings)
     query_profile = _query_profile(intent)
-    candidate_entries = _candidate_entries(index, query_profile, selected_paths=selected_paths)
+    seed_candidate_entries = _candidate_entries(index, query_profile, selected_paths=selected_paths)
+    candidate_entries, record_window_stats = _expand_record_window_entries(
+        seed_candidate_entries,
+        radius=record_window_radius,
+        max_extra_entries_per_file=record_window_max_extra_entries_per_file,
+        max_extra_entries_total=record_window_max_extra_entries_total,
+    )
     matches: list[Match] = []
     weak_matches: list[Match] = []
     weak_reservoir_limit = max(1, min(plan.limits.max_matches, max(3, plan.limits.max_matches // 4)))
@@ -193,6 +202,7 @@ def search_with_structural_sidecar(
                 warnings=warnings,
                 index=index,
                 query_profile=query_profile,
+                record_window_stats=record_window_stats,
             )
         try:
             with table.path.open("rb") as handle:
@@ -307,6 +317,7 @@ def search_with_structural_sidecar(
         "records_rejected_by_should_consider": records_rejected_by_should_consider,
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
+        **record_window_stats,
         "groups": group_matches(matches),
         "summary": _search_summary(
             index=index,
@@ -317,6 +328,7 @@ def search_with_structural_sidecar(
             searched_bytes=searched_bytes,
             records_considered=records_considered,
             source_kinds=source_kinds,
+            record_window_stats=record_window_stats,
         ),
         "privacy": _privacy_payload(),
         "warnings": sorted(set(warnings)),
@@ -535,6 +547,66 @@ def _candidate_entries(
     return [(table, [entry for _score, entry in entries]) for table, entries in candidates]
 
 
+def _expand_record_window_entries(
+    candidate_entries: list[tuple[StructuralFileTable, list[StructuralLineEntry]]],
+    *,
+    radius: int,
+    max_extra_entries_per_file: int,
+    max_extra_entries_total: int,
+) -> tuple[list[tuple[StructuralFileTable, list[StructuralLineEntry]]], dict[str, Any]]:
+    normalized_radius = max(0, int(radius or 0))
+    per_file_cap = max(0, int(max_extra_entries_per_file or 0))
+    total_cap = max(0, int(max_extra_entries_total or 0))
+    seed_entry_count = sum(len(entries) for _table, entries in candidate_entries)
+    stats = {
+        "record_window_enabled": normalized_radius > 0,
+        "record_window_radius": normalized_radius,
+        "record_window_seed_entry_count": seed_entry_count,
+        "record_window_extra_entry_count": 0,
+        "record_window_entry_count": seed_entry_count,
+        "record_window_max_extra_entries_per_file": per_file_cap,
+        "record_window_max_extra_entries_total": total_cap,
+        "record_window_extra_entries_capped": False,
+        "oracle_inputs_used": False,
+    }
+    if normalized_radius <= 0:
+        return candidate_entries, stats
+
+    expanded: list[tuple[StructuralFileTable, list[StructuralLineEntry]]] = []
+    total_extra_entries = 0
+    for table, seed_entries in candidate_entries:
+        seed_lines = {entry.line for entry in seed_entries}
+        entry_index_by_line = {entry.line: index for index, entry in enumerate(table.entries)}
+        file_entries: list[StructuralLineEntry] = []
+        seen_lines: set[int] = set()
+        file_extra_entries = 0
+        for seed in seed_entries:
+            if seed.line not in seen_lines:
+                file_entries.append(seed)
+                seen_lines.add(seed.line)
+            seed_index = entry_index_by_line.get(seed.line)
+            if seed_index is None:
+                continue
+            for delta in range(1, normalized_radius + 1):
+                for candidate_index in (seed_index - delta, seed_index + delta):
+                    if candidate_index < 0 or candidate_index >= len(table.entries):
+                        continue
+                    candidate = table.entries[candidate_index]
+                    if candidate.line in seen_lines or candidate.line in seed_lines:
+                        continue
+                    if file_extra_entries >= per_file_cap or total_extra_entries >= total_cap:
+                        stats["record_window_extra_entries_capped"] = True
+                        continue
+                    file_entries.append(candidate)
+                    seen_lines.add(candidate.line)
+                    file_extra_entries += 1
+                    total_extra_entries += 1
+        expanded.append((table, file_entries))
+    stats["record_window_extra_entry_count"] = total_extra_entries
+    stats["record_window_entry_count"] = sum(len(entries) for _table, entries in expanded)
+    return expanded, stats
+
+
 def _query_profile(intent: QueryIntent) -> dict[str, Any]:
     terms = _lexical_terms(" ".join(sorted(set(intent.base_terms) | set(intent.terms) | {intent.normalized, intent.original})))
     structural_tags: set[str] = set()
@@ -698,7 +770,9 @@ def _fallback_payload(
     warnings: list[str],
     index: StructuralSidecarIndex,
     query_profile: dict[str, Any],
+    record_window_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    record_window_stats = record_window_stats or _default_record_window_stats()
     return {
         "status": "fallback_required",
         "fallback_reason": reason,
@@ -711,10 +785,12 @@ def _fallback_payload(
         "records_rejected_by_should_consider": 0,
         "candidate_records_scored": 0,
         "candidate_records_deduped": 0,
+        **record_window_stats,
         "groups": [],
         "summary": {
             **index.sanitized_summary(),
             "fallback_reason": reason,
+            **record_window_stats,
             "raw_paths_included": False,
             "raw_text_included": False,
         },
@@ -734,6 +810,7 @@ def _search_summary(
     searched_bytes: int,
     records_considered: int,
     source_kinds: set[str],
+    record_window_stats: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         **index.sanitized_summary(),
@@ -744,10 +821,25 @@ def _search_summary(
         "searched_bytes": searched_bytes,
         "records_considered": records_considered,
         "source_kinds": sorted(source_kinds),
+        **record_window_stats,
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
+    }
+
+
+def _default_record_window_stats() -> dict[str, Any]:
+    return {
+        "record_window_enabled": False,
+        "record_window_radius": 0,
+        "record_window_seed_entry_count": 0,
+        "record_window_extra_entry_count": 0,
+        "record_window_entry_count": 0,
+        "record_window_max_extra_entries_per_file": 0,
+        "record_window_max_extra_entries_total": 0,
+        "record_window_extra_entries_capped": False,
+        "oracle_inputs_used": False,
     }
 
 
