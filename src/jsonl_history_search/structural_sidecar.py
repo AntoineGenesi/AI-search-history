@@ -41,6 +41,7 @@ STRUCTURAL_SIDECAR_VERSION = "structural-codex-claude-line-v1"
 TEXT_PROBE_LIMIT = 4000
 MAX_CANDIDATE_FILES = 12
 MAX_ENTRIES_PER_FILE = 80
+GLOBAL_STRATIFIED_ENTRY_SAMPLE_COUNT = 20
 
 
 @dataclass(frozen=True)
@@ -649,6 +650,15 @@ def _candidate_entry_nonselection_reason(
     if rank is None:
         return "candidate_entry_rank_not_reconstructed", profile
     profile = {**profile, "reconstructed_entry_rank_bucket": _rank_bucket(rank)}
+    if _uses_global_stratified_candidate_selection(candidate_selection_profile) and _use_intent_structural_order(
+        query_profile
+    ):
+        selected = _select_global_stratified_scored_entries(
+            ordered,
+            limit=max(1, min(MAX_ENTRIES_PER_FILE, len(ordered))),
+        )
+        if not any(entry.line == expected_entry.line for _score, entry in selected):
+            return "global_stratified_entry_limit_drop", profile
     if rank > MAX_ENTRIES_PER_FILE:
         return "per_file_entry_limit_drop", profile
     return "not_selected_after_candidate_file_limit_or_tie_order", profile
@@ -884,30 +894,56 @@ def _select_scored_entries(
     candidate_selection_profile: str,
 ) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
     limit = max(1, min(MAX_ENTRIES_PER_FILE, len(scored_entries)))
-    if not _is_intent_structural_profile(candidate_selection_profile) or not _use_intent_structural_order(query_profile):
-        scored_entries.sort(key=lambda item: item[0], reverse=True)
-        return scored_entries[:limit]
+    ordered = _ordered_scored_entries_for_profile(
+        scored_entries,
+        query_profile,
+        candidate_selection_profile=candidate_selection_profile,
+    )
+    if _uses_global_stratified_candidate_selection(candidate_selection_profile) and _use_intent_structural_order(
+        query_profile
+    ):
+        return _select_global_stratified_scored_entries(ordered, limit=limit)
+    return ordered[:limit]
 
-    query_tags = set(query_profile["structural_tags"])
-    prefer_timestamp = bool(query_profile.get("date_reason")) or bool(query_profile.get("date_window_present"))
-    preferred_role_tag = f"role:{_safe_tag(str(query_profile.get('role') or ''))}" if query_profile.get("role") else None
 
-    def sort_key(item: tuple[tuple[int, int, int, int], StructuralLineEntry]) -> tuple[int, int, int, int, int, int]:
-        base_score, entry = item
-        timestamp_match = int(prefer_timestamp and entry.timestamp_bucket == "timestamp_present")
-        role_match = int(bool(preferred_role_tag and preferred_role_tag in entry.structural_tags))
-        structural_overlap = len(entry.structural_tags & query_tags)
-        return (
-            timestamp_match,
-            role_match,
-            structural_overlap + base_score[0],
-            base_score[1],
-            base_score[2],
-            entry.line,
-        )
+def _select_global_stratified_scored_entries(
+    ordered_entries: list[tuple[tuple[int, int, int, int], StructuralLineEntry]],
+    *,
+    limit: int,
+) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
+    if len(ordered_entries) <= limit:
+        return ordered_entries[:limit]
 
-    scored_entries.sort(key=sort_key, reverse=True)
-    return scored_entries[:limit]
+    sample_count = min(GLOBAL_STRATIFIED_ENTRY_SAMPLE_COUNT, max(0, limit // 4), len(ordered_entries))
+    top_count = max(1, limit - sample_count)
+    selected = list(ordered_entries[:top_count])
+    seen_lines = {entry.line for _score, entry in selected}
+    if sample_count <= 0:
+        return selected[:limit]
+
+    rank_by_line = {entry.line: rank for rank, (_score, entry) in enumerate(ordered_entries)}
+    line_ordered = sorted(ordered_entries, key=lambda item: item[1].line)
+    total = len(line_ordered)
+    for bucket_index in range(sample_count):
+        start = bucket_index * total // sample_count
+        end = (bucket_index + 1) * total // sample_count
+        bucket = [item for item in line_ordered[start:end] if item[1].line not in seen_lines]
+        if not bucket:
+            continue
+        chosen = min(bucket, key=lambda item: rank_by_line.get(item[1].line, total))
+        selected.append(chosen)
+        seen_lines.add(chosen[1].line)
+        if len(selected) >= limit:
+            return selected
+
+    for item in ordered_entries:
+        if item[1].line in seen_lines:
+            continue
+        selected.append(item)
+        seen_lines.add(item[1].line)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _candidate_read_schedule(
@@ -930,7 +966,7 @@ def _candidate_read_schedule(
                     read_rank=read_rank,
                 )
             )
-    if candidate_selection_profile != "intent_structural_global":
+    if not _uses_global_candidate_read_schedule(candidate_selection_profile):
         return scheduled_entries
 
     ordered = list(scheduled_entries)
@@ -985,7 +1021,7 @@ def _global_candidate_read_sort_key(
 
 
 def _candidate_read_schedule_profile(candidate_selection_profile: str) -> str:
-    if candidate_selection_profile == "intent_structural_global":
+    if _uses_global_candidate_read_schedule(candidate_selection_profile):
         return "intent_structural_global"
     return "file_order"
 
@@ -1008,13 +1044,21 @@ def _candidate_read_schedule_preview(
 
 
 def _candidate_selection_profile(value: str | None) -> str:
-    if value in {"intent_structural", "intent_structural_global"}:
+    if value in {"intent_structural", "intent_structural_global", "intent_structural_global_stratified"}:
         return value
     return "default"
 
 
 def _is_intent_structural_profile(value: str) -> bool:
-    return value in {"intent_structural", "intent_structural_global"}
+    return value in {"intent_structural", "intent_structural_global", "intent_structural_global_stratified"}
+
+
+def _uses_global_candidate_read_schedule(value: str) -> bool:
+    return value in {"intent_structural_global", "intent_structural_global_stratified"}
+
+
+def _uses_global_stratified_candidate_selection(value: str) -> bool:
+    return value == "intent_structural_global_stratified"
 
 
 def _use_intent_structural_order(query_profile: dict[str, Any]) -> bool:
