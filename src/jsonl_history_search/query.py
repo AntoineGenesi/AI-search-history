@@ -123,6 +123,7 @@ class QueryIntent:
     terms: list[str]
     role: str | None = None
     role_filter_explicit: bool = False
+    temporal_question_reason: str | None = None
     date_window_start: datetime | None = None
     date_window_end: datetime | None = None
     date_reason: str | None = None
@@ -141,6 +142,7 @@ class QueryIntent:
             "expansion_reasons": self.expansion_reasons,
             "role": self.role,
             "role_filter_explicit": self.role_filter_explicit,
+            "temporal_question_reason": self.temporal_question_reason,
             "date_window": {
                 "start": self.date_window_start.isoformat() if self.date_window_start else None,
                 "end": self.date_window_end.isoformat() if self.date_window_end else None,
@@ -157,6 +159,7 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
     inferred_role = role or infer_role(normalized)
     role_filter_explicit = role is not None
     start, end, reason = infer_date_window(normalized, now)
+    temporal_question_reason = infer_temporal_question(normalized)
     date_window_filter = infer_date_window_filter(normalized, reason)
     artifact_hints = infer_artifacts(normalized)
     base_terms = infer_terms(normalized, artifact_hints)
@@ -178,6 +181,7 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
         terms=terms,
         role=inferred_role,
         role_filter_explicit=role_filter_explicit,
+        temporal_question_reason=temporal_question_reason,
         date_window_start=start,
         date_window_end=end,
         date_reason=reason,
@@ -187,6 +191,21 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
         expansion_reasons=expanded.reasons,
         warnings=warnings,
     )
+
+
+def infer_temporal_question(normalized: str) -> str | None:
+    if re.search(
+        r"\bwhen\s+(?:did|do|does|was|were|is|are|had|has|have|will|would|can|could|should|"
+        r"the|this|that|it|they|we|you|i|agent|assistant|user|task|case|session|conversation|decision|"
+        r"run|review|implementation|change|file|path|report|artifact|commit|branch|worktree)\b",
+        normalized,
+    ):
+        return "when_question"
+    if re.search(r"\bwhat\s+(?:date|day|time)\b", normalized):
+        return "what_date_time_question"
+    if re.search(r"\bwhich\s+(?:date|day|time)\b", normalized):
+        return "which_date_time_question"
+    return None
 
 
 def infer_role(normalized: str) -> str | None:
