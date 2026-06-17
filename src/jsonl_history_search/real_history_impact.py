@@ -1792,7 +1792,7 @@ def _baseline_contract() -> dict[str, str]:
         "package_search_rg_prefilter": "optional rg prefilter where eligible, followed by Python JSON parsing for evidence; fallback is labeled per row",
         "package_search_structural_sidecar": "opt-in structural Codex/Claude JSONL sidecar probe; indexes sanitized event/role/timestamp/session tags plus offsets, then passes reopened records through the existing ranking path",
         "package_search_structural_hybrid": "opt-in package-preserving hybrid probe; keeps package candidates first and appends a bounded non-duplicate structural sidecar supplement",
-        "package_search_structural_hybrid_budgeted": "opt-in budgeted hybrid probe; keeps package candidates first and appends a bounded structural supplement only when package candidate count is at or below the non-oracle threshold",
+        "package_search_structural_hybrid_budgeted": "opt-in default-off budgeted hybrid probe; keeps package candidates first and appends a bounded structural supplement when the budgeted gate allows it: package candidate count at or below the non-oracle threshold, or the explicit intent_structural_high_candidate_count gate profile detects sanitized date/timeline/date-window or role intent; does not change caps",
     }
 
 
