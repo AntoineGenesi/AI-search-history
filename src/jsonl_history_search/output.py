@@ -35,6 +35,8 @@ def render_text(payload: dict) -> str:
         return render_manifest_text(payload)
     if "generated_metadata_discovery" in payload:
         return render_generated_metadata_discovery_text(payload)
+    if "expansion_family_audit" in payload:
+        return render_expansion_family_audit_text(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_text(payload)
     if "agent_find" in payload:
@@ -156,6 +158,8 @@ def render_markdown(payload: dict) -> str:
         return render_manifest_markdown(payload)
     if "generated_metadata_discovery" in payload:
         return render_generated_metadata_discovery_markdown(payload)
+    if "expansion_family_audit" in payload:
+        return render_expansion_family_audit_markdown(payload)
     if "retrieval_efficiency_eval" in payload:
         return render_efficiency_eval_markdown(payload)
     if "agent_find" in payload:
@@ -238,6 +242,143 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_expansion_family_audit_text(payload: dict) -> str:
+    report = payload["expansion_family_audit"]
+    summary = report["summary"]
+    lines = [
+        "Expansion Family Audit",
+        f"Status: {report['status']}",
+        f"Verdict: {report['verdict']}",
+        f"Process detour lesson policy: {report['decision']['process_detour_lesson_policy']}",
+        f"Families: {summary['family_count']}",
+        f"Workflow-specific families: {summary['workflow_specific_family_count']}",
+        f"Candidate-supplement families: {summary['candidate_supplement_family_count']}",
+        (
+            "Workflow-specific candidate-supplement families: "
+            f"{summary['workflow_specific_candidate_supplement_family_count']}"
+        ),
+        f"High-risk families: {', '.join(summary['high_risk_families']) or '(none)'}",
+        (
+            "Candidate-replacement families: "
+            f"{', '.join(summary['candidate_replacement_families']) or '(none)'}"
+        ),
+        (
+            "Flagged local/proper registry labels: "
+            f"{', '.join(summary['flagged_local_or_proper_terms']) or '(none)'}"
+        ),
+        f"Generated metadata: {report['generated_metadata']['status']}",
+        f"Next action: {report['next_direct_tool_action']['action']}",
+        "Evidence basis:",
+    ]
+    for item in report["evidence_basis"]:
+        lines.append(f"- {item['source']}: {item['role']}; {item['summary']}")
+    lines.append("Families:")
+    for row in report["families"]:
+        flagged = ", ".join(row["flagged_local_or_proper_terms"]) or "-"
+        lines.append(
+            "- "
+            f"{row['name']} | scope={row['core_scope']} | risk={row['overfit_risk']} | "
+            f"metadata_role={row['generated_metadata_role']} | flagged={flagged}"
+        )
+    return "\n".join(lines)
+
+
+def render_expansion_family_audit_markdown(payload: dict) -> str:
+    report = payload["expansion_family_audit"]
+    summary = report["summary"]
+    lines = [
+        "# JSH-798 Expansion Family Hygiene Audit",
+        "",
+        "## Verdict",
+        "",
+        "Do not suppress, replace, or opt-in-gate `process_detour_lesson` yet. "
+        "The evidence supports diagnostic visibility only for now.",
+        "",
+        "Defaults are unchanged. Generated metadata remains unpromoted and is not "
+        "consumed by runtime search or replacement behavior.",
+        "",
+        "## Summary",
+        "",
+        f"- Families: `{summary['family_count']}`",
+        f"- Workflow-specific families: `{summary['workflow_specific_family_count']}`",
+        f"- Candidate-supplement families: `{summary['candidate_supplement_family_count']}`",
+        (
+            "- Workflow-specific candidate-supplement families: "
+            f"`{summary['workflow_specific_candidate_supplement_family_count']}`"
+        ),
+        f"- High-risk families: `{', '.join(summary['high_risk_families']) or 'none'}`",
+        (
+            "- Candidate-replacement families: "
+            f"`{', '.join(summary['candidate_replacement_families']) or 'none'}`"
+        ),
+        (
+            "- Flagged local/proper terms: "
+            f"`{', '.join(summary['flagged_local_or_proper_terms']) or 'none'}` "
+            "(sanitized labels from the code registry only)"
+        ),
+        "",
+        "## Counts",
+        "",
+        "| Family | Count |",
+        "| --- | ---: |",
+    ]
+    for label, count in summary["core_scope_counts"].items():
+        lines.append(f"| core_scope `{label}` | {count} |")
+    for label, count in summary["overfit_risk_counts"].items():
+        lines.append(f"| overfit_risk `{label}` | {count} |")
+    for label, count in summary["generated_metadata_role_counts"].items():
+        lines.append(f"| generated_metadata_role `{label}` | {count} |")
+    lines.extend(
+        [
+            "",
+            "## Decision",
+            "",
+            f"- Process-detour policy: `{report['decision']['process_detour_lesson_policy']}`",
+            f"- Runtime retrieval behavior changed: `{report['runtime_retrieval_behavior_changed']}`",
+            f"- Generated metadata status: `{report['generated_metadata']['status']}`",
+            "",
+            "## Evidence Basis",
+            "",
+        ]
+    )
+    for item in report["evidence_basis"]:
+        lines.append(f"- `{item['source']}`: {item['summary']}")
+    lines.extend(
+        [
+            "",
+            "## Next Direct Tool Action",
+            "",
+            f"`{report['next_direct_tool_action']['action']}`",
+            "",
+            report["next_direct_tool_action"]["description"],
+            "",
+            "This is not a harness/live recovery task and does not authorize "
+            "auth/send/process route work.",
+            "",
+            "## Family Rows",
+            "",
+            "| Family | Scope | Risk | Generated metadata role | Flagged labels |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in report["families"]:
+        flagged = ", ".join(row["flagged_local_or_proper_terms"]) or "-"
+        lines.append(
+            f"| `{row['name']}` | `{row['core_scope']}` | `{row['overfit_risk']}` | "
+            f"`{row['generated_metadata_role']}` | `{flagged}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Privacy And Oracle Boundary",
+            "",
+            "The report includes aggregate counts, sanitized family names, risk labels, "
+            "generated-metadata role labels, and sanitized flagged registry labels only.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def render_latest_user_messages_text(payload: dict) -> str:
