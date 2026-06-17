@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,15 @@ STRUCTURAL_SIDECAR_VERSION = "structural-codex-claude-line-v1"
 TEXT_PROBE_LIMIT = 4000
 MAX_CANDIDATE_FILES = 12
 MAX_ENTRIES_PER_FILE = 80
+
+
+@dataclass(frozen=True)
+class ScheduledStructuralEntry:
+    table: StructuralFileTable
+    entry: StructuralLineEntry
+    candidate_file_rank: int
+    candidate_entry_rank: int
+    read_rank: int
 
 
 @dataclass(frozen=True)
@@ -184,6 +194,12 @@ def search_with_structural_sidecar(
         max_extra_entries_per_file=record_window_max_extra_entries_per_file,
         max_extra_entries_total=record_window_max_extra_entries_total,
     )
+    candidate_read_schedule = _candidate_read_schedule(
+        candidate_entries,
+        query_profile,
+        candidate_selection_profile=normalized_candidate_selection_profile,
+    )
+    candidate_read_schedule_profile = _candidate_read_schedule_profile(normalized_candidate_selection_profile)
     matches: list[Match] = []
     weak_matches: list[Match] = []
     weak_reservoir_limit = max(1, min(plan.limits.max_matches, max(3, plan.limits.max_matches // 4)))
@@ -203,10 +219,11 @@ def search_with_structural_sidecar(
         index,
         query_profile,
         candidate_entries,
+        candidate_read_schedule=candidate_read_schedule,
         candidate_selection_profile=normalized_candidate_selection_profile,
     )
 
-    for table, entries in candidate_entries:
+    for table, _entries in candidate_entries:
         fallback_reason = _table_fallback_reason(table)
         if fallback_reason:
             return _fallback_payload(
@@ -217,101 +234,110 @@ def search_with_structural_sidecar(
                 query_profile=query_profile,
                 record_window_stats=record_window_stats,
                 candidate_selection_profile=normalized_candidate_selection_profile,
+                candidate_read_schedule_profile=candidate_read_schedule_profile,
             )
-        try:
-            with table.path.open("rb") as handle:
-                opened_order = len(opened_paths) + 1
-                opened_paths.add(str(table.path))
-                source_kinds.add(table.source_kind)
-                progress_item = {"path": table.path}
-                _mark_opened_file_progress(expected_diag, progress_item, table.path, opened_order)
-                for entry in entries:
-                    if time.perf_counter() - started > plan.limits.max_elapsed:
-                        warnings.append("Stopped structural sidecar at max elapsed cap.")
-                        break
-                    handle.seek(entry.byte_start)
-                    raw = handle.read(entry.byte_length)
-                    searched_bytes += len(raw)
-                    records_considered += 1
-                    _mark_opened_file_record_read(expected_diag, progress_item)
-                    record = parse_record(
-                        raw.decode("utf-8", errors="replace"),
-                        path=table.path,
-                        line=entry.line,
-                        default_tz=default_tz,
+    opened_handles: dict[str, Any] = {}
+    progress_by_path: dict[str, dict[str, Any]] = {}
+    with ExitStack() as stack:
+        for scheduled in candidate_read_schedule:
+            table = scheduled.table
+            entry = scheduled.entry
+            if time.perf_counter() - started > plan.limits.max_elapsed:
+                warnings.append("Stopped structural sidecar at max elapsed cap.")
+                break
+            try:
+                path_key = str(table.path)
+                handle = opened_handles.get(path_key)
+                if handle is None:
+                    handle = stack.enter_context(table.path.open("rb"))
+                    opened_handles[path_key] = handle
+                    opened_order = len(opened_paths) + 1
+                    opened_paths.add(path_key)
+                    source_kinds.add(table.source_kind)
+                    progress_item = {"path": table.path}
+                    progress_by_path[path_key] = progress_item
+                    _mark_opened_file_progress(expected_diag, progress_item, table.path, opened_order)
+                else:
+                    progress_item = progress_by_path[path_key]
+                handle.seek(entry.byte_start)
+                raw = handle.read(entry.byte_length)
+            except OSError as exc:
+                raise AdapterReadError(f"Could not open {table.path}: {exc}") from exc
+            searched_bytes += len(raw)
+            records_considered += 1
+            _mark_opened_file_record_read(expected_diag, progress_item)
+            record = parse_record(
+                raw.decode("utf-8", errors="replace"),
+                path=table.path,
+                line=entry.line,
+                default_tz=default_tz,
+            )
+            record.source_format = entry.source_kind
+            expected_state = _structural_expected_state_for_entry(expected_diag, table.path, entry.line)
+            if expected_state is not None:
+                expected_state["expected_record_line_reached_before_elapsed_stop"] = True
+                expected_state["expected_file_records_read_before_stop"] = int(progress_item.get("records_read") or 0)
+                expected_state["expected_file_progress_bucket"] = _records_read_bucket(
+                    int(progress_item.get("records_read") or 0)
+                )
+            if not should_consider(record, intent):
+                records_rejected_by_should_consider += 1
+                if expected_state is not None:
+                    expected_state["would_pass_should_consider"] = False
+                    expected_state["pre_reservoir_status"] = "rejected_by_should_consider"
+                    expected_state["should_consider_phase_label"] = "rejected_by_should_consider"
+                    expected_state["drop_phase_label"] = "should_consider_drop"
+                continue
+            if expected_state is not None:
+                expected_state["would_pass_should_consider"] = True
+                expected_state["should_consider_phase_label"] = "passed_should_consider"
+            key = _dedupe_key(record)
+            if key in dedupe:
+                candidate_records_deduped += 1
+                if expected_state is not None:
+                    expected_state["deduped_before_scoring"] = True
+                    expected_state["pre_reservoir_status"] = "deduped_before_scoring"
+                    expected_state["dedupe_phase_label"] = "deduped_before_scoring"
+                    expected_state["drop_phase_label"] = "dedupe_drop"
+                continue
+            dedupe.add(key)
+            candidate_records_scored += 1
+            score, reasons, artifacts = score_record(record, intent, cwd)
+            if expected_state is not None:
+                expected_state["expected_record_present_before_reservoir_retention"] = True
+                expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
+                expected_state["dedupe_phase_label"] = "not_deduped"
+                expected_state["score_label_count"] = len(reasons)
+                expected_state["artifact_label_count"] = len(artifacts)
+            match = _materialize_match(record, score, reasons, artifacts, intent)
+            if is_weak_partial_generic(reasons):
+                if expected_state is not None:
+                    expected_state["candidate_strength"] = "weak"
+                if len(weak_matches) < weak_reservoir_limit:
+                    weak_matches.append(match)
+                    if expected_state is not None:
+                        expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
+                else:
+                    weakest_index = min(
+                        range(len(weak_matches)),
+                        key=lambda index: match_sort_key(weak_matches[index]),
                     )
-                    record.source_format = entry.source_kind
-                    expected_state = _structural_expected_state_for_entry(expected_diag, table.path, entry.line)
-                    if expected_state is not None:
-                        expected_state["expected_record_line_reached_before_elapsed_stop"] = True
-                        expected_state["expected_file_records_read_before_stop"] = int(
-                            progress_item.get("records_read") or 0
-                        )
-                        expected_state["expected_file_progress_bucket"] = _records_read_bucket(
-                            int(progress_item.get("records_read") or 0)
-                        )
-                    if not should_consider(record, intent):
-                        records_rejected_by_should_consider += 1
+                    if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
+                        weak_matches[weakest_index] = match
                         if expected_state is not None:
-                            expected_state["would_pass_should_consider"] = False
-                            expected_state["pre_reservoir_status"] = "rejected_by_should_consider"
-                            expected_state["should_consider_phase_label"] = "rejected_by_should_consider"
-                            expected_state["drop_phase_label"] = "should_consider_drop"
-                        continue
-                    if expected_state is not None:
-                        expected_state["would_pass_should_consider"] = True
-                        expected_state["should_consider_phase_label"] = "passed_should_consider"
-                    key = _dedupe_key(record)
-                    if key in dedupe:
-                        candidate_records_deduped += 1
-                        if expected_state is not None:
-                            expected_state["deduped_before_scoring"] = True
-                            expected_state["pre_reservoir_status"] = "deduped_before_scoring"
-                            expected_state["dedupe_phase_label"] = "deduped_before_scoring"
-                            expected_state["drop_phase_label"] = "dedupe_drop"
-                        continue
-                    dedupe.add(key)
-                    candidate_records_scored += 1
-                    score, reasons, artifacts = score_record(record, intent, cwd)
-                    if expected_state is not None:
-                        expected_state["expected_record_present_before_reservoir_retention"] = True
-                        expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
-                        expected_state["dedupe_phase_label"] = "not_deduped"
-                        expected_state["score_label_count"] = len(reasons)
-                        expected_state["artifact_label_count"] = len(artifacts)
-                    match = _materialize_match(record, score, reasons, artifacts, intent)
-                    if is_weak_partial_generic(reasons):
-                        if expected_state is not None:
-                            expected_state["candidate_strength"] = "weak"
-                        if len(weak_matches) < weak_reservoir_limit:
-                            weak_matches.append(match)
-                            if expected_state is not None:
-                                expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
-                        else:
-                            weakest_index = min(
-                                range(len(weak_matches)),
-                                key=lambda index: match_sort_key(weak_matches[index]),
-                            )
-                            if match_sort_key(match) > match_sort_key(weak_matches[weakest_index]):
-                                weak_matches[weakest_index] = match
-                                if expected_state is not None:
-                                    expected_state["reservoir_phase_label"] = (
-                                        "weak_reservoir_replaced_existing_candidate"
-                                    )
-                            elif expected_state is not None:
-                                expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
-                                expected_state["drop_phase_label"] = "weak_reservoir_drop"
-                            weak_candidates_skipped += 1
-                        continue
-                    if expected_state is not None:
-                        expected_state["candidate_strength"] = "strong"
-                        expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
-                    matches.append(match)
-                    if len(matches) >= plan.limits.max_matches:
-                        warnings.append("Stopped structural sidecar at max match cap.")
-                        break
-        except OSError as exc:
-            raise AdapterReadError(f"Could not open {table.path}: {exc}") from exc
+                            expected_state["reservoir_phase_label"] = "weak_reservoir_replaced_existing_candidate"
+                    elif expected_state is not None:
+                        expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
+                        expected_state["drop_phase_label"] = "weak_reservoir_drop"
+                    weak_candidates_skipped += 1
+                continue
+            if expected_state is not None:
+                expected_state["candidate_strength"] = "strong"
+                expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
+            matches.append(match)
+            if len(matches) >= plan.limits.max_matches:
+                warnings.append("Stopped structural sidecar at max match cap.")
+                break
 
     if weak_candidates_skipped:
         warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
@@ -330,6 +356,9 @@ def search_with_structural_sidecar(
         "candidate_selection_profile": normalized_candidate_selection_profile,
         "candidate_files": len(candidate_entries),
         "candidate_entries": candidate_entry_count,
+        "candidate_read_schedule_profile": candidate_read_schedule_profile,
+        "candidate_read_schedule_entry_count": len(candidate_read_schedule),
+        "candidate_read_schedule_preview": _candidate_read_schedule_preview(candidate_read_schedule),
         "searched_files": len(opened_paths),
         "searched_bytes": searched_bytes,
         "records_considered": records_considered,
@@ -349,6 +378,7 @@ def search_with_structural_sidecar(
             source_kinds=source_kinds,
             record_window_stats=record_window_stats,
             candidate_selection_profile=normalized_candidate_selection_profile,
+            candidate_read_schedule_profile=candidate_read_schedule_profile,
         ),
         "privacy": _privacy_payload(),
         "warnings": sorted(set(warnings)),
@@ -379,6 +409,9 @@ def _init_structural_expected_ref_diagnostics(expected_refs: list[dict] | None) 
         state["candidate_file_selection_limit"] = MAX_CANDIDATE_FILES
         state["candidate_file_truncation_label"] = "not_evaluated"
         state["candidate_entry_truncation_label"] = "not_evaluated"
+        state["candidate_entry_read_rank_label"] = None
+        state["candidate_entry_read_rank_bucket"] = None
+        state["candidate_entry_read_schedule_profile"] = None
         state["score_label_count"] = None
         state["artifact_label_count"] = None
         state["pre_final_rank_label"] = None
@@ -405,6 +438,7 @@ def _mark_structural_expected_candidates(
     query_profile: dict[str, Any],
     candidate_entries: list[tuple[StructuralFileTable, list[StructuralLineEntry]]],
     *,
+    candidate_read_schedule: list[ScheduledStructuralEntry],
     candidate_selection_profile: str,
 ) -> None:
     if expected_diag is None:
@@ -415,6 +449,10 @@ def _mark_structural_expected_candidates(
         candidate_file_paths[str(table.path)] = (file_rank, len(entries))
         for entry_rank, entry in enumerate(entries, start=1):
             candidate_record_keys[(str(table.path), entry.line)] = (file_rank, entry_rank)
+    read_schedule_by_key = {
+        (str(scheduled.table.path), scheduled.entry.line): scheduled for scheduled in candidate_read_schedule
+    }
+    read_schedule_profile = _candidate_read_schedule_profile(candidate_selection_profile)
     for state in expected_diag["refs"]:
         path = state["_path"]
         key = (path, state["_line"])
@@ -438,6 +476,11 @@ def _mark_structural_expected_candidates(
             state["candidate_entry_rank_bucket"] = _rank_bucket(rank)
             state["candidate_entry_selection_reason"] = "selected_within_entry_limit"
             state["candidate_entry_truncation_label"] = "selected_within_entry_limit"
+            scheduled = read_schedule_by_key.get(key)
+            if scheduled is not None:
+                state["candidate_entry_read_rank_label"] = _rank_label("candidate_entry_read", scheduled.read_rank)
+                state["candidate_entry_read_rank_bucket"] = _rank_bucket(scheduled.read_rank)
+                state["candidate_entry_read_schedule_profile"] = read_schedule_profile
         elif table is not None:
             entry = next((item for item in table.entries if item.line == state["_line"]), None)
             if entry is not None:
@@ -533,6 +576,9 @@ def _public_structural_expected_ref_diagnostics(expected_diag: dict) -> dict:
         ref["candidate_file_selection_limit"] = int(state.get("candidate_file_selection_limit") or 0)
         ref["candidate_file_truncation_label"] = str(state.get("candidate_file_truncation_label") or "unknown")
         ref["candidate_entry_truncation_label"] = str(state.get("candidate_entry_truncation_label") or "unknown")
+        ref["candidate_entry_read_rank_label"] = state.get("candidate_entry_read_rank_label")
+        ref["candidate_entry_read_rank_bucket"] = state.get("candidate_entry_read_rank_bucket")
+        ref["candidate_entry_read_schedule_profile"] = state.get("candidate_entry_read_schedule_profile")
         ref["score_label_count"] = state.get("score_label_count")
         ref["artifact_label_count"] = state.get("artifact_label_count")
         ref["pre_final_rank_label"] = state.get("pre_final_rank_label")
@@ -636,7 +682,7 @@ def _ordered_scored_entries_for_profile(
     candidate_selection_profile: str,
 ) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
     ordered = list(scored_entries)
-    if candidate_selection_profile != "intent_structural" or not _use_intent_structural_order(query_profile):
+    if not _is_intent_structural_profile(candidate_selection_profile) or not _use_intent_structural_order(query_profile):
         ordered.sort(key=lambda item: item[0], reverse=True)
         return ordered
 
@@ -838,7 +884,7 @@ def _select_scored_entries(
     candidate_selection_profile: str,
 ) -> list[tuple[tuple[int, int, int, int], StructuralLineEntry]]:
     limit = max(1, min(MAX_ENTRIES_PER_FILE, len(scored_entries)))
-    if candidate_selection_profile != "intent_structural" or not _use_intent_structural_order(query_profile):
+    if not _is_intent_structural_profile(candidate_selection_profile) or not _use_intent_structural_order(query_profile):
         scored_entries.sort(key=lambda item: item[0], reverse=True)
         return scored_entries[:limit]
 
@@ -864,10 +910,111 @@ def _select_scored_entries(
     return scored_entries[:limit]
 
 
+def _candidate_read_schedule(
+    candidate_entries: list[tuple[StructuralFileTable, list[StructuralLineEntry]]],
+    query_profile: dict[str, Any],
+    *,
+    candidate_selection_profile: str,
+) -> list[ScheduledStructuralEntry]:
+    scheduled_entries = []
+    read_rank = 0
+    for file_rank, (table, entries) in enumerate(candidate_entries, start=1):
+        for entry_rank, entry in enumerate(entries, start=1):
+            read_rank += 1
+            scheduled_entries.append(
+                ScheduledStructuralEntry(
+                    table=table,
+                    entry=entry,
+                    candidate_file_rank=file_rank,
+                    candidate_entry_rank=entry_rank,
+                    read_rank=read_rank,
+                )
+            )
+    if candidate_selection_profile != "intent_structural_global":
+        return scheduled_entries
+
+    ordered = list(scheduled_entries)
+    ordered.sort(
+        key=lambda scheduled: _global_candidate_read_sort_key(scheduled, query_profile),
+        reverse=True,
+    )
+    return [
+        ScheduledStructuralEntry(
+            table=scheduled.table,
+            entry=scheduled.entry,
+            candidate_file_rank=scheduled.candidate_file_rank,
+            candidate_entry_rank=scheduled.candidate_entry_rank,
+            read_rank=read_rank,
+        )
+        for read_rank, scheduled in enumerate(ordered, start=1)
+    ]
+
+
+def _global_candidate_read_sort_key(
+    scheduled: ScheduledStructuralEntry,
+    query_profile: dict[str, Any],
+) -> tuple[int, int, int, int, int, int, int, int]:
+    entry = scheduled.entry
+    query_terms = set(query_profile["lexical_terms"])
+    query_tags = set(query_profile["structural_tags"])
+    query_event_families = set(query_profile["event_families"])
+    prefer_timestamp = bool(query_profile.get("date_reason")) or bool(query_profile.get("date_window_present"))
+    preferred_role_tag = f"role:{_safe_tag(str(query_profile.get('role') or ''))}" if query_profile.get("role") else None
+    base_score = _candidate_entry_base_score(
+        entry,
+        query_terms=query_terms,
+        query_tags=query_tags,
+        query_event_families=query_event_families,
+        query_profile=query_profile,
+        candidate_selection_profile="intent_structural_global",
+        diversity_bonus=int(scheduled.candidate_entry_rank == 1),
+    )
+    timestamp_match = int(prefer_timestamp and entry.timestamp_bucket == "timestamp_present")
+    role_match = int(bool(preferred_role_tag and preferred_role_tag in entry.structural_tags))
+    structural_overlap = len(entry.structural_tags & query_tags)
+    return (
+        timestamp_match,
+        role_match,
+        structural_overlap + base_score[0],
+        base_score[1],
+        base_score[2],
+        entry.line,
+        -scheduled.candidate_file_rank,
+        -scheduled.candidate_entry_rank,
+    )
+
+
+def _candidate_read_schedule_profile(candidate_selection_profile: str) -> str:
+    if candidate_selection_profile == "intent_structural_global":
+        return "intent_structural_global"
+    return "file_order"
+
+
+def _candidate_read_schedule_preview(
+    candidate_read_schedule: list[ScheduledStructuralEntry],
+    *,
+    limit: int = 20,
+) -> list[dict[str, int]]:
+    return [
+        {
+            "read_rank": scheduled.read_rank,
+            "candidate_file_rank": scheduled.candidate_file_rank,
+            "candidate_entry_rank": scheduled.candidate_entry_rank,
+            "line_numbers_included": 0,
+            "raw_paths_included": 0,
+        }
+        for scheduled in candidate_read_schedule[:limit]
+    ]
+
+
 def _candidate_selection_profile(value: str | None) -> str:
-    if value == "intent_structural":
-        return "intent_structural"
+    if value in {"intent_structural", "intent_structural_global"}:
+        return value
     return "default"
+
+
+def _is_intent_structural_profile(value: str) -> bool:
+    return value in {"intent_structural", "intent_structural_global"}
 
 
 def _use_intent_structural_order(query_profile: dict[str, Any]) -> bool:
@@ -997,7 +1144,7 @@ def _structural_overlap(
     candidate_selection_profile: str,
 ) -> int:
     overlap = len(entry.structural_tags & query_tags)
-    if candidate_selection_profile != "intent_structural":
+    if not _is_intent_structural_profile(candidate_selection_profile):
         return overlap
     role = query_profile.get("role")
     if role and f"role:{_safe_tag(str(role))}" in entry.structural_tags:
@@ -1135,6 +1282,7 @@ def _fallback_payload(
     query_profile: dict[str, Any],
     record_window_stats: dict[str, Any] | None = None,
     candidate_selection_profile: str = "default",
+    candidate_read_schedule_profile: str = "file_order",
 ) -> dict[str, Any]:
     record_window_stats = record_window_stats or _default_record_window_stats()
     return {
@@ -1142,6 +1290,9 @@ def _fallback_payload(
         "fallback_reason": reason,
         "query_profile": _sanitized_query_profile(query_profile),
         "candidate_selection_profile": candidate_selection_profile,
+        "candidate_read_schedule_profile": candidate_read_schedule_profile,
+        "candidate_read_schedule_entry_count": 0,
+        "candidate_read_schedule_preview": [],
         "candidate_files": 0,
         "candidate_entries": 0,
         "searched_files": 0,
@@ -1155,6 +1306,8 @@ def _fallback_payload(
         "summary": {
             **index.sanitized_summary(),
             "fallback_reason": reason,
+            "candidate_read_schedule_profile": candidate_read_schedule_profile,
+            "candidate_read_schedule_entry_count": 0,
             **record_window_stats,
             "raw_paths_included": False,
             "raw_text_included": False,
@@ -1177,13 +1330,16 @@ def _search_summary(
     source_kinds: set[str],
     record_window_stats: dict[str, Any],
     candidate_selection_profile: str,
+    candidate_read_schedule_profile: str,
 ) -> dict[str, Any]:
     return {
         **index.sanitized_summary(),
         "query_profile": _sanitized_query_profile(query_profile),
         "candidate_selection_profile": candidate_selection_profile,
+        "candidate_read_schedule_profile": candidate_read_schedule_profile,
         "candidate_file_count": candidate_file_count,
         "candidate_entry_count": candidate_entry_count,
+        "candidate_read_schedule_entry_count": candidate_entry_count,
         "opened_file_count": opened_file_count,
         "searched_bytes": searched_bytes,
         "records_considered": records_considered,

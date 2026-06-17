@@ -15,7 +15,7 @@ from .structural_sidecar import (
 
 BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD = 10
 BUDGETED_HYBRID_SUPPLEMENT_LIMIT = 10
-BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE = "intent_structural"
+BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE = "intent_structural_global"
 BUDGETED_HYBRID_RECORD_WINDOW_RADIUS = 0
 BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_PER_FILE = 0
 BUDGETED_HYBRID_RECORD_WINDOW_MAX_EXTRA_ENTRIES_TOTAL = 0
@@ -145,6 +145,12 @@ def hybrid_package_structural_result(
         "structural_supplement_candidate_count": len(structural_supplement),
         "supplement_limit": supplement_limit,
         "candidate_selection_profile": candidate_selection_profile,
+        "structural_candidate_read_schedule_profile": str(
+            (effective_structural_result or {}).get("candidate_read_schedule_profile") or "not_run"
+        ),
+        "structural_candidate_read_schedule_entry_count": int(
+            (effective_structural_result or {}).get("candidate_read_schedule_entry_count") or 0
+        ),
         "searched_files": int(package_result.get("searched_files", 0))
         + int((effective_structural_result or {}).get("searched_files", 0)),
         "searched_bytes": int(package_result.get("searched_bytes", 0))

@@ -1760,6 +1760,8 @@ def main(argv: list[str] | None = None) -> int:
             "structural_supplement_candidate_count": result["structural_supplement_candidate_count"],
             "supplement_limit": result["supplement_limit"],
             "candidate_selection_profile": result["candidate_selection_profile"],
+            "structural_candidate_read_schedule_profile": result["structural_candidate_read_schedule_profile"],
+            "structural_candidate_read_schedule_entry_count": result["structural_candidate_read_schedule_entry_count"],
             "package_searched_bytes": result["package_searched_bytes"],
             "structural_searched_bytes": result["structural_searched_bytes"],
             "structural_records_considered": result["structural_records_considered"],
