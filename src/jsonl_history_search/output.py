@@ -35,6 +35,8 @@ def render_text(payload: dict) -> str:
         return render_manifest_text(payload)
     if "generated_metadata_discovery" in payload:
         return render_generated_metadata_discovery_text(payload)
+    if "expansion_family_probe" in payload:
+        return render_expansion_family_probe_text(payload)
     if "expansion_family_audit" in payload:
         return render_expansion_family_audit_text(payload)
     if "retrieval_efficiency_eval" in payload:
@@ -158,6 +160,8 @@ def render_markdown(payload: dict) -> str:
         return render_manifest_markdown(payload)
     if "generated_metadata_discovery" in payload:
         return render_generated_metadata_discovery_markdown(payload)
+    if "expansion_family_probe" in payload:
+        return render_expansion_family_probe_markdown(payload)
     if "expansion_family_audit" in payload:
         return render_expansion_family_audit_markdown(payload)
     if "retrieval_efficiency_eval" in payload:
@@ -283,6 +287,141 @@ def render_expansion_family_audit_text(payload: dict) -> str:
             f"metadata_role={row['generated_metadata_role']} | flagged={flagged}"
         )
     return "\n".join(lines)
+
+
+def render_expansion_family_probe_text(payload: dict) -> str:
+    report = payload["expansion_family_probe"]
+    bridge = report["bridge"]
+    counters = report["counters"]
+    lines = [
+        "Expansion Family Probe",
+        f"Status: {report['status']}",
+        f"Family: {report['family']}",
+        f"Verdict: {report['verdict']}",
+        f"Bridge status: {bridge['status']}",
+        f"Common accepted cases: {bridge['accepted_common_case_count']}",
+        f"Missing from bridge: {bridge['missing_from_bridge_count']}",
+        f"Family triggers: {counters['family_trigger_count']}",
+        f"Recommendation: {report['recommendation']['action']}",
+        f"Runtime retrieval behavior changed: {report['runtime_retrieval_behavior_changed']}",
+    ]
+    term_status = counters["term_count_comparison"]["status"]
+    lines.append(f"Term-count comparison: {term_status}")
+    lines.append("Privacy: aggregate committed-safe counters only")
+    return "\n".join(lines)
+
+
+def render_expansion_family_probe_markdown(payload: dict) -> str:
+    report = payload["expansion_family_probe"]
+    bridge = report["bridge"]
+    counters = report["counters"]
+    metadata = report["family_metadata"]
+    lines = [
+        "# JSH-799 Process Detour Expansion Diagnostic Counters",
+        "",
+        "## Verdict",
+        "",
+        (
+            "Current retained real-history evidence does not exercise "
+            "`process_detour_lesson`; behavior comparison or removal is not "
+            "justified yet."
+            if counters["family_trigger_count"] == 0
+            else (
+                "Current retained real-history evidence exercises the target family; "
+                "a default-off behavior comparison is required before any default change."
+            )
+        ),
+        "",
+        "Defaults are unchanged. This report does not suppress, replace, opt-in-gate, "
+        "or promote generated metadata for the target family.",
+        "",
+        "## Aggregate Counters",
+        "",
+        f"- Family: `{report['family']}`",
+        f"- Scope: `{metadata['core_scope']}`",
+        f"- Overfit risk: `{metadata['overfit_risk']}`",
+        f"- Generated-metadata role: `{metadata['generated_metadata_role']}`",
+        f"- Bridge status: `{bridge['status']}`",
+        f"- Validator status: `{bridge['validator_status']}`",
+        f"- Manifest cases: `{bridge['manifest_case_count']}`",
+        f"- Bridge cases: `{bridge['bridge_case_count']}`",
+        f"- Common cases: `{bridge['common_case_count']}`",
+        f"- Accepted common cases: `{bridge['accepted_common_case_count']}`",
+        f"- Missing from newer manifest/bridge intersection: `{bridge['missing_from_bridge_count']}`",
+        f"- Extra bridge cases: `{bridge['extra_bridge_case_count']}`",
+        f"- Family trigger count: `{counters['family_trigger_count']}`",
+        "",
+        "## Planner Aggregate Check",
+        "",
+        (
+            "- Common accepted cases are `18`: "
+            f"`{bridge['planner_aggregate_match']['common_accepted_cases_18']}`"
+        ),
+        (
+            "- Missing from newer manifest is `2`: "
+            f"`{bridge['planner_aggregate_match']['missing_from_newer_manifest_2']}`"
+        ),
+        (
+            "- Process-detour triggers are `0`: "
+            f"`{bridge['planner_aggregate_match']['process_detour_lesson_triggers_0']}`"
+        ),
+        "",
+        "## Family And Label Buckets",
+        "",
+        "Accepted common case family buckets:",
+    ]
+    lines.extend(_markdown_count_lines(counters["accepted_case_family_buckets"]))
+    lines.append("")
+    lines.append("Accepted common case label buckets:")
+    lines.extend(_markdown_count_lines(counters["accepted_case_label_buckets"]))
+    lines.append("")
+    lines.append("Triggering case family buckets:")
+    lines.extend(_markdown_count_lines(counters["triggering_case_family_buckets"]))
+    lines.append("")
+    lines.append("Triggering case label buckets:")
+    lines.extend(_markdown_count_lines(counters["triggering_case_label_buckets"]))
+    lines.extend(["", "## Term Count Comparison", ""])
+    term_counts = counters["term_count_comparison"]
+    lines.append(f"- Status: `{term_counts['status']}`")
+    lines.append(
+        "- Current-vs-family-excluded term-count buckets included: "
+        f"`{term_counts['current_vs_family_excluded_term_count_buckets_included']}`"
+    )
+    if term_counts.get("current_vs_family_excluded_term_count_buckets_included"):
+        lines.append("- Current term-count buckets:")
+        lines.extend(_markdown_count_lines(term_counts["current_term_count_buckets"]))
+        lines.append("- Family-excluded term-count buckets:")
+        lines.extend(_markdown_count_lines(term_counts["family_excluded_term_count_buckets"]))
+        lines.append("- Term delta buckets:")
+        lines.extend(_markdown_count_lines(term_counts["term_delta_buckets"]))
+    lines.extend(
+        [
+            "",
+            "## Recommendation",
+            "",
+            f"`{report['recommendation']['action']}`",
+            "",
+            report["recommendation"]["reason"],
+            "",
+            "Next direct tool action should be selected from measured tool evidence, "
+            "not harness/live recovery.",
+            "",
+            "## Privacy Boundary",
+            "",
+            "This report includes aggregate counters, sanitized family names, and "
+            "sanitized manifest labels only. It omits raw query strings, case IDs, "
+            "expected refs, paths, target lines, session IDs, local usernames, "
+            "per-row expansions, current benchmark miss IDs, and user-specific "
+            "runtime phrasing.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _markdown_count_lines(counts: dict) -> list[str]:
+    if not counts:
+        return ["- `(none)`: `0`"]
+    return [f"- `{label}`: `{count}`" for label, count in sorted(counts.items())]
 
 
 def render_expansion_family_audit_markdown(payload: dict) -> str:

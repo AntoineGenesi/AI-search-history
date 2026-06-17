@@ -19,6 +19,7 @@ from .capability_diagnostic import build_capability_diagnostic
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .expansion import build_expansion_family_audit_report
+from .expansion_family_probe import build_expansion_family_probe_report, supported_family_names
 from .forensics import build_forensics_payload
 from .generated_metadata import build_generated_metadata_discovery_report
 from .harness_artifacts import (
@@ -196,6 +197,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     expansion_family_audit.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
     expansion_family_audit.add_argument("--report-output", default=None)
+    expansion_family_probe = subparsers.add_parser(
+        "expansion-family-probe",
+        description="Report-only aggregate retained-real-history probe for one expansion family.",
+    )
+    expansion_family_probe.add_argument("--family", choices=supported_family_names(), required=True)
+    expansion_family_probe.add_argument("--manifest", type=Path, default=None)
+    expansion_family_probe.add_argument("--private-bridge", type=Path, default=None)
+    expansion_family_probe.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
+    expansion_family_probe.add_argument("--report-output", default=None)
     forensics = subparsers.add_parser("forensics")
     add_common_args(forensics)
     forensics.add_argument("--commit", default=None)
@@ -1279,6 +1289,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if status in {"root_rejected"} else 0
     if args.command == "expansion-family-audit":
         payload = build_expansion_family_audit_report()
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+    if args.command == "expansion-family-probe":
+        payload = build_expansion_family_probe_report(
+            family=args.family,
+            manifest_path=args.manifest,
+            private_bridge_path=args.private_bridge,
+        )
         rendered = render(payload, args.format)
         if args.report_output:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
