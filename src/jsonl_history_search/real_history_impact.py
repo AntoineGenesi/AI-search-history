@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .metric_contract import add_metric_contract, real_history_impact_metrics
-from .query import infer_query
+from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
 from .scanner import search
 from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
@@ -649,7 +649,10 @@ def _run_package_search_structural_hybrid_budgeted(**kwargs) -> tuple[dict[str, 
         warnings=warnings,
         notes=["opt_in_budgeted_structural_supplement_probe"],
     )
-    row["structural_hybrid"] = _structural_hybrid_row_stats(hybrid_result)
+    row["structural_hybrid"] = _structural_hybrid_row_stats(
+        hybrid_result,
+        query_intent_summary=_query_intent_summary(intent, gate=gate),
+    )
     expected_diagnostics = _expected_ref_diagnostics_row(hybrid_result)
     if expected_diagnostics is not None:
         row["expected_ref_diagnostics"] = expected_diagnostics
@@ -877,9 +880,13 @@ def _match_key(match: dict[str, Any]) -> tuple[str, int]:
     return (str(match.get("path") or ""), int(match.get("line") or 0))
 
 
-def _structural_hybrid_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+def _structural_hybrid_row_stats(
+    result: dict[str, Any],
+    *,
+    query_intent_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     record_window = result.get("record_window") if isinstance(result.get("record_window"), dict) else {}
-    return {
+    stats = {
         "enabled": True,
         "status": str(result.get("status") or "unknown"),
         "strategy": str(result.get("strategy") or "unknown"),
@@ -907,6 +914,116 @@ def _structural_hybrid_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "raw_text_included": False,
         "expected_refs_used_for_retrieval": False,
     }
+    if query_intent_summary is not None:
+        stats["query_intent_summary"] = query_intent_summary
+    return stats
+
+
+def _query_intent_summary(intent: QueryIntent, *, gate: dict[str, Any]) -> dict[str, Any]:
+    date_or_timeline_present = bool(
+        intent.date_reason or intent.date_window_start is not None or intent.date_window_end is not None
+    )
+    role_label = str(intent.role) if intent.role in {"user", "assistant"} else None
+    high_candidate_labels: list[str] = []
+    if date_or_timeline_present:
+        high_candidate_labels.append("date_or_timeline_intent")
+    if role_label is not None:
+        high_candidate_labels.append("role_intent")
+    return {
+        "schema_version": 1,
+        "diagnostic_scope": "package_search_structural_hybrid_budgeted",
+        "date_or_timeline_intent_present": date_or_timeline_present,
+        "date_window_present": bool(intent.date_window_start is not None or intent.date_window_end is not None),
+        "date_window_filter_present": bool(intent.date_window_filter),
+        "date_reason_label": _date_reason_label(intent.date_reason),
+        "role_intent_present": role_label is not None,
+        "role_label": role_label,
+        "role_filter_explicit": bool(intent.role_filter_explicit),
+        "artifact_hint_count": len(intent.artifact_hints),
+        "artifact_hint_count_bucket": _count_bucket(len(intent.artifact_hints)),
+        "base_term_count": len(intent.base_terms),
+        "base_term_count_bucket": _count_bucket(len(intent.base_terms)),
+        "query_term_count": len(intent.terms),
+        "query_term_count_bucket": _count_bucket(len(intent.terms)),
+        "expansion_reason_count": len(intent.expansion_reasons),
+        "expansion_reason_count_bucket": _count_bucket(len(intent.expansion_reasons)),
+        "warning_count": len(intent.warnings),
+        "intent_structural_high_candidate_count_signal_labels": high_candidate_labels,
+        "intent_structural_high_candidate_count_could_trigger": bool(high_candidate_labels),
+        "gate_profile": _gate_profile_label(gate.get("gate_profile")),
+        "gate_reason": _gate_reason_label(gate.get("gate_reason")),
+        "gate_supplement_enabled": bool(gate.get("supplement_enabled")),
+        "gate_candidate_threshold": gate.get("gate_candidate_threshold"),
+        "gate_package_candidate_count": int(gate.get("package_candidate_count") or 0),
+        "gate_intent_override_enabled": bool(gate.get("intent_structural_high_candidate_count_enabled")),
+        "gate_intent_override_reason_labels": _intent_reason_labels(
+            gate.get("intent_structural_high_candidate_count_reasons")
+        ),
+        "oracle_inputs_used": False,
+        "privacy": {
+            "counts_and_labels_only": True,
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "raw_base_terms_included": False,
+            "raw_expansion_text_included": False,
+            "raw_artifact_hints_included": False,
+            "raw_private_text_included": False,
+            "raw_snippets_included": False,
+            "raw_paths_included": False,
+            "local_usernames_included": False,
+            "raw_session_ids_included": False,
+            "source_lines_included": False,
+            "target_lines_included": False,
+        },
+    }
+
+
+def _gate_profile_label(value: Any) -> str:
+    profile = str(value or "candidate_count")
+    if profile in {"candidate_count", "intent_structural_high_candidate_count"}:
+        return profile
+    return "unknown_gate_profile"
+
+
+def _gate_reason_label(value: Any) -> str:
+    reason = str(value or "unknown")
+    if reason in {
+        "ungated",
+        "package_candidate_count_at_or_below_threshold",
+        "package_candidate_count_above_threshold",
+        "intent_structural_high_candidate_count",
+    }:
+        return reason
+    return "unknown_gate_reason"
+
+
+def _intent_reason_labels(value: Any) -> list[str]:
+    labels = value if isinstance(value, list) else []
+    return [
+        str(label)
+        for label in labels
+        if label in {"date_or_timeline_intent", "role_intent"}
+    ]
+
+
+def _date_reason_label(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    if reason in {"yesterday", "last night", "last week", "a few days ago", "recent"}:
+        return "relative_date_window"
+    return "timeline_or_date_metadata"
+
+
+def _count_bucket(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count <= 3:
+        return "1-3"
+    if count <= 10:
+        return "4-10"
+    if count <= 40:
+        return "11-40"
+    return "41_plus"
 
 
 def _literal_candidates(query: str, files: list[RealHistoryFile]) -> tuple[list[Candidate], int, int, int]:
