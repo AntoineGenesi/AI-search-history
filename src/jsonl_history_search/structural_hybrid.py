@@ -14,6 +14,7 @@ from .structural_sidecar import (
 
 
 BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD = 10
+BUDGETED_HYBRID_GATE_PROFILE = "intent_structural_high_candidate_count"
 BUDGETED_HYBRID_SUPPLEMENT_LIMIT = 10
 BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE = "intent_structural_global_stratified"
 BUDGETED_HYBRID_RECORD_WINDOW_RADIUS = 0
@@ -30,6 +31,7 @@ def search_structural_hybrid_budgeted(
     mask_context: MaskContext | None = None,
     structural_sidecar_index: StructuralSidecarIndex | None = None,
     gate_candidate_threshold: int = BUDGETED_HYBRID_GATE_CANDIDATE_THRESHOLD,
+    gate_profile: str = BUDGETED_HYBRID_GATE_PROFILE,
     supplement_limit: int = BUDGETED_HYBRID_SUPPLEMENT_LIMIT,
     candidate_selection_profile: str = BUDGETED_HYBRID_CANDIDATE_SELECTION_PROFILE,
     record_window_radius: int = BUDGETED_HYBRID_RECORD_WINDOW_RADIUS,
@@ -50,6 +52,8 @@ def search_structural_hybrid_budgeted(
     gate = structural_supplement_gate(
         package_candidate_count=package_candidate_count,
         threshold=gate_candidate_threshold,
+        intent=intent,
+        gate_profile=gate_profile,
     )
     structural_result: dict[str, Any] | None = None
     if gate["supplement_enabled"]:
@@ -97,6 +101,7 @@ def search_structural_hybrid_budgeted(
         "private_bridge_required": False,
         "expected_refs_required": False,
         "candidate_selection_profile": candidate_selection_profile,
+        "gate_profile": gate_profile,
     }
     if package_result.get("expected_ref_diagnostics") is not None:
         result["expected_ref_diagnostics"] = package_result["expected_ref_diagnostics"]
@@ -177,27 +182,61 @@ def hybrid_package_structural_result(
     }
 
 
-def structural_supplement_gate(*, package_candidate_count: int, threshold: int | None) -> dict[str, Any]:
+def structural_supplement_gate(
+    *,
+    package_candidate_count: int,
+    threshold: int | None,
+    intent: QueryIntent | None = None,
+    gate_profile: str = "candidate_count",
+) -> dict[str, Any]:
+    normalized_profile = gate_profile if gate_profile == BUDGETED_HYBRID_GATE_PROFILE else "candidate_count"
+    intent_gate = _intent_structural_high_candidate_count_gate(intent)
     if threshold is None:
         return {
             "supplement_enabled": True,
             "gate_reason": "ungated",
             "gate_candidate_threshold": None,
             "package_candidate_count": package_candidate_count,
+            "gate_profile": normalized_profile,
+            "intent_structural_high_candidate_count_enabled": False,
+            "intent_structural_high_candidate_count_reasons": [],
             "oracle_inputs_used": False,
         }
     enabled = package_candidate_count <= threshold
+    intent_override_enabled = False
+    intent_reasons = intent_gate["reasons"] if normalized_profile == BUDGETED_HYBRID_GATE_PROFILE else []
+    if not enabled and normalized_profile == BUDGETED_HYBRID_GATE_PROFILE and intent_gate["enabled"]:
+        enabled = True
+        intent_override_enabled = True
     return {
         "supplement_enabled": enabled,
         "gate_reason": (
-            "package_candidate_count_at_or_below_threshold"
-            if enabled
-            else "package_candidate_count_above_threshold"
+            "intent_structural_high_candidate_count"
+            if intent_override_enabled
+            else (
+                "package_candidate_count_at_or_below_threshold"
+                if enabled
+                else "package_candidate_count_above_threshold"
+            )
         ),
         "gate_candidate_threshold": threshold,
         "package_candidate_count": package_candidate_count,
+        "gate_profile": normalized_profile,
+        "intent_structural_high_candidate_count_enabled": intent_override_enabled,
+        "intent_structural_high_candidate_count_reasons": intent_reasons,
         "oracle_inputs_used": False,
     }
+
+
+def _intent_structural_high_candidate_count_gate(intent: QueryIntent | None) -> dict[str, Any]:
+    if intent is None:
+        return {"enabled": False, "reasons": []}
+    reasons: list[str] = []
+    if intent.date_reason or intent.date_window_start is not None or intent.date_window_end is not None:
+        reasons.append("date_or_timeline_intent")
+    if intent.role:
+        reasons.append("role_intent")
+    return {"enabled": bool(reasons), "reasons": reasons}
 
 
 def _flat_matches(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
