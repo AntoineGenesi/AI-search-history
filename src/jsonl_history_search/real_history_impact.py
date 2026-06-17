@@ -850,10 +850,18 @@ def _hybrid_package_structural_result(
     return result
 
 
-def _structural_supplement_gate(*, package_candidate_count: int, threshold: int | None) -> dict[str, Any]:
+def _structural_supplement_gate(
+    *,
+    package_candidate_count: int,
+    threshold: int | None,
+    intent: QueryIntent | None = None,
+    gate_profile: str = "candidate_count",
+) -> dict[str, Any]:
     return _shared_structural_supplement_gate(
         package_candidate_count=package_candidate_count,
         threshold=threshold,
+        intent=intent,
+        gate_profile=gate_profile,
     )
 
 
