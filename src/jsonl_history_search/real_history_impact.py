@@ -923,6 +923,7 @@ def _query_intent_summary(intent: QueryIntent, *, gate: dict[str, Any]) -> dict[
     date_or_timeline_present = bool(
         intent.date_reason or intent.date_window_start is not None or intent.date_window_end is not None
     )
+    temporal_question_reason = _temporal_question_reason_label(intent.temporal_question_reason)
     role_label = str(intent.role) if intent.role in {"user", "assistant"} else None
     high_candidate_labels: list[str] = []
     if date_or_timeline_present:
@@ -936,6 +937,9 @@ def _query_intent_summary(intent: QueryIntent, *, gate: dict[str, Any]) -> dict[
         "date_window_present": bool(intent.date_window_start is not None or intent.date_window_end is not None),
         "date_window_filter_present": bool(intent.date_window_filter),
         "date_reason_label": _date_reason_label(intent.date_reason),
+        "temporal_question_intent_present": temporal_question_reason is not None,
+        "temporal_question_reason_label": temporal_question_reason,
+        "temporal_question_feeds_structural_gate": False,
         "role_intent_present": role_label is not None,
         "role_label": role_label,
         "role_filter_explicit": bool(intent.role_filter_explicit),
@@ -1012,6 +1016,12 @@ def _date_reason_label(reason: str | None) -> str | None:
     if reason in {"yesterday", "last night", "last week", "a few days ago", "recent"}:
         return "relative_date_window"
     return "timeline_or_date_metadata"
+
+
+def _temporal_question_reason_label(reason: str | None) -> str | None:
+    if reason in {"when_question", "what_date_time_question", "which_date_time_question"}:
+        return reason
+    return None
 
 
 def _count_bucket(count: int) -> str:
