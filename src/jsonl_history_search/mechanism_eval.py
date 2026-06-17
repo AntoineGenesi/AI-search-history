@@ -383,8 +383,10 @@ def _sanitize_prefilter(stats: dict[str, Any] | None, *, enabled: bool) -> dict[
         return {
             "enabled": bool(enabled),
             "status": "disabled" if not enabled else "not_attempted",
+            "fallback_reason": None,
             "needle_policy": None,
             "needle_count": 0,
+            "anchor_kind_counts": {},
             "files_reduced": 0,
             "bytes_reduced": 0,
         }
@@ -394,6 +396,7 @@ def _sanitize_prefilter(stats: dict[str, Any] | None, *, enabled: bool) -> dict[
         "fallback_reason": stats.get("fallback_reason"),
         "needle_policy": stats.get("needle_policy"),
         "needle_count": int(stats.get("needle_count", 0)),
+        "anchor_kind_counts": _safe_count_dict(stats.get("anchor_kind_counts")),
         "files_reduced": int(stats.get("files_reduced", 0)),
         "bytes_reduced": int(stats.get("bytes_reduced", 0)),
         "files_reduction_ratio": float(stats.get("files_reduction_ratio", 0.0)),
@@ -425,6 +428,8 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "total_searched_files": sum(row["searched_files"] for row in selected),
             "total_searched_bytes": sum(row["searched_bytes"] for row in selected),
             "rg_needle_policy_counts": _policy_counts(selected),
+            "rg_anchor_kind_counts": _anchor_kind_counts(selected),
+            "rg_fallback_reason_counts": _fallback_reason_counts(selected),
             "metadata_candidate_count_max": max((row["metadata_candidate_count"] for row in selected), default=0),
             "metadata_supplement_term_count_max": max(
                 (row.get("metadata_supplement", {}).get("term_count", 0) for row in selected),
@@ -491,6 +496,38 @@ def _policy_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
         if policy:
             counts[str(policy)] = counts.get(str(policy), 0) + 1
     return counts
+
+
+def _anchor_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        for kind, count in (row.get("rg_prefilter", {}).get("anchor_kind_counts") or {}).items():
+            counts[str(kind)] = counts.get(str(kind), 0) + int(count)
+    return counts
+
+
+def _fallback_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = row.get("rg_prefilter", {}).get("fallback_reason")
+        if reason:
+            counts[str(reason)] = counts.get(str(reason), 0) + 1
+    return counts
+
+
+def _safe_count_dict(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, int] = {}
+    for key, count in value.items():
+        label = str(key)
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,48}", label):
+            continue
+        try:
+            safe[label] = int(count)
+        except (TypeError, ValueError):
+            continue
+    return safe
 
 
 def _mechanism_gate(rows: list[dict[str, Any]], metadata_summary: dict[str, Any]) -> dict[str, Any]:
