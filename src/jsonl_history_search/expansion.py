@@ -2508,6 +2508,163 @@ def contextual_expansion_family_audit() -> list[dict[str, Any]]:
     return rows
 
 
+def build_expansion_family_audit_report() -> dict[str, Any]:
+    rows = contextual_expansion_family_audit()
+    core_scope_counts = _count_by(rows, "core_scope")
+    overfit_risk_counts = _count_by(rows, "overfit_risk")
+    generated_metadata_role_counts = _count_by(rows, "generated_metadata_role")
+    high_risk = [row["name"] for row in rows if row["overfit_risk"] == "high"]
+    candidate_replacements = [
+        row["name"] for row in rows if row["generated_metadata_role"] == "candidate_replacement"
+    ]
+    workflow_candidate_supplements = [
+        row["name"]
+        for row in rows
+        if row["core_scope"] == "workflow_specific"
+        and row["generated_metadata_role"] == "candidate_supplement"
+    ]
+    flagged_terms = sorted(
+        {
+            term
+            for row in rows
+            for term in row["flagged_local_or_proper_terms"]
+        }
+    )
+
+    return {
+        "expansion_family_audit": {
+            "schema_version": 1,
+            "status": "report_only_diagnostic",
+            "runtime_retrieval_behavior_changed": False,
+            "verdict": "do_not_suppress_replace_or_opt_in_gate_process_detour_lesson_yet",
+            "decision": {
+                "process_detour_lesson_policy": "diagnostic_visibility_only_for_now",
+                "reason": (
+                    "The current audit exposes a real high-risk local-lesson hygiene signal, "
+                    "but existing generated-metadata evidence is report-only or synthetic and "
+                    "does not yet justify disabling, replacing, or gating the runtime family."
+                ),
+            },
+            "defaults_unchanged": {
+                "default_package_search": True,
+                "default_find": True,
+                "default_semantic_debug": True,
+                "scanner": True,
+                "ranking": True,
+                "source_caps": True,
+                "output_caps": True,
+                "sidecars": True,
+                "runtime_expansion_family_behavior": True,
+            },
+            "generated_metadata": {
+                "default_promoted": False,
+                "runtime_consumed_by_search": False,
+                "replacement_enabled": False,
+                "status": "unpromoted_report_only_hypothesis",
+            },
+            "summary": {
+                "family_count": len(rows),
+                "core_scope_counts": core_scope_counts,
+                "overfit_risk_counts": overfit_risk_counts,
+                "generated_metadata_role_counts": generated_metadata_role_counts,
+                "workflow_specific_family_count": core_scope_counts.get("workflow_specific", 0),
+                "candidate_supplement_family_count": generated_metadata_role_counts.get(
+                    "candidate_supplement", 0
+                ),
+                "workflow_specific_candidate_supplement_family_count": len(
+                    workflow_candidate_supplements
+                ),
+                "high_risk_families": high_risk,
+                "candidate_replacement_families": candidate_replacements,
+                "flagged_local_or_proper_terms": flagged_terms,
+                "flagged_terms_source": "sanitized_labels_from_code_registry_only",
+            },
+            "families": rows,
+            "evidence_basis": [
+                {
+                    "source": "JSH-671",
+                    "role": "reason_for_existing_family",
+                    "summary": (
+                        "Added a bounded process-detour lesson family to recover vague "
+                        "retrospective process/tool-improvement evidence while keeping "
+                        "generic unrelated wording gated out."
+                    ),
+                },
+                {
+                    "source": "JSH-692",
+                    "role": "behavior_preserving_audit_metadata",
+                    "summary": (
+                        "Added family metadata and contextual_expansion_family_audit() "
+                        "without changing expansion predicates, expansion terms, ranking, "
+                        "scanning, rg prefiltering, or sidecar behavior."
+                    ),
+                },
+                {
+                    "source": "JSH-694",
+                    "role": "report_only_generated_metadata_discovery",
+                    "summary": (
+                        "Added opt-in sanitized metadata discovery with no default sidecar, "
+                        "index, watcher, ranking, search behavior, token-efficiency, or "
+                        "product-value promotion."
+                    ),
+                },
+                {
+                    "source": "JSH-696",
+                    "role": "synthetic_metadata_supplement_learning",
+                    "summary": (
+                        "Opt-in synthetic metadata supplement outcomes were neutral, harmed, "
+                        "and neutral; evidence stayed tiny, report-only, inconclusive, and "
+                        "unpromoted."
+                    ),
+                },
+                {
+                    "source": "JSH-797",
+                    "role": "no_runtime_change_caution",
+                    "summary": (
+                        "Kept temporal-question inference diagnostic-only and selected "
+                        "generated-metadata/query-expansion hygiene as the next direct tool "
+                        "path without harness/live recovery."
+                    ),
+                },
+            ],
+            "next_direct_tool_action": {
+                "action": "later_real_case_no_default_behavior_probe_or_stronger_audit_counter_report",
+                "description": (
+                    "Use committed-safe real-case evidence to test disabling or replacing the "
+                    "single high-risk family without changing defaults, or first strengthen "
+                    "audit counters/reporting if replacement evidence is still too weak."
+                ),
+                "not_next": [
+                    "harness_live_recovery",
+                    "auth_send_process_route_work",
+                    "default_generated_metadata_promotion",
+                    "runtime_case_specific_query_expansion",
+                ],
+            },
+            "privacy_and_oracle_boundary": {
+                "committed_safe": True,
+                "raw_private_snippets_included": False,
+                "raw_paths_included": False,
+                "session_ids_included": False,
+                "local_usernames_included": False,
+                "expected_refs_included": False,
+                "target_lines_included": False,
+                "row_specific_query_expansions_included": False,
+                "current_benchmark_miss_ids_included": False,
+                "user_specific_runtime_phrasing_included": False,
+            },
+        }
+    }
+
+
+def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = row[key]
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def apply_contextual_expansion_families(
     normalized: str,
     base_terms: list[str],
