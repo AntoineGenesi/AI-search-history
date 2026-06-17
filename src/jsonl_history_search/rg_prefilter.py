@@ -12,6 +12,7 @@ from .sources import SourcePlan, dangerous_reason, safe_resolve
 
 
 RG_TIMEOUT_SECONDS = 5.0
+ANCHOR_KINDS = ("path", "task_slug", "commit_hash", "code_identifier")
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,12 @@ class PlannedFile:
 class RgPrefilterResult:
     files: list[PlannedFile]
     stats: dict
+
+
+@dataclass(frozen=True)
+class PrefilterAnchor:
+    value: str
+    kind: str
 
 
 def filter_planned_files(
@@ -40,9 +47,11 @@ def filter_planned_files(
         stats.update({"status": "fallback", "fallback_reason": root_warning})
         return RgPrefilterResult(files=planned, stats=stats)
 
-    needles = _prefilter_needles(intent)
+    anchors = _prefilter_anchors(intent)
+    needles = [anchor.value for anchor in anchors]
     stats["needle_policy"] = "literal_anchors"
     stats["needle_count"] = len(needles)
+    stats["anchor_kind_counts"] = _anchor_kind_counts(anchors)
     if not needles:
         stats.update({"status": "fallback", "fallback_reason": "ineligible_query"})
         return RgPrefilterResult(files=planned, stats=stats)
@@ -131,6 +140,7 @@ def _base_stats(planned: list[PlannedFile]) -> dict:
         "bytes_reduction_ratio": 0.0,
         "needle_policy": None,
         "needle_count": 0,
+        "anchor_kind_counts": {},
         "used_as_final_evidence": False,
     }
 
@@ -152,27 +162,70 @@ def _reduction_stats(planned: list[PlannedFile], matched: list[PlannedFile]) -> 
     }
 
 
-def _prefilter_needles(intent: QueryIntent) -> list[str]:
-    anchors: set[str] = set()
+def _prefilter_anchors(intent: QueryIntent) -> list[PrefilterAnchor]:
+    anchors: dict[str, PrefilterAnchor] = {}
     for value in [*intent.artifact_hints, *intent.base_terms, *intent.terms]:
         item = " ".join(value.strip().split())
-        if item and _literal_prefilter_eligible(item):
-            anchors.add(item)
-    if not anchors and _literal_prefilter_eligible(intent.normalized):
-        anchors.add(" ".join(intent.normalized.strip().split()))
-    return sorted(anchors, key=lambda item: (-len(item), item))
+        kind = _literal_prefilter_anchor_kind(item)
+        if item and kind:
+            anchors[item] = PrefilterAnchor(value=item, kind=kind)
+    normalized = " ".join(intent.normalized.strip().split())
+    if not anchors:
+        kind = _literal_prefilter_anchor_kind(normalized)
+        if kind:
+            anchors[normalized] = PrefilterAnchor(value=normalized, kind=kind)
+    return sorted(anchors.values(), key=lambda item: (-len(item.value), item.value))
 
 
 def _literal_prefilter_eligible(value: str) -> bool:
+    return _literal_prefilter_anchor_kind(value) is not None
+
+
+def _literal_prefilter_anchor_kind(value: str) -> str | None:
     if not _fixed_term_safe(value) or len(value) < 4:
-        return False
+        return None
     if re.search(r"(?:^|/)(?:tasks|docs|reports|reviews|src|tests)/[\w./-]+", value):
-        return True
+        return "path"
     if re.search(r"\.(?:md|html|json|jsonl|csv|txt|py|sh)$", value):
-        return True
+        return "path"
     if re.fullmatch(r"[a-z]{2,12}-\d+[a-z]?(?:-[a-z0-9]+){1,12}", value):
+        return "task_slug"
+    if _is_commit_hash_anchor(value):
+        return "commit_hash"
+    if _is_code_identifier_anchor(value):
+        return "code_identifier"
+    return None
+
+
+def _is_commit_hash_anchor(value: str) -> bool:
+    lowered = value.lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", lowered):
+        return False
+    return not lowered.isdigit()
+
+
+def _is_code_identifier_anchor(value: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value):
+        return False
+    if "." in value:
+        parts = value.split(".")
+        return len(parts) >= 2 and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in parts)
+    if "_" in value:
+        parts = [part for part in value.split("_") if part]
+        return len(parts) >= 2 and any(len(part) >= 3 for part in parts)
+    if re.search(r"[a-z0-9][A-Z]", value):
+        return True
+    if re.fullmatch(r"[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+", value):
         return True
     return False
+
+
+def _anchor_kind_counts(anchors: list[PrefilterAnchor]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for anchor in anchors:
+        if anchor.kind in ANCHOR_KINDS:
+            counts[anchor.kind] = counts.get(anchor.kind, 0) + 1
+    return counts
 
 
 def _fixed_term_safe(value: str) -> bool:
