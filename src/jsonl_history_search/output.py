@@ -2964,6 +2964,28 @@ def render_real_history_impact_text(payload: dict) -> str:
             f"{decision.get('decision')} "
             f"default_changed={decision.get('default_search_behavior_changed')}"
         )
+    compact = report.get("compact_package_handoff") or {}
+    if compact:
+        equivalence = compact.get("equivalence") or {}
+        lines.append(
+            "compact_package_handoff: "
+            f"status={compact.get('status')} "
+            f"runs={compact.get('runs')} "
+            f"full_bytes={compact.get('full_result_output_context_bytes')} "
+            f"compact_bytes={compact.get('compact_context_bytes')} "
+            f"ratio={compact.get('compact_to_full_result_byte_ratio')} "
+            f"ref_equiv={equivalence.get('top_candidate_ref_ids_equivalent_runs')}/"
+            f"{equivalence.get('compared_runs')} "
+            f"window_ref_equiv={equivalence.get('source_window_ref_ids_equivalent_runs')}/"
+            f"{equivalence.get('compared_runs')}"
+        )
+    compact_decision = report.get("compact_package_handoff_decision") or {}
+    if compact_decision:
+        lines.append(
+            "compact_package_handoff_decision: "
+            f"{compact_decision.get('decision')} "
+            f"default_changed={compact_decision.get('default_search_behavior_changed')}"
+        )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -3134,6 +3156,70 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Product-value claim supported: `{decision.get('product_value_claim_supported')}`",
             ]
         )
+    compact = report.get("compact_package_handoff") or {}
+    compact_decision = report.get("compact_package_handoff_decision") or {}
+    if compact:
+        equivalence = compact.get("equivalence") or {}
+        lines.extend(
+            [
+                "",
+                "## Compact Package Handoff",
+                "",
+                f"- Status: `{compact.get('status')}`",
+                f"- Basis: `{compact.get('basis')}`",
+                f"- Runs: `{compact.get('runs')}`",
+                f"- Cases: `{compact.get('cases')}`",
+                f"- Baseline counts: `{compact.get('baseline_counts')}`",
+                f"- Full scanner-result output context bytes: `{compact.get('full_result_output_context_bytes')}`",
+                f"- Compact package context bytes: `{compact.get('compact_context_bytes')}`",
+                f"- Locator context bytes: `{compact.get('locator_context_bytes')}`",
+                f"- Source-window text bytes: `{compact.get('source_window_text_bytes')}`",
+                f"- Compact/full byte ratio: `{compact.get('compact_to_full_result_byte_ratio')}`",
+                f"- Median full scanner-result bytes: `{compact.get('median_full_result_output_context_bytes')}`",
+                f"- Median compact package bytes: `{compact.get('median_compact_context_bytes')}`",
+                f"- Top candidate count: `{compact.get('top_candidate_count')}`",
+                f"- Source window count: `{compact.get('source_window_count')}`",
+                f"- Equivalence comparison basis: `{equivalence.get('comparison_basis')}`",
+                f"- Top-candidate scope: `{equivalence.get('top_candidate_scope')}`",
+                f"- Top-candidate limit: `{equivalence.get('top_candidate_limit')}`",
+                f"- Source-window scope: `{equivalence.get('source_window_scope')}`",
+                f"- Source-window limit: `{equivalence.get('source_window_limit')}`",
+                f"- Compared runs: `{equivalence.get('compared_runs')}`",
+                f"- Top-candidate ref-id equivalent runs: `{equivalence.get('top_candidate_ref_ids_equivalent_runs')}`",
+                f"- Top-candidate source-ref equivalent runs: `{equivalence.get('top_candidate_source_refs_equivalent_runs')}`",
+                f"- Source-window ref-id equivalent runs: `{equivalence.get('source_window_ref_ids_equivalent_runs')}`",
+                f"- Source-window source-ref equivalent runs: `{equivalence.get('source_window_source_refs_equivalent_runs')}`",
+                f"- All top-candidate ref IDs equivalent: `{equivalence.get('all_top_candidate_ref_ids_equivalent')}`",
+                f"- All top-candidate source refs equivalent: `{equivalence.get('all_top_candidate_source_refs_equivalent')}`",
+                f"- All source-window ref IDs equivalent: `{equivalence.get('all_source_window_ref_ids_equivalent')}`",
+                f"- All source-window source refs equivalent: `{equivalence.get('all_source_window_source_refs_equivalent')}`",
+                f"- Legacy output context bytes preserved: `{compact.get('legacy_output_context_bytes_preserved')}`",
+                f"- Compact bytes measured separately: `{compact.get('compact_bytes_measured_separately')}`",
+            ]
+        )
+        privacy = compact.get("privacy") or {}
+        if privacy:
+            lines.extend(["", "### Compact Package Privacy", ""])
+            for key, value in privacy.items():
+                lines.append(f"- `{key}`: `{value}`")
+    if compact_decision:
+        lines.extend(
+            [
+                "",
+                "## Compact Package Decision",
+                "",
+                f"- Decision: `{compact_decision.get('decision')}`",
+                f"- Rationale: {compact_decision.get('rationale')}",
+                f"- Next action: `{compact_decision.get('next_action')}`",
+                f"- Default search behavior changed: `{compact_decision.get('default_search_behavior_changed')}`",
+                f"- Scanner/ranking/source selection changed: `{compact_decision.get('scanner_ranking_source_selection_changed')}`",
+                f"- Legacy output context bytes redefined: `{compact_decision.get('legacy_output_context_bytes_redefined')}`",
+                f"- Token-savings claim supported: `{compact_decision.get('token_savings_claim_supported')}`",
+                f"- Final-answer quality claim supported: `{compact_decision.get('final_answer_quality_claim_supported')}`",
+                f"- Product-value claim supported: `{compact_decision.get('product_value_claim_supported')}`",
+                f"- Default promotion supported: `{compact_decision.get('default_promotion_supported')}`",
+            ]
+        )
     omitted = report.get("rows_omitted") or {}
     if omitted:
         lines.extend(
@@ -3148,6 +3234,8 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Raw queries committed: `{omitted.get('raw_queries_committed')}`",
                 f"- Raw private paths committed: `{omitted.get('raw_private_paths_committed')}`",
                 f"- Raw anchor needles committed: `{omitted.get('raw_anchor_needles_committed')}`",
+                f"- Raw compact handoff detail committed: `{omitted.get('raw_compact_handoff_detail_committed')}`",
+                f"- Raw source windows committed: `{omitted.get('raw_source_windows_committed')}`",
             ]
         )
     diagnostic = report.get("structural_sidecar_diagnostic") or {}

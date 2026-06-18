@@ -36,6 +36,9 @@ DEFAULT_BASELINES = (
 )
 VALID_OUTCOMES = {"evidence_found", "ambiguous_candidates", "no_evidence"}
 GATE_STATUSES = {"pass", "fail", "inconclusive", "not_evaluated"}
+COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT = 10
+COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT = 5
+COMPACT_PACKAGE_SOURCE_WINDOW_BYTE_LIMIT = 640
 
 
 @dataclass(frozen=True)
@@ -184,6 +187,10 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     base_report["rg_prefilter_workflow_decision"] = _rg_prefilter_workflow_decision(
         base_report["rg_prefilter_coverage"],
         base_report["summary"],
+    )
+    base_report["compact_package_handoff"] = _compact_package_handoff_summary(rows)
+    base_report["compact_package_handoff_decision"] = _compact_package_handoff_decision(
+        base_report["compact_package_handoff"]
     )
     structural_diagnostic = _structural_sidecar_diagnostic(rows)
     if structural_diagnostic is not None:
@@ -859,6 +866,29 @@ def _run_package_search_variant(
         warnings=package_warnings,
         notes=[],
     )
+    if getattr(args, "package_compact_handoff", False):
+        compact_package = _build_compact_package_handoff(
+            result,
+            candidates,
+            context_lines=int(getattr(args, "context_lines", 0) or 0),
+        )
+        row["compact_package_handoff"] = _compact_package_row_stats(
+            compact_package,
+            row=row,
+            expected_refs=case.get("expected_refs", []),
+            legacy_top_candidate_ref_ids=_candidate_ref_ids(
+                candidates,
+                case.get("expected_refs", []),
+                limit=COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            ),
+            legacy_source_window_ref_ids=_candidate_ref_ids(
+                candidates,
+                case.get("expected_refs", []),
+                limit=COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+            ),
+            full_result_output_context_bytes=int(row["output_context_bytes"]),
+        )
+        raw_row["compact_package_handoff"] = compact_package
     row["scan_order"] = _scan_order_row(result)
     expected_diagnostics = _expected_ref_diagnostics_row(result)
     if expected_diagnostics is not None:
@@ -866,6 +896,205 @@ def _run_package_search_variant(
     raw_row["sanitized_row"] = row
     raw_row["package_result"] = result
     return row, raw_row
+
+
+def _build_compact_package_handoff(
+    result: dict[str, Any],
+    candidates: list[Candidate],
+    *,
+    context_lines: int,
+) -> dict[str, Any]:
+    matches = _flat_matches(result.get("groups", []))
+    top_matches = matches[:COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT]
+    top_candidates = []
+    for index, match in enumerate(top_matches, start=1):
+        source_ref = _match_source_ref(match)
+        top_candidates.append(
+            {
+                "candidate_id": f"c{index:03d}",
+                "rank": index,
+                "source_ref": source_ref,
+                "timestamp": match.get("timestamp"),
+                "role": match.get("role"),
+                "score": match.get("score"),
+                "reason_label_count": len(match.get("reasons") or []),
+            }
+        )
+    source_windows = []
+    for index, match in enumerate(matches[:COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT], start=1):
+        line_value = match.get("line")
+        if not isinstance(line_value, int):
+            continue
+        window = _match_source_window(match)
+        source_windows.append(
+            {
+                "candidate_id": f"c{index:03d}",
+                "source_ref": _match_source_ref(match),
+                "context_radius": 0,
+                "requested_context_radius": context_lines,
+                "window_basis": "candidate_snippet_clipped",
+                "start_line": window["start_line"],
+                "end_line": window["end_line"],
+                "line_count": window["line_count"],
+                "byte_count": window["byte_count"],
+                "text": window["text"],
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "package_kind": "compact_package_source_locator_source_window",
+        "candidate_count": len(candidates),
+        "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+        "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+        "top_candidates": top_candidates,
+        "source_windows": source_windows,
+        "no_evidence_meaning": {
+            "answer_scope": "not_found_in_searched_scope",
+            "not_all_history_absence": True,
+        },
+        "privacy_note": "Ignored raw private compact handoff detail. Do not commit.",
+    }
+    locator_payload = dict(payload)
+    locator_payload["source_windows"] = []
+    return {
+        "payload": payload,
+        "compact_context_bytes": _json_bytes(payload),
+        "locator_context_bytes": _json_bytes(locator_payload),
+        "source_window_text_bytes": sum(int(window.get("byte_count") or 0) for window in source_windows),
+        "source_window_count": len(source_windows),
+        "top_candidate_count": len(top_candidates),
+    }
+
+
+def _match_source_ref(match: dict[str, Any]) -> dict[str, Any]:
+    source_ref = {
+        "path": match.get("path") or "",
+        "line": int(match.get("line") or 0),
+    }
+    if match.get("session"):
+        source_ref["session"] = match.get("session")
+    return source_ref
+
+
+def _match_source_window(match: dict[str, Any]) -> dict[str, Any]:
+    line = int(match.get("line") or 0)
+    text = str(match.get("snippet") or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) > COMPACT_PACKAGE_SOURCE_WINDOW_BYTE_LIMIT:
+        text = encoded[:COMPACT_PACKAGE_SOURCE_WINDOW_BYTE_LIMIT].decode("utf-8", errors="ignore")
+        text = text.rstrip() + "..."
+    return {
+        "start_line": line,
+        "end_line": line,
+        "line_count": 1 if text else 0,
+        "byte_count": len(text.encode("utf-8")),
+        "text": text,
+    }
+
+
+def _compact_package_row_stats(
+    compact_package: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    expected_refs: list[dict[str, Any]],
+    legacy_top_candidate_ref_ids: list[str],
+    legacy_source_window_ref_ids: list[str],
+    full_result_output_context_bytes: int,
+) -> dict[str, Any]:
+    compact_context_bytes = int(compact_package.get("compact_context_bytes") or 0)
+    ratio = round(compact_context_bytes / full_result_output_context_bytes, 6) if full_result_output_context_bytes else 0.0
+    payload = compact_package.get("payload") if isinstance(compact_package.get("payload"), dict) else {}
+    compact_top_candidate_ref_ids = _compact_payload_ref_ids(
+        payload.get("top_candidates"),
+        expected_refs,
+        limit=COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+    )
+    compact_top_candidate_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in compact_top_candidate_ref_ids]
+    compact_source_window_ref_ids = _compact_payload_ref_ids(
+        payload.get("source_windows"),
+        expected_refs,
+        limit=COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+    )
+    legacy_top_candidate_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in legacy_top_candidate_ref_ids]
+    compact_source_window_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in compact_source_window_ref_ids]
+    legacy_source_window_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in legacy_source_window_ref_ids]
+    return {
+        "enabled": True,
+        "package_kind": "compact_package_source_locator_source_window",
+        "candidate_count": int(row.get("candidate_count") or 0),
+        "top_candidate_count": int(compact_package.get("top_candidate_count") or 0),
+        "source_window_count": int(compact_package.get("source_window_count") or 0),
+        "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+        "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+        "full_result_output_context_bytes": full_result_output_context_bytes,
+        "compact_context_bytes": compact_context_bytes,
+        "locator_context_bytes": int(compact_package.get("locator_context_bytes") or 0),
+        "source_window_text_bytes": int(compact_package.get("source_window_text_bytes") or 0),
+        "compact_to_full_result_byte_ratio": ratio,
+        "compact_byte_delta_vs_full_result": compact_context_bytes - full_result_output_context_bytes,
+        "legacy_output_context_bytes_preserved": True,
+        "compact_bytes_measured_separately": True,
+        "equivalence_scope": {
+            "top_candidate_scope": "same_ordered_top_candidate_limit",
+            "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            "source_window_scope": "same_ordered_source_window_limit",
+            "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+            "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+        },
+        "top_candidate_ref_ids_equivalent": compact_top_candidate_ref_ids == legacy_top_candidate_ref_ids,
+        "top_candidate_source_refs_equivalent": compact_top_candidate_source_refs == legacy_top_candidate_source_refs,
+        "source_window_ref_ids_equivalent": compact_source_window_ref_ids == legacy_source_window_ref_ids,
+        "source_window_source_refs_equivalent": compact_source_window_source_refs == legacy_source_window_source_refs,
+        "top_candidate_ref_id_count": len(legacy_top_candidate_ref_ids),
+        "top_candidate_source_ref_count": len(legacy_top_candidate_source_refs),
+        "compact_payload_top_candidate_ref_id_count": len(compact_top_candidate_ref_ids),
+        "compact_payload_source_window_ref_id_count": len(compact_source_window_ref_ids),
+        "legacy_source_window_ref_id_count": len(legacy_source_window_ref_ids),
+        "privacy": _compact_package_handoff_privacy(),
+    }
+
+
+def _candidate_ref_ids(
+    candidates: list[Candidate],
+    expected_refs: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    expected = {(ref["path"], ref["line"]): ref["ref_id"] for ref in expected_refs}
+    return [
+        expected[(candidate.path, candidate.line)]
+        for candidate in candidates[:limit]
+        if (candidate.path, candidate.line) in expected
+    ]
+
+
+def _compact_payload_ref_ids(
+    items: Any,
+    expected_refs: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    expected = {(str(ref["path"]), int(ref["line"])): ref["ref_id"] for ref in expected_refs}
+    ref_ids: list[str] = []
+    for item in list(items or [])[:limit]:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("source_ref")
+        if not isinstance(ref, dict):
+            continue
+        path = ref.get("path")
+        line = ref.get("line")
+        try:
+            key = (str(path), int(line))
+        except (TypeError, ValueError):
+            continue
+        if key in expected:
+            ref_ids.append(expected[key])
+    return ref_ids
+
+
+def _json_bytes(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
 
 def _candidates_from_groups(groups: list[dict[str, Any]]) -> tuple[list[Candidate], int]:
@@ -1557,6 +1786,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for baseline in sorted({row["baseline"] for row in rows})
         },
         "source_ref_equivalence": _package_equivalence(rows),
+        "compact_package_handoff": _compact_package_handoff_summary(rows),
         "no_evidence_correct": {
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
             "correct": sum(1 for row in rows if row.get("no_evidence_correct") is True),
@@ -1608,6 +1838,7 @@ def _rg_prefilter_coverage_privacy() -> dict[str, bool]:
         "raw_anchor_needles_included": False,
         "raw_query_text_included": False,
         "raw_private_text_included": False,
+        "raw_snippets_included": False,
         "raw_paths_included": False,
         "source_lines_included": False,
         "line_numbers_included": False,
@@ -1653,6 +1884,147 @@ def _rg_prefilter_workflow_decision(
         "evidence_basis": coverage.get("basis"),
         "source_ref_equivalence": equivalence,
         "next_action": "review_aggregate_coverage_before_any_runtime_routing_change",
+    }
+
+
+def _compact_package_handoff_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row
+        for row in rows
+        if row.get("baseline") in {"package_search", "package_search_rg_prefilter"}
+        and isinstance(row.get("compact_package_handoff"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "basis": "package_compact_handoff_flag_not_enabled_or_package_rows_not_run",
+            "runs": 0,
+            "cases": 0,
+            "baseline_counts": {},
+            "full_result_output_context_bytes": 0,
+            "compact_context_bytes": 0,
+            "locator_context_bytes": 0,
+            "source_window_text_bytes": 0,
+            "privacy": _compact_package_handoff_privacy(),
+            "equivalence": _compact_package_empty_equivalence(),
+            "legacy_output_context_bytes_preserved": True,
+            "compact_bytes_measured_separately": True,
+        }
+    stats = [row["compact_package_handoff"] for row in selected]
+    full_bytes = sum(int(item.get("full_result_output_context_bytes") or 0) for item in stats)
+    compact_bytes = sum(int(item.get("compact_context_bytes") or 0) for item in stats)
+    locator_bytes = sum(int(item.get("locator_context_bytes") or 0) for item in stats)
+    window_bytes = sum(int(item.get("source_window_text_bytes") or 0) for item in stats)
+    compared = len(stats)
+    ref_equivalent = sum(1 for item in stats if item.get("top_candidate_ref_ids_equivalent") is True)
+    source_equivalent = sum(1 for item in stats if item.get("top_candidate_source_refs_equivalent") is True)
+    window_ref_equivalent = sum(1 for item in stats if item.get("source_window_ref_ids_equivalent") is True)
+    window_source_equivalent = sum(1 for item in stats if item.get("source_window_source_refs_equivalent") is True)
+    return {
+        "status": "evaluated",
+        "basis": "opt_in_package_search_compact_source_locator_source_window_rows",
+        "runs": len(selected),
+        "cases": len({row["case_id"] for row in selected}),
+        "baseline_counts": _counts(row["baseline"] for row in selected),
+        "full_result_output_context_bytes": full_bytes,
+        "compact_context_bytes": compact_bytes,
+        "locator_context_bytes": locator_bytes,
+        "source_window_text_bytes": window_bytes,
+        "compact_context_tokens_approx": _ceil_div4(compact_bytes),
+        "full_result_output_context_tokens_approx": _ceil_div4(full_bytes),
+        "compact_to_full_result_byte_ratio": round(compact_bytes / full_bytes, 6) if full_bytes else 0.0,
+        "median_full_result_output_context_bytes": _median(
+            item.get("full_result_output_context_bytes") for item in stats
+        ),
+        "median_compact_context_bytes": _median(item.get("compact_context_bytes") for item in stats),
+        "median_locator_context_bytes": _median(item.get("locator_context_bytes") for item in stats),
+        "median_source_window_text_bytes": _median(item.get("source_window_text_bytes") for item in stats),
+        "source_window_count": sum(int(item.get("source_window_count") or 0) for item in stats),
+        "top_candidate_count": sum(int(item.get("top_candidate_count") or 0) for item in stats),
+        "equivalence": {
+            "compared_runs": compared,
+            "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+            "top_candidate_scope": "same_ordered_top_candidate_limit",
+            "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            "source_window_scope": "same_ordered_source_window_limit",
+            "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+            "top_candidate_ref_ids_equivalent_runs": ref_equivalent,
+            "top_candidate_source_refs_equivalent_runs": source_equivalent,
+            "source_window_ref_ids_equivalent_runs": window_ref_equivalent,
+            "source_window_source_refs_equivalent_runs": window_source_equivalent,
+            "all_top_candidate_ref_ids_equivalent": bool(compared and ref_equivalent == compared),
+            "all_top_candidate_source_refs_equivalent": bool(compared and source_equivalent == compared),
+            "all_source_window_ref_ids_equivalent": bool(compared and window_ref_equivalent == compared),
+            "all_source_window_source_refs_equivalent": bool(compared and window_source_equivalent == compared),
+        },
+        "privacy": _compact_package_handoff_privacy(),
+        "legacy_output_context_bytes_preserved": all(
+            item.get("legacy_output_context_bytes_preserved") is True for item in stats
+        ),
+        "compact_bytes_measured_separately": all(item.get("compact_bytes_measured_separately") is True for item in stats),
+    }
+
+
+def _compact_package_empty_equivalence() -> dict[str, Any]:
+    return {
+        "compared_runs": 0,
+        "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+        "top_candidate_scope": "same_ordered_top_candidate_limit",
+        "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+        "source_window_scope": "same_ordered_source_window_limit",
+        "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+        "top_candidate_ref_ids_equivalent_runs": 0,
+        "top_candidate_source_refs_equivalent_runs": 0,
+        "source_window_ref_ids_equivalent_runs": 0,
+        "source_window_source_refs_equivalent_runs": 0,
+        "all_top_candidate_ref_ids_equivalent": False,
+        "all_top_candidate_source_refs_equivalent": False,
+        "all_source_window_ref_ids_equivalent": False,
+        "all_source_window_source_refs_equivalent": False,
+    }
+
+
+def _compact_package_handoff_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "raw_compact_handoff_detail_committed": False,
+        "raw_source_windows_committed": False,
+        "raw_query_text_included": False,
+        "raw_private_text_included": False,
+        "raw_snippets_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "local_usernames_included": False,
+        "case_ids_required": False,
+        "vectors_or_indexes_included": False,
+    }
+
+
+def _compact_package_handoff_decision(summary: dict[str, Any]) -> dict[str, Any]:
+    status = summary.get("status")
+    if status == "evaluated":
+        decision = "keep_opt_in_diagnostic_only_no_default_promotion"
+        rationale = (
+            "The compact source-locator/source-window package is measured separately from full scanner-result "
+            "output_context_bytes and needs independent review before any workflow or default change."
+        )
+    else:
+        decision = "not_evaluated"
+        rationale = "Run benchmark-real-history-impact with --package-compact-handoff to evaluate compact counters."
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "default_search_behavior_changed": False,
+        "scanner_ranking_source_selection_changed": False,
+        "legacy_output_context_bytes_redefined": False,
+        "compact_bytes_measured_separately": True,
+        "token_savings_claim_supported": False,
+        "final_answer_quality_claim_supported": False,
+        "product_value_claim_supported": False,
+        "default_promotion_supported": False,
+        "next_action": "independent_review_compact_package_counters_before_any_runtime_or_workflow_change",
     }
 
 
@@ -1970,6 +2342,8 @@ def _apply_aggregate_only_report(report: dict[str, Any], *, row_count: int) -> N
         "raw_queries_committed": False,
         "raw_private_paths_committed": False,
         "raw_anchor_needles_committed": False,
+        "raw_compact_handoff_detail_committed": False,
+        "raw_source_windows_committed": False,
     }
     diagnostic = report.get("structural_sidecar_diagnostic")
     if isinstance(diagnostic, dict) and diagnostic.get("rows"):
@@ -2168,6 +2542,7 @@ def _privacy_contract() -> dict[str, bool]:
         "local_usernames_included": False,
         "raw_session_ids_included": False,
         "source_lines_included": False,
+        "raw_source_windows_included": False,
         "vectors_or_indexes_included": False,
         "raw_private_evidence_ignored": True,
     }
