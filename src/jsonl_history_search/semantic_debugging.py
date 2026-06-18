@@ -134,6 +134,7 @@ def build_semantic_debug_payload(
         mask_context=mask_context,
         output_format=getattr(args, "format", "json"),
         use_rg_prefilter=getattr(args, "rg_prefilter", False),
+        evaluate_cases=getattr(args, "evaluate_sanitized_manifest_gate", False),
     )
     candidate_causes = build_candidate_causes(candidates, timeline, tool_proof, joins)
     routes = build_routes(agent_find, source_scope, tool_report, forensics_payload, hints, benchmark_gate)
@@ -680,6 +681,7 @@ def build_manifest_evaluation(
     mask_context: Any,
     output_format: str,
     use_rg_prefilter: bool,
+    evaluate_cases: bool,
 ) -> dict[str, Any]:
     if not path.exists():
         return {
@@ -700,6 +702,58 @@ def build_manifest_evaluation(
     family_counts = Counter(case.get("family", "unknown") for case in cases if isinstance(case, dict))
     no_evidence_count = sum(1 for case in cases if "no_evidence" in str(case.get("family", "")))
     thin_families = sorted(family for family, count in family_counts.items() if count < 3)
+    reviewed_count = sum(1 for case in cases if isinstance(case, dict) and case.get("review_status") == "reviewed_real_history_gold")
+    if not evaluate_cases:
+        return {
+            "status": "evaluation_deferred" if validation.ok else "invalid_manifest",
+            "manifest": str(path),
+            "evaluation_kind": "not_run",
+            "reason": "sanitized manifest per-case evaluation is deferred by default; pass --evaluate-sanitized-manifest-gate to run it",
+            "measurement_basis": "cheap sanitized manifest metadata only; no per-case retrieval, scanner loop, private bridge, snippets, raw paths, raw private query text, vectors, or indexes are run",
+            "case_count": len(cases),
+            "reviewed_count": reviewed_count,
+            "reviewed_case_count": len(cases),
+            "below_floor_case_count": len(cases) < 20,
+            "old_target_floor": 20,
+            "family_counts": dict(sorted(family_counts.items())),
+            "thin_families": thin_families,
+            "missing_families": ["no_evidence"] if no_evidence_count == 0 else [],
+            "privacy_contract": "sanitized aggregate only; default path does not run manifest case queries, private bridge refs, raw private text, paths, session IDs, vectors, indexes, or persistent caches",
+            "correctness_gate": "not_run",
+            "correctness_evaluable_count": 0,
+            "correctness_not_evaluable_count": 0,
+            "correctness_pass_count": 0,
+            "correctness_fail_count": 0,
+            "correctness_status_counts": {},
+            "command_status_counts": {},
+            "elapsed_ms": {
+                "total": 0,
+                "median": 0,
+                "p90": 0,
+                "evaluation_total": 0,
+            },
+            "output_context_bytes": {
+                "total": 0,
+                "median": 0,
+                "p90": 0,
+            },
+            "estimated_output_tokens": {
+                "total": 0,
+                "median": 0,
+                "p90": 0,
+            },
+            "cases": [],
+            "errors": list(validation.errors),
+            "caveats": [
+                "Sanitized manifest per-case retrieval evaluation was not run in the default semantic-debug path.",
+                "Pass --evaluate-sanitized-manifest-gate to run the expensive case loop.",
+                "18 reviewed real-history cases are below the old 20-50 target floor."
+                if len(cases) < 20
+                else "case count meets the old target floor",
+                "No no-evidence family is present in the reviewed manifest." if no_evidence_count == 0 else "no-evidence family present",
+                "Correctness is not evaluated when the manifest gate is deferred.",
+            ],
+        }
     started = time.monotonic()
     case_rows = evaluate_manifest_cases(
         cases,
@@ -715,7 +769,6 @@ def build_manifest_evaluation(
     token_values = [int(row["estimated_output_tokens"]) for row in case_rows]
     correctness_counts = Counter(row.get("correctness_status", "unknown") for row in case_rows)
     command_status_counts = Counter(row.get("command_status", "unknown") for row in case_rows)
-    reviewed_count = sum(1 for case in cases if isinstance(case, dict) and case.get("review_status") == "reviewed_real_history_gold")
     return {
         "status": "evaluated_sanitized_manifest" if validation.ok else "invalid_manifest",
         "manifest": str(path),
@@ -906,8 +959,11 @@ def build_routes(
     selected = [
         {"primitive": "find", "reason": "candidate recovery, timeline, source scope, no-evidence fields"},
         {"primitive": "structured-tool-events", "reason": "structured action/tool proof"},
-        {"primitive": "sanitized_manifest_family_gate", "reason": "sanitized manifest-case evaluation without private bridge"},
     ]
+    if benchmark_gate.get("evaluation_kind") == "sanitized_manifest_iteration":
+        selected.append({"primitive": "sanitized_manifest_family_gate", "reason": "sanitized manifest-case evaluation without private bridge"})
+    else:
+        selected.append({"primitive": "sanitized_manifest_family_gate", "reason": "cheap sanitized manifest metadata only; per-case evaluation deferred by default"})
     if forensics_payload:
         selected.append({"primitive": "forensics", "reason": "commit/path/task/branch/around hint supplied"})
     rejected = [

@@ -299,6 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Committed sanitized real-history gold manifest for coverage-only caveats; no private bridge is required.",
     )
     semantic_debug.add_argument(
+        "--evaluate-sanitized-manifest-gate",
+        action="store_true",
+        help=(
+            "Opt in to the expensive sanitized manifest per-case evaluation. "
+            "By default semantic-debug reports only cheap manifest metadata and defers this gate."
+        ),
+    )
+    semantic_debug.add_argument(
         "--report-output",
         default=None,
         help="Optional path where the full semantic-debug packet should be written.",
