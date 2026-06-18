@@ -97,6 +97,33 @@ class SourcePlan:
         }
 
 
+@dataclass(frozen=True)
+class PlannedJsonlFiles:
+    files: tuple[tuple[Path, int], ...]
+    warnings: tuple[str, ...]
+    elapsed_ms: float
+    source: str = "shared_per_command_source_enumeration"
+
+    @property
+    def file_count(self) -> int:
+        return len(self.files)
+
+    @property
+    def byte_count(self) -> int:
+        return sum(size for _path, size in self.files)
+
+    def to_diagnostics(self) -> dict:
+        return {
+            "source": self.source,
+            "file_count": self.file_count,
+            "byte_count": self.byte_count,
+            "elapsed_ms": self.elapsed_ms,
+            "cap_hits": cap_hits_from_warnings(list(self.warnings)),
+            "cap_labels": cap_labels_from_warnings(list(self.warnings)),
+            "raw_paths_included": False,
+        }
+
+
 def build_source_plan(
     *,
     cwd: Path,
@@ -238,6 +265,44 @@ def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None
             files_seen += 1
             bytes_seen += size
             yield path, size, warnings
+
+
+def materialize_planned_jsonl_files(
+    plan: SourcePlan,
+    *,
+    preferred_terms: list[str] | None = None,
+    source: str = "shared_per_command_source_enumeration",
+) -> PlannedJsonlFiles:
+    started = time.perf_counter()
+    files: list[tuple[Path, int]] = []
+    observed_warnings = list(plan.warnings)
+    for path, size, enum_warnings in enumerate_jsonl_files(plan, preferred_terms=preferred_terms):
+        observed_warnings = list(enum_warnings)
+        files.append((path, size))
+    observed_warnings.extend(plan.warnings)
+    return PlannedJsonlFiles(
+        files=tuple(files),
+        warnings=tuple(sorted(set(observed_warnings))),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        source=source,
+    )
+
+
+def cap_labels_from_warnings(warnings: list[str]) -> list[str]:
+    labels: set[str] = set()
+    hits = cap_hits_from_warnings(warnings)
+    if hits.get("elapsed"):
+        labels.add("max_elapsed")
+    if hits.get("file"):
+        labels.add("max_files")
+    if hits.get("byte"):
+        labels.add("max_bytes")
+    lowered = "\n".join(str(warning).lower() for warning in warnings)
+    if "max match cap" in lowered or "retention-capped" in lowered:
+        labels.add("max_match")
+    if "reservoir-capped" in lowered:
+        labels.add("reservoir")
+    return sorted(labels)
 
 
 def build_jsonl_candidate_discovery(plan: SourcePlan, *, explicit_roots_provided: bool) -> dict:
