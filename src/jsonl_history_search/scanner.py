@@ -63,6 +63,7 @@ def search(
     expected_ref_diagnostics: list[dict] | None = None,
     planned_jsonl_files: PlannedJsonlFiles | None = None,
     include_private_diagnostics: bool = False,
+    prioritized_file_paths: set[str] | None = None,
 ) -> dict:
     started = time.monotonic()
     warnings = list(plan.warnings)
@@ -82,6 +83,7 @@ def search(
     searched_files = 0
     searched_bytes = 0
     searched_file_paths: list[str] = []
+    fielded_priority_opened_files: list[dict] = []
     stopped = False
     prefilter = None
     planned_files = []
@@ -99,7 +101,8 @@ def search(
             warnings = enum_warnings
             planned_files.append((path, size))
 
-    planned_files = order_planned_files_for_scan(planned_files, intent)
+    prioritized_paths = {str(path) for path in (prioritized_file_paths or set())}
+    planned_files = order_planned_files_for_scan(planned_files, intent, prioritized_file_paths=prioritized_paths)
     _mark_expected_files_selected(expected_diag, planned_files)
     planned_files_count = len(planned_files)
 
@@ -107,8 +110,9 @@ def search(
         prefilter_result = filter_planned_files(plan=plan, intent=intent, files=planned_files, cwd=cwd)
         prefilter = prefilter_result.stats
         planned_files = [(item.path, item.size) for item in prefilter_result.files]
-        planned_files = order_planned_files_for_scan(planned_files, intent)
+        planned_files = order_planned_files_for_scan(planned_files, intent, prioritized_file_paths=prioritized_paths)
     _mark_expected_files_queued(expected_diag, planned_files)
+    fielded_priority_scan_order = _fielded_priority_scan_order_diagnostics(planned_files, prioritized_paths)
 
     scan_queue = deque(
         {
@@ -116,6 +120,7 @@ def search(
             "size": size,
             "records": None,
             "opened": False,
+            "fielded_priority_label": fielded_priority_scan_order["_labels_by_path"].get(str(path)),
         }
         for path, size in planned_files
     )
@@ -133,6 +138,13 @@ def search(
                 searched_bytes += size
                 if include_private_diagnostics:
                     searched_file_paths.append(str(path))
+                if item.get("fielded_priority_label"):
+                    fielded_priority_opened_files.append(
+                        {
+                            "file_label": str(item["fielded_priority_label"]),
+                            "opened_order": searched_files,
+                        }
+                    )
                 _mark_opened_file_progress(expected_diag, item, path, searched_files)
                 source_kind = source_kind_for_path(path, plan)
                 item["records"] = iter_records_for_file(
@@ -309,6 +321,10 @@ def search(
         "candidate_records_deduped": candidate_records_deduped,
         "candidate_strength": candidate_strength,
         "dedupe_strategy": DEDUPLICATION_STRATEGY,
+        "fielded_priority_scan_order": _public_fielded_priority_scan_order(
+            fielded_priority_scan_order,
+            opened_files=fielded_priority_opened_files,
+        ),
         "groups": groups,
         "warnings": sorted(set(warnings + plan.warnings)),
         "blind_spots": sorted(set(blind_spots)),
@@ -757,16 +773,72 @@ def _pre_parse_stats(
     }
 
 
-def order_planned_files_for_scan(planned_files: list[tuple], intent: QueryIntent) -> list[tuple]:
+def order_planned_files_for_scan(
+    planned_files: list[tuple],
+    intent: QueryIntent,
+    *,
+    prioritized_file_paths: set[str] | None = None,
+) -> list[tuple]:
+    prioritized_paths = {str(path) for path in (prioritized_file_paths or set())}
     return sorted(
         planned_files,
         key=lambda item: (
+            0 if str(item[0]) in prioritized_paths else 1,
             -int(stat_mtime(item[0])),
             -filename_preference_score(item[0], intent.base_terms),
             item[1],
             str(item[0]),
         ),
     )
+
+
+def _fielded_priority_scan_order_diagnostics(planned_files: list[tuple], prioritized_paths: set[str]) -> dict:
+    included_paths = [str(path) for path, _size in planned_files if str(path) in prioritized_paths]
+    labels_by_path = {
+        path: f"fielded_priority_{index:03d}"
+        for index, path in enumerate(included_paths, start=1)
+    }
+    return {
+        "_labels_by_path": labels_by_path,
+        "enabled": bool(prioritized_paths),
+        "priority_source": "fielded_bm25_candidate_or_opened_files",
+        "status": "active" if included_paths else ("no_prioritized_files_in_planned_set" if prioritized_paths else "disabled"),
+        "planned_file_count": len(planned_files),
+        "prioritized_file_count": len(included_paths),
+        "non_prioritized_file_count": max(0, len(planned_files) - len(included_paths)),
+        "prioritized_file_labels": list(labels_by_path.values()),
+        "raw_paths_included": False,
+        "all_planned_files_preserved": True,
+        "fielded_priority_excludes_non_prioritized_files": False,
+        "no_exclusion_semantics": True,
+    }
+
+
+def _public_fielded_priority_scan_order(diagnostics: dict, *, opened_files: list[dict] | None = None) -> dict:
+    opened = [
+        {
+            "file_label": str(item.get("file_label") or ""),
+            "opened_order": int(item.get("opened_order") or 0),
+        }
+        for item in (opened_files or [])
+        if item.get("file_label")
+    ]
+    return {
+        "enabled": bool(diagnostics.get("enabled", False)),
+        "priority_source": str(diagnostics.get("priority_source") or "fielded_bm25_candidate_or_opened_files"),
+        "status": str(diagnostics.get("status") or "disabled"),
+        "planned_file_count": int(diagnostics.get("planned_file_count") or 0),
+        "prioritized_file_count": int(diagnostics.get("prioritized_file_count") or 0),
+        "non_prioritized_file_count": int(diagnostics.get("non_prioritized_file_count") or 0),
+        "opened_prioritized_file_count": len(opened),
+        "opened_prioritized_files": opened,
+        "prioritized_file_labels": list(diagnostics.get("prioritized_file_labels") or []),
+        "raw_paths_included": False,
+        "opened_order_labels_include_raw_paths": False,
+        "all_planned_files_preserved": bool(diagnostics.get("all_planned_files_preserved", True)),
+        "fielded_priority_excludes_non_prioritized_files": False,
+        "no_exclusion_semantics": True,
+    }
 
 
 def dedupe_key_for_record(record) -> tuple[str, ...]:
