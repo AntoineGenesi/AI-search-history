@@ -24,6 +24,30 @@ TEXT_STAGE_WEIGHTS = {
 FUZZY_STAGE_WEIGHT = 7.0
 
 
+@dataclass(frozen=True)
+class MatchTermProfile:
+    term: str
+    lowered: str
+    stage: str
+    phrase_pattern: re.Pattern[str] | None = None
+
+
+@dataclass(frozen=True)
+class QueryMatchProfile:
+    active_terms: tuple[MatchTermProfile, ...]
+    base_terms: tuple[str, ...]
+    fuzzy_terms: tuple[str, ...]
+    has_multi_token_exact_phrase: bool
+
+
+@dataclass
+class RecordMatchEvidence:
+    lowered_text: str
+    should_consider: bool
+    tokens: set[str] | None = None
+    fuzzy_matches: list[dict[str, str]] | None = None
+
+
 @dataclass
 class Match:
     path: str
@@ -43,27 +67,90 @@ class Match:
         return asdict(self)
 
 
-def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[float, list[str], list[str]]:
+def build_match_profile(intent: QueryIntent) -> QueryMatchProfile:
+    active: list[MatchTermProfile] = []
+    for term in active_match_terms(intent):
+        stage = stage_for_term(intent, term)
+        active.append(
+            MatchTermProfile(
+                term=term,
+                lowered=term.lower(),
+                stage=stage,
+                phrase_pattern=_phrase_pattern(term) if stage == "exact_phrase" else None,
+            )
+        )
+    active_terms = tuple(active)
+    return QueryMatchProfile(
+        active_terms=active_terms,
+        base_terms=tuple(concrete_base_terms(intent)),
+        fuzzy_terms=tuple(fuzzy_query_terms(intent)),
+        has_multi_token_exact_phrase=any(
+            "exact_phrase" in set(intent.expansion_reasons.get(term, [])) and len(term_tokens(term)) > 1
+            for term in intent.terms
+        ),
+    )
+
+
+def evaluate_record_match(
+    record: Record,
+    intent: QueryIntent,
+    *,
+    profile: QueryMatchProfile | None = None,
+) -> RecordMatchEvidence:
+    profile = profile or build_match_profile(intent)
+    evidence = RecordMatchEvidence(lowered_text=record.text.lower(), should_consider=True)
+    if intent.role and intent.role_filter_explicit and not role_matches(record.role, intent.role):
+        evidence.should_consider = False
+        return evidence
+    if intent.date_window_filter and intent.date_window_start and intent.date_window_end:
+        if record.timestamp is None:
+            evidence.should_consider = False
+            return evidence
+        local_ts = record.timestamp.astimezone(intent.date_window_start.tzinfo)
+        if not (intent.date_window_start <= local_ts < intent.date_window_end):
+            evidence.should_consider = False
+            return evidence
+    if not profile.active_terms:
+        return evidence
+    if any(term.lowered in evidence.lowered_text for term in profile.active_terms):
+        return evidence
+    if any(_profile_phrase_like_match(term, evidence.lowered_text) for term in profile.active_terms):
+        return evidence
+    evidence.fuzzy_matches = fuzzy_match_terms(record.text, intent, profile=profile, evidence=evidence)
+    evidence.should_consider = bool(evidence.fuzzy_matches)
+    return evidence
+
+
+def score_record(
+    record: Record,
+    intent: QueryIntent,
+    cwd: str | None,
+    *,
+    profile: QueryMatchProfile | None = None,
+    evidence: RecordMatchEvidence | None = None,
+) -> tuple[float, list[str], list[str]]:
+    profile = profile or build_match_profile(intent)
+    evidence = evidence or RecordMatchEvidence(lowered_text=record.text.lower(), should_consider=True)
     score = 0.0
     reasons: list[str] = []
-    lowered = record.text.lower()
-    match_terms = active_match_terms(intent)
-    for term in match_terms:
-        stage = stage_for_term(intent, term)
-        matched = term.lower() in lowered
+    lowered = evidence.lowered_text
+    for term_profile in profile.active_terms:
+        term = term_profile.term
+        stage = term_profile.stage
+        matched = term_profile.lowered in lowered
         phrase_like = False
         if not matched and stage == "exact_phrase":
-            phrase_like = phrase_like_match(term, lowered)
+            phrase_like = _profile_phrase_like_match(term_profile, lowered)
             matched = phrase_like
         if matched:
             score += TEXT_STAGE_WEIGHTS.get(stage, 8.0)
             reasons.append(f"text:{stage}:{term}")
             if phrase_like:
                 reasons.append(f"phrase:separator_insensitive:{term}")
-            elif stage == "exact_phrase" and len(term_tokens(term)) > 1:
+            elif stage == "exact_phrase" and term_profile.phrase_pattern is not None:
                 reasons.append(f"phrase:exact:{term}")
 
-    coverage = base_term_coverage(record.text, intent)
+    coverage = base_term_coverage(record.text, intent, profile=profile, evidence=evidence)
     base_count = len(coverage["base_terms"])
     covered_count = len(coverage["covered"])
     if base_count:
@@ -73,12 +160,12 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
         elif covered_count > 1:
             score += min(6.0, covered_count * 2.0)
 
-    for fuzzy in fuzzy_match_terms(record.text, intent):
+    for fuzzy in fuzzy_match_terms(record.text, intent, profile=profile, evidence=evidence):
         if any(reason.endswith(f":{fuzzy['query']}") for reason in reasons):
             continue
         score += FUZZY_STAGE_WEIGHT
         reasons.append(f"fuzzy:typo_fuzzy:{fuzzy['query']}~{fuzzy['matched']}")
-    if not match_terms:
+    if not profile.active_terms:
         score += 1
         reasons.append("bounded-no-term")
     if intent.role and role_matches(record.role, intent.role):
@@ -96,7 +183,7 @@ def score_record(record: Record, intent: QueryIntent, cwd: str | None) -> tuple[
     if intent.artifact_hints and artifacts:
         score += 5
         reasons.append("artifact:artifact_path")
-    if is_partial_generic_multi_token(reasons, intent):
+    if is_partial_generic_multi_token(reasons, intent, profile=profile):
         score -= 4.0
         reasons.append("penalty:partial_generic_multi_token")
     if record.timestamp:
@@ -115,24 +202,13 @@ def role_matches(actual: str, wanted: str) -> bool:
     return wanted in actual
 
 
-def should_consider(record: Record, intent: QueryIntent) -> bool:
-    if intent.role and intent.role_filter_explicit and not role_matches(record.role, intent.role):
-        return False
-    if intent.date_window_filter and intent.date_window_start and intent.date_window_end:
-        if record.timestamp is None:
-            return False
-        local_ts = record.timestamp.astimezone(intent.date_window_start.tzinfo)
-        if not (intent.date_window_start <= local_ts < intent.date_window_end):
-            return False
-    terms = active_match_terms(intent)
-    if terms:
-        lowered = record.text.lower()
-        if any(term.lower() in lowered for term in terms):
-            return True
-        if any(stage_for_term(intent, term) == "exact_phrase" and phrase_like_match(term, lowered) for term in terms):
-            return True
-        return bool(fuzzy_match_terms(record.text, intent))
-    return True
+def should_consider(
+    record: Record,
+    intent: QueryIntent,
+    *,
+    profile: QueryMatchProfile | None = None,
+) -> bool:
+    return evaluate_record_match(record, intent, profile=profile).should_consider
 
 
 def active_match_terms(intent: QueryIntent) -> list[str]:
@@ -172,9 +248,15 @@ def is_weak_partial_generic(reasons: list[str]) -> bool:
     return not any(reason.startswith(strong_prefixes) for reason in reason_set)
 
 
-def is_partial_generic_multi_token(reasons: list[str], intent: QueryIntent) -> bool:
-    base_terms = concrete_base_terms(intent)
-    if len(base_terms) < 2 or not has_multi_token_exact_phrase(intent):
+def is_partial_generic_multi_token(
+    reasons: list[str],
+    intent: QueryIntent,
+    *,
+    profile: QueryMatchProfile | None = None,
+) -> bool:
+    profile = profile or build_match_profile(intent)
+    base_terms = list(profile.base_terms)
+    if len(base_terms) < 2 or not profile.has_multi_token_exact_phrase:
         return False
     if any(reason.startswith("phrase:") for reason in reasons):
         return False
@@ -194,10 +276,7 @@ def is_partial_generic_multi_token(reasons: list[str], intent: QueryIntent) -> b
 
 
 def has_multi_token_exact_phrase(intent: QueryIntent) -> bool:
-    for term in intent.terms:
-        if "exact_phrase" in set(intent.expansion_reasons.get(term, [])) and len(term_tokens(term)) > 1:
-            return True
-    return False
+    return build_match_profile(intent).has_multi_token_exact_phrase
 
 
 def parse_coverage_reason(reason: str) -> tuple[int, int]:
@@ -211,12 +290,19 @@ def parse_coverage_reason(reason: str) -> tuple[int, int]:
         return 0, 0
 
 
-def base_term_coverage(text: str, intent: QueryIntent) -> dict[str, list[str]]:
-    terms = concrete_base_terms(intent)
+def base_term_coverage(
+    text: str,
+    intent: QueryIntent,
+    *,
+    profile: QueryMatchProfile | None = None,
+    evidence: RecordMatchEvidence | None = None,
+) -> dict[str, list[str]]:
+    profile = profile or build_match_profile(intent)
+    terms = list(profile.base_terms)
     if not terms:
         return {"base_terms": [], "covered": []}
-    tokens = token_set(text)
-    lowered = text.lower()
+    tokens = _tokens_for_text(text, evidence)
+    lowered = _lowered_for_text(text, evidence)
     covered = []
     for term in terms:
         normalized = term.lower()
@@ -230,11 +316,20 @@ def concrete_base_terms(intent: QueryIntent) -> list[str]:
 
 
 def phrase_like_match(term: str, lowered_text: str) -> bool:
+    pattern = _phrase_pattern(term)
+    return bool(pattern and pattern.search(lowered_text))
+
+
+def _phrase_pattern(term: str) -> re.Pattern[str] | None:
     tokens = term_tokens(term)
     if len(tokens) < 2:
-        return False
+        return None
     pattern = r"(?<![a-z0-9])" + r"[\W_./:-]+".join(re.escape(token) for token in tokens) + r"(?![a-z0-9])"
-    return re.search(pattern, lowered_text) is not None
+    return re.compile(pattern)
+
+
+def _profile_phrase_like_match(term: MatchTermProfile, lowered_text: str) -> bool:
+    return bool(term.phrase_pattern and term.phrase_pattern.search(lowered_text))
 
 
 def term_tokens(term: str) -> list[str]:
@@ -279,11 +374,21 @@ def task_or_doc_path_evidence(lowered_text: str, artifacts: list[str]) -> bool:
     return bool(re.search(r"\b(?:tasks|docs|reports|codex/state/reviews)/[\w./-]+", lowered_text))
 
 
-def fuzzy_match_terms(text: str, intent: QueryIntent, *, limit: int = 8) -> list[dict[str, str]]:
-    query_terms = fuzzy_query_terms(intent)
+def fuzzy_match_terms(
+    text: str,
+    intent: QueryIntent,
+    *,
+    limit: int = 8,
+    profile: QueryMatchProfile | None = None,
+    evidence: RecordMatchEvidence | None = None,
+) -> list[dict[str, str]]:
+    if evidence is not None and evidence.fuzzy_matches is not None:
+        return evidence.fuzzy_matches[:limit]
+    profile = profile or build_match_profile(intent)
+    query_terms = list(profile.fuzzy_terms)
     if not query_terms:
         return []
-    record_tokens = token_set(text)
+    record_tokens = _tokens_for_text(text, evidence)
     if not record_tokens:
         return []
     matches: list[dict[str, str]] = []
@@ -295,6 +400,8 @@ def fuzzy_match_terms(text: str, intent: QueryIntent, *, limit: int = 8) -> list
             matches.append({"query": query, "matched": best})
             if len(matches) >= limit:
                 break
+    if evidence is not None:
+        evidence.fuzzy_matches = matches
     return matches
 
 
@@ -320,6 +427,18 @@ def token_set(text: str) -> set[str]:
             if len(part) >= 4:
                 tokens.add(part)
     return tokens
+
+
+def _tokens_for_text(text: str, evidence: RecordMatchEvidence | None) -> set[str]:
+    if evidence is None:
+        return token_set(text)
+    if evidence.tokens is None:
+        evidence.tokens = token_set(text)
+    return evidence.tokens
+
+
+def _lowered_for_text(text: str, evidence: RecordMatchEvidence | None) -> str:
+    return evidence.lowered_text if evidence is not None else text.lower()
 
 
 def best_fuzzy_token(query: str, tokens: set[str]) -> str | None:
