@@ -155,6 +155,10 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
             **fielded_bm25_index.sanitized_summary(),
             "build_bytes": int(fielded_bm25_index.metrics.get("build_bytes", 0)),
             "build_elapsed_ms": fielded_bm25_index.metrics.get("build_elapsed_ms", 0.0),
+            "profile": _phase_profile_stats(
+                fielded_bm25_index.metrics.get("profile"),
+                "fielded_bm25_index_build",
+            ),
         }
     rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
@@ -1797,6 +1801,8 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     query_profile = result.get("query_profile") if isinstance(result.get("query_profile"), dict) else {}
     privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(result.get("materialization"))
+    phase_profile = _phase_profile_stats(result.get("profile"), "fielded_bm25_search_materialization")
+    index_build_profile = _phase_profile_stats(summary.get("profile"), "fielded_bm25_index_build")
     return {
         "enabled": True,
         "status": str(result.get("status") or "unknown"),
@@ -1819,6 +1825,8 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "bm25_rank_buckets": _safe_count_dict(result.get("bm25_rank_buckets")),
         "materialization": materialization,
+        "phase_profile": phase_profile,
+        "index_build_profile": index_build_profile,
         "query_profile": query_profile,
         "expected_refs_used_for_retrieval": False,
         "raw_paths_included": False,
@@ -1842,6 +1850,7 @@ def _rrf_fusion_row_stats(
     package_lane = _rrf_diagnostic_lane(diagnostics, "package_search")
     fielded_lane = _rrf_diagnostic_lane(diagnostics, "package_search_fielded_bm25")
     fusion = diagnostics.get("fusion") if isinstance(diagnostics.get("fusion"), dict) else {}
+    phase_profiles = _rrf_phase_profiles(diagnostics)
     return {
         "enabled": True,
         "feature_state": str(diagnostics.get("feature_state") or "shadow_report_only"),
@@ -1865,6 +1874,7 @@ def _rrf_fusion_row_stats(
         "package_latency_ms": float(package_lane.get("elapsed_ms") or 0.0),
         "fielded_latency_ms": float(fielded_lane.get("elapsed_ms") or 0.0),
         "fusion_latency_ms": float(fusion.get("elapsed_ms") or result.get("fusion_elapsed_ms") or 0.0),
+        "phase_profiles": phase_profiles,
         "shared_retrieval_mode_used": result.get("retrieval_mode") == "rrf-fusion",
         "shared_source_enumeration_used": bool((diagnostics.get("shared_source_enumeration") or {}).get("consumed_by_lanes")),
         "duplicate_local_work_diagnostics_present": isinstance(diagnostics.get("duplicate_local_work"), dict),
@@ -1894,6 +1904,14 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
     fielded_lane = _rrf_diagnostic_lane(diagnostics, "package_search_fielded_bm25")
     index_summary = fielded_lane.get("index_summary") if isinstance(fielded_lane.get("index_summary"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(fielded_lane.get("materialization"))
+    phase_profile = _phase_profile_stats(
+        fielded_lane.get("profile"),
+        "fielded_bm25_search_materialization",
+    )
+    index_build_profile = _phase_profile_stats(
+        fielded_lane.get("index_build_profile"),
+        "fielded_bm25_index_build",
+    )
     return {
         "enabled": True,
         "status": "shared_rrf_fusion_lane",
@@ -1916,6 +1934,8 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "candidate_records_deduped": 0,
         "bm25_rank_buckets": {},
         "materialization": materialization,
+        "phase_profile": phase_profile,
+        "index_build_profile": index_build_profile,
         "query_profile": {},
         "expected_refs_used_for_retrieval": False,
         "raw_paths_included": False,
@@ -1961,6 +1981,76 @@ def _fielded_bm25_materialization_stats(value: Any) -> dict[str, Any]:
         "raw_text_included": bool(materialization.get("raw_text_included", False)),
         "raw_paths_included": bool(materialization.get("raw_paths_included", False)),
     }
+
+
+def _phase_profile_stats(value: Any, phase: str) -> dict[str, Any]:
+    profile = value if isinstance(value, dict) else {}
+    rss_available = bool(profile.get("rss_available", False))
+    return {
+        "phase": str(profile.get("phase") or phase),
+        "elapsed_ms": float(profile.get("elapsed_ms") or 0.0),
+        "rss_available": rss_available,
+        "rss_units": "bytes",
+        "rss_start_max_bytes": _optional_int(profile.get("rss_start_max_bytes")),
+        "rss_end_max_bytes": _optional_int(profile.get("rss_end_max_bytes")),
+        "rss_max_bytes": _optional_int(profile.get("rss_max_bytes")),
+        "rss_delta_bytes": _optional_int(profile.get("rss_delta_bytes")),
+        "rss_unavailable_reason": None if rss_available else str(profile.get("rss_unavailable_reason") or "not_profiled"),
+        "rss_current_bytes": None,
+        "rss_current_unavailable_reason": "resource_ru_maxrss_reports_process_peak_not_current",
+        "candidate_count": _optional_int(profile.get("candidate_count")),
+        "candidate_rows": _optional_int(profile.get("candidate_rows")),
+        "candidate_rows_materialized": _optional_int(profile.get("candidate_rows_materialized")),
+        "file_count": _optional_int(profile.get("file_count")),
+        "byte_count": _optional_int(profile.get("byte_count")),
+        "searched_files": _optional_int(profile.get("searched_files")),
+        "searched_bytes": _optional_int(profile.get("searched_bytes")),
+        "records_considered": _optional_int(profile.get("records_considered")),
+        "indexed_file_count": _optional_int(profile.get("indexed_file_count")),
+        "indexed_record_count": _optional_int(profile.get("indexed_record_count")),
+        "indexed_chunk_count": _optional_int(profile.get("indexed_chunk_count")),
+        "build_bytes": _optional_int(profile.get("build_bytes")),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _rrf_phase_profiles(diagnostics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    shared = diagnostics.get("shared_source_enumeration") if isinstance(diagnostics.get("shared_source_enumeration"), dict) else {}
+    package_lane = _rrf_diagnostic_lane(diagnostics, "package_search")
+    fielded_lane = _rrf_diagnostic_lane(diagnostics, "package_search_fielded_bm25")
+    fusion = diagnostics.get("fusion") if isinstance(diagnostics.get("fusion"), dict) else {}
+    return {
+        "total_explicit_rrf_retrieval": _phase_profile_stats(
+            diagnostics.get("total_explicit_rrf_retrieval"),
+            "total_explicit_rrf_retrieval",
+        ),
+        "shared_source_enumeration": _phase_profile_stats(shared.get("profile"), "shared_source_enumeration"),
+        "package_lane": _phase_profile_stats(package_lane.get("profile"), "package_lane"),
+        "fielded_bm25_index_build": _phase_profile_stats(
+            fielded_lane.get("index_build_profile"),
+            "fielded_bm25_index_build",
+        ),
+        "fielded_bm25_search_materialization": _phase_profile_stats(
+            fielded_lane.get("profile"),
+            "fielded_bm25_search_materialization",
+        ),
+        "rrf_fusion": _phase_profile_stats(fusion.get("profile"), "rrf_fusion"),
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _shared_source_enumeration_row_stats(diagnostics: dict[str, Any]) -> dict[str, Any] | None:
@@ -2373,6 +2463,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "candidate_rows_surfaced": 0,
             "bm25_rank_buckets": {},
             "materialization": _fielded_bm25_materialization_aggregate([]),
+            "phase_profiles": _phase_profiles_aggregate([]),
             "privacy": _fielded_bm25_privacy(),
         }
     rank_buckets: dict[str, int] = {}
@@ -2395,6 +2486,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_records_deduped": sum(int(item.get("candidate_records_deduped") or 0) for item in selected),
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
         "materialization": _fielded_bm25_materialization_aggregate(selected),
+        "phase_profiles": _fielded_bm25_phase_profiles_aggregate(selected),
         "privacy": _fielded_bm25_privacy(),
     }
 
@@ -2438,6 +2530,86 @@ def _fielded_bm25_materialization_aggregate(rows: list[dict[str, Any]]) -> dict[
     }
 
 
+def _fielded_bm25_phase_profiles_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "fielded_bm25_index_build": _phase_profiles_aggregate(
+            [row.get("index_build_profile") for row in rows if isinstance(row.get("index_build_profile"), dict)]
+        ),
+        "fielded_bm25_search_materialization": _phase_profiles_aggregate(
+            [row.get("phase_profile") for row in rows if isinstance(row.get("phase_profile"), dict)]
+        ),
+    }
+
+
+def _rrf_phase_profiles_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    phase_names = (
+        "total_explicit_rrf_retrieval",
+        "shared_source_enumeration",
+        "package_lane",
+        "fielded_bm25_index_build",
+        "fielded_bm25_search_materialization",
+        "rrf_fusion",
+    )
+    return {
+        phase: _phase_profiles_aggregate(
+            [
+                item.get("phase_profiles", {}).get(phase)
+                for item in rows
+                if isinstance(item.get("phase_profiles"), dict)
+                and isinstance(item.get("phase_profiles", {}).get(phase), dict)
+            ]
+        )
+        for phase in phase_names
+    }
+
+
+def _phase_profiles_aggregate(profiles: list[Any]) -> dict[str, Any]:
+    selected = [profile for profile in profiles if isinstance(profile, dict)]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "rss_available_runs": 0,
+            "rss_unavailable_reason_counts": {},
+            "median_elapsed_ms": 0.0,
+            "max_rss_max_bytes": None,
+            "median_rss_delta_bytes": None,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "source_lines_included": False,
+            "line_numbers_included": False,
+            "session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        }
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "phase_counts": _counts(item.get("phase") for item in selected),
+        "rss_available_runs": sum(1 for item in selected if item.get("rss_available")),
+        "rss_unavailable_reason_counts": _counts(
+            item.get("rss_unavailable_reason") for item in selected if not item.get("rss_available")
+        ),
+        "median_elapsed_ms": _median(item.get("elapsed_ms") for item in selected),
+        "max_rss_max_bytes": _max_optional(item.get("rss_max_bytes") for item in selected),
+        "median_rss_delta_bytes": _median(item.get("rss_delta_bytes") for item in selected if item.get("rss_delta_bytes") is not None),
+        "raw_paths_included": any(bool(item.get("raw_paths_included")) for item in selected),
+        "raw_text_included": any(bool(item.get("raw_text_included")) for item in selected),
+        "raw_query_text_included": any(bool(item.get("raw_query_text_included")) for item in selected),
+        "source_lines_included": any(bool(item.get("source_lines_included")) for item in selected),
+        "line_numbers_included": any(bool(item.get("line_numbers_included")) for item in selected),
+        "session_ids_included": any(bool(item.get("session_ids_included")) for item in selected),
+        "vectors_or_persisted_indexes_included": any(
+            bool(item.get("vectors_or_persisted_indexes_included")) for item in selected
+        ),
+    }
+
+
+def _max_optional(values: Any) -> int | None:
+    selected = [int(value) for value in values if value is not None]
+    return max(selected) if selected else None
+
+
 def _rrf_fusion_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     selected = [row.get("rrf_fusion") for row in rows if isinstance(row.get("rrf_fusion"), dict)]
     if not selected:
@@ -2450,6 +2622,7 @@ def _rrf_fusion_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "fielded_only_count": 0,
             "top_n_fielded_only_promotion_count": 0,
             "privacy": _rrf_fusion_privacy(),
+            "phase_profiles": _phase_profiles_aggregate([]),
         }
     return {
         "status": "evaluated",
@@ -2480,6 +2653,7 @@ def _rrf_fusion_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "median_package_latency_ms": _median(item.get("package_latency_ms") for item in selected),
         "median_fielded_latency_ms": _median(item.get("fielded_latency_ms") for item in selected),
         "median_fusion_latency_ms": _median(item.get("fusion_latency_ms") for item in selected),
+        "phase_profiles": _rrf_phase_profiles_aggregate(selected),
         "privacy": _rrf_fusion_privacy(),
     }
 

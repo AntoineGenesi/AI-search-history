@@ -11,6 +11,7 @@ from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .clustering import facets_for_record
+from .profiling import finish_phase_profile, start_phase_profile
 from .query import QueryIntent
 from .ranking import Match, group_matches, make_snippet, score_record
 from .records import Record, parse_record
@@ -78,6 +79,7 @@ class FieldedBm25Index:
             "indexed_chunk_count": int(self.metrics.get("indexed_chunks", 0)),
             "build_bytes": int(self.metrics.get("build_bytes", 0)),
             "build_elapsed_ms": self.metrics.get("build_elapsed_ms", 0.0),
+            "profile": _phase_profile_payload(self.metrics.get("profile"), "fielded_bm25_index_build"),
             "planned_file_enumeration_reused": bool(self.metrics.get("planned_file_enumeration_reused", False)),
             "planned_file_count": int(self.metrics.get("planned_file_count", 0)),
             "planned_file_bytes": int(self.metrics.get("planned_file_bytes", 0)),
@@ -121,6 +123,7 @@ def build_fielded_bm25_index(
     planned_jsonl_files: PlannedJsonlFiles | None = None,
 ) -> FieldedBm25Index:
     started = time.perf_counter()
+    profile_token = start_phase_profile("fielded_bm25_index_build")
     try:
         connection = sqlite3.connect(":memory:")
         connection.execute("PRAGMA temp_store = MEMORY")
@@ -139,9 +142,10 @@ def build_fielded_bm25_index(
             """
         )
     except sqlite3.Error as exc:
+        profile = finish_phase_profile(profile_token, indexed_file_count=0, indexed_record_count=0, indexed_chunk_count=0)
         return FieldedBm25Index(
             connection=None,
-            metrics={"build_elapsed_ms": _elapsed_ms(started)},
+            metrics={"build_elapsed_ms": _elapsed_ms(started), "profile": profile},
             available=False,
             unavailable_reason=type(exc).__name__,
             warnings=["SQLite FTS5 is unavailable; fielded BM25 lane cannot run."],
@@ -236,6 +240,13 @@ def build_fielded_bm25_index(
         index.metrics["planned_file_enumeration_reused"] = True
         index.metrics["planned_file_count"] = planned_jsonl_files.file_count
         index.metrics["planned_file_bytes"] = planned_jsonl_files.byte_count
+    index.metrics["profile"] = finish_phase_profile(
+        profile_token,
+        indexed_file_count=int(index.metrics.get("indexed_files", 0)),
+        indexed_record_count=int(index.metrics.get("indexed_records", 0)),
+        indexed_chunk_count=int(index.metrics.get("indexed_chunks", 0)),
+        build_bytes=int(index.metrics.get("build_bytes", 0)),
+    )
     index.warnings = sorted(set(index.warnings + plan.warnings))
     return index
 
@@ -251,15 +262,20 @@ def search_with_fielded_bm25(
     include_private_diagnostics: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    profile_token = start_phase_profile("fielded_bm25_search_materialization")
     warnings = list(index.warnings) + list(plan.warnings)
     query = _fts_query_for_intent(intent)
     expected_diag = _init_fielded_expected_ref_diagnostics(expected_ref_diagnostics)
     _mark_expected_indexed(expected_diag, index)
     if not index.available or index.connection is None:
-        return _unavailable_payload(index, started, warnings, query, expected_diag)
+        payload = _unavailable_payload(index, started, warnings, query, expected_diag)
+        payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
+        return payload
     if query is None:
         warnings.append("Fielded BM25 query had no escaped FTS terms.")
-        return _empty_payload(index, started, warnings, query, expected_diag, status="ineligible_query")
+        payload = _empty_payload(index, started, warnings, query, expected_diag, status="ineligible_query")
+        payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
+        return payload
 
     candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
     try:
@@ -277,7 +293,9 @@ def search_with_fielded_bm25(
         )
     except sqlite3.Error as exc:
         warnings.append(f"Fielded BM25 query failed: {type(exc).__name__}.")
-        return _empty_payload(index, started, warnings, query, expected_diag, status="query_failed")
+        payload = _empty_payload(index, started, warnings, query, expected_diag, status="query_failed")
+        payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
+        return payload
 
     _mark_expected_candidate_rows(expected_diag, rows)
     matches: list[Match] = []
@@ -374,6 +392,15 @@ def search_with_fielded_bm25(
         "privacy": _privacy_payload(),
         "warnings": sorted(set(warnings)),
         "elapsed_ms": _elapsed_ms(started),
+        "profile": finish_phase_profile(
+            profile_token,
+            candidate_rows=len(rows),
+            candidate_count=len(matches),
+            searched_files=len(opened_paths),
+            searched_bytes=searched_bytes,
+            records_considered=records_considered,
+            candidate_rows_materialized=int(materialization.get("candidate_rows_materialized") or 0),
+        ),
     }
     if include_private_diagnostics:
         payload["_searched_file_paths"] = sorted(opened_paths)
@@ -559,6 +586,40 @@ def _new_materialization_counters() -> dict[str, int | bool]:
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
     }
+
+
+def _phase_profile_payload(value: Any, phase: str) -> dict[str, Any]:
+    profile = value if isinstance(value, dict) else {}
+    rss_available = bool(profile.get("rss_available", False))
+    return {
+        "phase": str(profile.get("phase") or phase),
+        "elapsed_ms": float(profile.get("elapsed_ms") or 0.0),
+        "rss_available": rss_available,
+        "rss_units": "bytes",
+        "rss_start_max_bytes": _optional_int(profile.get("rss_start_max_bytes")),
+        "rss_end_max_bytes": _optional_int(profile.get("rss_end_max_bytes")),
+        "rss_max_bytes": _optional_int(profile.get("rss_max_bytes")),
+        "rss_delta_bytes": _optional_int(profile.get("rss_delta_bytes")),
+        "rss_unavailable_reason": None if rss_available else str(profile.get("rss_unavailable_reason") or "not_profiled"),
+        "rss_current_bytes": None,
+        "rss_current_unavailable_reason": "resource_ru_maxrss_reports_process_peak_not_current",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _clip_index_text(raw_text: str) -> str:
