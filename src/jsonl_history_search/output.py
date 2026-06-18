@@ -2727,6 +2727,22 @@ def render_impact_benchmark_text(payload: dict) -> str:
                 f"{gate_name}: status={gate.get('status')} "
                 f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
             )
+    coverage = report.get("rg_prefilter_coverage") or {}
+    if coverage:
+        lines.append(
+            "rg_prefilter_coverage: "
+            f"runs={coverage.get('runs')} "
+            f"used={coverage.get('used_runs')} "
+            f"anchors={coverage.get('anchor_kind_counts')} "
+            f"fallbacks={coverage.get('fallback_reason_counts')}"
+        )
+    decision = report.get("rg_prefilter_workflow_decision") or {}
+    if decision:
+        lines.append(
+            "rg_prefilter_workflow_decision: "
+            f"{decision.get('decision')} "
+            f"default_changed={decision.get('default_search_behavior_changed')}"
+        )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -3041,6 +3057,80 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                     f"{_escape_markdown_table(count_text or '(none)')} |"
                 )
     lines.extend(_benchmark_gate_markdown_lines(report))
+    scope = report.get("report_scope") or {}
+    if scope:
+        lines.extend(
+            [
+                "",
+                "## Report Scope",
+                "",
+                f"- Mode: `{scope.get('mode')}`",
+                f"- Requested case limit: `{scope.get('requested_case_limit')}`",
+                f"- Evaluated case count: `{scope.get('evaluated_case_count')}`",
+                f"- Limitation: {scope.get('limitation')}",
+            ]
+        )
+    coverage = report.get("rg_prefilter_coverage") or {}
+    decision = report.get("rg_prefilter_workflow_decision") or {}
+    if coverage:
+        lines.extend(
+            [
+                "",
+                "## Rg Prefilter Anchor Coverage",
+                "",
+                f"- Status: `{coverage.get('status')}`",
+                f"- Basis: `{coverage.get('basis')}`",
+                f"- Runs: `{coverage.get('runs')}`",
+                f"- Cases: `{coverage.get('cases')}`",
+                f"- Eligible runs: `{coverage.get('eligible_runs')}`",
+                f"- Used runs: `{coverage.get('used_runs')}`",
+                f"- Attempted runs: `{coverage.get('attempted_runs')}`",
+                f"- Anchor-kind counts: `{coverage.get('anchor_kind_counts')}`",
+                f"- Fallback reason counts: `{coverage.get('fallback_reason_counts')}`",
+                f"- Status counts: `{coverage.get('status_counts')}`",
+                f"- Needle policy counts: `{coverage.get('needle_policy_counts')}`",
+                f"- Median files reduction ratio: `{coverage.get('median_files_reduction_ratio')}`",
+                f"- Median bytes reduction ratio: `{coverage.get('median_bytes_reduction_ratio')}`",
+            ]
+        )
+        privacy = coverage.get("privacy") or {}
+        if privacy:
+            lines.extend(["", "### Coverage Privacy", ""])
+            for key, value in privacy.items():
+                lines.append(f"- `{key}`: `{value}`")
+    if decision:
+        lines.extend(
+            [
+                "",
+                "## Rg Prefilter Workflow Decision",
+                "",
+                f"- Decision: `{decision.get('decision')}`",
+                f"- Rationale: {decision.get('rationale')}",
+                f"- Next action: `{decision.get('next_action')}`",
+                f"- Default search behavior changed: `{decision.get('default_search_behavior_changed')}`",
+                f"- Default rg promotion supported: `{decision.get('rg_default_promotion_supported')}`",
+                f"- Universal rg supported: `{decision.get('universal_rg_supported')}`",
+                f"- Token-savings claim supported: `{decision.get('token_savings_claim_supported')}`",
+                f"- Final-answer quality claim supported: `{decision.get('final_answer_quality_claim_supported')}`",
+                f"- Product-value claim supported: `{decision.get('product_value_claim_supported')}`",
+            ]
+        )
+    omitted = report.get("rows_omitted") or {}
+    if omitted:
+        lines.extend(
+            [
+                "",
+                "## Omitted Per-Case Rows",
+                "",
+                f"- Omitted: `{omitted.get('omitted')}`",
+                f"- Row count: `{omitted.get('row_count')}`",
+                f"- Reason: `{omitted.get('reason')}`",
+                f"- Case IDs committed: `{omitted.get('case_ids_committed')}`",
+                f"- Raw queries committed: `{omitted.get('raw_queries_committed')}`",
+                f"- Raw private paths committed: `{omitted.get('raw_private_paths_committed')}`",
+                f"- Raw anchor needles committed: `{omitted.get('raw_anchor_needles_committed')}`",
+            ]
+        )
     diagnostic = report.get("structural_sidecar_diagnostic") or {}
     if diagnostic:
         decision = diagnostic.get("decision") or {}

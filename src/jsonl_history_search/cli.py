@@ -489,6 +489,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to sanitized expected-ref reach/retention diagnostics in package-search rows.",
     )
+    real_history_impact.add_argument(
+        "--aggregate-only-report",
+        action="store_true",
+        help="Omit per-case rows from the committed report payload after aggregate metrics are computed.",
+    )
     real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
     add_common_args(real_history_timestamp_seek)
     real_history_timestamp_seek.add_argument(
