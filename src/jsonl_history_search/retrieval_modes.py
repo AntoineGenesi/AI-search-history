@@ -219,6 +219,7 @@ def build_rrf_retrieval_diagnostics(
     ) if overlap else 0
     cap_labels = cap_labels_from_warnings(warnings)
     fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
+    fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
     fielded_ordering = _fielded_priority_ordering_diagnostics(
         package_result=package_result,
         planned_file_count=int(planned_jsonl_file_diagnostics.get("file_count") or 0),
@@ -290,6 +291,7 @@ def build_rrf_retrieval_diagnostics(
                 "searched_files": int(fielded_result.get("searched_files", 0)),
                 "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
                 "materialization": fielded_materialization,
+                "source_grouping": fielded_source_grouping,
                 "planned_file_source": "shared_source_enumeration",
                 "cap_labels": cap_labels_from_warnings(fielded_result.get("warnings", []) or []),
                 "index_summary": fielded_index_summary,
@@ -306,6 +308,7 @@ def build_rrf_retrieval_diagnostics(
             "planned_file_count": int(planned_jsonl_file_diagnostics.get("file_count") or 0),
         },
         "fielded_informed_package_ordering": fielded_ordering,
+        "fielded_source_grouping": fielded_source_grouping,
         "duplicate_local_work": {
             "raw_paths_included": False,
             "enumeration_reused": True,
@@ -342,6 +345,33 @@ def build_rrf_retrieval_diagnostics(
             "scanner_scheduling_constants_changed": False,
             "package_lane_scoped_or_skipped": False,
         },
+}
+
+
+def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    grouping = fielded_result.get("fielded_source_grouping") if isinstance(fielded_result, dict) else {}
+    if not isinstance(grouping, dict):
+        grouping = {}
+    return {
+        "enabled": bool(grouping.get("enabled", False)),
+        "strategy": str(grouping.get("strategy") or "disabled"),
+        "candidate_rows_considered": int(grouping.get("candidate_rows_considered") or 0),
+        "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
+        "candidate_row_limit": int(grouping.get("candidate_row_limit") or 0),
+        "candidate_row_pool_limit": int(grouping.get("candidate_row_pool_limit") or 0),
+        "source_count_considered": int(grouping.get("source_count_considered") or 0),
+        "source_count_selected": int(grouping.get("source_count_selected") or 0),
+        "dominant_source_share_before": float(grouping.get("dominant_source_share_before") or 0.0),
+        "dominant_source_share_after": float(grouping.get("dominant_source_share_after") or 0.0),
+        "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
+        "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
     }
 
 

@@ -34,6 +34,7 @@ TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 # downstream parse/rank cost instead of expanding each hit into large chunks.
 CHUNK_RECORD_LIMIT = 1
 INDEX_LINE_TEXT_LIMIT = 1200
+FIELDED_SOURCE_GROUPING_POOL_FACTOR = 4
 
 
 @dataclass(frozen=True)
@@ -278,8 +279,9 @@ def search_with_fielded_bm25(
         return payload
 
     candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
+    candidate_pool_limit = max(candidate_limit * FIELDED_SOURCE_GROUPING_POOL_FACTOR, candidate_limit)
     try:
-        rows = list(
+        raw_rows = list(
             index.connection.execute(
                 """
                 SELECT rowid, bm25(records) AS bm25_score
@@ -288,7 +290,7 @@ def search_with_fielded_bm25(
                 ORDER BY bm25_score ASC
                 LIMIT ?
                 """,
-                (query, candidate_limit),
+                (query, candidate_pool_limit),
             )
         )
     except sqlite3.Error as exc:
@@ -297,6 +299,12 @@ def search_with_fielded_bm25(
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
 
+    rows, source_grouping = _select_source_grouped_candidate_rows(
+        raw_rows,
+        index,
+        selected_limit=candidate_limit,
+        pool_limit=candidate_pool_limit,
+    )
     _mark_expected_candidate_rows(expected_diag, rows)
     matches: list[Match] = []
     dedupe: set[tuple[str, ...]] = set()
@@ -375,9 +383,12 @@ def search_with_fielded_bm25(
         "query_profile": _query_profile(intent, query),
         "candidate_rows": len(rows),
         "candidate_row_limit": candidate_limit,
+        "candidate_row_pool_limit": candidate_pool_limit,
         "candidate_rows_generated": len(rows),
+        "candidate_rows_considered": len(raw_rows),
         "candidate_rows_retained": pre_cap_count,
         "candidate_rows_surfaced": len(matches),
+        "fielded_source_grouping": source_grouping,
         "bm25_rank_buckets": dict(sorted(bm25_rank_buckets.items())),
         "searched_files": len(opened_paths),
         "opened_files": len(opened_paths),
@@ -395,6 +406,7 @@ def search_with_fielded_bm25(
         "profile": finish_phase_profile(
             profile_token,
             candidate_rows=len(rows),
+            candidate_rows_considered=len(raw_rows),
             candidate_count=len(matches),
             searched_files=len(opened_paths),
             searched_bytes=searched_bytes,
@@ -565,6 +577,127 @@ def _materialize_chunk_records(
             int(counters["records_materialized_from_file_reopen"]) + len(records)
         )
     return records
+
+
+def _select_source_grouped_candidate_rows(
+    rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    selected_limit: int,
+    pool_limit: int,
+) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
+    bounded_limit = max(int(selected_limit), 0)
+    if bounded_limit <= 0:
+        return [], _source_grouping_diagnostics(
+            rows_considered=len(rows),
+            rows_selected=0,
+            selected_limit=bounded_limit,
+            pool_limit=pool_limit,
+            considered_source_counts={},
+            selected_source_counts={},
+            source_head_rows_selected=0,
+            global_tail_rows_selected=0,
+        )
+
+    grouped_rows: dict[str, list[tuple[Any, ...]]] = {}
+    considered_source_counts: dict[str, int] = {}
+    for row in rows:
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        source_key = _source_grouping_key(ref)
+        grouped_rows.setdefault(source_key, []).append(row)
+        considered_source_counts[source_key] = considered_source_counts.get(source_key, 0) + 1
+
+    selected: list[tuple[Any, ...]] = []
+    selected_rowids: set[int] = set()
+    source_head_rows_selected = 0
+    for source_rows in grouped_rows.values():
+        if len(selected) >= bounded_limit:
+            break
+        head = source_rows[0]
+        rowid = int(head[0])
+        if rowid in selected_rowids:
+            continue
+        selected.append(head)
+        selected_rowids.add(rowid)
+        source_head_rows_selected += 1
+
+    global_tail_rows_selected = 0
+    for row in rows:
+        if len(selected) >= bounded_limit:
+            break
+        rowid = int(row[0])
+        if rowid in selected_rowids:
+            continue
+        selected.append(row)
+        selected_rowids.add(rowid)
+        global_tail_rows_selected += 1
+
+    selected_source_counts: dict[str, int] = {}
+    for row in selected:
+        ref = index.records.get(int(row[0]))
+        if ref is None:
+            continue
+        source_key = _source_grouping_key(ref)
+        selected_source_counts[source_key] = selected_source_counts.get(source_key, 0) + 1
+
+    return selected, _source_grouping_diagnostics(
+        rows_considered=len(rows),
+        rows_selected=len(selected),
+        selected_limit=bounded_limit,
+        pool_limit=pool_limit,
+        considered_source_counts=considered_source_counts,
+        selected_source_counts=selected_source_counts,
+        source_head_rows_selected=source_head_rows_selected,
+        global_tail_rows_selected=global_tail_rows_selected,
+    )
+
+
+def _source_grouping_key(ref: FieldedBm25RecordRef) -> str:
+    return str(ref.path)
+
+
+def _source_grouping_diagnostics(
+    *,
+    rows_considered: int,
+    rows_selected: int,
+    selected_limit: int,
+    pool_limit: int,
+    considered_source_counts: dict[str, int],
+    selected_source_counts: dict[str, int],
+    source_head_rows_selected: int,
+    global_tail_rows_selected: int,
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "strategy": "source_heads_then_global_bm25_tail",
+        "candidate_rows_considered": int(rows_considered),
+        "candidate_rows_selected": int(rows_selected),
+        "candidate_row_limit": int(selected_limit),
+        "candidate_row_pool_limit": int(pool_limit),
+        "source_count_considered": len(considered_source_counts),
+        "source_count_selected": len(selected_source_counts),
+        "dominant_source_share_before": _dominant_source_share(considered_source_counts),
+        "dominant_source_share_after": _dominant_source_share(selected_source_counts),
+        "source_head_rows_selected": int(source_head_rows_selected),
+        "global_tail_rows_selected": int(global_tail_rows_selected),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _dominant_source_share(source_counts: dict[str, int]) -> float:
+    total = sum(source_counts.values())
+    if total <= 0:
+        return 0.0
+    return round(max(source_counts.values()) / total, 6)
 
 
 def _new_materialization_counters() -> dict[str, int | bool]:
