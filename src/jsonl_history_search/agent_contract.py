@@ -741,9 +741,17 @@ def sanitize_source_plan(source_plan: Any) -> dict[str, Any]:
     if not isinstance(source_plan, dict):
         source_plan = {}
     prune_reasons = source_plan.get("prune_reasons") if isinstance(source_plan.get("prune_reasons"), dict) else {}
+    deferred_reason_counts = (
+        source_plan.get("deferred_reason_counts")
+        if isinstance(source_plan.get("deferred_reason_counts"), dict)
+        else {}
+    )
     materialization_budget = (
         source_plan.get("materialization_budget") if isinstance(source_plan.get("materialization_budget"), dict) else {}
     )
+    budget_basis = source_plan.get("budget_basis") if isinstance(source_plan.get("budget_basis"), dict) else {}
+    source_tiers = source_plan.get("source_tiers") if isinstance(source_plan.get("source_tiers"), dict) else {}
+    retry_guidance = source_plan.get("retry_guidance") if isinstance(source_plan.get("retry_guidance"), dict) else {}
     date_window = source_plan.get("date_window") if isinstance(source_plan.get("date_window"), dict) else {}
     return {
         "schema_version": int(source_plan.get("schema_version") or 1),
@@ -760,6 +768,30 @@ def sanitize_source_plan(source_plan: Any) -> dict[str, Any]:
         "byte_count_total": int(source_plan.get("byte_count_total") or 0),
         "byte_count_selected": int(source_plan.get("byte_count_selected") or 0),
         "prune_reasons": {str(key): int(value or 0) for key, value in sorted(prune_reasons.items())},
+        "tier_order": [str(item) for item in source_plan.get("tier_order") or []],
+        "source_tiers": sanitize_source_tiers(source_tiers),
+        "deferred_reason_counts": {str(key): int(value or 0) for key, value in sorted(deferred_reason_counts.items())},
+        "budget_basis": {
+            "policy": str(budget_basis.get("policy") or ""),
+            "max_selected_files": int(budget_basis.get("max_selected_files") or 0),
+            "max_selected_bytes": int(budget_basis.get("max_selected_bytes") or 0),
+            "eligible_source_count_after_hard_prune": int(
+                budget_basis.get("eligible_source_count_after_hard_prune") or 0
+            ),
+            "effective_files": int(budget_basis.get("effective_files") or 0),
+            "effective_bytes": int(budget_basis.get("effective_bytes") or 0),
+            "max_matches": int(budget_basis.get("max_matches") or 0),
+            "uses_scoring_weights": bool(budget_basis.get("uses_scoring_weights", False)),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "retry_guidance": {
+            "needed": bool(retry_guidance.get("needed", False)),
+            "deferred_source_count": int(retry_guidance.get("deferred_source_count") or 0),
+            "guidance": str(retry_guidance.get("guidance") or ""),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
         "materialization_budget": {
             "max_files": int(materialization_budget.get("max_files") or 0),
             "max_bytes": int(materialization_budget.get("max_bytes") or 0),
@@ -778,8 +810,45 @@ def sanitize_source_plan(source_plan: Any) -> dict[str, Any]:
         "raw_text_included": False,
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
+        "privacy_flags": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+        },
         "persistent_index_or_cache_used": False,
     }
+
+
+def sanitize_source_tiers(source_tiers: Any) -> dict[str, Any]:
+    if not isinstance(source_tiers, dict):
+        source_tiers = {}
+    lexical_probe = source_tiers.get("lexical_probe") if isinstance(source_tiers.get("lexical_probe"), dict) else {}
+    return {
+        "order": [str(item) for item in source_tiers.get("order") or []],
+        "selection_order": [str(item) for item in source_tiers.get("selection_order") or []],
+        "stable_ordering": str(source_tiers.get("stable_ordering") or ""),
+        "lexical_probe": {
+            "enabled": bool(lexical_probe.get("enabled", False)),
+            "reason": str(lexical_probe.get("reason") or "no_already_built_cheap_source_probe_available"),
+            "selected_count": int(lexical_probe.get("selected_count") or 0),
+        },
+        "eligible_counts": sanitize_int_counts(source_tiers.get("eligible_counts")),
+        "selected_counts": sanitize_int_counts(source_tiers.get("selected_counts")),
+        "deferred_counts": sanitize_int_counts(source_tiers.get("deferred_counts")),
+        "date_overlap_counts": sanitize_int_counts(source_tiers.get("date_overlap_counts")),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+    }
+
+
+def sanitize_int_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): int(count or 0) for key, count in sorted(value.items())}
 
 
 def compact_provenance_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1860,12 +1929,16 @@ def build_no_evidence_report(
         "selected_roots": source_scope["selected_roots"],
         "private_roots": source_scope["private_roots"],
         "cap_hit": source_scope["cap_hit"],
+        "deferred_source_count": source_scope["not_searched_scope"]["source_plan"]["sources_deferred_budget"],
+        "retry_guidance": source_scope["not_searched_scope"]["source_plan"]["retry_guidance"],
+        "not_all_history_absence": True,
         "weak_candidates": weak_candidates,
         "warnings": search_result.get("warnings", []),
         "blind_spots": search_result.get("blind_spots", []),
         "why_not_confident": (
             "No matching candidate rows survived the searched scope. "
-            "This does not prove evidence is absent from excluded roots, missing roots, roots outside the source plan, or scope beyond any hit caps."
+            "This does not prove evidence is absent from excluded roots, missing roots, roots outside the source plan, "
+            "budget-deferred sources, or scope beyond any hit caps."
         ),
     }
 
@@ -1928,6 +2001,10 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
                 "sources_pruned_hard": retrieval_source_plan["sources_pruned_hard"],
                 "sources_deferred_budget": retrieval_source_plan["sources_deferred_budget"],
                 "prune_reasons": retrieval_source_plan["prune_reasons"],
+                "deferred_reason_counts": retrieval_source_plan["deferred_reason_counts"],
+                "source_tiers": retrieval_source_plan["source_tiers"],
+                "budget_basis": retrieval_source_plan["budget_basis"],
+                "retry_guidance": retrieval_source_plan["retry_guidance"],
                 "exhaustive_available": retrieval_source_plan["exhaustive_available"],
                 "raw_paths_included": False,
                 "raw_text_included": False,
@@ -2017,6 +2094,8 @@ def next_search_suggestions(
             suggestions.append("Inspect rejected/excluded roots and rerun with an allowed safe root if that source was intended.")
         if source_scope["cap_hit"].get("hit"):
             suggestions.append("Raise safe caps or narrow the query/source scope before treating this no-evidence result as meaningful.")
+        if source_scope["not_searched_scope"]["source_plan"].get("sources_deferred_budget", 0) > 0:
+            suggestions.append("Raise safe source budgets or add a stronger artifact/task/date/root hint to search budget-deferred files.")
         suggestions.append("Inspect no_evidence_report and rerun with any extra artifact, project, date, or speaker hint before declaring permanent no evidence.")
     elif len(candidates) > INLINE_CANDIDATE_LIMIT:
         suggestions.append("Use the top clusters or write a report instead of opening every candidate.")
