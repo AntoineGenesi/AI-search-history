@@ -7,7 +7,15 @@ from .adapters import AdapterReadError, iter_records_for_file
 from .clustering import facets_for_record
 from .masking import MaskContext
 from .query import QueryIntent
-from .ranking import Match, group_matches, is_weak_partial_generic, make_snippet, score_record, should_consider
+from .ranking import (
+    Match,
+    build_match_profile,
+    evaluate_record_match,
+    group_matches,
+    is_weak_partial_generic,
+    make_snippet,
+    score_record,
+)
 from .rg_prefilter import filter_planned_files
 from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
 
@@ -48,6 +56,7 @@ def search(
     prefilter = None
     planned_files = []
     expected_diag = _init_expected_ref_diagnostics(expected_ref_diagnostics)
+    match_profile = build_match_profile(intent)
 
     for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
         path, size, enum_warnings = enumerated
@@ -111,7 +120,8 @@ def search(
                     expected_state["expected_file_progress_bucket"] = _records_read_bucket(
                         int(item.get("records_read") or 0)
                     )
-                if not should_consider(record, intent):
+                match_evidence = evaluate_record_match(record, intent, profile=match_profile)
+                if not match_evidence.should_consider:
                     records_rejected_by_should_consider += 1
                     if expected_state is not None:
                         expected_state["would_pass_should_consider"] = False
@@ -133,7 +143,13 @@ def search(
                     continue
                 dedupe.add(key)
                 candidate_records_scored += 1
-                score, reasons, artifacts = score_record(record, intent, cwd)
+                score, reasons, artifacts = score_record(
+                    record,
+                    intent,
+                    cwd,
+                    profile=match_profile,
+                    evidence=match_evidence,
+                )
                 if expected_state is not None:
                     expected_state["expected_record_present_before_reservoir_retention"] = True
                     expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
