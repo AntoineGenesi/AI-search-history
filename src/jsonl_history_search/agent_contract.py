@@ -129,6 +129,9 @@ def build_agent_find_payload(
     }
     if search_result.get("retrieval_diagnostics"):
         agent_find["retrieval_diagnostics"] = search_result["retrieval_diagnostics"]
+        retrieval_pressure = build_retrieval_pressure_summary(search_result)
+        if retrieval_pressure:
+            agent_find["retrieval_pressure"] = retrieval_pressure
     handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=search_result,
@@ -148,6 +151,7 @@ def build_agent_find_payload(
             source_locator_handoff=handoff,
             next_reads=handoff["next_reads"],
             no_evidence=agent_find["no_evidence_report"],
+            retrieval_pressure=agent_find.get("retrieval_pressure"),
         )
     return {"agent_find": agent_find}
 
@@ -172,6 +176,7 @@ def build_compact_provenance_handoff(
     source_locator_handoff: dict[str, Any],
     next_reads: list[dict[str, Any]],
     no_evidence: dict[str, Any],
+    retrieval_pressure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an opt-in provenance map from already-emitted agent-facing fields."""
     compact_candidates = compact_provenance_candidates(candidates)
@@ -221,6 +226,9 @@ def build_compact_provenance_handoff(
             "default_promotion_supported": False,
         },
     }
+    if retrieval_pressure:
+        packet["derived_from"].append("retrieval_pressure")
+        packet["retrieval_pressure"] = retrieval_pressure
     packet_bytes = len(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     packet["context_budget"] = {
         "payload_bytes": packet_bytes,
@@ -228,6 +236,71 @@ def build_compact_provenance_handoff(
         "measurement_basis": "compact_provenance_handoff_packet_only",
     }
     return packet
+
+
+def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str, Any] | None:
+    diagnostics = search_result.get("retrieval_diagnostics") or {}
+    if not isinstance(diagnostics, dict):
+        return None
+    retrieval_mode = diagnostics.get("retrieval_mode") or search_result.get("retrieval_mode")
+    if not retrieval_mode:
+        return None
+
+    high_recall_state = diagnostics.get("high_recall_mode_state") or {}
+    cap_labels = sorted(str(label) for label in diagnostics.get("cap_labels", []) if label)
+    capped = bool(high_recall_state.get("capped", bool(cap_labels)))
+    result_completeness = "lower_bound_due_to_caps" if capped else "complete_within_configured_caps"
+    shared_source_enumeration = diagnostics.get("shared_source_enumeration") or {}
+    duplicate_local_work = diagnostics.get("duplicate_local_work") or {}
+    lane_file_overlap = diagnostics.get("lane_file_overlap") or {}
+    claim_boundaries = diagnostics.get("claim_boundaries") or {}
+
+    return {
+        "retrieval_mode": retrieval_mode,
+        "capped": capped,
+        "cap_labels": cap_labels,
+        "lower_bound_result": capped,
+        "result_completeness": result_completeness,
+        "explicit_opt_in_required": bool(high_recall_state.get("explicit_opt_in_required", False)),
+        "default_behavior_changed": bool(high_recall_state.get("default_behavior_changed", False)),
+        "shared_source_enumeration": {
+            "file_count": int(shared_source_enumeration.get("file_count") or 0),
+            "byte_count": int(shared_source_enumeration.get("byte_count") or 0),
+            "consumed_by_lanes": list(shared_source_enumeration.get("consumed_by_lanes") or []),
+            "raw_paths_included": False,
+        },
+        "duplicate_local_work": {
+            "enumeration_reused": bool(duplicate_local_work.get("enumeration_reused", False)),
+            "avoided_second_enumeration": bool(duplicate_local_work.get("avoided_second_enumeration", False)),
+            "duplicate_file_visit_count": int(duplicate_local_work.get("duplicate_file_visit_count") or 0),
+            "duplicate_file_overlap_count": int(duplicate_local_work.get("duplicate_file_overlap_count") or 0),
+            "duplicate_searched_bytes_lower_bound": int(
+                duplicate_local_work.get("duplicate_searched_bytes_lower_bound") or 0
+            ),
+            "local_work_only_not_model_tokens": bool(
+                duplicate_local_work.get("local_work_only_not_model_tokens", True)
+            ),
+            "raw_paths_included": False,
+        },
+        "lane_file_overlap": {
+            "package_opened_file_count": int(lane_file_overlap.get("package_opened_file_count") or 0),
+            "fielded_opened_file_count": int(lane_file_overlap.get("fielded_opened_file_count") or 0),
+            "overlap_file_count": int(lane_file_overlap.get("overlap_file_count") or 0),
+            "union_file_count": int(lane_file_overlap.get("union_file_count") or 0),
+            "raw_paths_included": False,
+        },
+        "claim_boundaries": {
+            "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
+            "final_answer_quality_claim_supported": bool(
+                claim_boundaries.get("final_answer_quality_claim_supported", False)
+            ),
+            "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
+            "default_behavior_changed": bool(claim_boundaries.get("default_behavior_changed", False)),
+            "all_history_completeness_claim_supported": bool(
+                claim_boundaries.get("all_history_completeness_claim_supported", False)
+            ),
+        },
+    }
 
 
 def compact_provenance_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

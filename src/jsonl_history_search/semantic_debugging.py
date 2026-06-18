@@ -176,6 +176,8 @@ def build_semantic_debug_payload(
     if result.get("retrieval_diagnostics"):
         packet["retrieval_diagnostics"] = result["retrieval_diagnostics"]
         packet["claim_boundaries"].update(result["retrieval_diagnostics"].get("claim_boundaries", {}))
+    if agent_find.get("retrieval_pressure"):
+        packet["retrieval_pressure"] = agent_find["retrieval_pressure"]
     if getattr(args, "compact_provenance_handoff", False):
         packet["compact_provenance_handoff"] = build_compact_provenance_handoff(
             status=packet["status"],
@@ -184,6 +186,7 @@ def build_semantic_debug_payload(
             source_locator_handoff=source_locator_handoff,
             next_reads=next_reads,
             no_evidence=no_evidence,
+            retrieval_pressure=packet.get("retrieval_pressure"),
         )
     return {
         "semantic_debug": packet,
