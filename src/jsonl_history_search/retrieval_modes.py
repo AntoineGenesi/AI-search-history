@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
+from .profiling import finish_phase_profile, start_phase_profile
 from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT, RrfLane, fuse_ranked_groups
 from .scanner import search
 from .sources import materialize_planned_jsonl_files
@@ -55,11 +56,17 @@ def run_rrf_fusion_retrieval(
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
 ) -> dict[str, Any]:
-    enumeration_started = time.perf_counter()
+    total_profile_token = start_phase_profile("total_explicit_rrf_retrieval")
+    enumeration_profile_token = start_phase_profile("shared_source_enumeration")
     planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
-    enumeration_elapsed_ms = _elapsed_ms(enumeration_started)
+    enumeration_profile = finish_phase_profile(
+        enumeration_profile_token,
+        file_count=planned_jsonl_files.file_count,
+        byte_count=planned_jsonl_files.byte_count,
+    )
+    enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
 
-    package_started = time.perf_counter()
+    package_profile_token = start_phase_profile("package_lane")
     package_result = search(
         plan,
         intent,
@@ -70,13 +77,28 @@ def run_rrf_fusion_retrieval(
         planned_jsonl_files=planned_jsonl_files,
         include_private_diagnostics=True,
     )
-    package_elapsed_ms = _elapsed_ms(package_started)
+    package_count = _candidate_count(package_result)
+    package_profile = finish_phase_profile(
+        package_profile_token,
+        candidate_count=package_count,
+        searched_files=int(package_result.get("searched_files", 0)),
+        searched_bytes=int(package_result.get("searched_bytes", 0)),
+        records_considered=int(package_result.get("records_considered", 0)),
+    )
+    package_elapsed_ms = float(package_profile["elapsed_ms"])
     package_searched_paths = set(package_result.pop("_searched_file_paths", []) or [])
 
-    fielded_index_started = time.perf_counter()
+    fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
     fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
-    fielded_index_elapsed_ms = _elapsed_ms(fielded_index_started)
-    fielded_started = time.perf_counter()
+    fielded_index_profile = finish_phase_profile(
+        fielded_index_profile_token,
+        indexed_file_count=int(fielded_index.metrics.get("indexed_files", 0)),
+        indexed_record_count=int(fielded_index.metrics.get("indexed_records", 0)),
+        indexed_chunk_count=int(fielded_index.metrics.get("indexed_chunks", 0)),
+        build_bytes=int(fielded_index.metrics.get("build_bytes", 0)),
+    )
+    fielded_index_elapsed_ms = float(fielded_index_profile["elapsed_ms"])
+    fielded_started = start_phase_profile("fielded_bm25_search_materialization")
     fielded_result = search_with_fielded_bm25(
         fielded_index,
         plan,
@@ -85,10 +107,19 @@ def run_rrf_fusion_retrieval(
         cwd=cwd,
         include_private_diagnostics=True,
     )
-    fielded_elapsed_ms = _elapsed_ms(fielded_started)
+    fielded_count = _candidate_count(fielded_result)
+    fielded_profile = finish_phase_profile(
+        fielded_started,
+        candidate_count=fielded_count,
+        candidate_rows=int(fielded_result.get("candidate_rows_generated", 0) or 0),
+        searched_files=int(fielded_result.get("searched_files", 0)),
+        searched_bytes=int(fielded_result.get("searched_bytes", 0)),
+        records_considered=int(fielded_result.get("records_considered", 0)),
+    )
+    fielded_elapsed_ms = float(fielded_profile["elapsed_ms"])
     fielded_searched_paths = set(fielded_result.pop("_searched_file_paths", []) or [])
 
-    fusion_started = time.perf_counter()
+    fusion_profile_token = start_phase_profile("rrf_fusion")
     fused_result = fuse_ranked_groups(
         [
             RrfLane(RRF_LANE_NAMES[0], package_result.get("groups", [])),
@@ -99,7 +130,16 @@ def run_rrf_fusion_retrieval(
         final_limit=plan.limits.max_matches,
         preferred_lane=RRF_LANE_NAMES[0],
     )
-    fusion_elapsed_ms = _elapsed_ms(fusion_started)
+    fused_count = _candidate_count(fused_result)
+    fusion_profile = finish_phase_profile(fusion_profile_token, candidate_count=fused_count)
+    fusion_elapsed_ms = float(fusion_profile["elapsed_ms"])
+    total_profile = finish_phase_profile(
+        total_profile_token,
+        candidate_count=fused_count,
+        planned_file_count=planned_jsonl_files.file_count,
+        searched_files=int(package_result.get("searched_files", 0)) + int(fielded_result.get("searched_files", 0)),
+        searched_bytes=int(package_result.get("searched_bytes", 0)) + int(fielded_result.get("searched_bytes", 0)),
+    )
 
     package_warnings = list(package_result.get("warnings", []) or [])
     fielded_warnings = list(fielded_result.get("warnings", []) or [])
@@ -134,6 +174,14 @@ def run_rrf_fusion_retrieval(
                 package_searched_paths=package_searched_paths,
                 fielded_searched_paths=fielded_searched_paths,
                 warnings=warnings,
+                profiles={
+                    "total_explicit_rrf_retrieval": total_profile,
+                    "shared_source_enumeration": enumeration_profile,
+                    "package_lane": package_profile,
+                    "fielded_bm25_index_build": fielded_index_profile,
+                    "fielded_bm25_search_materialization": fielded_profile,
+                    "rrf_fusion": fusion_profile,
+                },
             ),
         }
     )
@@ -155,7 +203,9 @@ def build_rrf_retrieval_diagnostics(
     package_searched_paths: set[str],
     fielded_searched_paths: set[str],
     warnings: list[str],
+    profiles: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    profiles = profiles if isinstance(profiles, dict) else {}
     package_count = _candidate_count(package_result)
     fielded_count = _candidate_count(fielded_result)
     fused_count = _candidate_count(fused_result)
@@ -184,6 +234,7 @@ def build_rrf_retrieval_diagnostics(
         "shared_source_enumeration": {
             **planned_jsonl_file_diagnostics,
             "elapsed_ms": enumeration_elapsed_ms,
+            "profile": _phase_profile(profiles.get("shared_source_enumeration"), "shared_source_enumeration"),
             "consumed_by_lanes": list(RRF_LANE_NAMES),
         },
         "rrf_summary": {
@@ -208,6 +259,7 @@ def build_rrf_retrieval_diagnostics(
                 "candidate_count": package_count,
                 "elapsed_ms": package_elapsed_ms,
                 "elapsed_label": elapsed_label(package_elapsed_ms),
+                "profile": _phase_profile(profiles.get("package_lane"), "package_lane"),
                 "searched_files": int(package_result.get("searched_files", 0)),
                 "searched_bytes": int(package_result.get("searched_bytes", 0)),
                 "planned_file_source": "shared_source_enumeration",
@@ -218,8 +270,16 @@ def build_rrf_retrieval_diagnostics(
                 "candidate_count": fielded_count,
                 "elapsed_ms": fielded_elapsed_ms,
                 "elapsed_label": elapsed_label(fielded_elapsed_ms),
+                "profile": _phase_profile(
+                    profiles.get("fielded_bm25_search_materialization"),
+                    "fielded_bm25_search_materialization",
+                ),
                 "index_build_elapsed_ms": fielded_index_elapsed_ms,
                 "index_build_elapsed_label": elapsed_label(fielded_index_elapsed_ms),
+                "index_build_profile": _phase_profile(
+                    profiles.get("fielded_bm25_index_build"),
+                    "fielded_bm25_index_build",
+                ),
                 "candidate_rows": int(fielded_result.get("candidate_rows_generated", 0) or 0),
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
                 "searched_files": int(fielded_result.get("searched_files", 0)),
@@ -253,9 +313,14 @@ def build_rrf_retrieval_diagnostics(
         "fusion": {
             "elapsed_ms": fusion_elapsed_ms,
             "elapsed_label": elapsed_label(fusion_elapsed_ms),
+            "profile": _phase_profile(profiles.get("rrf_fusion"), "rrf_fusion"),
             "candidate_count": fused_count,
             "cap_labels": cap_labels_from_warnings(warnings),
         },
+        "total_explicit_rrf_retrieval": _phase_profile(
+            profiles.get("total_explicit_rrf_retrieval"),
+            "total_explicit_rrf_retrieval",
+        ),
         "cap_labels": cap_labels,
         "claim_boundaries": {
             "default_behavior_changed": False,
@@ -311,6 +376,40 @@ def _fielded_materialization_diagnostics(fielded_result: dict[str, Any]) -> dict
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
     }
+
+
+def _phase_profile(value: Any, phase: str) -> dict[str, Any]:
+    profile = value if isinstance(value, dict) else {}
+    rss_available = bool(profile.get("rss_available", False))
+    return {
+        "phase": str(profile.get("phase") or phase),
+        "elapsed_ms": float(profile.get("elapsed_ms") or 0.0),
+        "rss_available": rss_available,
+        "rss_units": "bytes",
+        "rss_start_max_bytes": _optional_int(profile.get("rss_start_max_bytes")),
+        "rss_end_max_bytes": _optional_int(profile.get("rss_end_max_bytes")),
+        "rss_max_bytes": _optional_int(profile.get("rss_max_bytes")),
+        "rss_delta_bytes": _optional_int(profile.get("rss_delta_bytes")),
+        "rss_unavailable_reason": None if rss_available else str(profile.get("rss_unavailable_reason") or "not_profiled"),
+        "rss_current_bytes": None,
+        "rss_current_unavailable_reason": "resource_ru_maxrss_reports_process_peak_not_current",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def cap_labels_from_warnings(warnings: list[str]) -> list[str]:
