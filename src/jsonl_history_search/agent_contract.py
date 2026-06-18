@@ -410,6 +410,28 @@ def build_stage_diagnostics(
                 "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
                 "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
                 "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+                "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
+                "suppressed_adjacent_row_count": int(
+                    ((grouping.get("adjacent_run_collapse") or {}).get("suppressed_adjacent_row_count")) or 0
+                ),
+                "collapsed_adjacent_run_count": int(
+                    ((grouping.get("adjacent_run_collapse") or {}).get("collapsed_adjacent_run_count")) or 0
+                ),
+                "group_count_considered": int(
+                    ((grouping.get("group_interleaving") or {}).get("group_count_considered")) or 0
+                ),
+                "group_count_selected": int(
+                    ((grouping.get("group_interleaving") or {}).get("group_count_selected")) or 0
+                ),
+                "distinct_sources_selected": int(
+                    ((grouping.get("group_interleaving") or {}).get("distinct_sources_selected")) or 0
+                ),
+                "distinct_sessions_selected": int(
+                    ((grouping.get("group_interleaving") or {}).get("distinct_sessions_selected")) or 0
+                ),
+                "distinct_days_selected": int(
+                    ((grouping.get("group_interleaving") or {}).get("distinct_days_selected")) or 0
+                ),
                 "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
                 "rows_dropped_by_stream_cap_total": int(
                     ((grouping.get("stream_selection") or {}).get("rows_dropped_by_stream_cap_total")) or 0
@@ -625,6 +647,11 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "stream_head_rows_selected": int(fielded_source_grouping.get("stream_head_rows_selected") or 0),
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "group_interleaved_rows_selected": int(fielded_source_grouping.get("group_interleaved_rows_selected") or 0),
+            "adjacent_run_collapse": sanitize_adjacent_run_collapse(
+                fielded_source_grouping.get("adjacent_run_collapse")
+            ),
+            "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
@@ -710,6 +737,11 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "stream_head_rows_selected": int(fielded_source_grouping.get("stream_head_rows_selected") or 0),
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "group_interleaved_rows_selected": int(fielded_source_grouping.get("group_interleaved_rows_selected") or 0),
+            "adjacent_run_collapse": sanitize_adjacent_run_collapse(
+                fielded_source_grouping.get("adjacent_run_collapse")
+            ),
+            "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
@@ -775,6 +807,56 @@ def sanitize_stream_selection(value: Any) -> dict[str, Any]:
         "raw_text_included": False,
         "raw_query_text_included": False,
         "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def sanitize_adjacent_run_collapse(value: Any) -> dict[str, Any]:
+    collapse = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(collapse.get("enabled", False)),
+        "strategy": str(collapse.get("strategy") or "disabled"),
+        "rows_before_collapse": int(collapse.get("rows_before_collapse") or 0),
+        "representative_rows_after_collapse": int(collapse.get("representative_rows_after_collapse") or 0),
+        "adjacent_run_count": int(collapse.get("adjacent_run_count") or 0),
+        "collapsed_adjacent_run_count": int(collapse.get("collapsed_adjacent_run_count") or 0),
+        "suppressed_adjacent_row_count": int(collapse.get("suppressed_adjacent_row_count") or 0),
+        "max_adjacent_run_size": int(collapse.get("max_adjacent_run_size") or 0),
+        "suppressed_rows_are_aggregate_counters_only": bool(
+            collapse.get("suppressed_rows_are_aggregate_counters_only", True)
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def sanitize_group_interleaving(value: Any) -> dict[str, Any]:
+    interleaving = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(interleaving.get("enabled", False)),
+        "strategy": str(interleaving.get("strategy") or "disabled"),
+        "group_count_considered": int(interleaving.get("group_count_considered") or 0),
+        "group_count_selected": int(interleaving.get("group_count_selected") or 0),
+        "rows_selected_by_interleaving": int(interleaving.get("rows_selected_by_interleaving") or 0),
+        "distinct_sources_considered": int(interleaving.get("distinct_sources_considered") or 0),
+        "distinct_sessions_considered": int(interleaving.get("distinct_sessions_considered") or 0),
+        "distinct_days_considered": int(interleaving.get("distinct_days_considered") or 0),
+        "distinct_sources_selected": int(interleaving.get("distinct_sources_selected") or 0),
+        "distinct_sessions_selected": int(interleaving.get("distinct_sessions_selected") or 0),
+        "distinct_days_selected": int(interleaving.get("distinct_days_selected") or 0),
+        "dominant_group_share_before": float(interleaving.get("dominant_group_share_before") or 0.0),
+        "dominant_group_share_after": float(interleaving.get("dominant_group_share_after") or 0.0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
         "line_numbers_included": False,

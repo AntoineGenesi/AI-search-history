@@ -1880,6 +1880,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(result.get("materialization"))
     query_streams = _fielded_bm25_query_stream_stats(result.get("fielded_query_streams"))
+    source_grouping = _fielded_bm25_source_grouping_stats(result.get("fielded_source_grouping"))
     phase_profile = _phase_profile_stats(result.get("profile"), "fielded_bm25_search_materialization")
     index_build_profile = _phase_profile_stats(summary.get("profile"), "fielded_bm25_index_build")
     return {
@@ -1904,6 +1905,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "bm25_rank_buckets": _safe_count_dict(result.get("bm25_rank_buckets")),
         "query_streams": query_streams,
+        "source_grouping": source_grouping,
         "materialization": materialization,
         "phase_profile": phase_profile,
         "index_build_profile": index_build_profile,
@@ -1985,6 +1987,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
     index_summary = fielded_lane.get("index_summary") if isinstance(fielded_lane.get("index_summary"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(fielded_lane.get("materialization"))
     query_streams = _fielded_bm25_query_stream_stats(fielded_lane.get("query_streams"))
+    source_grouping = _fielded_bm25_source_grouping_stats(fielded_lane.get("source_grouping"))
     phase_profile = _phase_profile_stats(
         fielded_lane.get("profile"),
         "fielded_bm25_search_materialization",
@@ -2015,6 +2018,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "candidate_records_deduped": 0,
         "bm25_rank_buckets": {},
         "query_streams": query_streams,
+        "source_grouping": source_grouping,
         "materialization": materialization,
         "phase_profile": phase_profile,
         "index_build_profile": index_build_profile,
@@ -2084,6 +2088,54 @@ def _fielded_bm25_query_stream_stats(value: Any) -> dict[str, Any]:
         "selected_rows_by_stream": selected_by_stream,
         "rows_dropped_by_stream_cap": dropped_by_stream,
         "rows_dropped_by_stream_cap_total": int(streams.get("rows_dropped_by_stream_cap_total") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+    }
+
+
+def _fielded_bm25_source_grouping_stats(value: Any) -> dict[str, Any]:
+    grouping = value if isinstance(value, dict) else {}
+    collapse = grouping.get("adjacent_run_collapse") if isinstance(grouping.get("adjacent_run_collapse"), dict) else {}
+    interleaving = grouping.get("group_interleaving") if isinstance(grouping.get("group_interleaving"), dict) else {}
+    return {
+        "enabled": bool(grouping.get("enabled", False)),
+        "strategy": str(grouping.get("strategy") or "disabled"),
+        "candidate_rows_considered": int(grouping.get("candidate_rows_considered") or 0),
+        "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
+        "source_count_considered": int(grouping.get("source_count_considered") or 0),
+        "source_count_selected": int(grouping.get("source_count_selected") or 0),
+        "dominant_source_share_before": float(grouping.get("dominant_source_share_before") or 0.0),
+        "dominant_source_share_after": float(grouping.get("dominant_source_share_after") or 0.0),
+        "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
+        "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
+        "adjacent_run_collapse": {
+            "enabled": bool(collapse.get("enabled", False)),
+            "collapsed_adjacent_run_count": int(collapse.get("collapsed_adjacent_run_count") or 0),
+            "suppressed_adjacent_row_count": int(collapse.get("suppressed_adjacent_row_count") or 0),
+            "max_adjacent_run_size": int(collapse.get("max_adjacent_run_size") or 0),
+            "suppressed_rows_are_aggregate_counters_only": bool(
+                collapse.get("suppressed_rows_are_aggregate_counters_only", True)
+            ),
+        },
+        "group_interleaving": {
+            "enabled": bool(interleaving.get("enabled", False)),
+            "group_count_considered": int(interleaving.get("group_count_considered") or 0),
+            "group_count_selected": int(interleaving.get("group_count_selected") or 0),
+            "distinct_sources_considered": int(interleaving.get("distinct_sources_considered") or 0),
+            "distinct_sessions_considered": int(interleaving.get("distinct_sessions_considered") or 0),
+            "distinct_days_considered": int(interleaving.get("distinct_days_considered") or 0),
+            "distinct_sources_selected": int(interleaving.get("distinct_sources_selected") or 0),
+            "distinct_sessions_selected": int(interleaving.get("distinct_sessions_selected") or 0),
+            "distinct_days_selected": int(interleaving.get("distinct_days_selected") or 0),
+            "dominant_group_share_before": float(interleaving.get("dominant_group_share_before") or 0.0),
+            "dominant_group_share_after": float(interleaving.get("dominant_group_share_after") or 0.0),
+        },
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -2575,6 +2627,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "candidate_rows_surfaced": 0,
             "bm25_rank_buckets": {},
             "query_streams": _fielded_bm25_query_stream_aggregate([]),
+            "source_grouping": _fielded_bm25_source_grouping_aggregate([]),
             "materialization": _fielded_bm25_materialization_aggregate([]),
             "phase_profiles": _phase_profiles_aggregate([]),
             "privacy": _fielded_bm25_privacy(),
@@ -2599,6 +2652,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_records_deduped": sum(int(item.get("candidate_records_deduped") or 0) for item in selected),
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
         "query_streams": _fielded_bm25_query_stream_aggregate(selected),
+        "source_grouping": _fielded_bm25_source_grouping_aggregate(selected),
         "materialization": _fielded_bm25_materialization_aggregate(selected),
         "phase_profiles": _fielded_bm25_phase_profiles_aggregate(selected),
         "privacy": _fielded_bm25_privacy(),
@@ -2648,6 +2702,68 @@ def _fielded_bm25_query_stream_aggregate(rows: list[dict[str, Any]]) -> dict[str
         "rows_dropped_by_stream_cap": dict(sorted(dropped_by_stream.items())),
         "rows_dropped_by_stream_cap_total": sum(
             int(item.get("rows_dropped_by_stream_cap_total") or 0) for item in selected
+        ),
+        "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _fielded_bm25_source_grouping_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row.get("source_grouping")
+        for row in rows
+        if isinstance(row.get("source_grouping"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "suppressed_adjacent_row_count": 0,
+            "collapsed_adjacent_run_count": 0,
+            "group_interleaved_rows_selected": 0,
+            "privacy": _fielded_bm25_privacy(),
+        }
+    collapse_rows = [
+        item.get("adjacent_run_collapse")
+        for item in selected
+        if isinstance(item.get("adjacent_run_collapse"), dict)
+    ]
+    interleaving_rows = [
+        item.get("group_interleaving")
+        for item in selected
+        if isinstance(item.get("group_interleaving"), dict)
+    ]
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "candidate_rows_considered": sum(int(item.get("candidate_rows_considered") or 0) for item in selected),
+        "candidate_rows_selected": sum(int(item.get("candidate_rows_selected") or 0) for item in selected),
+        "source_count_considered_total": sum(int(item.get("source_count_considered") or 0) for item in selected),
+        "source_count_selected_total": sum(int(item.get("source_count_selected") or 0) for item in selected),
+        "rows_dropped_by_source_cap": sum(int(item.get("rows_dropped_by_source_cap") or 0) for item in selected),
+        "group_interleaved_rows_selected": sum(
+            int(item.get("group_interleaved_rows_selected") or 0) for item in selected
+        ),
+        "collapsed_adjacent_run_count": sum(
+            int(item.get("collapsed_adjacent_run_count") or 0) for item in collapse_rows
+        ),
+        "suppressed_adjacent_row_count": sum(
+            int(item.get("suppressed_adjacent_row_count") or 0) for item in collapse_rows
+        ),
+        "max_adjacent_run_size": max((int(item.get("max_adjacent_run_size") or 0) for item in collapse_rows), default=0),
+        "group_count_considered_total": sum(
+            int(item.get("group_count_considered") or 0) for item in interleaving_rows
+        ),
+        "group_count_selected_total": sum(
+            int(item.get("group_count_selected") or 0) for item in interleaving_rows
+        ),
+        "distinct_sources_selected_total": sum(
+            int(item.get("distinct_sources_selected") or 0) for item in interleaving_rows
+        ),
+        "distinct_sessions_selected_total": sum(
+            int(item.get("distinct_sessions_selected") or 0) for item in interleaving_rows
+        ),
+        "distinct_days_selected_total": sum(
+            int(item.get("distinct_days_selected") or 0) for item in interleaving_rows
         ),
         "privacy": _fielded_bm25_privacy(),
     }
