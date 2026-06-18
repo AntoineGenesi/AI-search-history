@@ -80,7 +80,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
         return {"real_history_impact_benchmark": report}
 
-    selected_cases = case_bundle[: args.case_limit if args.case_limit and args.case_limit > 0 else None]
+    selected_cases, subset_selection = _select_cases(case_bundle, args)
     limits = _limits_from_args(args)
     roots = _selected_roots(args, selected_cases)
     root_labels = [f"root_{index + 1:03d}" for index, _root in enumerate(roots)]
@@ -91,6 +91,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         root_labels=root_labels,
         started=started,
         bridge_report=bridge_result.report,
+        subset_selection=subset_selection,
     )
     base_report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
 
@@ -221,11 +222,12 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         base_report["report_scope"] = {
             "mode": "aggregate_only_report",
             "requested_case_limit": int(getattr(args, "case_limit", 0) or 0),
+            "selected_case_families": list(getattr(args, "case_family", []) or []),
             "evaluated_case_count": len({row["case_id"] for row in rows}),
             "limitation": (
-                "bounded aggregate-only diagnostic; smaller case limits and cap hits are coverage/report-surface "
-                "evidence only and do not support real-history coverage, default rg, universal rg, token-savings, "
-                "final-answer quality, or product-value claims"
+                "bounded aggregate-only diagnostic; subset selection, smaller case limits, and cap hits are "
+                "coverage/report-surface evidence only and do not support full-manifest prevalence, default rg, "
+                "universal rg, token-savings, final-answer quality, or product-value claims"
             ),
         }
     _add_metric_sections(base_report)
@@ -278,7 +280,10 @@ def _base_report(
     root_labels: list[str],
     started: float,
     bridge_report: dict[str, Any],
+    subset_selection: dict[str, Any],
 ) -> dict[str, Any]:
+    manifest_floor_status = _case_count_floor_status(manifest_case_count)
+    evaluated_floor_status = _case_count_floor_status(len(selected_cases))
     return {
         "schema_version": 1,
         "run_id": uuid.uuid4().hex[:12],
@@ -288,7 +293,10 @@ def _base_report(
         "case_count": len(selected_cases),
         "case_families": sorted({case["family"] for case in selected_cases}),
         "historical_original_case_count": 18,
-        "case_count_floor_status": _case_count_floor_status(manifest_case_count),
+        "case_count_floor_status": evaluated_floor_status,
+        "evaluated_case_count_floor_status": evaluated_floor_status,
+        "manifest_case_count_floor_status": manifest_floor_status,
+        "subset_selection": subset_selection,
         "root_labels": root_labels,
         "limits": limits.to_dict(),
         "baseline_contract": _baseline_contract(),
@@ -334,6 +342,31 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _manifest_case_count(manifest: dict[str, Any]) -> int:
     cases = manifest.get("cases")
     return len(cases) if isinstance(cases, list) else 0
+
+
+def _select_cases(cases: list[dict[str, Any]], args) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    requested_families = [str(item) for item in (getattr(args, "case_family", []) or []) if item]
+    selected = cases
+    mode = "all_manifest_cases"
+    if requested_families:
+        allowed = set(requested_families)
+        selected = [case for case in cases if case.get("family") in allowed]
+        mode = "sanitized_manifest_family_subset"
+    if getattr(args, "case_limit", 0) and args.case_limit > 0:
+        selected = selected[: args.case_limit]
+    return selected, {
+        "mode": mode,
+        "requested_family_labels": sorted(set(requested_families)),
+        "available_case_count": len(cases),
+        "selected_case_count": len(selected),
+        "selected_family_counts": _counts(case.get("family") for case in selected),
+        "selection_basis": (
+            "sanitized manifest family labels only; no raw query text, private paths, source lines, "
+            "session IDs, local usernames, exact case IDs, expected refs, target lines, or raw anchor needles"
+        ),
+        "subset_prevalence_claim": False,
+        "full_manifest_prevalence_claim": not bool(requested_families),
+    }
 
 
 def _case_count_floor_status(case_count: int) -> str:

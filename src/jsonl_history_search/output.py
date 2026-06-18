@@ -2727,22 +2727,6 @@ def render_impact_benchmark_text(payload: dict) -> str:
                 f"{gate_name}: status={gate.get('status')} "
                 f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
             )
-    coverage = report.get("rg_prefilter_coverage") or {}
-    if coverage:
-        lines.append(
-            "rg_prefilter_coverage: "
-            f"runs={coverage.get('runs')} "
-            f"used={coverage.get('used_runs')} "
-            f"anchors={coverage.get('anchor_kind_counts')} "
-            f"fallbacks={coverage.get('fallback_reason_counts')}"
-        )
-    decision = report.get("rg_prefilter_workflow_decision") or {}
-    if decision:
-        lines.append(
-            "rg_prefilter_workflow_decision: "
-            f"{decision.get('decision')} "
-            f"default_changed={decision.get('default_search_behavior_changed')}"
-        )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -2962,6 +2946,24 @@ def render_real_history_impact_text(payload: dict) -> str:
                 f"{gate_name}: status={gate.get('status')} "
                 f"reasons={', '.join(gate.get('reasons') or []) or '(none)'}"
             )
+    coverage = report.get("rg_prefilter_coverage") or {}
+    if coverage:
+        lines.append(
+            "rg_prefilter_coverage: "
+            f"runs={coverage.get('runs')} "
+            f"used={coverage.get('used_runs')} "
+            f"eligible={coverage.get('eligible_runs')} "
+            f"attempted={coverage.get('attempted_runs')} "
+            f"anchors={coverage.get('anchor_kind_counts')} "
+            f"fallbacks={coverage.get('fallback_reason_counts')}"
+        )
+    decision = report.get("rg_prefilter_workflow_decision") or {}
+    if decision:
+        lines.append(
+            "rg_prefilter_workflow_decision: "
+            f"{decision.get('decision')} "
+            f"default_changed={decision.get('default_search_behavior_changed')}"
+        )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -2993,7 +2995,7 @@ def render_real_history_impact_text(payload: dict) -> str:
 def render_real_history_impact_markdown(payload: dict) -> str:
     report = payload["real_history_impact_benchmark"]
     lines = [
-        "# JSH-049 Real-History Impact Benchmark",
+        "# Real-History Impact Benchmark",
         "",
         f"**Status:** `{report.get('status')}`",
         f"**Data source:** `{report.get('data_source')}`",
@@ -3001,8 +3003,25 @@ def render_real_history_impact_markdown(payload: dict) -> str:
         f"**Cases:** `{report.get('case_count', 0)}` of `{report.get('manifest_case_count', 0)}` manifest cases",
         f"**Roots:** {', '.join(f'`{label}`' for label in report.get('root_labels') or []) or '(none)'}",
         f"**Total wall time ms:** `{report.get('total_wall_time_ms', 0)}`",
-        f"**Case-count floor status:** `{report.get('case_count_floor_status', report.get('below_floor_case_count_caveat'))}`",
+        f"**Evaluated-case floor status:** `{report.get('evaluated_case_count_floor_status', report.get('case_count_floor_status'))}`",
+        f"**Manifest-case floor status:** `{report.get('manifest_case_count_floor_status', report.get('case_count_floor_status'))}`",
     ]
+    subset = report.get("subset_selection") or {}
+    if subset:
+        lines.extend(
+            [
+                "",
+                "## Subset Selection",
+                "",
+                f"- Mode: `{subset.get('mode')}`",
+                f"- Requested family labels: `{subset.get('requested_family_labels')}`",
+                f"- Selected case count: `{subset.get('selected_case_count')}`",
+                f"- Selected family counts: `{subset.get('selected_family_counts')}`",
+                f"- Selection basis: {subset.get('selection_basis')}",
+                f"- Full-manifest prevalence claim: `{subset.get('full_manifest_prevalence_claim')}`",
+                f"- Subset prevalence claim: `{subset.get('subset_prevalence_claim')}`",
+            ]
+        )
     raw = report.get("raw_private_evidence") or {}
     if report.get("headline_findings"):
         lines.extend(["", "## Headline Findings", ""])

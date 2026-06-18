@@ -445,6 +445,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of reviewed real-history cases to run; 0 means all cases.",
     )
     real_history_impact.add_argument(
+        "--case-family",
+        action="append",
+        default=[],
+        help="Sanitized manifest family to include; may be passed more than once. Defaults to all families.",
+    )
+    real_history_impact.add_argument(
         "--repeat",
         type=int,
         default=1,
