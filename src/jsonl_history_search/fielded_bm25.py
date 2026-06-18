@@ -36,6 +36,7 @@ TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 CHUNK_RECORD_LIMIT = 1
 INDEX_LINE_TEXT_LIMIT = 1200
 FIELDED_SOURCE_GROUPING_POOL_FACTOR = 4
+FTS_FIELD_NAMES = {"role", "timestamp_bucket", "tool_event", "artifact_task_path", "cwd_project", "text"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,13 @@ class FieldedBm25Index:
             "raw_cwd_included": False,
             "vectors_or_persisted_indexes_included": False,
         }
+
+
+@dataclass(frozen=True)
+class FieldedQueryStream:
+    label: str
+    query: str
+    fields: tuple[str, ...]
 
 
 def sqlite_fts5_available() -> bool:
@@ -268,38 +276,55 @@ def search_with_fielded_bm25(
     profile_token = start_phase_profile("fielded_bm25_search_materialization")
     warnings = list(index.warnings) + list(plan.warnings)
     query = _fts_query_for_intent(intent)
+    query_streams = _fielded_query_streams_for_intent(intent, query)
     expected_diag = _init_fielded_expected_ref_diagnostics(expected_ref_diagnostics)
     _mark_expected_indexed(expected_diag, index)
     if not index.available or index.connection is None:
-        payload = _unavailable_payload(index, started, warnings, query, expected_diag)
+        payload = _unavailable_payload(index, started, warnings, query, expected_diag, query_streams=query_streams)
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
-    if query is None:
+    if not query_streams:
         warnings.append("Fielded BM25 query had no escaped FTS terms.")
-        payload = _empty_payload(index, started, warnings, query, expected_diag, status="ineligible_query")
+        payload = _empty_payload(
+            index,
+            started,
+            warnings,
+            query,
+            expected_diag,
+            status="ineligible_query",
+            query_streams=query_streams,
+        )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
 
     candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
     candidate_pool_limit = max(candidate_limit * FIELDED_SOURCE_GROUPING_POOL_FACTOR, candidate_limit)
-    try:
-        raw_rows = list(
-            index.connection.execute(
-                """
-                SELECT rowid, bm25(records) AS bm25_score
-                FROM records
-                WHERE records MATCH ?
-                ORDER BY bm25_score ASC
-                LIMIT ?
-                """,
-                (query, candidate_pool_limit),
-            )
+    raw_rows, stream_diagnostics, stream_error_types = _execute_fielded_query_streams(
+        index,
+        query_streams,
+        candidate_pool_limit=candidate_pool_limit,
+    )
+    if stream_error_types:
+        warnings.append("Fielded BM25 query stream failed: " + ",".join(sorted(stream_error_types)) + ".")
+    if not raw_rows and stream_error_types:
+        payload = _empty_payload(
+            index,
+            started,
+            warnings,
+            query,
+            expected_diag,
+            status="query_failed",
+            query_streams=query_streams,
+            query_stream_diagnostics=stream_diagnostics,
         )
-    except sqlite3.Error as exc:
-        warnings.append(f"Fielded BM25 query failed: {type(exc).__name__}.")
-        payload = _empty_payload(index, started, warnings, query, expected_diag, status="query_failed")
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
+    query_stream_summary = _query_stream_summary(
+        streams=query_streams,
+        diagnostics=stream_diagnostics,
+        deduped_row_count=len(raw_rows),
+        candidate_pool_limit=candidate_pool_limit,
+    )
 
     rows, source_grouping = _select_source_grouped_candidate_rows(
         raw_rows,
@@ -383,6 +408,7 @@ def search_with_fielded_bm25(
         "fallback_reason": None,
         "fts": _fts_stats(index, query=query),
         "query_profile": _query_profile(intent, query),
+        "fielded_query_streams": query_stream_summary,
         "candidate_rows": len(rows),
         "candidate_row_limit": candidate_limit,
         "candidate_row_pool_limit": candidate_pool_limit,
@@ -789,6 +815,274 @@ def _fts_query_for_intent(intent: QueryIntent) -> str | None:
     return " OR ".join(parts)
 
 
+def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | None) -> list[FieldedQueryStream]:
+    streams: list[FieldedQueryStream] = []
+    if base_query:
+        streams.append(FieldedQueryStream(label="base_lexical", query=base_query, fields=("text",)))
+
+    text_query = _field_query("text", _anchor_values_for_fielded_streams(intent))
+    if not text_query:
+        return _unique_streams(streams)
+
+    plan = intent.query_plan
+    primary_intent = plan.primary_intent if plan is not None else "generic_history"
+    detected_intents = set(plan.detected_intents if plan is not None else [])
+    role_hints = _role_hints_for_query_streams(intent)
+    for role in role_hints:
+        role_query = _field_query("role", [role])
+        if role_query:
+            streams.append(
+                FieldedQueryStream(
+                    label=f"role_text_{_stream_label_part(role)}",
+                    query=f"{role_query} AND ({text_query})",
+                    fields=("role", "text"),
+                )
+            )
+
+    if primary_intent in {"when_user_said", "workflow_failure"} or "when_user_said" in detected_intents:
+        timestamp_query = _timestamp_query_for_intent(intent)
+        if timestamp_query:
+            streams.append(
+                FieldedQueryStream(
+                    label="timestamp_text",
+                    query=f"{timestamp_query} AND ({text_query})",
+                    fields=("timestamp_bucket", "text"),
+                )
+            )
+
+    artifact_query = _field_query("artifact_task_path", intent.artifact_hints)
+    if artifact_query:
+        streams.append(
+            FieldedQueryStream(
+                label="artifact_path_text",
+                query=f"{artifact_query} AND ({text_query})",
+                fields=("artifact_task_path", "text"),
+            )
+        )
+
+    if primary_intent in {"workflow_failure", "why", "source_next_reads"}:
+        tool_query = _field_query("tool_event", _tool_event_query_terms_for_intent(primary_intent))
+        if tool_query:
+            streams.append(
+                FieldedQueryStream(
+                    label=f"tool_event_text_{_stream_label_part(primary_intent)}",
+                    query=f"{tool_query} AND ({text_query})",
+                    fields=("tool_event", "text"),
+                )
+            )
+
+    return _unique_streams(streams)
+
+
+def _execute_fielded_query_streams(
+    index: FieldedBm25Index,
+    streams: list[FieldedQueryStream],
+    *,
+    candidate_pool_limit: int,
+) -> tuple[list[tuple[Any, ...]], list[dict[str, Any]], set[str]]:
+    merged_rows: list[tuple[Any, ...]] = []
+    seen_rowids: set[int] = set()
+    diagnostics: list[dict[str, Any]] = []
+    error_types: set[str] = set()
+    assert index.connection is not None
+    for stream in streams:
+        try:
+            rows = list(
+                index.connection.execute(
+                    """
+                    SELECT rowid, bm25(records) AS bm25_score
+                    FROM records
+                    WHERE records MATCH ?
+                    ORDER BY bm25_score ASC
+                    LIMIT ?
+                    """,
+                    (stream.query, candidate_pool_limit),
+                )
+            )
+        except sqlite3.Error as exc:
+            error_type = type(exc).__name__
+            error_types.add(error_type)
+            diagnostics.append(
+                _query_stream_diagnostic(
+                    stream,
+                    row_count=0,
+                    deduped_row_count=0,
+                    status="query_failed",
+                    error_type=error_type,
+                )
+            )
+            continue
+        deduped_count = 0
+        for row in rows:
+            rowid = int(row[0])
+            if rowid in seen_rowids:
+                continue
+            seen_rowids.add(rowid)
+            merged_rows.append(row)
+            deduped_count += 1
+        diagnostics.append(
+            _query_stream_diagnostic(
+                stream,
+                row_count=len(rows),
+                deduped_row_count=deduped_count,
+                status="available",
+                error_type=None,
+            )
+        )
+    return merged_rows, diagnostics, error_types
+
+
+def _query_stream_summary(
+    *,
+    streams: list[FieldedQueryStream],
+    diagnostics: list[dict[str, Any]],
+    deduped_row_count: int,
+    candidate_pool_limit: int,
+) -> dict[str, Any]:
+    generated = sum(int(item.get("row_count") or 0) for item in diagnostics)
+    deduped_by_stream = sum(int(item.get("deduped_row_count") or 0) for item in diagnostics)
+    return {
+        "enabled": True,
+        "strategy": "query_plan_fielded_streams_then_rowid_dedupe",
+        "stream_count": len(streams),
+        "streams": diagnostics,
+        "candidate_row_pool_limit_per_stream": int(candidate_pool_limit),
+        "row_count_before_dedupe": int(generated),
+        "row_count_after_dedupe": int(deduped_row_count),
+        "deduped_row_count_from_streams": int(deduped_by_stream),
+        "duplicate_row_count": max(int(generated) - int(deduped_row_count), 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _query_stream_diagnostic(
+    stream: FieldedQueryStream,
+    *,
+    row_count: int,
+    deduped_row_count: int,
+    status: str,
+    error_type: str | None,
+) -> dict[str, Any]:
+    return {
+        "label": stream.label,
+        "fields": list(stream.fields),
+        "status": status,
+        "row_count": int(row_count),
+        "deduped_row_count": int(deduped_row_count),
+        "error_type": error_type,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+    }
+
+
+def _unique_streams(streams: list[FieldedQueryStream]) -> list[FieldedQueryStream]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[FieldedQueryStream] = []
+    for stream in streams:
+        key = (stream.label, stream.query)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(stream)
+    return unique
+
+
+def _field_query(field_name: str, values: list[str] | tuple[str, ...]) -> str | None:
+    if field_name not in FTS_FIELD_NAMES:
+        return None
+    seen: set[str] = set()
+    parts: list[str] = []
+    for value in values:
+        for token in _fts_tokens(str(value)):
+            lowered = token.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            parts.append(f'{field_name}:"{_escape_fts_phrase(lowered)}"')
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " OR ".join(parts) + ")"
+
+
+def _anchor_values_for_fielded_streams(intent: QueryIntent) -> list[str]:
+    values: list[str] = []
+    plan = intent.query_plan
+    if plan is not None:
+        values.extend(str(item) for item in plan.anchor_terms if str(item).strip())
+    values.extend(str(item) for item in intent.base_terms if str(item).strip())
+    values.extend(str(item) for item in intent.terms if str(item).strip())
+    return values
+
+
+def _role_hints_for_query_streams(intent: QueryIntent) -> list[str]:
+    plan = intent.query_plan
+    roles: list[str] = []
+    if plan is not None:
+        field_roles = (plan.field_hints or {}).get("roles") or []
+        roles.extend(str(role) for role in field_roles if str(role).strip())
+    if intent.role:
+        roles.append(intent.role)
+    primary_intent = plan.primary_intent if plan is not None else "generic_history"
+    if primary_intent == "when_user_said":
+        roles.append("user")
+    if primary_intent in {"why", "workflow_failure", "source_next_reads"}:
+        roles.extend(["assistant", "tool"])
+    return _unique_ordered_strings(_role_bucket(role) for role in roles)
+
+
+def _timestamp_query_for_intent(intent: QueryIntent) -> str | None:
+    values: list[str] = []
+    if intent.date_window_start is not None:
+        values.append(intent.date_window_start.strftime("%Y-%m-%d"))
+        values.append(intent.date_window_start.strftime("%Y-%m"))
+    return _field_query("timestamp_bucket", values)
+
+
+def _tool_event_query_terms_for_intent(primary_intent: str) -> list[str]:
+    if primary_intent == "workflow_failure":
+        return ["function_call", "function_call_output", "tool", "error", "failed", "failure"]
+    if primary_intent == "source_next_reads":
+        return ["function_call", "function_call_output", "tool"]
+    return ["function_call", "function_call_output", "tool", "assistant_message", "agent_message"]
+
+
+def _unique_ordered_strings(values) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        lowered = str(value).lower().strip()
+        if not lowered or lowered in seen:
+            continue
+        seen.add(lowered)
+        ordered.append(lowered)
+    return ordered
+
+
+def _stream_label_part(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    return cleaned[:40] or "unknown"
+
+
+def _escape_fts_phrase(value: str) -> str:
+    return value.replace('"', '""')
+
+
 def _fts_tokens(value: str) -> list[str]:
     return [match.group(0) for match in FTS_TOKEN_RE.finditer(value) if len(match.group(0)) >= 2]
 
@@ -1047,12 +1341,25 @@ def _unavailable_payload(
     warnings: list[str],
     query: str | None,
     expected_diag: dict | None,
+    query_streams: list[FieldedQueryStream] | None = None,
+    query_stream_diagnostics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    query_streams = query_streams or []
+    query_stream_diagnostics = query_stream_diagnostics or [
+        _query_stream_diagnostic(stream, row_count=0, deduped_row_count=0, status="not_run", error_type=None)
+        for stream in query_streams
+    ]
     return {
         "status": "fts_unavailable",
         "fallback_reason": "sqlite_fts5_unavailable",
         "fts": _fts_stats(index, query=query),
         "query_profile": {"raw_query_text_included": False, "raw_query_terms_included": False},
+        "fielded_query_streams": _query_stream_summary(
+            streams=query_streams,
+            diagnostics=query_stream_diagnostics,
+            deduped_row_count=0,
+            candidate_pool_limit=0,
+        ),
         "candidate_rows": 0,
         "candidate_rows_generated": 0,
         "candidate_rows_retained": 0,
@@ -1081,8 +1388,18 @@ def _empty_payload(
     expected_diag: dict | None,
     *,
     status: str,
+    query_streams: list[FieldedQueryStream] | None = None,
+    query_stream_diagnostics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    payload = _unavailable_payload(index, started, warnings, query, expected_diag)
+    payload = _unavailable_payload(
+        index,
+        started,
+        warnings,
+        query,
+        expected_diag,
+        query_streams=query_streams,
+        query_stream_diagnostics=query_stream_diagnostics,
+    )
     payload["status"] = status
     payload["fallback_reason"] = None
     payload["fts"] = _fts_stats(index, query=query)
