@@ -254,6 +254,7 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
     duplicate_local_work = diagnostics.get("duplicate_local_work") or {}
     lane_file_overlap = diagnostics.get("lane_file_overlap") or {}
     fielded_ordering = diagnostics.get("fielded_informed_package_ordering") or {}
+    fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     claim_boundaries = diagnostics.get("claim_boundaries") or {}
 
     return {
@@ -304,6 +305,23 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             ),
             "fielded_priority_excludes_non_prioritized_files": False,
             "no_exclusion_semantics": True,
+        },
+        "fielded_source_grouping": {
+            "enabled": bool(fielded_source_grouping.get("enabled", False)),
+            "strategy": str(fielded_source_grouping.get("strategy") or "disabled"),
+            "candidate_rows_considered": int(fielded_source_grouping.get("candidate_rows_considered") or 0),
+            "candidate_rows_selected": int(fielded_source_grouping.get("candidate_rows_selected") or 0),
+            "source_count_considered": int(fielded_source_grouping.get("source_count_considered") or 0),
+            "source_count_selected": int(fielded_source_grouping.get("source_count_selected") or 0),
+            "dominant_source_share_before": float(
+                fielded_source_grouping.get("dominant_source_share_before") or 0.0
+            ),
+            "dominant_source_share_after": float(fielded_source_grouping.get("dominant_source_share_after") or 0.0),
+            "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
+            "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_session_ids_included": False,
         },
         "claim_boundaries": {
             "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
