@@ -2986,6 +2986,28 @@ def render_real_history_impact_text(payload: dict) -> str:
             f"{compact_decision.get('decision')} "
             f"default_changed={compact_decision.get('default_search_behavior_changed')}"
         )
+    agent_compact = report.get("agent_compact_provenance_handoff") or {}
+    if agent_compact:
+        no_evidence = agent_compact.get("no_evidence") or {}
+        lines.append(
+            "agent_compact_provenance_handoff: "
+            f"status={agent_compact.get('status')} "
+            f"runs={agent_compact.get('runs')} "
+            f"full_manifest_20={agent_compact.get('full_manifest_20_case_run')} "
+            f"full_bytes={agent_compact.get('full_result_output_context_bytes')} "
+            f"compact_bytes={agent_compact.get('compact_context_bytes')} "
+            f"ratio={agent_compact.get('compact_to_full_result_byte_ratio')} "
+            f"source_refs={agent_compact.get('source_ref_count')} "
+            f"next_reads={agent_compact.get('next_read_count')} "
+            f"no_evidence_scope_rows={no_evidence.get('scope_limited_semantics_preserved_rows')}"
+        )
+    agent_compact_decision = report.get("agent_compact_provenance_handoff_decision") or {}
+    if agent_compact_decision:
+        lines.append(
+            "agent_compact_provenance_handoff_decision: "
+            f"{agent_compact_decision.get('decision')} "
+            f"default_changed={agent_compact_decision.get('default_search_behavior_changed')}"
+        )
     summary = report.get("summary", {})
     if summary:
         lines.append("Summary:")
@@ -3220,6 +3242,80 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Default promotion supported: `{compact_decision.get('default_promotion_supported')}`",
             ]
         )
+    agent_compact = report.get("agent_compact_provenance_handoff") or {}
+    agent_compact_decision = report.get("agent_compact_provenance_handoff_decision") or {}
+    if agent_compact:
+        no_evidence = agent_compact.get("no_evidence") or {}
+        cap_hit = agent_compact.get("cap_hit") or {}
+        lines.extend(
+            [
+                "",
+                "## Agent Compact Provenance Handoff",
+                "",
+                f"- Status: `{agent_compact.get('status')}`",
+                f"- Basis: `{agent_compact.get('basis')}`",
+                f"- Runs: `{agent_compact.get('runs')}`",
+                f"- Cases: `{agent_compact.get('cases')}`",
+                f"- Manifest case count: `{agent_compact.get('manifest_case_count')}`",
+                f"- Evaluated case count: `{agent_compact.get('evaluated_case_count')}`",
+                f"- Requested case limit: `{agent_compact.get('requested_case_limit')}`",
+                f"- Full manifest requested: `{agent_compact.get('full_manifest_requested')}`",
+                f"- Full manifest run: `{agent_compact.get('full_manifest_run')}`",
+                f"- Full 20-case manifest run: `{agent_compact.get('full_manifest_20_case_run')}`",
+                f"- Baseline counts: `{agent_compact.get('baseline_counts')}`",
+                f"- Status counts: `{agent_compact.get('status_counts')}`",
+                f"- Full scanner-result output context bytes: `{agent_compact.get('full_result_output_context_bytes')}`",
+                f"- Agent compact handoff context bytes: `{agent_compact.get('compact_context_bytes')}`",
+                f"- Compact/full byte ratio: `{agent_compact.get('compact_to_full_result_byte_ratio')}`",
+                f"- Median full scanner-result bytes: `{agent_compact.get('median_full_result_output_context_bytes')}`",
+                f"- Median agent compact handoff bytes: `{agent_compact.get('median_compact_context_bytes')}`",
+                f"- Candidate count: `{agent_compact.get('candidate_count')}`",
+                f"- Compact candidate count: `{agent_compact.get('compact_candidate_count')}`",
+                f"- Source-ref count: `{agent_compact.get('source_ref_count')}`",
+                f"- Source-window count: `{agent_compact.get('source_window_count')}`",
+                f"- Next-read count: `{agent_compact.get('next_read_count')}`",
+                f"- No-evidence rows: `{no_evidence.get('rows')}`",
+                f"- No-evidence needed rows: `{no_evidence.get('needed_rows')}`",
+                f"- No-evidence scope-limited semantics preserved rows: `{no_evidence.get('scope_limited_semantics_preserved_rows')}`",
+                f"- No-evidence not-all-history absence rows: `{no_evidence.get('not_all_history_absence_rows')}`",
+                f"- No-evidence answer-scope counts: `{no_evidence.get('answer_scope_counts')}`",
+                f"- Cap-hit rows: `{cap_hit.get('rows')}`",
+                f"- Cap-hit rows by label: `{cap_hit.get('rows_by_label')}`",
+                f"- Legacy output context bytes preserved: `{agent_compact.get('legacy_output_context_bytes_preserved')}`",
+                f"- Compact bytes measured separately: `{agent_compact.get('compact_bytes_measured_separately')}`",
+            ]
+        )
+        privacy = agent_compact.get("privacy") or {}
+        if privacy:
+            lines.extend(["", "### Agent Compact Privacy", ""])
+            for key, value in privacy.items():
+                lines.append(f"- `{key}`: `{value}`")
+        claims = agent_compact.get("claim_boundaries") or {}
+        if claims:
+            lines.extend(["", "### Agent Compact Claim Boundaries", ""])
+            for key, value in claims.items():
+                lines.append(f"- `{key}`: `{value}`")
+    if agent_compact_decision:
+        lines.extend(
+            [
+                "",
+                "## Agent Compact Decision",
+                "",
+                f"- Decision: `{agent_compact_decision.get('decision')}`",
+                f"- Rationale: {agent_compact_decision.get('rationale')}",
+                f"- Next action: `{agent_compact_decision.get('next_action')}`",
+                f"- Measured packet: `{agent_compact_decision.get('measured_packet')}`",
+                f"- Measured builder: `{agent_compact_decision.get('measured_builder')}`",
+                f"- Old compact package diagnostic used as measured packet: `{agent_compact_decision.get('old_compact_package_diagnostic_used_as_measured_packet')}`",
+                f"- Default search behavior changed: `{agent_compact_decision.get('default_search_behavior_changed')}`",
+                f"- Scanner/ranking/source selection changed: `{agent_compact_decision.get('scanner_ranking_source_selection_changed')}`",
+                f"- Legacy output context bytes redefined: `{agent_compact_decision.get('legacy_output_context_bytes_redefined')}`",
+                f"- Token-savings claim supported: `{agent_compact_decision.get('token_savings_claim_supported')}`",
+                f"- Final-answer quality claim supported: `{agent_compact_decision.get('final_answer_quality_claim_supported')}`",
+                f"- Product-value claim supported: `{agent_compact_decision.get('product_value_claim_supported')}`",
+                f"- Default promotion supported: `{agent_compact_decision.get('default_promotion_supported')}`",
+            ]
+        )
     omitted = report.get("rows_omitted") or {}
     if omitted:
         lines.extend(
@@ -3235,6 +3331,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Raw private paths committed: `{omitted.get('raw_private_paths_committed')}`",
                 f"- Raw anchor needles committed: `{omitted.get('raw_anchor_needles_committed')}`",
                 f"- Raw compact handoff detail committed: `{omitted.get('raw_compact_handoff_detail_committed')}`",
+                f"- Raw agent compact handoff detail committed: `{omitted.get('raw_agent_compact_handoff_detail_committed')}`",
                 f"- Raw source windows committed: `{omitted.get('raw_source_windows_committed')}`",
             ]
         )
