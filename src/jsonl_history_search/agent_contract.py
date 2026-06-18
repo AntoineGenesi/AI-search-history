@@ -399,6 +399,26 @@ def build_stage_diagnostics(
                 "candidate_window_omitted_count": int(
                     source_window_packaging.get("candidate_window_omitted_count") or 0
                 ),
+                "distinct_source_count_considered": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("distinct_source_count_considered")
+                    or 0
+                ),
+                "distinct_source_count_selected": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("distinct_source_count_selected") or 0
+                ),
+                "intent_preferred_candidate_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("intent_preferred_candidate_count")
+                    or 0
+                ),
+                "intent_preferred_window_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("intent_preferred_window_count") or 0
+                ),
+                "source_head_window_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("source_head_window_count") or 0
+                ),
+                "fill_window_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("fill_window_count") or 0
+                ),
                 "open_next_metadata_only": bool(source_window_packaging.get("open_next_metadata_only", True)),
                 "source_window_text_included": bool(
                     source_window_packaging.get("source_window_text_included", False)
@@ -1130,11 +1150,13 @@ def build_source_locator_handoff(
     if not next_read_rows:
         next_read_rows = next_reads_from_candidates(candidate_rows)
     query_plan = source_plan.get("query", {}).get("query_plan") or {}
-    source_windows = build_source_windows(
+    source_window_result = build_source_window_package(
         candidates=candidate_rows,
         next_reads=next_read_rows,
         query_plan=query_plan,
     )
+    source_windows = source_window_result["windows"]
+    source_window_selection_policy = source_window_result["selection_policy"]
     candidate_window_omitted_count = max(0, candidate_count - len(source_windows))
     source_window_packaging = {
         "schema_version": 1,
@@ -1147,8 +1169,9 @@ def build_source_locator_handoff(
         "raw_text_included": False,
         "source_window_text_included": False,
         "open_next_metadata_only": True,
+        "selection_policy": source_window_selection_policy,
         "budget_policy": {
-            "ordering_basis": "existing_candidate_order",
+            "ordering_basis": "query_plan_intent_tiered_source_head_then_existing_order_fill",
             "source_windows": "capped",
             "source_refs": "included_exact",
             "next_reads": "included_exact_for_emitted_windows",
@@ -1234,14 +1257,34 @@ def build_source_windows(
     next_reads: list[dict[str, Any]],
     query_plan: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
+    return build_source_window_package(candidates=candidates, next_reads=next_reads, query_plan=query_plan)["windows"]
+
+
+def build_source_window_package(
+    *,
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+    next_reads: list[dict[str, Any]],
+    query_plan: dict[str, Any] | None,
+) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     next_read_by_candidate = {
         str(read.get("candidate_id") or ""): read for read in next_reads if read.get("candidate_id") is not None
     }
     primary_intent = (query_plan or {}).get("primary_intent") or "generic_history"
     window_needs = list((query_plan or {}).get("source_window_needs") or [])
-    for index, candidate in enumerate(candidates[:SOURCE_WINDOW_LIMIT], 1):
-        data = candidate_to_source_window_data(candidate)
+    normalized_candidates = normalize_source_window_candidates(candidates)
+    selected_candidates = select_source_window_candidates(
+        normalized_candidates,
+        query_plan=query_plan or {},
+        primary_intent=primary_intent,
+    )
+    intent_preferred_ids = {
+        str(item["data"].get("candidate_id") or "")
+        for item in normalized_candidates
+        if source_window_candidate_matches_intent(item["data"], query_plan or {}, primary_intent)
+    }
+    for index, selected in enumerate(selected_candidates, 1):
+        data = selected["data"]
         source_ref = data["source_ref"]
         target = source_ref_target(source_ref)
         candidate_id = str(data.get("candidate_id") or "")
@@ -1261,6 +1304,7 @@ def build_source_windows(
                 "target": target,
                 "intent": primary_intent,
                 "window_kind": source_window_kind(primary_intent, window_needs),
+                "selection_reason_code": selected["selection_reason_code"],
                 "role": data.get("role"),
                 "timestamp_utc": data.get("timestamp_utc"),
                 "cwd": data.get("cwd"),
@@ -1277,7 +1321,123 @@ def build_source_windows(
                 },
             }
         )
-    return windows
+    selected_ids = {str(item["data"].get("candidate_id") or "") for item in selected_candidates}
+    selected_sources = {str(item["source_key"]) for item in selected_candidates}
+    selection_policy = {
+        "schema_version": 1,
+        "ordering_basis": "query_plan_intent_tiered_source_head_then_existing_order_fill",
+        "candidate_count_considered": len(normalized_candidates),
+        "distinct_source_count_considered": len({str(item["source_key"]) for item in normalized_candidates}),
+        "distinct_source_count_selected": len(selected_sources),
+        "intent_preferred_candidate_count": len(intent_preferred_ids),
+        "intent_preferred_window_count": len(selected_ids & intent_preferred_ids),
+        "source_head_window_count": sum(
+            1
+            for item in selected_candidates
+            if item["selection_reason_code"] in {"intent_preferred_distinct_source", "distinct_source"}
+        ),
+        "fill_window_count": sum(
+            1 for item in selected_candidates if item["selection_reason_code"] == "existing_order_fill"
+        ),
+    }
+    return {"windows": windows, "selection_policy": selection_policy}
+
+
+def normalize_source_window_candidates(
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for ordinal, candidate in enumerate(candidates):
+        data = candidate_to_source_window_data(candidate)
+        candidate_id = str(data.get("candidate_id") or "")
+        normalized.append(
+            {
+                "ordinal": ordinal,
+                "data": data,
+                "source_key": source_window_source_key(data, candidate_id=candidate_id),
+            }
+        )
+    return normalized
+
+
+def select_source_window_candidates(
+    normalized_candidates: list[dict[str, Any]],
+    *,
+    query_plan: dict[str, Any],
+    primary_intent: str,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    selected_source_keys: set[str] = set()
+    intent_candidates = [
+        item
+        for item in normalized_candidates
+        if source_window_candidate_matches_intent(item["data"], query_plan, primary_intent)
+    ]
+    first_pass_candidates = intent_candidates if intent_candidates else normalized_candidates
+
+    for item in first_pass_candidates:
+        if len(selected) >= SOURCE_WINDOW_LIMIT:
+            break
+        candidate_id = str(item["data"].get("candidate_id") or "")
+        source_key = str(item["source_key"])
+        if source_key in selected_source_keys:
+            continue
+        selected.append(
+            {
+                **item,
+                "selection_reason_code": "intent_preferred_distinct_source"
+                if item in intent_candidates
+                else "distinct_source",
+            }
+        )
+        selected_ids.add(candidate_id)
+        selected_source_keys.add(source_key)
+
+    for item in normalized_candidates:
+        if len(selected) >= SOURCE_WINDOW_LIMIT:
+            break
+        candidate_id = str(item["data"].get("candidate_id") or "")
+        if candidate_id in selected_ids:
+            continue
+        selected.append({**item, "selection_reason_code": "existing_order_fill"})
+        selected_ids.add(candidate_id)
+
+    return selected
+
+
+def source_window_source_key(data: dict[str, Any], *, candidate_id: str) -> str:
+    source_ref = data.get("source_ref") or {}
+    path = source_ref.get("path")
+    if path:
+        return f"path:{path}"
+    session_id = source_ref.get("session_id") or data.get("session")
+    if session_id:
+        return f"session:{session_id}"
+    target = source_ref_target(source_ref)
+    if target:
+        return f"target:{target}"
+    return f"candidate:{candidate_id}"
+
+
+def source_window_candidate_matches_intent(
+    data: dict[str, Any],
+    query_plan: dict[str, Any],
+    primary_intent: str,
+) -> bool:
+    role = str(data.get("role") or "").lower()
+    if primary_intent == "when_user_said":
+        return "user" in role
+    if primary_intent == "workflow_failure":
+        return bool(data.get("timestamp_utc"))
+    if primary_intent == "why":
+        hinted_roles = [str(item).lower() for item in (query_plan.get("field_hints") or {}).get("roles") or []]
+        return bool(hinted_roles) and any(hinted_role in role for hinted_role in hinted_roles)
+    if primary_intent == "what_was_i_talking_about":
+        return bool(data.get("cwd") or data.get("timestamp_utc"))
+    if primary_intent in {"source_next_reads", "next_reads"}:
+        return bool(source_ref_target(data.get("source_ref") or {}))
+    return False
 
 
 def candidate_to_source_window_data(candidate: dict[str, Any] | CandidateRow) -> dict[str, Any]:
@@ -1286,6 +1446,7 @@ def candidate_to_source_window_data(candidate: dict[str, Any] | CandidateRow) ->
             "candidate_id": candidate.candidate_id,
             "source_ref": candidate.source_ref,
             "role": candidate.role,
+            "session": candidate.session,
             "timestamp_utc": candidate.timestamp_utc,
             "cwd": candidate.cwd,
             "reason_codes": list(candidate.reason_codes)[:SOURCE_WINDOW_REASON_CODE_LIMIT],
@@ -1294,6 +1455,7 @@ def candidate_to_source_window_data(candidate: dict[str, Any] | CandidateRow) ->
         "candidate_id": candidate.get("candidate_id"),
         "source_ref": candidate.get("source_ref") or {},
         "role": candidate.get("role"),
+        "session": candidate.get("session"),
         "timestamp_utc": candidate.get("timestamp_utc"),
         "cwd": candidate.get("cwd"),
         "reason_codes": list(candidate.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
