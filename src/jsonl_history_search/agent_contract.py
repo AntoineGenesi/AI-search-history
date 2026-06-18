@@ -127,6 +127,8 @@ def build_agent_find_payload(
             "searched_bytes": search_result.get("searched_bytes", 0),
         },
     }
+    if search_result.get("retrieval_diagnostics"):
+        agent_find["retrieval_diagnostics"] = search_result["retrieval_diagnostics"]
     handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=search_result,
@@ -375,7 +377,8 @@ def build_candidate_rows(search_result: dict) -> list[CandidateRow]:
                     tasks=list(match.get("tasks") or [])[:20],
                 )
             )
-    rows.sort(key=lambda item: (item.score, item.timestamp or "", item.path, -item.line), reverse=True)
+    if not search_result.get("preserve_match_order"):
+        rows.sort(key=lambda item: (item.score, item.timestamp or "", item.path, -item.line), reverse=True)
     return [replace(row, rank=index + 1, candidate_id=f"c{index + 1:03d}") for index, row in enumerate(rows)]
 
 

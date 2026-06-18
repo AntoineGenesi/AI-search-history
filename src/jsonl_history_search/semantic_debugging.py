@@ -21,6 +21,7 @@ from .claims import classify_claim_action, parse_review_verdict
 from .forensics import build_forensics_payload
 from .query import infer_query
 from .real_history_gold import validate_manifest_file
+from .retrieval_modes import RETRIEVAL_MODE_PACKAGE, run_retrieval_mode
 from .scanner import search
 from .tool_events import build_tool_events_payload
 
@@ -58,9 +59,10 @@ def build_semantic_debug_payload(
     mask_context: Any = None,
     configuration_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
-    result = search(
-        plan,
-        intent,
+    result = run_retrieval_mode(
+        retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
+        plan=plan,
+        intent=intent,
         default_tz=default_tz,
         cwd=source_plan["cwd"],
         mask_context=mask_context,
@@ -171,6 +173,9 @@ def build_semantic_debug_payload(
             "native_scanner_default": False,
         },
     }
+    if result.get("retrieval_diagnostics"):
+        packet["retrieval_diagnostics"] = result["retrieval_diagnostics"]
+        packet["claim_boundaries"].update(result["retrieval_diagnostics"].get("claim_boundaries", {}))
     if getattr(args, "compact_provenance_handoff", False):
         packet["compact_provenance_handoff"] = build_compact_provenance_handoff(
             status=packet["status"],
