@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,7 @@ def build_agent_find_payload(
     manifest_report: dict | None = None,
     output_format: str = "json",
     report_output: str | None = None,
+    compact_provenance_handoff: bool = False,
 ) -> dict[str, Any]:
     candidates = build_candidate_rows(search_result)
     timeline = build_timeline(candidates)
@@ -136,6 +138,15 @@ def build_agent_find_payload(
         },
     )
     agent_find["source_locator_handoff"] = handoff
+    if compact_provenance_handoff:
+        agent_find["compact_provenance_handoff"] = build_compact_provenance_handoff(
+            status=status,
+            command_surface="find",
+            candidates=candidate_dicts,
+            source_locator_handoff=handoff,
+            next_reads=handoff["next_reads"],
+            no_evidence=agent_find["no_evidence_report"],
+        )
     return {"agent_find": agent_find}
 
 
@@ -149,6 +160,183 @@ def command_surface() -> dict[str, str]:
         "cluster-candidates": "Groups candidates by task, artifact, preference, session, or path for compact AI handoff.",
         "no-evidence-report": "Reports searched-scope-only no-evidence, not all-history/global/permanent absence; includes excluded scope, weak candidates, warnings, and next safe searches.",
     }
+
+
+def build_compact_provenance_handoff(
+    *,
+    status: str,
+    command_surface: str,
+    candidates: list[dict[str, Any]],
+    source_locator_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    no_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an opt-in provenance map from already-emitted agent-facing fields."""
+    compact_candidates = compact_provenance_candidates(candidates)
+    source_refs = compact_provenance_source_refs(
+        compact_candidates,
+        source_locator_handoff.get("candidate_ordering", {}).get("top_candidates", []),
+        next_reads,
+    )
+    packet: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "no_evidence" if status == "no_evidence" else "candidates_found",
+        "command_surface": command_surface,
+        "derived_from": [
+            "source_locator_handoff",
+            "find_candidates" if command_surface == "find" else "strongest_candidates",
+            "next_reads",
+            "no_evidence",
+        ],
+        "candidate_count": len(candidates),
+        "candidates": compact_candidates,
+        "source_refs": source_refs,
+        "source_windows": compact_provenance_source_windows(compact_candidates),
+        "next_reads": list(next_reads or [])[:8],
+        "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
+        "scope": {
+            "source_family": source_locator_handoff.get("source_family", {}),
+            "selected_roots": source_locator_handoff.get("selected_roots", []),
+            "rejected_roots": source_locator_handoff.get("rejected_roots", []),
+            "caps": source_locator_handoff.get("caps", {}),
+            "blind_spots": source_locator_handoff.get("blind_spots", []),
+            "not_searched_scope": source_locator_handoff.get("not_searched_scope", {}),
+        },
+        "privacy_boundaries": {
+            **source_locator_handoff.get("privacy_boundaries", {}),
+            "raw_private_text_or_snippets_included": False,
+            "source_window_text_included": False,
+            "source_refs_may_point_to_local_transcripts": bool(source_refs),
+        },
+        "claim_boundaries": {
+            **source_locator_handoff.get("claim_boundaries", {}),
+            "compact_handoff_is_opt_in": True,
+            "default_behavior_changed": False,
+            "scanner_ranking_or_source_selection_changed": False,
+            "token_savings_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "product_value_claim_supported": False,
+            "default_promotion_supported": False,
+        },
+    }
+    packet_bytes = len(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    packet["context_budget"] = {
+        "payload_bytes": packet_bytes,
+        "estimated_tokens": estimate_tokens(packet_bytes),
+        "measurement_basis": "compact_provenance_handoff_packet_only",
+    }
+    return packet
+
+
+def compact_provenance_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for candidate in candidates[:8]:
+        source_ref = candidate.get("source_ref") or {}
+        rows.append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "rank": candidate.get("rank"),
+                "source_ref": source_ref,
+                "target": source_ref_target(source_ref),
+                "timestamp_utc": candidate.get("timestamp_utc"),
+                "role": candidate.get("role"),
+                "confidence": candidate.get("confidence"),
+                "stage": candidate.get("stage") or first_value(candidate.get("stages", [])),
+                "score": candidate.get("score"),
+                "reason_codes": list(candidate.get("reason_codes", []))[:8],
+            }
+        )
+    return rows
+
+
+def compact_provenance_source_refs(
+    candidates: list[dict[str, Any]],
+    locator_candidates: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refs = []
+    for candidate in candidates:
+        refs.append(
+            {
+                "kind": "candidate_source_ref",
+                "candidate_id": candidate.get("candidate_id"),
+                "source_ref": candidate.get("source_ref") or {},
+                "target": candidate.get("target"),
+            }
+        )
+    for candidate in locator_candidates[:8]:
+        ref = candidate.get("source_ref") or {}
+        refs.append(
+            {
+                "kind": "source_locator_top_candidate_ref",
+                "candidate_id": candidate.get("candidate_id"),
+                "source_ref": ref,
+                "target": source_ref_target(ref),
+            }
+        )
+    for read in next_reads[:8]:
+        refs.append(
+            {
+                "kind": read.get("kind", "next_read"),
+                "candidate_id": read.get("candidate_id"),
+                "source_ref": read.get("source_ref") or {},
+                "target": read.get("target"),
+            }
+        )
+    return dedupe_provenance_refs(refs)[:12]
+
+
+def compact_provenance_source_windows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    windows = []
+    for candidate in candidates[:5]:
+        windows.append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "source_ref": candidate.get("source_ref") or {},
+                "target": candidate.get("target"),
+                "window_kind": "emitted_candidate_source_window",
+                "text_included": False,
+                "reason": "open source_ref/next_read target for surrounding transcript context",
+            }
+        )
+    return windows
+
+
+def compact_provenance_no_evidence(no_evidence: dict[str, Any], source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
+    locator_meaning = source_locator_handoff.get("no_evidence_meaning", {})
+    return {
+        "needed": bool(no_evidence.get("needed")),
+        "answer_scope": no_evidence.get("answer_scope") or locator_meaning.get("answer_scope"),
+        "not_all_history_absence": locator_meaning.get("not_all_history_absence", True),
+        "meaning": locator_meaning.get("meaning"),
+        "candidate_rows_found": no_evidence.get("candidate_rows_found"),
+        "searched_scope": no_evidence.get("searched_scope"),
+        "not_searched_scope": no_evidence.get("not_searched_scope") or source_locator_handoff.get("not_searched_scope"),
+        "why_not_confident": no_evidence.get("why_not_confident"),
+    }
+
+
+def dedupe_provenance_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    deduped = []
+    for ref in refs:
+        key = (
+            ref.get("kind"),
+            ref.get("candidate_id"),
+            json.dumps(ref.get("source_ref") or {}, sort_keys=True),
+            ref.get("target"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped
+
+
+def first_value(values: Any) -> Any:
+    if isinstance(values, list) and values:
+        return values[0]
+    return None
 
 
 def build_candidate_rows(search_result: dict) -> list[CandidateRow]:

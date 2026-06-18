@@ -142,6 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Optional path where the full find report should be written as JSON or Markdown.",
         )
+        find.add_argument(
+            "--compact-provenance-handoff",
+            action="store_true",
+            help=(
+                "Opt in to an extra compact_provenance_handoff JSON packet derived "
+                "from emitted candidates, source refs, next reads, and no-evidence scope."
+            ),
+        )
     structural_hybrid = subparsers.add_parser(
         "find-structural-hybrid-budgeted",
         description=(
@@ -275,6 +283,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the full semantic-debug packet should be written.",
+    )
+    semantic_debug.add_argument(
+        "--compact-provenance-handoff",
+        action="store_true",
+        help=(
+            "Opt in to an extra compact_provenance_handoff JSON packet derived "
+            "from emitted candidates, source refs, next reads, and no-evidence scope."
+        ),
     )
     private_mine = subparsers.add_parser("private-benchmark-mine")
     add_common_args(private_mine)
@@ -1427,6 +1443,8 @@ def main(argv: list[str] | None = None) -> int:
                     "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
                 }
             }
+            if "compact_provenance_handoff" in packet:
+                payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
             rendered = render(payload, args.format)
         print(rendered)
         return 0
@@ -1857,6 +1875,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest_report=manifest_report,
             output_format=args.format,
             report_output=args.report_output,
+            compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
         )
     elif args.command == "plan":
         payload = {
@@ -1891,7 +1910,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _short_report_written_payload(payload: dict, report_output: str) -> dict:
     report = payload["agent_find"]
-    return {
+    short = {
         "agent_find": {
             "schema_version": report["schema_version"],
             "status": report["status"],
@@ -1907,6 +1926,9 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
             "message": "Full find report written to report_output; stdout is a compact handoff map.",
         }
     }
+    if "compact_provenance_handoff" in report:
+        short["agent_find"]["compact_provenance_handoff"] = report["compact_provenance_handoff"]
+    return short
 
 
 def _short_lineage_report_written_payload(payload: dict, report_output: str) -> dict:
