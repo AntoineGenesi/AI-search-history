@@ -94,6 +94,7 @@ from .real_history_timestamp_seek import DEFAULT_MANIFEST as DEFAULT_REAL_HISTOR
 from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE
 from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
 from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
+from .retrieval_modes import RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrieval_mode
 from .scanner import search
 from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
 from .skill_audit import build_skill_audit_payload
@@ -148,6 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Opt in to an extra compact_provenance_handoff JSON packet derived "
                 "from emitted candidates, source refs, next reads, and no-evidence scope."
+            ),
+        )
+        find.add_argument(
+            "--retrieval-mode",
+            choices=RETRIEVAL_MODES,
+            default=RETRIEVAL_MODE_PACKAGE,
+            help=(
+                "Retrieval backend for agent-facing find output. Default package keeps existing behavior; "
+                "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
             ),
         )
     structural_hybrid = subparsers.add_parser(
@@ -290,6 +300,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Opt in to an extra compact_provenance_handoff JSON packet derived "
             "from emitted candidates, source refs, next reads, and no-evidence scope."
+        ),
+    )
+    semantic_debug.add_argument(
+        "--retrieval-mode",
+        choices=RETRIEVAL_MODES,
+        default=RETRIEVAL_MODE_PACKAGE,
+        help=(
+            "Retrieval backend for semantic-debug candidate evidence. Default package keeps existing behavior; "
+            "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
         ),
     )
     private_mine = subparsers.add_parser("private-benchmark-mine")
@@ -1456,6 +1475,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if "compact_provenance_handoff" in packet:
                 payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
+            if "retrieval_diagnostics" in packet:
+                payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
             rendered = render(payload, args.format)
         print(rendered)
         return 0
@@ -1861,9 +1882,10 @@ def main(argv: list[str] | None = None) -> int:
         }
     elif args.command in {"find", "plan-sources", "broaden-query", "find-candidates", "timeline", "cluster-candidates", "no-evidence-report"}:
         mask_context = _mask_context_from_args(args)
-        result = search(
-            plan,
-            intent,
+        result = run_retrieval_mode(
+            retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
+            plan=plan,
+            intent=intent,
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=source_plan["cwd"],
             mask_context=mask_context,
@@ -1939,6 +1961,8 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
     }
     if "compact_provenance_handoff" in report:
         short["agent_find"]["compact_provenance_handoff"] = report["compact_provenance_handoff"]
+    if "retrieval_diagnostics" in report:
+        short["agent_find"]["retrieval_diagnostics"] = report["retrieval_diagnostics"]
     return short
 
 
