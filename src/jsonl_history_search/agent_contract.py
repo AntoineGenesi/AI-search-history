@@ -173,6 +173,11 @@ def build_compact_provenance_handoff(
 ) -> dict[str, Any]:
     """Build an opt-in provenance map from already-emitted agent-facing fields."""
     compact_candidates = compact_provenance_candidates(candidates)
+    source_refs = compact_provenance_source_refs(
+        compact_candidates,
+        source_locator_handoff.get("candidate_ordering", {}).get("top_candidates", []),
+        next_reads,
+    )
     packet: dict[str, Any] = {
         "schema_version": 1,
         "status": "no_evidence" if status == "no_evidence" else "candidates_found",
@@ -185,11 +190,7 @@ def build_compact_provenance_handoff(
         ],
         "candidate_count": len(candidates),
         "candidates": compact_candidates,
-        "source_refs": compact_provenance_source_refs(
-            compact_candidates,
-            source_locator_handoff.get("candidate_ordering", {}).get("top_candidates", []),
-            next_reads,
-        ),
+        "source_refs": source_refs,
         "source_windows": compact_provenance_source_windows(compact_candidates),
         "next_reads": list(next_reads or [])[:8],
         "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
@@ -205,7 +206,7 @@ def build_compact_provenance_handoff(
             **source_locator_handoff.get("privacy_boundaries", {}),
             "raw_private_text_or_snippets_included": False,
             "source_window_text_included": False,
-            "source_refs_may_point_to_local_transcripts": bool(compact_candidates),
+            "source_refs_may_point_to_local_transcripts": bool(source_refs),
         },
         "claim_boundaries": {
             **source_locator_handoff.get("claim_boundaries", {}),
