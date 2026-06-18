@@ -15,6 +15,7 @@ from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .metric_contract import add_metric_contract, real_history_impact_metrics
 from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
+from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT, RrfLane, fuse_ranked_groups
 from .scanner import search
 from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
 from .structural_hybrid import (
@@ -142,7 +143,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
             "build_bytes": int(structural_sidecar_index.metrics.get("build_bytes", 0)),
             "build_elapsed_ms": structural_sidecar_index.metrics.get("build_elapsed_ms", 0.0),
         }
-    if "package_search_fielded_bm25" in selected:
+    if any(baseline in selected for baseline in {"package_search_fielded_bm25", "package_search_rrf_fusion"}):
         phase_started = time.perf_counter()
         fielded_bm25_index = build_fielded_bm25_index(
             plan,
@@ -168,6 +169,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 "package_search_structural_hybrid": _run_package_search_structural_hybrid,
                 "package_search_structural_hybrid_budgeted": _run_package_search_structural_hybrid_budgeted,
                 "package_search_fielded_bm25": _run_package_search_fielded_bm25,
+                "package_search_rrf_fusion": _run_package_search_rrf_fusion,
             }[baseline]
             for repeat_index in range(max(1, args.repeat)):
                 runner_kwargs = {
@@ -184,7 +186,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                     "package_search_structural_hybrid_budgeted",
                 }:
                     runner_kwargs["structural_sidecar_index"] = structural_sidecar_index
-                if baseline == "package_search_fielded_bm25":
+                if baseline in {"package_search_fielded_bm25", "package_search_rrf_fusion"}:
                     runner_kwargs["fielded_bm25_index"] = fielded_bm25_index
                 row, raw_row = runner(**runner_kwargs)
                 rows.append(row)
@@ -664,6 +666,101 @@ def _run_package_search_fielded_bm25(**kwargs) -> tuple[dict[str, Any], dict[str
         row["expected_ref_diagnostics"] = expected_diagnostics
     raw_row["sanitized_row"] = row
     raw_row["fielded_bm25_result"] = result
+    return row, raw_row
+
+
+def _run_package_search_rrf_fusion(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
+    case = kwargs["case"]
+    args = kwargs["args"]
+    plan = kwargs["plan"]
+    index = kwargs.get("fielded_bm25_index")
+    started = time.perf_counter()
+    default_tz = timezone_from_args(args.timezone, args.timezone_offset)
+    now = parse_now(args.now, default_tz)
+    intent = infer_query(str(case["query_text"]), now=now)
+    expected_refs = case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None
+    cwd = str(Path(args.cwd).expanduser().resolve())
+    package_started = time.perf_counter()
+    package_result = search(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        use_rg_prefilter=False,
+        expected_ref_diagnostics=expected_refs,
+    )
+    package_elapsed_ms = _elapsed_ms(package_started)
+    fielded_started = time.perf_counter()
+    if index is None:
+        index = build_fielded_bm25_index(plan, default_tz=default_tz)
+    fielded_result = search_with_fielded_bm25(
+        index,
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        expected_ref_diagnostics=expected_refs,
+    )
+    fielded_elapsed_ms = _elapsed_ms(fielded_started)
+    fused_started = time.perf_counter()
+    fused_result = fuse_ranked_groups(
+        [
+            RrfLane("package_search", package_result.get("groups", [])),
+            RrfLane("package_search_fielded_bm25", fielded_result.get("groups", [])),
+        ],
+        rank_constant=DEFAULT_RRF_RANK_CONSTANT,
+        candidate_window_size=plan.limits.max_matches,
+        final_limit=plan.limits.max_matches,
+        preferred_lane="package_search",
+    )
+    fused_result["fusion_elapsed_ms"] = _elapsed_ms(fused_started)
+    package_warnings = _safe_warnings(package_result.get("warnings") or [])
+    fielded_warnings = _safe_warnings(fielded_result.get("warnings") or [])
+    warnings = _safe_warnings(package_warnings + fielded_warnings)
+    row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(warnings)))
+    candidates, ranking_reason_label_count = _candidates_from_groups(fused_result.get("groups", []))
+    package_searched_bytes = int(package_result.get("searched_bytes", 0))
+    fielded_searched_bytes = int(fielded_result.get("searched_bytes", 0))
+    row, raw_row = _row_pair(
+        case=case,
+        baseline="package_search_rrf_fusion",
+        repeat_index=kwargs["repeat_index"],
+        started=started,
+        tool_calls=2,
+        subprocess_calls=0,
+        files_opened=int(package_result.get("searched_files", 0)) + int(fielded_result.get("searched_files", 0)),
+        records_parsed=_package_records_parsed_from_result(
+            package_result,
+            files=kwargs["files"],
+            searched_bytes=package_searched_bytes,
+            prefilter=_prefilter_row_stats({}, enabled=False),
+            use_rg_prefilter=False,
+        )
+        + int(fielded_result.get("records_considered", 0)),
+        bytes_scanned=package_searched_bytes + fielded_searched_bytes,
+        bytes_parsed=package_searched_bytes + fielded_searched_bytes,
+        output_context_bytes=len(json.dumps(fused_result, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+        candidates=candidates,
+        cap_hit_labels=row_cap_hit_labels,
+        ranking_reason_label_count=ranking_reason_label_count,
+        warnings=warnings,
+        notes=["opt_in_report_only_package_fielded_bm25_rrf_fusion_probe"],
+    )
+    row["rrf_fusion"] = _rrf_fusion_row_stats(
+        fused_result,
+        package_result=package_result,
+        fielded_result=fielded_result,
+        package_elapsed_ms=package_elapsed_ms,
+        fielded_elapsed_ms=fielded_elapsed_ms,
+    )
+    row["fielded_bm25"] = _fielded_bm25_row_stats(fielded_result)
+    expected_diagnostics = _fused_expected_ref_diagnostics(case, fused_result)
+    if expected_diagnostics is not None:
+        row["expected_ref_diagnostics"] = expected_diagnostics
+    raw_row["sanitized_row"] = row
+    raw_row["package_result"] = package_result
+    raw_row["fielded_bm25_result"] = fielded_result
+    raw_row["rrf_fusion_result"] = fused_result
     return row, raw_row
 
 
@@ -1773,6 +1870,86 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _rrf_fusion_row_stats(
+    result: dict[str, Any],
+    *,
+    package_result: dict[str, Any],
+    fielded_result: dict[str, Any],
+    package_elapsed_ms: float,
+    fielded_elapsed_ms: float,
+) -> dict[str, Any]:
+    privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
+    return {
+        "enabled": True,
+        "feature_state": "shadow_report_only",
+        "status": str(result.get("status") or "unknown"),
+        "strategy": str(result.get("strategy") or "unknown"),
+        "rank_constant": int(result.get("rank_constant") or 0),
+        "lane_count": int(result.get("lane_count") or 0),
+        "lane_names": [str(item) for item in result.get("lane_names", [])],
+        "equal_lane_weights": bool(privacy.get("equal_lane_weights")),
+        "candidate_window_size": result.get("candidate_window_size"),
+        "candidate_window_sizes": _safe_count_dict(result.get("candidate_window_sizes")),
+        "lane_unique_candidate_counts": _safe_count_dict(result.get("lane_unique_candidate_counts")),
+        "overlap_count": int(result.get("overlap_count") or 0),
+        "jaccard": float(result.get("jaccard") or 0.0),
+        "package_only_count": int(result.get("package_only_count") or 0),
+        "fielded_only_count": int(result.get("fielded_only_count") or 0),
+        "top_n_fielded_only_promotion_count": int(result.get("top_n_fielded_only_promotion_count") or 0),
+        "candidate_count": int(result.get("candidate_count") or 0),
+        "package_candidate_count": len(_flat_matches(package_result.get("groups", []))),
+        "fielded_candidate_count": len(_flat_matches(fielded_result.get("groups", []))),
+        "package_latency_ms": package_elapsed_ms,
+        "fielded_latency_ms": fielded_elapsed_ms,
+        "fusion_latency_ms": float(result.get("fusion_elapsed_ms") or 0.0),
+        "raw_score_inputs_used_for_fusion": bool(privacy.get("raw_score_inputs_used_for_fusion", True)),
+        "score_normalization_used": bool(privacy.get("score_normalization_used", True)),
+        "fused_score_threshold_used": bool(privacy.get("fused_score_threshold_used", True)),
+        "benchmark_tuned_weights_used": bool(privacy.get("benchmark_tuned_weights_used", True)),
+        "raw_paths_included": False,
+        "raw_private_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "expected_refs_used_for_retrieval": False,
+        "privacy": _rrf_fusion_privacy(),
+    }
+
+
+def _fused_expected_ref_diagnostics(case: dict[str, Any], fused_result: dict[str, Any]) -> dict[str, Any] | None:
+    expected_refs = case.get("expected_refs") or []
+    if not expected_refs:
+        return None
+    final_keys = _match_keys(fused_result.get("groups", []))
+    refs = []
+    for ref in expected_refs:
+        ref_id = ref.get("ref_id")
+        path = ref.get("path")
+        line = ref.get("line")
+        if not isinstance(ref_id, str) or path is None or not isinstance(line, int):
+            continue
+        refs.append(
+            {
+                "ref_id": ref_id,
+                "expected_record_present_in_final_candidate_groups": (str(path), line) in final_keys,
+                "final_status": "present_in_fused_final_candidates"
+                if (str(path), line) in final_keys
+                else "not_present_in_fused_final_candidates",
+            }
+        )
+    return {
+        "diagnostic_scope": "package_search_rrf_fusion_final_candidates",
+        "refs": refs,
+        "expected_ref_count": len(refs),
+        "final_candidate_expected_ref_count": sum(
+            1 for ref in refs if ref["expected_record_present_in_final_candidate_groups"]
+        ),
+        "expected_refs_used_for_retrieval": False,
+        "raw_paths_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
 def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | None:
     diagnostics = result.get("expected_ref_diagnostics")
     if not isinstance(diagnostics, dict):
@@ -2142,6 +2319,47 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _rrf_fusion_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [row.get("rrf_fusion") for row in rows if isinstance(row.get("rrf_fusion"), dict)]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "rank_constant": DEFAULT_RRF_RANK_CONSTANT,
+            "overlap_count": 0,
+            "package_only_count": 0,
+            "fielded_only_count": 0,
+            "top_n_fielded_only_promotion_count": 0,
+            "privacy": _rrf_fusion_privacy(),
+        }
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "feature_state_counts": _counts(item.get("feature_state") for item in selected),
+        "status_counts": _counts(item.get("status") for item in selected),
+        "rank_constant": DEFAULT_RRF_RANK_CONSTANT,
+        "equal_lane_weights_runs": sum(1 for item in selected if item.get("equal_lane_weights")),
+        "median_candidate_window_size": _median(item.get("candidate_window_size") for item in selected),
+        "median_overlap_count": _median(item.get("overlap_count") for item in selected),
+        "median_jaccard": _median(item.get("jaccard") for item in selected),
+        "package_only_count": sum(int(item.get("package_only_count") or 0) for item in selected),
+        "fielded_only_count": sum(int(item.get("fielded_only_count") or 0) for item in selected),
+        "top_n_fielded_only_promotion_count": sum(
+            int(item.get("top_n_fielded_only_promotion_count") or 0) for item in selected
+        ),
+        "raw_score_inputs_used_for_fusion_runs": sum(
+            1 for item in selected if item.get("raw_score_inputs_used_for_fusion")
+        ),
+        "score_normalization_used_runs": sum(1 for item in selected if item.get("score_normalization_used")),
+        "fused_score_threshold_used_runs": sum(1 for item in selected if item.get("fused_score_threshold_used")),
+        "benchmark_tuned_weights_used_runs": sum(1 for item in selected if item.get("benchmark_tuned_weights_used")),
+        "median_package_latency_ms": _median(item.get("package_latency_ms") for item in selected),
+        "median_fielded_latency_ms": _median(item.get("fielded_latency_ms") for item in selected),
+        "median_fusion_latency_ms": _median(item.get("fusion_latency_ms") for item in selected),
+        "privacy": _rrf_fusion_privacy(),
+    }
+
+
 def _fielded_bm25_privacy() -> dict[str, bool]:
     return {
         "aggregate_only": True,
@@ -2153,6 +2371,22 @@ def _fielded_bm25_privacy() -> dict[str, bool]:
         "line_numbers_included": False,
         "session_ids_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _rrf_fusion_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "raw_private_text_included": False,
+        "raw_query_text_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "raw_score_inputs_used_for_fusion": False,
+        "score_normalization_used": False,
+        "fused_score_threshold_used": False,
+        "benchmark_tuned_weights_used": False,
     }
 
 
@@ -2230,6 +2464,7 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             ),
             "candidate_strength": _candidate_strength_aggregate(selected),
             "fielded_bm25": _fielded_bm25_aggregate(selected),
+            "rrf_fusion": _rrf_fusion_aggregate(selected),
         }
     if "package_search" in summary and "package_search_rg_prefilter" in summary:
         summary["package_search_rg_prefilter"]["equivalence_vs_package_search"] = _package_equivalence(rows)
@@ -2260,6 +2495,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "pre_parse": _pre_parse_aggregate(rows),
         "candidate_strength": _candidate_strength_aggregate(rows),
         "fielded_bm25": _fielded_bm25_aggregate(rows),
+        "rrf_fusion": _rrf_fusion_aggregate(rows),
         "no_evidence_correct": {
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
             "correct": sum(1 for row in rows if row.get("no_evidence_correct") is True),
@@ -3237,6 +3473,7 @@ def _baseline_contract() -> dict[str, str]:
         "package_search": "current JSONL infer_query/search path over the same selected roots and caps",
         "package_search_rg_prefilter": "optional rg prefilter where eligible, followed by Python JSON parsing for evidence; fallback is labeled per row",
         "package_search_fielded_bm25": "opt-in default-off SQLite FTS5/BM25 record/chunk candidate generator; indexes source-ref-preserving Codex/Claude fields in memory, queries escaped infer_query terms, then passes materialized records through existing Match/grouping conventions; no RRF or default promotion",
+        "package_search_rrf_fusion": "opt-in report-only Reciprocal Rank Fusion lane over package_search and package_search_fielded_bm25 ranked candidates; rank-only with rank_constant=60, equal lane weights, stable source-record identity dedupe, no raw-score blending, no score normalization, no fused-score thresholds, and no default promotion",
         "package_search_structural_sidecar": "opt-in structural Codex/Claude JSONL sidecar probe; indexes sanitized event/role/timestamp/session tags plus offsets, then passes reopened records through the existing ranking path",
         "package_search_structural_hybrid": "opt-in package-preserving hybrid probe; keeps package candidates first and appends a bounded non-duplicate structural sidecar supplement",
         "package_search_structural_hybrid_budgeted": "opt-in default-off budgeted hybrid probe; keeps package candidates first and appends a bounded structural supplement when the budgeted gate allows it: package candidate count at or below the non-oracle threshold, or the explicit intent_structural_high_candidate_count gate profile detects sanitized date/timeline/date-window or role intent; does not change caps",
