@@ -311,6 +311,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_rows_considered": int(fielded_result.get("candidate_rows_considered", 0) or 0),
         "candidate_rows_retained": int(fielded_result.get("candidate_rows_retained", 0) or 0),
         "candidate_rows_surfaced": int(fielded_result.get("candidate_rows_surfaced", 0) or 0),
+        "query_streams": _fielded_query_streams_diagnostics(fielded_result),
         "searched_files": int(fielded_result.get("searched_files", 0)),
         "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
         "records_considered": int(fielded_result.get("records_considered", 0)),
@@ -494,6 +495,7 @@ def build_rrf_retrieval_diagnostics(
                 ),
                 "candidate_rows": int(fielded_result.get("candidate_rows_generated", 0) or 0),
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
+                "query_streams": _fielded_query_streams_diagnostics(fielded_result),
                 "searched_files": int(fielded_result.get("searched_files", 0)),
                 "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
                 "materialization": fielded_materialization,
@@ -578,6 +580,54 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    streams = fielded_result.get("fielded_query_streams") if isinstance(fielded_result, dict) else {}
+    if not isinstance(streams, dict):
+        streams = {}
+    stream_items: list[dict[str, Any]] = []
+    for item in streams.get("streams") or []:
+        if not isinstance(item, dict):
+            continue
+        stream_items.append(
+            {
+                "label": str(item.get("label") or "unknown"),
+                "fields": [str(field) for field in item.get("fields") or []],
+                "status": str(item.get("status") or "unknown"),
+                "row_count": int(item.get("row_count") or 0),
+                "deduped_row_count": int(item.get("deduped_row_count") or 0),
+                "error_type": item.get("error_type") if item.get("error_type") is None else str(item.get("error_type")),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "raw_session_ids_included": False,
+                "raw_cwd_included": False,
+                "source_lines_included": False,
+                "line_numbers_included": False,
+            }
+        )
+    return {
+        "enabled": bool(streams.get("enabled", False)),
+        "strategy": str(streams.get("strategy") or "disabled"),
+        "stream_count": int(streams.get("stream_count") or len(stream_items)),
+        "streams": stream_items,
+        "candidate_row_pool_limit_per_stream": int(streams.get("candidate_row_pool_limit_per_stream") or 0),
+        "row_count_before_dedupe": int(streams.get("row_count_before_dedupe") or 0),
+        "row_count_after_dedupe": int(streams.get("row_count_after_dedupe") or 0),
+        "deduped_row_count_from_streams": int(streams.get("deduped_row_count_from_streams") or 0),
+        "duplicate_row_count": int(streams.get("duplicate_row_count") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
