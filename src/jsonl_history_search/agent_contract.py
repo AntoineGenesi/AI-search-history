@@ -502,7 +502,7 @@ def matched_terms_from_reasons(reasons: list[str]) -> list[str]:
 def confidence_for_score(score: float, stages: list[str], reasons: list[str] | None = None) -> str:
     stage_set = set(stages)
     reason_set = set(reasons or [])
-    has_generic_penalty = "penalty:partial_generic_multi_token" in reason_set
+    has_generic_penalty = any(reason.startswith("penalty:") for reason in reason_set)
     has_supporting_evidence = bool(
         {"exact_phrase", "base_term_full_coverage", "artifact_path", "cwd_project"} & stage_set
     )

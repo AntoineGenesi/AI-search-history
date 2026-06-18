@@ -1548,6 +1548,7 @@ def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
         "records_rejected_by_should_consider": int(result.get("records_rejected_by_should_consider") or 0),
         "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
+        "candidate_strength": _candidate_strength_row_stats(result),
         "dedupe_strategy": str(result.get("dedupe_strategy") or "unknown"),
         "raw_paths_included": False,
     }
@@ -1585,6 +1586,49 @@ def _pre_parse_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "raw_lines_skipped_before_full_json_parse": int(stats.get("raw_lines_skipped_before_full_json_parse") or 0),
         "full_json_records_parsed": int(stats.get("full_json_records_parsed") or 0),
         "raw_anchor_needles_included": False,
+    }
+
+
+def _candidate_strength_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+    stats = result.get("candidate_strength")
+    if not isinstance(stats, dict):
+        return {
+            "status": "unavailable",
+            "strategy": None,
+            "strong_reservoir_limit": 0,
+            "weak_reservoir_limit": 0,
+            "strong_candidates": 0,
+            "weak_candidates": 0,
+            "weak_partial_generic_candidates": 0,
+            "weak_broad_unanchored_low_evidence_candidates": 0,
+            "strong_reservoir_retained": 0,
+            "strong_reservoir_replaced": 0,
+            "strong_reservoir_cap_dropped": 0,
+            "weak_reservoir_retained": 0,
+            "weak_reservoir_replaced": 0,
+            "weak_reservoir_cap_dropped": 0,
+            "raw_private_text_included": False,
+            "raw_paths_included": False,
+        }
+    return {
+        "status": "evaluated",
+        "strategy": stats.get("strategy"),
+        "strong_reservoir_limit": int(stats.get("strong_reservoir_limit") or 0),
+        "weak_reservoir_limit": int(stats.get("weak_reservoir_limit") or 0),
+        "strong_candidates": int(stats.get("strong_candidates") or 0),
+        "weak_candidates": int(stats.get("weak_candidates") or 0),
+        "weak_partial_generic_candidates": int(stats.get("weak_partial_generic_candidates") or 0),
+        "weak_broad_unanchored_low_evidence_candidates": int(
+            stats.get("weak_broad_unanchored_low_evidence_candidates") or 0
+        ),
+        "strong_reservoir_retained": int(stats.get("strong_reservoir_retained") or 0),
+        "strong_reservoir_replaced": int(stats.get("strong_reservoir_replaced") or 0),
+        "strong_reservoir_cap_dropped": int(stats.get("strong_reservoir_cap_dropped") or 0),
+        "weak_reservoir_retained": int(stats.get("weak_reservoir_retained") or 0),
+        "weak_reservoir_replaced": int(stats.get("weak_reservoir_replaced") or 0),
+        "weak_reservoir_cap_dropped": int(stats.get("weak_reservoir_cap_dropped") or 0),
+        "raw_private_text_included": False,
+        "raw_paths_included": False,
     }
 
 
@@ -1659,6 +1703,7 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                     ref.get("expected_record_present_in_final_candidate_groups")
                 ),
                 "candidate_strength": ref.get("candidate_strength"),
+                "candidate_strength_label": ref.get("candidate_strength_label"),
                 "pre_parse_phase_label": str(ref.get("pre_parse_phase_label") or "unknown"),
                 "should_consider_phase_label": str(ref.get("should_consider_phase_label") or "unknown"),
                 "dedupe_phase_label": str(ref.get("dedupe_phase_label") or "unknown"),
@@ -1872,6 +1917,64 @@ def _pre_parse_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _candidate_strength_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        (row.get("scan_order") or {}).get("candidate_strength")
+        for row in rows
+        if isinstance((row.get("scan_order") or {}).get("candidate_strength"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "strategy_counts": {},
+            "strong_candidates": 0,
+            "weak_candidates": 0,
+            "weak_partial_generic_candidates": 0,
+            "weak_broad_unanchored_low_evidence_candidates": 0,
+            "strong_reservoir_retained": 0,
+            "strong_reservoir_replaced": 0,
+            "strong_reservoir_cap_dropped": 0,
+            "weak_reservoir_retained": 0,
+            "weak_reservoir_replaced": 0,
+            "weak_reservoir_cap_dropped": 0,
+            "privacy": _candidate_strength_privacy(),
+        }
+    counter_fields = (
+        "strong_candidates",
+        "weak_candidates",
+        "weak_partial_generic_candidates",
+        "weak_broad_unanchored_low_evidence_candidates",
+        "strong_reservoir_retained",
+        "strong_reservoir_replaced",
+        "strong_reservoir_cap_dropped",
+        "weak_reservoir_retained",
+        "weak_reservoir_replaced",
+        "weak_reservoir_cap_dropped",
+    )
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "strategy_counts": _counts(item.get("strategy") for item in selected),
+        "median_strong_reservoir_limit": _median(item.get("strong_reservoir_limit") for item in selected),
+        "median_weak_reservoir_limit": _median(item.get("weak_reservoir_limit") for item in selected),
+        **{field: sum(int(item.get(field) or 0) for item in selected) for field in counter_fields},
+        "privacy": _candidate_strength_privacy(),
+    }
+
+
+def _candidate_strength_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "raw_private_text_included": False,
+        "raw_query_text_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+    }
+
+
 def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for baseline in baselines:
@@ -1932,6 +2035,7 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
             "full_json_records_parsed": sum(
                 int((row.get("pre_parse") or {}).get("full_json_records_parsed") or 0) for row in selected
             ),
+            "candidate_strength": _candidate_strength_aggregate(selected),
         }
     if "package_search" in summary and "package_search_rg_prefilter" in summary:
         summary["package_search_rg_prefilter"]["equivalence_vs_package_search"] = _package_equivalence(rows)
@@ -1960,6 +2064,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "source_ref_equivalence": _package_equivalence(rows),
         "compact_package_handoff": _compact_package_handoff_summary(rows),
         "pre_parse": _pre_parse_aggregate(rows),
+        "candidate_strength": _candidate_strength_aggregate(rows),
         "no_evidence_correct": {
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
             "correct": sum(1 for row in rows if row.get("no_evidence_correct") is True),
@@ -3018,6 +3123,7 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
                 "missing_root",
                 "arbitrary_root_enabled_with_hard_caps",
                 "weak_partial_candidates_reservoir_capped",
+                "weak_low_evidence_candidates_reservoir_capped",
             )
         ):
             safe.append(warning)
@@ -3036,6 +3142,8 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
                 safe.append("stopped_at_max_match_cap")
         elif "weak partial generic candidates were reservoir-capped" in lowered:
             safe.append("weak_partial_candidates_reservoir_capped")
+        elif "weak low-evidence candidates were reservoir-capped" in lowered:
+            safe.append("weak_low_evidence_candidates_reservoir_capped")
         elif "dangerous broad root rejected" in lowered:
             safe.append("root_rejected_dangerous_broad_root")
         elif "missing transcript root" in lowered:

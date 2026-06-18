@@ -12,6 +12,7 @@ from .query import QueryIntent
 from .ranking import (
     Match,
     build_match_profile,
+    candidate_strength_label,
     evaluate_record_match,
     group_matches,
     is_weak_partial_generic,
@@ -29,6 +30,7 @@ CONTENT_MIRROR_SOURCE_KINDS = {"codex_history", "codex_sessions"}
 PRE_PARSE_STRATEGY = "literal_anchor_raw_line_contains_any_jsonl_only"
 PRE_PARSE_SAFE_STAGES = {"artifact_path", "task_slug"}
 PRE_PARSE_ANCHOR_KINDS = ("path", "task_slug")
+CANDIDATE_STRENGTH_STRATEGY = "strong_anchors_low_evidence_broad_partial_generic_to_weak_reservoir"
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,7 @@ def search(
     strong_reservoir_limit = max(1, plan.limits.max_matches)
     strong_candidates_retention_capped = 0
     weak_candidates_skipped = 0
+    candidate_strength = _initial_candidate_strength_stats(weak_reservoir_limit, strong_reservoir_limit)
     dedupe: set[tuple[str, ...]] = set()
     records_read = 0
     records_rejected_by_should_consider = 0
@@ -192,11 +195,15 @@ def search(
                     expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
                     expected_state["dedupe_phase_label"] = "not_deduped"
                 candidate_sort_key = match_candidate_sort_key(record, score)
+                strength_label = candidate_strength_label(reasons)
+                _count_candidate_strength(candidate_strength, strength_label)
                 if is_weak_partial_generic(reasons):
                     if expected_state is not None:
                         expected_state["candidate_strength"] = "weak"
+                        expected_state["candidate_strength_label"] = strength_label
                     if len(weak_matches) < weak_reservoir_limit:
                         weak_matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
+                        candidate_strength["weak_reservoir_retained"] += 1
                         if expected_state is not None:
                             expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
                     else:
@@ -208,17 +215,22 @@ def search(
                             weak_matches[weakest_index] = _materialize_match(
                                 record, score, reasons, artifacts, intent, mask_context
                             )
+                            candidate_strength["weak_reservoir_replaced"] += 1
                             if expected_state is not None:
                                 expected_state["reservoir_phase_label"] = "weak_reservoir_replaced_existing_candidate"
-                        elif expected_state is not None:
-                            expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
-                            expected_state["drop_phase_label"] = "weak_reservoir_drop"
+                        else:
+                            candidate_strength["weak_reservoir_cap_dropped"] += 1
+                            if expected_state is not None:
+                                expected_state["reservoir_phase_label"] = "weak_reservoir_cap_drop"
+                                expected_state["drop_phase_label"] = "weak_reservoir_drop"
                         weak_candidates_skipped += 1
                     continue
                 if expected_state is not None:
                     expected_state["candidate_strength"] = "strong"
+                    expected_state["candidate_strength_label"] = strength_label
                 if len(matches) < strong_reservoir_limit:
                     matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
+                    candidate_strength["strong_reservoir_retained"] += 1
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
                     continue
@@ -230,11 +242,14 @@ def search(
                     matches[weakest_index] = _materialize_match(
                         record, score, reasons, artifacts, intent, mask_context
                     )
+                    candidate_strength["strong_reservoir_replaced"] += 1
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_replaced_existing_candidate"
-                elif expected_state is not None:
-                    expected_state["reservoir_phase_label"] = "strong_reservoir_cap_drop"
-                    expected_state["drop_phase_label"] = "strong_reservoir_drop"
+                else:
+                    candidate_strength["strong_reservoir_cap_dropped"] += 1
+                    if expected_state is not None:
+                        expected_state["reservoir_phase_label"] = "strong_reservoir_cap_drop"
+                        expected_state["drop_phase_label"] = "strong_reservoir_drop"
                 strong_candidates_retention_capped += 1
         except AdapterReadError as exc:
             warnings.append(str(exc))
@@ -247,7 +262,7 @@ def search(
     if strong_candidates_retention_capped:
         warnings.append("Strong candidates were retention-capped at max match cap before final ranking.")
     if weak_candidates_skipped:
-        warnings.append("Weak partial generic candidates were reservoir-capped before final ranking.")
+        warnings.append("Weak low-evidence candidates were reservoir-capped before final ranking.")
     _mark_expected_pre_final_candidates(expected_diag, matches + weak_matches)
     matches = matches + weak_matches
     if len(matches) > plan.limits.max_matches:
@@ -271,6 +286,7 @@ def search(
         "records_rejected_by_should_consider": records_rejected_by_should_consider,
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
+        "candidate_strength": candidate_strength,
         "dedupe_strategy": DEDUPLICATION_STRATEGY,
         "groups": groups,
         "warnings": sorted(set(warnings + plan.warnings)),
@@ -319,6 +335,7 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
             "expected_record_present_in_final_candidate_refs": False,
             "expected_record_present_in_final_candidate_groups": False,
             "candidate_strength": None,
+            "candidate_strength_label": None,
             "pre_parse_phase_label": "not_reached",
             "should_consider_phase_label": "not_reached",
             "dedupe_phase_label": "not_reached",
@@ -551,6 +568,7 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
                     state["expected_record_present_in_final_candidate_groups"]
                 ),
                 "candidate_strength": state["candidate_strength"],
+                "candidate_strength_label": state["candidate_strength_label"],
                 "pre_parse_phase_label": state["pre_parse_phase_label"],
                 "should_consider_phase_label": state["should_consider_phase_label"],
                 "dedupe_phase_label": state["dedupe_phase_label"],
@@ -615,6 +633,35 @@ def _records_read_bucket(records_read: int) -> str:
     if records_read <= 8192:
         return "2049-8192"
     return "8193_plus"
+
+
+def _initial_candidate_strength_stats(weak_reservoir_limit: int, strong_reservoir_limit: int) -> dict:
+    return {
+        "strategy": CANDIDATE_STRENGTH_STRATEGY,
+        "strong_reservoir_limit": int(strong_reservoir_limit),
+        "weak_reservoir_limit": int(weak_reservoir_limit),
+        "strong_candidates": 0,
+        "weak_candidates": 0,
+        "weak_partial_generic_candidates": 0,
+        "weak_broad_unanchored_low_evidence_candidates": 0,
+        "strong_reservoir_retained": 0,
+        "strong_reservoir_replaced": 0,
+        "strong_reservoir_cap_dropped": 0,
+        "weak_reservoir_retained": 0,
+        "weak_reservoir_replaced": 0,
+        "weak_reservoir_cap_dropped": 0,
+    }
+
+
+def _count_candidate_strength(stats: dict, strength_label: str) -> None:
+    if strength_label == "strong":
+        stats["strong_candidates"] += 1
+        return
+    stats["weak_candidates"] += 1
+    if strength_label == "weak_partial_generic":
+        stats["weak_partial_generic_candidates"] += 1
+    elif strength_label == "weak_broad_unanchored_low_evidence":
+        stats["weak_broad_unanchored_low_evidence_candidates"] += 1
 
 
 def _build_pre_parse_filter(match_profile) -> LiteralAnchorRawLineFilter | None:
