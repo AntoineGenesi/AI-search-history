@@ -860,7 +860,13 @@ def _run_package_search_variant(
             )
     prefilter = _prefilter_row_stats(result, enabled=use_rg_prefilter)
     searched_bytes = int(result.get("searched_bytes", 0))
-    records_parsed = _estimated_package_records_parsed(files, searched_bytes, prefilter, use_rg_prefilter)
+    records_parsed = _package_records_parsed_from_result(
+        result,
+        files=files,
+        searched_bytes=searched_bytes,
+        prefilter=prefilter,
+        use_rg_prefilter=use_rg_prefilter,
+    )
     row, raw_row = _row_pair(
         case=case,
         baseline=baseline,
@@ -920,6 +926,7 @@ def _run_package_search_variant(
             full_result_output_context_bytes=int(row["output_context_bytes"]),
         )
         raw_row["agent_compact_provenance_handoff"] = compact_handoff
+    row["pre_parse"] = _pre_parse_row_stats(result)
     row["scan_order"] = _scan_order_row(result)
     expected_diagnostics = _expected_ref_diagnostics_row(result)
     if expected_diagnostics is not None:
@@ -1525,17 +1532,59 @@ def _row_pair(
 
 
 def _scan_order_row(result: dict[str, Any]) -> dict[str, Any]:
+    pre_parse = _pre_parse_row_stats(result)
     return {
         "strategy": str(result.get("scan_order_strategy") or "unknown"),
         "record_quantum": int(result.get("scan_record_quantum") or 0),
         "planned_files_count": int(result.get("planned_files_count") or 0),
         "opened_files_count": int(result.get("opened_files_count") or result.get("searched_files") or 0),
         "records_read": int(result.get("records_read") or 0),
+        "raw_lines_examined": int(result.get("raw_lines_examined") or 0),
+        "raw_lines_skipped_before_full_json_parse": int(
+            result.get("raw_lines_skipped_before_full_json_parse") or 0
+        ),
+        "full_json_records_parsed": int(result.get("full_json_records_parsed") or 0),
+        "pre_parse": pre_parse,
         "records_rejected_by_should_consider": int(result.get("records_rejected_by_should_consider") or 0),
         "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "dedupe_strategy": str(result.get("dedupe_strategy") or "unknown"),
         "raw_paths_included": False,
+    }
+
+
+def _pre_parse_row_stats(result: dict[str, Any]) -> dict[str, Any]:
+    stats = result.get("pre_parse")
+    if not isinstance(stats, dict):
+        return {
+            "enabled": False,
+            "eligible": False,
+            "status": "unavailable",
+            "strategy": None,
+            "applies_to": "line_oriented_jsonl_records_only",
+            "needle_policy": None,
+            "needle_count": 0,
+            "anchor_kind_counts": {},
+            "raw_lines_examined": int(result.get("raw_lines_examined") or 0),
+            "raw_lines_skipped_before_full_json_parse": int(
+                result.get("raw_lines_skipped_before_full_json_parse") or 0
+            ),
+            "full_json_records_parsed": int(result.get("full_json_records_parsed") or 0),
+            "raw_anchor_needles_included": False,
+        }
+    return {
+        "enabled": bool(stats.get("enabled")),
+        "eligible": bool(stats.get("eligible")),
+        "status": str(stats.get("status") or "unknown"),
+        "strategy": stats.get("strategy"),
+        "applies_to": str(stats.get("applies_to") or "line_oriented_jsonl_records_only"),
+        "needle_policy": stats.get("needle_policy"),
+        "needle_count": int(stats.get("needle_count") or 0),
+        "anchor_kind_counts": _safe_count_dict(stats.get("anchor_kind_counts")),
+        "raw_lines_examined": int(stats.get("raw_lines_examined") or 0),
+        "raw_lines_skipped_before_full_json_parse": int(stats.get("raw_lines_skipped_before_full_json_parse") or 0),
+        "full_json_records_parsed": int(stats.get("full_json_records_parsed") or 0),
+        "raw_anchor_needles_included": False,
     }
 
 
@@ -1580,12 +1629,19 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                 "expected_file_label": ref.get("expected_file_label"),
                 "expected_file_open_order": ref.get("expected_file_open_order"),
                 "expected_file_records_read_before_stop": int(ref.get("expected_file_records_read_before_stop") or 0),
+                "expected_file_raw_lines_examined_before_stop": int(
+                    ref.get("expected_file_raw_lines_examined_before_stop") or 0
+                ),
                 "expected_file_progress_bucket": str(ref.get("expected_file_progress_bucket") or "unknown"),
+                "expected_file_raw_progress_bucket": str(ref.get("expected_file_raw_progress_bucket") or "unknown"),
                 "expected_file_selected_by_source_plan": bool(ref.get("expected_file_selected_by_source_plan")),
                 "expected_file_queued_for_scan": bool(ref.get("expected_file_queued_for_scan")),
                 "expected_file_opened_before_scan_stop": bool(ref.get("expected_file_opened_before_scan_stop")),
                 "expected_record_line_reached_before_elapsed_stop": bool(
                     ref.get("expected_record_line_reached_before_elapsed_stop")
+                ),
+                "expected_record_skipped_before_full_json_parse": bool(
+                    ref.get("expected_record_skipped_before_full_json_parse")
                 ),
                 "line_reach_status": str(ref.get("line_reach_status") or "unknown"),
                 "would_pass_should_consider": ref.get("would_pass_should_consider"),
@@ -1603,11 +1659,13 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                     ref.get("expected_record_present_in_final_candidate_groups")
                 ),
                 "candidate_strength": ref.get("candidate_strength"),
+                "pre_parse_phase_label": str(ref.get("pre_parse_phase_label") or "unknown"),
                 "should_consider_phase_label": str(ref.get("should_consider_phase_label") or "unknown"),
                 "dedupe_phase_label": str(ref.get("dedupe_phase_label") or "unknown"),
                 "reservoir_phase_label": str(ref.get("reservoir_phase_label") or "unknown"),
                 "final_cap_phase_label": str(ref.get("final_cap_phase_label") or "unknown"),
                 "drop_phase_label": ref.get("drop_phase_label"),
+                "pre_parse_status": str(ref.get("pre_parse_status") or "unknown"),
                 "pre_reservoir_status": str(ref.get("pre_reservoir_status") or "unknown"),
                 "pre_final_status": str(ref.get("pre_final_status") or "unknown"),
                 "final_status": str(ref.get("final_status") or "unknown"),
@@ -1719,6 +1777,19 @@ def _estimated_package_records_parsed(
     return None
 
 
+def _package_records_parsed_from_result(
+    result: dict[str, Any],
+    *,
+    files: list[RealHistoryFile],
+    searched_bytes: int,
+    prefilter: dict[str, Any],
+    use_rg_prefilter: bool,
+) -> int | None:
+    if "full_json_records_parsed" in result:
+        return int(result.get("full_json_records_parsed") or 0)
+    return _estimated_package_records_parsed(files, searched_bytes, prefilter, use_rg_prefilter)
+
+
 def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
     stats = result.get("prefilter") if enabled else None
     if not isinstance(stats, dict):
@@ -1759,6 +1830,45 @@ def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, 
         "bytes_reduced": int(stats.get("bytes_reduced", 0)),
         "files_reduction_ratio": float(stats.get("files_reduction_ratio", 0.0)),
         "bytes_reduction_ratio": float(stats.get("bytes_reduction_ratio", 0.0)),
+    }
+
+
+def _pre_parse_anchor_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        for kind, count in ((row.get("pre_parse") or {}).get("anchor_kind_counts") or {}).items():
+            counts[str(kind)] = counts.get(str(kind), 0) + int(count or 0)
+    return dict(sorted(counts.items()))
+
+
+def _pre_parse_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [row for row in rows if isinstance(row.get("pre_parse"), dict)]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "active_runs": 0,
+            "raw_lines_examined": 0,
+            "raw_lines_skipped_before_full_json_parse": 0,
+            "full_json_records_parsed": 0,
+            "anchor_kind_counts": {},
+            "privacy": {"raw_anchor_needles_included": False},
+        }
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "active_runs": sum(1 for row in selected if (row.get("pre_parse") or {}).get("status") == "active"),
+        "status_counts": _counts((row.get("pre_parse") or {}).get("status") for row in selected),
+        "raw_lines_examined": sum(int((row.get("pre_parse") or {}).get("raw_lines_examined") or 0) for row in selected),
+        "raw_lines_skipped_before_full_json_parse": sum(
+            int((row.get("pre_parse") or {}).get("raw_lines_skipped_before_full_json_parse") or 0)
+            for row in selected
+        ),
+        "full_json_records_parsed": sum(
+            int((row.get("pre_parse") or {}).get("full_json_records_parsed") or 0) for row in selected
+        ),
+        "anchor_kind_counts": _pre_parse_anchor_kind_counts(selected),
+        "privacy": {"raw_anchor_needles_included": False},
     }
 
 
@@ -1811,6 +1921,17 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
                 1 for row in selected if (row.get("rg_prefilter") or {}).get("status") == "used"
             ),
             "rg_prefilter_eligible_runs": sum(1 for row in selected if (row.get("rg_prefilter") or {}).get("eligible")),
+            "pre_parse_statuses": _counts((row.get("pre_parse") or {}).get("status") for row in selected),
+            "pre_parse_active_runs": sum(1 for row in selected if (row.get("pre_parse") or {}).get("status") == "active"),
+            "pre_parse_anchor_kind_counts": _pre_parse_anchor_kind_counts(selected),
+            "raw_lines_examined": sum(int((row.get("pre_parse") or {}).get("raw_lines_examined") or 0) for row in selected),
+            "raw_lines_skipped_before_full_json_parse": sum(
+                int((row.get("pre_parse") or {}).get("raw_lines_skipped_before_full_json_parse") or 0)
+                for row in selected
+            ),
+            "full_json_records_parsed": sum(
+                int((row.get("pre_parse") or {}).get("full_json_records_parsed") or 0) for row in selected
+            ),
         }
     if "package_search" in summary and "package_search_rg_prefilter" in summary:
         summary["package_search_rg_prefilter"]["equivalence_vs_package_search"] = _package_equivalence(rows)
@@ -1838,6 +1959,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "source_ref_equivalence": _package_equivalence(rows),
         "compact_package_handoff": _compact_package_handoff_summary(rows),
+        "pre_parse": _pre_parse_aggregate(rows),
         "no_evidence_correct": {
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
             "correct": sum(1 for row in rows if row.get("no_evidence_correct") is True),

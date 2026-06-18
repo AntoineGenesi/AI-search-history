@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
+import re
 import time
 
-from .adapters import AdapterReadError, iter_records_for_file
+from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
 from .clustering import facets_for_record
 from .masking import MaskContext
 from .query import QueryIntent
@@ -24,6 +26,25 @@ SCAN_RECORD_QUANTUM = 128
 SCAN_ORDER_STRATEGY = "newest_mtime_desc_filename_query_preference_size_asc_path_asc_record_quantum_128_round_robin"
 DEDUPLICATION_STRATEGY = "normalized_text_timestamp_cwd_source_ref_scope_preserving_arbitrary_refs"
 CONTENT_MIRROR_SOURCE_KINDS = {"codex_history", "codex_sessions"}
+PRE_PARSE_STRATEGY = "literal_anchor_raw_line_contains_any_jsonl_only"
+PRE_PARSE_SAFE_STAGES = {"artifact_path", "task_slug"}
+PRE_PARSE_ANCHOR_KINDS = ("path", "task_slug")
+
+
+@dataclass(frozen=True)
+class PreParseAnchor:
+    value: str
+    kind: str
+
+
+class LiteralAnchorRawLineFilter:
+    def __init__(self, anchors: list[PreParseAnchor]) -> None:
+        self.anchors = tuple(anchors)
+        self._needles = tuple(anchor.value.lower() for anchor in anchors)
+
+    def should_parse(self, raw_line: str) -> bool:
+        lowered = raw_line.lower()
+        return any(needle in lowered for needle in self._needles)
 
 
 def search(
@@ -57,6 +78,8 @@ def search(
     planned_files = []
     expected_diag = _init_expected_ref_diagnostics(expected_ref_diagnostics)
     match_profile = build_match_profile(intent)
+    pre_parse_filter = _build_pre_parse_filter(match_profile)
+    raw_line_stats = RawLineScanStats()
 
     for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
         path, size, enum_warnings = enumerated
@@ -97,7 +120,15 @@ def search(
                 searched_bytes += size
                 _mark_opened_file_progress(expected_diag, item, path, searched_files)
                 source_kind = source_kind_for_path(path, plan)
-                item["records"] = iter_records_for_file(path, source_kind, default_tz)
+                item["records"] = iter_records_for_file(
+                    path,
+                    source_kind,
+                    default_tz,
+                    raw_line_filter=pre_parse_filter,
+                    raw_line_stats=raw_line_stats,
+                    on_raw_line_examined=_raw_line_examined_marker(expected_diag, item),
+                    on_raw_line_skipped=_raw_line_skipped_marker(expected_diag, item),
+                )
                 item["opened"] = True
             records = item["records"]
             exhausted = False
@@ -116,6 +147,12 @@ def search(
                 expected_state = _expected_state_for_record(expected_diag, record)
                 if expected_state is not None:
                     expected_state["expected_record_line_reached_before_elapsed_stop"] = True
+                    if pre_parse_filter is not None and expected_state["pre_parse_phase_label"] == "not_reached":
+                        expected_state["pre_parse_phase_label"] = "raw_line_gate_passed"
+                        expected_state["pre_parse_status"] = "passed_raw_line_gate"
+                    elif pre_parse_filter is None and expected_state["pre_parse_phase_label"] == "not_reached":
+                        expected_state["pre_parse_phase_label"] = "raw_line_gate_disabled"
+                        expected_state["pre_parse_status"] = "disabled"
                     expected_state["expected_file_records_read_before_stop"] = int(item.get("records_read") or 0)
                     expected_state["expected_file_progress_bucket"] = _records_read_bucket(
                         int(item.get("records_read") or 0)
@@ -227,6 +264,10 @@ def search(
         "planned_files_count": planned_files_count,
         "opened_files_count": searched_files,
         "records_read": records_read,
+        "raw_lines_examined": raw_line_stats.raw_lines_examined,
+        "raw_lines_skipped_before_full_json_parse": raw_line_stats.raw_lines_skipped_before_full_json_parse,
+        "full_json_records_parsed": raw_line_stats.full_json_records_parsed,
+        "pre_parse": _pre_parse_stats(pre_parse_filter, raw_line_stats),
         "records_rejected_by_should_consider": records_rejected_by_should_consider,
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
@@ -263,11 +304,14 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
             "expected_file_label": None,
             "expected_file_open_order": None,
             "expected_file_records_read_before_stop": 0,
+            "expected_file_raw_lines_examined_before_stop": 0,
             "expected_file_progress_bucket": "not_opened",
+            "expected_file_raw_progress_bucket": "not_opened",
             "expected_file_selected_by_source_plan": False,
             "expected_file_queued_for_scan": False,
             "expected_file_opened_before_scan_stop": False,
             "expected_record_line_reached_before_elapsed_stop": False,
+            "expected_record_skipped_before_full_json_parse": False,
             "would_pass_should_consider": None,
             "deduped_before_scoring": False,
             "expected_record_present_before_reservoir_retention": False,
@@ -275,11 +319,13 @@ def _init_expected_ref_diagnostics(expected_refs: list[dict] | None) -> dict | N
             "expected_record_present_in_final_candidate_refs": False,
             "expected_record_present_in_final_candidate_groups": False,
             "candidate_strength": None,
+            "pre_parse_phase_label": "not_reached",
             "should_consider_phase_label": "not_reached",
             "dedupe_phase_label": "not_reached",
             "reservoir_phase_label": "not_reached",
             "final_cap_phase_label": "not_reached",
             "drop_phase_label": None,
+            "pre_parse_status": "not_reached",
             "pre_reservoir_status": "not_reached",
             "pre_final_status": "not_reached",
             "final_status": "not_reached",
@@ -318,7 +364,10 @@ def _mark_opened_file_progress(expected_diag: dict | None, item: dict, path, ope
         "file_label": item["file_label"],
         "opened_order": opened_order,
         "records_read": 0,
+        "raw_lines_examined": 0,
+        "raw_lines_skipped_before_full_json_parse": 0,
         "records_read_bucket": "0",
+        "raw_lines_examined_bucket": "0",
         "expected_ref_file": str(path) in expected_diag["by_file"],
         "_path": str(path),
     }
@@ -349,6 +398,47 @@ def _mark_opened_file_record_read(expected_diag: dict | None, item: dict) -> Non
         state["expected_file_progress_bucket"] = progress["records_read_bucket"]
 
 
+def _raw_line_examined_marker(expected_diag: dict | None, item: dict):
+    def mark(_path, _line: int) -> None:
+        item["raw_lines_examined"] = int(item.get("raw_lines_examined") or 0) + 1
+        if expected_diag is None:
+            return
+        progress = expected_diag["opened_by_path"].get(str(item["path"]))
+        if progress is not None:
+            progress["raw_lines_examined"] = int(item["raw_lines_examined"])
+            progress["raw_lines_examined_bucket"] = _records_read_bucket(int(item["raw_lines_examined"]))
+        for state in expected_diag["by_file"].get(str(item["path"]), []):
+            state["expected_file_raw_lines_examined_before_stop"] = int(item["raw_lines_examined"])
+            state["expected_file_raw_progress_bucket"] = _records_read_bucket(int(item["raw_lines_examined"]))
+
+    return mark
+
+
+def _raw_line_skipped_marker(expected_diag: dict | None, item: dict):
+    def mark(path, line: int) -> None:
+        item["raw_lines_skipped_before_full_json_parse"] = int(item.get("raw_lines_skipped_before_full_json_parse") or 0) + 1
+        if expected_diag is None:
+            return
+        progress = expected_diag["opened_by_path"].get(str(item["path"]))
+        if progress is not None:
+            progress["raw_lines_skipped_before_full_json_parse"] = int(
+                item.get("raw_lines_skipped_before_full_json_parse") or 0
+            )
+        state = expected_diag["by_ref"].get((str(path), int(line)))
+        if state is None:
+            return
+        state["expected_record_line_reached_before_elapsed_stop"] = True
+        state["expected_record_skipped_before_full_json_parse"] = True
+        state["pre_parse_phase_label"] = "raw_line_gate_skipped"
+        state["pre_parse_status"] = "skipped_before_full_json_parse"
+        state["pre_reservoir_status"] = "skipped_before_full_json_parse"
+        state["pre_final_status"] = "skipped_before_full_json_parse"
+        state["final_status"] = "skipped_before_full_json_parse"
+        state["drop_phase_label"] = "pre_parse_drop"
+
+    return mark
+
+
 def _expected_state_for_record(expected_diag: dict | None, record) -> dict | None:
     if expected_diag is None:
         return None
@@ -365,6 +455,8 @@ def _mark_expected_pre_final_candidates(expected_diag: dict | None, candidates: 
         state["expected_record_present_in_pre_final_candidate_state"] = present
         if present:
             state["pre_final_status"] = "present_in_pre_final_candidate_state"
+        elif state["expected_record_skipped_before_full_json_parse"]:
+            state["pre_final_status"] = "skipped_before_full_json_parse"
         elif state["expected_record_present_before_reservoir_retention"]:
             state["pre_final_status"] = "dropped_by_reservoir_retention"
             if state["reservoir_phase_label"] in {"not_reached", "strong_reservoir_retained", "weak_reservoir_retained"}:
@@ -390,6 +482,9 @@ def _mark_expected_final_candidates(expected_diag: dict | None, candidates: list
         if present:
             state["final_status"] = "present_in_final_candidate_groups"
             state["final_cap_phase_label"] = "present_in_final_output"
+        elif state["expected_record_skipped_before_full_json_parse"]:
+            state["final_status"] = "skipped_before_full_json_parse"
+            state["final_cap_phase_label"] = "pre_parse_drop"
         elif state["expected_record_present_in_pre_final_candidate_state"]:
             state["final_status"] = "lost_between_pre_final_and_final_output"
             state["final_cap_phase_label"] = "final_cap_drop"
@@ -418,18 +513,27 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
                 if state["expected_file_opened_before_scan_stop"]
                 else "file_not_opened"
             )
+        elif state["expected_record_skipped_before_full_json_parse"]:
+            line_reach_status = "raw_line_skipped_before_full_json_parse"
         public_refs.append(
             {
                 "ref_id": state["ref_id"],
                 "expected_file_label": state["expected_file_label"],
                 "expected_file_open_order": state["expected_file_open_order"],
                 "expected_file_records_read_before_stop": int(state["expected_file_records_read_before_stop"]),
+                "expected_file_raw_lines_examined_before_stop": int(
+                    state["expected_file_raw_lines_examined_before_stop"]
+                ),
                 "expected_file_progress_bucket": state["expected_file_progress_bucket"],
+                "expected_file_raw_progress_bucket": state["expected_file_raw_progress_bucket"],
                 "expected_file_selected_by_source_plan": bool(state["expected_file_selected_by_source_plan"]),
                 "expected_file_queued_for_scan": bool(state["expected_file_queued_for_scan"]),
                 "expected_file_opened_before_scan_stop": bool(state["expected_file_opened_before_scan_stop"]),
                 "expected_record_line_reached_before_elapsed_stop": bool(
                     state["expected_record_line_reached_before_elapsed_stop"]
+                ),
+                "expected_record_skipped_before_full_json_parse": bool(
+                    state["expected_record_skipped_before_full_json_parse"]
                 ),
                 "line_reach_status": line_reach_status,
                 "would_pass_should_consider": state["would_pass_should_consider"],
@@ -447,11 +551,13 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
                     state["expected_record_present_in_final_candidate_groups"]
                 ),
                 "candidate_strength": state["candidate_strength"],
+                "pre_parse_phase_label": state["pre_parse_phase_label"],
                 "should_consider_phase_label": state["should_consider_phase_label"],
                 "dedupe_phase_label": state["dedupe_phase_label"],
                 "reservoir_phase_label": state["reservoir_phase_label"],
                 "final_cap_phase_label": state["final_cap_phase_label"],
                 "drop_phase_label": state["drop_phase_label"],
+                "pre_parse_status": state["pre_parse_status"],
                 "pre_reservoir_status": state["pre_reservoir_status"],
                 "pre_final_status": state["pre_final_status"],
                 "final_status": state["final_status"],
@@ -483,7 +589,12 @@ def _public_expected_ref_diagnostics(expected_diag: dict) -> dict:
                 "file_label": item["file_label"],
                 "opened_order": int(item["opened_order"]),
                 "records_read": int(item["records_read"]),
+                "raw_lines_examined": int(item.get("raw_lines_examined") or 0),
+                "raw_lines_skipped_before_full_json_parse": int(
+                    item.get("raw_lines_skipped_before_full_json_parse") or 0
+                ),
                 "records_read_bucket": item["records_read_bucket"],
+                "raw_lines_examined_bucket": item.get("raw_lines_examined_bucket") or "0",
                 "expected_ref_file": bool(item["expected_ref_file"]),
             }
             for item in expected_diag["opened_files"]
@@ -504,6 +615,71 @@ def _records_read_bucket(records_read: int) -> str:
     if records_read <= 8192:
         return "2049-8192"
     return "8193_plus"
+
+
+def _build_pre_parse_filter(match_profile) -> LiteralAnchorRawLineFilter | None:
+    anchors: dict[str, PreParseAnchor] = {}
+    for term in match_profile.active_terms:
+        if term.stage not in PRE_PARSE_SAFE_STAGES:
+            continue
+        value = " ".join(term.term.strip().split())
+        kind = _pre_parse_anchor_kind(value, stage=term.stage)
+        if kind is None:
+            continue
+        anchors[value.lower()] = PreParseAnchor(value=value, kind=kind)
+    if not anchors:
+        return None
+    return LiteralAnchorRawLineFilter(sorted(anchors.values(), key=lambda item: (-len(item.value), item.value)))
+
+
+def _pre_parse_anchor_kind(value: str, *, stage: str) -> str | None:
+    if not _fixed_term_safe(value):
+        return None
+    if stage == "artifact_path" and _path_like_anchor(value):
+        return "path"
+    if stage == "task_slug" and _task_slug_anchor(value):
+        return "task_slug"
+    return None
+
+
+def _path_like_anchor(value: str) -> bool:
+    return bool(
+        re.search(r"(?:^|/)(?:tasks|docs|reports|reviews|src|tests|codex/state/reviews)/[\w./-]+", value)
+        or re.search(r"\.(?:md|html|json|jsonl|csv|txt|py|sh)$", value)
+    )
+
+
+def _task_slug_anchor(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-z]{2,12}-\d+[a-z]?(?:-[a-z0-9]+){0,12}", value.lower()))
+
+
+def _fixed_term_safe(value: str) -> bool:
+    return 2 < len(value) <= 240 and "\x00" not in value
+
+
+def _pre_parse_stats(
+    pre_parse_filter: LiteralAnchorRawLineFilter | None,
+    raw_line_stats: RawLineScanStats,
+) -> dict:
+    anchors = list(pre_parse_filter.anchors) if pre_parse_filter is not None else []
+    anchor_kind_counts: dict[str, int] = {}
+    for anchor in anchors:
+        if anchor.kind in PRE_PARSE_ANCHOR_KINDS:
+            anchor_kind_counts[anchor.kind] = anchor_kind_counts.get(anchor.kind, 0) + 1
+    return {
+        "enabled": pre_parse_filter is not None,
+        "eligible": pre_parse_filter is not None,
+        "status": "active" if pre_parse_filter is not None else "ineligible_query",
+        "strategy": PRE_PARSE_STRATEGY,
+        "applies_to": "line_oriented_jsonl_records_only",
+        "needle_policy": "literal_high_signal_anchors" if pre_parse_filter is not None else None,
+        "needle_count": len(anchors),
+        "anchor_kind_counts": anchor_kind_counts,
+        "raw_lines_examined": int(raw_line_stats.raw_lines_examined),
+        "raw_lines_skipped_before_full_json_parse": int(raw_line_stats.raw_lines_skipped_before_full_json_parse),
+        "full_json_records_parsed": int(raw_line_stats.full_json_records_parsed),
+        "raw_anchor_needles_included": False,
+    }
 
 
 def order_planned_files_for_scan(planned_files: list[tuple], intent: QueryIntent) -> list[tuple]:
