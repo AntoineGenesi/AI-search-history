@@ -198,7 +198,8 @@ def build_compact_provenance_handoff(
         "candidate_count": len(candidates),
         "candidates": compact_candidates,
         "source_refs": source_refs,
-        "source_windows": compact_provenance_source_windows(compact_candidates),
+        "source_windows": list(source_locator_handoff.get("source_windows") or []),
+        "source_window_packaging": source_locator_handoff.get("source_window_packaging", {}),
         "next_reads": list(next_reads or [])[:8],
         "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
         "scope": {
@@ -481,19 +482,7 @@ def compact_provenance_source_refs(
 
 
 def compact_provenance_source_windows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    windows = []
-    for candidate in candidates[:5]:
-        windows.append(
-            {
-                "candidate_id": candidate.get("candidate_id"),
-                "source_ref": candidate.get("source_ref") or {},
-                "target": candidate.get("target"),
-                "window_kind": "emitted_candidate_source_window",
-                "text_included": False,
-                "reason": "open source_ref/next_read target for surrounding transcript context",
-            }
-        )
-    return windows
+    return build_source_windows(candidates=candidates, next_reads=[], query_plan={})
 
 
 def compact_provenance_no_evidence(no_evidence: dict[str, Any], source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
@@ -828,8 +817,15 @@ def build_source_locator_handoff(
     next_read_rows = list(next_reads or [])
     if not next_read_rows:
         next_read_rows = next_reads_from_candidates(candidate_rows)
+    query_plan = source_plan.get("query", {}).get("query_plan") or {}
+    source_windows = build_source_windows(
+        candidates=candidate_rows,
+        next_reads=next_read_rows,
+        query_plan=query_plan,
+    )
     return {
         "schema_version": 1,
+        "query_plan": query_plan,
         "source_family": {
             "primary": source_family,
             "selected_kinds": sorted({root.get("kind", "unknown") for root in sources.get("roots", [])}),
@@ -850,6 +846,16 @@ def build_source_locator_handoff(
             "candidate_count": candidate_count,
             "top_candidates": compact_handoff_candidates(candidate_rows),
         },
+        "source_windows": source_windows,
+        "source_window_packaging": {
+            "schema_version": 1,
+            "status": "packaged" if source_windows else "no_candidate_windows",
+            "candidate_window_count": len(source_windows),
+            "builder": "source_locator_handoff",
+            "raw_text_included": False,
+            "source_window_text_included": False,
+            "open_next_metadata_only": True,
+        },
         "next_reads": next_read_rows[:8],
         "no_evidence_meaning": {
             "answer_scope": "not_found_in_searched_scope",
@@ -859,6 +865,8 @@ def build_source_locator_handoff(
         "privacy_boundaries": {
             "root_metadata_raw_paths_included": False,
             "raw_private_text_or_bridge_payload_included": False,
+            "raw_private_text_or_snippets_in_source_windows_included": False,
+            "source_window_text_included": False,
             "vectors_indexes_or_timestamp_sidecars_created": False,
             "candidate_source_refs_may_point_to_local_transcripts": bool(candidate_count),
         },
@@ -870,6 +878,99 @@ def build_source_locator_handoff(
         },
         "non_default_routes": ["embeddings:not_run", "timestamp_sidecars:not_run", "semantic_linter_runtime:not_used", "private_bridges:not_included", "broad_drive_scans:guarded"],
     }
+
+
+def build_source_windows(
+    *,
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+    next_reads: list[dict[str, Any]],
+    query_plan: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    windows: list[dict[str, Any]] = []
+    next_read_by_candidate = {
+        str(read.get("candidate_id") or ""): read for read in next_reads if read.get("candidate_id") is not None
+    }
+    primary_intent = (query_plan or {}).get("primary_intent") or "generic_history"
+    window_needs = list((query_plan or {}).get("source_window_needs") or [])
+    for index, candidate in enumerate(candidates[:5], 1):
+        data = candidate_to_source_window_data(candidate)
+        source_ref = data["source_ref"]
+        target = source_ref_target(source_ref)
+        candidate_id = str(data.get("candidate_id") or "")
+        next_read = next_read_by_candidate.get(candidate_id) or {
+            "kind": "jsonl_source_ref",
+            "target": target,
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "reason": "open source_ref target for surrounding transcript context",
+        }
+        windows.append(
+            {
+                "schema_version": 1,
+                "window_id": f"sw{index:03d}",
+                "candidate_id": candidate_id,
+                "source_ref": source_ref,
+                "target": target,
+                "intent": primary_intent,
+                "window_kind": source_window_kind(primary_intent, window_needs),
+                "role": data.get("role"),
+                "timestamp_utc": data.get("timestamp_utc"),
+                "cwd": data.get("cwd"),
+                "project_hint": project_hint_from_cwd(data.get("cwd")),
+                "reason_codes": data.get("reason_codes", []),
+                "next_read": next_read,
+                "text_included": False,
+                "source_window_text_included": False,
+                "reason": "open source_ref target for surrounding transcript context",
+                "open_instruction": "open source_ref target for surrounding transcript context",
+                "searched_scope_boundary": {
+                    "answer_scope": "candidate_from_searched_scope",
+                    "not_all_history_absence": True,
+                },
+            }
+        )
+    return windows
+
+
+def candidate_to_source_window_data(candidate: dict[str, Any] | CandidateRow) -> dict[str, Any]:
+    if isinstance(candidate, CandidateRow):
+        return {
+            "candidate_id": candidate.candidate_id,
+            "source_ref": candidate.source_ref,
+            "role": candidate.role,
+            "timestamp_utc": candidate.timestamp_utc,
+            "cwd": candidate.cwd,
+            "reason_codes": list(candidate.reason_codes)[:8],
+        }
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "source_ref": candidate.get("source_ref") or {},
+        "role": candidate.get("role"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "cwd": candidate.get("cwd"),
+        "reason_codes": list(candidate.get("reason_codes", []))[:8],
+    }
+
+
+def source_window_kind(primary_intent: str, window_needs: list[str]) -> str:
+    for kind in ("decision_context", "failure_timeline", "user_wording", "topic_context", "next_reads"):
+        if kind in window_needs:
+            return kind
+    if primary_intent == "why":
+        return "decision_context"
+    if primary_intent == "workflow_failure":
+        return "failure_timeline"
+    if primary_intent == "when_user_said":
+        return "user_wording"
+    if primary_intent == "what_was_i_talking_about":
+        return "topic_context"
+    return "candidate_context"
+
+
+def project_hint_from_cwd(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    return Path(str(cwd)).name or None
 
 
 def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:

@@ -117,6 +117,28 @@ DATE_METADATA_REASONS = {"date window", "duration window", "last run", "runtime"
 
 
 @dataclass
+class QueryPlan:
+    schema_version: int
+    primary_intent: str
+    detected_intents: list[str]
+    anchor_terms: list[str]
+    field_hints: dict
+    source_window_needs: list[str]
+    privacy: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "primary_intent": self.primary_intent,
+            "detected_intents": self.detected_intents,
+            "anchor_terms": self.anchor_terms,
+            "field_hints": self.field_hints,
+            "source_window_needs": self.source_window_needs,
+            "privacy": self.privacy,
+        }
+
+
+@dataclass
 class QueryIntent:
     original: str
     normalized: str
@@ -132,6 +154,7 @@ class QueryIntent:
     base_terms: list[str] = field(default_factory=list)
     expansion_reasons: dict[str, list[str]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    query_plan: QueryPlan | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -151,6 +174,7 @@ class QueryIntent:
             },
             "artifact_hints": self.artifact_hints,
             "warnings": self.warnings,
+            "query_plan": self.query_plan.to_dict() if self.query_plan else None,
         }
 
 
@@ -175,6 +199,16 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
     warnings: list[str] = []
     if not terms and not (start and end):
         warnings.append("No concrete terms or date window inferred; search may be broad within selected transcript roots.")
+    query_plan = build_query_plan(
+        normalized=normalized,
+        base_terms=base_terms,
+        artifact_hints=artifact_hints,
+        role=inferred_role,
+        temporal_question_reason=temporal_question_reason,
+        date_reason=reason,
+        date_window_start=start,
+        date_window_end=end,
+    )
     return QueryIntent(
         original=query,
         normalized=normalized,
@@ -190,7 +224,97 @@ def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryI
         base_terms=base_terms,
         expansion_reasons=expanded.reasons,
         warnings=warnings,
+        query_plan=query_plan,
     )
+
+
+def build_query_plan(
+    *,
+    normalized: str,
+    base_terms: list[str],
+    artifact_hints: list[str],
+    role: str | None,
+    temporal_question_reason: str | None,
+    date_reason: str | None,
+    date_window_start: datetime | None,
+    date_window_end: datetime | None,
+) -> QueryPlan:
+    detected: list[str] = []
+    if re.search(r"\b(when\s+did\s+i\s+(?:say|tell|mention)|when\s+did\s+user\s+say|what\s+date\s+did\s+i\s+say)\b", normalized):
+        detected.append("when_user_said")
+    if re.search(r"\b(where\s+did\b.*\b(?:go\s+wrong|fail)|where\b.*\bworkflow\b.*\bwrong|went\s+wrong|workflow\s+failure|failure|failed|regression|error)\b", normalized):
+        detected.append("workflow_failure")
+    if re.search(r"\b(why|reason|because|cause|caused|decision|decide|decided|rationale)\b", normalized):
+        detected.append("why")
+    if re.search(r"\b(what\s+was\s+i\s+talking\s+about|what\s+were\s+we\s+(?:talking\s+about|discussing)|talking\s+about\s+then|discussing\s+then)\b", normalized):
+        detected.append("what_was_i_talking_about")
+    if re.search(r"\b(source\s+refs?|next\s+reads?|open\s+next|what\s+should\s+i\s+open|where\s+should\s+i\s+read)\b", normalized):
+        detected.append("source_next_reads")
+    if temporal_question_reason and role == "user" and "when_user_said" not in detected:
+        detected.append("when_user_said")
+    if not detected:
+        detected.append("generic_history")
+    detected = _unique_ordered(detected)
+    primary = detected[0]
+    roles = _query_plan_roles(primary, role)
+    field_hints = {
+        "roles": roles,
+        "timestamp": {
+            "wanted": bool(temporal_question_reason or date_reason or primary in {"when_user_said", "workflow_failure"}),
+            "window": {
+                "start": date_window_start.isoformat() if date_window_start else None,
+                "end": date_window_end.isoformat() if date_window_end else None,
+                "reason": date_reason,
+            },
+        },
+        "cwd_project": {"wanted": True},
+        "tool_events": {"wanted": primary in {"why", "workflow_failure", "source_next_reads"}},
+        "artifact_paths": list(artifact_hints)[:20],
+        "source_refs": {"wanted": True},
+    }
+    return QueryPlan(
+        schema_version=1,
+        primary_intent=primary,
+        detected_intents=detected,
+        anchor_terms=list(base_terms)[:24],
+        field_hints=field_hints,
+        source_window_needs=_query_plan_source_window_needs(detected),
+        privacy={
+            "raw_query_text_included": False,
+            "private_transcript_text_included": False,
+        },
+    )
+
+
+def _query_plan_roles(primary_intent: str, role: str | None) -> list[str]:
+    roles: list[str] = []
+    if role:
+        roles.append(role)
+    if primary_intent == "when_user_said":
+        roles.append("user")
+    elif primary_intent == "workflow_failure":
+        roles.extend(["assistant", "tool", "user"])
+    elif primary_intent == "why":
+        roles.extend(["assistant", "user", "tool"])
+    return _unique_ordered(roles)
+
+
+def _query_plan_source_window_needs(detected_intents: list[str]) -> list[str]:
+    needs: list[str] = []
+    for intent in detected_intents:
+        if intent == "why":
+            needs.append("decision_context")
+        elif intent == "workflow_failure":
+            needs.append("failure_timeline")
+        elif intent == "when_user_said":
+            needs.append("user_wording")
+        elif intent == "what_was_i_talking_about":
+            needs.append("topic_context")
+        elif intent == "source_next_reads":
+            needs.append("next_reads")
+    if not needs:
+        needs.append("candidate_context")
+    return _unique_ordered(needs)
 
 
 def infer_temporal_question(normalized: str) -> str | None:
