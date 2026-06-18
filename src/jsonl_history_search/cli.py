@@ -1553,7 +1553,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.report_output:
             output_path = Path(args.report_output).expanduser()
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(rendered, encoding="utf-8")
+            output_path.write_text(render(payload, "json"), encoding="utf-8")
             markdown_path = (
                 Path(args.markdown_report_output).expanduser()
                 if args.markdown_report_output
