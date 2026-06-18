@@ -10,6 +10,7 @@ from typing import Any
 
 from .agent_contract import (
     build_agent_find_payload,
+    build_compact_provenance_handoff,
     build_source_scope_summary,
     build_source_locator_handoff,
     estimate_tokens,
@@ -74,6 +75,7 @@ def build_semantic_debug_payload(
         manifest_report=None,
         output_format=getattr(args, "format", "json"),
         report_output=getattr(args, "report_output", None),
+        compact_provenance_handoff=False,
     )
     agent_find = agent_payload["agent_find"]
 
@@ -169,6 +171,15 @@ def build_semantic_debug_payload(
             "native_scanner_default": False,
         },
     }
+    if getattr(args, "compact_provenance_handoff", False):
+        packet["compact_provenance_handoff"] = build_compact_provenance_handoff(
+            status=packet["status"],
+            command_surface="semantic_debug",
+            candidates=candidates,
+            source_locator_handoff=source_locator_handoff,
+            next_reads=next_reads,
+            no_evidence=no_evidence,
+        )
     return {
         "semantic_debug": packet,
         "warnings": sorted(set(result.get("warnings", []) + tool_payload.get("warnings", []) + (forensics_payload or {}).get("warnings", []))),
