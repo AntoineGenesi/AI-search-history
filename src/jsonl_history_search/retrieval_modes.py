@@ -7,7 +7,11 @@ from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .profiling import finish_phase_profile, start_phase_profile
 from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT, RrfLane, fuse_ranked_groups
 from .scanner import search
-from .sources import build_command_local_source_catalog, materialize_planned_jsonl_files
+from .sources import (
+    build_command_local_source_catalog,
+    build_command_local_source_plan,
+    materialize_planned_jsonl_files,
+)
 
 
 RETRIEVAL_MODE_PACKAGE = "package"
@@ -74,9 +78,10 @@ def run_fielded_bm25_retrieval(
     )
     enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
     source_catalog = build_command_local_source_catalog(plan, planned_jsonl_files)
+    selected_jsonl_files, source_plan = build_command_local_source_plan(plan, planned_jsonl_files, intent)
 
     fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
-    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
+    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=selected_jsonl_files)
     fielded_index_profile = finish_phase_profile(
         fielded_index_profile_token,
         indexed_file_count=int(fielded_index.metrics.get("indexed_files", 0)),
@@ -112,6 +117,7 @@ def run_fielded_bm25_retrieval(
         total_profile_token,
         candidate_count=fielded_count,
         planned_file_count=planned_jsonl_files.file_count,
+        selected_file_count=selected_jsonl_files.file_count,
         searched_files=int(fielded_result.get("searched_files", 0)),
         searched_bytes=int(fielded_result.get("searched_bytes", 0)),
     )
@@ -128,6 +134,7 @@ def run_fielded_bm25_retrieval(
                 enumeration_elapsed_ms=enumeration_elapsed_ms,
                 planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
                 source_catalog=source_catalog,
+                source_plan=source_plan,
                 warnings=warnings,
                 profiles={
                     "total_fielded_bm25_retrieval": total_profile,
@@ -296,6 +303,7 @@ def build_fielded_bm25_retrieval_diagnostics(
     enumeration_elapsed_ms: float,
     planned_jsonl_file_diagnostics: dict[str, Any],
     source_catalog: dict[str, Any],
+    source_plan: dict[str, Any],
     warnings: list[str],
     profiles: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -361,6 +369,7 @@ def build_fielded_bm25_retrieval_diagnostics(
             "consumed_by_lanes": [RETRIEVAL_MODE_FIELDED_BM25],
         },
         "source_catalog": source_catalog,
+        "source_plan": source_plan,
         "fielded_bm25": fielded_summary,
         "fielded_source_grouping": fielded_source_grouping,
         "phase_profiles": {

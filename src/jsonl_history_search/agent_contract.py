@@ -319,6 +319,7 @@ def build_stage_diagnostics(
     fielded = pressure.get("fielded_bm25") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
+    source_plan = sanitize_source_plan(pressure.get("source_plan") or diagnostics.get("source_plan") or {})
     grouping = pressure.get("fielded_source_grouping") or {}
     cap_labels = list(pressure.get("cap_labels") or diagnostics.get("cap_labels") or [])
     candidate_count = int(pressure.get("fielded_bm25", {}).get("candidate_count") or 0)
@@ -344,6 +345,7 @@ def build_stage_diagnostics(
                 "byte_count": int(source_enumeration.get("byte_count") or 0),
                 "consumed_by_lane_count": len(source_enumeration.get("consumed_by_lanes") or []),
                 "source_catalog": source_catalog,
+                "source_plan": source_plan,
             },
         ),
         stage_diagnostic(
@@ -458,6 +460,9 @@ def build_stage_diagnostics(
                 "candidate_rows_found": int(no_evidence_report.get("candidate_rows_found") or candidate_count),
                 "searched_files": int((no_evidence_report.get("searched_scope") or {}).get("searched_files") or 0),
                 "searched_bytes": int((no_evidence_report.get("searched_scope") or {}).get("searched_bytes") or 0),
+                "selected_source_count": int(source_plan.get("sources_selected") or 0),
+                "pruned_source_count": int(source_plan.get("sources_pruned_hard") or 0),
+                "deferred_source_count": int(source_plan.get("sources_deferred_budget") or 0),
                 "not_all_history_absence": bool(no_evidence_report.get("not_all_history_absence", True)),
             },
         ),
@@ -474,6 +479,7 @@ def build_stage_diagnostics(
             candidate_count=candidate_count,
         ),
         "source_catalog": source_catalog,
+        "source_plan": source_plan,
         "claim_boundaries": {
             "token_savings_claim_supported": False,
             "final_answer_quality_claim_supported": False,
@@ -619,6 +625,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     result_completeness = "lower_bound_due_to_caps" if capped else "complete_within_configured_caps"
     shared_source_enumeration = diagnostics.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(diagnostics.get("source_catalog") or {})
+    source_plan = sanitize_source_plan(diagnostics.get("source_plan") or {})
     fielded_bm25 = diagnostics.get("fielded_bm25") or {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
@@ -639,6 +646,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "raw_paths_included": False,
         },
         "source_catalog": source_catalog,
+        "source_plan": source_plan,
         "fielded_bm25": {
             "status": fielded_bm25.get("status"),
             "candidate_count": int(fielded_bm25.get("candidate_count") or 0),
@@ -721,6 +729,51 @@ def sanitize_source_catalog(catalog: Any) -> dict[str, Any]:
         "rejected_root_count": int(catalog.get("rejected_root_count") or 0),
         "warning_count": int(catalog.get("warning_count") or 0),
         "elapsed_ms": float(catalog.get("elapsed_ms") or 0.0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "persistent_index_or_cache_used": False,
+    }
+
+
+def sanitize_source_plan(source_plan: Any) -> dict[str, Any]:
+    if not isinstance(source_plan, dict):
+        source_plan = {}
+    prune_reasons = source_plan.get("prune_reasons") if isinstance(source_plan.get("prune_reasons"), dict) else {}
+    materialization_budget = (
+        source_plan.get("materialization_budget") if isinstance(source_plan.get("materialization_budget"), dict) else {}
+    )
+    date_window = source_plan.get("date_window") if isinstance(source_plan.get("date_window"), dict) else {}
+    return {
+        "schema_version": int(source_plan.get("schema_version") or 1),
+        "source": str(source_plan.get("source") or "command_local_source_plan"),
+        "basis": str(source_plan.get("basis") or "command_local_source_catalog"),
+        "selection_policy": str(
+            source_plan.get("selection_policy") or "hard_prune_only_path_date_bucket_disjoint_from_intent_date_window"
+        ),
+        "sources_total": int(source_plan.get("sources_total") or 0),
+        "sources_selected": int(source_plan.get("sources_selected") or 0),
+        "sources_pruned_hard": int(source_plan.get("sources_pruned_hard") or 0),
+        "sources_deferred_budget": int(source_plan.get("sources_deferred_budget") or 0),
+        "sources_unknown_or_undated_selected": int(source_plan.get("sources_unknown_or_undated_selected") or 0),
+        "byte_count_total": int(source_plan.get("byte_count_total") or 0),
+        "byte_count_selected": int(source_plan.get("byte_count_selected") or 0),
+        "prune_reasons": {str(key): int(value or 0) for key, value in sorted(prune_reasons.items())},
+        "materialization_budget": {
+            "max_files": int(materialization_budget.get("max_files") or 0),
+            "max_bytes": int(materialization_budget.get("max_bytes") or 0),
+            "max_elapsed": float(materialization_budget.get("max_elapsed") or 0.0),
+            "effective_files": int(materialization_budget.get("effective_files") or 0),
+            "effective_bytes": int(materialization_budget.get("effective_bytes") or 0),
+        },
+        "exhaustive_available": bool(source_plan.get("exhaustive_available", False)),
+        "date_window": {
+            "present": bool(date_window.get("present", False)),
+            "start": date_window.get("start") if date_window.get("start") is None else str(date_window.get("start")),
+            "end": date_window.get("end") if date_window.get("end") is None else str(date_window.get("end")),
+            "raw_query_text_included": False,
+        },
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_session_ids_included": False,
@@ -1821,6 +1874,10 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
     sources = source_plan.get("sources", {})
     roots = list(sources.get("roots", []))
     rejected_roots = list(sources.get("rejected_roots", []))
+    retrieval_diagnostics = search_result.get("retrieval_diagnostics") if isinstance(search_result, dict) else {}
+    retrieval_source_plan = sanitize_source_plan(
+        retrieval_diagnostics.get("source_plan") if isinstance(retrieval_diagnostics, dict) else {}
+    )
     blind_spots = list(search_result.get("blind_spots", []) or sources.get("blind_spots", []))
     missing_roots = [root for root in roots if root_is_missing(root, blind_spots)]
     missing_paths = {root.get("path") for root in missing_roots}
@@ -1838,6 +1895,10 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
         not_searched_notes.append("At least one cap stopped enumeration, scanning, or candidate retention before full selected-root coverage.")
     if rejected_roots:
         not_searched_notes.append("Rejected roots are listed separately under excluded_scope and were not traversed.")
+    if retrieval_source_plan["sources_pruned_hard"] > 0:
+        not_searched_notes.append("Fielded BM25 searched only source-plan selected files; date-disjoint files were pruned before indexing.")
+    if retrieval_source_plan["sources_deferred_budget"] > 0:
+        not_searched_notes.append("Some source-plan files were deferred by budget and were not searched.")
     return {
         "terms": sources.get("scope_terms", []),
         "selected_roots": [compact_scope_root(root) for root in roots],
@@ -1846,6 +1907,9 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
             "roots": [compact_scope_root(root) for root in searched_roots],
             "searched_files": search_result.get("searched_files", 0),
             "searched_bytes": search_result.get("searched_bytes", 0),
+            "source_plan_selected_files": retrieval_source_plan["sources_selected"],
+            "source_plan_pruned_files": retrieval_source_plan["sources_pruned_hard"],
+            "source_plan_deferred_files": retrieval_source_plan["sources_deferred_budget"],
             "result_meaning": "not_found_in_this_scope_only" if not search_result.get("groups") else "candidates_found_in_this_scope",
         },
         "excluded_scope": {
@@ -1858,6 +1922,16 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
             "missing_root_count": len(missing_roots),
             "cap_limited": cap_hit,
             "outside_selected_roots": "not searched unless explicitly selected with safe caps",
+            "source_plan": {
+                "sources_total": retrieval_source_plan["sources_total"],
+                "sources_selected": retrieval_source_plan["sources_selected"],
+                "sources_pruned_hard": retrieval_source_plan["sources_pruned_hard"],
+                "sources_deferred_budget": retrieval_source_plan["sources_deferred_budget"],
+                "prune_reasons": retrieval_source_plan["prune_reasons"],
+                "exhaustive_available": retrieval_source_plan["exhaustive_available"],
+                "raw_paths_included": False,
+                "raw_text_included": False,
+            },
             "notes": not_searched_notes,
         },
         "cap_hit": cap_hit,
