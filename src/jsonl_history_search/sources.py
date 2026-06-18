@@ -124,6 +124,35 @@ class PlannedJsonlFiles:
         }
 
 
+def build_command_local_source_catalog(plan: SourcePlan, planned_jsonl_files: PlannedJsonlFiles) -> dict:
+    source_kind_counts: dict[str, int] = {}
+    for path, _size in planned_jsonl_files.files:
+        source_kind = source_kind_for_path(path, plan)
+        source_kind_counts[source_kind] = source_kind_counts.get(source_kind, 0) + 1
+    cap_labels = cap_labels_from_warnings(list(planned_jsonl_files.warnings))
+    return {
+        "schema_version": 1,
+        "source": "command_local_source_catalog",
+        "basis": planned_jsonl_files.source,
+        "file_count": planned_jsonl_files.file_count,
+        "byte_count": planned_jsonl_files.byte_count,
+        "source_kind_counts": dict(sorted(source_kind_counts.items())),
+        "cap_labels": cap_labels,
+        "cap_hits": cap_hits_from_warnings(list(planned_jsonl_files.warnings)),
+        "selected_file_count": planned_jsonl_files.file_count,
+        "skipped_file_count": 0,
+        "selected_root_count": len(plan.roots),
+        "rejected_root_count": len(plan.rejected_roots),
+        "warning_count": len(planned_jsonl_files.warnings),
+        "elapsed_ms": planned_jsonl_files.elapsed_ms,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "persistent_index_or_cache_used": False,
+    }
+
+
 def build_source_plan(
     *,
     cwd: Path,
