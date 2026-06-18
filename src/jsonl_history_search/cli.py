@@ -17,8 +17,11 @@ from .agent_loop_cost import (
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .compact_handoff_usefulness import (
+    DEFAULT_ANSWER_USE_FIXTURE as DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE,
     DEFAULT_FIXTURE as DEFAULT_COMPACT_HANDOFF_USEFULNESS_FIXTURE,
+    build_compact_handoff_answer_use_eval_payload,
     build_compact_handoff_usefulness_eval_payload,
+    render_compact_handoff_answer_use_markdown,
     render_compact_handoff_usefulness_markdown,
 )
 from .evaluation import build_efficiency_eval
@@ -479,6 +482,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the compact handoff usefulness report should be written.",
+    )
+    compact_handoff_answer_use = subparsers.add_parser("compact-handoff-answer-use-eval")
+    compact_handoff_answer_use.add_argument(
+        "--fixture",
+        default=str(DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE),
+        help="Committed approved-safe compact-handoff answer-use fixture.",
+    )
+    compact_handoff_answer_use.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    compact_handoff_answer_use.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the compact handoff answer-use report should be written.",
     )
     real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
     add_common_args(real_history_impact)
@@ -1581,6 +1596,20 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         status = payload["compact_handoff_usefulness_eval"]["status"]
+        return 1 if status == "invalid_fixture" else 0
+    if args.command == "compact-handoff-answer-use-eval":
+        payload = build_compact_handoff_answer_use_eval_payload(Path(args.fixture).expanduser())
+        rendered = (
+            render(payload, "json")
+            if args.format == "json"
+            else render_compact_handoff_answer_use_markdown(payload)
+        )
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["compact_handoff_answer_use_eval"]["status"]
         return 1 if status == "invalid_fixture" else 0
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)
