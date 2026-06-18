@@ -253,6 +253,7 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
     shared_source_enumeration = diagnostics.get("shared_source_enumeration") or {}
     duplicate_local_work = diagnostics.get("duplicate_local_work") or {}
     lane_file_overlap = diagnostics.get("lane_file_overlap") or {}
+    fielded_ordering = diagnostics.get("fielded_informed_package_ordering") or {}
     claim_boundaries = diagnostics.get("claim_boundaries") or {}
 
     return {
@@ -288,6 +289,21 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "overlap_file_count": int(lane_file_overlap.get("overlap_file_count") or 0),
             "union_file_count": int(lane_file_overlap.get("union_file_count") or 0),
             "raw_paths_included": False,
+        },
+        "fielded_informed_package_ordering": {
+            "enabled": bool(fielded_ordering.get("enabled", False)),
+            "status": str(fielded_ordering.get("status") or "disabled"),
+            "planned_file_count": int(fielded_ordering.get("planned_file_count") or 0),
+            "prioritized_file_count": int(fielded_ordering.get("prioritized_file_count") or 0),
+            "package_opened_prioritized_file_count": int(
+                fielded_ordering.get("package_opened_prioritized_file_count") or 0
+            ),
+            "raw_paths_included": False,
+            "complete_planned_file_set_preserved": bool(
+                fielded_ordering.get("complete_planned_file_set_preserved", True)
+            ),
+            "fielded_priority_excludes_non_prioritized_files": False,
+            "no_exclusion_semantics": True,
         },
         "claim_boundaries": {
             "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),

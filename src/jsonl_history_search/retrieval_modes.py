@@ -66,28 +66,6 @@ def run_rrf_fusion_retrieval(
     )
     enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
 
-    package_profile_token = start_phase_profile("package_lane")
-    package_result = search(
-        plan,
-        intent,
-        default_tz=default_tz,
-        cwd=cwd,
-        mask_context=mask_context,
-        use_rg_prefilter=use_rg_prefilter,
-        planned_jsonl_files=planned_jsonl_files,
-        include_private_diagnostics=True,
-    )
-    package_count = _candidate_count(package_result)
-    package_profile = finish_phase_profile(
-        package_profile_token,
-        candidate_count=package_count,
-        searched_files=int(package_result.get("searched_files", 0)),
-        searched_bytes=int(package_result.get("searched_bytes", 0)),
-        records_considered=int(package_result.get("records_considered", 0)),
-    )
-    package_elapsed_ms = float(package_profile["elapsed_ms"])
-    package_searched_paths = set(package_result.pop("_searched_file_paths", []) or [])
-
     fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
     fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
     fielded_index_profile = finish_phase_profile(
@@ -118,6 +96,29 @@ def run_rrf_fusion_retrieval(
     )
     fielded_elapsed_ms = float(fielded_profile["elapsed_ms"])
     fielded_searched_paths = set(fielded_result.pop("_searched_file_paths", []) or [])
+
+    package_profile_token = start_phase_profile("package_lane")
+    package_result = search(
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        mask_context=mask_context,
+        use_rg_prefilter=use_rg_prefilter,
+        planned_jsonl_files=planned_jsonl_files,
+        include_private_diagnostics=True,
+        prioritized_file_paths=fielded_searched_paths,
+    )
+    package_count = _candidate_count(package_result)
+    package_profile = finish_phase_profile(
+        package_profile_token,
+        candidate_count=package_count,
+        searched_files=int(package_result.get("searched_files", 0)),
+        searched_bytes=int(package_result.get("searched_bytes", 0)),
+        records_considered=int(package_result.get("records_considered", 0)),
+    )
+    package_elapsed_ms = float(package_profile["elapsed_ms"])
+    package_searched_paths = set(package_result.pop("_searched_file_paths", []) or [])
 
     fusion_profile_token = start_phase_profile("rrf_fusion")
     fused_result = fuse_ranked_groups(
@@ -218,6 +219,10 @@ def build_rrf_retrieval_diagnostics(
     ) if overlap else 0
     cap_labels = cap_labels_from_warnings(warnings)
     fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
+    fielded_ordering = _fielded_priority_ordering_diagnostics(
+        package_result=package_result,
+        planned_file_count=int(planned_jsonl_file_diagnostics.get("file_count") or 0),
+    )
     return {
         "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
         "feature_state": "active_explicit_opt_in",
@@ -229,7 +234,7 @@ def build_rrf_retrieval_diagnostics(
             "capped": bool(cap_labels),
             "cap_labels": cap_labels,
             "costlier_than_package_lane": True,
-            "reason": "rrf_fusion_runs_package_search_plus_fielded_bm25_before_rank_fusion",
+            "reason": "rrf_fusion_runs_fielded_bm25_then_package_search_before_rank_fusion",
         },
         "shared_source_enumeration": {
             **planned_jsonl_file_diagnostics,
@@ -300,6 +305,7 @@ def build_rrf_retrieval_diagnostics(
             "fielded_only_file_count": len(fielded_searched_paths - package_searched_paths),
             "planned_file_count": int(planned_jsonl_file_diagnostics.get("file_count") or 0),
         },
+        "fielded_informed_package_ordering": fielded_ordering,
         "duplicate_local_work": {
             "raw_paths_included": False,
             "enumeration_reused": True,
@@ -334,6 +340,7 @@ def build_rrf_retrieval_diagnostics(
             "tuned_lane_weights_used": False,
             "fused_score_threshold_used": False,
             "scanner_scheduling_constants_changed": False,
+            "package_lane_scoped_or_skipped": False,
         },
     }
 
@@ -375,6 +382,45 @@ def _fielded_materialization_diagnostics(fielded_result: dict[str, Any]) -> dict
         "source_lines_included": False,
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_priority_ordering_diagnostics(
+    *,
+    package_result: dict[str, Any],
+    planned_file_count: int,
+) -> dict[str, Any]:
+    ordering = package_result.get("fielded_priority_scan_order") if isinstance(package_result, dict) else {}
+    if not isinstance(ordering, dict):
+        ordering = {}
+    opened_prioritized = [
+        {
+            "file_label": str(item.get("file_label") or ""),
+            "opened_order": int(item.get("opened_order") or 0),
+        }
+        for item in (ordering.get("opened_prioritized_files") or [])
+        if isinstance(item, dict) and item.get("file_label")
+    ]
+    return {
+        "enabled": bool(ordering.get("enabled", False)),
+        "status": str(ordering.get("status") or "disabled"),
+        "priority_source": str(ordering.get("priority_source") or "fielded_bm25_candidate_or_opened_files"),
+        "planned_file_count": planned_file_count,
+        "package_planned_file_count": int(ordering.get("planned_file_count") or 0),
+        "prioritized_file_count": int(ordering.get("prioritized_file_count") or 0),
+        "non_prioritized_file_count": int(ordering.get("non_prioritized_file_count") or 0),
+        "package_opened_prioritized_file_count": int(ordering.get("opened_prioritized_file_count") or 0),
+        "package_opened_prioritized_files": opened_prioritized,
+        "prioritized_file_labels": list(ordering.get("prioritized_file_labels") or []),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "opened_order_labels_include_raw_paths": False,
+        "all_planned_package_files_remain_queued": True,
+        "complete_planned_file_set_preserved": bool(ordering.get("all_planned_files_preserved", True)),
+        "fielded_priority_excludes_non_prioritized_files": False,
+        "no_exclusion_semantics": True,
+        "package_lane_scoped": False,
+        "package_lane_skipped": False,
     }
 
 
