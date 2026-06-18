@@ -2939,6 +2939,19 @@ def render_real_history_impact_text(payload: dict) -> str:
                 "Cap-hit rows by label: "
                 + ", ".join(f"{label}={count}" for label, count in sorted(cap_counts.items()))
             )
+    pre_parse = (report.get("aggregate") or {}).get("pre_parse") or {}
+    if pre_parse:
+        lines.append(
+            "pre_parse: "
+            f"status={pre_parse.get('status')} "
+            f"runs={pre_parse.get('runs')} "
+            f"active={pre_parse.get('active_runs')} "
+            f"statuses={pre_parse.get('status_counts')} "
+            f"anchors={pre_parse.get('anchor_kind_counts')} "
+            f"raw_examined={pre_parse.get('raw_lines_examined')} "
+            f"skipped_before_parse={pre_parse.get('raw_lines_skipped_before_full_json_parse')} "
+            f"full_json_records_parsed={pre_parse.get('full_json_records_parsed')}"
+        )
     for gate_name in ("ranking_quality_gate", "rg_prefilter_gate"):
         gate = report.get(gate_name) or {}
         if gate:
@@ -3119,6 +3132,28 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                     f"`{_escape_markdown_table(str(baseline))}` | "
                     f"{_escape_markdown_table(count_text or '(none)')} |"
                 )
+    pre_parse = (report.get("aggregate") or {}).get("pre_parse") or {}
+    if pre_parse:
+        privacy = pre_parse.get("privacy") or {}
+        lines.extend(
+            [
+                "",
+                "## Pre-Parse Raw-Line Gate",
+                "",
+                f"- Status: `{pre_parse.get('status')}`",
+                f"- Runs: `{pre_parse.get('runs')}`",
+                f"- Active runs: `{pre_parse.get('active_runs')}`",
+                f"- Status counts: `{pre_parse.get('status_counts')}`",
+                f"- Anchor-kind counts: `{pre_parse.get('anchor_kind_counts')}`",
+                f"- Raw JSONL lines examined: `{pre_parse.get('raw_lines_examined')}`",
+                (
+                    "- Raw JSONL lines skipped before full JSON parse: "
+                    f"`{pre_parse.get('raw_lines_skipped_before_full_json_parse')}`"
+                ),
+                f"- Full JSON records parsed: `{pre_parse.get('full_json_records_parsed')}`",
+                f"- Raw anchor needles included: `{privacy.get('raw_anchor_needles_included')}`",
+            ]
+        )
     lines.extend(_benchmark_gate_markdown_lines(report))
     scope = report.get("report_scope") or {}
     if scope:
