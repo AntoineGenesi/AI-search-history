@@ -1604,6 +1604,9 @@ def _candidate_strength_row_stats(result: dict[str, Any]) -> dict[str, Any]:
             "strong_reservoir_retained": 0,
             "strong_reservoir_replaced": 0,
             "strong_reservoir_cap_dropped": 0,
+            "strong_high_evidence_candidates": 0,
+            "strong_high_evidence_reservoir_retained": 0,
+            "strong_high_evidence_reservoir_cap_dropped": 0,
             "weak_reservoir_retained": 0,
             "weak_reservoir_replaced": 0,
             "weak_reservoir_cap_dropped": 0,
@@ -1624,6 +1627,13 @@ def _candidate_strength_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "strong_reservoir_retained": int(stats.get("strong_reservoir_retained") or 0),
         "strong_reservoir_replaced": int(stats.get("strong_reservoir_replaced") or 0),
         "strong_reservoir_cap_dropped": int(stats.get("strong_reservoir_cap_dropped") or 0),
+        "strong_high_evidence_candidates": int(stats.get("strong_high_evidence_candidates") or 0),
+        "strong_high_evidence_reservoir_retained": int(
+            stats.get("strong_high_evidence_reservoir_retained") or 0
+        ),
+        "strong_high_evidence_reservoir_cap_dropped": int(
+            stats.get("strong_high_evidence_reservoir_cap_dropped") or 0
+        ),
         "weak_reservoir_retained": int(stats.get("weak_reservoir_retained") or 0),
         "weak_reservoir_replaced": int(stats.get("weak_reservoir_replaced") or 0),
         "weak_reservoir_cap_dropped": int(stats.get("weak_reservoir_cap_dropped") or 0),
@@ -1935,6 +1945,9 @@ def _candidate_strength_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "strong_reservoir_retained": 0,
             "strong_reservoir_replaced": 0,
             "strong_reservoir_cap_dropped": 0,
+            "strong_high_evidence_candidates": 0,
+            "strong_high_evidence_reservoir_retained": 0,
+            "strong_high_evidence_reservoir_cap_dropped": 0,
             "weak_reservoir_retained": 0,
             "weak_reservoir_replaced": 0,
             "weak_reservoir_cap_dropped": 0,
@@ -1948,6 +1961,9 @@ def _candidate_strength_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "strong_reservoir_retained",
         "strong_reservoir_replaced",
         "strong_reservoir_cap_dropped",
+        "strong_high_evidence_candidates",
+        "strong_high_evidence_reservoir_retained",
+        "strong_high_evidence_reservoir_cap_dropped",
         "weak_reservoir_retained",
         "weak_reservoir_replaced",
         "weak_reservoir_cap_dropped",
