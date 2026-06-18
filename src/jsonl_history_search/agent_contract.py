@@ -318,6 +318,7 @@ def build_stage_diagnostics(
     compact_output_limits = compact_output_budget.get("limits") or {}
     fielded = pressure.get("fielded_bm25") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
+    source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
     grouping = pressure.get("fielded_source_grouping") or {}
     cap_labels = list(pressure.get("cap_labels") or diagnostics.get("cap_labels") or [])
     candidate_count = int(pressure.get("fielded_bm25", {}).get("candidate_count") or 0)
@@ -342,6 +343,7 @@ def build_stage_diagnostics(
                 "file_count": int(source_enumeration.get("file_count") or 0),
                 "byte_count": int(source_enumeration.get("byte_count") or 0),
                 "consumed_by_lane_count": len(source_enumeration.get("consumed_by_lanes") or []),
+                "source_catalog": source_catalog,
             },
         ),
         stage_diagnostic(
@@ -471,6 +473,7 @@ def build_stage_diagnostics(
             source_window_packaging=source_window_packaging,
             candidate_count=candidate_count,
         ),
+        "source_catalog": source_catalog,
         "claim_boundaries": {
             "token_savings_claim_supported": False,
             "final_answer_quality_claim_supported": False,
@@ -615,6 +618,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     capped = bool(fielded_state.get("capped", bool(cap_labels)))
     result_completeness = "lower_bound_due_to_caps" if capped else "complete_within_configured_caps"
     shared_source_enumeration = diagnostics.get("shared_source_enumeration") or {}
+    source_catalog = sanitize_source_catalog(diagnostics.get("source_catalog") or {})
     fielded_bm25 = diagnostics.get("fielded_bm25") or {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
@@ -634,6 +638,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "consumed_by_lanes": list(shared_source_enumeration.get("consumed_by_lanes") or []),
             "raw_paths_included": False,
         },
+        "source_catalog": source_catalog,
         "fielded_bm25": {
             "status": fielded_bm25.get("status"),
             "candidate_count": int(fielded_bm25.get("candidate_count") or 0),
@@ -689,6 +694,38 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
         },
+    }
+
+
+def sanitize_source_catalog(catalog: Any) -> dict[str, Any]:
+    if not isinstance(catalog, dict):
+        catalog = {}
+    source_kind_counts = catalog.get("source_kind_counts") if isinstance(catalog.get("source_kind_counts"), dict) else {}
+    cap_hits = catalog.get("cap_hits") if isinstance(catalog.get("cap_hits"), dict) else {}
+    return {
+        "schema_version": int(catalog.get("schema_version") or 1),
+        "source": str(catalog.get("source") or "command_local_source_catalog"),
+        "basis": str(catalog.get("basis") or "shared_per_command_source_enumeration"),
+        "file_count": int(catalog.get("file_count") or 0),
+        "byte_count": int(catalog.get("byte_count") or 0),
+        "source_kind_counts": {str(key): int(value or 0) for key, value in sorted(source_kind_counts.items())},
+        "cap_labels": sorted(str(label) for label in catalog.get("cap_labels") or [] if label),
+        "cap_hits": {
+            "file": bool(cap_hits.get("file", False)),
+            "byte": bool(cap_hits.get("byte", False)),
+            "elapsed": bool(cap_hits.get("elapsed", False)),
+        },
+        "selected_file_count": int(catalog.get("selected_file_count") or catalog.get("file_count") or 0),
+        "skipped_file_count": int(catalog.get("skipped_file_count") or 0),
+        "selected_root_count": int(catalog.get("selected_root_count") or 0),
+        "rejected_root_count": int(catalog.get("rejected_root_count") or 0),
+        "warning_count": int(catalog.get("warning_count") or 0),
+        "elapsed_ms": float(catalog.get("elapsed_ms") or 0.0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "persistent_index_or_cache_used": False,
     }
 
 
