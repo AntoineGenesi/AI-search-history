@@ -5,8 +5,14 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
+
+
+PATH_DATE_PART_RE = re.compile(r"^(\d{4})(?:[-_](\d{2})(?:[-_](\d{2}))?)?$")
+YEAR_PART_RE = re.compile(r"^\d{4}$")
+MONTH_OR_DAY_PART_RE = re.compile(r"^\d{2}$")
 
 
 @dataclass
@@ -151,6 +157,138 @@ def build_command_local_source_catalog(plan: SourcePlan, planned_jsonl_files: Pl
         "raw_cwd_included": False,
         "persistent_index_or_cache_used": False,
     }
+
+
+def build_command_local_source_plan(
+    plan: SourcePlan,
+    planned_jsonl_files: PlannedJsonlFiles,
+    intent: Any,
+) -> tuple[PlannedJsonlFiles, dict]:
+    selected_files: list[tuple[Path, int]] = []
+    pruned_hard = 0
+    deferred_budget = 0
+    unknown_or_undated = 0
+    prune_reasons: dict[str, int] = {}
+
+    for path, size in planned_jsonl_files.files:
+        date_bucket = path_date_bucket(path, intent)
+        if date_bucket is None:
+            unknown_or_undated += 1
+            selected_files.append((path, size))
+            continue
+        bucket_start, bucket_end = date_bucket
+        if date_bucket_disjoint_from_intent(bucket_start, bucket_end, intent):
+            pruned_hard += 1
+            reason = "path_date_bucket_disjoint_from_intent_date_window"
+            prune_reasons[reason] = prune_reasons.get(reason, 0) + 1
+            continue
+        selected_files.append((path, size))
+
+    selected = PlannedJsonlFiles(
+        files=tuple(selected_files),
+        warnings=planned_jsonl_files.warnings,
+        elapsed_ms=planned_jsonl_files.elapsed_ms,
+        source="command_local_source_plan_selected_files",
+    )
+    cap_hits = cap_hits_from_warnings(list(planned_jsonl_files.warnings))
+    diagnostics = {
+        "schema_version": 1,
+        "source": "command_local_source_plan",
+        "basis": "command_local_source_catalog",
+        "selection_policy": "hard_prune_only_path_date_bucket_disjoint_from_intent_date_window",
+        "sources_total": planned_jsonl_files.file_count,
+        "sources_selected": selected.file_count,
+        "sources_pruned_hard": pruned_hard,
+        "sources_deferred_budget": deferred_budget,
+        "sources_unknown_or_undated_selected": unknown_or_undated,
+        "byte_count_total": planned_jsonl_files.byte_count,
+        "byte_count_selected": selected.byte_count,
+        "prune_reasons": dict(sorted(prune_reasons.items())),
+        "materialization_budget": {
+            "max_files": plan.limits.max_files,
+            "max_bytes": plan.limits.max_bytes,
+            "max_elapsed": plan.limits.max_elapsed,
+            "effective_files": plan.limits.effective_files(),
+            "effective_bytes": plan.limits.effective_bytes(),
+        },
+        "exhaustive_available": not any(cap_hits.values()),
+        "date_window": {
+            "present": bool(getattr(intent, "date_window_start", None) and getattr(intent, "date_window_end", None)),
+            "start": getattr(intent, "date_window_start", None).isoformat()
+            if getattr(intent, "date_window_start", None)
+            else None,
+            "end": getattr(intent, "date_window_end", None).isoformat()
+            if getattr(intent, "date_window_end", None)
+            else None,
+            "raw_query_text_included": False,
+        },
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "persistent_index_or_cache_used": False,
+    }
+    return selected, diagnostics
+
+
+def path_date_bucket(path: Path, intent: Any) -> tuple[datetime, datetime] | None:
+    window_start = getattr(intent, "date_window_start", None)
+    if window_start is None:
+        return None
+    tzinfo = window_start.tzinfo
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if YEAR_PART_RE.fullmatch(part):
+            year = int(part)
+            if index + 1 < len(parts) and MONTH_OR_DAY_PART_RE.fullmatch(parts[index + 1]):
+                month = int(parts[index + 1])
+                if index + 2 < len(parts) and MONTH_OR_DAY_PART_RE.fullmatch(parts[index + 2]):
+                    day = int(parts[index + 2])
+                    bucket = _safe_bucket(year, month, day, tzinfo=tzinfo)
+                    if bucket is not None:
+                        return bucket
+                bucket = _safe_bucket(year, month, None, tzinfo=tzinfo)
+                if bucket is not None:
+                    return bucket
+            bucket = _safe_bucket(year, None, None, tzinfo=tzinfo)
+            if bucket is not None:
+                return bucket
+        match = PATH_DATE_PART_RE.fullmatch(part) or PATH_DATE_PART_RE.fullmatch(Path(part).stem)
+        if match:
+            year = int(match.group(1))
+            month = int(match.group(2)) if match.group(2) else None
+            day = int(match.group(3)) if match.group(3) else None
+            bucket = _safe_bucket(year, month, day, tzinfo=tzinfo)
+            if bucket is not None:
+                return bucket
+    return None
+
+
+def _safe_bucket(year: int, month: int | None, day: int | None, *, tzinfo) -> tuple[datetime, datetime] | None:
+    if year < 1900 or year > 2100:
+        return None
+    try:
+        if month is None:
+            start = datetime(year, 1, 1, tzinfo=tzinfo)
+            return start, datetime(year + 1, 1, 1, tzinfo=tzinfo)
+        if day is None:
+            start = datetime(year, month, 1, tzinfo=tzinfo)
+            end = datetime(year + 1, 1, 1, tzinfo=tzinfo) if month == 12 else datetime(year, month + 1, 1, tzinfo=tzinfo)
+            return start, end
+        start = datetime(year, month, day, tzinfo=tzinfo)
+        return start, start + timedelta(days=1)
+    except ValueError:
+        return None
+
+
+def date_bucket_disjoint_from_intent(bucket_start: datetime, bucket_end: datetime, intent: Any) -> bool:
+    window_start = getattr(intent, "date_window_start", None)
+    window_end = getattr(intent, "date_window_end", None)
+    if window_start is None or window_end is None:
+        return False
+    local_start = bucket_start.astimezone(window_start.tzinfo)
+    local_end = bucket_end.astimezone(window_start.tzinfo)
+    return local_end <= window_start or local_start >= window_end
 
 
 def build_source_plan(
