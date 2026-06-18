@@ -613,6 +613,15 @@ def build_parser() -> argparse.ArgumentParser:
             "default search output and output_context_bytes are unchanged."
         ),
     )
+    real_history_impact.add_argument(
+        "--source-tier-answerability-pressure",
+        action="store_true",
+        help=(
+            "Opt in to aggregate-only source-tier answerability pressure metrics for "
+            "explicit package_search_fielded_bm25 rows using the live agent compact "
+            "provenance handoff builder."
+        ),
+    )
     real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
     add_common_args(real_history_timestamp_seek)
     real_history_timestamp_seek.add_argument(
