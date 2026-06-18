@@ -167,6 +167,7 @@ def build_rrf_retrieval_diagnostics(
         int(fielded_result.get("searched_bytes", 0)),
     ) if overlap else 0
     cap_labels = cap_labels_from_warnings(warnings)
+    fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
     return {
         "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
         "feature_state": "active_explicit_opt_in",
@@ -223,6 +224,7 @@ def build_rrf_retrieval_diagnostics(
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
                 "searched_files": int(fielded_result.get("searched_files", 0)),
                 "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
+                "materialization": fielded_materialization,
                 "planned_file_source": "shared_source_enumeration",
                 "cap_labels": cap_labels_from_warnings(fielded_result.get("warnings", []) or []),
                 "index_summary": fielded_index_summary,
@@ -245,6 +247,7 @@ def build_rrf_retrieval_diagnostics(
             "duplicate_file_visit_count": duplicate_file_visits,
             "duplicate_file_overlap_count": len(overlap),
             "duplicate_searched_bytes_lower_bound": duplicate_bytes_lower_bound,
+            "fielded_bm25_materialization": fielded_materialization,
             "local_work_only_not_model_tokens": True,
         },
         "fusion": {
@@ -267,6 +270,46 @@ def build_rrf_retrieval_diagnostics(
             "fused_score_threshold_used": False,
             "scanner_scheduling_constants_changed": False,
         },
+    }
+
+
+def _fielded_materialization_diagnostics(fielded_result: dict[str, Any]) -> dict[str, int | bool]:
+    materialization = fielded_result.get("materialization") if isinstance(fielded_result, dict) else {}
+    if not isinstance(materialization, dict):
+        materialization = {}
+    return {
+        "candidate_rows_materialized": int(materialization.get("candidate_rows_materialized") or 0),
+        "candidate_rows_materialized_from_in_memory_raw": int(
+            materialization.get("candidate_rows_materialized_from_in_memory_raw") or 0
+        ),
+        "candidate_rows_materialized_from_cached_record": int(
+            materialization.get("candidate_rows_materialized_from_cached_record") or 0
+        ),
+        "candidate_rows_materialized_from_file_reopen": int(
+            materialization.get("candidate_rows_materialized_from_file_reopen") or 0
+        ),
+        "candidate_rows_materialization_failed": int(
+            materialization.get("candidate_rows_materialization_failed") or 0
+        ),
+        "records_materialized_from_in_memory_raw": int(
+            materialization.get("records_materialized_from_in_memory_raw") or 0
+        ),
+        "records_materialized_from_cached_record": int(
+            materialization.get("records_materialized_from_cached_record") or 0
+        ),
+        "records_materialized_from_file_reopen": int(
+            materialization.get("records_materialized_from_file_reopen") or 0
+        ),
+        "file_reopen_attempts": int(materialization.get("file_reopen_attempts") or 0),
+        "file_reopen_failures": int(materialization.get("file_reopen_failures") or 0),
+        "in_memory_raw_materialization_available": bool(
+            materialization.get("in_memory_raw_materialization_available", False)
+        ),
+        "raw_text_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
