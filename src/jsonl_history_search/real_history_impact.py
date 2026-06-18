@@ -1796,6 +1796,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     fts = result.get("fts") if isinstance(result.get("fts"), dict) else {}
     query_profile = result.get("query_profile") if isinstance(result.get("query_profile"), dict) else {}
     privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
+    materialization = _fielded_bm25_materialization_stats(result.get("materialization"))
     return {
         "enabled": True,
         "status": str(result.get("status") or "unknown"),
@@ -1817,6 +1818,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "bm25_rank_buckets": _safe_count_dict(result.get("bm25_rank_buckets")),
+        "materialization": materialization,
         "query_profile": query_profile,
         "expected_refs_used_for_retrieval": False,
         "raw_paths_included": False,
@@ -1891,6 +1893,7 @@ def _rrf_diagnostic_lane(diagnostics: dict[str, Any], name: str) -> dict[str, An
 def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
     fielded_lane = _rrf_diagnostic_lane(diagnostics, "package_search_fielded_bm25")
     index_summary = fielded_lane.get("index_summary") if isinstance(fielded_lane.get("index_summary"), dict) else {}
+    materialization = _fielded_bm25_materialization_stats(fielded_lane.get("materialization"))
     return {
         "enabled": True,
         "status": "shared_rrf_fusion_lane",
@@ -1912,6 +1915,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "candidate_records_scored": 0,
         "candidate_records_deduped": 0,
         "bm25_rank_buckets": {},
+        "materialization": materialization,
         "query_profile": {},
         "expected_refs_used_for_retrieval": False,
         "raw_paths_included": False,
@@ -1921,6 +1925,41 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_bm25_materialization_stats(value: Any) -> dict[str, Any]:
+    materialization = value if isinstance(value, dict) else {}
+    return {
+        "candidate_rows_materialized": int(materialization.get("candidate_rows_materialized") or 0),
+        "candidate_rows_materialized_from_in_memory_raw": int(
+            materialization.get("candidate_rows_materialized_from_in_memory_raw") or 0
+        ),
+        "candidate_rows_materialized_from_cached_record": int(
+            materialization.get("candidate_rows_materialized_from_cached_record") or 0
+        ),
+        "candidate_rows_materialized_from_file_reopen": int(
+            materialization.get("candidate_rows_materialized_from_file_reopen") or 0
+        ),
+        "candidate_rows_materialization_failed": int(
+            materialization.get("candidate_rows_materialization_failed") or 0
+        ),
+        "records_materialized_from_in_memory_raw": int(
+            materialization.get("records_materialized_from_in_memory_raw") or 0
+        ),
+        "records_materialized_from_cached_record": int(
+            materialization.get("records_materialized_from_cached_record") or 0
+        ),
+        "records_materialized_from_file_reopen": int(
+            materialization.get("records_materialized_from_file_reopen") or 0
+        ),
+        "file_reopen_attempts": int(materialization.get("file_reopen_attempts") or 0),
+        "file_reopen_failures": int(materialization.get("file_reopen_failures") or 0),
+        "in_memory_raw_materialization_available": bool(
+            materialization.get("in_memory_raw_materialization_available", False)
+        ),
+        "raw_text_included": bool(materialization.get("raw_text_included", False)),
+        "raw_paths_included": bool(materialization.get("raw_paths_included", False)),
     }
 
 
@@ -2333,6 +2372,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "candidate_rows_retained": 0,
             "candidate_rows_surfaced": 0,
             "bm25_rank_buckets": {},
+            "materialization": _fielded_bm25_materialization_aggregate([]),
             "privacy": _fielded_bm25_privacy(),
         }
     rank_buckets: dict[str, int] = {}
@@ -2354,7 +2394,47 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_records_scored": sum(int(item.get("candidate_records_scored") or 0) for item in selected),
         "candidate_records_deduped": sum(int(item.get("candidate_records_deduped") or 0) for item in selected),
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
+        "materialization": _fielded_bm25_materialization_aggregate(selected),
         "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _fielded_bm25_materialization_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row.get("materialization")
+        for row in rows
+        if isinstance(row.get("materialization"), dict)
+    ]
+    counter_fields = (
+        "candidate_rows_materialized",
+        "candidate_rows_materialized_from_in_memory_raw",
+        "candidate_rows_materialized_from_cached_record",
+        "candidate_rows_materialized_from_file_reopen",
+        "candidate_rows_materialization_failed",
+        "records_materialized_from_in_memory_raw",
+        "records_materialized_from_cached_record",
+        "records_materialized_from_file_reopen",
+        "file_reopen_attempts",
+        "file_reopen_failures",
+    )
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            **{field: 0 for field in counter_fields},
+            "in_memory_raw_materialization_available_runs": 0,
+            "raw_text_included": False,
+            "raw_paths_included": False,
+        }
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        **{field: sum(int(item.get(field) or 0) for item in selected) for field in counter_fields},
+        "in_memory_raw_materialization_available_runs": sum(
+            1 for item in selected if item.get("in_memory_raw_materialization_available")
+        ),
+        "raw_text_included": any(bool(item.get("raw_text_included")) for item in selected),
+        "raw_paths_included": any(bool(item.get("raw_paths_included")) for item in selected),
     }
 
 
