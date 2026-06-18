@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .expansion import task_slug_variants
+
 
 PATH_DATE_PART_RE = re.compile(r"^(\d{4})(?:[-_](\d{2})(?:[-_](\d{2}))?)?$")
 YEAR_PART_RE = re.compile(r"^\d{4}$")
@@ -164,17 +166,14 @@ def build_command_local_source_plan(
     planned_jsonl_files: PlannedJsonlFiles,
     intent: Any,
 ) -> tuple[PlannedJsonlFiles, dict]:
-    selected_files: list[tuple[Path, int]] = []
+    date_eligible: list[tuple[int, Path, int, str]] = []
     pruned_hard = 0
-    deferred_budget = 0
-    unknown_or_undated = 0
     prune_reasons: dict[str, int] = {}
 
-    for path, size in planned_jsonl_files.files:
+    for ordinal, (path, size) in enumerate(planned_jsonl_files.files):
         date_bucket = path_date_bucket(path, intent)
         if date_bucket is None:
-            unknown_or_undated += 1
-            selected_files.append((path, size))
+            date_eligible.append((ordinal, path, size, "unknown_or_undated"))
             continue
         bucket_start, bucket_end = date_bucket
         if date_bucket_disjoint_from_intent(bucket_start, bucket_end, intent):
@@ -182,7 +181,15 @@ def build_command_local_source_plan(
             reason = "path_date_bucket_disjoint_from_intent_date_window"
             prune_reasons[reason] = prune_reasons.get(reason, 0) + 1
             continue
-        selected_files.append((path, size))
+        date_eligible.append((ordinal, path, size, "date_overlaps_intent"))
+
+    tiered = assign_budgeted_source_tiers(plan, date_eligible, intent)
+    selected_files = [(path, size) for _ordinal, path, size, _tier in tiered["selected"]]
+    deferred_budget = len(tiered["deferred"])
+    selected_ordinals = {ordinal for ordinal, _path, _size, _tier in tiered["selected"]}
+    unknown_or_undated_selected = sum(
+        1 for ordinal, _path, _size, date_status in date_eligible if date_status == "unknown_or_undated" and ordinal in selected_ordinals
+    )
 
     selected = PlannedJsonlFiles(
         files=tuple(selected_files),
@@ -195,15 +202,20 @@ def build_command_local_source_plan(
         "schema_version": 1,
         "source": "command_local_source_plan",
         "basis": "command_local_source_catalog",
-        "selection_policy": "hard_prune_only_path_date_bucket_disjoint_from_intent_date_window",
+        "selection_policy": "date_disjoint_hard_prune_then_deterministic_budgeted_source_tiers",
         "sources_total": planned_jsonl_files.file_count,
         "sources_selected": selected.file_count,
         "sources_pruned_hard": pruned_hard,
         "sources_deferred_budget": deferred_budget,
-        "sources_unknown_or_undated_selected": unknown_or_undated,
+        "sources_unknown_or_undated_selected": unknown_or_undated_selected,
         "byte_count_total": planned_jsonl_files.byte_count,
         "byte_count_selected": selected.byte_count,
         "prune_reasons": dict(sorted(prune_reasons.items())),
+        "tier_order": SOURCE_TIER_ORDER,
+        "source_tiers": tiered["source_tiers"],
+        "deferred_reason_counts": tiered["deferred_reason_counts"],
+        "budget_basis": tiered["budget_basis"],
+        "retry_guidance": tiered["retry_guidance"],
         "materialization_budget": {
             "max_files": plan.limits.max_files,
             "max_bytes": plan.limits.max_bytes,
@@ -211,7 +223,7 @@ def build_command_local_source_plan(
             "effective_files": plan.limits.effective_files(),
             "effective_bytes": plan.limits.effective_bytes(),
         },
-        "exhaustive_available": not any(cap_hits.values()),
+        "exhaustive_available": not any(cap_hits.values()) and deferred_budget == 0,
         "date_window": {
             "present": bool(getattr(intent, "date_window_start", None) and getattr(intent, "date_window_end", None)),
             "start": getattr(intent, "date_window_start", None).isoformat()
@@ -226,9 +238,199 @@ def build_command_local_source_plan(
         "raw_text_included": False,
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
+        "privacy_flags": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+        },
         "persistent_index_or_cache_used": False,
     }
     return selected, diagnostics
+
+
+SOURCE_TIER_ORDER = [
+    "hard_required",
+    "structural_exact",
+    "lexical_probe",
+    "fallback_recent_or_broad",
+    "deferred",
+]
+
+
+def assign_budgeted_source_tiers(
+    plan: SourcePlan,
+    eligible_files: list[tuple[int, Path, int, str]],
+    intent: Any,
+) -> dict[str, Any]:
+    budget_basis = source_tier_budget_basis(plan, eligible_files)
+    max_selected_files = int(budget_basis["max_selected_files"])
+    max_selected_bytes = int(budget_basis["max_selected_bytes"])
+    tier_buckets: dict[str, list[tuple[int, Path, int]]] = {tier: [] for tier in SOURCE_TIER_ORDER if tier != "deferred"}
+    date_overlap_counts = {"date_overlaps_intent": 0, "unknown_or_undated": 0}
+
+    for ordinal, path, size, date_status in eligible_files:
+        date_overlap_counts[date_status] = date_overlap_counts.get(date_status, 0) + 1
+        tier = source_tier_for_path(path, plan, intent)
+        tier_buckets[tier].append((ordinal, path, size))
+
+    selected: list[tuple[int, Path, int, str]] = []
+    deferred: list[tuple[int, Path, int, str]] = []
+    selected_bytes = 0
+    for tier in SOURCE_TIER_ORDER:
+        if tier in {"deferred", "lexical_probe"}:
+            continue
+        for ordinal, path, size in sorted(tier_buckets.get(tier, []), key=lambda item: item[0]):
+            if len(selected) >= max_selected_files or selected_bytes + size > max_selected_bytes:
+                deferred.append((ordinal, path, size, tier))
+                continue
+            selected.append((ordinal, path, size, tier))
+            selected_bytes += size
+
+    deferred_reason_counts: dict[str, int] = {}
+    for _ordinal, _path, _size, tier in deferred:
+        reason = f"budget_exhausted_after_{tier}"
+        deferred_reason_counts[reason] = deferred_reason_counts.get(reason, 0) + 1
+
+    selected_tier_counts: dict[str, int] = {tier: 0 for tier in SOURCE_TIER_ORDER}
+    deferred_from_tier_counts: dict[str, int] = {tier: 0 for tier in SOURCE_TIER_ORDER}
+    eligible_tier_counts: dict[str, int] = {tier: 0 for tier in SOURCE_TIER_ORDER}
+    for tier, items in tier_buckets.items():
+        eligible_tier_counts[tier] = len(items)
+    for _ordinal, _path, _size, tier in selected:
+        selected_tier_counts[tier] += 1
+    for _ordinal, _path, _size, tier in deferred:
+        deferred_from_tier_counts[tier] += 1
+    eligible_tier_counts["deferred"] = len(deferred)
+    selected_tier_counts["deferred"] = 0
+    deferred_from_tier_counts["deferred"] = len(deferred)
+
+    return {
+        "selected": selected,
+        "deferred": deferred,
+        "source_tiers": {
+            "order": SOURCE_TIER_ORDER,
+            "selection_order": [tier for tier in SOURCE_TIER_ORDER if tier not in {"lexical_probe", "deferred"}],
+            "stable_ordering": "planned_source_enumeration_order_within_each_tier",
+            "lexical_probe": {
+                "enabled": False,
+                "reason": "no_already_built_cheap_source_probe_available",
+                "selected_count": 0,
+            },
+            "eligible_counts": eligible_tier_counts,
+            "selected_counts": selected_tier_counts,
+            "deferred_counts": deferred_from_tier_counts,
+            "date_overlap_counts": dict(sorted(date_overlap_counts.items())),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+        },
+        "deferred_reason_counts": dict(sorted(deferred_reason_counts.items())),
+        "budget_basis": budget_basis,
+        "retry_guidance": source_tier_retry_guidance(len(deferred)),
+    }
+
+
+def source_tier_budget_basis(plan: SourcePlan, eligible_files: list[tuple[int, Path, int, str]]) -> dict[str, Any]:
+    eligible_count = len(eligible_files)
+    effective_files = plan.limits.effective_files()
+    effective_bytes = plan.limits.effective_bytes()
+    max_matches = max(1, int(plan.limits.max_matches or 1))
+    return {
+        "policy": "min_effective_file_cap_and_max_matches_source_budget",
+        "max_selected_files": max(0, min(eligible_count, effective_files, max_matches)),
+        "max_selected_bytes": effective_bytes,
+        "eligible_source_count_after_hard_prune": eligible_count,
+        "effective_files": effective_files,
+        "effective_bytes": effective_bytes,
+        "max_matches": int(plan.limits.max_matches),
+        "uses_scoring_weights": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def source_tier_retry_guidance(deferred_count: int) -> dict[str, Any]:
+    return {
+        "needed": deferred_count > 0,
+        "deferred_source_count": deferred_count,
+        "guidance": (
+            "Rerun with a narrower artifact/task/date/root hint or raise safe --max-matches/--max-files caps "
+            "before treating no-evidence as exhaustive."
+            if deferred_count > 0
+            else "No budget-deferred source retry needed for this source plan."
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def source_tier_for_path(path: Path, plan: SourcePlan, intent: Any) -> str:
+    path_text = path.as_posix().lower()
+    source_kind = source_kind_for_path(path, plan).lower()
+    hard_terms = hard_required_source_terms(intent)
+    if any(term and term in path_text for term in hard_terms):
+        return "hard_required"
+
+    structural_terms = structural_source_terms(intent)
+    structural_space = f"{path_text} {source_kind} {root_label_for_path(path, plan).lower()}"
+    if any(term and term in structural_space for term in structural_terms):
+        return "structural_exact"
+
+    return "fallback_recent_or_broad"
+
+
+def hard_required_source_terms(intent: Any) -> list[str]:
+    terms: list[str] = []
+    for hint in getattr(intent, "artifact_hints", []) or []:
+        normalized = str(hint).lower().strip()
+        if "/" in normalized or "." in normalized:
+            terms.extend(source_hint_variants(normalized))
+        terms.extend(task_slug_variants(normalized))
+    for value in [getattr(intent, "original", ""), getattr(intent, "normalized", "")]:
+        terms.extend(task_slug_variants(str(value)))
+    return unique_source_terms(terms)
+
+
+def structural_source_terms(intent: Any) -> list[str]:
+    terms: list[str] = []
+    query_plan = getattr(intent, "query_plan", None)
+    if query_plan is not None:
+        terms.extend(str(term).lower().strip() for term in getattr(query_plan, "anchor_terms", []) or [])
+        field_hints = getattr(query_plan, "field_hints", {}) or {}
+        for hint in field_hints.get("artifact_paths", []) or []:
+            terms.extend(source_hint_variants(str(hint).lower().strip()))
+            terms.extend(task_slug_variants(str(hint)))
+    terms.extend(str(term).lower().strip() for term in getattr(intent, "base_terms", []) or [])
+    terms.extend(str(term).lower().strip() for term in getattr(intent, "artifact_hints", []) or [])
+    return unique_source_terms(terms, min_length=4)
+
+
+def source_hint_variants(value: str) -> list[str]:
+    normalized = value.lower().strip()
+    if not normalized:
+        return []
+    path = Path(normalized)
+    variants = {normalized, path.name}
+    if path.stem:
+        variants.add(path.stem)
+        variants.add(path.stem.replace("-", "_"))
+        variants.add(path.stem.replace("_", "-"))
+    return sorted(variants)
+
+
+def unique_source_terms(values: list[str], *, min_length: int = 1) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = " ".join(str(value).lower().strip().split())
+        if len(normalized) < min_length or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
 
 
 def path_date_bucket(path: Path, intent: Any) -> tuple[datetime, datetime] | None:
