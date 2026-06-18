@@ -1477,6 +1477,8 @@ def main(argv: list[str] | None = None) -> int:
                 payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
             if "retrieval_diagnostics" in packet:
                 payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
+            if "retrieval_pressure" in packet:
+                payload["semantic_debug"]["retrieval_pressure"] = packet["retrieval_pressure"]
             rendered = render(payload, args.format)
         print(rendered)
         return 0
@@ -1963,6 +1965,8 @@ def _short_report_written_payload(payload: dict, report_output: str) -> dict:
         short["agent_find"]["compact_provenance_handoff"] = report["compact_provenance_handoff"]
     if "retrieval_diagnostics" in report:
         short["agent_find"]["retrieval_diagnostics"] = report["retrieval_diagnostics"]
+    if "retrieval_pressure" in report:
+        short["agent_find"]["retrieval_pressure"] = report["retrieval_pressure"]
     return short
 
 
