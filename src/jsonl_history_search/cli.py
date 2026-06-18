@@ -524,6 +524,15 @@ def build_parser() -> argparse.ArgumentParser:
             "handoff diagnostic; default search output and output_context_bytes are unchanged."
         ),
     )
+    real_history_impact.add_argument(
+        "--agent-compact-provenance-handoff",
+        action="store_true",
+        help=(
+            "Opt in to aggregate pressure metrics for the agent-facing JSH-804 "
+            "compact_provenance_handoff packet built through the find contract; "
+            "default search output and output_context_bytes are unchanged."
+        ),
+    )
     real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
     add_common_args(real_history_timestamp_seek)
     real_history_timestamp_seek.add_argument(

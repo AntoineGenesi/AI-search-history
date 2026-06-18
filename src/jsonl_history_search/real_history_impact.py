@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_contract import build_agent_find_payload
 from .metric_contract import add_metric_contract, real_history_impact_metrics
 from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
@@ -192,6 +193,19 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     base_report["compact_package_handoff_decision"] = _compact_package_handoff_decision(
         base_report["compact_package_handoff"]
     )
+    if getattr(args, "agent_compact_provenance_handoff", False):
+        base_report["agent_compact_provenance_handoff"] = _agent_compact_provenance_handoff_summary(
+            rows,
+            manifest_case_count=manifest_case_count,
+            evaluated_case_count=len(selected_cases),
+            requested_case_limit=int(getattr(args, "case_limit", 0) or 0),
+        )
+        base_report["agent_compact_provenance_handoff_decision"] = _agent_compact_provenance_handoff_decision(
+            base_report["agent_compact_provenance_handoff"]
+        )
+        base_report["aggregate"]["agent_compact_provenance_handoff"] = base_report[
+            "agent_compact_provenance_handoff"
+        ]
     structural_diagnostic = _structural_sidecar_diagnostic(rows)
     if structural_diagnostic is not None:
         base_report["structural_sidecar_diagnostic"] = structural_diagnostic
@@ -889,6 +903,23 @@ def _run_package_search_variant(
             full_result_output_context_bytes=int(row["output_context_bytes"]),
         )
         raw_row["compact_package_handoff"] = compact_package
+    if baseline == "package_search" and getattr(args, "agent_compact_provenance_handoff", False):
+        source_plan = _agent_find_source_plan(plan=plan, intent=intent, args=args, now=now)
+        agent_find = build_agent_find_payload(
+            source_plan=source_plan,
+            search_result=result,
+            manifest_report=None,
+            output_format="json",
+            report_output=None,
+            compact_provenance_handoff=True,
+        )["agent_find"]
+        compact_handoff = agent_find["compact_provenance_handoff"]
+        row["agent_compact_provenance_handoff"] = _agent_compact_provenance_row_stats(
+            compact_handoff,
+            row=row,
+            full_result_output_context_bytes=int(row["output_context_bytes"]),
+        )
+        raw_row["agent_compact_provenance_handoff"] = compact_handoff
     row["scan_order"] = _scan_order_row(result)
     expected_diagnostics = _expected_ref_diagnostics_row(result)
     if expected_diagnostics is not None:
@@ -896,6 +927,26 @@ def _run_package_search_variant(
     raw_row["sanitized_row"] = row
     raw_row["package_result"] = result
     return row, raw_row
+
+
+def _agent_find_source_plan(
+    *,
+    plan: SourcePlan,
+    intent: QueryIntent,
+    args,
+    now: Any,
+) -> dict[str, Any]:
+    cwd = Path(args.cwd).expanduser().resolve()
+    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
+    claude_home = Path(args.claude_home).expanduser() if args.claude_home else Path.home() / ".claude"
+    return {
+        "query": intent.to_dict(),
+        "sources": plan.to_dict(),
+        "cwd": str(cwd),
+        "codex_home": str(codex_home),
+        "claude_home": str(claude_home),
+        "now": now.isoformat(),
+    }
 
 
 def _build_compact_package_handoff(
@@ -2028,6 +2079,252 @@ def _compact_package_handoff_decision(summary: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _agent_compact_provenance_row_stats(
+    compact_handoff: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    full_result_output_context_bytes: int,
+) -> dict[str, Any]:
+    context_budget = compact_handoff.get("context_budget") if isinstance(compact_handoff.get("context_budget"), dict) else {}
+    compact_context_bytes = int(context_budget.get("payload_bytes") or _json_bytes(compact_handoff))
+    ratio = round(compact_context_bytes / full_result_output_context_bytes, 6) if full_result_output_context_bytes else 0.0
+    no_evidence = compact_handoff.get("no_evidence") if isinstance(compact_handoff.get("no_evidence"), dict) else {}
+    privacy = compact_handoff.get("privacy_boundaries") if isinstance(compact_handoff.get("privacy_boundaries"), dict) else {}
+    claims = compact_handoff.get("claim_boundaries") if isinstance(compact_handoff.get("claim_boundaries"), dict) else {}
+    return {
+        "enabled": True,
+        "package_kind": "agent_compact_provenance_handoff",
+        "measurement_basis": context_budget.get("measurement_basis") or "compact_provenance_handoff_packet_only",
+        "command_surface": compact_handoff.get("command_surface"),
+        "status": compact_handoff.get("status"),
+        "candidate_count": int(compact_handoff.get("candidate_count") or 0),
+        "compact_candidate_count": len(compact_handoff.get("candidates") or []),
+        "source_ref_count": len(compact_handoff.get("source_refs") or []),
+        "source_window_count": len(compact_handoff.get("source_windows") or []),
+        "next_read_count": len(compact_handoff.get("next_reads") or []),
+        "full_result_output_context_bytes": full_result_output_context_bytes,
+        "compact_context_bytes": compact_context_bytes,
+        "compact_to_full_result_byte_ratio": ratio,
+        "compact_byte_delta_vs_full_result": compact_context_bytes - full_result_output_context_bytes,
+        "legacy_output_context_bytes_preserved": True,
+        "compact_bytes_measured_separately": True,
+        "no_evidence": {
+            "needed": bool(no_evidence.get("needed")),
+            "answer_scope_label": _safe_agent_compact_label(no_evidence.get("answer_scope")),
+            "not_all_history_absence": bool(no_evidence.get("not_all_history_absence")),
+            "scope_limited_semantics_preserved": (
+                no_evidence.get("answer_scope") == "not_found_in_searched_scope"
+                and no_evidence.get("not_all_history_absence") is True
+            ),
+        },
+        "cap_hit": {
+            "labels": list(row.get("cap_hit_labels") or []),
+            "hit": bool(row.get("cap_hit_labels")),
+        },
+        "privacy": _agent_compact_provenance_privacy(privacy),
+        "claim_boundaries": _agent_compact_provenance_claim_boundaries(claims),
+    }
+
+
+def _agent_compact_provenance_handoff_summary(
+    rows: list[dict[str, Any]],
+    *,
+    manifest_case_count: int,
+    evaluated_case_count: int,
+    requested_case_limit: int,
+) -> dict[str, Any]:
+    selected = [
+        row
+        for row in rows
+        if row.get("baseline") == "package_search"
+        and isinstance(row.get("agent_compact_provenance_handoff"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "basis": "agent_compact_provenance_handoff_flag_not_enabled_or_package_search_rows_not_run",
+            "runs": 0,
+            "cases": 0,
+            "manifest_case_count": manifest_case_count,
+            "evaluated_case_count": evaluated_case_count,
+            "requested_case_limit": requested_case_limit,
+            "full_manifest_requested": requested_case_limit == 0,
+            "full_manifest_run": False,
+            "full_manifest_20_case_run": False,
+            "baseline_counts": {},
+            "full_result_output_context_bytes": 0,
+            "compact_context_bytes": 0,
+            "privacy": _agent_compact_provenance_privacy(),
+            "claim_boundaries": _agent_compact_provenance_claim_boundaries(),
+            "legacy_output_context_bytes_preserved": True,
+            "compact_bytes_measured_separately": True,
+        }
+    stats = [row["agent_compact_provenance_handoff"] for row in selected]
+    full_bytes = sum(int(item.get("full_result_output_context_bytes") or 0) for item in stats)
+    compact_bytes = sum(int(item.get("compact_context_bytes") or 0) for item in stats)
+    status_counts = _counts(item.get("status") for item in stats)
+    no_evidence_rows = [item.get("no_evidence") or {} for item in stats]
+    cap_rows = [item.get("cap_hit") or {} for item in stats]
+    full_manifest_run = requested_case_limit == 0 and evaluated_case_count == manifest_case_count
+    aggregate_privacy = _agent_compact_provenance_aggregate_privacy(stats)
+    return {
+        "status": "evaluated",
+        "basis": "opt_in_agent_find_compact_provenance_handoff_rows",
+        "runs": len(selected),
+        "cases": len({row["case_id"] for row in selected}),
+        "manifest_case_count": manifest_case_count,
+        "evaluated_case_count": evaluated_case_count,
+        "requested_case_limit": requested_case_limit,
+        "full_manifest_requested": requested_case_limit == 0,
+        "full_manifest_run": full_manifest_run,
+        "full_manifest_20_case_run": bool(full_manifest_run and manifest_case_count == 20 and evaluated_case_count == 20),
+        "baseline_counts": _counts(row["baseline"] for row in selected),
+        "status_counts": status_counts,
+        "full_result_output_context_bytes": full_bytes,
+        "compact_context_bytes": compact_bytes,
+        "compact_context_tokens_approx": _ceil_div4(compact_bytes),
+        "full_result_output_context_tokens_approx": _ceil_div4(full_bytes),
+        "compact_to_full_result_byte_ratio": round(compact_bytes / full_bytes, 6) if full_bytes else 0.0,
+        "median_full_result_output_context_bytes": _median(
+            item.get("full_result_output_context_bytes") for item in stats
+        ),
+        "median_compact_context_bytes": _median(item.get("compact_context_bytes") for item in stats),
+        "candidate_count": sum(int(item.get("candidate_count") or 0) for item in stats),
+        "compact_candidate_count": sum(int(item.get("compact_candidate_count") or 0) for item in stats),
+        "source_ref_count": sum(int(item.get("source_ref_count") or 0) for item in stats),
+        "source_window_count": sum(int(item.get("source_window_count") or 0) for item in stats),
+        "next_read_count": sum(int(item.get("next_read_count") or 0) for item in stats),
+        "median_source_ref_count": _median(item.get("source_ref_count") for item in stats),
+        "median_next_read_count": _median(item.get("next_read_count") for item in stats),
+        "no_evidence": {
+            "rows": len(no_evidence_rows),
+            "needed_rows": sum(1 for item in no_evidence_rows if item.get("needed") is True),
+            "scope_limited_semantics_preserved_rows": sum(
+                1 for item in no_evidence_rows if item.get("scope_limited_semantics_preserved") is True
+            ),
+            "not_all_history_absence_rows": sum(
+                1 for item in no_evidence_rows if item.get("not_all_history_absence") is True
+            ),
+            "answer_scope_counts": _counts(item.get("answer_scope_label") for item in no_evidence_rows),
+        },
+        "cap_hit": {
+            "rows": sum(1 for item in cap_rows if item.get("hit") is True),
+            "rows_by_label": _cap_hit_row_counts(selected),
+        },
+        "privacy": aggregate_privacy,
+        "claim_boundaries": _agent_compact_provenance_claim_boundaries(),
+        "legacy_output_context_bytes_preserved": all(
+            item.get("legacy_output_context_bytes_preserved") is True for item in stats
+        ),
+        "compact_bytes_measured_separately": all(item.get("compact_bytes_measured_separately") is True for item in stats),
+    }
+
+
+def _safe_agent_compact_label(value: Any) -> str:
+    label = str(value or "unavailable")
+    return label if _safe_counter_label(label) else "other"
+
+
+def _agent_compact_provenance_privacy(source: dict[str, Any] | None = None) -> dict[str, bool]:
+    source = source or {}
+    return {
+        "aggregate_only": True,
+        "raw_agent_compact_handoff_detail_committed": False,
+        "raw_query_text_included": False,
+        "raw_private_text_included": False,
+        "raw_snippets_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "local_usernames_included": False,
+        "case_ids_required": False,
+        "vectors_or_indexes_included": False,
+        "raw_private_text_or_snippets_included": bool(source.get("raw_private_text_or_snippets_included", False)),
+        "source_window_text_included": bool(source.get("source_window_text_included", False)),
+        "source_refs_may_point_to_local_transcripts": bool(source.get("source_refs_may_point_to_local_transcripts", False)),
+    }
+
+
+def _agent_compact_provenance_aggregate_privacy(stats: list[dict[str, Any]]) -> dict[str, bool]:
+    privacy_rows = [item.get("privacy") or {} for item in stats]
+    return _agent_compact_provenance_privacy(
+        {
+            "raw_private_text_or_snippets_included": any(
+                item.get("raw_private_text_or_snippets_included") is True for item in privacy_rows
+            ),
+            "source_window_text_included": any(item.get("source_window_text_included") is True for item in privacy_rows),
+            "source_refs_may_point_to_local_transcripts": any(
+                item.get("source_refs_may_point_to_local_transcripts") is True for item in privacy_rows
+            ),
+        }
+    )
+
+
+def _agent_compact_provenance_claim_boundaries(source: dict[str, Any] | None = None) -> dict[str, bool]:
+    source = source or {}
+    return {
+        "compact_handoff_is_opt_in": bool(source.get("compact_handoff_is_opt_in", True)),
+        "default_behavior_changed": bool(source.get("default_behavior_changed", False)),
+        "scanner_ranking_or_source_selection_changed": bool(
+            source.get("scanner_ranking_or_source_selection_changed", False)
+        ),
+        "token_savings_claim_supported": bool(source.get("token_savings_claim_supported", False)),
+        "final_answer_quality_claim_supported": bool(source.get("final_answer_quality_claim_supported", False)),
+        "product_value_claim_supported": bool(source.get("product_value_claim_supported", False)),
+        "default_promotion_supported": bool(source.get("default_promotion_supported", False)),
+    }
+
+
+def _agent_compact_provenance_handoff_decision(summary: dict[str, Any]) -> dict[str, Any]:
+    status = summary.get("status")
+    if status == "evaluated":
+        if summary.get("full_manifest_20_case_run"):
+            decision = "record_full_manifest_pressure_aggregate_only_keep_opt_in"
+            rationale = (
+                "The actual agent-facing compact_provenance_handoff packet was measured through the find "
+                "contract on the full 20-case manifest; this is pressure evidence only and remains opt-in."
+            )
+            next_action = "independent_review_agent_compact_full_manifest_pressure_before_any_follow_up"
+        elif summary.get("full_manifest_requested"):
+            decision = "record_non_20_or_partial_manifest_pressure_keep_opt_in"
+            rationale = (
+                "The actual agent-facing compact_provenance_handoff packet was measured through the find "
+                "contract, but the run was not a full 20-case manifest result."
+            )
+            next_action = "fix_or_record_full_manifest_pressure_bottleneck"
+        else:
+            decision = "debug_subset_only_keep_opt_in"
+            rationale = (
+                "The actual agent-facing compact_provenance_handoff packet was measured on a subset only; "
+                "subset results are debug evidence and do not support product or default-promotion claims."
+            )
+            next_action = "run_case_limit_0_full_manifest_before_product_interpretation"
+    else:
+        decision = "not_evaluated"
+        rationale = (
+            "Run benchmark-real-history-impact with --agent-compact-provenance-handoff to evaluate the "
+            "actual JSH-804 agent-facing packet."
+        )
+        next_action = "run_agent_compact_provenance_handoff_pressure"
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "default_search_behavior_changed": False,
+        "scanner_ranking_source_selection_changed": False,
+        "legacy_output_context_bytes_redefined": False,
+        "compact_bytes_measured_separately": True,
+        "measured_packet": "agent_find.compact_provenance_handoff",
+        "measured_builder": "build_agent_find_payload(compact_provenance_handoff=True)",
+        "old_compact_package_diagnostic_used_as_measured_packet": False,
+        "token_savings_claim_supported": False,
+        "final_answer_quality_claim_supported": False,
+        "product_value_claim_supported": False,
+        "default_promotion_supported": False,
+        "next_action": next_action,
+    }
+
+
 def _structural_sidecar_diagnostic(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     structural_rows = {
         (row["case_id"], row["repeat_index"]): row
@@ -2343,6 +2640,7 @@ def _apply_aggregate_only_report(report: dict[str, Any], *, row_count: int) -> N
         "raw_private_paths_committed": False,
         "raw_anchor_needles_committed": False,
         "raw_compact_handoff_detail_committed": False,
+        "raw_agent_compact_handoff_detail_committed": False,
         "raw_source_windows_committed": False,
     }
     diagnostic = report.get("structural_sidecar_diagnostic")
