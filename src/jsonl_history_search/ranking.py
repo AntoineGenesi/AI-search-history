@@ -22,6 +22,8 @@ TEXT_STAGE_WEIGHTS = {
     "semantic_local": 6.0,
 }
 FUZZY_STAGE_WEIGHT = 7.0
+BROAD_UNANCHORED_LOW_EVIDENCE_PENALTY = "penalty:broad_unanchored_low_evidence"
+PARTIAL_GENERIC_MULTI_TOKEN_PENALTY = "penalty:partial_generic_multi_token"
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,10 @@ def score_record(
         reasons.append("artifact:artifact_path")
     if is_partial_generic_multi_token(reasons, intent, profile=profile):
         score -= 4.0
-        reasons.append("penalty:partial_generic_multi_token")
+        reasons.append(PARTIAL_GENERIC_MULTI_TOKEN_PENALTY)
+    elif is_broad_unanchored_low_evidence(reasons):
+        score -= 3.0
+        reasons.append(BROAD_UNANCHORED_LOW_EVIDENCE_PENALTY)
     if record.timestamp:
         age_days = max(0.0, (datetime.now(timezone.utc) - record.timestamp.astimezone(timezone.utc)).total_seconds() / 86400)
         score += max(0.0, 3.0 - min(age_days / 30.0, 3.0))
@@ -235,17 +240,19 @@ def stage_for_term(intent: QueryIntent, term: str) -> str:
     return "normalized_terms"
 
 
-def is_weak_partial_generic(reasons: list[str]) -> bool:
+def candidate_strength_label(reasons: list[str]) -> str:
     reason_set = set(reasons)
-    if "penalty:partial_generic_multi_token" not in reason_set:
-        return False
-    strong_prefixes = (
-        "phrase:",
-        "artifact:",
-        "text:artifact_path:",
-        "text:task_slug:",
-    )
-    return not any(reason.startswith(strong_prefixes) for reason in reason_set)
+    if has_anchoring_evidence(reasons):
+        return "strong"
+    if PARTIAL_GENERIC_MULTI_TOKEN_PENALTY in reason_set:
+        return "weak_partial_generic"
+    if BROAD_UNANCHORED_LOW_EVIDENCE_PENALTY in reason_set:
+        return "weak_broad_unanchored_low_evidence"
+    return "strong"
+
+
+def is_weak_partial_generic(reasons: list[str]) -> bool:
+    return candidate_strength_label(reasons) != "strong"
 
 
 def is_partial_generic_multi_token(
@@ -257,6 +264,8 @@ def is_partial_generic_multi_token(
     profile = profile or build_match_profile(intent)
     base_terms = list(profile.base_terms)
     if len(base_terms) < 2 or not profile.has_multi_token_exact_phrase:
+        return False
+    if has_anchoring_evidence(reasons):
         return False
     if any(reason.startswith("phrase:") for reason in reasons):
         return False
@@ -273,6 +282,37 @@ def is_partial_generic_multi_token(
         or reason.startswith("fuzzy:typo_fuzzy:")
     ]
     return bool(generic_hits)
+
+
+def is_broad_unanchored_low_evidence(reasons: list[str]) -> bool:
+    if has_anchoring_evidence(reasons):
+        return False
+    covered_count, total_count = coverage_counts(reasons)
+    if total_count < 2 or covered_count > 1 or covered_count == total_count:
+        return False
+    generic_hits = [
+        reason
+        for reason in reasons
+        if reason.startswith("text:normalized_terms:")
+        or reason.startswith("text:synonym_paraphrase:")
+        or reason.startswith("text:semantic_local:")
+    ]
+    return 0 < len(generic_hits) <= 2
+
+
+def has_anchoring_evidence(reasons: list[str]) -> bool:
+    for reason in reasons:
+        if reason.startswith(("phrase:", "artifact:", "text:artifact_path:", "text:task_slug:", "role:", "project:")):
+            return True
+        if reason in {"cwd", "date-window"}:
+            return True
+    covered_count, total_count = coverage_counts(reasons)
+    return bool(total_count and (covered_count == total_count or covered_count > 1))
+
+
+def coverage_counts(reasons: list[str]) -> tuple[int, int]:
+    coverage_reason = next((reason for reason in reasons if reason.startswith("coverage:base_terms:")), "")
+    return parse_coverage_reason(coverage_reason)
 
 
 def has_multi_token_exact_phrase(intent: QueryIntent) -> bool:
