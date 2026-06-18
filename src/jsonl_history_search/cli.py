@@ -445,6 +445,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of reviewed real-history cases to run; 0 means all cases.",
     )
     real_history_impact.add_argument(
+        "--case-family",
+        action="append",
+        default=[],
+        help="Sanitized manifest family to include; may be passed more than once. Defaults to all families.",
+    )
+    real_history_impact.add_argument(
         "--repeat",
         type=int,
         default=1,
@@ -488,6 +494,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture-expected-ref-diagnostics",
         action="store_true",
         help="Opt in to sanitized expected-ref reach/retention diagnostics in package-search rows.",
+    )
+    real_history_impact.add_argument(
+        "--aggregate-only-report",
+        action="store_true",
+        help="Omit per-case rows from the committed report payload after aggregate metrics are computed.",
     )
     real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
     add_common_args(real_history_timestamp_seek)

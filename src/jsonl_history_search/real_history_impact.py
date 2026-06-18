@@ -80,7 +80,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
         return {"real_history_impact_benchmark": report}
 
-    selected_cases = case_bundle[: args.case_limit if args.case_limit and args.case_limit > 0 else None]
+    selected_cases, subset_selection = _select_cases(case_bundle, args)
     limits = _limits_from_args(args)
     roots = _selected_roots(args, selected_cases)
     root_labels = [f"root_{index + 1:03d}" for index, _root in enumerate(roots)]
@@ -91,6 +91,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         root_labels=root_labels,
         started=started,
         bridge_report=bridge_result.report,
+        subset_selection=subset_selection,
     )
     base_report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
 
@@ -179,6 +180,11 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     base_report["rows"] = rows
     base_report["summary"] = _summarize(rows, selected)
     base_report["aggregate"] = _aggregate(rows)
+    base_report["rg_prefilter_coverage"] = _rg_prefilter_coverage(rows)
+    base_report["rg_prefilter_workflow_decision"] = _rg_prefilter_workflow_decision(
+        base_report["rg_prefilter_coverage"],
+        base_report["summary"],
+    )
     structural_diagnostic = _structural_sidecar_diagnostic(rows)
     if structural_diagnostic is not None:
         base_report["structural_sidecar_diagnostic"] = structural_diagnostic
@@ -212,7 +218,21 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         "committed": False,
     }
     base_report["total_wall_time_ms"] = _elapsed_ms(started)
+    if getattr(args, "aggregate_only_report", False):
+        base_report["report_scope"] = {
+            "mode": "aggregate_only_report",
+            "requested_case_limit": int(getattr(args, "case_limit", 0) or 0),
+            "selected_case_families": list(getattr(args, "case_family", []) or []),
+            "evaluated_case_count": len({row["case_id"] for row in rows}),
+            "limitation": (
+                "bounded aggregate-only diagnostic; subset selection, smaller case limits, and cap hits are "
+                "coverage/report-surface evidence only and do not support full-manifest prevalence, default rg, "
+                "universal rg, token-savings, final-answer quality, or product-value claims"
+            ),
+        }
     _add_metric_sections(base_report)
+    if getattr(args, "aggregate_only_report", False):
+        _apply_aggregate_only_report(base_report, row_count=len(rows))
     return {"real_history_impact_benchmark": base_report}
 
 
@@ -260,7 +280,10 @@ def _base_report(
     root_labels: list[str],
     started: float,
     bridge_report: dict[str, Any],
+    subset_selection: dict[str, Any],
 ) -> dict[str, Any]:
+    manifest_floor_status = _case_count_floor_status(manifest_case_count)
+    evaluated_floor_status = _case_count_floor_status(len(selected_cases))
     return {
         "schema_version": 1,
         "run_id": uuid.uuid4().hex[:12],
@@ -270,7 +293,10 @@ def _base_report(
         "case_count": len(selected_cases),
         "case_families": sorted({case["family"] for case in selected_cases}),
         "historical_original_case_count": 18,
-        "case_count_floor_status": _case_count_floor_status(manifest_case_count),
+        "case_count_floor_status": evaluated_floor_status,
+        "evaluated_case_count_floor_status": evaluated_floor_status,
+        "manifest_case_count_floor_status": manifest_floor_status,
+        "subset_selection": subset_selection,
         "root_labels": root_labels,
         "limits": limits.to_dict(),
         "baseline_contract": _baseline_contract(),
@@ -316,6 +342,31 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _manifest_case_count(manifest: dict[str, Any]) -> int:
     cases = manifest.get("cases")
     return len(cases) if isinstance(cases, list) else 0
+
+
+def _select_cases(cases: list[dict[str, Any]], args) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    requested_families = [str(item) for item in (getattr(args, "case_family", []) or []) if item]
+    selected = cases
+    mode = "all_manifest_cases"
+    if requested_families:
+        allowed = set(requested_families)
+        selected = [case for case in cases if case.get("family") in allowed]
+        mode = "sanitized_manifest_family_subset"
+    if getattr(args, "case_limit", 0) and args.case_limit > 0:
+        selected = selected[: args.case_limit]
+    return selected, {
+        "mode": mode,
+        "requested_family_labels": sorted(set(requested_families)),
+        "available_case_count": len(cases),
+        "selected_case_count": len(selected),
+        "selected_family_counts": _counts(case.get("family") for case in selected),
+        "selection_basis": (
+            "sanitized manifest family labels only; no raw query text, private paths, source lines, "
+            "session IDs, local usernames, exact case IDs, expected refs, target lines, or raw anchor needles"
+        ),
+        "subset_prevalence_claim": False,
+        "full_manifest_prevalence_claim": not bool(requested_families),
+    }
 
 
 def _case_count_floor_status(case_count: int) -> str:
@@ -1395,8 +1446,12 @@ def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, 
             "enabled": bool(enabled),
             "available": None,
             "attempted": False,
+            "eligible": False,
             "status": "disabled" if not enabled else "not_attempted",
             "fallback_reason": None,
+            "needle_policy": None,
+            "needle_count": 0,
+            "anchor_kind_counts": {},
             "candidate_files": 0,
             "candidate_bytes": 0,
             "matched_files": 0,
@@ -1410,8 +1465,12 @@ def _prefilter_row_stats(result: dict[str, Any], *, enabled: bool) -> dict[str, 
         "enabled": bool(stats.get("enabled")),
         "available": stats.get("available"),
         "attempted": bool(stats.get("attempted")),
+        "eligible": bool(stats.get("eligible")),
         "status": str(stats.get("status") or "unknown"),
         "fallback_reason": stats.get("fallback_reason"),
+        "needle_policy": stats.get("needle_policy"),
+        "needle_count": int(stats.get("needle_count", 0)),
+        "anchor_kind_counts": _safe_count_dict(stats.get("anchor_kind_counts")),
         "candidate_files": int(stats.get("candidate_files", 0)),
         "candidate_bytes": int(stats.get("candidate_bytes", 0)),
         "matched_files": int(stats.get("matched_files", 0)),
@@ -1465,6 +1524,13 @@ def _summarize(rows: list[dict[str, Any]], baselines: tuple[str, ...]) -> dict[s
                 row["rg_prefilter"]["bytes_reduction_ratio"] for row in selected
             ),
             "rg_prefilter_statuses": _counts((row.get("rg_prefilter") or {}).get("status") for row in selected),
+            "rg_needle_policy_counts": _prefilter_policy_counts(selected),
+            "rg_anchor_kind_counts": _prefilter_anchor_kind_counts(selected),
+            "rg_fallback_reason_counts": _prefilter_fallback_reason_counts(selected),
+            "rg_prefilter_used_runs": sum(
+                1 for row in selected if (row.get("rg_prefilter") or {}).get("status") == "used"
+            ),
+            "rg_prefilter_eligible_runs": sum(1 for row in selected if (row.get("rg_prefilter") or {}).get("eligible")),
         }
     if "package_search" in summary and "package_search_rg_prefilter" in summary:
         summary["package_search_rg_prefilter"]["equivalence_vs_package_search"] = _package_equivalence(rows)
@@ -1495,6 +1561,98 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "cases": sum(1 for row in rows if row.get("expected_outcome") == "no_evidence"),
             "correct": sum(1 for row in rows if row.get("no_evidence_correct") is True),
         },
+    }
+
+
+def _rg_prefilter_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [row for row in rows if row["baseline"] == "package_search_rg_prefilter"]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "basis": "package_search_rg_prefilter_not_run",
+            "runs": 0,
+            "cases": 0,
+            "used_runs": 0,
+            "eligible_runs": 0,
+            "anchor_kind_counts": {},
+            "fallback_reason_counts": {},
+            "status_counts": {},
+            "needle_policy_counts": {},
+            "privacy": _rg_prefilter_coverage_privacy(),
+        }
+    return {
+        "status": "evaluated",
+        "basis": "sanitized_package_search_rg_prefilter_rows",
+        "runs": len(selected),
+        "cases": len({row["case_id"] for row in selected}),
+        "used_runs": sum(1 for row in selected if (row.get("rg_prefilter") or {}).get("status") == "used"),
+        "eligible_runs": sum(1 for row in selected if (row.get("rg_prefilter") or {}).get("eligible")),
+        "attempted_runs": sum(1 for row in selected if (row.get("rg_prefilter") or {}).get("attempted")),
+        "anchor_kind_counts": _prefilter_anchor_kind_counts(selected),
+        "fallback_reason_counts": _prefilter_fallback_reason_counts(selected),
+        "status_counts": _counts((row.get("rg_prefilter") or {}).get("status") for row in selected),
+        "needle_policy_counts": _prefilter_policy_counts(selected),
+        "median_files_reduction_ratio": _median(
+            (row.get("rg_prefilter") or {}).get("files_reduction_ratio", 0.0) for row in selected
+        ),
+        "median_bytes_reduction_ratio": _median(
+            (row.get("rg_prefilter") or {}).get("bytes_reduction_ratio", 0.0) for row in selected
+        ),
+        "privacy": _rg_prefilter_coverage_privacy(),
+    }
+
+
+def _rg_prefilter_coverage_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "raw_anchor_needles_included": False,
+        "raw_query_text_included": False,
+        "raw_private_text_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "local_usernames_included": False,
+        "case_ids_required": False,
+    }
+
+
+def _rg_prefilter_workflow_decision(
+    coverage: dict[str, Any],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    anchor_total = sum(int(count) for count in (coverage.get("anchor_kind_counts") or {}).values())
+    used_runs = int(coverage.get("used_runs") or 0)
+    evaluated_runs = int(coverage.get("runs") or 0)
+    equivalence = (summary.get("package_search_rg_prefilter") or {}).get("equivalence_vs_package_search") or {}
+    if anchor_total and used_runs:
+        decision = "keep_opt_in_exact_anchor_rg_prefilter_and_document_when_to_try_it"
+        rationale = (
+            "Real-history aggregate rows include high-signal exact anchors and at least one used rg prefilter run, "
+            "so agents may be nudged to opt in when the user prompt already contains a path, task slug, commit hash, "
+            "or code/module identifier."
+        )
+    elif evaluated_runs:
+        decision = "keep_report_diagnostic_only_no_workflow_nudge"
+        rationale = (
+            "The evaluated real-history rg-prefilter rows did not show used high-signal anchor coverage, "
+            "so a skill/workflow nudge is not justified by this aggregate."
+        )
+    else:
+        decision = "not_evaluated"
+        rationale = "package_search_rg_prefilter was not run in this benchmark payload."
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "default_search_behavior_changed": False,
+        "rg_default_promotion_supported": False,
+        "universal_rg_supported": False,
+        "token_savings_claim_supported": False,
+        "final_answer_quality_claim_supported": False,
+        "product_value_claim_supported": False,
+        "evidence_basis": coverage.get("basis"),
+        "source_ref_equivalence": equivalence,
+        "next_action": "review_aggregate_coverage_before_any_runtime_routing_change",
     }
 
 
@@ -1754,6 +1912,73 @@ def _package_equivalence(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "equivalent_top_candidate_source_refs": ref_equivalent,
         "all_equivalent": bool(compared and doc_equivalent == compared and ref_equivalent == compared),
     }
+
+
+def _prefilter_policy_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        policy = (row.get("rg_prefilter") or {}).get("needle_policy")
+        if isinstance(policy, str) and _safe_counter_label(policy):
+            counts[policy] = counts.get(policy, 0) + 1
+    return counts
+
+
+def _prefilter_anchor_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        for kind, count in _safe_count_dict((row.get("rg_prefilter") or {}).get("anchor_kind_counts")).items():
+            counts[kind] = counts.get(kind, 0) + count
+    return counts
+
+
+def _prefilter_fallback_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = (row.get("rg_prefilter") or {}).get("fallback_reason")
+        if isinstance(reason, str) and _safe_counter_label(reason):
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _safe_count_dict(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, int] = {}
+    for key, count in value.items():
+        label = str(key)
+        if not _safe_counter_label(label):
+            continue
+        try:
+            safe[label] = int(count)
+        except (TypeError, ValueError):
+            continue
+    return safe
+
+
+def _safe_counter_label(value: str) -> bool:
+    return bool(value) and len(value) <= 64 and all(ch.islower() or ch.isdigit() or ch == "_" for ch in value)
+
+
+def _apply_aggregate_only_report(report: dict[str, Any], *, row_count: int) -> None:
+    report["rows"] = []
+    report["rows_omitted"] = {
+        "omitted": True,
+        "row_count": row_count,
+        "reason": "aggregate_only_report_requested",
+        "raw_private_evidence_storage": (report.get("raw_private_evidence") or {}).get("storage"),
+        "case_ids_committed": False,
+        "raw_queries_committed": False,
+        "raw_private_paths_committed": False,
+        "raw_anchor_needles_committed": False,
+    }
+    diagnostic = report.get("structural_sidecar_diagnostic")
+    if isinstance(diagnostic, dict) and diagnostic.get("rows"):
+        diagnostic["rows_omitted"] = {
+            "omitted": True,
+            "row_count": len(diagnostic.get("rows") or []),
+            "reason": "aggregate_only_report_requested",
+        }
+        diagnostic["rows"] = []
 
 
 def _evaluate_gate_statuses(rows: list[dict[str, Any]], summary: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
