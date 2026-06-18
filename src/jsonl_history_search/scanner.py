@@ -18,6 +18,7 @@ from .ranking import (
     is_weak_partial_generic,
     make_snippet,
     score_record,
+    strong_evidence_retention_tier,
 )
 from .rg_prefilter import filter_planned_files
 from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
@@ -30,7 +31,9 @@ CONTENT_MIRROR_SOURCE_KINDS = {"codex_history", "codex_sessions"}
 PRE_PARSE_STRATEGY = "literal_anchor_raw_line_contains_any_jsonl_only"
 PRE_PARSE_SAFE_STAGES = {"artifact_path", "task_slug"}
 PRE_PARSE_ANCHOR_KINDS = ("path", "task_slug")
-CANDIDATE_STRENGTH_STRATEGY = "strong_anchors_low_evidence_broad_partial_generic_to_weak_reservoir"
+CANDIDATE_STRENGTH_STRATEGY = (
+    "strong_anchors_low_evidence_broad_partial_generic_to_weak_reservoir_high_evidence_strong_retention"
+)
 
 
 @dataclass(frozen=True)
@@ -194,10 +197,10 @@ def search(
                     expected_state["expected_record_present_before_reservoir_retention"] = True
                     expected_state["pre_reservoir_status"] = "present_before_reservoir_retention"
                     expected_state["dedupe_phase_label"] = "not_deduped"
-                candidate_sort_key = match_candidate_sort_key(record, score)
                 strength_label = candidate_strength_label(reasons)
                 _count_candidate_strength(candidate_strength, strength_label)
                 if is_weak_partial_generic(reasons):
+                    candidate_sort_key = match_candidate_sort_key(record, score)
                     if expected_state is not None:
                         expected_state["candidate_strength"] = "weak"
                         expected_state["candidate_strength_label"] = strength_label
@@ -228,6 +231,10 @@ def search(
                 if expected_state is not None:
                     expected_state["candidate_strength"] = "strong"
                     expected_state["candidate_strength_label"] = strength_label
+                evidence_tier = strong_evidence_retention_tier(reasons)
+                if evidence_tier:
+                    candidate_strength["strong_high_evidence_candidates"] += 1
+                candidate_sort_key = match_candidate_sort_key(record, score, reasons)
                 if len(matches) < strong_reservoir_limit:
                     matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
                     candidate_strength["strong_reservoir_retained"] += 1
@@ -247,6 +254,8 @@ def search(
                         expected_state["reservoir_phase_label"] = "strong_reservoir_replaced_existing_candidate"
                 else:
                     candidate_strength["strong_reservoir_cap_dropped"] += 1
+                    if evidence_tier:
+                        candidate_strength["strong_high_evidence_reservoir_cap_dropped"] += 1
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_cap_drop"
                         expected_state["drop_phase_label"] = "strong_reservoir_drop"
@@ -263,6 +272,9 @@ def search(
         warnings.append("Strong candidates were retention-capped at max match cap before final ranking.")
     if weak_candidates_skipped:
         warnings.append("Weak low-evidence candidates were reservoir-capped before final ranking.")
+    candidate_strength["strong_high_evidence_reservoir_retained"] = sum(
+        1 for match in matches if strong_evidence_retention_tier(match.reasons)
+    )
     _mark_expected_pre_final_candidates(expected_diag, matches + weak_matches)
     matches = matches + weak_matches
     if len(matches) > plan.limits.max_matches:
@@ -647,6 +659,9 @@ def _initial_candidate_strength_stats(weak_reservoir_limit: int, strong_reservoi
         "strong_reservoir_retained": 0,
         "strong_reservoir_replaced": 0,
         "strong_reservoir_cap_dropped": 0,
+        "strong_high_evidence_candidates": 0,
+        "strong_high_evidence_reservoir_retained": 0,
+        "strong_high_evidence_reservoir_cap_dropped": 0,
         "weak_reservoir_retained": 0,
         "weak_reservoir_replaced": 0,
         "weak_reservoir_cap_dropped": 0,
@@ -795,8 +810,9 @@ def _materialize_match(
     )
 
 
-def match_candidate_sort_key(record, score: float) -> tuple[float, str, str, int]:
+def match_candidate_sort_key(record, score: float, reasons: list[str] | None = None) -> tuple[int, float, str, str, int]:
     return (
+        strong_evidence_retention_tier(reasons or []),
         round(score, 3),
         record.timestamp.isoformat() if record.timestamp else "",
         record.path,
@@ -804,5 +820,5 @@ def match_candidate_sort_key(record, score: float) -> tuple[float, str, str, int
     )
 
 
-def match_sort_key(match: Match) -> tuple[float, str, str, int]:
-    return (match.score, match.timestamp or "", match.path, -match.line)
+def match_sort_key(match: Match) -> tuple[int, float, str, str, int]:
+    return (strong_evidence_retention_tier(match.reasons), match.score, match.timestamp or "", match.path, -match.line)

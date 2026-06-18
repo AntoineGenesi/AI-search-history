@@ -255,6 +255,26 @@ def is_weak_partial_generic(reasons: list[str]) -> bool:
     return candidate_strength_label(reasons) != "strong"
 
 
+def strong_evidence_retention_tier(reasons: list[str]) -> int:
+    """General evidence tier used before final output caps choose retained candidates."""
+    tier = 0
+    for reason in reasons:
+        if reason.startswith(("text:artifact_path:", "text:task_slug:", "artifact:")):
+            tier = max(tier, 5)
+        elif reason.startswith("phrase:"):
+            tier = max(tier, 5)
+        elif reason in {"date-window", "cwd"} or reason.startswith("project:"):
+            tier = max(tier, 4)
+        elif reason.startswith("fuzzy:typo_fuzzy:"):
+            tier = max(tier, 3)
+    covered_count, total_count = coverage_counts(reasons)
+    if total_count > 1 and covered_count == total_count:
+        tier = max(tier, 4)
+    elif covered_count > 1:
+        tier = max(tier, 3)
+    return tier
+
+
 def is_partial_generic_multi_token(
     reasons: list[str],
     intent: QueryIntent,
