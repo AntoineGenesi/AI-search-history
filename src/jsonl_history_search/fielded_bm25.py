@@ -42,6 +42,7 @@ class FieldedBm25RecordRef:
     line: int
     source_kind: str
     raw_text: str
+    raw_materialization_text: str | None = None
     line_end: int | None = None
     record: Record | None = None
 
@@ -288,6 +289,7 @@ def search_with_fielded_bm25(
     bm25_rank_buckets: dict[str, int] = {}
     opened_paths: set[str] = set()
     searched_bytes = 0
+    materialization = _new_materialization_counters()
 
     for rank, row in enumerate(rows, start=1):
         rowid = int(row[0])
@@ -296,7 +298,7 @@ def search_with_fielded_bm25(
             continue
         opened_paths.add(str(chunk_ref.path))
         bm25_rank_buckets[_rank_bucket(rank)] = bm25_rank_buckets.get(_rank_bucket(rank), 0) + 1
-        for record in _materialize_chunk_records(chunk_ref, default_tz=default_tz):
+        for record in _materialize_chunk_records(chunk_ref, default_tz=default_tz, counters=materialization):
             records_considered += 1
             expected_state = _fielded_expected_state(expected_diag, record)
             if expected_state is not None:
@@ -366,6 +368,7 @@ def search_with_fielded_bm25(
         "records_rejected_by_existing_ranker": records_rejected_by_ranker,
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
+        "materialization": materialization,
         "groups": group_matches(matches),
         "summary": index.sanitized_summary(),
         "privacy": _privacy_payload(),
@@ -430,6 +433,7 @@ def _add_raw_chunk(
     last_line = chunk_lines[-1][0]
     raw_lines = tuple(raw for _line, raw in chunk_lines)
     raw_text = "\n".join(_clip_index_text(raw) for raw in raw_lines)
+    raw_materialization_text = "\n".join(raw_lines)
     insert_buffer.append(_raw_insert_row(rowid, raw_text, source_kind))
     index.records[rowid] = FieldedBm25RecordRef(
         rowid=rowid,
@@ -438,6 +442,7 @@ def _add_raw_chunk(
         line_end=last_line,
         source_kind=source_kind,
         raw_text=raw_text,
+        raw_materialization_text=raw_materialization_text,
     )
     index.metrics["indexed_chunks"] += 1
     if len(insert_buffer) >= 500:
@@ -472,11 +477,47 @@ def _materialize_record_ref(ref: FieldedBm25RecordRef, *, default_tz) -> Record:
     return ref_record
 
 
-def _materialize_chunk_records(ref: FieldedBm25RecordRef, *, default_tz) -> list[Record]:
+def _materialize_chunk_records(
+    ref: FieldedBm25RecordRef,
+    *,
+    default_tz,
+    counters: dict[str, int | bool] | None = None,
+) -> list[Record]:
+    if counters is not None:
+        counters["candidate_rows_materialized"] = int(counters["candidate_rows_materialized"]) + 1
     line_end = int(ref.line_end or ref.line)
     if line_end <= ref.line and ref.record is not None:
+        if counters is not None:
+            counters["candidate_rows_materialized_from_cached_record"] = (
+                int(counters["candidate_rows_materialized_from_cached_record"]) + 1
+            )
+            counters["records_materialized_from_cached_record"] = (
+                int(counters["records_materialized_from_cached_record"]) + 1
+            )
         return [_materialize_record_ref(ref, default_tz=default_tz)]
+    if ref.raw_materialization_text is not None:
+        if counters is not None:
+            counters["in_memory_raw_materialization_available"] = True
+            counters["candidate_rows_materialized_from_in_memory_raw"] = (
+                int(counters["candidate_rows_materialized_from_in_memory_raw"]) + 1
+            )
+        records = []
+        for offset, raw_line in enumerate(ref.raw_materialization_text.splitlines()):
+            line = ref.line + offset
+            record = parse_record(raw_line, path=ref.path, line=line, default_tz=default_tz)
+            record.source_format = ref.source_kind
+            records.append(record)
+        if counters is not None:
+            counters["records_materialized_from_in_memory_raw"] = (
+                int(counters["records_materialized_from_in_memory_raw"]) + len(records)
+            )
+        return records
     records: list[Record] = []
+    if counters is not None:
+        counters["file_reopen_attempts"] = int(counters["file_reopen_attempts"]) + 1
+        counters["candidate_rows_materialized_from_file_reopen"] = (
+            int(counters["candidate_rows_materialized_from_file_reopen"]) + 1
+        )
     try:
         with ref.path.open("r", encoding="utf-8", errors="replace") as handle:
             selected = itertools.islice(handle, ref.line - 1, line_end)
@@ -486,8 +527,38 @@ def _materialize_chunk_records(ref: FieldedBm25RecordRef, *, default_tz) -> list
                 record.source_format = ref.source_kind
                 records.append(record)
     except OSError:
+        if counters is not None:
+            counters["file_reopen_failures"] = int(counters["file_reopen_failures"]) + 1
+            counters["candidate_rows_materialization_failed"] = (
+                int(counters["candidate_rows_materialization_failed"]) + 1
+            )
         return []
+    if counters is not None:
+        counters["records_materialized_from_file_reopen"] = (
+            int(counters["records_materialized_from_file_reopen"]) + len(records)
+        )
     return records
+
+
+def _new_materialization_counters() -> dict[str, int | bool]:
+    return {
+        "candidate_rows_materialized": 0,
+        "candidate_rows_materialized_from_in_memory_raw": 0,
+        "candidate_rows_materialized_from_cached_record": 0,
+        "candidate_rows_materialized_from_file_reopen": 0,
+        "candidate_rows_materialization_failed": 0,
+        "records_materialized_from_in_memory_raw": 0,
+        "records_materialized_from_cached_record": 0,
+        "records_materialized_from_file_reopen": 0,
+        "file_reopen_attempts": 0,
+        "file_reopen_failures": 0,
+        "in_memory_raw_materialization_available": False,
+        "raw_text_included": False,
+        "raw_paths_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
 
 
 def _clip_index_text(raw_text: str) -> str:
@@ -777,6 +848,7 @@ def _unavailable_payload(
         "records_considered": 0,
         "candidate_records_scored": 0,
         "candidate_records_deduped": 0,
+        "materialization": _new_materialization_counters(),
         "bm25_rank_buckets": {},
         "groups": [],
         "summary": index.sanitized_summary(),
