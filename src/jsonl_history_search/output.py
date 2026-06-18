@@ -2975,6 +2975,8 @@ def render_real_history_impact_text(payload: dict) -> str:
             f"compact_bytes={compact.get('compact_context_bytes')} "
             f"ratio={compact.get('compact_to_full_result_byte_ratio')} "
             f"ref_equiv={equivalence.get('top_candidate_ref_ids_equivalent_runs')}/"
+            f"{equivalence.get('compared_runs')} "
+            f"window_ref_equiv={equivalence.get('source_window_ref_ids_equivalent_runs')}/"
             f"{equivalence.get('compared_runs')}"
         )
     compact_decision = report.get("compact_package_handoff_decision") or {}
@@ -3177,11 +3179,20 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Median compact package bytes: `{compact.get('median_compact_context_bytes')}`",
                 f"- Top candidate count: `{compact.get('top_candidate_count')}`",
                 f"- Source window count: `{compact.get('source_window_count')}`",
+                f"- Equivalence comparison basis: `{equivalence.get('comparison_basis')}`",
+                f"- Top-candidate scope: `{equivalence.get('top_candidate_scope')}`",
+                f"- Top-candidate limit: `{equivalence.get('top_candidate_limit')}`",
+                f"- Source-window scope: `{equivalence.get('source_window_scope')}`",
+                f"- Source-window limit: `{equivalence.get('source_window_limit')}`",
                 f"- Compared runs: `{equivalence.get('compared_runs')}`",
                 f"- Top-candidate ref-id equivalent runs: `{equivalence.get('top_candidate_ref_ids_equivalent_runs')}`",
                 f"- Top-candidate source-ref equivalent runs: `{equivalence.get('top_candidate_source_refs_equivalent_runs')}`",
+                f"- Source-window ref-id equivalent runs: `{equivalence.get('source_window_ref_ids_equivalent_runs')}`",
+                f"- Source-window source-ref equivalent runs: `{equivalence.get('source_window_source_refs_equivalent_runs')}`",
                 f"- All top-candidate ref IDs equivalent: `{equivalence.get('all_top_candidate_ref_ids_equivalent')}`",
                 f"- All top-candidate source refs equivalent: `{equivalence.get('all_top_candidate_source_refs_equivalent')}`",
+                f"- All source-window ref IDs equivalent: `{equivalence.get('all_source_window_ref_ids_equivalent')}`",
+                f"- All source-window source refs equivalent: `{equivalence.get('all_source_window_source_refs_equivalent')}`",
                 f"- Legacy output context bytes preserved: `{compact.get('legacy_output_context_bytes_preserved')}`",
                 f"- Compact bytes measured separately: `{compact.get('compact_bytes_measured_separately')}`",
             ]

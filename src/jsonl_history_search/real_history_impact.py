@@ -875,7 +875,17 @@ def _run_package_search_variant(
         row["compact_package_handoff"] = _compact_package_row_stats(
             compact_package,
             row=row,
-            compact_top_candidate_ref_ids=_compact_candidate_ref_ids(case, candidates),
+            expected_refs=case.get("expected_refs", []),
+            legacy_top_candidate_ref_ids=_candidate_ref_ids(
+                candidates,
+                case.get("expected_refs", []),
+                limit=COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            ),
+            legacy_source_window_ref_ids=_candidate_ref_ids(
+                candidates,
+                case.get("expected_refs", []),
+                limit=COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+            ),
             full_result_output_context_bytes=int(row["output_context_bytes"]),
         )
         raw_row["compact_package_handoff"] = compact_package
@@ -986,14 +996,28 @@ def _compact_package_row_stats(
     compact_package: dict[str, Any],
     *,
     row: dict[str, Any],
-    compact_top_candidate_ref_ids: list[str],
+    expected_refs: list[dict[str, Any]],
+    legacy_top_candidate_ref_ids: list[str],
+    legacy_source_window_ref_ids: list[str],
     full_result_output_context_bytes: int,
 ) -> dict[str, Any]:
     compact_context_bytes = int(compact_package.get("compact_context_bytes") or 0)
     ratio = round(compact_context_bytes / full_result_output_context_bytes, 6) if full_result_output_context_bytes else 0.0
-    top_candidate_ref_ids = list(row.get("top_candidate_ref_ids") or [])
-    top_candidate_source_refs = list(row.get("top_candidate_source_refs") or [])
+    payload = compact_package.get("payload") if isinstance(compact_package.get("payload"), dict) else {}
+    compact_top_candidate_ref_ids = _compact_payload_ref_ids(
+        payload.get("top_candidates"),
+        expected_refs,
+        limit=COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+    )
     compact_top_candidate_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in compact_top_candidate_ref_ids]
+    compact_source_window_ref_ids = _compact_payload_ref_ids(
+        payload.get("source_windows"),
+        expected_refs,
+        limit=COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+    )
+    legacy_top_candidate_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in legacy_top_candidate_ref_ids]
+    compact_source_window_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in compact_source_window_ref_ids]
+    legacy_source_window_source_refs = [f"sanitized_ref:{ref_id}" for ref_id in legacy_source_window_ref_ids]
     return {
         "enabled": True,
         "package_kind": "compact_package_source_locator_source_window",
@@ -1010,21 +1034,63 @@ def _compact_package_row_stats(
         "compact_byte_delta_vs_full_result": compact_context_bytes - full_result_output_context_bytes,
         "legacy_output_context_bytes_preserved": True,
         "compact_bytes_measured_separately": True,
-        "top_candidate_ref_ids_equivalent": compact_top_candidate_ref_ids == top_candidate_ref_ids,
-        "top_candidate_source_refs_equivalent": compact_top_candidate_source_refs == top_candidate_source_refs,
-        "top_candidate_ref_id_count": len(top_candidate_ref_ids),
-        "top_candidate_source_ref_count": len(top_candidate_source_refs),
+        "equivalence_scope": {
+            "top_candidate_scope": "same_ordered_top_candidate_limit",
+            "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            "source_window_scope": "same_ordered_source_window_limit",
+            "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
+            "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+        },
+        "top_candidate_ref_ids_equivalent": compact_top_candidate_ref_ids == legacy_top_candidate_ref_ids,
+        "top_candidate_source_refs_equivalent": compact_top_candidate_source_refs == legacy_top_candidate_source_refs,
+        "source_window_ref_ids_equivalent": compact_source_window_ref_ids == legacy_source_window_ref_ids,
+        "source_window_source_refs_equivalent": compact_source_window_source_refs == legacy_source_window_source_refs,
+        "top_candidate_ref_id_count": len(legacy_top_candidate_ref_ids),
+        "top_candidate_source_ref_count": len(legacy_top_candidate_source_refs),
+        "compact_payload_top_candidate_ref_id_count": len(compact_top_candidate_ref_ids),
+        "compact_payload_source_window_ref_id_count": len(compact_source_window_ref_ids),
+        "legacy_source_window_ref_id_count": len(legacy_source_window_ref_ids),
         "privacy": _compact_package_handoff_privacy(),
     }
 
 
-def _compact_candidate_ref_ids(case: dict[str, Any], candidates: list[Candidate]) -> list[str]:
-    expected = {(ref["path"], ref["line"]): ref["ref_id"] for ref in case.get("expected_refs", [])}
+def _candidate_ref_ids(
+    candidates: list[Candidate],
+    expected_refs: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    expected = {(ref["path"], ref["line"]): ref["ref_id"] for ref in expected_refs}
     return [
         expected[(candidate.path, candidate.line)]
-        for candidate in candidates[:COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT]
+        for candidate in candidates[:limit]
         if (candidate.path, candidate.line) in expected
     ]
+
+
+def _compact_payload_ref_ids(
+    items: Any,
+    expected_refs: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    expected = {(str(ref["path"]), int(ref["line"])): ref["ref_id"] for ref in expected_refs}
+    ref_ids: list[str] = []
+    for item in list(items or [])[:limit]:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("source_ref")
+        if not isinstance(ref, dict):
+            continue
+        path = ref.get("path")
+        line = ref.get("line")
+        try:
+            key = (str(path), int(line))
+        except (TypeError, ValueError):
+            continue
+        if key in expected:
+            ref_ids.append(expected[key])
+    return ref_ids
 
 
 def _json_bytes(payload: dict[str, Any]) -> int:
@@ -1852,6 +1918,8 @@ def _compact_package_handoff_summary(rows: list[dict[str, Any]]) -> dict[str, An
     compared = len(stats)
     ref_equivalent = sum(1 for item in stats if item.get("top_candidate_ref_ids_equivalent") is True)
     source_equivalent = sum(1 for item in stats if item.get("top_candidate_source_refs_equivalent") is True)
+    window_ref_equivalent = sum(1 for item in stats if item.get("source_window_ref_ids_equivalent") is True)
+    window_source_equivalent = sum(1 for item in stats if item.get("source_window_source_refs_equivalent") is True)
     return {
         "status": "evaluated",
         "basis": "opt_in_package_search_compact_source_locator_source_window_rows",
@@ -1875,10 +1943,19 @@ def _compact_package_handoff_summary(rows: list[dict[str, Any]]) -> dict[str, An
         "top_candidate_count": sum(int(item.get("top_candidate_count") or 0) for item in stats),
         "equivalence": {
             "compared_runs": compared,
+            "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+            "top_candidate_scope": "same_ordered_top_candidate_limit",
+            "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+            "source_window_scope": "same_ordered_source_window_limit",
+            "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
             "top_candidate_ref_ids_equivalent_runs": ref_equivalent,
             "top_candidate_source_refs_equivalent_runs": source_equivalent,
+            "source_window_ref_ids_equivalent_runs": window_ref_equivalent,
+            "source_window_source_refs_equivalent_runs": window_source_equivalent,
             "all_top_candidate_ref_ids_equivalent": bool(compared and ref_equivalent == compared),
             "all_top_candidate_source_refs_equivalent": bool(compared and source_equivalent == compared),
+            "all_source_window_ref_ids_equivalent": bool(compared and window_ref_equivalent == compared),
+            "all_source_window_source_refs_equivalent": bool(compared and window_source_equivalent == compared),
         },
         "privacy": _compact_package_handoff_privacy(),
         "legacy_output_context_bytes_preserved": all(
@@ -1891,10 +1968,19 @@ def _compact_package_handoff_summary(rows: list[dict[str, Any]]) -> dict[str, An
 def _compact_package_empty_equivalence() -> dict[str, Any]:
     return {
         "compared_runs": 0,
+        "comparison_basis": "compact_payload_source_refs_vs_legacy_full_result_source_refs",
+        "top_candidate_scope": "same_ordered_top_candidate_limit",
+        "top_candidate_limit": COMPACT_PACKAGE_TOP_CANDIDATE_LIMIT,
+        "source_window_scope": "same_ordered_source_window_limit",
+        "source_window_limit": COMPACT_PACKAGE_SOURCE_WINDOW_LIMIT,
         "top_candidate_ref_ids_equivalent_runs": 0,
         "top_candidate_source_refs_equivalent_runs": 0,
+        "source_window_ref_ids_equivalent_runs": 0,
+        "source_window_source_refs_equivalent_runs": 0,
         "all_top_candidate_ref_ids_equivalent": False,
         "all_top_candidate_source_refs_equivalent": False,
+        "all_source_window_ref_ids_equivalent": False,
+        "all_source_window_source_refs_equivalent": False,
     }
 
 
