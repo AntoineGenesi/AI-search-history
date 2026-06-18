@@ -3351,6 +3351,154 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Default promotion supported: `{agent_compact_decision.get('default_promotion_supported')}`",
             ]
         )
+    source_tier_pressure = report.get("source_tier_answerability_pressure") or {}
+    source_tier_decision = report.get("source_tier_answerability_pressure_decision") or {}
+    if source_tier_pressure:
+        source_catalog = source_tier_pressure.get("source_catalog") or {}
+        source_plan = source_tier_pressure.get("source_plan") or {}
+        stage_bottlenecks = source_tier_pressure.get("stage_bottlenecks") or {}
+        compact_budget = source_tier_pressure.get("compact_context_budget") or {}
+        cap_hit = source_tier_pressure.get("cap_hit") or {}
+        no_evidence = source_tier_pressure.get("no_evidence") or {}
+        lines.extend(
+            [
+                "",
+                "## Source-Tier Answerability Pressure",
+                "",
+                f"- Status: `{source_tier_pressure.get('status')}`",
+                f"- Basis: `{source_tier_pressure.get('basis')}`",
+                f"- Runs: `{source_tier_pressure.get('runs')}`",
+                f"- Cases: `{source_tier_pressure.get('cases')}`",
+                f"- Manifest case count: `{source_tier_pressure.get('manifest_case_count')}`",
+                f"- Evaluated case count: `{source_tier_pressure.get('evaluated_case_count')}`",
+                f"- Requested case limit: `{source_tier_pressure.get('requested_case_limit')}`",
+                f"- Full manifest requested: `{source_tier_pressure.get('full_manifest_requested')}`",
+                f"- Full manifest run: `{source_tier_pressure.get('full_manifest_run')}`",
+                f"- Full 20-case manifest run: `{source_tier_pressure.get('full_manifest_20_case_run')}`",
+                f"- Baseline counts: `{source_tier_pressure.get('baseline_counts')}`",
+                f"- Answerability status counts: `{source_tier_pressure.get('answerability_status_counts')}`",
+                f"- Answerable-from-packet rows: `{source_tier_pressure.get('answerable_from_packet_rows')}`",
+                (
+                    "- Candidate-presence-implies-answerability rows: "
+                    f"`{source_tier_pressure.get('candidate_presence_implies_answerability_rows')}`"
+                ),
+                f"- Diagnostic candidate rows: `{source_tier_pressure.get('diagnostic_candidate_rows')}`",
+                f"- Weak candidate diagnostic rows: `{source_tier_pressure.get('weak_candidate_diagnostic_rows')}`",
+                f"- Cap-hit rows: `{cap_hit.get('rows')}`",
+                f"- Cap-hit rows by label: `{cap_hit.get('rows_by_label')}`",
+                f"- No-evidence needed rows: `{no_evidence.get('needed_rows')}`",
+                f"- No-evidence answer-scope counts: `{no_evidence.get('answer_scope_counts')}`",
+            ]
+        )
+        lines.extend(
+            [
+                "",
+                "### Source Catalog and Plan",
+                "",
+                f"- Source catalog present rows: `{source_catalog.get('present_rows')}`",
+                f"- Median source catalog file count: `{source_catalog.get('median_file_count')}`",
+                f"- Median selected file count: `{source_catalog.get('median_selected_file_count')}`",
+                f"- Source catalog cap label counts: `{source_catalog.get('cap_label_counts')}`",
+                f"- Source catalog raw paths included: `{source_catalog.get('raw_paths_included')}`",
+                f"- Source catalog raw text included: `{source_catalog.get('raw_text_included')}`",
+                (
+                    "- Persistent index or cache used: "
+                    f"`{source_catalog.get('persistent_index_or_cache_used')}`"
+                ),
+                f"- Source plan present rows: `{source_plan.get('present_rows')}`",
+                f"- Median sources total: `{source_plan.get('median_sources_total')}`",
+                f"- Median sources selected: `{source_plan.get('median_sources_selected')}`",
+                f"- Sources selected total: `{source_plan.get('sources_selected_total')}`",
+                f"- Sources pruned hard total: `{source_plan.get('sources_pruned_hard_total')}`",
+                f"- Sources deferred by budget total: `{source_plan.get('sources_deferred_budget_total')}`",
+                f"- Deferred rows: `{source_plan.get('deferred_rows')}`",
+                f"- Retry guidance rows: `{source_plan.get('retry_guidance_rows')}`",
+                f"- Retry guidance present rows: `{source_plan.get('retry_guidance_present_rows')}`",
+                f"- Selected tier counts: `{source_plan.get('selected_tier_counts')}`",
+                f"- Deferred tier counts: `{source_plan.get('deferred_tier_counts')}`",
+                f"- Deferred reason counts: `{source_plan.get('deferred_reason_counts')}`",
+                f"- Uses scoring weights rows: `{source_plan.get('uses_scoring_weights_rows')}`",
+                f"- Source plan raw paths included: `{source_plan.get('raw_paths_included')}`",
+                f"- Source plan raw text included: `{source_plan.get('raw_text_included')}`",
+            ]
+        )
+        lines.extend(
+            [
+                "",
+                "### Stage Bottlenecks",
+                "",
+                (
+                    "- Dominant pressure stage counts: "
+                    f"`{stage_bottlenecks.get('dominant_pressure_stage_counts')}`"
+                ),
+                f"- Stage status counts: `{stage_bottlenecks.get('stage_status_counts')}`",
+                f"- Stage next-fix hint counts: `{stage_bottlenecks.get('stage_next_fix_hint_counts')}`",
+            ]
+        )
+        lines.extend(
+            [
+                "",
+                "### Compact Budget",
+                "",
+                f"- Compact context bytes: `{compact_budget.get('compact_context_bytes')}`",
+                f"- Compact context tokens approx: `{compact_budget.get('compact_context_tokens_approx')}`",
+                (
+                    "- Full result output context bytes: "
+                    f"`{compact_budget.get('full_result_output_context_bytes')}`"
+                ),
+                f"- Median compact context bytes: `{compact_budget.get('median_compact_context_bytes')}`",
+                (
+                    "- Median full result output context bytes: "
+                    f"`{compact_budget.get('median_full_result_output_context_bytes')}`"
+                ),
+                f"- Measurement basis counts: `{compact_budget.get('measurement_basis_counts')}`",
+                f"- Output count totals: `{compact_budget.get('output_count_totals')}`",
+                f"- Output limit maxima: `{compact_budget.get('output_limit_maxima')}`",
+            ]
+        )
+        privacy = source_tier_pressure.get("privacy") or {}
+        if privacy:
+            lines.extend(["", "### Source-Tier Privacy", ""])
+            for key, value in privacy.items():
+                lines.append(f"- `{key}`: `{value}`")
+        claims = source_tier_pressure.get("claim_boundaries") or {}
+        if claims:
+            lines.extend(["", "### Source-Tier Claim Boundaries", ""])
+            for key, value in claims.items():
+                lines.append(f"- `{key}`: `{value}`")
+    if source_tier_decision:
+        lines.extend(
+            [
+                "",
+                "## Source-Tier Answerability Decision",
+                "",
+                f"- Decision: `{source_tier_decision.get('decision')}`",
+                f"- Selected next product decision: `{source_tier_decision.get('selected_next_product_decision')}`",
+                f"- Rationale: {source_tier_decision.get('rationale')}",
+                f"- Next action: `{source_tier_decision.get('next_action')}`",
+                f"- Measured packet: `{source_tier_decision.get('measured_packet')}`",
+                f"- Measured builder: `{source_tier_decision.get('measured_builder')}`",
+                f"- Measured baseline: `{source_tier_decision.get('measured_baseline')}`",
+                f"- Uses live fielded BM25 result: `{source_tier_decision.get('uses_live_fielded_bm25_result')}`",
+                f"- Uses handcrafted packets: `{source_tier_decision.get('uses_handcrafted_packets')}`",
+                f"- Default search behavior changed: `{source_tier_decision.get('default_search_behavior_changed')}`",
+                (
+                    "- Scanner/ranking/source selection changed: "
+                    f"`{source_tier_decision.get('scanner_ranking_source_selection_changed')}`"
+                ),
+                (
+                    "- Legacy output context bytes redefined: "
+                    f"`{source_tier_decision.get('legacy_output_context_bytes_redefined')}`"
+                ),
+                f"- Token-savings claim supported: `{source_tier_decision.get('token_savings_claim_supported')}`",
+                (
+                    "- Final-answer quality claim supported: "
+                    f"`{source_tier_decision.get('final_answer_quality_claim_supported')}`"
+                ),
+                f"- Product-value claim supported: `{source_tier_decision.get('product_value_claim_supported')}`",
+                f"- Default promotion supported: `{source_tier_decision.get('default_promotion_supported')}`",
+            ]
+        )
     omitted = report.get("rows_omitted") or {}
     if omitted:
         lines.extend(

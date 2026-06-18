@@ -15,10 +15,18 @@ from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .metric_contract import add_metric_contract, real_history_impact_metrics
 from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
-from .retrieval_modes import run_rrf_fusion_retrieval
+from .retrieval_modes import build_fielded_bm25_retrieval_diagnostics, run_rrf_fusion_retrieval
 from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT
 from .scanner import search
-from .sources import Limits, SourcePlan, build_source_plan, enumerate_jsonl_files
+from .sources import (
+    Limits,
+    SourcePlan,
+    build_command_local_source_catalog,
+    build_command_local_source_plan,
+    build_source_plan,
+    enumerate_jsonl_files,
+    materialize_planned_jsonl_files,
+)
 from .structural_hybrid import (
     hybrid_package_structural_result as _shared_hybrid_package_structural_result,
     search_structural_hybrid_budgeted,
@@ -229,6 +237,19 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         )
         base_report["aggregate"]["agent_compact_provenance_handoff"] = base_report[
             "agent_compact_provenance_handoff"
+        ]
+    if getattr(args, "source_tier_answerability_pressure", False):
+        base_report["source_tier_answerability_pressure"] = _source_tier_answerability_pressure_summary(
+            rows,
+            manifest_case_count=manifest_case_count,
+            evaluated_case_count=len(selected_cases),
+            requested_case_limit=int(getattr(args, "case_limit", 0) or 0),
+        )
+        base_report["source_tier_answerability_pressure_decision"] = (
+            _source_tier_answerability_pressure_decision(base_report["source_tier_answerability_pressure"])
+        )
+        base_report["aggregate"]["source_tier_answerability_pressure"] = base_report[
+            "source_tier_answerability_pressure"
         ]
     structural_diagnostic = _structural_sidecar_diagnostic(rows)
     if structural_diagnostic is not None:
@@ -666,6 +687,30 @@ def _run_package_search_fielded_bm25(**kwargs) -> tuple[dict[str, Any], dict[str
         notes=["opt_in_fielded_sqlite_fts5_bm25_candidate_generator_probe"],
     )
     row["fielded_bm25"] = _fielded_bm25_row_stats(result)
+    if getattr(args, "source_tier_answerability_pressure", False):
+        _attach_source_tier_answerability_retrieval_diagnostics(
+            result,
+            index=index,
+            plan=plan,
+            intent=intent,
+            warnings=fielded_warnings,
+        )
+        source_plan = _agent_find_source_plan(plan=plan, intent=intent, args=args, now=now)
+        agent_find = build_agent_find_payload(
+            source_plan=source_plan,
+            search_result=result,
+            manifest_report=None,
+            output_format="json",
+            report_output=None,
+            compact_provenance_handoff=True,
+        )["agent_find"]
+        compact_handoff = agent_find["compact_provenance_handoff"]
+        row["source_tier_answerability_pressure"] = _source_tier_answerability_pressure_row_stats(
+            compact_handoff,
+            row=row,
+            full_result_output_context_bytes=int(row["output_context_bytes"]),
+        )
+        raw_row["source_tier_answerability_pressure"] = compact_handoff
     expected_diagnostics = _expected_ref_diagnostics_row(result)
     if expected_diagnostics is not None:
         row["expected_ref_diagnostics"] = expected_diagnostics
@@ -1080,6 +1125,39 @@ def _agent_find_source_plan(
         "claude_home": str(claude_home),
         "now": now.isoformat(),
     }
+
+
+def _attach_source_tier_answerability_retrieval_diagnostics(
+    result: dict[str, Any],
+    *,
+    index: Any,
+    plan: SourcePlan,
+    intent: QueryIntent,
+    warnings: list[str],
+) -> None:
+    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
+    source_catalog = build_command_local_source_catalog(plan, planned_jsonl_files)
+    _selected_jsonl_files, source_plan = build_command_local_source_plan(plan, planned_jsonl_files, intent)
+    index_summary = index.sanitized_summary() if index is not None and hasattr(index, "sanitized_summary") else {}
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    result["retrieval_mode"] = "fielded-bm25"
+    result["retrieval_diagnostics"] = build_fielded_bm25_retrieval_diagnostics(
+        fielded_result=result,
+        fielded_index_summary=index_summary,
+        fielded_index_elapsed_ms=float(summary.get("build_elapsed_ms") or 0.0),
+        fielded_elapsed_ms=float((result.get("profile") or {}).get("elapsed_ms") or 0.0),
+        enumeration_elapsed_ms=float(planned_jsonl_files.elapsed_ms),
+        planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
+        source_catalog=source_catalog,
+        source_plan=source_plan,
+        warnings=warnings,
+        profiles={
+            "fielded_bm25_index_build": summary.get("profile") if isinstance(summary.get("profile"), dict) else {},
+            "fielded_bm25_search_materialization": result.get("profile")
+            if isinstance(result.get("profile"), dict)
+            else {},
+        },
+    )
 
 
 def _build_compact_package_handoff(
@@ -3366,6 +3444,482 @@ def _agent_compact_provenance_handoff_decision(summary: dict[str, Any]) -> dict[
     }
 
 
+def _source_tier_answerability_pressure_row_stats(
+    compact_handoff: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    full_result_output_context_bytes: int,
+) -> dict[str, Any]:
+    evidence = (
+        compact_handoff.get("evidence_sufficiency")
+        if isinstance(compact_handoff.get("evidence_sufficiency"), dict)
+        else {}
+    )
+    context_budget = (
+        compact_handoff.get("context_budget") if isinstance(compact_handoff.get("context_budget"), dict) else {}
+    )
+    output_budget = compact_handoff.get("output_budget") if isinstance(compact_handoff.get("output_budget"), dict) else {}
+    no_evidence = compact_handoff.get("no_evidence") if isinstance(compact_handoff.get("no_evidence"), dict) else {}
+    stage_diagnostics = (
+        compact_handoff.get("stage_diagnostics")
+        if isinstance(compact_handoff.get("stage_diagnostics"), dict)
+        else {}
+    )
+    source_catalog = stage_diagnostics.get("source_catalog") if isinstance(stage_diagnostics.get("source_catalog"), dict) else {}
+    source_plan = stage_diagnostics.get("source_plan") if isinstance(stage_diagnostics.get("source_plan"), dict) else {}
+    source_tiers = source_plan.get("source_tiers") if isinstance(source_plan.get("source_tiers"), dict) else {}
+    retry_guidance = source_plan.get("retry_guidance") if isinstance(source_plan.get("retry_guidance"), dict) else {}
+    searched_scope_support = (
+        evidence.get("searched_scope_support") if isinstance(evidence.get("searched_scope_support"), dict) else {}
+    )
+    source_tier_boundary = (
+        evidence.get("source_tier_boundary") if isinstance(evidence.get("source_tier_boundary"), dict) else {}
+    )
+    no_evidence_boundary = (
+        evidence.get("no_evidence_boundary") if isinstance(evidence.get("no_evidence_boundary"), dict) else {}
+    )
+    related_policy = (
+        evidence.get("related_candidate_policy") if isinstance(evidence.get("related_candidate_policy"), dict) else {}
+    )
+    counts = output_budget.get("counts") if isinstance(output_budget.get("counts"), dict) else {}
+    limits = output_budget.get("limits") if isinstance(output_budget.get("limits"), dict) else {}
+    compact_context_bytes = int(context_budget.get("payload_bytes") or _json_bytes(compact_handoff))
+    return {
+        "enabled": True,
+        "baseline": row.get("baseline"),
+        "package_kind": "source_tier_answerability_pressure",
+        "measurement_basis": "fielded_bm25_result_to_live_agent_find_compact_provenance_handoff",
+        "command_surface": compact_handoff.get("command_surface"),
+        "packet_status": compact_handoff.get("status"),
+        "answerability_status": _safe_agent_compact_label(
+            compact_handoff.get("answerability_status") or evidence.get("support_class")
+        ),
+        "evidence_sufficiency": {
+            "support_class": _safe_agent_compact_label(evidence.get("support_class")),
+            "answerable_from_packet": bool(evidence.get("answerable_from_packet", False)),
+            "grounding_state": _safe_agent_compact_label(evidence.get("grounding_state")),
+            "candidate_presence_implies_answerability": bool(
+                evidence.get("candidate_presence_implies_answerability", False)
+            ),
+            "searched_scope_support": {
+                "candidate_count": int(searched_scope_support.get("candidate_count") or 0),
+                "strong_candidate_count": int(searched_scope_support.get("strong_candidate_count") or 0),
+                "weak_or_related_candidate_count": int(
+                    searched_scope_support.get("weak_or_related_candidate_count") or 0
+                ),
+                "diagnostic_candidates_preserved": bool(
+                    searched_scope_support.get("diagnostic_candidates_preserved", False)
+                ),
+            },
+            "source_tier_boundary": {
+                "sources_selected": int(source_tier_boundary.get("sources_selected") or 0),
+                "sources_deferred_budget": int(source_tier_boundary.get("sources_deferred_budget") or 0),
+                "retry_guidance_needed": bool(source_tier_boundary.get("retry_guidance_needed", False)),
+                "exhaustive_available": bool(source_tier_boundary.get("exhaustive_available", False)),
+                "hard_required_selected": int(source_tier_boundary.get("hard_required_selected") or 0),
+                "raw_paths_included": False,
+                "raw_text_included": False,
+            },
+            "no_evidence_boundary": {
+                "needed": bool(no_evidence_boundary.get("needed", False)),
+                "answer_scope": _safe_agent_compact_label(no_evidence_boundary.get("answer_scope")),
+                "not_all_history_absence": bool(no_evidence_boundary.get("not_all_history_absence", True)),
+                "deferred_source_count": int(no_evidence_boundary.get("deferred_source_count") or 0),
+            },
+            "related_candidate_policy": {
+                "weak_candidates_remain_as_diagnostics": bool(
+                    related_policy.get("weak_candidates_remain_as_diagnostics", False)
+                ),
+                "source_refs_and_windows_preserved": bool(
+                    related_policy.get("source_refs_and_windows_preserved", False)
+                ),
+                "do_not_promote_weak_candidates_to_answer": bool(
+                    related_policy.get("do_not_promote_weak_candidates_to_answer", False)
+                ),
+            },
+        },
+        "source_catalog": {
+            "present": bool(source_catalog),
+            "file_count": int(source_catalog.get("file_count") or 0),
+            "byte_count": int(source_catalog.get("byte_count") or 0),
+            "selected_file_count": int(source_catalog.get("selected_file_count") or 0),
+            "skipped_file_count": int(source_catalog.get("skipped_file_count") or 0),
+            "cap_labels": [label for label in source_catalog.get("cap_labels") or [] if _safe_counter_label(str(label))],
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "persistent_index_or_cache_used": False,
+        },
+        "source_plan": {
+            "present": bool(source_plan),
+            "sources_total": int(source_plan.get("sources_total") or 0),
+            "sources_selected": int(source_plan.get("sources_selected") or 0),
+            "sources_pruned_hard": int(source_plan.get("sources_pruned_hard") or 0),
+            "sources_deferred_budget": int(source_plan.get("sources_deferred_budget") or 0),
+            "exhaustive_available": bool(source_plan.get("exhaustive_available", False)),
+            "tier_order": [
+                str(item) for item in source_plan.get("tier_order") or [] if _safe_counter_label(str(item))
+            ],
+            "selected_counts": _safe_count_dict(source_tiers.get("selected_counts")),
+            "deferred_counts": _safe_count_dict(source_tiers.get("deferred_counts")),
+            "deferred_reason_counts": _safe_count_dict(source_plan.get("deferred_reason_counts")),
+            "retry_guidance_needed": bool(retry_guidance.get("needed", False)),
+            "retry_deferred_source_count": int(retry_guidance.get("deferred_source_count") or 0),
+            "retry_guidance_present": bool(retry_guidance.get("guidance")),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "uses_scoring_weights": bool((source_plan.get("budget_basis") or {}).get("uses_scoring_weights", False)),
+        },
+        "source_window_packaging": _source_tier_stage_counters(stage_diagnostics, "source_window_packaging"),
+        "compact_context_budget": {
+            "payload_bytes": compact_context_bytes,
+            "estimated_tokens": int(context_budget.get("estimated_tokens") or _ceil_div4(compact_context_bytes)),
+            "measurement_basis": context_budget.get("measurement_basis") or "compact_provenance_handoff_packet_only",
+            "full_result_output_context_bytes": full_result_output_context_bytes,
+            "compact_to_full_result_byte_ratio": (
+                round(compact_context_bytes / full_result_output_context_bytes, 6)
+                if full_result_output_context_bytes
+                else 0.0
+            ),
+            "output_counts": {str(key): int(value or 0) for key, value in sorted(counts.items())},
+            "output_limits": {str(key): int(value or 0) for key, value in sorted(limits.items())},
+        },
+        "no_evidence": {
+            "needed": bool(no_evidence.get("needed")),
+            "answer_scope_label": _safe_agent_compact_label(no_evidence.get("answer_scope")),
+            "not_all_history_absence": bool(no_evidence.get("not_all_history_absence")),
+        },
+        "stage_diagnostics": {
+            "present": bool(stage_diagnostics),
+            "dominant_pressure_stage": _safe_agent_compact_label(stage_diagnostics.get("dominant_pressure_stage")),
+            "stage_status_counts": _stage_status_counts(stage_diagnostics),
+            "stage_next_fix_hint_counts": _stage_next_fix_hint_counts(stage_diagnostics),
+        },
+        "cap_hit": {
+            "labels": list(row.get("cap_hit_labels") or []),
+            "hit": bool(row.get("cap_hit_labels")),
+        },
+        "privacy": _source_tier_answerability_pressure_privacy(),
+        "claim_boundaries": _source_tier_answerability_pressure_claim_boundaries(),
+    }
+
+
+def _source_tier_answerability_pressure_summary(
+    rows: list[dict[str, Any]],
+    *,
+    manifest_case_count: int,
+    evaluated_case_count: int,
+    requested_case_limit: int,
+) -> dict[str, Any]:
+    selected = [
+        row
+        for row in rows
+        if row.get("baseline") == "package_search_fielded_bm25"
+        and isinstance(row.get("source_tier_answerability_pressure"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "basis": "source_tier_answerability_pressure_flag_not_enabled_or_fielded_bm25_rows_not_run",
+            "runs": 0,
+            "cases": 0,
+            "manifest_case_count": manifest_case_count,
+            "evaluated_case_count": evaluated_case_count,
+            "requested_case_limit": requested_case_limit,
+            "full_manifest_requested": requested_case_limit == 0,
+            "full_manifest_run": False,
+            "full_manifest_20_case_run": False,
+            "baseline_counts": {},
+            "answerability_status_counts": {},
+            "evidence_sufficiency": {},
+            "source_catalog": {},
+            "source_plan": {},
+            "stage_bottlenecks": {},
+            "privacy": _source_tier_answerability_pressure_privacy(),
+            "claim_boundaries": _source_tier_answerability_pressure_claim_boundaries(),
+        }
+    stats = [row["source_tier_answerability_pressure"] for row in selected]
+    evidence_rows = [item.get("evidence_sufficiency") or {} for item in stats]
+    source_plans = [item.get("source_plan") or {} for item in stats]
+    source_catalogs = [item.get("source_catalog") or {} for item in stats]
+    budgets = [item.get("compact_context_budget") or {} for item in stats]
+    no_evidence_rows = [item.get("no_evidence") or {} for item in stats]
+    stage_rows = [item.get("stage_diagnostics") or {} for item in stats]
+    cap_rows = [item.get("cap_hit") or {} for item in stats]
+    full_manifest_run = requested_case_limit == 0 and evaluated_case_count == manifest_case_count
+    return {
+        "status": "evaluated",
+        "basis": "opt_in_fielded_bm25_live_agent_compact_answerability_rows",
+        "runs": len(selected),
+        "cases": len({row["case_id"] for row in selected}),
+        "manifest_case_count": manifest_case_count,
+        "evaluated_case_count": evaluated_case_count,
+        "requested_case_limit": requested_case_limit,
+        "full_manifest_requested": requested_case_limit == 0,
+        "full_manifest_run": full_manifest_run,
+        "full_manifest_20_case_run": bool(full_manifest_run and manifest_case_count == 20 and evaluated_case_count == 20),
+        "baseline_counts": _counts(row["baseline"] for row in selected),
+        "answerability_status_counts": _counts(item.get("answerability_status") for item in stats),
+        "answerable_from_packet_rows": sum(
+            1 for item in evidence_rows if item.get("answerable_from_packet") is True
+        ),
+        "candidate_presence_implies_answerability_rows": sum(
+            1 for item in evidence_rows if item.get("candidate_presence_implies_answerability") is True
+        ),
+        "diagnostic_candidate_rows": sum(
+            1
+            for item in evidence_rows
+            if (item.get("searched_scope_support") or {}).get("diagnostic_candidates_preserved") is True
+        ),
+        "weak_candidate_diagnostic_rows": sum(
+            1
+            for item in evidence_rows
+            if int((item.get("searched_scope_support") or {}).get("weak_or_related_candidate_count") or 0) > 0
+        ),
+        "source_catalog": {
+            "present_rows": sum(1 for item in source_catalogs if item.get("present") is True),
+            "median_file_count": _median(item.get("file_count") for item in source_catalogs),
+            "median_selected_file_count": _median(item.get("selected_file_count") for item in source_catalogs),
+            "cap_label_counts": _counts(
+                label for item in source_catalogs for label in (item.get("cap_labels") or [])
+            ),
+            "raw_paths_included": any(item.get("raw_paths_included") is True for item in source_catalogs),
+            "raw_text_included": any(item.get("raw_text_included") is True for item in source_catalogs),
+            "persistent_index_or_cache_used": any(
+                item.get("persistent_index_or_cache_used") is True for item in source_catalogs
+            ),
+        },
+        "source_plan": {
+            "present_rows": sum(1 for item in source_plans if item.get("present") is True),
+            "median_sources_total": _median(item.get("sources_total") for item in source_plans),
+            "median_sources_selected": _median(item.get("sources_selected") for item in source_plans),
+            "sources_selected_total": sum(int(item.get("sources_selected") or 0) for item in source_plans),
+            "sources_pruned_hard_total": sum(int(item.get("sources_pruned_hard") or 0) for item in source_plans),
+            "sources_deferred_budget_total": sum(
+                int(item.get("sources_deferred_budget") or 0) for item in source_plans
+            ),
+            "deferred_rows": sum(1 for item in source_plans if int(item.get("sources_deferred_budget") or 0) > 0),
+            "retry_guidance_rows": sum(1 for item in source_plans if item.get("retry_guidance_needed") is True),
+            "retry_guidance_present_rows": sum(
+                1 for item in source_plans if item.get("retry_guidance_present") is True
+            ),
+            "selected_tier_counts": _sum_count_dicts(item.get("selected_counts") for item in source_plans),
+            "deferred_tier_counts": _sum_count_dicts(item.get("deferred_counts") for item in source_plans),
+            "deferred_reason_counts": _sum_count_dicts(item.get("deferred_reason_counts") for item in source_plans),
+            "uses_scoring_weights_rows": sum(1 for item in source_plans if item.get("uses_scoring_weights") is True),
+            "raw_paths_included": any(item.get("raw_paths_included") is True for item in source_plans),
+            "raw_text_included": any(item.get("raw_text_included") is True for item in source_plans),
+        },
+        "no_evidence": {
+            "needed_rows": sum(1 for item in no_evidence_rows if item.get("needed") is True),
+            "not_all_history_absence_rows": sum(
+                1 for item in no_evidence_rows if item.get("not_all_history_absence") is True
+            ),
+            "answer_scope_counts": _counts(item.get("answer_scope_label") for item in no_evidence_rows),
+        },
+        "compact_context_budget": {
+            "compact_context_bytes": sum(int(item.get("payload_bytes") or 0) for item in budgets),
+            "compact_context_tokens_approx": _ceil_div4(sum(int(item.get("payload_bytes") or 0) for item in budgets)),
+            "full_result_output_context_bytes": sum(
+                int(item.get("full_result_output_context_bytes") or 0) for item in budgets
+            ),
+            "median_compact_context_bytes": _median(item.get("payload_bytes") for item in budgets),
+            "median_full_result_output_context_bytes": _median(
+                item.get("full_result_output_context_bytes") for item in budgets
+            ),
+            "measurement_basis_counts": _counts(item.get("measurement_basis") for item in budgets),
+            "output_count_totals": _sum_count_dicts(item.get("output_counts") for item in budgets),
+            "output_limit_maxima": _max_count_dicts(item.get("output_limits") for item in budgets),
+        },
+        "stage_bottlenecks": {
+            "dominant_pressure_stage_counts": _counts(item.get("dominant_pressure_stage") for item in stage_rows),
+            "stage_status_counts": _sum_nested_count_dicts(item.get("stage_status_counts") for item in stage_rows),
+            "stage_next_fix_hint_counts": _sum_nested_count_dicts(
+                item.get("stage_next_fix_hint_counts") for item in stage_rows
+            ),
+        },
+        "cap_hit": {
+            "rows": sum(1 for item in cap_rows if item.get("hit") is True),
+            "rows_by_label": _cap_hit_row_counts(selected),
+        },
+        "privacy": _source_tier_answerability_pressure_privacy(),
+        "claim_boundaries": _source_tier_answerability_pressure_claim_boundaries(),
+    }
+
+
+def _source_tier_answerability_pressure_decision(summary: dict[str, Any]) -> dict[str, Any]:
+    if summary.get("status") != "evaluated":
+        decision = "not_evaluated"
+        rationale = (
+            "Run benchmark-real-history-impact with --baseline package_search_fielded_bm25 "
+            "--source-tier-answerability-pressure to evaluate the JSH-841 answerability path under real-history pressure."
+        )
+        next_action = "run_source_tier_answerability_pressure_full_manifest"
+    elif not summary.get("full_manifest_run"):
+        decision = "record_subset_or_partial_pressure_only"
+        rationale = "The source-tier answerability pressure section did not cover the full manifest."
+        next_action = "rerun_full_manifest_or_record_exact_stage_bottleneck"
+    elif int((summary.get("cap_hit") or {}).get("rows") or 0) > 0:
+        decision = "improve_fielded_bm25_large_history_cap_pressure"
+        rationale = "Full-manifest source-tier answerability pressure still hit configured caps."
+        next_action = "target_dominant_stage_bottleneck_before_answer_quality_claims"
+    elif int((summary.get("source_plan") or {}).get("deferred_rows") or 0) > 0:
+        decision = "improve_deferred_source_tier_retry_or_budget_behavior"
+        rationale = "Source-tier answerability stayed non-exhaustive because selected runs deferred sources."
+        next_action = "inspect_deferred_source_tier_rows_privately_and_choose_source_budget_or_retry_guidance_delta"
+    elif int(summary.get("candidate_presence_implies_answerability_rows") or 0) > 0:
+        decision = "repair_candidate_presence_answerability_boundary"
+        rationale = "At least one compact packet implied answerability from candidate presence."
+        next_action = "fix_answerability_boundary_before_more_pressure_reporting"
+    else:
+        decision = "record_full_manifest_answerability_pressure_keep_opt_in"
+        rationale = (
+            "The live fielded-BM25 compact handoff answerability path produced aggregate-only pressure "
+            "counters without changing defaults or supporting final-answer/token claims."
+        )
+        next_action = "independent_review_then_choose_next_product_delta_from_stage_bottleneck_counts"
+    return {
+        "selected_next_product_decision": decision,
+        "decision": decision,
+        "rationale": rationale,
+        "next_action": next_action,
+        "default_search_behavior_changed": False,
+        "scanner_ranking_source_selection_changed": False,
+        "legacy_output_context_bytes_redefined": False,
+        "measured_packet": "agent_find.compact_provenance_handoff",
+        "measured_builder": "build_agent_find_payload(compact_provenance_handoff=True)",
+        "measured_baseline": "package_search_fielded_bm25",
+        "uses_live_fielded_bm25_result": True,
+        "uses_handcrafted_packets": False,
+        "token_savings_claim_supported": False,
+        "final_answer_quality_claim_supported": False,
+        "product_value_claim_supported": False,
+        "default_promotion_supported": False,
+    }
+
+
+def _source_tier_stage_counters(stage_diagnostics: dict[str, Any], stage_name: str) -> dict[str, Any]:
+    for stage in stage_diagnostics.get("stages") or []:
+        if isinstance(stage, dict) and stage.get("stage") == stage_name:
+            counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+            return {
+                "status": _safe_agent_compact_label(stage.get("status")),
+                "candidate_window_count": int(counters.get("candidate_window_count") or 0),
+                "candidate_window_limit": int(counters.get("candidate_window_limit") or 0),
+                "candidate_window_omitted_count": int(counters.get("candidate_window_omitted_count") or 0),
+                "distinct_source_count_selected": int(counters.get("distinct_source_count_selected") or 0),
+                "source_window_text_included": bool(counters.get("source_window_text_included", False)),
+            }
+    return {
+        "status": "not_evaluated",
+        "candidate_window_count": 0,
+        "candidate_window_limit": 0,
+        "candidate_window_omitted_count": 0,
+        "distinct_source_count_selected": 0,
+        "source_window_text_included": False,
+    }
+
+
+def _stage_status_counts(stage_diagnostics: dict[str, Any]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for stage in stage_diagnostics.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        name = _safe_agent_compact_label(stage.get("stage"))
+        status = _safe_agent_compact_label(stage.get("status"))
+        counts.setdefault(name, {})[status] = counts.setdefault(name, {}).get(status, 0) + 1
+    return counts
+
+
+def _stage_next_fix_hint_counts(stage_diagnostics: dict[str, Any]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for stage in stage_diagnostics.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        name = _safe_agent_compact_label(stage.get("stage"))
+        hint = _safe_agent_compact_label(stage.get("next_fix_hint"))
+        counts.setdefault(name, {})[hint] = counts.setdefault(name, {}).get(hint, 0) + 1
+    return counts
+
+
+def _sum_count_dicts(values: Any) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, count in value.items():
+            label = str(key)
+            if not _safe_counter_label(label):
+                continue
+            totals[label] = totals.get(label, 0) + int(count or 0)
+    return dict(sorted(totals.items()))
+
+
+def _max_count_dicts(values: Any) -> dict[str, int]:
+    maxima: dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, count in value.items():
+            label = str(key)
+            if not _safe_counter_label(label):
+                continue
+            maxima[label] = max(maxima.get(label, 0), int(count or 0))
+    return dict(sorted(maxima.items()))
+
+
+def _sum_nested_count_dicts(values: Any) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for outer_key, inner in value.items():
+            outer_label = str(outer_key)
+            if not _safe_counter_label(outer_label) or not isinstance(inner, dict):
+                continue
+            bucket = totals.setdefault(outer_label, {})
+            for inner_key, count in inner.items():
+                inner_label = str(inner_key)
+                if not _safe_counter_label(inner_label):
+                    continue
+                bucket[inner_label] = bucket.get(inner_label, 0) + int(count or 0)
+    return {key: dict(sorted(value.items())) for key, value in sorted(totals.items())}
+
+
+def _source_tier_answerability_pressure_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "raw_source_tier_answerability_detail_committed": False,
+        "raw_agent_compact_handoff_detail_committed": False,
+        "raw_query_text_included": False,
+        "raw_private_text_included": False,
+        "raw_snippets_included": False,
+        "raw_paths_included": False,
+        "raw_source_refs_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "local_usernames_included": False,
+        "case_ids_required": False,
+        "payloads_included": False,
+        "vectors_or_indexes_included": False,
+    }
+
+
+def _source_tier_answerability_pressure_claim_boundaries() -> dict[str, bool]:
+    return {
+        "benchmark_result_only": True,
+        "compact_handoff_is_opt_in": True,
+        "fielded_bm25_is_explicit_opt_in": True,
+        "default_behavior_changed": False,
+        "scanner_ranking_or_source_selection_changed": False,
+        "token_savings_claim_supported": False,
+        "final_answer_quality_claim_supported": False,
+        "product_value_claim_supported": False,
+        "default_promotion_supported": False,
+        "all_history_completeness_claim_supported": False,
+    }
+
+
 def _structural_sidecar_diagnostic(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     structural_rows = {
         (row["case_id"], row["repeat_index"]): row
@@ -3682,6 +4236,7 @@ def _apply_aggregate_only_report(report: dict[str, Any], *, row_count: int) -> N
         "raw_anchor_needles_committed": False,
         "raw_compact_handoff_detail_committed": False,
         "raw_agent_compact_handoff_detail_committed": False,
+        "raw_source_tier_answerability_detail_committed": False,
         "raw_source_windows_committed": False,
     }
     diagnostic = report.get("structural_sidecar_diagnostic")
