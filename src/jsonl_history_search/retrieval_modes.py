@@ -585,7 +585,10 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "dominant_source_share_before": float(grouping.get("dominant_source_share_before") or 0.0),
         "dominant_source_share_after": float(grouping.get("dominant_source_share_after") or 0.0),
         "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
+        "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
         "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+        "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
+        "stream_selection": _fielded_stream_selection_diagnostics(grouping.get("stream_selection")),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -611,6 +614,8 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
                 "status": str(item.get("status") or "unknown"),
                 "row_count": int(item.get("row_count") or 0),
                 "deduped_row_count": int(item.get("deduped_row_count") or 0),
+                "stream_limit": int(item.get("stream_limit") or 0),
+                "hit_limit": bool(item.get("hit_limit", False)),
                 "error_type": item.get("error_type") if item.get("error_type") is None else str(item.get("error_type")),
                 "raw_query_text_included": False,
                 "raw_query_terms_included": False,
@@ -628,10 +633,17 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "stream_count": int(streams.get("stream_count") or len(stream_items)),
         "streams": stream_items,
         "candidate_row_pool_limit_per_stream": int(streams.get("candidate_row_pool_limit_per_stream") or 0),
+        "per_stream_limit": int(streams.get("per_stream_limit") or 0),
+        "stream_hit_limit_count": int(streams.get("stream_hit_limit_count") or 0),
+        "saturated_stream_count": int(streams.get("saturated_stream_count") or 0),
+        "saturated_stream_labels": [str(label) for label in streams.get("saturated_stream_labels") or []],
         "row_count_before_dedupe": int(streams.get("row_count_before_dedupe") or 0),
         "row_count_after_dedupe": int(streams.get("row_count_after_dedupe") or 0),
         "deduped_row_count_from_streams": int(streams.get("deduped_row_count_from_streams") or 0),
         "duplicate_row_count": int(streams.get("duplicate_row_count") or 0),
+        "selected_rows_by_stream": _safe_int_dict(streams.get("selected_rows_by_stream")),
+        "rows_dropped_by_stream_cap": _safe_int_dict(streams.get("rows_dropped_by_stream_cap")),
+        "rows_dropped_by_stream_cap_total": int(streams.get("rows_dropped_by_stream_cap_total") or 0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -642,6 +654,30 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
     }
+
+
+def _fielded_stream_selection_diagnostics(value: Any) -> dict[str, Any]:
+    selection = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(selection.get("enabled", False)),
+        "selected_rows_by_stream": _safe_int_dict(selection.get("selected_rows_by_stream")),
+        "rows_dropped_by_stream_cap": _safe_int_dict(selection.get("rows_dropped_by_stream_cap")),
+        "rows_dropped_by_stream_cap_total": int(selection.get("rows_dropped_by_stream_cap_total") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _safe_int_dict(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): int(count or 0) for key, count in sorted(value.items())}
 
 
 def _fielded_materialization_diagnostics(fielded_result: dict[str, Any]) -> dict[str, int | bool]:

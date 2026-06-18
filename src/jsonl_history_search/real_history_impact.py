@@ -1879,6 +1879,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     query_profile = result.get("query_profile") if isinstance(result.get("query_profile"), dict) else {}
     privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(result.get("materialization"))
+    query_streams = _fielded_bm25_query_stream_stats(result.get("fielded_query_streams"))
     phase_profile = _phase_profile_stats(result.get("profile"), "fielded_bm25_search_materialization")
     index_build_profile = _phase_profile_stats(summary.get("profile"), "fielded_bm25_index_build")
     return {
@@ -1902,6 +1903,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_scored": int(result.get("candidate_records_scored") or 0),
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "bm25_rank_buckets": _safe_count_dict(result.get("bm25_rank_buckets")),
+        "query_streams": query_streams,
         "materialization": materialization,
         "phase_profile": phase_profile,
         "index_build_profile": index_build_profile,
@@ -1982,6 +1984,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
     fielded_lane = _rrf_diagnostic_lane(diagnostics, "package_search_fielded_bm25")
     index_summary = fielded_lane.get("index_summary") if isinstance(fielded_lane.get("index_summary"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(fielded_lane.get("materialization"))
+    query_streams = _fielded_bm25_query_stream_stats(fielded_lane.get("query_streams"))
     phase_profile = _phase_profile_stats(
         fielded_lane.get("profile"),
         "fielded_bm25_search_materialization",
@@ -2011,6 +2014,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "candidate_records_scored": 0,
         "candidate_records_deduped": 0,
         "bm25_rank_buckets": {},
+        "query_streams": query_streams,
         "materialization": materialization,
         "phase_profile": phase_profile,
         "index_build_profile": index_build_profile,
@@ -2058,6 +2062,36 @@ def _fielded_bm25_materialization_stats(value: Any) -> dict[str, Any]:
         ),
         "raw_text_included": bool(materialization.get("raw_text_included", False)),
         "raw_paths_included": bool(materialization.get("raw_paths_included", False)),
+    }
+
+
+def _fielded_bm25_query_stream_stats(value: Any) -> dict[str, Any]:
+    streams = value if isinstance(value, dict) else {}
+    selected_by_stream = _safe_count_dict(streams.get("selected_rows_by_stream"))
+    dropped_by_stream = _safe_count_dict(streams.get("rows_dropped_by_stream_cap"))
+    return {
+        "enabled": bool(streams.get("enabled", False)),
+        "stream_count": int(streams.get("stream_count") or 0),
+        "per_stream_limit": int(
+            streams.get("per_stream_limit") or streams.get("candidate_row_pool_limit_per_stream") or 0
+        ),
+        "stream_hit_limit_count": int(streams.get("stream_hit_limit_count") or 0),
+        "saturated_stream_count": int(streams.get("saturated_stream_count") or 0),
+        "saturated_stream_labels": [str(label) for label in streams.get("saturated_stream_labels") or []],
+        "row_count_before_dedupe": int(streams.get("row_count_before_dedupe") or 0),
+        "row_count_after_dedupe": int(streams.get("row_count_after_dedupe") or 0),
+        "duplicate_row_count": int(streams.get("duplicate_row_count") or 0),
+        "selected_rows_by_stream": selected_by_stream,
+        "rows_dropped_by_stream_cap": dropped_by_stream,
+        "rows_dropped_by_stream_cap_total": int(streams.get("rows_dropped_by_stream_cap_total") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
     }
 
 
@@ -2540,6 +2574,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "candidate_rows_retained": 0,
             "candidate_rows_surfaced": 0,
             "bm25_rank_buckets": {},
+            "query_streams": _fielded_bm25_query_stream_aggregate([]),
             "materialization": _fielded_bm25_materialization_aggregate([]),
             "phase_profiles": _phase_profiles_aggregate([]),
             "privacy": _fielded_bm25_privacy(),
@@ -2563,8 +2598,57 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_records_scored": sum(int(item.get("candidate_records_scored") or 0) for item in selected),
         "candidate_records_deduped": sum(int(item.get("candidate_records_deduped") or 0) for item in selected),
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
+        "query_streams": _fielded_bm25_query_stream_aggregate(selected),
         "materialization": _fielded_bm25_materialization_aggregate(selected),
         "phase_profiles": _fielded_bm25_phase_profiles_aggregate(selected),
+        "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _fielded_bm25_query_stream_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row.get("query_streams")
+        for row in rows
+        if isinstance(row.get("query_streams"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "stream_hit_limit_runs": 0,
+            "saturated_stream_total": 0,
+            "row_count_before_dedupe": 0,
+            "row_count_after_dedupe": 0,
+            "duplicate_row_count": 0,
+            "selected_rows_by_stream": {},
+            "rows_dropped_by_stream_cap": {},
+            "rows_dropped_by_stream_cap_total": 0,
+            "privacy": _fielded_bm25_privacy(),
+        }
+    selected_by_stream: dict[str, int] = {}
+    dropped_by_stream: dict[str, int] = {}
+    saturated_labels: dict[str, int] = {}
+    for item in selected:
+        for label, count in (item.get("selected_rows_by_stream") or {}).items():
+            selected_by_stream[str(label)] = selected_by_stream.get(str(label), 0) + int(count or 0)
+        for label, count in (item.get("rows_dropped_by_stream_cap") or {}).items():
+            dropped_by_stream[str(label)] = dropped_by_stream.get(str(label), 0) + int(count or 0)
+        for label in item.get("saturated_stream_labels") or []:
+            saturated_labels[str(label)] = saturated_labels.get(str(label), 0) + 1
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "stream_hit_limit_runs": sum(1 for item in selected if int(item.get("stream_hit_limit_count") or 0) > 0),
+        "saturated_stream_total": sum(int(item.get("saturated_stream_count") or 0) for item in selected),
+        "saturated_stream_label_counts": dict(sorted(saturated_labels.items())),
+        "row_count_before_dedupe": sum(int(item.get("row_count_before_dedupe") or 0) for item in selected),
+        "row_count_after_dedupe": sum(int(item.get("row_count_after_dedupe") or 0) for item in selected),
+        "duplicate_row_count": sum(int(item.get("duplicate_row_count") or 0) for item in selected),
+        "selected_rows_by_stream": dict(sorted(selected_by_stream.items())),
+        "rows_dropped_by_stream_cap": dict(sorted(dropped_by_stream.items())),
+        "rows_dropped_by_stream_cap_total": sum(
+            int(item.get("rows_dropped_by_stream_cap_total") or 0) for item in selected
+        ),
         "privacy": _fielded_bm25_privacy(),
     }
 

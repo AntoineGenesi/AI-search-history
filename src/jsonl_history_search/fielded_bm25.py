@@ -299,7 +299,7 @@ def search_with_fielded_bm25(
 
     candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
     candidate_pool_limit = max(candidate_limit * FIELDED_SOURCE_GROUPING_POOL_FACTOR, candidate_limit)
-    raw_rows, stream_diagnostics, stream_error_types = _execute_fielded_query_streams(
+    raw_rows, row_stream_labels, stream_rows, stream_diagnostics, stream_error_types = _execute_fielded_query_streams(
         index,
         query_streams,
         candidate_pool_limit=candidate_pool_limit,
@@ -319,18 +319,20 @@ def search_with_fielded_bm25(
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
-    query_stream_summary = _query_stream_summary(
-        streams=query_streams,
-        diagnostics=stream_diagnostics,
-        deduped_row_count=len(raw_rows),
-        candidate_pool_limit=candidate_pool_limit,
-    )
-
     rows, source_grouping = _select_source_grouped_candidate_rows(
         raw_rows,
         index,
         selected_limit=candidate_limit,
         pool_limit=candidate_pool_limit,
+        row_stream_labels=row_stream_labels,
+        stream_rows=stream_rows,
+    )
+    query_stream_summary = _query_stream_summary(
+        streams=query_streams,
+        diagnostics=stream_diagnostics,
+        deduped_row_count=len(raw_rows),
+        candidate_pool_limit=candidate_pool_limit,
+        selection=source_grouping.get("stream_selection"),
     )
     _mark_expected_candidate_rows(expected_diag, rows)
     matches: list[Match] = []
@@ -616,8 +618,12 @@ def _select_source_grouped_candidate_rows(
     *,
     selected_limit: int,
     pool_limit: int,
+    row_stream_labels: dict[int, set[str]] | None = None,
+    stream_rows: dict[str, list[tuple[Any, ...]]] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
     bounded_limit = max(int(selected_limit), 0)
+    row_stream_labels = row_stream_labels or {}
+    stream_rows = stream_rows or {}
     if bounded_limit <= 0:
         return [], _source_grouping_diagnostics(
             rows_considered=len(rows),
@@ -626,14 +632,20 @@ def _select_source_grouped_candidate_rows(
             pool_limit=pool_limit,
             considered_source_counts={},
             selected_source_counts={},
+            selected_stream_counts={},
+            dropped_stream_counts=_stream_dropped_counts(stream_rows, set()),
+            rows_dropped_by_source_cap=0,
             source_head_rows_selected=0,
+            stream_head_rows_selected=0,
             global_tail_rows_selected=0,
         )
 
     grouped_rows: dict[str, list[tuple[Any, ...]]] = {}
     considered_source_counts: dict[str, int] = {}
+    row_by_id: dict[int, tuple[Any, ...]] = {}
     for row in rows:
         rowid = int(row[0])
+        row_by_id[rowid] = row
         ref = index.records.get(rowid)
         if ref is None:
             continue
@@ -643,6 +655,20 @@ def _select_source_grouped_candidate_rows(
 
     selected: list[tuple[Any, ...]] = []
     selected_rowids: set[int] = set()
+    stream_head_rows_selected = 0
+
+    for label, label_rows in stream_rows.items():
+        if len(selected) >= bounded_limit:
+            break
+        for row in label_rows:
+            rowid = int(row[0])
+            if rowid in selected_rowids or rowid not in row_by_id:
+                continue
+            selected.append(row_by_id[rowid])
+            selected_rowids.add(rowid)
+            stream_head_rows_selected += 1
+            break
+
     source_head_rows_selected = 0
     for source_rows in grouped_rows.values():
         if len(selected) >= bounded_limit:
@@ -667,12 +693,21 @@ def _select_source_grouped_candidate_rows(
         global_tail_rows_selected += 1
 
     selected_source_counts: dict[str, int] = {}
+    selected_stream_counts: dict[str, int] = {}
     for row in selected:
-        ref = index.records.get(int(row[0]))
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
         if ref is None:
             continue
         source_key = _source_grouping_key(ref)
         selected_source_counts[source_key] = selected_source_counts.get(source_key, 0) + 1
+        for label in row_stream_labels.get(rowid, set()):
+            selected_stream_counts[label] = selected_stream_counts.get(label, 0) + 1
+    rows_dropped_by_source_cap = sum(
+        max(int(count) - int(selected_source_counts.get(source_key, 0)), 0)
+        for source_key, count in considered_source_counts.items()
+    )
+    dropped_stream_counts = _stream_dropped_counts(stream_rows, selected_rowids)
 
     return selected, _source_grouping_diagnostics(
         rows_considered=len(rows),
@@ -681,7 +716,11 @@ def _select_source_grouped_candidate_rows(
         pool_limit=pool_limit,
         considered_source_counts=considered_source_counts,
         selected_source_counts=selected_source_counts,
+        selected_stream_counts=selected_stream_counts,
+        dropped_stream_counts=dropped_stream_counts,
+        rows_dropped_by_source_cap=rows_dropped_by_source_cap,
         source_head_rows_selected=source_head_rows_selected,
+        stream_head_rows_selected=stream_head_rows_selected,
         global_tail_rows_selected=global_tail_rows_selected,
     )
 
@@ -698,12 +737,19 @@ def _source_grouping_diagnostics(
     pool_limit: int,
     considered_source_counts: dict[str, int],
     selected_source_counts: dict[str, int],
+    selected_stream_counts: dict[str, int],
+    dropped_stream_counts: dict[str, int],
+    rows_dropped_by_source_cap: int,
     source_head_rows_selected: int,
+    stream_head_rows_selected: int,
     global_tail_rows_selected: int,
 ) -> dict[str, Any]:
+    rows_dropped_by_stream_cap = sum(int(count) for count in dropped_stream_counts.values())
     return {
         "enabled": True,
-        "strategy": "source_heads_then_global_bm25_tail",
+        "strategy": "stream_heads_then_source_heads_then_global_bm25_tail"
+        if selected_stream_counts or stream_head_rows_selected
+        else "source_heads_then_global_bm25_tail",
         "candidate_rows_considered": int(rows_considered),
         "candidate_rows_selected": int(rows_selected),
         "candidate_row_limit": int(selected_limit),
@@ -712,8 +758,24 @@ def _source_grouping_diagnostics(
         "source_count_selected": len(selected_source_counts),
         "dominant_source_share_before": _dominant_source_share(considered_source_counts),
         "dominant_source_share_after": _dominant_source_share(selected_source_counts),
+        "stream_head_rows_selected": int(stream_head_rows_selected),
         "source_head_rows_selected": int(source_head_rows_selected),
         "global_tail_rows_selected": int(global_tail_rows_selected),
+        "stream_selection": {
+            "enabled": bool(selected_stream_counts or dropped_stream_counts or stream_head_rows_selected),
+            "selected_rows_by_stream": dict(sorted(selected_stream_counts.items())),
+            "rows_dropped_by_stream_cap": dict(sorted(dropped_stream_counts.items())),
+            "rows_dropped_by_stream_cap_total": int(rows_dropped_by_stream_cap),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "line_numbers_included": False,
+            "source_lines_included": False,
+        },
+        "rows_dropped_by_source_cap": int(rows_dropped_by_source_cap),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -722,6 +784,16 @@ def _source_grouping_diagnostics(
         "line_numbers_included": False,
         "source_lines_included": False,
     }
+
+
+def _stream_dropped_counts(stream_rows: dict[str, list[tuple[Any, ...]]], selected_rowids: set[int]) -> dict[str, int]:
+    dropped: dict[str, int] = {}
+    for label, rows in stream_rows.items():
+        rowids = {int(row[0]) for row in rows}
+        count = sum(1 for rowid in rowids if rowid not in selected_rowids)
+        if count:
+            dropped[label] = count
+    return dropped
 
 
 def _dominant_source_share(source_counts: dict[str, int]) -> float:
@@ -879,9 +951,11 @@ def _execute_fielded_query_streams(
     streams: list[FieldedQueryStream],
     *,
     candidate_pool_limit: int,
-) -> tuple[list[tuple[Any, ...]], list[dict[str, Any]], set[str]]:
+) -> tuple[list[tuple[Any, ...]], dict[int, set[str]], dict[str, list[tuple[Any, ...]]], list[dict[str, Any]], set[str]]:
     merged_rows: list[tuple[Any, ...]] = []
     seen_rowids: set[int] = set()
+    row_stream_labels: dict[int, set[str]] = {}
+    stream_rows: dict[str, list[tuple[Any, ...]]] = {}
     diagnostics: list[dict[str, Any]] = []
     error_types: set[str] = set()
     assert index.connection is not None
@@ -907,14 +981,18 @@ def _execute_fielded_query_streams(
                     stream,
                     row_count=0,
                     deduped_row_count=0,
+                    stream_limit=candidate_pool_limit,
+                    hit_limit=False,
                     status="query_failed",
                     error_type=error_type,
                 )
             )
             continue
+        stream_rows[stream.label] = rows
         deduped_count = 0
         for row in rows:
             rowid = int(row[0])
+            row_stream_labels.setdefault(rowid, set()).add(stream.label)
             if rowid in seen_rowids:
                 continue
             seen_rowids.add(rowid)
@@ -925,11 +1003,13 @@ def _execute_fielded_query_streams(
                 stream,
                 row_count=len(rows),
                 deduped_row_count=deduped_count,
+                stream_limit=candidate_pool_limit,
+                hit_limit=len(rows) >= candidate_pool_limit,
                 status="available",
                 error_type=None,
             )
         )
-    return merged_rows, diagnostics, error_types
+    return merged_rows, row_stream_labels, stream_rows, diagnostics, error_types
 
 
 def _query_stream_summary(
@@ -938,19 +1018,33 @@ def _query_stream_summary(
     diagnostics: list[dict[str, Any]],
     deduped_row_count: int,
     candidate_pool_limit: int,
+    selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     generated = sum(int(item.get("row_count") or 0) for item in diagnostics)
     deduped_by_stream = sum(int(item.get("deduped_row_count") or 0) for item in diagnostics)
+    saturated_labels = [
+        str(item.get("label"))
+        for item in diagnostics
+        if bool(item.get("hit_limit")) and item.get("label")
+    ]
+    selection = selection if isinstance(selection, dict) else {}
     return {
         "enabled": True,
-        "strategy": "query_plan_fielded_streams_then_rowid_dedupe",
+        "strategy": "query_plan_fielded_streams_then_stream_source_heads_then_rowid_dedupe",
         "stream_count": len(streams),
         "streams": diagnostics,
         "candidate_row_pool_limit_per_stream": int(candidate_pool_limit),
+        "per_stream_limit": int(candidate_pool_limit),
+        "stream_hit_limit_count": len(saturated_labels),
+        "saturated_stream_count": len(saturated_labels),
+        "saturated_stream_labels": saturated_labels,
         "row_count_before_dedupe": int(generated),
         "row_count_after_dedupe": int(deduped_row_count),
         "deduped_row_count_from_streams": int(deduped_by_stream),
         "duplicate_row_count": max(int(generated) - int(deduped_row_count), 0),
+        "selected_rows_by_stream": dict(selection.get("selected_rows_by_stream") or {}),
+        "rows_dropped_by_stream_cap": dict(selection.get("rows_dropped_by_stream_cap") or {}),
+        "rows_dropped_by_stream_cap_total": int(selection.get("rows_dropped_by_stream_cap_total") or 0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -968,6 +1062,8 @@ def _query_stream_diagnostic(
     *,
     row_count: int,
     deduped_row_count: int,
+    stream_limit: int,
+    hit_limit: bool,
     status: str,
     error_type: str | None,
 ) -> dict[str, Any]:
@@ -977,6 +1073,8 @@ def _query_stream_diagnostic(
         "status": status,
         "row_count": int(row_count),
         "deduped_row_count": int(deduped_row_count),
+        "stream_limit": int(stream_limit),
+        "hit_limit": bool(hit_limit),
         "error_type": error_type,
         "raw_query_text_included": False,
         "raw_query_terms_included": False,
@@ -1346,7 +1444,15 @@ def _unavailable_payload(
 ) -> dict[str, Any]:
     query_streams = query_streams or []
     query_stream_diagnostics = query_stream_diagnostics or [
-        _query_stream_diagnostic(stream, row_count=0, deduped_row_count=0, status="not_run", error_type=None)
+        _query_stream_diagnostic(
+            stream,
+            row_count=0,
+            deduped_row_count=0,
+            stream_limit=0,
+            hit_limit=False,
+            status="not_run",
+            error_type=None,
+        )
         for stream in query_streams
     ]
     return {

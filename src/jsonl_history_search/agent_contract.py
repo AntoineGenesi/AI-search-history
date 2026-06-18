@@ -329,6 +329,7 @@ def build_stage_diagnostics(
     compact_output_counts = compact_output_budget.get("counts") or {}
     compact_output_limits = compact_output_budget.get("limits") or {}
     fielded = pressure.get("fielded_bm25") or {}
+    query_streams = fielded.get("query_streams") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
     source_plan = sanitize_source_plan(pressure.get("source_plan") or diagnostics.get("source_plan") or {})
@@ -376,6 +377,12 @@ def build_stage_diagnostics(
                 "planned_file_enumeration_reused": bool(
                     (fielded.get("index_summary") or {}).get("planned_file_enumeration_reused", False)
                 ),
+                "query_stream_count": int(query_streams.get("stream_count") or 0),
+                "stream_hit_limit_count": int(query_streams.get("stream_hit_limit_count") or 0),
+                "saturated_stream_count": int(query_streams.get("saturated_stream_count") or 0),
+                "row_count_before_dedupe": int(query_streams.get("row_count_before_dedupe") or 0),
+                "row_count_after_dedupe": int(query_streams.get("row_count_after_dedupe") or 0),
+                "rows_dropped_by_stream_cap_total": int(query_streams.get("rows_dropped_by_stream_cap_total") or 0),
             },
         ),
         stage_diagnostic(
@@ -400,8 +407,13 @@ def build_stage_diagnostics(
                 "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
                 "source_count_considered": int(grouping.get("source_count_considered") or 0),
                 "source_count_selected": int(grouping.get("source_count_selected") or 0),
+                "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
                 "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
                 "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+                "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
+                "rows_dropped_by_stream_cap_total": int(
+                    ((grouping.get("stream_selection") or {}).get("rows_dropped_by_stream_cap_total")) or 0
+                ),
             },
         ),
         stage_diagnostic(
@@ -610,8 +622,11 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
                 fielded_source_grouping.get("dominant_source_share_before") or 0.0
             ),
             "dominant_source_share_after": float(fielded_source_grouping.get("dominant_source_share_after") or 0.0),
+            "stream_head_rows_selected": int(fielded_source_grouping.get("stream_head_rows_selected") or 0),
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
+            "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
             "raw_text_included": False,
             "raw_session_ids_included": False,
@@ -672,6 +687,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "searched_files": int(fielded_bm25.get("searched_files") or 0),
             "searched_bytes": int(fielded_bm25.get("searched_bytes") or 0),
             "records_considered": int(fielded_bm25.get("records_considered") or 0),
+            "query_streams": sanitize_query_stream_pressure(fielded_bm25.get("query_streams")),
             "materialization": fielded_bm25.get("materialization") or {},
             "index_summary": fielded_bm25.get("index_summary") or {},
             "raw_paths_included": False,
@@ -691,8 +707,11 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 fielded_source_grouping.get("dominant_source_share_before") or 0.0
             ),
             "dominant_source_share_after": float(fielded_source_grouping.get("dominant_source_share_after") or 0.0),
+            "stream_head_rows_selected": int(fielded_source_grouping.get("stream_head_rows_selected") or 0),
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
+            "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
             "raw_text_included": False,
             "raw_session_ids_included": False,
@@ -714,6 +733,52 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
         },
+    }
+
+
+def sanitize_query_stream_pressure(value: Any) -> dict[str, Any]:
+    streams = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(streams.get("enabled", False)),
+        "strategy": str(streams.get("strategy") or "disabled"),
+        "stream_count": int(streams.get("stream_count") or 0),
+        "candidate_row_pool_limit_per_stream": int(streams.get("candidate_row_pool_limit_per_stream") or 0),
+        "per_stream_limit": int(streams.get("per_stream_limit") or 0),
+        "stream_hit_limit_count": int(streams.get("stream_hit_limit_count") or 0),
+        "saturated_stream_count": int(streams.get("saturated_stream_count") or 0),
+        "saturated_stream_labels": [str(label) for label in streams.get("saturated_stream_labels") or []],
+        "row_count_before_dedupe": int(streams.get("row_count_before_dedupe") or 0),
+        "row_count_after_dedupe": int(streams.get("row_count_after_dedupe") or 0),
+        "duplicate_row_count": int(streams.get("duplicate_row_count") or 0),
+        "selected_rows_by_stream": sanitize_int_counts(streams.get("selected_rows_by_stream")),
+        "rows_dropped_by_stream_cap": sanitize_int_counts(streams.get("rows_dropped_by_stream_cap")),
+        "rows_dropped_by_stream_cap_total": int(streams.get("rows_dropped_by_stream_cap_total") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def sanitize_stream_selection(value: Any) -> dict[str, Any]:
+    selection = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(selection.get("enabled", False)),
+        "selected_rows_by_stream": sanitize_int_counts(selection.get("selected_rows_by_stream")),
+        "rows_dropped_by_stream_cap": sanitize_int_counts(selection.get("rows_dropped_by_stream_cap")),
+        "rows_dropped_by_stream_cap_total": int(selection.get("rows_dropped_by_stream_cap_total") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
     }
 
 
