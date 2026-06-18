@@ -245,6 +245,8 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
     retrieval_mode = diagnostics.get("retrieval_mode") or search_result.get("retrieval_mode")
     if not retrieval_mode:
         return None
+    if retrieval_mode == "fielded-bm25":
+        return build_fielded_bm25_retrieval_pressure_summary(diagnostics)
 
     high_recall_state = diagnostics.get("high_recall_mode_state") or {}
     cap_labels = sorted(str(label) for label in diagnostics.get("cap_labels", []) if label)
@@ -322,6 +324,89 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "raw_paths_included": False,
             "raw_text_included": False,
             "raw_session_ids_included": False,
+        },
+        "claim_boundaries": {
+            "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
+            "final_answer_quality_claim_supported": bool(
+                claim_boundaries.get("final_answer_quality_claim_supported", False)
+            ),
+            "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
+            "default_behavior_changed": bool(claim_boundaries.get("default_behavior_changed", False)),
+            "all_history_completeness_claim_supported": bool(
+                claim_boundaries.get("all_history_completeness_claim_supported", False)
+            ),
+        },
+    }
+
+
+def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    fielded_state = diagnostics.get("fielded_mode_state") or {}
+    cap_labels = sorted(str(label) for label in diagnostics.get("cap_labels", []) if label)
+    capped = bool(fielded_state.get("capped", bool(cap_labels)))
+    result_completeness = "lower_bound_due_to_caps" if capped else "complete_within_configured_caps"
+    shared_source_enumeration = diagnostics.get("shared_source_enumeration") or {}
+    fielded_bm25 = diagnostics.get("fielded_bm25") or {}
+    fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
+    phase_profiles = diagnostics.get("phase_profiles") or {}
+    claim_boundaries = diagnostics.get("claim_boundaries") or {}
+
+    return {
+        "retrieval_mode": "fielded-bm25",
+        "capped": capped,
+        "cap_labels": cap_labels,
+        "lower_bound_result": capped,
+        "result_completeness": result_completeness,
+        "explicit_opt_in_required": bool(fielded_state.get("explicit_opt_in_required", False)),
+        "default_behavior_changed": bool(fielded_state.get("default_behavior_changed", False)),
+        "shared_source_enumeration": {
+            "file_count": int(shared_source_enumeration.get("file_count") or 0),
+            "byte_count": int(shared_source_enumeration.get("byte_count") or 0),
+            "consumed_by_lanes": list(shared_source_enumeration.get("consumed_by_lanes") or []),
+            "raw_paths_included": False,
+        },
+        "fielded_bm25": {
+            "status": fielded_bm25.get("status"),
+            "candidate_count": int(fielded_bm25.get("candidate_count") or 0),
+            "candidate_rows": int(fielded_bm25.get("candidate_rows") or 0),
+            "candidate_row_limit": int(fielded_bm25.get("candidate_row_limit") or 0),
+            "candidate_row_pool_limit": int(fielded_bm25.get("candidate_row_pool_limit") or 0),
+            "candidate_rows_generated": int(fielded_bm25.get("candidate_rows_generated") or 0),
+            "candidate_rows_considered": int(fielded_bm25.get("candidate_rows_considered") or 0),
+            "candidate_rows_retained": int(fielded_bm25.get("candidate_rows_retained") or 0),
+            "candidate_rows_surfaced": int(fielded_bm25.get("candidate_rows_surfaced") or 0),
+            "searched_files": int(fielded_bm25.get("searched_files") or 0),
+            "searched_bytes": int(fielded_bm25.get("searched_bytes") or 0),
+            "records_considered": int(fielded_bm25.get("records_considered") or 0),
+            "materialization": fielded_bm25.get("materialization") or {},
+            "index_summary": fielded_bm25.get("index_summary") or {},
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "fielded_source_grouping": {
+            "enabled": bool(fielded_source_grouping.get("enabled", False)),
+            "strategy": str(fielded_source_grouping.get("strategy") or "disabled"),
+            "candidate_rows_considered": int(fielded_source_grouping.get("candidate_rows_considered") or 0),
+            "candidate_rows_selected": int(fielded_source_grouping.get("candidate_rows_selected") or 0),
+            "source_count_considered": int(fielded_source_grouping.get("source_count_considered") or 0),
+            "source_count_selected": int(fielded_source_grouping.get("source_count_selected") or 0),
+            "dominant_source_share_before": float(
+                fielded_source_grouping.get("dominant_source_share_before") or 0.0
+            ),
+            "dominant_source_share_after": float(fielded_source_grouping.get("dominant_source_share_after") or 0.0),
+            "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
+            "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "phase_profiles": {
+            "total_fielded_bm25_retrieval": phase_profiles.get("total_fielded_bm25_retrieval") or {},
+            "shared_source_enumeration": phase_profiles.get("shared_source_enumeration") or {},
+            "fielded_bm25_index_build": phase_profiles.get("fielded_bm25_index_build") or {},
+            "fielded_bm25_search_materialization": phase_profiles.get("fielded_bm25_search_materialization") or {},
         },
         "claim_boundaries": {
             "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
