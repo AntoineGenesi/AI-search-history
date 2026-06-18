@@ -3154,6 +3154,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Raw anchor needles included: `{privacy.get('raw_anchor_needles_included')}`",
             ]
         )
+    lines.extend(_fielded_bm25_query_stream_pressure_markdown_lines(report))
     lines.extend(_benchmark_gate_markdown_lines(report))
     scope = report.get("report_scope") or {}
     if scope:
@@ -3630,6 +3631,45 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"{_escape_markdown_table(row_caps)} |"
             )
     return "\n".join(lines)
+
+
+def _fielded_bm25_query_stream_pressure_markdown_lines(report: dict) -> list[str]:
+    query_streams = ((report.get("aggregate") or {}).get("fielded_bm25") or {}).get("query_streams") or {}
+    if not isinstance(query_streams, dict):
+        return []
+    if query_streams.get("status") == "not_evaluated" and not int(query_streams.get("runs") or 0):
+        return []
+    privacy = query_streams.get("privacy") or {}
+    lines = [
+        "",
+        "## Fielded BM25 Query-Stream Pressure",
+        "",
+        f"- Status: `{query_streams.get('status')}`",
+        f"- Runs: `{query_streams.get('runs')}`",
+        f"- Stream hit-limit runs: `{query_streams.get('stream_hit_limit_runs')}`",
+        f"- Saturated stream total: `{query_streams.get('saturated_stream_total')}`",
+        (
+            "- Saturated stream label counts: "
+            f"`{_compact_counter_map(query_streams.get('saturated_stream_label_counts') or {})}`"
+        ),
+        f"- Row count before dedupe: `{query_streams.get('row_count_before_dedupe')}`",
+        f"- Row count after dedupe: `{query_streams.get('row_count_after_dedupe')}`",
+        f"- Duplicate row count: `{query_streams.get('duplicate_row_count')}`",
+        (
+            "- Selected rows by stream: "
+            f"`{_compact_counter_map(query_streams.get('selected_rows_by_stream') or {})}`"
+        ),
+        (
+            "- Rows dropped by stream cap: "
+            f"`{_compact_counter_map(query_streams.get('rows_dropped_by_stream_cap') or {})}`"
+        ),
+        f"- Rows dropped by stream cap total: `{query_streams.get('rows_dropped_by_stream_cap_total')}`",
+    ]
+    if privacy:
+        lines.extend(["", "### Fielded BM25 Query-Stream Privacy", ""])
+        for key, value in privacy.items():
+            lines.append(f"- `{key}`: `{value}`")
+    return lines
 
 
 def render_real_history_package_miss_audit_text(payload: dict) -> str:
