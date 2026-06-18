@@ -24,6 +24,11 @@ from .compact_handoff_usefulness import (
     render_compact_handoff_answer_use_markdown,
     render_compact_handoff_usefulness_markdown,
 )
+from .source_tier_answer_use import (
+    DEFAULT_FIXTURE as DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE,
+    build_source_tier_answer_use_eval_payload,
+    render_source_tier_answer_use_markdown,
+)
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .expansion import build_expansion_family_audit_report
@@ -502,6 +507,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the compact handoff answer-use report should be written.",
+    )
+    source_tier_answer_use = subparsers.add_parser("source-tier-answer-use-eval")
+    source_tier_answer_use.add_argument(
+        "--fixture",
+        default=str(DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE),
+        help="Committed synthetic source-tier answer-use fixture.",
+    )
+    source_tier_answer_use.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    source_tier_answer_use.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the source-tier answer-use report should be written.",
     )
     real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
     add_common_args(real_history_impact)
@@ -1618,6 +1635,20 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         status = payload["compact_handoff_answer_use_eval"]["status"]
+        return 1 if status == "invalid_fixture" else 0
+    if args.command == "source-tier-answer-use-eval":
+        payload = build_source_tier_answer_use_eval_payload(Path(args.fixture).expanduser())
+        rendered = (
+            render(payload, "json")
+            if args.format == "json"
+            else render_source_tier_answer_use_markdown(payload)
+        )
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["source_tier_answer_use_eval"]["status"]
         return 1 if status == "invalid_fixture" else 0
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)

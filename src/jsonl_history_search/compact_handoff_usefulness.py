@@ -345,11 +345,31 @@ def build_live_packet_bundle(case: dict[str, Any], *, fixture_path: Path) -> dic
     root_dir = fixture_path.resolve().parents[2]
     cwd = resolve_fixture_path(root_dir, str(case["cwd"]))
     root = resolve_fixture_path(root_dir, str(case["root"]))
-    synthetic_codex_home = root_dir / "tests" / "fixtures" / "compact_handoff_usefulness" / "synthetic_codex_home"
-    synthetic_claude_home = root_dir / "tests" / "fixtures" / "compact_handoff_usefulness" / "synthetic_claude_home"
+    synthetic_codex_home = resolve_fixture_path(
+        root_dir,
+        str(case.get("codex_home") or "tests/fixtures/compact_handoff_usefulness/synthetic_codex_home"),
+    )
+    synthetic_claude_home = resolve_fixture_path(
+        root_dir,
+        str(case.get("claude_home") or "tests/fixtures/compact_handoff_usefulness/synthetic_claude_home"),
+    )
     query = str(case["query"])
     now = parse_now(str(case.get("now") or "2026-06-19T00:00:00+00:00"), timezone.utc)
-    limits = Limits(max_files=20, max_bytes=200_000, max_matches=20, max_elapsed=15.0, hard_cap_files=20, hard_cap_bytes=200_000)
+    raw_limits = case.get("limits") if isinstance(case.get("limits"), dict) else {}
+    max_files = int(raw_limits.get("max_files") or 20)
+    max_bytes = int(raw_limits.get("max_bytes") or 200_000)
+    max_matches = int(raw_limits.get("max_matches") or 20)
+    max_elapsed = float(raw_limits.get("max_elapsed") or 15.0)
+    hard_cap_files = int(raw_limits.get("hard_cap_files") or max_files)
+    hard_cap_bytes = int(raw_limits.get("hard_cap_bytes") or max_bytes)
+    limits = Limits(
+        max_files=max_files,
+        max_bytes=max_bytes,
+        max_matches=max_matches,
+        max_elapsed=max_elapsed,
+        hard_cap_files=hard_cap_files,
+        hard_cap_bytes=hard_cap_bytes,
+    )
     intent = infer_query(query, now=now, role=case.get("role"))
     plan = build_source_plan(
         cwd=cwd,
