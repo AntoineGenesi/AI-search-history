@@ -21,7 +21,7 @@ from .ranking import (
     strong_evidence_retention_tier,
 )
 from .rg_prefilter import filter_planned_files
-from .sources import SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
+from .sources import PlannedJsonlFiles, SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
 
 
 SCAN_RECORD_QUANTUM = 128
@@ -61,6 +61,8 @@ def search(
     mask_context: MaskContext | None = None,
     use_rg_prefilter: bool = False,
     expected_ref_diagnostics: list[dict] | None = None,
+    planned_jsonl_files: PlannedJsonlFiles | None = None,
+    include_private_diagnostics: bool = False,
 ) -> dict:
     started = time.monotonic()
     warnings = list(plan.warnings)
@@ -79,6 +81,7 @@ def search(
     candidate_records_scored = 0
     searched_files = 0
     searched_bytes = 0
+    searched_file_paths: list[str] = []
     stopped = False
     prefilter = None
     planned_files = []
@@ -87,10 +90,14 @@ def search(
     pre_parse_filter = _build_pre_parse_filter(match_profile)
     raw_line_stats = RawLineScanStats()
 
-    for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
-        path, size, enum_warnings = enumerated
-        warnings = enum_warnings
-        planned_files.append((path, size))
+    if planned_jsonl_files is not None:
+        planned_files = list(planned_jsonl_files.files)
+        warnings = sorted(set(warnings + list(planned_jsonl_files.warnings)))
+    else:
+        for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
+            path, size, enum_warnings = enumerated
+            warnings = enum_warnings
+            planned_files.append((path, size))
 
     planned_files = order_planned_files_for_scan(planned_files, intent)
     _mark_expected_files_selected(expected_diag, planned_files)
@@ -124,6 +131,8 @@ def search(
             if not item["opened"]:
                 searched_files += 1
                 searched_bytes += size
+                if include_private_diagnostics:
+                    searched_file_paths.append(str(path))
                 _mark_opened_file_progress(expected_diag, item, path, searched_files)
                 source_kind = source_kind_for_path(path, plan)
                 item["records"] = iter_records_for_file(
@@ -306,6 +315,10 @@ def search(
     }
     if prefilter is not None:
         payload["prefilter"] = prefilter
+    if planned_jsonl_files is not None:
+        payload["planned_file_enumeration"] = planned_jsonl_files.to_diagnostics()
+    if include_private_diagnostics:
+        payload["_searched_file_paths"] = searched_file_paths
     if expected_diag is not None:
         payload["expected_ref_diagnostics"] = _public_expected_ref_diagnostics(expected_diag)
     if mask_context is not None and mask_context.stats is not None:

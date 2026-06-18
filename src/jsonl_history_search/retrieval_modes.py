@@ -6,6 +6,7 @@ from typing import Any
 from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT, RrfLane, fuse_ranked_groups
 from .scanner import search
+from .sources import materialize_planned_jsonl_files
 
 
 RETRIEVAL_MODE_PACKAGE = "package"
@@ -54,6 +55,10 @@ def run_rrf_fusion_retrieval(
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
 ) -> dict[str, Any]:
+    enumeration_started = time.perf_counter()
+    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
+    enumeration_elapsed_ms = _elapsed_ms(enumeration_started)
+
     package_started = time.perf_counter()
     package_result = search(
         plan,
@@ -62,11 +67,14 @@ def run_rrf_fusion_retrieval(
         cwd=cwd,
         mask_context=mask_context,
         use_rg_prefilter=use_rg_prefilter,
+        planned_jsonl_files=planned_jsonl_files,
+        include_private_diagnostics=True,
     )
     package_elapsed_ms = _elapsed_ms(package_started)
+    package_searched_paths = set(package_result.pop("_searched_file_paths", []) or [])
 
     fielded_index_started = time.perf_counter()
-    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz)
+    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
     fielded_index_elapsed_ms = _elapsed_ms(fielded_index_started)
     fielded_started = time.perf_counter()
     fielded_result = search_with_fielded_bm25(
@@ -75,8 +83,10 @@ def run_rrf_fusion_retrieval(
         intent,
         default_tz=default_tz,
         cwd=cwd,
+        include_private_diagnostics=True,
     )
     fielded_elapsed_ms = _elapsed_ms(fielded_started)
+    fielded_searched_paths = set(fielded_result.pop("_searched_file_paths", []) or [])
 
     fusion_started = time.perf_counter()
     fused_result = fuse_ranked_groups(
@@ -119,6 +129,10 @@ def run_rrf_fusion_retrieval(
                 fielded_index_elapsed_ms=fielded_index_elapsed_ms,
                 fielded_elapsed_ms=fielded_elapsed_ms,
                 fusion_elapsed_ms=fusion_elapsed_ms,
+                enumeration_elapsed_ms=enumeration_elapsed_ms,
+                planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
+                package_searched_paths=package_searched_paths,
+                fielded_searched_paths=fielded_searched_paths,
                 warnings=warnings,
             ),
         }
@@ -136,16 +150,41 @@ def build_rrf_retrieval_diagnostics(
     fielded_index_elapsed_ms: float,
     fielded_elapsed_ms: float,
     fusion_elapsed_ms: float,
+    enumeration_elapsed_ms: float,
+    planned_jsonl_file_diagnostics: dict[str, Any],
+    package_searched_paths: set[str],
+    fielded_searched_paths: set[str],
     warnings: list[str],
 ) -> dict[str, Any]:
     package_count = _candidate_count(package_result)
     fielded_count = _candidate_count(fielded_result)
     fused_count = _candidate_count(fused_result)
+    overlap = package_searched_paths & fielded_searched_paths
+    union = package_searched_paths | fielded_searched_paths
+    duplicate_file_visits = int(package_result.get("searched_files", 0)) + int(fielded_result.get("searched_files", 0)) - len(union)
+    duplicate_bytes_lower_bound = min(
+        int(package_result.get("searched_bytes", 0)),
+        int(fielded_result.get("searched_bytes", 0)),
+    ) if overlap else 0
+    cap_labels = cap_labels_from_warnings(warnings)
     return {
         "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
         "feature_state": "active_explicit_opt_in",
         "strategy": "rank_only_reciprocal_rank_fusion",
         "experimental_high_recall_costlier_path": True,
+        "high_recall_mode_state": {
+            "explicit_opt_in_required": True,
+            "default_behavior_changed": False,
+            "capped": bool(cap_labels),
+            "cap_labels": cap_labels,
+            "costlier_than_package_lane": True,
+            "reason": "rrf_fusion_runs_package_search_plus_fielded_bm25_before_rank_fusion",
+        },
+        "shared_source_enumeration": {
+            **planned_jsonl_file_diagnostics,
+            "elapsed_ms": enumeration_elapsed_ms,
+            "consumed_by_lanes": list(RRF_LANE_NAMES),
+        },
         "rrf_summary": {
             "rank_constant": int(fused_result.get("rank_constant") or DEFAULT_RRF_RANK_CONSTANT),
             "lane_names": list(fused_result.get("lane_names") or RRF_LANE_NAMES),
@@ -167,29 +206,54 @@ def build_rrf_retrieval_diagnostics(
                 "name": RRF_LANE_NAMES[0],
                 "candidate_count": package_count,
                 "elapsed_ms": package_elapsed_ms,
+                "elapsed_label": elapsed_label(package_elapsed_ms),
                 "searched_files": int(package_result.get("searched_files", 0)),
                 "searched_bytes": int(package_result.get("searched_bytes", 0)),
+                "planned_file_source": "shared_source_enumeration",
                 "cap_labels": cap_labels_from_warnings(package_result.get("warnings", []) or []),
             },
             {
                 "name": RRF_LANE_NAMES[1],
                 "candidate_count": fielded_count,
                 "elapsed_ms": fielded_elapsed_ms,
+                "elapsed_label": elapsed_label(fielded_elapsed_ms),
                 "index_build_elapsed_ms": fielded_index_elapsed_ms,
+                "index_build_elapsed_label": elapsed_label(fielded_index_elapsed_ms),
                 "candidate_rows": int(fielded_result.get("candidate_rows_generated", 0) or 0),
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
                 "searched_files": int(fielded_result.get("searched_files", 0)),
                 "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
+                "planned_file_source": "shared_source_enumeration",
                 "cap_labels": cap_labels_from_warnings(fielded_result.get("warnings", []) or []),
                 "index_summary": fielded_index_summary,
             },
         ],
+        "lane_file_overlap": {
+            "raw_paths_included": False,
+            "package_opened_file_count": len(package_searched_paths),
+            "fielded_opened_file_count": len(fielded_searched_paths),
+            "overlap_file_count": len(overlap),
+            "union_file_count": len(union),
+            "package_only_file_count": len(package_searched_paths - fielded_searched_paths),
+            "fielded_only_file_count": len(fielded_searched_paths - package_searched_paths),
+            "planned_file_count": int(planned_jsonl_file_diagnostics.get("file_count") or 0),
+        },
+        "duplicate_local_work": {
+            "raw_paths_included": False,
+            "enumeration_reused": True,
+            "avoided_second_enumeration": True,
+            "duplicate_file_visit_count": duplicate_file_visits,
+            "duplicate_file_overlap_count": len(overlap),
+            "duplicate_searched_bytes_lower_bound": duplicate_bytes_lower_bound,
+            "local_work_only_not_model_tokens": True,
+        },
         "fusion": {
             "elapsed_ms": fusion_elapsed_ms,
+            "elapsed_label": elapsed_label(fusion_elapsed_ms),
             "candidate_count": fused_count,
             "cap_labels": cap_labels_from_warnings(warnings),
         },
-        "cap_labels": cap_labels_from_warnings(warnings),
+        "cap_labels": cap_labels,
         "claim_boundaries": {
             "default_behavior_changed": False,
             "default_promotion_supported": False,
@@ -221,6 +285,16 @@ def cap_labels_from_warnings(warnings: list[str]) -> list[str]:
         if "reservoir-capped" in lowered:
             labels.add("reservoir")
     return sorted(labels)
+
+
+def elapsed_label(elapsed_ms: float) -> str:
+    if elapsed_ms >= 10_000:
+        return "10s_plus"
+    if elapsed_ms >= 1_000:
+        return "1s_to_10s"
+    if elapsed_ms >= 100:
+        return "100ms_to_1s"
+    return "under_100ms"
 
 
 def _candidate_count(result: dict[str, Any]) -> int:

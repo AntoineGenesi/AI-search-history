@@ -22,7 +22,7 @@ from .scanner import (
     dedupe_key_for_record,
     match_sort_key,
 )
-from .sources import SourcePlan, enumerate_jsonl_files, source_kind_for_path, stat_size
+from .sources import PlannedJsonlFiles, SourcePlan, enumerate_jsonl_files, source_kind_for_path, stat_size
 from .tool_events import detect_events_for_record
 
 
@@ -77,6 +77,9 @@ class FieldedBm25Index:
             "indexed_chunk_count": int(self.metrics.get("indexed_chunks", 0)),
             "build_bytes": int(self.metrics.get("build_bytes", 0)),
             "build_elapsed_ms": self.metrics.get("build_elapsed_ms", 0.0),
+            "planned_file_enumeration_reused": bool(self.metrics.get("planned_file_enumeration_reused", False)),
+            "planned_file_count": int(self.metrics.get("planned_file_count", 0)),
+            "planned_file_bytes": int(self.metrics.get("planned_file_bytes", 0)),
             "source_kind_counts": dict(sorted(source_kind_counts.items())),
             "role_bucket_counts": dict(sorted(role_bucket_counts.items())),
             "timestamp_bucket_counts": dict(sorted(timestamp_bucket_counts.items())),
@@ -110,7 +113,12 @@ def sqlite_fts5_available() -> bool:
     return True
 
 
-def build_fielded_bm25_index(plan: SourcePlan, *, default_tz) -> FieldedBm25Index:
+def build_fielded_bm25_index(
+    plan: SourcePlan,
+    *,
+    default_tz,
+    planned_jsonl_files: PlannedJsonlFiles | None = None,
+) -> FieldedBm25Index:
     started = time.perf_counter()
     try:
         connection = sqlite3.connect(":memory:")
@@ -150,11 +158,16 @@ def build_fielded_bm25_index(plan: SourcePlan, *, default_tz) -> FieldedBm25Inde
     )
     rowid = 0
     insert_buffer: list[tuple[int, str, str, str, str, str, str, str]] = []
-    for path, _size, enum_warnings in enumerate_jsonl_files(plan):
+    if planned_jsonl_files is not None:
+        enumerated_files = [(path, size, list(planned_jsonl_files.warnings)) for path, size in planned_jsonl_files.files]
+    else:
+        enumerated_files = enumerate_jsonl_files(plan)
+
+    for path, size, enum_warnings in enumerated_files:
         index.warnings = list(enum_warnings)
         source_kind = source_kind_for_path(path, plan)
         file_records = 0
-        file_bytes = stat_size(path)
+        file_bytes = int(size) if planned_jsonl_files is not None else stat_size(path)
         try:
             if path.suffix == ".jsonl":
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -218,6 +231,10 @@ def build_fielded_bm25_index(plan: SourcePlan, *, default_tz) -> FieldedBm25Inde
     _flush_insert_buffer(connection, insert_buffer)
     connection.commit()
     index.metrics["build_elapsed_ms"] = _elapsed_ms(started)
+    if planned_jsonl_files is not None:
+        index.metrics["planned_file_enumeration_reused"] = True
+        index.metrics["planned_file_count"] = planned_jsonl_files.file_count
+        index.metrics["planned_file_bytes"] = planned_jsonl_files.byte_count
     index.warnings = sorted(set(index.warnings + plan.warnings))
     return index
 
@@ -230,6 +247,7 @@ def search_with_fielded_bm25(
     default_tz,
     cwd: str | None,
     expected_ref_diagnostics: list[dict] | None = None,
+    include_private_diagnostics: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     warnings = list(index.warnings) + list(plan.warnings)
@@ -354,6 +372,8 @@ def search_with_fielded_bm25(
         "warnings": sorted(set(warnings)),
         "elapsed_ms": _elapsed_ms(started),
     }
+    if include_private_diagnostics:
+        payload["_searched_file_paths"] = sorted(opened_paths)
     if expected_diag is not None:
         payload["expected_ref_diagnostics"] = _public_fielded_expected_ref_diagnostics(expected_diag)
     return payload
