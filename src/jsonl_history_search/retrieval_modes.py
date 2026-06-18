@@ -12,7 +12,8 @@ from .sources import materialize_planned_jsonl_files
 
 RETRIEVAL_MODE_PACKAGE = "package"
 RETRIEVAL_MODE_RRF_FUSION = "rrf-fusion"
-RETRIEVAL_MODES = (RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODE_RRF_FUSION)
+RETRIEVAL_MODE_FIELDED_BM25 = "fielded-bm25"
+RETRIEVAL_MODES = (RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODE_RRF_FUSION, RETRIEVAL_MODE_FIELDED_BM25)
 RRF_LANE_NAMES = ("package_search", "package_search_fielded_bm25")
 
 
@@ -44,7 +45,101 @@ def run_retrieval_mode(
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
         )
+    if retrieval_mode == RETRIEVAL_MODE_FIELDED_BM25:
+        return run_fielded_bm25_retrieval(
+            plan=plan,
+            intent=intent,
+            default_tz=default_tz,
+            cwd=cwd,
+            mask_context=mask_context,
+        )
     raise ValueError(f"unsupported retrieval mode: {retrieval_mode}")
+
+
+def run_fielded_bm25_retrieval(
+    *,
+    plan: Any,
+    intent: Any,
+    default_tz: Any,
+    cwd: str | None,
+    mask_context: Any = None,
+) -> dict[str, Any]:
+    total_profile_token = start_phase_profile("total_fielded_bm25_retrieval")
+    enumeration_profile_token = start_phase_profile("shared_source_enumeration")
+    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
+    enumeration_profile = finish_phase_profile(
+        enumeration_profile_token,
+        file_count=planned_jsonl_files.file_count,
+        byte_count=planned_jsonl_files.byte_count,
+    )
+    enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
+
+    fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
+    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
+    fielded_index_profile = finish_phase_profile(
+        fielded_index_profile_token,
+        indexed_file_count=int(fielded_index.metrics.get("indexed_files", 0)),
+        indexed_record_count=int(fielded_index.metrics.get("indexed_records", 0)),
+        indexed_chunk_count=int(fielded_index.metrics.get("indexed_chunks", 0)),
+        build_bytes=int(fielded_index.metrics.get("build_bytes", 0)),
+    )
+    fielded_index_elapsed_ms = float(fielded_index_profile["elapsed_ms"])
+
+    fielded_started = start_phase_profile("fielded_bm25_search_materialization")
+    fielded_result = search_with_fielded_bm25(
+        fielded_index,
+        plan,
+        intent,
+        default_tz=default_tz,
+        cwd=cwd,
+        mask_context=mask_context,
+        include_private_diagnostics=True,
+    )
+    fielded_count = _candidate_count(fielded_result)
+    fielded_profile = finish_phase_profile(
+        fielded_started,
+        candidate_count=fielded_count,
+        candidate_rows=int(fielded_result.get("candidate_rows_generated", 0) or 0),
+        searched_files=int(fielded_result.get("searched_files", 0)),
+        searched_bytes=int(fielded_result.get("searched_bytes", 0)),
+        records_considered=int(fielded_result.get("records_considered", 0)),
+    )
+    fielded_elapsed_ms = float(fielded_profile["elapsed_ms"])
+    fielded_result.pop("_searched_file_paths", None)
+    warnings = sorted(set(fielded_result.get("warnings", []) or []))
+    total_profile = finish_phase_profile(
+        total_profile_token,
+        candidate_count=fielded_count,
+        planned_file_count=planned_jsonl_files.file_count,
+        searched_files=int(fielded_result.get("searched_files", 0)),
+        searched_bytes=int(fielded_result.get("searched_bytes", 0)),
+    )
+
+    fielded_result.update(
+        {
+            "retrieval_mode": RETRIEVAL_MODE_FIELDED_BM25,
+            "warnings": warnings,
+            "retrieval_diagnostics": build_fielded_bm25_retrieval_diagnostics(
+                fielded_result=fielded_result,
+                fielded_index_summary=fielded_index.sanitized_summary(),
+                fielded_index_elapsed_ms=fielded_index_elapsed_ms,
+                fielded_elapsed_ms=fielded_elapsed_ms,
+                enumeration_elapsed_ms=enumeration_elapsed_ms,
+                planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
+                warnings=warnings,
+                profiles={
+                    "total_fielded_bm25_retrieval": total_profile,
+                    "shared_source_enumeration": enumeration_profile,
+                    "fielded_bm25_index_build": fielded_index_profile,
+                    "fielded_bm25_search_materialization": fielded_profile,
+                },
+            ),
+        }
+    )
+    if mask_context is not None and getattr(mask_context, "stats", None) is not None:
+        fielded_result["masking"] = mask_context.stats.to_dict()
+        fielded_result["warnings"] = sorted(set(fielded_result["warnings"] + mask_context.stats.warnings))
+    return fielded_result
 
 
 def run_rrf_fusion_retrieval(
@@ -83,6 +178,7 @@ def run_rrf_fusion_retrieval(
         intent,
         default_tz=default_tz,
         cwd=cwd,
+        mask_context=mask_context,
         include_private_diagnostics=True,
     )
     fielded_count = _candidate_count(fielded_result)
@@ -187,6 +283,116 @@ def run_rrf_fusion_retrieval(
         }
     )
     return fused_result
+
+
+def build_fielded_bm25_retrieval_diagnostics(
+    *,
+    fielded_result: dict[str, Any],
+    fielded_index_summary: dict[str, Any],
+    fielded_index_elapsed_ms: float,
+    fielded_elapsed_ms: float,
+    enumeration_elapsed_ms: float,
+    planned_jsonl_file_diagnostics: dict[str, Any],
+    warnings: list[str],
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    profiles = profiles if isinstance(profiles, dict) else {}
+    cap_labels = cap_labels_from_warnings(warnings)
+    fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
+    fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
+    fielded_summary = {
+        "status": fielded_result.get("status"),
+        "fallback_reason": fielded_result.get("fallback_reason"),
+        "candidate_count": _candidate_count(fielded_result),
+        "candidate_rows": int(fielded_result.get("candidate_rows", 0) or 0),
+        "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
+        "candidate_row_pool_limit": int(fielded_result.get("candidate_row_pool_limit", 0) or 0),
+        "candidate_rows_generated": int(fielded_result.get("candidate_rows_generated", 0) or 0),
+        "candidate_rows_considered": int(fielded_result.get("candidate_rows_considered", 0) or 0),
+        "candidate_rows_retained": int(fielded_result.get("candidate_rows_retained", 0) or 0),
+        "candidate_rows_surfaced": int(fielded_result.get("candidate_rows_surfaced", 0) or 0),
+        "searched_files": int(fielded_result.get("searched_files", 0)),
+        "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
+        "records_considered": int(fielded_result.get("records_considered", 0)),
+        "records_rejected_by_existing_ranker": int(fielded_result.get("records_rejected_by_existing_ranker", 0) or 0),
+        "candidate_records_scored": int(fielded_result.get("candidate_records_scored", 0) or 0),
+        "candidate_records_deduped": int(fielded_result.get("candidate_records_deduped", 0) or 0),
+        "bm25_rank_buckets": dict(fielded_result.get("bm25_rank_buckets") or {}),
+        "materialization": fielded_materialization,
+        "index_summary": fielded_index_summary,
+        "elapsed_ms": fielded_elapsed_ms,
+        "elapsed_label": elapsed_label(fielded_elapsed_ms),
+        "profile": _phase_profile(
+            profiles.get("fielded_bm25_search_materialization"),
+            "fielded_bm25_search_materialization",
+        ),
+        "index_build_elapsed_ms": fielded_index_elapsed_ms,
+        "index_build_elapsed_label": elapsed_label(fielded_index_elapsed_ms),
+        "index_build_profile": _phase_profile(
+            profiles.get("fielded_bm25_index_build"),
+            "fielded_bm25_index_build",
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+    return {
+        "retrieval_mode": RETRIEVAL_MODE_FIELDED_BM25,
+        "feature_state": "active_explicit_opt_in",
+        "strategy": "direct_fielded_bm25_record_retrieval",
+        "fielded_mode_state": {
+            "explicit_opt_in_required": True,
+            "default_behavior_changed": False,
+            "capped": bool(cap_labels),
+            "cap_labels": cap_labels,
+            "persistent_index_or_cache_used": False,
+            "reason": "fielded_bm25_builds_in_memory_sqlite_fts5_index_from_planned_jsonl_sources",
+        },
+        "shared_source_enumeration": {
+            **planned_jsonl_file_diagnostics,
+            "elapsed_ms": enumeration_elapsed_ms,
+            "profile": _phase_profile(profiles.get("shared_source_enumeration"), "shared_source_enumeration"),
+            "consumed_by_lanes": [RETRIEVAL_MODE_FIELDED_BM25],
+        },
+        "fielded_bm25": fielded_summary,
+        "fielded_source_grouping": fielded_source_grouping,
+        "phase_profiles": {
+            "total_fielded_bm25_retrieval": _phase_profile(
+                profiles.get("total_fielded_bm25_retrieval"),
+                "total_fielded_bm25_retrieval",
+            ),
+            "shared_source_enumeration": _phase_profile(
+                profiles.get("shared_source_enumeration"),
+                "shared_source_enumeration",
+            ),
+            "fielded_bm25_index_build": _phase_profile(
+                profiles.get("fielded_bm25_index_build"),
+                "fielded_bm25_index_build",
+            ),
+            "fielded_bm25_search_materialization": _phase_profile(
+                profiles.get("fielded_bm25_search_materialization"),
+                "fielded_bm25_search_materialization",
+            ),
+        },
+        "cap_labels": cap_labels,
+        "claim_boundaries": {
+            "default_behavior_changed": False,
+            "default_promotion_supported": False,
+            "token_savings_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "broad_speedup_claim_supported": False,
+            "all_history_completeness_claim_supported": False,
+            "persistent_index_or_cache_used": False,
+            "raw_score_blending_used": False,
+            "score_normalization_used": False,
+            "tuned_lane_weights_used": False,
+            "fused_score_threshold_used": False,
+            "scanner_scheduling_constants_changed": False,
+            "package_lane_scoped_or_skipped": False,
+        },
+    }
 
 
 def build_rrf_retrieval_diagnostics(

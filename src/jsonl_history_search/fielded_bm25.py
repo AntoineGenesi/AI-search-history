@@ -15,6 +15,7 @@ from .profiling import finish_phase_profile, start_phase_profile
 from .query import QueryIntent
 from .ranking import Match, group_matches, make_snippet, score_record
 from .records import Record, parse_record
+from .masking import MaskContext
 from .scanner import (
     _init_expected_ref_diagnostics,
     _mark_expected_final_candidates,
@@ -259,6 +260,7 @@ def search_with_fielded_bm25(
     *,
     default_tz,
     cwd: str | None,
+    mask_context: MaskContext | None = None,
     expected_ref_diagnostics: list[dict] | None = None,
     include_private_diagnostics: bool = False,
 ) -> dict[str, Any]:
@@ -366,7 +368,7 @@ def search_with_fielded_bm25(
                 expected_state["candidate_strength_label"] = "fielded_bm25"
                 expected_state["score_label_count"] = len(reasons)
                 expected_state["artifact_label_count"] = len(artifacts)
-            matches.append(_materialize_match(record, score, reasons, artifacts, intent))
+            matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
 
     searched_bytes = sum(int(index.files.get(path, {}).get("byte_count") or 0) for path in opened_paths)
     _mark_expected_pre_final_candidates(expected_diag, matches)
@@ -418,6 +420,9 @@ def search_with_fielded_bm25(
         payload["_searched_file_paths"] = sorted(opened_paths)
     if expected_diag is not None:
         payload["expected_ref_diagnostics"] = _public_fielded_expected_ref_diagnostics(expected_diag)
+    if mask_context is not None and mask_context.stats is not None:
+        payload["masking"] = mask_context.stats.to_dict()
+        payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
 
 
@@ -921,7 +926,22 @@ def _fts_stats(index: FieldedBm25Index, *, query: str | None) -> dict[str, Any]:
     }
 
 
-def _materialize_match(record: Record, score: float, reasons: list[str], artifacts: list[str], intent: QueryIntent) -> Match:
+def _materialize_match(
+    record: Record,
+    score: float,
+    reasons: list[str],
+    artifacts: list[str],
+    intent: QueryIntent,
+    mask_context: MaskContext | None,
+) -> Match:
+    if mask_context is not None:
+        copied_text = mask_context.mask_text(
+            record.text,
+            source_path=record.path,
+            source_index=record.line,
+        )
+    else:
+        copied_text = record.text
     facets = facets_for_record(path=record.path, text=record.text, artifacts=artifacts)
     return Match(
         path=record.path,
@@ -929,7 +949,7 @@ def _materialize_match(record: Record, score: float, reasons: list[str], artifac
         role=record.role,
         timestamp=record.timestamp.isoformat() if record.timestamp else None,
         cwd=record.cwd,
-        snippet=make_snippet(record.text, intent.terms),
+        snippet=make_snippet(copied_text, intent.terms),
         score=round(score, 3),
         reasons=sorted(set(["fielded_bm25:candidate"] + reasons), key=(["fielded_bm25:candidate"] + reasons).index),
         artifacts=facets.artifacts,
