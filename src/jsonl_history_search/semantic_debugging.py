@@ -12,6 +12,7 @@ from .agent_contract import (
     build_agent_find_payload,
     build_compact_provenance_handoff,
     build_source_scope_summary,
+    build_stage_diagnostics,
     build_source_locator_handoff,
     estimate_tokens,
     reduction_ratio,
@@ -120,6 +121,9 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         source_family="local_ai_conversation_jsonl",
         question_family=compact_handoff_question_family(family),
+        product_path="semantic_debug",
+        no_evidence_report=agent_find.get("no_evidence_report"),
+        retrieval_pressure=agent_find.get("retrieval_pressure"),
     )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
@@ -178,6 +182,8 @@ def build_semantic_debug_payload(
         packet["claim_boundaries"].update(result["retrieval_diagnostics"].get("claim_boundaries", {}))
     if agent_find.get("retrieval_pressure"):
         packet["retrieval_pressure"] = agent_find["retrieval_pressure"]
+    if source_locator_handoff.get("stage_diagnostics") and packet.get("retrieval_pressure"):
+        packet["retrieval_pressure"]["stage_diagnostics"] = source_locator_handoff["stage_diagnostics"]
     if getattr(args, "compact_provenance_handoff", False):
         packet["compact_provenance_handoff"] = build_compact_provenance_handoff(
             status=packet["status"],
@@ -188,6 +194,22 @@ def build_semantic_debug_payload(
             no_evidence=no_evidence,
             retrieval_pressure=packet.get("retrieval_pressure"),
         )
+        compact_stage_diagnostics = build_stage_diagnostics(
+            product_path="semantic_debug",
+            query_plan=source_locator_handoff.get("query_plan"),
+            search_result=result,
+            retrieval_pressure=packet.get("retrieval_pressure"),
+            source_window_packaging=source_locator_handoff.get("source_window_packaging"),
+            compact_context_budget=packet["compact_provenance_handoff"].get("context_budget"),
+            no_evidence_report=agent_find.get("no_evidence_report"),
+            compact_handoff_requested=True,
+        )
+        if compact_stage_diagnostics:
+            source_locator_handoff["stage_diagnostics"] = compact_stage_diagnostics
+            if packet.get("retrieval_pressure"):
+                packet["retrieval_pressure"]["stage_diagnostics"] = compact_stage_diagnostics
+                packet["compact_provenance_handoff"]["retrieval_pressure"] = packet["retrieval_pressure"]
+            packet["compact_provenance_handoff"]["stage_diagnostics"] = compact_stage_diagnostics
     return {
         "semantic_debug": packet,
         "warnings": sorted(set(result.get("warnings", []) + tool_payload.get("warnings", []) + (forensics_payload or {}).get("warnings", []))),

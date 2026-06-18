@@ -75,6 +75,12 @@ def build_agent_find_payload(
     raw_baseline_bytes = search_result.get("searched_bytes", 0)
     estimated_reduction_ratio = reduction_ratio(context_bytes, raw_baseline_bytes)
     status = "found" if candidates else "no_evidence"
+    no_evidence_report = build_no_evidence_report(
+        status=status,
+        source_plan=source_plan,
+        search_result=search_result,
+        manifest_report=manifest_report,
+    )
     agent_find = {
         "schema_version": 1,
         "status": status,
@@ -91,12 +97,7 @@ def build_agent_find_payload(
         "timeline": [candidate.to_dict() for candidate in timeline[:INLINE_CANDIDATE_LIMIT]],
         "cluster_candidates": build_cluster_candidates(search_result),
         "evidence_bundles": build_evidence_bundles(search_result),
-        "no_evidence_report": build_no_evidence_report(
-            status=status,
-            source_plan=source_plan,
-            search_result=search_result,
-            manifest_report=manifest_report,
-        ),
+        "no_evidence_report": no_evidence_report,
         "next_search_suggestions": next_search_suggestions(
             status=status,
             source_plan=source_plan,
@@ -141,8 +142,13 @@ def build_agent_find_payload(
         question_family={
             "primary": "agent_find",
         },
+        product_path="find",
+        no_evidence_report=no_evidence_report,
+        retrieval_pressure=agent_find.get("retrieval_pressure"),
     )
     agent_find["source_locator_handoff"] = handoff
+    if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
+        agent_find["retrieval_pressure"]["stage_diagnostics"] = handoff["stage_diagnostics"]
     if compact_provenance_handoff:
         agent_find["compact_provenance_handoff"] = build_compact_provenance_handoff(
             status=status,
@@ -153,6 +159,22 @@ def build_agent_find_payload(
             no_evidence=agent_find["no_evidence_report"],
             retrieval_pressure=agent_find.get("retrieval_pressure"),
         )
+        compact_stage_diagnostics = build_stage_diagnostics(
+            product_path="find",
+            query_plan=handoff.get("query_plan"),
+            search_result=search_result,
+            retrieval_pressure=agent_find.get("retrieval_pressure"),
+            source_window_packaging=handoff.get("source_window_packaging"),
+            compact_context_budget=agent_find["compact_provenance_handoff"].get("context_budget"),
+            no_evidence_report=no_evidence_report,
+            compact_handoff_requested=True,
+        )
+        if compact_stage_diagnostics:
+            handoff["stage_diagnostics"] = compact_stage_diagnostics
+            if agent_find.get("retrieval_pressure"):
+                agent_find["retrieval_pressure"]["stage_diagnostics"] = compact_stage_diagnostics
+                agent_find["compact_provenance_handoff"]["retrieval_pressure"] = agent_find["retrieval_pressure"]
+            agent_find["compact_provenance_handoff"]["stage_diagnostics"] = compact_stage_diagnostics
     return {"agent_find": agent_find}
 
 
@@ -237,6 +259,192 @@ def build_compact_provenance_handoff(
         "measurement_basis": "compact_provenance_handoff_packet_only",
     }
     return packet
+
+
+STAGE_DIAGNOSTIC_LABELS = [
+    "query_planning",
+    "source_enumeration",
+    "fielded_index_search",
+    "candidate_materialization",
+    "source_grouping_diversity",
+    "source_window_packaging",
+    "compact_handoff_output",
+    "searched_scope_no_evidence",
+]
+
+
+def build_stage_diagnostics(
+    *,
+    product_path: str,
+    query_plan: dict[str, Any] | None,
+    search_result: dict[str, Any],
+    retrieval_pressure: dict[str, Any] | None,
+    source_window_packaging: dict[str, Any] | None,
+    compact_context_budget: dict[str, Any] | None = None,
+    no_evidence_report: dict[str, Any] | None = None,
+    compact_handoff_requested: bool = False,
+) -> dict[str, Any] | None:
+    diagnostics = search_result.get("retrieval_diagnostics") or {}
+    retrieval_mode = diagnostics.get("retrieval_mode") or search_result.get("retrieval_mode")
+    if retrieval_mode != "fielded-bm25":
+        return None
+
+    pressure = retrieval_pressure or {}
+    query_plan = query_plan or {}
+    source_window_packaging = source_window_packaging or {}
+    no_evidence_report = no_evidence_report or {}
+    fielded = pressure.get("fielded_bm25") or {}
+    source_enumeration = pressure.get("shared_source_enumeration") or {}
+    grouping = pressure.get("fielded_source_grouping") or {}
+    cap_labels = list(pressure.get("cap_labels") or diagnostics.get("cap_labels") or [])
+    candidate_count = int(pressure.get("fielded_bm25", {}).get("candidate_count") or 0)
+    no_evidence_needed = bool(no_evidence_report.get("needed"))
+
+    stages = [
+        stage_diagnostic(
+            "query_planning",
+            "available" if query_plan else "not_run",
+            "anchor_terms_empty" if query_plan and not query_plan.get("anchor_terms") else "none" if query_plan else "query_plan_missing",
+            {
+                "anchor_term_count": len(query_plan.get("anchor_terms") or []),
+                "source_window_need_count": len(query_plan.get("source_window_needs") or []),
+                "has_primary_intent": bool(query_plan.get("primary_intent")),
+            },
+        ),
+        stage_diagnostic(
+            "source_enumeration",
+            "capped" if cap_labels else "available" if int(source_enumeration.get("file_count") or 0) else "empty",
+            "none",
+            {
+                "file_count": int(source_enumeration.get("file_count") or 0),
+                "byte_count": int(source_enumeration.get("byte_count") or 0),
+                "consumed_by_lane_count": len(source_enumeration.get("consumed_by_lanes") or []),
+            },
+        ),
+        stage_diagnostic(
+            "fielded_index_search",
+            "capped" if cap_labels else "available" if fielded.get("status") else "not_run",
+            "none",
+            {
+                "candidate_count": candidate_count,
+                "candidate_rows": int(fielded.get("candidate_rows") or 0),
+                "candidate_row_limit": int(fielded.get("candidate_row_limit") or 0),
+                "candidate_row_pool_limit": int(fielded.get("candidate_row_pool_limit") or 0),
+                "candidate_rows_generated": int(fielded.get("candidate_rows_generated") or 0),
+                "records_considered": int(fielded.get("records_considered") or 0),
+                "searched_files": int(fielded.get("searched_files") or 0),
+                "searched_bytes": int(fielded.get("searched_bytes") or 0),
+                "planned_file_enumeration_reused": bool(
+                    (fielded.get("index_summary") or {}).get("planned_file_enumeration_reused", False)
+                ),
+            },
+        ),
+        stage_diagnostic(
+            "candidate_materialization",
+            "capped" if cap_labels else "available" if int(fielded.get("candidate_rows_retained") or 0) else "empty",
+            "none",
+            {
+                "candidate_rows_considered": int(fielded.get("candidate_rows_considered") or 0),
+                "candidate_rows_retained": int(fielded.get("candidate_rows_retained") or 0),
+                "candidate_rows_surfaced": int(fielded.get("candidate_rows_surfaced") or 0),
+                "materialized_from_in_memory_raw": int(
+                    (fielded.get("materialization") or {}).get("candidate_rows_materialized_from_in_memory_raw") or 0
+                ),
+            },
+        ),
+        stage_diagnostic(
+            "source_grouping_diversity",
+            "available" if grouping.get("enabled") else "not_run",
+            "none",
+            {
+                "candidate_rows_considered": int(grouping.get("candidate_rows_considered") or 0),
+                "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
+                "source_count_considered": int(grouping.get("source_count_considered") or 0),
+                "source_count_selected": int(grouping.get("source_count_selected") or 0),
+                "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
+                "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+            },
+        ),
+        stage_diagnostic(
+            "source_window_packaging",
+            "packaged" if source_window_packaging.get("status") == "packaged" else "empty",
+            "none",
+            {
+                "candidate_window_count": int(source_window_packaging.get("candidate_window_count") or 0),
+                "open_next_metadata_only": bool(source_window_packaging.get("open_next_metadata_only", True)),
+                "source_window_text_included": bool(
+                    source_window_packaging.get("source_window_text_included", False)
+                ),
+            },
+        ),
+        stage_diagnostic(
+            "compact_handoff_output",
+            "packaged" if compact_handoff_requested and compact_context_budget else "not_requested",
+            "none",
+            {
+                "payload_bytes": int((compact_context_budget or {}).get("payload_bytes") or 0),
+                "estimated_tokens": int((compact_context_budget or {}).get("estimated_tokens") or 0),
+            },
+        ),
+        stage_diagnostic(
+            "searched_scope_no_evidence",
+            "available" if no_evidence_needed else "not_run",
+            "none",
+            {
+                "needed": no_evidence_needed,
+                "candidate_rows_found": int(no_evidence_report.get("candidate_rows_found") or candidate_count),
+                "searched_files": int((no_evidence_report.get("searched_scope") or {}).get("searched_files") or 0),
+                "searched_bytes": int((no_evidence_report.get("searched_scope") or {}).get("searched_bytes") or 0),
+                "not_all_history_absence": bool(no_evidence_report.get("not_all_history_absence", True)),
+            },
+        ),
+    ]
+    return {
+        "schema_version": 1,
+        "retrieval_mode": "fielded-bm25",
+        "product_path": product_path,
+        "stages": stages,
+        "dominant_pressure_stage": dominant_stage(
+            cap_labels=cap_labels,
+            no_evidence_needed=no_evidence_needed,
+            source_window_packaging=source_window_packaging,
+            candidate_count=candidate_count,
+        ),
+        "claim_boundaries": {
+            "token_savings_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "default_promotion_supported": False,
+        },
+    }
+
+
+def stage_diagnostic(stage: str, status: str, next_fix_hint: str, counters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": status,
+        "next_fix_hint": next_fix_hint,
+        "counters": counters,
+        "privacy": {
+            "raw_text_included": False,
+            "raw_paths_included": False,
+        },
+    }
+
+
+def dominant_stage(
+    *,
+    cap_labels: list[Any],
+    no_evidence_needed: bool,
+    source_window_packaging: dict[str, Any],
+    candidate_count: int,
+) -> str:
+    if no_evidence_needed or candidate_count == 0:
+        return "searched_scope_no_evidence"
+    if source_window_packaging.get("status") != "packaged":
+        return "source_window_packaging"
+    if cap_labels:
+        return "fielded_index_search"
+    return "none"
 
 
 def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str, Any] | None:
@@ -807,6 +1015,9 @@ def build_source_locator_handoff(
     next_reads: list[dict[str, Any]] | None = None,
     source_family: str = "local_ai_conversation_jsonl",
     question_family: dict[str, Any] | None = None,
+    product_path: str = "find",
+    no_evidence_report: dict[str, Any] | None = None,
+    retrieval_pressure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable agent handoff for deciding where to read next."""
     source_scope = build_source_scope_summary(source_plan, search_result)
@@ -823,7 +1034,16 @@ def build_source_locator_handoff(
         next_reads=next_read_rows,
         query_plan=query_plan,
     )
-    return {
+    source_window_packaging = {
+        "schema_version": 1,
+        "status": "packaged" if source_windows else "no_candidate_windows",
+        "candidate_window_count": len(source_windows),
+        "builder": "source_locator_handoff",
+        "raw_text_included": False,
+        "source_window_text_included": False,
+        "open_next_metadata_only": True,
+    }
+    payload = {
         "schema_version": 1,
         "query_plan": query_plan,
         "source_family": {
@@ -847,15 +1067,7 @@ def build_source_locator_handoff(
             "top_candidates": compact_handoff_candidates(candidate_rows),
         },
         "source_windows": source_windows,
-        "source_window_packaging": {
-            "schema_version": 1,
-            "status": "packaged" if source_windows else "no_candidate_windows",
-            "candidate_window_count": len(source_windows),
-            "builder": "source_locator_handoff",
-            "raw_text_included": False,
-            "source_window_text_included": False,
-            "open_next_metadata_only": True,
-        },
+        "source_window_packaging": source_window_packaging,
         "next_reads": next_read_rows[:8],
         "no_evidence_meaning": {
             "answer_scope": "not_found_in_searched_scope",
@@ -878,6 +1090,18 @@ def build_source_locator_handoff(
         },
         "non_default_routes": ["embeddings:not_run", "timestamp_sidecars:not_run", "semantic_linter_runtime:not_used", "private_bridges:not_included", "broad_drive_scans:guarded"],
     }
+    stage_diagnostics = build_stage_diagnostics(
+        product_path=product_path,
+        query_plan=query_plan,
+        search_result=search_result,
+        retrieval_pressure=retrieval_pressure,
+        source_window_packaging=source_window_packaging,
+        no_evidence_report=no_evidence_report,
+        compact_handoff_requested=False,
+    )
+    if stage_diagnostics:
+        payload["stage_diagnostics"] = stage_diagnostics
+    return payload
 
 
 def build_source_windows(
