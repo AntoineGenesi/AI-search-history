@@ -159,6 +159,8 @@ def evaluate_source_tier_case(case: dict[str, Any], *, fixture_path: Path) -> di
         "retrieval_mode_observed": observed["retrieval_mode"],
         "packet_status": observed["packet_status"],
         "compact_status": observed["compact_status"],
+        "answerability_status": observed["answerability_status"],
+        "answerability_scope": observed["answerability_scope"],
         "answer_use_status": "useful" if failure_class is None else "not_useful",
         "metrics": metrics,
         "selected_source_tier_summary": observed["selected_source_tier_summary"],
@@ -196,6 +198,7 @@ def observe_source_tier_packet(packet_bundle: dict[str, Any], case: dict[str, An
     source_windows = list(compact.get("source_windows") or [])
     next_reads = list(compact.get("next_reads") or [])
     no_evidence = compact.get("no_evidence") or {}
+    evidence_sufficiency = compact.get("evidence_sufficiency") if isinstance(compact.get("evidence_sufficiency"), dict) else {}
     claim_boundaries = compact.get("claim_boundaries") or {}
     expected_targets = [str(item) for item in case.get("expected_source_targets") or []]
     source_ref_targets = normalize_targets(targets_from_source_refs(source_refs), repo_root=repo_root)
@@ -205,6 +208,8 @@ def observe_source_tier_packet(packet_bundle: dict[str, Any], case: dict[str, An
         "retrieval_mode": retrieval_diagnostics.get("retrieval_mode"),
         "packet_status": packet.get("status"),
         "compact_status": compact.get("status"),
+        "answerability_status": str(compact.get("answerability_status") or evidence_sufficiency.get("support_class") or ""),
+        "evidence_sufficiency": evidence_sufficiency,
         "expected_source_refs_present": targets_present(expected_targets, source_ref_targets),
         "expected_source_windows_present": targets_present(expected_targets, window_targets),
         "expected_next_reads_present": targets_present(expected_targets, next_read_targets),
@@ -212,6 +217,7 @@ def observe_source_tier_packet(packet_bundle: dict[str, Any], case: dict[str, An
         "deferred_source_tier_summary": deferred_source_tier_summary(source_plan),
         "next_read_deferred_retry_guidance": next_read_deferred_retry_guidance(no_evidence, source_plan),
         "no_evidence_scope": no_evidence_scope(no_evidence, claim_boundaries),
+        "answerability_scope": answerability_scope(evidence_sufficiency),
         "compact_budget_honesty": compact_budget_honesty(compact, source_plan),
         "claim_boundaries_honest": unsupported_claims_false(claim_boundaries),
     }
@@ -268,6 +274,31 @@ def no_evidence_scope(no_evidence: dict[str, Any], claim_boundaries: dict[str, A
     }
 
 
+def answerability_scope(evidence_sufficiency: dict[str, Any]) -> dict[str, Any]:
+    no_evidence_boundary = (
+        evidence_sufficiency.get("no_evidence_boundary")
+        if isinstance(evidence_sufficiency.get("no_evidence_boundary"), dict)
+        else {}
+    )
+    searched_scope_support = (
+        evidence_sufficiency.get("searched_scope_support")
+        if isinstance(evidence_sufficiency.get("searched_scope_support"), dict)
+        else {}
+    )
+    return {
+        "support_class": str(evidence_sufficiency.get("support_class") or ""),
+        "answerable_from_packet": bool(evidence_sufficiency.get("answerable_from_packet", False)),
+        "candidate_presence_implies_answerability": bool(
+            evidence_sufficiency.get("candidate_presence_implies_answerability", True)
+        ),
+        "no_evidence_needed": bool(no_evidence_boundary.get("needed", False)),
+        "no_evidence_answer_scope": no_evidence_boundary.get("answer_scope"),
+        "not_all_history_absence": bool(no_evidence_boundary.get("not_all_history_absence", False)),
+        "strong_candidate_count": int(searched_scope_support.get("strong_candidate_count") or 0),
+        "weak_or_related_candidate_count": int(searched_scope_support.get("weak_or_related_candidate_count") or 0),
+    }
+
+
 def compact_budget_honesty(compact: dict[str, Any], source_plan: dict[str, Any]) -> dict[str, Any]:
     packaging = compact.get("source_window_packaging") if isinstance(compact.get("source_window_packaging"), dict) else {}
     budget_basis = source_plan.get("budget_basis") if isinstance(source_plan.get("budget_basis"), dict) else {}
@@ -289,21 +320,42 @@ def score_metrics(observed: dict[str, Any], case: dict[str, Any]) -> dict[str, b
     retry_present = observed["next_read_deferred_retry_guidance"]["retry_guidance_present"]
     if fixture_class == "answerable_with_included_sources":
         context_usefulness = observed["expected_source_refs_present"] and observed["expected_source_windows_present"]
-        groundedness = observed["expected_source_refs_present"] and observed["claim_boundaries_honest"]
-        answer_relevance = route == "answer_from_included_sources" and observed["packet_status"] != "no_evidence"
+        groundedness = (
+            observed["answerability_status"] == "supported_in_searched_scope"
+            and observed["expected_source_refs_present"]
+            and observed["claim_boundaries_honest"]
+        )
+        answer_relevance = (
+            route == "answer_from_included_sources"
+            and observed["answerability_status"] == "supported_in_searched_scope"
+        )
         scoped_no_evidence = True
         next_read_quality = observed["expected_next_reads_present"]
     elif fixture_class == "answerable_only_if_deferred_source_read":
         context_usefulness = deferred_count > 0 and retry_present
-        groundedness = not observed["expected_source_refs_present"] and observed["claim_boundaries_honest"]
-        answer_relevance = route == "deferred_source_retry"
+        groundedness = (
+            observed["answerability_status"] == "deferred_source_needed"
+            and observed["claim_boundaries_honest"]
+            and observed["answerability_scope"]["candidate_presence_implies_answerability"] is False
+        )
+        answer_relevance = route == "deferred_source_retry" and observed["answerability_status"] == "deferred_source_needed"
         scoped_no_evidence = True
         next_read_quality = observed["deferred_source_tier_summary"]["retry_needed"] and retry_present
     else:
-        context_usefulness = observed["packet_status"] == "no_evidence"
+        context_usefulness = observed["answerability_status"] in {
+            "searched_scope_no_evidence",
+            "insufficient_grounding",
+        }
         groundedness = observed["claim_boundaries_honest"]
-        answer_relevance = route == "scoped_no_evidence"
-        scoped_no_evidence = observed["no_evidence_scope"]["scope_limited"]
+        answer_relevance = route == "scoped_no_evidence" and observed["answerability_status"] in {
+            "searched_scope_no_evidence",
+            "insufficient_grounding",
+        }
+        scoped_no_evidence = (
+            observed["answerability_scope"]["support_class"] == "searched_scope_no_evidence"
+            and observed["answerability_scope"]["no_evidence_needed"]
+            and observed["answerability_scope"]["not_all_history_absence"]
+        )
         next_read_quality = retry_present if deferred_count > 0 else True
     budget = observed["compact_budget_honesty"]
     selected = observed["selected_source_tier_summary"]
@@ -435,8 +487,8 @@ def render_source_tier_answer_use_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Rows",
             "",
-            "| Case | Fixture Class | Surface | Status | Failure Class | Selected/Deferred | Next Read | No-Evidence Scope | Budget | Decision Signal |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Case | Fixture Class | Surface | Status | Answerability | Failure Class | Selected/Deferred | Next Read | No-Evidence Scope | Budget | Decision Signal |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in report["rows"]:
@@ -444,6 +496,7 @@ def render_source_tier_answer_use_markdown(payload: dict[str, Any]) -> str:
         deferred = row.get("deferred_source_tier_summary", {})
         next_read = row.get("next_read_deferred_retry_guidance", {})
         no_evidence = row.get("no_evidence_scope", {})
+        answerability = row.get("answerability_scope", {})
         budget = row.get("compact_budget_honesty", {})
         lines.append(
             "| "
@@ -453,13 +506,14 @@ def render_source_tier_answer_use_markdown(payload: dict[str, Any]) -> str:
                     markdown_cell(row["fixture_class"]),
                     markdown_cell(row["command_surface"]),
                     markdown_cell(row["answer_use_status"]),
+                    markdown_cell(row.get("answerability_status") or "missing"),
                     markdown_cell(row["failure_class"] or "none"),
                     markdown_cell(f"{selected.get('sources_selected', 0)}/{deferred.get('sources_deferred_budget', 0)}"),
                     markdown_cell(
                         f"needed={next_read.get('retry_needed', False)}, deferred={next_read.get('deferred_source_count', 0)}"
                     ),
                     markdown_cell(
-                        f"present={no_evidence.get('present', False)}, scoped={no_evidence.get('scope_limited', False)}"
+                        f"present={no_evidence.get('present', False)}, scoped={no_evidence.get('scope_limited', False)}, answerability_no_evidence={answerability.get('no_evidence_needed', False)}"
                     ),
                     markdown_cell(
                         f"windows={budget.get('source_window_count', 0)}, honest={row.get('metrics', {}).get('budget_honesty', False)}"

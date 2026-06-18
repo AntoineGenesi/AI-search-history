@@ -15,6 +15,10 @@ SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT = 5
 COMPACT_PROVENANCE_CANDIDATE_LIMIT = 8
 COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
 COMPACT_PROVENANCE_NEXT_READ_LIMIT = 8
+ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE = "supported_in_searched_scope"
+ANSWERABILITY_DEFERRED_SOURCE_NEEDED = "deferred_source_needed"
+ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE = "searched_scope_no_evidence"
+ANSWERABILITY_INSUFFICIENT_GROUNDING = "insufficient_grounding"
 
 
 @dataclass(frozen=True)
@@ -216,6 +220,12 @@ def build_compact_provenance_handoff(
     source_refs = source_ref_candidates[:COMPACT_PROVENANCE_SOURCE_REF_LIMIT]
     source_windows = list(source_locator_handoff.get("source_windows") or [])[:SOURCE_WINDOW_LIMIT]
     compact_next_reads = list(next_reads or [])[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]
+    answerability = build_compact_answerability(
+        status=status,
+        candidates=compact_candidates,
+        source_locator_handoff=source_locator_handoff,
+        no_evidence=no_evidence,
+    )
     output_budget = build_compact_handoff_output_budget(
         candidate_count=len(candidates),
         candidates_included=len(compact_candidates),
@@ -236,6 +246,8 @@ def build_compact_provenance_handoff(
             "no_evidence",
         ],
         "candidate_count": len(candidates),
+        "answerability_status": answerability["support_class"],
+        "evidence_sufficiency": answerability,
         "candidates": compact_candidates,
         "source_refs": source_refs,
         "source_windows": source_windows,
@@ -985,6 +997,149 @@ def compact_provenance_no_evidence(no_evidence: dict[str, Any], source_locator_h
         "not_searched_scope": no_evidence.get("not_searched_scope") or source_locator_handoff.get("not_searched_scope"),
         "why_not_confident": no_evidence.get("why_not_confident"),
     }
+
+
+def build_compact_answerability(
+    *,
+    status: str,
+    candidates: list[dict[str, Any]],
+    source_locator_handoff: dict[str, Any],
+    no_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Classify answer support separately from retrieval candidate presence."""
+    source_plan = compact_answerability_source_plan(source_locator_handoff)
+    retry_guidance = source_plan.get("retry_guidance") if isinstance(source_plan.get("retry_guidance"), dict) else {}
+    source_tiers = source_plan.get("source_tiers") if isinstance(source_plan.get("source_tiers"), dict) else {}
+    selected_counts = source_tiers.get("selected_counts") if isinstance(source_tiers.get("selected_counts"), dict) else {}
+    deferred_count = int(source_plan.get("sources_deferred_budget") or 0)
+    hard_required_selected = int(selected_counts.get("hard_required") or 0)
+    source_plan_present = bool(source_plan.get("source") or source_plan.get("basis") or source_plan.get("source_tiers"))
+    coverage_rows = [candidate_coverage(candidate) for candidate in candidates]
+    strongest_coverage = max(coverage_rows, key=lambda item: item["ratio"], default={"matched": 0, "total": 0, "ratio": 0.0})
+    strong_candidates = [
+        candidate
+        for candidate, coverage in zip(candidates, coverage_rows)
+        if candidate_is_strong_answerability_signal(candidate, coverage)
+    ]
+    weak_candidate_count = max(0, len(candidates) - len(strong_candidates))
+
+    if candidates and not source_plan_present:
+        support_class = ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE
+        answerable = True
+        grounding_state = "candidate_support_without_source_tier_plan"
+        reasons = ["source_tier_answerability_gate_not_applicable"]
+    elif status == "no_evidence" or not candidates:
+        support_class = ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE
+        answerable = False
+        grounding_state = "no_candidate_support_in_searched_scope"
+        reasons = ["no_candidate_rows_survived_searched_scope"]
+    elif not strong_candidates:
+        support_class = ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE
+        answerable = False
+        grounding_state = "weak_or_broad_candidates_only"
+        reasons = ["candidate_presence_is_diagnostic_only", "distinctive_anchor_coverage_insufficient"]
+    elif deferred_count > 0 and hard_required_selected == 0:
+        support_class = ANSWERABILITY_DEFERRED_SOURCE_NEEDED
+        answerable = False
+        grounding_state = "searched_scope_support_non_exhaustive_due_to_deferred_sources"
+        reasons = ["source_plan_deferred_sources_remain", "no_hard_required_source_selected"]
+    elif strong_candidates:
+        support_class = ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE
+        answerable = True
+        grounding_state = "strong_candidate_support_in_selected_sources"
+        reasons = ["strong_candidate_coverage_in_searched_scope"]
+    else:
+        support_class = ANSWERABILITY_INSUFFICIENT_GROUNDING
+        answerable = False
+        grounding_state = "support_could_not_be_established"
+        reasons = ["candidate_presence_does_not_establish_answerability"]
+
+    return {
+        "schema_version": 1,
+        "support_class": support_class,
+        "answerability_status": support_class,
+        "answerable_from_packet": answerable,
+        "grounding_state": grounding_state,
+        "candidate_presence_implies_answerability": False,
+        "searched_scope_support": {
+            "candidate_count": len(candidates),
+            "strong_candidate_count": len(strong_candidates),
+            "weak_or_related_candidate_count": weak_candidate_count,
+            "strongest_candidate_coverage": {
+                "matched_terms": int(strongest_coverage.get("matched") or 0),
+                "total_terms": int(strongest_coverage.get("total") or 0),
+                "ratio": round(float(strongest_coverage.get("ratio") or 0.0), 3),
+            },
+            "diagnostic_candidates_preserved": bool(candidates),
+        },
+        "source_tier_boundary": {
+            "sources_selected": int(source_plan.get("sources_selected") or 0),
+            "sources_deferred_budget": deferred_count,
+            "retry_guidance_needed": bool(retry_guidance.get("needed", False)),
+            "exhaustive_available": bool(source_plan.get("exhaustive_available", False)),
+            "hard_required_selected": hard_required_selected,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "no_evidence_boundary": {
+            "needed": support_class == ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE,
+            "answer_scope": (
+                "not_found_in_searched_scope"
+                if support_class == ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE
+                else no_evidence.get("answer_scope")
+            ),
+            "not_all_history_absence": True,
+            "deferred_source_count": deferred_count,
+        },
+        "related_candidate_policy": {
+            "weak_candidates_remain_as_diagnostics": weak_candidate_count > 0,
+            "source_refs_and_windows_preserved": True,
+            "do_not_promote_weak_candidates_to_answer": True,
+        },
+        "reasons": reasons,
+        "claim_boundaries": {
+            "retrieval_quality_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "all_history_completeness_claim_supported": False,
+        },
+    }
+
+
+def compact_answerability_source_plan(source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
+    stage_plan = source_locator_handoff.get("stage_diagnostics", {}).get("source_plan")
+    if isinstance(stage_plan, dict) and stage_plan:
+        return stage_plan
+    not_searched_plan = source_locator_handoff.get("not_searched_scope", {}).get("source_plan")
+    if isinstance(not_searched_plan, dict):
+        return not_searched_plan
+    return {}
+
+
+def candidate_coverage(candidate: dict[str, Any]) -> dict[str, Any]:
+    for code in candidate.get("reason_codes") or []:
+        if not isinstance(code, str) or not code.startswith("coverage:base_terms:"):
+            continue
+        _, _, fraction = code.partition("coverage:base_terms:")
+        matched_text, _, total_text = fraction.partition("/")
+        try:
+            matched = int(matched_text)
+            total = int(total_text)
+        except ValueError:
+            continue
+        ratio = (matched / total) if total > 0 else 0.0
+        return {"matched": matched, "total": total, "ratio": ratio}
+    return {"matched": 0, "total": 0, "ratio": 0.0}
+
+
+def candidate_is_strong_answerability_signal(candidate: dict[str, Any], coverage: dict[str, Any]) -> bool:
+    if "base_term_full_coverage" == candidate.get("stage"):
+        return True
+    matched = int(coverage.get("matched") or 0)
+    total = int(coverage.get("total") or 0)
+    ratio = float(coverage.get("ratio") or 0.0)
+    if total <= 0:
+        return candidate.get("confidence") == "high"
+    return matched >= 3 and ratio >= 0.5
 
 
 def dedupe_provenance_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
