@@ -77,6 +77,7 @@ def build_semantic_debug_payload(
     result["warnings"] = sorted(
         set(result.get("warnings", []) + intent.warnings + (configuration_warnings or []))
     )
+    requested_evidence_context_window = max(0, int(getattr(args, "evidence_context_window", 0) or 0))
     agent_payload = build_agent_find_payload(
         source_plan=source_plan,
         search_result=result,
@@ -84,7 +85,7 @@ def build_semantic_debug_payload(
         output_format=getattr(args, "format", "json"),
         report_output=getattr(args, "report_output", None),
         compact_provenance_handoff=False,
-        evidence_context_window=getattr(args, "evidence_context_window", 0),
+        evidence_context_window=0,
     )
     agent_find = agent_payload["agent_find"]
 
@@ -139,7 +140,7 @@ def build_semantic_debug_payload(
         retrieval_pressure=agent_find.get("retrieval_pressure"),
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
-        evidence_context_window=getattr(args, "evidence_context_window", 0),
+        evidence_context_window=requested_evidence_context_window,
     )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(

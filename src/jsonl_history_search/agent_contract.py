@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
@@ -626,6 +627,42 @@ def build_stage_diagnostics(
                 "evidence_packet_materialized_context_omitted_or_truncated_count": int(
                     evidence_packet_summary.get("materialized_context_omitted_or_truncated_count") or 0
                 ),
+                "context_records_served_from_segment_cache": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "context_records_served_from_segment_cache"
+                    )
+                    or 0
+                ),
+                "context_records_served_from_in_memory_rows": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "context_records_served_from_in_memory_rows"
+                    )
+                    or 0
+                ),
+                "context_source_files_opened": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "context_source_files_opened"
+                    )
+                    or 0
+                ),
+                "context_bytes_read_for_fallback": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "context_bytes_read_for_fallback"
+                    )
+                    or 0
+                ),
+                "context_fallback_reparses": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "fallback_reparses"
+                    )
+                    or 0
+                ),
+                "context_stale_or_invalidated_fallback_count": int(
+                    (evidence_packet_summary.get("materialized_context_source_counters") or {}).get(
+                        "stale_or_invalidated_fallback_count"
+                    )
+                    or 0
+                ),
                 "evidence_packet_text_included": bool(evidence_packet_summary.get("raw_text_included", False)),
             },
         ),
@@ -878,6 +915,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     fielded_evidence_channels = diagnostics.get("fielded_evidence_channels") or fielded_bm25.get("evidence_channels") or {}
     fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
+    fielded_context_source = fielded_bm25.get("context_source_counters") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
     claim_boundaries = diagnostics.get("claim_boundaries") or {}
 
@@ -931,6 +969,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "query_streams": sanitize_query_stream_pressure(fielded_bm25.get("query_streams")),
             "evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
             "context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
+            "context_source_counters": sanitize_context_source_counters(fielded_context_source),
             "materialization": fielded_bm25.get("materialization") or {},
             "index_summary": fielded_bm25.get("index_summary") or {},
             "raw_paths_included": False,
@@ -2356,6 +2395,7 @@ def build_evidence_packet_package(
     materialized_context_omitted = 0
     materialized_context_truncated = 0
     materialized_context_read_error_count = 0
+    context_source_counters = new_context_source_counters()
 
     for packet_index, group in enumerate(ordered_groups[:EVIDENCE_PACKET_LIMIT], 1):
         children = sorted(
@@ -2374,8 +2414,10 @@ def build_evidence_packet_package(
         materialized_context = materialize_evidence_packet_context(
             hit_children=hit_children,
             source_plan=source_plan or {},
+            search_result=search_result,
             evidence_context_window=evidence_context_window,
             total_chars_remaining=materialized_total_chars_remaining,
+            context_source_counters=context_source_counters,
         )
         materialized_total_chars_remaining = int(materialized_context.pop("_total_chars_remaining"))
         materialized_counts = materialized_context.get("counts") or {}
@@ -2474,6 +2516,7 @@ def build_evidence_packet_package(
         "materialized_context_omitted_or_truncated_count": materialized_context_omitted,
         "materialized_context_truncated_text_record_count": materialized_context_truncated,
         "materialized_context_read_error_count": materialized_context_read_error_count,
+        "materialized_context_source_counters": sanitize_context_source_counters(context_source_counters),
         "materialized_context_total_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT,
         "materialized_context_packet_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
         "materialized_context_record_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_RECORD_CHAR_LIMIT,
@@ -2499,8 +2542,10 @@ def materialize_evidence_packet_context(
     *,
     hit_children: list[dict[str, Any]],
     source_plan: dict[str, Any],
+    search_result: dict[str, Any] | None = None,
     evidence_context_window: int,
     total_chars_remaining: int,
+    context_source_counters: dict[str, int | bool] | None = None,
 ) -> dict[str, Any]:
     evidence_context_window = max(0, int(evidence_context_window or 0))
     base = {
@@ -2553,23 +2598,49 @@ def materialize_evidence_packet_context(
             "status": "source_not_found_or_out_of_scope",
             "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
         }
-    try:
-        records = list(iter_records_for_file(source_path, evidence_context_source_kind(source_path, source_plan), timezone.utc))
-    except (AdapterReadError, OSError) as exc:
-        requested_count = len(
-            {
-                line
-                for child_line in child_lines
-                for line in range(child_line - evidence_context_window, child_line + evidence_context_window + 1)
-                if line >= 1
+    records, source_status = evidence_context_records_from_fielded_cache(
+        source_path,
+        search_result=search_result or {},
+        context_source_counters=context_source_counters,
+    )
+    if records is None:
+        if context_source_counters is not None:
+            context_source_counters["context_source_files_opened"] = (
+                int(context_source_counters["context_source_files_opened"]) + 1
+            )
+            context_source_counters["fallback_reparses"] = int(context_source_counters["fallback_reparses"]) + 1
+            try:
+                context_source_counters["context_bytes_read_for_fallback"] = (
+                    int(context_source_counters["context_bytes_read_for_fallback"]) + int(source_path.stat().st_size)
+                )
+            except OSError:
+                pass
+        try:
+            records = list(iter_records_for_file(source_path, evidence_context_source_kind(source_path, source_plan), timezone.utc))
+        except (AdapterReadError, OSError) as exc:
+            if context_source_counters is not None:
+                context_source_counters["fallback_reparse_failures"] = (
+                    int(context_source_counters["fallback_reparse_failures"]) + 1
+                )
+                context_source_counters["stale_or_invalidated_fallback_count"] = (
+                    int(context_source_counters["stale_or_invalidated_fallback_count"]) + 1
+                    if source_status in {"missing_source_rows", "empty_source_rows"}
+                    else int(context_source_counters["stale_or_invalidated_fallback_count"])
+                )
+            requested_count = len(
+                {
+                    line
+                    for child_line in child_lines
+                    for line in range(child_line - evidence_context_window, child_line + evidence_context_window + 1)
+                    if line >= 1
+                }
+            )
+            return {
+                **base,
+                "status": "read_error",
+                "error": str(exc),
+                "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
             }
-        )
-        return {
-            **base,
-            "status": "read_error",
-            "error": str(exc),
-            "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
-        }
 
     total_records = len(records)
     requested_lines = sorted(
@@ -2615,6 +2686,10 @@ def materialize_evidence_packet_context(
     included_chars = sum(len(str(record.get("text") or "")) for record in materialized_records)
     next_total_remaining = max(0, int(total_chars_remaining or 0) - included_chars)
     omitted_or_truncated = omitted_by_record_limit + omitted_by_char_limit + truncated_text_record_count
+    if context_source_counters is not None:
+        context_source_counters["omitted_or_truncated_context_records"] = (
+            int(context_source_counters["omitted_or_truncated_context_records"]) + omitted_or_truncated
+        )
     return {
         **base,
         "status": "materialized" if materialized_records else "no_records_materialized",
@@ -2676,6 +2751,128 @@ def materialized_context_counts(
         "omitted_or_truncated_count": omitted_or_truncated_count,
         "included_char_count": included_char_count,
     }
+
+
+def new_context_source_counters() -> dict[str, int | bool]:
+    return {
+        "context_records_served_from_segment_cache": 0,
+        "context_records_served_from_in_memory_rows": 0,
+        "context_source_files_opened": 0,
+        "context_bytes_read_for_fallback": 0,
+        "fallback_reparses": 0,
+        "fallback_reparse_failures": 0,
+        "omitted_or_truncated_context_records": 0,
+        "stale_or_invalidated_fallback_count": 0,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def sanitize_context_source_counters(counters: dict[str, Any] | None) -> dict[str, int | bool]:
+    counters = counters if isinstance(counters, dict) else {}
+    return {
+        "context_records_served_from_segment_cache": int(
+            counters.get("context_records_served_from_segment_cache") or 0
+        ),
+        "context_records_served_from_in_memory_rows": int(
+            counters.get("context_records_served_from_in_memory_rows") or 0
+        ),
+        "context_source_files_opened": int(counters.get("context_source_files_opened") or 0),
+        "context_bytes_read_for_fallback": int(counters.get("context_bytes_read_for_fallback") or 0),
+        "fallback_reparses": int(counters.get("fallback_reparses") or 0),
+        "fallback_reparse_failures": int(counters.get("fallback_reparse_failures") or 0),
+        "omitted_or_truncated_context_records": int(counters.get("omitted_or_truncated_context_records") or 0),
+        "stale_or_invalidated_fallback_count": int(counters.get("stale_or_invalidated_fallback_count") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def evidence_context_records_from_fielded_cache(
+    source_path: Path,
+    *,
+    search_result: dict[str, Any],
+    context_source_counters: dict[str, int | bool] | None,
+) -> tuple[list[Any] | None, str]:
+    context_index = search_result.get("_fielded_context_index") if isinstance(search_result, dict) else None
+    if not isinstance(context_index, dict):
+        return None, "no_context_index"
+    records_by_source = context_index.get("records_by_source")
+    if not isinstance(records_by_source, dict):
+        return None, "invalid_context_index"
+    rows = records_by_source.get(str(source_path))
+    if rows is None:
+        rows = records_by_source.get(str(source_path.expanduser()))
+    if not isinstance(rows, list):
+        return None, "missing_source_rows"
+    if not rows:
+        return None, "empty_source_rows"
+    records: list[Any] = []
+    source_kind = ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_kind = str(row.get("source_kind") or source_kind)
+        record_payload = row.get("record") if isinstance(row.get("record"), dict) else None
+        if record_payload:
+            record = evidence_context_record_from_cached_payload(record_payload, source_path=source_path)
+            records.append(record)
+            continue
+        raw_materialization_text = row.get("raw_materialization_text")
+        raw_text = raw_materialization_text if raw_materialization_text is not None else row.get("raw_text")
+        if raw_text is None:
+            continue
+        first_line = int(row.get("line") or 1)
+        for offset, raw_line in enumerate(str(raw_text).splitlines() or [str(raw_text)]):
+            record = evidence_context_record_from_raw_line(
+                raw_line,
+                source_path=source_path,
+                line=first_line + offset,
+                source_kind=source_kind,
+            )
+            records.append(record)
+    records.sort(key=lambda record: int(getattr(record, "line", 0) or 0))
+    if context_source_counters is not None:
+        counter_name = (
+            "context_records_served_from_segment_cache"
+            if bool(context_index.get("warm_query_reused_index", False))
+            else "context_records_served_from_in_memory_rows"
+        )
+        context_source_counters[counter_name] = int(context_source_counters[counter_name]) + len(records)
+    return records, "cache_rows"
+
+
+def evidence_context_record_from_cached_payload(payload: dict[str, Any], *, source_path: Path) -> Any:
+    timestamp = None
+    raw_timestamp = payload.get("timestamp")
+    if isinstance(raw_timestamp, str) and raw_timestamp:
+        try:
+            timestamp = datetime.fromisoformat(raw_timestamp)
+        except ValueError:
+            timestamp = None
+    return SimpleNamespace(
+        path=str(source_path),
+        line=int(payload.get("line") or 1),
+        role=str(payload.get("role") or ""),
+        text=str(payload.get("text") or ""),
+        timestamp=timestamp,
+        cwd=str(payload.get("cwd")) if payload.get("cwd") else None,
+        raw_timestamp=str(payload.get("raw_timestamp")) if payload.get("raw_timestamp") else None,
+    )
+
+
+def evidence_context_record_from_raw_line(
+    raw_line: str,
+    *,
+    source_path: Path,
+    line: int,
+    source_kind: str,
+) -> Any:
+    from .records import parse_record
+
+    record = parse_record(raw_line, path=source_path, line=line, default_tz=timezone.utc)
+    record.source_format = source_kind
+    return record
 
 
 def materialized_context_record(record: Any, *, hit_child: bool, char_limit: int) -> dict[str, Any]:
