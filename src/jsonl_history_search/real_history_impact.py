@@ -16,6 +16,7 @@ from .metric_contract import add_metric_contract, real_history_impact_metrics
 from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
 from .retrieval_modes import build_fielded_bm25_retrieval_diagnostics, run_rrf_fusion_retrieval
+from .retrieve_expand_answer_use import ALLOWED_BOTTLENECK_LABELS
 from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT
 from .scanner import search
 from .sources import (
@@ -245,11 +246,20 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
             evaluated_case_count=len(selected_cases),
             requested_case_limit=int(getattr(args, "case_limit", 0) or 0),
         )
+        base_report["large_history_stage_attribution_pressure"] = (
+            _large_history_stage_attribution_pressure_summary(
+                base_report["source_tier_answerability_pressure"],
+                base_report=base_report,
+            )
+        )
         base_report["source_tier_answerability_pressure_decision"] = (
             _source_tier_answerability_pressure_decision(base_report["source_tier_answerability_pressure"])
         )
         base_report["aggregate"]["source_tier_answerability_pressure"] = base_report[
             "source_tier_answerability_pressure"
+        ]
+        base_report["aggregate"]["large_history_stage_attribution_pressure"] = base_report[
+            "large_history_stage_attribution_pressure"
         ]
     structural_diagnostic = _structural_sidecar_diagnostic(rows)
     if structural_diagnostic is not None:
@@ -4052,6 +4062,322 @@ def _source_tier_answerability_pressure_decision(summary: dict[str, Any]) -> dic
         "final_answer_quality_claim_supported": False,
         "product_value_claim_supported": False,
         "default_promotion_supported": False,
+    }
+
+
+def _large_history_stage_attribution_pressure_summary(
+    source_summary: dict[str, Any],
+    *,
+    base_report: dict[str, Any],
+) -> dict[str, Any]:
+    if source_summary.get("status") != "evaluated":
+        no_decision_reason = "source_tier_answerability_pressure_not_evaluated"
+        return {
+            "status": "not_evaluated",
+            "basis": "requires_source_tier_answerability_pressure",
+            "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+            "selected_next_bottleneck": "no_decision",
+            "stage_bottleneck_summary": _large_history_stage_bottleneck_summary({}, {}, no_decision_reason),
+            "selected_next_tool_delta": _large_history_tool_delta("no_decision", no_decision_reason),
+            "no_decision_reason": no_decision_reason,
+            "latency_indexing_boundary": _large_history_latency_indexing_boundary(source_summary, base_report),
+            "privacy": _large_history_stage_attribution_privacy(),
+            "claim_boundaries": _large_history_stage_attribution_claim_boundaries(),
+        }
+
+    stage_scores = _large_history_stage_scores(source_summary, base_report)
+    selected = _select_large_history_bottleneck(stage_scores)
+    latency_boundary = _large_history_latency_indexing_boundary(source_summary, base_report)
+    if selected == "indexing_latency" and not latency_boundary["indexing_latency_selection_supported"]:
+        stage_scores["indexing_latency"] = 0
+        selected = _select_large_history_bottleneck(stage_scores)
+    no_decision_reason = _large_history_no_decision_reason(source_summary, stage_scores, latency_boundary)
+    return {
+        "status": "evaluated",
+        "basis": "aggregate_safe_source_tier_answerability_pressure_stage_mapping",
+        "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+        "selected_next_bottleneck": selected,
+        "stage_bottleneck_summary": _large_history_stage_bottleneck_summary(
+            stage_scores,
+            _large_history_stage_signal_counts(source_summary, base_report),
+            no_decision_reason,
+        ),
+        "selected_next_tool_delta": _large_history_tool_delta(selected, no_decision_reason),
+        **({"no_decision_reason": no_decision_reason} if selected == "no_decision" else {}),
+        "latency_indexing_boundary": latency_boundary,
+        "privacy": _large_history_stage_attribution_privacy(),
+        "claim_boundaries": _large_history_stage_attribution_claim_boundaries(),
+    }
+
+
+def _large_history_stage_scores(source_summary: dict[str, Any], base_report: dict[str, Any]) -> dict[str, int]:
+    signals = _large_history_stage_signal_counts(source_summary, base_report)
+    scores = {label: 0 for label in ALLOWED_BOTTLENECK_LABELS}
+    scores["source_window_choice"] = (
+        signals["deferred_source_needed_rows"]
+        + signals["source_plan_deferred_rows"]
+        + signals["source_plan_retry_guidance_rows"]
+        + signals["source_grouping_selection_changed_rows"]
+        + signals["candidate_window_omitted_total"]
+        + signals["rows_dropped_by_source_cap_total"]
+        + signals["source_window_stage_pressure_rows"]
+    )
+    within_source_depth = signals["next_read_recoverable_rows"] - signals["source_grouping_selection_changed_rows"]
+    scores["within_source_depth"] = max(0, within_source_depth) + signals["next_read_omission_total"]
+    scores["query_planning"] = signals["query_plan_hint_rows"]
+    scores["output_behavior"] = (
+        signals["candidate_presence_implies_answerability_rows"]
+        + signals["compact_output_omission_total"]
+        + signals["compact_output_stage_pressure_rows"]
+    )
+    if _large_history_latency_indexing_boundary(
+        source_summary,
+        base_report,
+    )["indexing_latency_selection_supported"]:
+        scores["indexing_latency"] = signals["cap_hit_rows"] + signals["fielded_bm25_slow_phase_count"]
+    return scores
+
+
+def _large_history_stage_signal_counts(source_summary: dict[str, Any], base_report: dict[str, Any]) -> dict[str, int]:
+    answerability = source_summary.get("answerability_status_counts") or {}
+    source_plan = source_summary.get("source_plan") or {}
+    recovery = source_summary.get("next_read_recovery") or {}
+    compact_budget = source_summary.get("compact_context_budget") or {}
+    stage_bottlenecks = source_summary.get("stage_bottlenecks") or {}
+    stage_status = stage_bottlenecks.get("stage_status_counts") or {}
+    stage_hints = stage_bottlenecks.get("stage_next_fix_hint_counts") or {}
+    output_totals = compact_budget.get("output_count_totals") or {}
+    cap_hit = source_summary.get("cap_hit") or {}
+    fielded_phase_profiles = (
+        (base_report.get("aggregate") or {}).get("fielded_bm25", {}).get("phase_profiles") or {}
+    )
+    return {
+        "deferred_source_needed_rows": int(answerability.get("deferred_source_needed") or 0),
+        "searched_scope_no_evidence_rows": int(answerability.get("searched_scope_no_evidence") or 0),
+        "supported_in_searched_scope_rows": int(answerability.get("supported_in_searched_scope") or 0),
+        "source_plan_deferred_rows": int(source_plan.get("deferred_rows") or 0),
+        "source_plan_retry_guidance_rows": int(source_plan.get("retry_guidance_rows") or 0),
+        "source_grouping_selection_changed_rows": int(
+            recovery.get("source_grouping_selection_changed_rows") or 0
+        ),
+        "next_read_recoverable_rows": int(recovery.get("recoverable_rows") or 0),
+        "candidate_window_omitted_total": int(recovery.get("candidate_window_omitted_total") or 0),
+        "rows_dropped_by_source_cap_total": int(recovery.get("rows_dropped_by_source_cap_total") or 0),
+        "next_read_omission_total": int(output_totals.get("next_reads_omitted") or 0),
+        "compact_output_omission_total": sum(
+            int(output_totals.get(key) or 0)
+            for key in ("candidates_omitted", "source_refs_omitted", "source_windows_omitted")
+        ),
+        "candidate_presence_implies_answerability_rows": int(
+            source_summary.get("candidate_presence_implies_answerability_rows") or 0
+        ),
+        "source_window_stage_pressure_rows": _large_history_stage_status_signal(
+            stage_status,
+            stage_names={"source_window_packaging"},
+            pressure_statuses={"empty", "capped", "omitted", "not_packaged"},
+        ),
+        "compact_output_stage_pressure_rows": _large_history_stage_status_signal(
+            stage_status,
+            stage_names={"compact_handoff_output"},
+            pressure_statuses={"empty", "capped", "omitted", "not_requested"},
+        ),
+        "query_plan_hint_rows": _large_history_stage_hint_signal(
+            stage_hints,
+            needles=("query", "intent", "plan"),
+        ),
+        "cap_hit_rows": int(cap_hit.get("rows") or 0),
+        "fielded_bm25_slow_phase_count": _large_history_slow_fielded_phase_count(fielded_phase_profiles),
+    }
+
+
+def _large_history_stage_status_signal(
+    stage_status: dict[str, Any],
+    *,
+    stage_names: set[str],
+    pressure_statuses: set[str],
+) -> int:
+    total = 0
+    for stage_name in stage_names:
+        statuses = stage_status.get(stage_name) if isinstance(stage_status.get(stage_name), dict) else {}
+        for status, count in statuses.items():
+            if str(status) in pressure_statuses:
+                total += int(count or 0)
+    return total
+
+
+def _large_history_stage_hint_signal(stage_hints: dict[str, Any], *, needles: tuple[str, ...]) -> int:
+    total = 0
+    for hints in stage_hints.values():
+        if not isinstance(hints, dict):
+            continue
+        for hint, count in hints.items():
+            hint_text = str(hint)
+            if any(needle in hint_text for needle in needles):
+                total += int(count or 0)
+    return total
+
+
+def _large_history_slow_fielded_phase_count(phase_profiles: dict[str, Any]) -> int:
+    total = 0
+    for profile in phase_profiles.values():
+        if not isinstance(profile, dict) or profile.get("status") != "evaluated":
+            continue
+        if float(profile.get("median_elapsed_ms") or 0.0) >= 1000.0:
+            total += int(profile.get("runs") or 1)
+    return total
+
+
+def _select_large_history_bottleneck(stage_scores: dict[str, int]) -> str:
+    non_decision = {
+        label: int(stage_scores.get(label) or 0)
+        for label in ALLOWED_BOTTLENECK_LABELS
+        if label != "no_decision"
+    }
+    if not any(count > 0 for count in non_decision.values()):
+        return "no_decision"
+    highest = max(non_decision.values())
+    for label in ALLOWED_BOTTLENECK_LABELS:
+        if label != "no_decision" and non_decision.get(label) == highest:
+            return label
+    return "no_decision"
+
+
+def _large_history_latency_indexing_boundary(
+    source_summary: dict[str, Any],
+    base_report: dict[str, Any],
+) -> dict[str, Any]:
+    source_catalog = source_summary.get("source_catalog") if isinstance(source_summary.get("source_catalog"), dict) else {}
+    signals = _large_history_stage_signal_counts_without_latency(source_summary, base_report)
+    cap_hit_rows = signals["cap_hit_rows"]
+    supported_or_deferred = (
+        signals["supported_in_searched_scope_rows"] + signals["deferred_source_needed_rows"]
+    )
+    cases = int(source_summary.get("cases") or 0)
+    fielded_phase_profiles = (
+        (base_report.get("aggregate") or {}).get("fielded_bm25", {}).get("phase_profiles") or {}
+    )
+    slow_phase_count = _large_history_slow_fielded_phase_count(fielded_phase_profiles)
+    persistent_index_used = bool(source_catalog.get("persistent_index_or_cache_used"))
+    retrieval_usefulness_acceptable = cases > 0 and supported_or_deferred >= cases
+    cap_or_latency_prevents_stage_reach = bool(
+        (signals["searched_scope_no_evidence_rows"] > 0 and cap_hit_rows > 0) or slow_phase_count > 0
+    )
+    return {
+        "selection_rule": (
+            "select_indexing_latency_only_when_p95_p99_or_cap_exits_prevent_evidence_quality_stage_reach_or_"
+            "materialization_dominates_runtime_while_retrieval_usefulness_is_acceptable"
+        ),
+        "cap_hit_rows": cap_hit_rows,
+        "supported_or_deferred_rows": supported_or_deferred,
+        "case_count": cases,
+        "retrieval_usefulness_acceptable": retrieval_usefulness_acceptable,
+        "cap_or_latency_prevents_stage_reach": cap_or_latency_prevents_stage_reach,
+        "fielded_bm25_slow_phase_count": slow_phase_count,
+        "persistent_index_or_cache_used": persistent_index_used,
+        "indexing_latency_selection_supported": bool(
+            retrieval_usefulness_acceptable and cap_or_latency_prevents_stage_reach
+        ),
+        "indexing_necessity_claim_supported": False,
+    }
+
+
+def _large_history_stage_signal_counts_without_latency(
+    source_summary: dict[str, Any],
+    base_report: dict[str, Any],
+) -> dict[str, int]:
+    answerability = source_summary.get("answerability_status_counts") or {}
+    cap_hit = source_summary.get("cap_hit") or {}
+    return {
+        "cap_hit_rows": int(cap_hit.get("rows") or 0),
+        "searched_scope_no_evidence_rows": int(answerability.get("searched_scope_no_evidence") or 0),
+        "supported_in_searched_scope_rows": int(answerability.get("supported_in_searched_scope") or 0),
+        "deferred_source_needed_rows": int(answerability.get("deferred_source_needed") or 0),
+    }
+
+
+def _large_history_stage_bottleneck_summary(
+    stage_scores: dict[str, int],
+    signal_counts: dict[str, int],
+    no_decision_reason: str | None,
+) -> dict[str, Any]:
+    counts = {label: int(stage_scores.get(label) or 0) for label in ALLOWED_BOTTLENECK_LABELS}
+    if no_decision_reason and not any(counts[label] for label in counts if label != "no_decision"):
+        counts["no_decision"] = 1
+    return {
+        "bottleneck_stage_counts": {key: value for key, value in counts.items() if value > 0},
+        "signal_counts": dict(sorted(signal_counts.items())),
+        "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+        "selection_basis": (
+            "aggregate_safe_source_tier_signals_mapped_to_jsh_849_labels_then_"
+            "dominant_non_no_decision_by_count_and_allowed_order"
+        ),
+        **({"no_decision_reason": no_decision_reason} if no_decision_reason else {}),
+    }
+
+
+def _large_history_no_decision_reason(
+    source_summary: dict[str, Any],
+    stage_scores: dict[str, int],
+    latency_boundary: dict[str, Any],
+) -> str | None:
+    if any(int(stage_scores.get(label) or 0) > 0 for label in ALLOWED_BOTTLENECK_LABELS if label != "no_decision"):
+        return None
+    if not source_summary.get("full_manifest_run"):
+        return "non_full_manifest_pressure_cannot_select_large_history_bottleneck"
+    if latency_boundary.get("cap_hit_rows") and not latency_boundary.get("indexing_latency_selection_supported"):
+        return "cap_pressure_present_but_aggregate_counters_do_not_show_indexing_latency_as_dominant"
+    return "no_dominant_privacy_safe_stage_signal"
+
+
+def _large_history_tool_delta(selected: str, no_decision_reason: str | None) -> dict[str, Any]:
+    mapping = {
+        "source_window_choice": {
+            "next_tool_delta": "improve_source_window_choice_under_large_history_pressure",
+            "implementation_included": False,
+        },
+        "within_source_depth": {
+            "next_tool_delta": "improve_bounded_within_source_depth_or_read_more_coverage",
+            "implementation_included": False,
+        },
+        "query_planning": {
+            "next_tool_delta": "improve_query_planning_for_large_history_source_selection",
+            "implementation_included": False,
+        },
+        "output_behavior": {
+            "next_tool_delta": "improve_compact_output_behavior_and_defer_boundaries",
+            "implementation_included": False,
+        },
+        "indexing_latency": {
+            "next_tool_delta": "evaluate_incremental_or_cached_indexing_for_repeated_large_history_pressure",
+            "implementation_included": False,
+        },
+        "no_decision": {
+            "next_tool_delta": "add_missing_privacy_safe_stage_counter_before_tool_delta",
+            "implementation_included": False,
+        },
+    }
+    result = dict(mapping.get(selected, mapping["no_decision"]))
+    if selected == "no_decision":
+        result["reason"] = no_decision_reason or "no_dominant_privacy_safe_stage_signal"
+    return result
+
+
+def _large_history_stage_attribution_privacy() -> dict[str, bool]:
+    privacy = _source_tier_answerability_pressure_privacy()
+    return {
+        **privacy,
+        "aggregate_stage_counts_only": True,
+        "raw_stage_rows_committed": False,
+    }
+
+
+def _large_history_stage_attribution_claim_boundaries() -> dict[str, bool]:
+    return {
+        **_source_tier_answerability_pressure_claim_boundaries(),
+        "large_history_stage_attribution_only": True,
+        "selected_tool_delta_implemented": False,
+        "indexing_necessity_claim_supported": False,
+        "llm_judge_used": False,
     }
 
 
