@@ -46,6 +46,7 @@ CONTEXT_NEIGHBORHOOD_STREAM_LABEL = "context_neighborhood"
 CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
 CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
+FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY = "sha256_full_source_bytes_for_cache_validation"
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,12 @@ class FieldedBm25Index:
             "segments_loaded": int(self.metrics.get("segments_loaded", 0)),
             "segments_written": int(self.metrics.get("segments_written", 0)),
             "warm_query_reused_index": bool(self.metrics.get("warm_query_reused_index", False)),
+            "content_fingerprint_validation_enabled": bool(
+                self.metrics.get("content_fingerprint_validation_enabled", False)
+            ),
+            "content_fingerprint_strategy": FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY,
+            "content_fingerprint_files": int(self.metrics.get("content_fingerprint_files", 0)),
+            "content_fingerprint_bytes": int(self.metrics.get("content_fingerprint_bytes", 0)),
             "persistent_reuse_claim": "local_work_reduction_only_not_token_savings_or_final_answer_quality",
             "indexed_file_count": int(self.metrics.get("indexed_files", 0)),
             "indexed_record_count": int(self.metrics.get("indexed_records", 0)),
@@ -160,7 +167,7 @@ class FieldedBm25PersistentCache:
             ):
                 manifest = loaded
         cache = cls(root=root, manifest=manifest)
-        cache.sources_deleted = cache.prune_deleted_sources()
+        cache.sources_deleted = cache.prune_missing_segments()
         return cache
 
     @property
@@ -177,7 +184,14 @@ class FieldedBm25PersistentCache:
     def segment_path(self, source_key: str) -> Path:
         return self.segments_dir / f"{source_key}.json"
 
-    def metadata_for(self, path: Path, *, size: int, source_kind: str) -> dict[str, Any]:
+    def metadata_for(
+        self,
+        path: Path,
+        *,
+        size: int,
+        source_kind: str,
+        content_fingerprint: str,
+    ) -> dict[str, Any]:
         stat = path.stat()
         return {
             "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
@@ -186,11 +200,25 @@ class FieldedBm25PersistentCache:
             "source_kind": source_kind,
             "size": int(size),
             "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            "content_fingerprint_strategy": FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY,
+            "content_fingerprint": content_fingerprint,
         }
 
-    def load_segment(self, path: Path, *, size: int, source_kind: str) -> tuple[dict[str, Any] | None, bool]:
+    def load_segment(
+        self,
+        path: Path,
+        *,
+        size: int,
+        source_kind: str,
+        content_fingerprint: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
         source_key = self.source_key(path)
-        metadata = self.metadata_for(path, size=size, source_kind=source_kind)
+        metadata = self.metadata_for(
+            path,
+            size=size,
+            source_kind=source_kind,
+            content_fingerprint=content_fingerprint,
+        )
         entry = (self.manifest.get("sources") or {}).get(source_key)
         if not isinstance(entry, dict):
             return None, False
@@ -218,10 +246,15 @@ class FieldedBm25PersistentCache:
         record_count: int,
         byte_count: int,
         rows: list[dict[str, Any]],
-        content_hash: str | None,
+        content_fingerprint: str,
     ) -> None:
         source_key = self.source_key(path)
-        metadata = self.metadata_for(path, size=size, source_kind=source_kind)
+        metadata = self.metadata_for(
+            path,
+            size=size,
+            source_kind=source_kind,
+            content_fingerprint=content_fingerprint,
+        )
         segment = {
             "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
             "parser_version": FIELDED_BM25_PARSER_VERSION,
@@ -230,7 +263,8 @@ class FieldedBm25PersistentCache:
             "record_count": int(record_count),
             "byte_count": int(byte_count),
             "row_count": len(rows),
-            "content_hash": content_hash,
+            "content_fingerprint_strategy": FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY,
+            "content_fingerprint": content_fingerprint,
             "rows": rows,
             "raw_paths_included": False,
             "raw_query_text_included": False,
@@ -242,17 +276,27 @@ class FieldedBm25PersistentCache:
         self.manifest.setdefault("sources", {})[source_key] = {
             "metadata": metadata,
             "segment_file": f"segments/{source_key}.json",
-            "source_path": str(Path(path).expanduser().resolve()),
+            "source_key": source_key,
+            "safe_path_identity_hash": source_key,
             "record_count": int(record_count),
             "row_count": len(rows),
+            "raw_paths_included": False,
         }
 
-    def prune_deleted_sources(self) -> int:
+    def prune_missing_segments(self) -> int:
         sources = self.manifest.setdefault("sources", {})
         deleted = 0
-        for source_key, entry in list(sources.items()):
-            source_path = entry.get("source_path") if isinstance(entry, dict) else None
-            if source_path and not Path(source_path).exists():
+        for source_key in list(sources):
+            if not self.segment_path(source_key).exists():
+                sources.pop(source_key, None)
+                deleted += 1
+        return deleted
+
+    def prune_unselected_sources(self, selected_source_keys: set[str]) -> int:
+        sources = self.manifest.setdefault("sources", {})
+        deleted = 0
+        for source_key in list(sources):
+            if source_key not in selected_source_keys:
                 self._drop_source(source_key)
                 deleted += 1
         return deleted
@@ -358,6 +402,9 @@ def build_fielded_bm25_index(
             "segments_loaded": 0,
             "segments_written": 0,
             "warm_query_reused_index": False,
+            "content_fingerprint_validation_enabled": persistent_index_dir is not None,
+            "content_fingerprint_files": 0,
+            "content_fingerprint_bytes": 0,
         },
     )
     persistent_cache = FieldedBm25PersistentCache.open(Path(persistent_index_dir)) if persistent_index_dir else None
@@ -369,6 +416,11 @@ def build_fielded_bm25_index(
         enumerated_files = [(path, size, list(planned_jsonl_files.warnings)) for path, size in planned_jsonl_files.files]
     else:
         enumerated_files = enumerate_jsonl_files(plan)
+    if persistent_cache is not None:
+        selected_source_keys = {persistent_cache.source_key(path) for path, _size, _warnings in enumerated_files}
+        index.metrics["sources_deleted"] = int(index.metrics.get("sources_deleted", 0)) + persistent_cache.prune_unselected_sources(
+            selected_source_keys
+        )
 
     for path, size, enum_warnings in enumerated_files:
         index.warnings = list(enum_warnings)
@@ -377,8 +429,17 @@ def build_fielded_bm25_index(
         file_bytes = int(size) if planned_jsonl_files is not None else stat_size(path)
         segment_start_rowid = rowid
         content_hasher = hashlib.sha256()
+        content_fingerprint = ""
         if persistent_cache is not None:
-            segment, invalidated = persistent_cache.load_segment(path, size=file_bytes, source_kind=source_kind)
+            content_fingerprint, fingerprint_bytes = _source_content_fingerprint(path)
+            index.metrics["content_fingerprint_files"] += 1
+            index.metrics["content_fingerprint_bytes"] += fingerprint_bytes
+            segment, invalidated = persistent_cache.load_segment(
+                path,
+                size=file_bytes,
+                source_kind=source_kind,
+                content_fingerprint=content_fingerprint,
+            )
             if invalidated:
                 index.metrics["sources_invalidated"] += 1
             if segment is not None:
@@ -479,7 +540,7 @@ def build_fielded_bm25_index(
                 record_count=file_records,
                 byte_count=file_bytes,
                 rows=segment_rows,
-                content_hash=content_hasher.hexdigest() if file_records else None,
+                content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
             )
             index.metrics["segments_written"] += len(segment_rows)
     _flush_insert_buffer(connection, insert_buffer)
@@ -925,6 +986,16 @@ def _valid_persistent_segment(segment: Any, *, metadata: dict[str, Any]) -> bool
         return False
     rows = segment.get("rows")
     return isinstance(rows, list)
+
+
+def _source_content_fingerprint(path: Path) -> tuple[str, int]:
+    hasher = hashlib.sha256()
+    byte_count = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            byte_count += len(chunk)
+            hasher.update(chunk)
+    return hasher.hexdigest(), byte_count
 
 
 def _add_raw_chunk(

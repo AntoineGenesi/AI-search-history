@@ -433,6 +433,12 @@ def build_stage_diagnostics(
                 "segments_loaded": int(index_summary.get("segments_loaded") or 0),
                 "segments_written": int(index_summary.get("segments_written") or 0),
                 "warm_query_reused_index": bool(index_summary.get("warm_query_reused_index", False)),
+                "content_fingerprint_validation_enabled": bool(
+                    index_summary.get("content_fingerprint_validation_enabled", False)
+                ),
+                "content_fingerprint_files": int(index_summary.get("content_fingerprint_files") or 0),
+                "content_fingerprint_bytes": int(index_summary.get("content_fingerprint_bytes") or 0),
+                "content_fingerprint_strategy": str(index_summary.get("content_fingerprint_strategy") or ""),
                 "persistent_reuse_claim": str(
                     index_summary.get("persistent_reuse_claim")
                     or "local_work_reduction_only_not_token_savings_or_final_answer_quality"
@@ -851,6 +857,12 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
         "segments_loaded": int(index_summary.get("segments_loaded") or 0),
         "segments_written": int(index_summary.get("segments_written") or 0),
         "warm_query_reused_index": bool(index_summary.get("warm_query_reused_index", False)),
+        "content_fingerprint_validation_enabled": bool(
+            index_summary.get("content_fingerprint_validation_enabled", False)
+        ),
+        "content_fingerprint_files": int(index_summary.get("content_fingerprint_files") or 0),
+        "content_fingerprint_bytes": int(index_summary.get("content_fingerprint_bytes") or 0),
+        "content_fingerprint_strategy": str(index_summary.get("content_fingerprint_strategy") or ""),
         "shared_source_enumeration": {
             "file_count": int(shared_source_enumeration.get("file_count") or 0),
             "byte_count": int(shared_source_enumeration.get("byte_count") or 0),
