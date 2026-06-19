@@ -397,6 +397,25 @@ def build_stage_diagnostics(
     child_query_plan = pressure.get("fielded_child_query_plan") or fielded.get("child_query_plan") or {}
     evidence_channels = pressure.get("fielded_evidence_channels") or fielded.get("evidence_channels") or {}
     context_neighborhood = pressure.get("fielded_context_neighborhood") or fielded.get("context_neighborhood") or {}
+    candidate_stage_loss = sanitize_fielded_candidate_stage_loss(
+        pressure.get("fielded_candidate_stage_loss")
+        or fielded.get("candidate_stage_loss")
+        or diagnostics.get("fielded_candidate_stage_loss")
+    )
+    if (
+        evidence_packet_summary
+        and int(evidence_packet_summary.get("packet_count") or 0) == 0
+        and int(candidate_stage_loss["materialization_ranking_final_caps"].get("candidate_rows_surfaced") or 0) > 0
+    ):
+        candidate_stage_loss = {
+            **candidate_stage_loss,
+            "dominant_loss_stage": "passage_window_sparse",
+            "passage_window": {
+                "evidence_packet_count": int(evidence_packet_summary.get("packet_count") or 0),
+                "evidence_packet_limit": int(evidence_packet_summary.get("packet_limit") or EVIDENCE_PACKET_LIMIT),
+                "passage_window_sparse": True,
+            },
+        }
     source_enumeration = pressure.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
     source_plan = sanitize_source_plan(pressure.get("source_plan") or diagnostics.get("source_plan") or {})
@@ -509,6 +528,9 @@ def build_stage_diagnostics(
                 "context_neighborhood_generated_rows": int(context_neighborhood.get("generated_neighbor_rows") or 0),
                 "context_neighborhood_selected_rows": int(context_neighborhood.get("selected_neighbor_rows") or 0),
                 "context_neighborhood_omitted_rows": int(context_neighborhood.get("omitted_neighbor_rows") or 0),
+                "candidate_stage_loss": candidate_stage_loss,
+                "dominant_loss_stage": candidate_stage_loss["dominant_loss_stage"],
+                "large_history_memory_pressure_proxy": candidate_stage_loss["large_history_memory_pressure_proxy"],
             },
         ),
         stage_diagnostic(
@@ -747,6 +769,7 @@ def build_stage_diagnostics(
         ),
         "source_catalog": source_catalog,
         "source_plan": source_plan,
+        "fielded_candidate_stage_loss": candidate_stage_loss,
         "claim_boundaries": {
             "token_savings_claim_supported": False,
             "final_answer_quality_claim_supported": False,
@@ -944,7 +967,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     fielded_child_query_plan = diagnostics.get("fielded_child_query_plan") or fielded_bm25.get("child_query_plan") or {}
     fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
     fielded_candidate_stage_loss = sanitize_fielded_candidate_stage_loss(
-        diagnostics.get("fielded_candidate_stage_loss") or fielded_bm25.get("fielded_candidate_stage_loss")
+        diagnostics.get("fielded_candidate_stage_loss") or fielded_bm25.get("candidate_stage_loss")
     )
     fielded_context_source = fielded_bm25.get("context_source_counters") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
@@ -1001,9 +1024,9 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "child_query_plan": sanitize_child_query_plan_pressure(fielded_child_query_plan),
             "evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
             "context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
+            "candidate_stage_loss": fielded_candidate_stage_loss,
             "context_source_counters": sanitize_context_source_counters(fielded_context_source),
             "materialization": fielded_bm25.get("materialization") or {},
-            "fielded_candidate_stage_loss": fielded_candidate_stage_loss,
             "index_summary": fielded_bm25.get("index_summary") or {},
             "raw_paths_included": False,
             "raw_text_included": False,
@@ -1093,107 +1116,6 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
             "persistent_index_or_cache_used": bool(claim_boundaries.get("persistent_index_or_cache_used", False)),
-        },
-    }
-
-
-def sanitize_fielded_candidate_stage_loss(value: Any) -> dict[str, Any]:
-    stage_loss = value if isinstance(value, dict) else {}
-    source_planning = stage_loss.get("source_planning") if isinstance(stage_loss.get("source_planning"), dict) else {}
-    query_streams = stage_loss.get("query_streams") if isinstance(stage_loss.get("query_streams"), dict) else {}
-    evidence_channels = (
-        stage_loss.get("evidence_channels") if isinstance(stage_loss.get("evidence_channels"), dict) else {}
-    )
-    source_grouping = stage_loss.get("source_grouping") if isinstance(stage_loss.get("source_grouping"), dict) else {}
-    materialization = stage_loss.get("materialization") if isinstance(stage_loss.get("materialization"), dict) else {}
-    memory_pressure = stage_loss.get("memory_pressure") if isinstance(stage_loss.get("memory_pressure"), dict) else {}
-    return {
-        "dominant_loss_stage": str(stage_loss.get("dominant_loss_stage") or "none"),
-        "source_planning": {
-            "planned_file_count": int(source_planning.get("planned_file_count") or 0),
-            "selected_file_count": int(source_planning.get("selected_file_count") or 0),
-            "deferred_file_count": int(source_planning.get("deferred_file_count") or 0),
-            "pruned_file_count": int(source_planning.get("pruned_file_count") or 0),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "query_streams": {
-            "stream_count": int(query_streams.get("stream_count") or 0),
-            "saturated_stream_count": int(query_streams.get("saturated_stream_count") or 0),
-            "rows_before_dedupe": int(query_streams.get("rows_before_dedupe") or 0),
-            "rows_after_dedupe": int(query_streams.get("rows_after_dedupe") or 0),
-            "rows_dropped_by_stream_cap_total": int(query_streams.get("rows_dropped_by_stream_cap_total") or 0),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "evidence_channels": {
-            "channel_count": int(evidence_channels.get("channel_count") or 0),
-            "rows_before_fusion": int(evidence_channels.get("rows_before_fusion") or 0),
-            "rows_after_fusion": int(evidence_channels.get("rows_after_fusion") or 0),
-            "rows_selected": int(evidence_channels.get("rows_selected") or 0),
-            "rows_dropped_by_fusion": int(evidence_channels.get("rows_dropped_by_fusion") or 0),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "source_grouping": {
-            "rows_considered": int(source_grouping.get("rows_considered") or 0),
-            "rows_selected": int(source_grouping.get("rows_selected") or 0),
-            "rows_dropped_by_source_cap": int(source_grouping.get("rows_dropped_by_source_cap") or 0),
-            "rows_dropped_total": int(source_grouping.get("rows_dropped_total") or 0),
-            "source_group_count_considered": int(source_grouping.get("source_group_count_considered") or 0),
-            "source_group_count_selected": int(source_grouping.get("source_group_count_selected") or 0),
-            "session_group_count_considered": int(source_grouping.get("session_group_count_considered") or 0),
-            "session_group_count_selected": int(source_grouping.get("session_group_count_selected") or 0),
-            "day_group_count_considered": int(source_grouping.get("day_group_count_considered") or 0),
-            "day_group_count_selected": int(source_grouping.get("day_group_count_selected") or 0),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "materialization": {
-            "candidate_rows_materialized": int(materialization.get("candidate_rows_materialized") or 0),
-            "records_materialized": int(materialization.get("records_materialized") or 0),
-            "file_reopen_attempts": int(materialization.get("file_reopen_attempts") or 0),
-            "file_reopen_failures": int(materialization.get("file_reopen_failures") or 0),
-            "candidate_rows_materialization_failed": int(
-                materialization.get("candidate_rows_materialization_failed") or 0
-            ),
-            "candidate_rows_retained": int(materialization.get("candidate_rows_retained") or 0),
-            "candidate_rows_surfaced": int(materialization.get("candidate_rows_surfaced") or 0),
-            "final_candidate_count": int(materialization.get("final_candidate_count") or 0),
-            "records_rejected_by_existing_ranker": int(materialization.get("records_rejected_by_existing_ranker") or 0),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "memory_pressure": {
-            "memory_pressure_basis": str(
-                memory_pressure.get("memory_pressure_basis") or "candidate_materialization_proxy"
-            ),
-            "indexed_chunks": int(memory_pressure.get("indexed_chunks") or 0),
-            "candidate_rows_from_query_streams": int(memory_pressure.get("candidate_rows_from_query_streams") or 0),
-            "candidate_rows_considered": int(memory_pressure.get("candidate_rows_considered") or 0),
-            "candidate_rows_materialized": int(memory_pressure.get("candidate_rows_materialized") or 0),
-            "rows_dropped_total": int(memory_pressure.get("rows_dropped_total") or 0),
-            "runtime_rss_bytes_available": bool(memory_pressure.get("runtime_rss_bytes_available", False)),
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
-        },
-        "privacy": {
-            "raw_paths_included": False,
-            "raw_text_included": False,
-            "raw_query_text_included": False,
-            "raw_session_ids_included": False,
         },
     }
 
@@ -1350,6 +1272,153 @@ def sanitize_evidence_channel_pressure(value: Any) -> dict[str, Any]:
         "line_numbers_included": False,
         "source_lines_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def sanitize_fielded_candidate_stage_loss(value: Any) -> dict[str, Any]:
+    stage_loss = value if isinstance(value, dict) else {}
+    source_planning = stage_loss.get("source_planning") if isinstance(stage_loss.get("source_planning"), dict) else {}
+    query_streams = stage_loss.get("query_streams") if isinstance(stage_loss.get("query_streams"), dict) else {}
+    evidence_channels = (
+        stage_loss.get("evidence_channels") if isinstance(stage_loss.get("evidence_channels"), dict) else {}
+    )
+    source_grouping = stage_loss.get("source_grouping") if isinstance(stage_loss.get("source_grouping"), dict) else {}
+    materialization = (
+        stage_loss.get("materialization_ranking_final_caps")
+        if isinstance(stage_loss.get("materialization_ranking_final_caps"), dict)
+        else {}
+    )
+    memory_proxy = (
+        stage_loss.get("large_history_memory_pressure_proxy")
+        if isinstance(stage_loss.get("large_history_memory_pressure_proxy"), dict)
+        else {}
+    )
+    allowed = [
+        "source_not_planned",
+        "no_first_stage_candidate",
+        "stream_cap_drop",
+        "evidence_fusion_drop",
+        "source_grouping_drop",
+        "materialization_or_ranker_drop",
+        "final_match_cap",
+        "passage_window_sparse",
+        "none",
+    ]
+    dominant = str(stage_loss.get("dominant_loss_stage") or "none")
+    if dominant not in allowed:
+        dominant = "none"
+    return {
+        "schema_version": int(stage_loss.get("schema_version") or 1),
+        "retrieval_mode": "fielded-bm25",
+        "summary_answer": str(
+            stage_loss.get("summary_answer")
+            or "candidates_are_generated_by_source_planning_fielded_index_query_streams_evidence_fusion_then_lost_at_the_dominant_loss_stage"
+        ),
+        "dominant_loss_stage": dominant,
+        "allowed_dominant_loss_stages": allowed,
+        "source_planning": {
+            "planned_file_count": int(source_planning.get("planned_file_count") or 0),
+            "selected_file_count": int(source_planning.get("selected_file_count") or 0),
+            "deferred_source_count": int(source_planning.get("deferred_source_count") or 0),
+            "pruned_source_count": int(source_planning.get("pruned_source_count") or 0),
+            "planned_byte_count": int(source_planning.get("planned_byte_count") or 0),
+            "indexed_row_count": int(source_planning.get("indexed_row_count") or 0),
+            "indexed_chunk_count": int(source_planning.get("indexed_chunk_count") or 0),
+            "build_bytes": int(source_planning.get("build_bytes") or 0),
+        },
+        "query_streams": {
+            "stream_count": int(query_streams.get("stream_count") or 0),
+            "child_stream_count": int(query_streams.get("child_stream_count") or 0),
+            "saturated_stream_count": int(query_streams.get("saturated_stream_count") or 0),
+            "raw_row_count": int(query_streams.get("raw_row_count") or 0),
+            "unique_row_count": int(query_streams.get("unique_row_count") or 0),
+            "duplicate_row_count": int(query_streams.get("duplicate_row_count") or 0),
+            "stream_cap_drop_count": int(query_streams.get("stream_cap_drop_count") or 0),
+            "selected_rows_by_stream": sanitize_int_counts(query_streams.get("selected_rows_by_stream")),
+            "rows_dropped_by_stream_cap": sanitize_int_counts(query_streams.get("rows_dropped_by_stream_cap")),
+        },
+        "evidence_channels": {
+            "channel_count": int(evidence_channels.get("channel_count") or 0),
+            "channel_labels": [str(label) for label in evidence_channels.get("channel_labels") or []],
+            "channel_kinds": {
+                str(label): str(kind) for label, kind in (evidence_channels.get("channel_kinds") or {}).items()
+            },
+            "channel_row_counts": sanitize_int_counts(evidence_channels.get("channel_row_counts")),
+            "unique_row_count_before_fusion": int(evidence_channels.get("unique_row_count_before_fusion") or 0),
+            "selected_row_count_after_fusion": int(evidence_channels.get("selected_row_count_after_fusion") or 0),
+            "dropped_row_count_after_fusion": int(evidence_channels.get("dropped_row_count_after_fusion") or 0),
+            "selected_rows_by_channel_after_fusion": sanitize_int_counts(
+                evidence_channels.get("selected_rows_by_channel_after_fusion")
+            ),
+            "dropped_rows_by_channel_after_fusion": sanitize_int_counts(
+                evidence_channels.get("dropped_rows_by_channel_after_fusion")
+            ),
+            "selected_rows_by_channel_after_grouping": sanitize_int_counts(
+                evidence_channels.get("selected_rows_by_channel_after_grouping")
+            ),
+            "dropped_rows_by_channel_after_grouping": sanitize_int_counts(
+                evidence_channels.get("dropped_rows_by_channel_after_grouping")
+            ),
+        },
+        "source_grouping": {
+            "candidate_rows_considered": int(source_grouping.get("candidate_rows_considered") or 0),
+            "candidate_rows_selected": int(source_grouping.get("candidate_rows_selected") or 0),
+            "candidate_rows_dropped": int(source_grouping.get("candidate_rows_dropped") or 0),
+            "source_count_considered": int(source_grouping.get("source_count_considered") or 0),
+            "source_count_selected": int(source_grouping.get("source_count_selected") or 0),
+            "source_group_count_considered": int(source_grouping.get("source_group_count_considered") or 0),
+            "source_group_count_selected": int(source_grouping.get("source_group_count_selected") or 0),
+            "source_group_count_omitted": int(source_grouping.get("source_group_count_omitted") or 0),
+            "session_group_count_considered": int(source_grouping.get("session_group_count_considered") or 0),
+            "session_group_count_selected": int(source_grouping.get("session_group_count_selected") or 0),
+            "session_group_count_omitted": int(source_grouping.get("session_group_count_omitted") or 0),
+            "day_group_count_considered": int(source_grouping.get("day_group_count_considered") or 0),
+            "day_group_count_selected": int(source_grouping.get("day_group_count_selected") or 0),
+            "day_group_count_omitted": int(source_grouping.get("day_group_count_omitted") or 0),
+            "rows_dropped_by_source_cap": int(source_grouping.get("rows_dropped_by_source_cap") or 0),
+        },
+        "materialization_ranking_final_caps": {
+            "candidate_rows_materialized": int(materialization.get("candidate_rows_materialized") or 0),
+            "candidate_rows_generated": int(materialization.get("candidate_rows_generated") or 0),
+            "candidate_rows_considered": int(materialization.get("candidate_rows_considered") or 0),
+            "candidate_rows_retained": int(materialization.get("candidate_rows_retained") or 0),
+            "candidate_rows_surfaced": int(materialization.get("candidate_rows_surfaced") or 0),
+            "records_rejected_by_existing_ranker": int(materialization.get("records_rejected_by_existing_ranker") or 0),
+            "candidate_records_deduped": int(materialization.get("candidate_records_deduped") or 0),
+            "candidate_records_scored": int(materialization.get("candidate_records_scored") or 0),
+            "materialization_failed_count": int(materialization.get("materialization_failed_count") or 0),
+            "ranker_or_materialization_drop_count": int(
+                materialization.get("ranker_or_materialization_drop_count") or 0
+            ),
+            "final_match_cap_drop_count": int(materialization.get("final_match_cap_drop_count") or 0),
+            "max_match_cap_hit": bool(materialization.get("max_match_cap_hit", False)),
+        },
+        "large_history_memory_pressure_proxy": {
+            "planned_byte_count": int(memory_proxy.get("planned_byte_count") or 0),
+            "build_bytes": int(memory_proxy.get("build_bytes") or 0),
+            "indexed_row_count": int(memory_proxy.get("indexed_row_count") or 0),
+            "query_stream_raw_row_count": int(memory_proxy.get("query_stream_raw_row_count") or 0),
+            "evidence_unique_row_count_before_fusion": int(
+                memory_proxy.get("evidence_unique_row_count_before_fusion") or 0
+            ),
+            "candidate_row_pool_limit": int(memory_proxy.get("candidate_row_pool_limit") or 0),
+            "memory_fix_claim_supported": False,
+        },
+        "privacy": {
+            "raw_text_included": False,
+            "raw_paths_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "source_lines_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "claim_boundaries": {
+            "ranking_or_candidate_generation_constants_changed": False,
+            "memory_fix_claim_supported": False,
+            "token_savings_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "all_history_completeness_claim_supported": False,
+        },
     }
 
 
