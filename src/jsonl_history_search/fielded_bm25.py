@@ -48,6 +48,9 @@ CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
 FIELDED_EVIDENCE_SELECTION_POLICY_VERSION = "fielded-evidence-selection-v1"
 FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY = "sha256_full_source_bytes_for_cache_validation"
+FIELDED_BM25_SQLITE_TEMP_STORE = "FILE"
+FIELDED_BM25_SQLITE_CACHE_SIZE_KIB = 65536
+FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES = 0
 QUERY_PLAN_MODE_AUTO = "auto"
 QUERY_PLAN_MODE_OFF = "off"
 QUERY_PLAN_MODE_DEBUG = "debug"
@@ -117,6 +120,16 @@ class FieldedBm25Index:
             "content_fingerprint_files": int(self.metrics.get("content_fingerprint_files", 0)),
             "content_fingerprint_bytes": int(self.metrics.get("content_fingerprint_bytes", 0)),
             "persistent_reuse_claim": "local_work_reduction_only_not_token_savings_or_final_answer_quality",
+            "sqlite_temp_store": str(self.metrics.get("sqlite_temp_store") or FIELDED_BM25_SQLITE_TEMP_STORE),
+            "sqlite_cache_size_kib": int(
+                self.metrics.get("sqlite_cache_size_kib") or FIELDED_BM25_SQLITE_CACHE_SIZE_KIB
+            ),
+            "sqlite_mmap_size_bytes": int(
+                self.metrics.get("sqlite_mmap_size_bytes") or FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES
+            ),
+            "sqlite_pressure_settings_enabled": bool(
+                self.metrics.get("sqlite_pressure_settings_enabled", True)
+            ),
             "indexed_file_count": int(self.metrics.get("indexed_files", 0)),
             "indexed_record_count": int(self.metrics.get("indexed_records", 0)),
             "indexed_chunk_count": int(self.metrics.get("indexed_chunks", 0)),
@@ -379,7 +392,9 @@ def build_fielded_bm25_index(
     profile_token = start_phase_profile("fielded_bm25_index_build")
     try:
         connection = sqlite3.connect(":memory:")
-        connection.execute("PRAGMA temp_store = MEMORY")
+        connection.execute("PRAGMA temp_store = FILE")
+        connection.execute(f"PRAGMA cache_size = -{FIELDED_BM25_SQLITE_CACHE_SIZE_KIB}")
+        connection.execute(f"PRAGMA mmap_size = {FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES}")
         connection.execute("PRAGMA synchronous = OFF")
         connection.execute(
             """
@@ -423,6 +438,10 @@ def build_fielded_bm25_index(
             "content_fingerprint_validation_enabled": persistent_index_dir is not None,
             "content_fingerprint_files": 0,
             "content_fingerprint_bytes": 0,
+            "sqlite_temp_store": FIELDED_BM25_SQLITE_TEMP_STORE,
+            "sqlite_cache_size_kib": FIELDED_BM25_SQLITE_CACHE_SIZE_KIB,
+            "sqlite_mmap_size_bytes": FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES,
+            "sqlite_pressure_settings_enabled": True,
         },
     )
     persistent_cache = FieldedBm25PersistentCache.open(Path(persistent_index_dir)) if persistent_index_dir else None
