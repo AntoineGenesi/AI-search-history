@@ -78,6 +78,7 @@ def build_agent_find_payload(
     report_output: str | None = None,
     compact_provenance_handoff: bool = False,
 ) -> dict[str, Any]:
+    expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     candidates = build_candidate_rows(search_result)
     timeline = build_timeline(candidates)
     candidate_dicts = [candidate.to_dict() for candidate in candidates]
@@ -147,7 +148,7 @@ def build_agent_find_payload(
         source_plan=source_plan,
         search_result=search_result,
         candidates=candidate_dicts,
-        next_reads=next_reads_from_candidates(candidates),
+        next_reads=next_reads_from_candidates(candidates, expansion_action_context=expansion_action_context),
         source_family="local_ai_conversation_jsonl",
         question_family={
             "primary": "agent_find",
@@ -155,6 +156,7 @@ def build_agent_find_payload(
         product_path="find",
         no_evidence_report=no_evidence_report,
         retrieval_pressure=agent_find.get("retrieval_pressure"),
+        expansion_action_context=expansion_action_context,
     )
     agent_find["source_locator_handoff"] = handoff
     if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
@@ -190,6 +192,7 @@ def build_agent_find_payload(
 
 def command_surface() -> dict[str, str]:
     return {
+        "read-more": "Bounded provenance expansion for an exact source_ref: record, window, or next records without rerunning broad search.",
         "source-locator-handoff": "Inspect this before broad search: stable handoff with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
         "find-candidates": "Focused fuzzy/typo/synonym/paraphrase candidate recovery with compact source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
@@ -1141,6 +1144,7 @@ def build_compact_handoff_output_budget(
             "source_refs": COMPACT_PROVENANCE_SOURCE_REF_LIMIT,
             "source_windows": SOURCE_WINDOW_LIMIT,
             "next_reads": COMPACT_PROVENANCE_NEXT_READ_LIMIT,
+            "expansion_actions_per_ref": 3,
             "reason_codes_per_candidate": SOURCE_WINDOW_REASON_CODE_LIMIT,
         },
         "counts": {
@@ -1163,6 +1167,7 @@ def build_compact_handoff_output_budget(
             "stage_diagnostics": "preserved",
             "no_evidence": "preserved_searched_scope",
             "next_reads": "included_exact_capped",
+            "expansion_actions": "included_exact_capped",
             "snippets": "omitted",
         },
         "claim_boundaries": {
@@ -1697,6 +1702,7 @@ def build_source_locator_handoff(
     product_path: str = "find",
     no_evidence_report: dict[str, Any] | None = None,
     retrieval_pressure: dict[str, Any] | None = None,
+    expansion_action_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable agent handoff for deciding where to read next."""
     source_scope = build_source_scope_summary(source_plan, search_result)
@@ -1706,12 +1712,16 @@ def build_source_locator_handoff(
     candidate_count = len(candidate_rows) or sum(len(group.get("matches", [])) for group in search_result.get("groups", []))
     next_read_rows = list(next_reads or [])
     if not next_read_rows:
-        next_read_rows = next_reads_from_candidates(candidate_rows)
+        next_read_rows = next_reads_from_candidates(
+            candidate_rows,
+            expansion_action_context=expansion_action_context,
+        )
     query_plan = source_plan.get("query", {}).get("query_plan") or {}
     source_window_result = build_source_window_package(
         candidates=candidate_rows,
         next_reads=next_read_rows,
         query_plan=query_plan,
+        expansion_action_context=expansion_action_context,
     )
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
@@ -1740,6 +1750,7 @@ def build_source_locator_handoff(
             {"field": "source_ref", "action": "included", "preserves_exact_refs": True},
             {"field": "target", "action": "included", "preserves_exact_refs": True},
             {"field": "next_read", "action": "included", "preserves_exact_refs": True},
+            {"field": "expansion_actions", "action": "included", "preserves_exact_refs": True},
             {"field": "reason_codes", "action": "capped", "limit": SOURCE_WINDOW_REASON_CODE_LIMIT},
             {
                 "field": "text_or_snippets",
@@ -1814,8 +1825,14 @@ def build_source_windows(
     candidates: list[dict[str, Any]] | list[CandidateRow],
     next_reads: list[dict[str, Any]],
     query_plan: dict[str, Any] | None,
+    expansion_action_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    return build_source_window_package(candidates=candidates, next_reads=next_reads, query_plan=query_plan)["windows"]
+    return build_source_window_package(
+        candidates=candidates,
+        next_reads=next_reads,
+        query_plan=query_plan,
+        expansion_action_context=expansion_action_context,
+    )["windows"]
 
 
 def build_source_window_package(
@@ -1823,6 +1840,7 @@ def build_source_window_package(
     candidates: list[dict[str, Any]] | list[CandidateRow],
     next_reads: list[dict[str, Any]],
     query_plan: dict[str, Any] | None,
+    expansion_action_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     next_read_by_candidate = {
@@ -1853,6 +1871,7 @@ def build_source_window_package(
             "source_ref": source_ref,
             "reason": "open source_ref target for surrounding transcript context",
         }
+        next_read = {key: value for key, value in next_read.items() if key != "expansion_actions"}
         windows.append(
             {
                 "schema_version": 1,
@@ -1869,6 +1888,11 @@ def build_source_window_package(
                 "project_hint": project_hint_from_cwd(data.get("cwd")),
                 "reason_codes": list(data.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
                 "next_read": next_read,
+                "expansion_actions": read_more_actions_for_source_ref(
+                    source_ref,
+                    candidate_id=candidate_id,
+                    expansion_action_context=expansion_action_context,
+                ),
                 "text_included": False,
                 "source_window_text_included": False,
                 "reason": "open source_ref target for surrounding transcript context",
@@ -2041,7 +2065,11 @@ def project_hint_from_cwd(cwd: str | None) -> str | None:
     return Path(str(cwd)).name or None
 
 
-def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
+def next_reads_from_candidates(
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+    *,
+    expansion_action_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
     for candidate in candidates[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]:
         if isinstance(candidate, CandidateRow):
@@ -2060,9 +2088,115 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
                     "candidate_id": str(candidate_id or ""),
                     "source_ref": source_ref,
                     "reason": "open candidate source_ref before broad search",
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        source_ref,
+                        candidate_id=str(candidate_id or ""),
+                        expansion_action_context=expansion_action_context,
+                    ),
                 }
             )
     return reads
+
+
+def expansion_action_context_from_source_plan(source_plan: dict[str, Any]) -> dict[str, Any]:
+    sources = source_plan.get("sources") if isinstance(source_plan.get("sources"), dict) else {}
+    roots = [root for root in sources.get("roots") or [] if isinstance(root, dict) and root.get("path")]
+    limits = sources.get("limits") if isinstance(sources.get("limits"), dict) else {}
+    root_paths = [str(root["path"]) for root in roots]
+    return {
+        "cwd": source_plan.get("cwd") if any(not Path(path).expanduser().is_absolute() for path in root_paths) else None,
+        "roots": root_paths,
+        "allow_arbitrary_root": any(not bool(root.get("known", False)) for root in roots),
+        "hard_cap_files": limits.get("hard_cap_files"),
+        "hard_cap_bytes": limits.get("hard_cap_bytes"),
+    }
+
+
+def expansion_action_context_argv(expansion_action_context: dict[str, Any] | None) -> list[str]:
+    if not expansion_action_context:
+        return []
+    argv: list[str] = []
+    cwd = expansion_action_context.get("cwd")
+    if cwd:
+        argv.extend(["--cwd", str(cwd)])
+    for root in expansion_action_context.get("roots") or []:
+        argv.extend(["--root", str(root)])
+    if expansion_action_context.get("allow_arbitrary_root"):
+        argv.append("--allow-arbitrary-root")
+    for option, key in (
+        ("--hard-cap-files", "hard_cap_files"),
+        ("--hard-cap-bytes", "hard_cap_bytes"),
+    ):
+        value = expansion_action_context.get(key)
+        if value is not None:
+            argv.extend([option, str(value)])
+    return argv
+
+
+def read_more_actions_for_source_ref(
+    source_ref: dict[str, Any],
+    *,
+    candidate_id: str | None = None,
+    expansion_action_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    target = source_ref_target(source_ref)
+    if not target:
+        return []
+    line = normalized_source_ref_line(source_ref.get("line"))
+    common = {
+        "kind": "source_expansion",
+        "command": "jsonl-history-search read-more",
+        "claim_boundaries": {
+            "broad_search_rerun": False,
+            "ranking_or_cap_changed": False,
+        },
+    }
+    context_argv = expansion_action_context_argv(expansion_action_context)
+    actions = [
+        {
+            **common,
+            "mode": "record",
+            "argv": ["read-more", target, "--mode", "record", "--format", "json", *context_argv],
+        }
+    ]
+    if line:
+        actions.extend(
+            [
+                {
+                    **common,
+                    "mode": "window",
+                    "argv": [
+                        "read-more",
+                        target,
+                        "--mode",
+                        "window",
+                        "--before",
+                        "2",
+                        "--after",
+                        "2",
+                        "--format",
+                        "json",
+                        *context_argv,
+                    ],
+                },
+                {
+                    **common,
+                    "mode": "next",
+                    "argv": [
+                        "read-more",
+                        target,
+                        "--mode",
+                        "next",
+                        "--next-count",
+                        "3",
+                        "--format",
+                        "json",
+                        *context_argv,
+                    ],
+                },
+            ]
+        )
+    return actions
 
 
 def source_ref_target(source_ref: dict[str, Any]) -> str | None:

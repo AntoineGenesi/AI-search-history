@@ -11,10 +11,12 @@ from typing import Any
 from .agent_contract import (
     build_agent_find_payload,
     build_compact_provenance_handoff,
+    expansion_action_context_from_source_plan,
     build_source_scope_summary,
     build_stage_diagnostics,
     build_source_locator_handoff,
     estimate_tokens,
+    read_more_actions_for_source_ref,
     reduction_ratio,
     source_ref_target,
 )
@@ -60,6 +62,7 @@ def build_semantic_debug_payload(
     mask_context: Any = None,
     configuration_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
+    expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     result = run_retrieval_mode(
         retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
         plan=plan,
@@ -113,7 +116,13 @@ def build_semantic_debug_payload(
     joins = merge_local_task_review_joins(joins, hints, cwd=Path(source_plan["cwd"]))
     no_evidence = build_no_evidence_section(agent_find, source_scope, tool_report, forensics_payload)
     uncertainty = build_uncertainty(agent_find, source_scope, tool_report, forensics_payload, family)
-    next_reads = build_next_reads(candidates, tool_proof, joins, hints)
+    next_reads = build_next_reads(
+        candidates,
+        tool_proof,
+        joins,
+        hints,
+        expansion_action_context=expansion_action_context,
+    )
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=result,
@@ -124,6 +133,7 @@ def build_semantic_debug_payload(
         product_path="semantic_debug",
         no_evidence_report=agent_find.get("no_evidence_report"),
         retrieval_pressure=agent_find.get("retrieval_pressure"),
+        expansion_action_context=expansion_action_context,
     )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
@@ -489,7 +499,7 @@ def build_uncertainty(
     tool_report: dict[str, Any],
     forensics_payload: dict[str, Any] | None,
     family: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     labels = []
     if agent_find.get("status") == "no_evidence":
         labels.append(("no_candidate_rows", "No candidate rows matched within the searched scope."))
@@ -541,18 +551,42 @@ def build_next_reads(
     tool_proof: dict[str, Any],
     joins: dict[str, Any],
     hints: dict[str, str | None],
+    *,
+    expansion_action_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    reads: list[dict[str, str]] = []
+    reads: list[dict[str, Any]] = []
     for candidate in candidates[:5]:
         ref = candidate.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append({"kind": "jsonl_source_ref", "target": target, "reason": "confirm candidate snippet in source context"})
+            reads.append(
+                {
+                    "kind": "jsonl_source_ref",
+                    "target": target,
+                    "source_ref": dict(ref),
+                    "reason": "confirm candidate snippet in source context",
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        ref,
+                        expansion_action_context=expansion_action_context,
+                    ),
+                }
+            )
     for event in tool_proof.get("events", [])[:4]:
         ref = event.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append({"kind": "tool_event_source_ref", "target": target, "reason": "confirm structured action proof"})
+            reads.append(
+                {
+                    "kind": "tool_event_source_ref",
+                    "target": target,
+                    "source_ref": dict(ref),
+                    "reason": "confirm structured action proof",
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        ref,
+                        expansion_action_context=expansion_action_context,
+                    ),
+                }
+            )
     for item in joins.get("review_evidence", [])[:4]:
         if item.get("path"):
             reads.append({"kind": "task_or_review_artifact", "target": item["path"], "reason": "confirm task/review verdict and claim-action classification"})
@@ -1021,11 +1055,11 @@ def dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def dedupe_dicts(values: list[dict[str, str]]) -> list[dict[str, str]]:
+def dedupe_dicts(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     result = []
     for item in values:
-        key = tuple(sorted(item.items()))
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
         if key not in seen:
             seen.add(key)
             result.append(item)
