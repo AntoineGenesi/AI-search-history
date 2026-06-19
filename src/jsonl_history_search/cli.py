@@ -29,6 +29,11 @@ from .source_tier_answer_use import (
     build_source_tier_answer_use_eval_payload,
     render_source_tier_answer_use_markdown,
 )
+from .retrieve_expand_answer_use import (
+    DEFAULT_FIXTURE as DEFAULT_RETRIEVE_EXPAND_ANSWER_USE_FIXTURE,
+    build_retrieve_expand_answer_use_eval_payload,
+    render_retrieve_expand_answer_use_markdown,
+)
 from .evaluation import build_efficiency_eval
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .expansion import build_expansion_family_audit_report
@@ -534,6 +539,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the source-tier answer-use report should be written.",
+    )
+    retrieve_expand_answer_use = subparsers.add_parser("retrieve-expand-answer-use-eval")
+    retrieve_expand_answer_use.add_argument(
+        "--fixture",
+        default=str(DEFAULT_RETRIEVE_EXPAND_ANSWER_USE_FIXTURE),
+        help="Committed synthetic retrieve -> expand answer-use fixture.",
+    )
+    retrieve_expand_answer_use.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    retrieve_expand_answer_use.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the retrieve -> expand answer-use report should be written.",
     )
     real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
     add_common_args(real_history_impact)
@@ -1673,6 +1690,20 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         status = payload["source_tier_answer_use_eval"]["status"]
+        return 1 if status == "invalid_fixture" else 0
+    if args.command == "retrieve-expand-answer-use-eval":
+        payload = build_retrieve_expand_answer_use_eval_payload(Path(args.fixture).expanduser())
+        rendered = (
+            render(payload, "json")
+            if args.format == "json"
+            else render_retrieve_expand_answer_use_markdown(payload)
+        )
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        status = payload["retrieve_expand_answer_use_eval"]["status"]
         return 1 if status == "invalid_fixture" else 0
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)
