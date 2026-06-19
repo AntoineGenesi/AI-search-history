@@ -40,6 +40,7 @@ FTS_FIELD_NAMES = {"role", "timestamp_bucket", "tool_event", "artifact_task_path
 CONTEXT_NEIGHBORHOOD_STREAM_LABEL = "context_neighborhood"
 CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
 CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
+FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,14 @@ class FieldedQueryStream:
     label: str
     query: str
     fields: tuple[str, ...]
+    channel: str = "query_stream"
+
+
+@dataclass(frozen=True)
+class FieldedEvidenceChannel:
+    label: str
+    kind: str
+    rows: list[tuple[Any, ...]]
 
 
 def sqlite_fts5_available() -> bool:
@@ -322,6 +331,12 @@ def search_with_fielded_bm25(
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
+    evidence_channels = _build_fielded_evidence_channels(
+        raw_rows=raw_rows,
+        query_streams=query_streams,
+        stream_rows=stream_rows,
+        candidate_pool_limit=candidate_pool_limit,
+    )
     context_neighborhood = _context_neighborhood_candidate_rows(
         raw_rows,
         index,
@@ -330,7 +345,22 @@ def search_with_fielded_bm25(
         stream_rows=stream_rows,
         row_limit=candidate_limit,
     )
-    selection_rows = context_neighborhood["rows"] + raw_rows
+    if context_neighborhood["rows"]:
+        evidence_channels.insert(
+            0,
+            FieldedEvidenceChannel(
+                label=CONTEXT_NEIGHBORHOOD_STREAM_LABEL,
+                kind="structural_neighborhood",
+                rows=sorted(
+                    list(context_neighborhood["rows"]),
+                    key=lambda row: _context_neighborhood_selection_key(index, int(row[0])),
+                ),
+            )
+        )
+    selection_rows, fusion = _fuse_fielded_evidence_channels(
+        evidence_channels,
+        candidate_pool_limit=candidate_pool_limit,
+    )
     if context_neighborhood["enabled"]:
         selection_rows = sorted(selection_rows, key=lambda row: _context_neighborhood_selection_key(index, int(row[0])))
     rows, source_grouping = _select_source_grouped_candidate_rows(
@@ -358,6 +388,11 @@ def search_with_fielded_bm25(
         deduped_row_count=len(raw_rows),
         candidate_pool_limit=candidate_pool_limit,
         selection=source_grouping.get("stream_selection"),
+    )
+    evidence_channel_summary = _fielded_evidence_channel_summary(
+        fusion=fusion,
+        selected_rows=rows,
+        candidate_pool_limit=candidate_pool_limit,
     )
     _mark_expected_candidate_rows(expected_diag, rows)
     matches: list[Match] = []
@@ -404,6 +439,8 @@ def search_with_fielded_bm25(
                 reasons = [*reasons, "fielded_bm25:context_neighborhood"]
                 if score <= 0:
                     score = 1.0
+            for label in _selected_evidence_reason_labels(rowid, fusion):
+                reasons = [*reasons, f"fielded_bm25:evidence_channel:{label}"]
             if score <= 0:
                 records_rejected_by_ranker += 1
                 if expected_state is not None:
@@ -440,6 +477,7 @@ def search_with_fielded_bm25(
         "fts": _fts_stats(index, query=query),
         "query_profile": _query_profile(intent, query),
         "fielded_query_streams": query_stream_summary,
+        "fielded_evidence_channels": evidence_channel_summary,
         "candidate_rows": len(rows),
         "candidate_row_limit": candidate_limit,
         "candidate_row_pool_limit": candidate_pool_limit,
@@ -1414,7 +1452,9 @@ def _fts_query_for_intent(intent: QueryIntent) -> str | None:
 def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | None) -> list[FieldedQueryStream]:
     streams: list[FieldedQueryStream] = []
     if base_query:
-        streams.append(FieldedQueryStream(label="base_lexical", query=base_query, fields=("text",)))
+        streams.append(
+            FieldedQueryStream(label="base_lexical", query=base_query, fields=("text",), channel="base_lexical")
+        )
 
     text_query = _field_query("text", _anchor_values_for_fielded_streams(intent))
     if not text_query:
@@ -1423,6 +1463,16 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
     plan = intent.query_plan
     primary_intent = plan.primary_intent if plan is not None else "generic_history"
     detected_intents = set(plan.detected_intents if plan is not None else [])
+    phrase_query = _phrase_query("text", _anchor_values_for_fielded_streams(intent))
+    if phrase_query and primary_intent in {"when_user_said", "why", "workflow_failure"}:
+        streams.append(
+            FieldedQueryStream(
+                label=f"exact_phrase_text_{_stream_label_part(primary_intent)}",
+                query=phrase_query,
+                fields=("text",),
+                channel="exact_phrase",
+            )
+        )
     role_hints = _role_hints_for_query_streams(intent)
     for role in role_hints:
         role_query = _field_query("role", [role])
@@ -1432,8 +1482,18 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     label=f"role_text_{_stream_label_part(role)}",
                     query=f"{role_query} AND ({text_query})",
                     fields=("role", "text"),
+                    channel=f"role_text_{_stream_label_part(role)}",
                 )
             )
+            if phrase_query and primary_intent in {"when_user_said", "why", "workflow_failure"}:
+                streams.append(
+                    FieldedQueryStream(
+                        label=f"role_phrase_{_stream_label_part(role)}",
+                        query=f"{role_query} AND ({phrase_query})",
+                        fields=("role", "text"),
+                        channel=f"role_phrase_{_stream_label_part(role)}",
+                    )
+                )
 
     if primary_intent in {"when_user_said", "workflow_failure"} or "when_user_said" in detected_intents:
         timestamp_query = _timestamp_query_for_intent(intent)
@@ -1443,6 +1503,7 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     label="timestamp_text",
                     query=f"{timestamp_query} AND ({text_query})",
                     fields=("timestamp_bucket", "text"),
+                    channel="timestamp_text",
                 )
             )
 
@@ -1453,6 +1514,7 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                 label="artifact_path_text",
                 query=f"{artifact_query} AND ({text_query})",
                 fields=("artifact_task_path", "text"),
+                channel="artifact_path_text",
             )
         )
 
@@ -1464,8 +1526,18 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     label=f"tool_event_text_{_stream_label_part(primary_intent)}",
                     query=f"{tool_query} AND ({text_query})",
                     fields=("tool_event", "text"),
+                    channel=f"tool_event_text_{_stream_label_part(primary_intent)}",
                 )
             )
+            if phrase_query and primary_intent in {"workflow_failure", "why"}:
+                streams.append(
+                    FieldedQueryStream(
+                        label=f"tool_event_phrase_{_stream_label_part(primary_intent)}",
+                        query=f"{tool_query} AND ({phrase_query})",
+                        fields=("tool_event", "text"),
+                        channel=f"tool_event_phrase_{_stream_label_part(primary_intent)}",
+                    )
+                )
 
     return _unique_streams(streams)
 
@@ -1536,6 +1608,204 @@ def _execute_fielded_query_streams(
     return merged_rows, row_stream_labels, stream_rows, diagnostics, error_types
 
 
+def _build_fielded_evidence_channels(
+    *,
+    raw_rows: list[tuple[Any, ...]],
+    query_streams: list[FieldedQueryStream],
+    stream_rows: dict[str, list[tuple[Any, ...]]],
+    candidate_pool_limit: int,
+) -> list[FieldedEvidenceChannel]:
+    channels: list[FieldedEvidenceChannel] = []
+    for stream in query_streams:
+        rows = list(stream_rows.get(stream.label) or [])
+        if not rows:
+            continue
+        label = _safe_evidence_channel_label(stream.channel or stream.label)
+        channels.append(FieldedEvidenceChannel(label=label, kind="query_stream", rows=rows[:candidate_pool_limit]))
+    if raw_rows:
+        channels.append(
+            FieldedEvidenceChannel(
+                label="fielded_stream_union",
+                kind="query_stream_union",
+                rows=list(raw_rows[:candidate_pool_limit]),
+            )
+        )
+    return channels
+
+
+def _fuse_fielded_evidence_channels(
+    channels: list[FieldedEvidenceChannel],
+    *,
+    candidate_pool_limit: int,
+) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
+    bounded_limit = max(int(candidate_pool_limit), 0)
+    row_by_id: dict[int, tuple[Any, ...]] = {}
+    channel_ranks_by_rowid: dict[int, dict[str, int]] = {}
+    channel_row_counts: dict[str, int] = {}
+    for channel in channels:
+        label = _safe_evidence_channel_label(channel.label)
+        seen_in_channel: set[int] = set()
+        for rank, row in enumerate(channel.rows, start=1):
+            rowid = int(row[0])
+            if rowid in seen_in_channel:
+                continue
+            seen_in_channel.add(rowid)
+            row_by_id.setdefault(rowid, row)
+            channel_ranks_by_rowid.setdefault(rowid, {})[label] = rank
+        channel_row_counts[label] = len(seen_in_channel)
+
+    fused_ranked_rowids = sorted(
+        row_by_id,
+        key=lambda rowid: (
+            -_rrf_score(channel_ranks_by_rowid.get(rowid, {})),
+            min(channel_ranks_by_rowid.get(rowid, {}).values(), default=10**12),
+            -len(channel_ranks_by_rowid.get(rowid, {})),
+            rowid,
+        ),
+    )
+    channel_head_rowids: list[int] = []
+    for channel in channels:
+        label = _safe_evidence_channel_label(channel.label)
+        ranked = sorted(
+            (
+                int(row[0])
+                for row in channel.rows
+                if label in channel_ranks_by_rowid.get(int(row[0]), {})
+            ),
+            key=lambda rowid: (channel_ranks_by_rowid.get(rowid, {}).get(label, 10**12), rowid),
+        )
+        if ranked:
+            channel_head_rowids.append(ranked[0])
+    selected_rowids: list[int] = []
+    seen_selected: set[int] = set()
+    for rowid in [*channel_head_rowids, *fused_ranked_rowids]:
+        if rowid in seen_selected:
+            continue
+        if len(selected_rowids) >= bounded_limit:
+            break
+        selected_rowids.append(rowid)
+        seen_selected.add(rowid)
+    fused_rows = [(rowid, -_rrf_score(channel_ranks_by_rowid.get(rowid, {}))) for rowid in selected_rowids]
+    selected_set = set(selected_rowids)
+    selected_by_channel: dict[str, int] = {}
+    dropped_by_channel: dict[str, int] = {}
+    for label, row_count in channel_row_counts.items():
+        selected_count = sum(1 for rowid in selected_set if label in channel_ranks_by_rowid.get(rowid, {}))
+        if selected_count:
+            selected_by_channel[label] = selected_count
+        dropped_count = max(int(row_count) - selected_count, 0)
+        if dropped_count:
+            dropped_by_channel[label] = dropped_count
+    return fused_rows, {
+        "enabled": True,
+        "strategy": "rank_only_rrf_evidence_channel_fusion_before_adjacent_run_collapse",
+        "rank_constant": FIELDED_EVIDENCE_RRF_RANK_CONSTANT,
+        "candidate_row_pool_limit": bounded_limit,
+        "channel_count": len(channels),
+        "channel_labels": [_safe_evidence_channel_label(channel.label) for channel in channels],
+        "channel_kinds": {_safe_evidence_channel_label(channel.label): str(channel.kind) for channel in channels},
+        "channel_row_counts": dict(sorted(channel_row_counts.items())),
+        "unique_row_count_before_fusion": len(row_by_id),
+        "selected_row_count": len(selected_rowids),
+        "dropped_row_count": max(len(row_by_id) - len(selected_rowids), 0),
+        "channel_head_rows_seeded": len(set(channel_head_rowids) & selected_set),
+        "selected_rows_by_channel": dict(sorted(selected_by_channel.items())),
+        "dropped_rows_by_channel": dict(sorted(dropped_by_channel.items())),
+        "row_channel_ranks": channel_ranks_by_rowid,
+        "selected_rowids": set(selected_rowids),
+        "raw_score_inputs_used_for_fusion": False,
+        "raw_bm25_scores_used_for_fusion": False,
+        "score_normalization_used": False,
+        "equal_channel_weights": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _rrf_score(channel_ranks: dict[str, int]) -> float:
+    return sum(1.0 / (FIELDED_EVIDENCE_RRF_RANK_CONSTANT + int(rank)) for rank in channel_ranks.values())
+
+
+def _fielded_evidence_channel_summary(
+    *,
+    fusion: dict[str, Any],
+    selected_rows: list[tuple[Any, ...]],
+    candidate_pool_limit: int,
+) -> dict[str, Any]:
+    selected_rowids = {int(row[0]) for row in selected_rows}
+    row_channel_ranks = fusion.get("row_channel_ranks") if isinstance(fusion.get("row_channel_ranks"), dict) else {}
+    selected_after_grouping: dict[str, int] = {}
+    dropped_after_grouping: dict[str, int] = {}
+    channel_row_counts = {
+        str(label): int(count or 0)
+        for label, count in (fusion.get("channel_row_counts") or {}).items()
+    }
+    for rowid in selected_rowids:
+        for label in (row_channel_ranks.get(rowid) or {}):
+            selected_after_grouping[str(label)] = selected_after_grouping.get(str(label), 0) + 1
+    for label, count in channel_row_counts.items():
+        dropped = max(count - int(selected_after_grouping.get(label, 0)), 0)
+        if dropped:
+            dropped_after_grouping[label] = dropped
+    return {
+        "enabled": bool(fusion.get("enabled", False)),
+        "strategy": str(fusion.get("strategy") or "disabled"),
+        "fusion_stage": "before_adjacent_run_collapse_and_source_session_day_rollup",
+        "rank_fusion_style": "reciprocal_rank_fusion",
+        "rank_constant": int(fusion.get("rank_constant") or FIELDED_EVIDENCE_RRF_RANK_CONSTANT),
+        "rank_only": True,
+        "raw_score_inputs_used_for_fusion": False,
+        "raw_bm25_scores_used_for_fusion": False,
+        "score_normalization_used": False,
+        "equal_channel_weights": True,
+        "candidate_row_pool_limit": int(candidate_pool_limit),
+        "channel_count": int(fusion.get("channel_count") or 0),
+        "channel_labels": [str(label) for label in fusion.get("channel_labels") or []],
+        "channel_kinds": {str(label): str(kind) for label, kind in (fusion.get("channel_kinds") or {}).items()},
+        "channel_row_counts": dict(sorted(channel_row_counts.items())),
+        "unique_row_count_before_fusion": int(fusion.get("unique_row_count_before_fusion") or 0),
+        "selected_row_count_after_fusion": int(fusion.get("selected_row_count") or 0),
+        "dropped_row_count_after_fusion": int(fusion.get("dropped_row_count") or 0),
+        "selected_rows_by_channel_after_fusion": _safe_int_count_dict(fusion.get("selected_rows_by_channel")),
+        "dropped_rows_by_channel_after_fusion": _safe_int_count_dict(fusion.get("dropped_rows_by_channel")),
+        "selected_rows_by_channel_after_grouping": dict(sorted(selected_after_grouping.items())),
+        "dropped_rows_by_channel_after_grouping": dict(sorted(dropped_after_grouping.items())),
+        "selected_row_reason_label_prefix": "fielded_bm25:evidence_channel:",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _selected_evidence_reason_labels(rowid: int, fusion: dict[str, Any]) -> list[str]:
+    row_channel_ranks = fusion.get("row_channel_ranks") if isinstance(fusion.get("row_channel_ranks"), dict) else {}
+    ranks = row_channel_ranks.get(int(rowid)) or {}
+    return [_safe_evidence_channel_label(label) for label in ranks]
+
+
+def _safe_evidence_channel_label(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", str(value).lower()).strip("_")
+    return cleaned[:48] or "unknown"
+
+
+def _safe_int_count_dict(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): int(count or 0) for key, count in sorted(value.items())}
+
+
 def _query_stream_summary(
     *,
     streams: list[FieldedQueryStream],
@@ -1593,6 +1863,7 @@ def _query_stream_diagnostic(
 ) -> dict[str, Any]:
     return {
         "label": stream.label,
+        "channel": _safe_evidence_channel_label(stream.channel or stream.label),
         "fields": list(stream.fields),
         "status": status,
         "row_count": int(row_count),
@@ -1640,6 +1911,22 @@ def _field_query(field_name: str, values: list[str] | tuple[str, ...]) -> str | 
     if len(parts) == 1:
         return parts[0]
     return "(" + " OR ".join(parts) + ")"
+
+
+def _phrase_query(field_name: str, values: list[str] | tuple[str, ...]) -> str | None:
+    if field_name not in FTS_FIELD_NAMES:
+        return None
+    tokens: list[str] = []
+    for value in values:
+        for token in _fts_tokens(str(value)):
+            lowered = token.lower()
+            if not tokens or tokens[-1] != lowered:
+                tokens.append(lowered)
+    tokens = tokens[:8]
+    if len(tokens) < 2:
+        return None
+    phrase = " ".join(_escape_fts_phrase(token) for token in tokens)
+    return f'{field_name}:"{phrase}"'
 
 
 def _anchor_values_for_fielded_streams(intent: QueryIntent) -> list[str]:
