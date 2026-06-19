@@ -19,6 +19,10 @@ RETRIEVAL_MODE_RRF_FUSION = "rrf-fusion"
 RETRIEVAL_MODE_FIELDED_BM25 = "fielded-bm25"
 RETRIEVAL_MODES = (RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODE_RRF_FUSION, RETRIEVAL_MODE_FIELDED_BM25)
 RRF_LANE_NAMES = ("package_search", "package_search_fielded_bm25")
+QUERY_PLAN_MODE_AUTO = "auto"
+QUERY_PLAN_MODE_OFF = "off"
+QUERY_PLAN_MODE_DEBUG = "debug"
+QUERY_PLAN_MODES = (QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODE_OFF, QUERY_PLAN_MODE_DEBUG)
 
 
 def run_retrieval_mode(
@@ -31,6 +35,7 @@ def run_retrieval_mode(
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
     fielded_bm25_index_dir: str | None = None,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
 ) -> dict[str, Any]:
     if retrieval_mode == RETRIEVAL_MODE_PACKAGE:
         return search(
@@ -58,6 +63,7 @@ def run_retrieval_mode(
             cwd=cwd,
             mask_context=mask_context,
             fielded_bm25_index_dir=fielded_bm25_index_dir,
+            query_plan_mode=query_plan_mode,
         )
     raise ValueError(f"unsupported retrieval mode: {retrieval_mode}")
 
@@ -70,6 +76,7 @@ def run_fielded_bm25_retrieval(
     cwd: str | None,
     mask_context: Any = None,
     fielded_bm25_index_dir: str | None = None,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
 ) -> dict[str, Any]:
     total_profile_token = start_phase_profile("total_fielded_bm25_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
@@ -108,6 +115,7 @@ def run_fielded_bm25_retrieval(
         cwd=cwd,
         mask_context=mask_context,
         include_private_diagnostics=True,
+        query_plan_mode=query_plan_mode,
     )
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
@@ -321,9 +329,12 @@ def build_fielded_bm25_retrieval_diagnostics(
     fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
     fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_evidence_channels = _fielded_evidence_channel_diagnostics(fielded_result)
+    child_query_plan = _fielded_child_query_plan_diagnostics(fielded_result)
     fielded_summary = {
         "status": fielded_result.get("status"),
         "fallback_reason": fielded_result.get("fallback_reason"),
+        "query_plan_mode": str(fielded_result.get("query_plan_mode") or QUERY_PLAN_MODE_AUTO),
+        "child_query_plan": child_query_plan,
         "candidate_count": _candidate_count(fielded_result),
         "candidate_rows": int(fielded_result.get("candidate_rows", 0) or 0),
         "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
@@ -385,6 +396,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "source_plan": source_plan,
         "fielded_bm25": fielded_summary,
         "fielded_evidence_channels": fielded_evidence_channels,
+        "fielded_child_query_plan": child_query_plan,
         "fielded_context_neighborhood": fielded_context_neighborhood,
         "fielded_source_grouping": fielded_source_grouping,
         "phase_profiles": {
@@ -790,6 +802,14 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         stream_items.append(
             {
                 "label": str(item.get("label") or "unknown"),
+                "channel": str(item.get("channel") or item.get("label") or "unknown"),
+                "intent": str(item.get("intent") or "generic_history"),
+                "kind": str(item.get("kind") or "base"),
+                "child": bool(item.get("child", False)),
+                "reason_codes": [str(reason) for reason in item.get("reason_codes") or []],
+                "skip_reason_code": item.get("skip_reason_code")
+                if item.get("skip_reason_code") is None
+                else str(item.get("skip_reason_code")),
                 "fields": [str(field) for field in item.get("fields") or []],
                 "status": str(item.get("status") or "unknown"),
                 "row_count": int(item.get("row_count") or 0),
@@ -810,8 +830,11 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
     return {
         "enabled": bool(streams.get("enabled", False)),
         "strategy": str(streams.get("strategy") or "disabled"),
+        "query_plan_mode": str(streams.get("query_plan_mode") or QUERY_PLAN_MODE_AUTO),
         "stream_count": int(streams.get("stream_count") or len(stream_items)),
         "streams": stream_items,
+        "child_stream_count": int(streams.get("child_stream_count") or 0),
+        "child_stream_labels": [str(label) for label in streams.get("child_stream_labels") or []],
         "candidate_row_pool_limit_per_stream": int(streams.get("candidate_row_pool_limit_per_stream") or 0),
         "per_stream_limit": int(streams.get("per_stream_limit") or 0),
         "stream_hit_limit_count": int(streams.get("stream_hit_limit_count") or 0),
@@ -832,6 +855,84 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "raw_cwd_included": False,
         "source_lines_included": False,
         "line_numbers_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_child_query_plan_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    plan = fielded_result.get("fielded_child_query_plan") if isinstance(fielded_result, dict) else {}
+    if not isinstance(plan, dict):
+        plan = {}
+    children: list[dict[str, Any]] = []
+    for item in plan.get("children") or []:
+        if not isinstance(item, dict):
+            continue
+        children.append(
+            {
+                "label": str(item.get("label") or "unknown"),
+                "intent": str(item.get("intent") or "generic_history"),
+                "kind": str(item.get("kind") or "unknown"),
+                "fields": [str(field) for field in item.get("fields") or []],
+                "status": str(item.get("status") or "unknown"),
+                "skip_reason_code": item.get("skip_reason_code")
+                if item.get("skip_reason_code") is None
+                else str(item.get("skip_reason_code")),
+                "reason_codes": [str(reason) for reason in item.get("reason_codes") or []],
+                "row_count": int(item.get("row_count") or 0),
+                "deduped_row_count": int(item.get("deduped_row_count") or 0),
+                "stream_limit": int(item.get("stream_limit") or 0),
+                "hit_limit": bool(item.get("hit_limit", False)),
+                "selected_rows_after_grouping": int(item.get("selected_rows_after_grouping") or 0),
+                "dropped_rows_after_grouping": int(item.get("dropped_rows_after_grouping") or 0),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "raw_session_ids_included": False,
+                "raw_cwd_included": False,
+                "vectors_or_persisted_indexes_included": False,
+            }
+        )
+    skipped: list[dict[str, Any]] = []
+    for item in plan.get("skipped") or []:
+        if not isinstance(item, dict):
+            continue
+        skipped.append(
+            {
+                "intent": str(item.get("intent") or "generic_history"),
+                "status": str(item.get("status") or "skipped"),
+                "skip_reason_code": str(item.get("skip_reason_code") or "unknown"),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+            }
+        )
+    return {
+        "query_plan_mode": str(plan.get("query_plan_mode") or QUERY_PLAN_MODE_AUTO),
+        "primary_intent": str(plan.get("primary_intent") or "generic_history"),
+        "supported_child_channel_intent": plan.get("supported_child_channel_intent")
+        if plan.get("supported_child_channel_intent") is None
+        else str(plan.get("supported_child_channel_intent")),
+        "enabled": bool(plan.get("enabled", False)),
+        "debug": bool(plan.get("debug", False)),
+        "child_channel_count": int(plan.get("child_channel_count") or len(children)),
+        "child_channel_labels": [str(label) for label in plan.get("child_channel_labels") or []],
+        "children": children,
+        "skipped": skipped,
+        "privacy": {
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "private_transcript_text_included": False,
+            "raw_paths_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
         "vectors_or_persisted_indexes_included": False,
     }
 

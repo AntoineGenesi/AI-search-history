@@ -73,6 +73,7 @@ def build_semantic_debug_payload(
         mask_context=mask_context,
         use_rg_prefilter=getattr(args, "rg_prefilter", False),
         fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
+        query_plan_mode=getattr(args, "query_plan", "auto"),
     )
     result["warnings"] = sorted(
         set(result.get("warnings", []) + intent.warnings + (configuration_warnings or []))
