@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +31,14 @@ from .tool_events import detect_events_for_record
 
 
 FIELDED_BM25_VERSION = "fielded-sqlite-fts5-record-chunk-v1"
+FIELDED_BM25_INDEX_SCHEMA_VERSION = "fielded-bm25-segment-cache-v1"
+FIELDED_BM25_PARSER_VERSION = "jsonl-record-parser-v1"
 FTS_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/-]*", re.IGNORECASE)
 TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 # Keep JSONL rows as source-record candidates so the FTS LIMIT bounds
 # downstream parse/rank cost instead of expanding each hit into large chunks.
 CHUNK_RECORD_LIMIT = 1
+FIELDED_BM25_CHUNKING_VERSION = f"record-limit-{CHUNK_RECORD_LIMIT}"
 INDEX_LINE_TEXT_LIMIT = 1200
 FIELDED_SOURCE_GROUPING_POOL_FACTOR = 4
 FTS_FIELD_NAMES = {"role", "timestamp_bucket", "tool_event", "artifact_task_path", "cwd_project", "text"}
@@ -81,6 +86,18 @@ class FieldedBm25Index:
             "version": self.version,
             "available": self.available,
             "unavailable_reason": self.unavailable_reason,
+            "persistent_index_enabled": bool(self.metrics.get("persistent_index_enabled", False)),
+            "index_schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "parser_version": FIELDED_BM25_PARSER_VERSION,
+            "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
+            "sources_reused": int(self.metrics.get("sources_reused", 0)),
+            "sources_reindexed": int(self.metrics.get("sources_reindexed", 0)),
+            "sources_invalidated": int(self.metrics.get("sources_invalidated", 0)),
+            "sources_deleted": int(self.metrics.get("sources_deleted", 0)),
+            "segments_loaded": int(self.metrics.get("segments_loaded", 0)),
+            "segments_written": int(self.metrics.get("segments_written", 0)),
+            "warm_query_reused_index": bool(self.metrics.get("warm_query_reused_index", False)),
+            "persistent_reuse_claim": "local_work_reduction_only_not_token_savings_or_final_answer_quality",
             "indexed_file_count": int(self.metrics.get("indexed_files", 0)),
             "indexed_record_count": int(self.metrics.get("indexed_records", 0)),
             "indexed_chunk_count": int(self.metrics.get("indexed_chunks", 0)),
@@ -109,6 +126,157 @@ class FieldedBm25Index:
             "raw_cwd_included": False,
             "vectors_or_persisted_indexes_included": False,
         }
+
+
+@dataclass
+class FieldedBm25PersistentCache:
+    root: Path
+    manifest: dict[str, Any] = field(default_factory=dict)
+    sources_deleted: int = 0
+
+    @classmethod
+    def open(cls, root: Path) -> "FieldedBm25PersistentCache":
+        root = Path(root).expanduser()
+        segments_dir = root / "segments"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = root / "manifest.json"
+        manifest: dict[str, Any] = {
+            "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "parser_version": FIELDED_BM25_PARSER_VERSION,
+            "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
+            "sources": {},
+        }
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = {}
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("schema_version") == FIELDED_BM25_INDEX_SCHEMA_VERSION
+                and loaded.get("parser_version") == FIELDED_BM25_PARSER_VERSION
+                and loaded.get("chunking_version") == FIELDED_BM25_CHUNKING_VERSION
+                and isinstance(loaded.get("sources"), dict)
+            ):
+                manifest = loaded
+        cache = cls(root=root, manifest=manifest)
+        cache.sources_deleted = cache.prune_deleted_sources()
+        return cache
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.root / "manifest.json"
+
+    @property
+    def segments_dir(self) -> Path:
+        return self.root / "segments"
+
+    def source_key(self, path: Path) -> str:
+        return hashlib.sha256(str(Path(path).expanduser().resolve()).encode("utf-8", errors="replace")).hexdigest()
+
+    def segment_path(self, source_key: str) -> Path:
+        return self.segments_dir / f"{source_key}.json"
+
+    def metadata_for(self, path: Path, *, size: int, source_kind: str) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "parser_version": FIELDED_BM25_PARSER_VERSION,
+            "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
+            "source_kind": source_kind,
+            "size": int(size),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        }
+
+    def load_segment(self, path: Path, *, size: int, source_kind: str) -> tuple[dict[str, Any] | None, bool]:
+        source_key = self.source_key(path)
+        metadata = self.metadata_for(path, size=size, source_kind=source_kind)
+        entry = (self.manifest.get("sources") or {}).get(source_key)
+        if not isinstance(entry, dict):
+            return None, False
+        expected = entry.get("metadata")
+        if not isinstance(expected, dict) or any(expected.get(key) != value for key, value in metadata.items()):
+            self._drop_source(source_key)
+            return None, True
+        segment_path = self.segment_path(source_key)
+        try:
+            segment = json.loads(segment_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._drop_source(source_key)
+            return None, True
+        if not _valid_persistent_segment(segment, metadata=metadata):
+            self._drop_source(source_key)
+            return None, True
+        return segment, False
+
+    def write_segment(
+        self,
+        path: Path,
+        *,
+        size: int,
+        source_kind: str,
+        record_count: int,
+        byte_count: int,
+        rows: list[dict[str, Any]],
+        content_hash: str | None,
+    ) -> None:
+        source_key = self.source_key(path)
+        metadata = self.metadata_for(path, size=size, source_kind=source_kind)
+        segment = {
+            "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "parser_version": FIELDED_BM25_PARSER_VERSION,
+            "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
+            "metadata": metadata,
+            "record_count": int(record_count),
+            "byte_count": int(byte_count),
+            "row_count": len(rows),
+            "content_hash": content_hash,
+            "rows": rows,
+            "raw_paths_included": False,
+            "raw_query_text_included": False,
+            "vectors_included": False,
+        }
+        tmp_path = self.segment_path(source_key).with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(segment, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        tmp_path.replace(self.segment_path(source_key))
+        self.manifest.setdefault("sources", {})[source_key] = {
+            "metadata": metadata,
+            "segment_file": f"segments/{source_key}.json",
+            "source_path": str(Path(path).expanduser().resolve()),
+            "record_count": int(record_count),
+            "row_count": len(rows),
+        }
+
+    def prune_deleted_sources(self) -> int:
+        sources = self.manifest.setdefault("sources", {})
+        deleted = 0
+        for source_key, entry in list(sources.items()):
+            source_path = entry.get("source_path") if isinstance(entry, dict) else None
+            if source_path and not Path(source_path).exists():
+                self._drop_source(source_key)
+                deleted += 1
+        return deleted
+
+    def save(self) -> None:
+        payload = {
+            "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "parser_version": FIELDED_BM25_PARSER_VERSION,
+            "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
+            "sources": self.manifest.get("sources") or {},
+        }
+        tmp_path = self.manifest_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        tmp_path.replace(self.manifest_path)
+        self.manifest = payload
+
+    def _drop_source(self, source_key: str) -> None:
+        try:
+            self.segment_path(source_key).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        self.manifest.setdefault("sources", {}).pop(source_key, None)
 
 
 @dataclass(frozen=True)
@@ -143,6 +311,7 @@ def build_fielded_bm25_index(
     *,
     default_tz,
     planned_jsonl_files: PlannedJsonlFiles | None = None,
+    persistent_index_dir: Path | str | None = None,
 ) -> FieldedBm25Index:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_index_build")
@@ -181,8 +350,19 @@ def build_fielded_bm25_index(
             "indexed_records": 0,
             "indexed_chunks": 0,
             "read_error_files": 0,
+            "persistent_index_enabled": persistent_index_dir is not None,
+            "sources_reused": 0,
+            "sources_reindexed": 0,
+            "sources_invalidated": 0,
+            "sources_deleted": 0,
+            "segments_loaded": 0,
+            "segments_written": 0,
+            "warm_query_reused_index": False,
         },
     )
+    persistent_cache = FieldedBm25PersistentCache.open(Path(persistent_index_dir)) if persistent_index_dir else None
+    if persistent_cache is not None:
+        index.metrics["sources_deleted"] = persistent_cache.sources_deleted
     rowid = 0
     insert_buffer: list[tuple[int, str, str, str, str, str, str, str]] = []
     if planned_jsonl_files is not None:
@@ -195,11 +375,41 @@ def build_fielded_bm25_index(
         source_kind = source_kind_for_path(path, plan)
         file_records = 0
         file_bytes = int(size) if planned_jsonl_files is not None else stat_size(path)
+        segment_start_rowid = rowid
+        content_hasher = hashlib.sha256()
+        if persistent_cache is not None:
+            segment, invalidated = persistent_cache.load_segment(path, size=file_bytes, source_kind=source_kind)
+            if invalidated:
+                index.metrics["sources_invalidated"] += 1
+            if segment is not None:
+                rowid = _load_persistent_segment_rows(
+                    connection,
+                    index,
+                    insert_buffer,
+                    rowid,
+                    path=path,
+                    source_kind=source_kind,
+                    segment=segment,
+                )
+                file_records = int(segment.get("record_count") or 0)
+                index.files[str(path)] = {
+                    "source_kind": source_kind,
+                    "record_count": file_records,
+                    "byte_count": file_bytes,
+                }
+                index.metrics["indexed_files"] += 1
+                index.metrics["indexed_records"] += file_records
+                index.metrics["build_bytes"] += file_bytes
+                index.metrics["sources_reused"] += 1
+                index.metrics["segments_loaded"] += int(segment.get("row_count") or len(segment.get("rows") or []))
+                continue
+            index.metrics["sources_reindexed"] += 1
         try:
             if path.suffix == ".jsonl":
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
                     chunk_lines: list[tuple[int, str]] = []
                     for line_number, raw_line in enumerate(handle, 1):
+                        content_hasher.update(raw_line.encode("utf-8", errors="replace"))
                         file_records += 1
                         chunk_lines.append((line_number, raw_line.rstrip("\n")))
                         if len(chunk_lines) >= CHUNK_RECORD_LIMIT:
@@ -226,6 +436,7 @@ def build_fielded_bm25_index(
                 _flush_insert_buffer(connection, insert_buffer)
             else:
                 for record in iter_records_for_file(path, source_kind, default_tz):
+                    content_hasher.update(record.text.encode("utf-8", errors="replace"))
                     rowid += 1
                     file_records += 1
                     _insert_record(connection, rowid, record, source_kind)
@@ -255,8 +466,27 @@ def build_fielded_bm25_index(
         if path.suffix != ".jsonl":
             index.metrics["indexed_chunks"] += file_records
         index.metrics["build_bytes"] += file_bytes
+        if persistent_cache is not None:
+            segment_rows = [
+                _persistent_row_from_ref(index.records[candidate_rowid])
+                for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
+                if candidate_rowid in index.records
+            ]
+            persistent_cache.write_segment(
+                path,
+                size=file_bytes,
+                source_kind=source_kind,
+                record_count=file_records,
+                byte_count=file_bytes,
+                rows=segment_rows,
+                content_hash=content_hasher.hexdigest() if file_records else None,
+            )
+            index.metrics["segments_written"] += len(segment_rows)
     _flush_insert_buffer(connection, insert_buffer)
     connection.commit()
+    if persistent_cache is not None:
+        persistent_cache.save()
+        index.metrics["warm_query_reused_index"] = bool(index.metrics.get("sources_reused", 0))
     index.metrics["build_elapsed_ms"] = _elapsed_ms(started)
     if planned_jsonl_files is not None:
         index.metrics["planned_file_enumeration_reused"] = True
@@ -524,25 +754,29 @@ def search_with_fielded_bm25(
 
 
 def _insert_record(connection: sqlite3.Connection, rowid: int, record: Record, source_kind: str) -> None:
-    facets = facets_for_record(path=record.path, text=record.text, artifacts=[])
-    tool_event_terms = _tool_event_terms(record)
-    artifact_task_path_terms = " ".join(sorted(set(facets.artifacts + facets.tasks + _path_terms(record))))
     connection.execute(
         """
         INSERT INTO records(
             rowid, source_kind, role, cwd_project, timestamp_bucket, tool_event, artifact_task_path, text
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            rowid,
-            source_kind,
-            _role_bucket(record.role),
-            _cwd_project_terms(record),
-            _timestamp_bucket(record),
-            tool_event_terms,
-            artifact_task_path_terms,
-            record.text,
-        ),
+        _record_insert_row(rowid, record, source_kind),
+    )
+
+
+def _record_insert_row(rowid: int, record: Record, source_kind: str) -> tuple[int, str, str, str, str, str, str, str]:
+    facets = facets_for_record(path=record.path, text=record.text, artifacts=[])
+    tool_event_terms = _tool_event_terms(record)
+    artifact_task_path_terms = " ".join(sorted(set(facets.artifacts + facets.tasks + _path_terms(record))))
+    return (
+        rowid,
+        source_kind,
+        _role_bucket(record.role),
+        _cwd_project_terms(record),
+        _timestamp_bucket(record),
+        tool_event_terms,
+        artifact_task_path_terms,
+        record.text,
     )
 
 
@@ -557,6 +791,140 @@ def _raw_insert_row(rowid: int, raw_text: str, source_kind: str) -> tuple[int, s
         _raw_artifact_task_path_terms(raw_text),
         raw_text,
     )
+
+
+def _persistent_row_from_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
+    if ref.record is not None:
+        insert_row = _record_insert_row(0, ref.record, ref.source_kind)
+        record_payload = _record_to_persistent_payload(ref.record)
+    else:
+        insert_row = _raw_insert_row(0, ref.raw_text, ref.source_kind)
+        record_payload = None
+    return {
+        "line": int(ref.line),
+        "line_end": int(ref.line_end or ref.line),
+        "source_kind": ref.source_kind,
+        "raw_text": ref.raw_text,
+        "raw_materialization_text": ref.raw_materialization_text,
+        "record": record_payload,
+        "fts": {
+            "source_kind": insert_row[1],
+            "role": insert_row[2],
+            "cwd_project": insert_row[3],
+            "timestamp_bucket": insert_row[4],
+            "tool_event": insert_row[5],
+            "artifact_task_path": insert_row[6],
+            "text": insert_row[7],
+        },
+    }
+
+
+def _load_persistent_segment_rows(
+    connection: sqlite3.Connection,
+    index: FieldedBm25Index,
+    insert_buffer: list[tuple[int, str, str, str, str, str, str, str]],
+    rowid: int,
+    *,
+    path: Path,
+    source_kind: str,
+    segment: dict[str, Any],
+) -> int:
+    for row in segment.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        fts = row.get("fts") if isinstance(row.get("fts"), dict) else {}
+        rowid += 1
+        insert_buffer.append(
+            (
+                rowid,
+                str(fts.get("source_kind") or source_kind),
+                str(fts.get("role") or ""),
+                str(fts.get("cwd_project") or ""),
+                str(fts.get("timestamp_bucket") or ""),
+                str(fts.get("tool_event") or ""),
+                str(fts.get("artifact_task_path") or ""),
+                str(fts.get("text") or row.get("raw_text") or ""),
+            )
+        )
+        record_payload = row.get("record") if isinstance(row.get("record"), dict) else None
+        record = _record_from_persistent_payload(record_payload, path=path) if record_payload else None
+        index.records[rowid] = FieldedBm25RecordRef(
+            rowid=rowid,
+            path=path,
+            line=int(row.get("line") or 1),
+            line_end=int(row.get("line_end") or row.get("line") or 1),
+            source_kind=source_kind,
+            raw_text=str(row.get("raw_text") or ""),
+            raw_materialization_text=(
+                str(row.get("raw_materialization_text"))
+                if row.get("raw_materialization_text") is not None
+                else None
+            ),
+            record=record,
+        )
+        index.metrics["indexed_chunks"] += 1
+        if len(insert_buffer) >= 500:
+            _flush_insert_buffer(connection, insert_buffer)
+    return rowid
+
+
+def _record_to_persistent_payload(record: Record) -> dict[str, Any]:
+    return {
+        "line": int(record.line),
+        "role": record.role,
+        "text": record.text,
+        "timestamp": record.timestamp.isoformat() if record.timestamp is not None else None,
+        "cwd": record.cwd,
+        "raw_timestamp": record.raw_timestamp,
+        "source_format": record.source_format,
+        "record_id": record.record_id,
+        "parent_id": record.parent_id,
+        "conversation_id": record.conversation_id,
+    }
+
+
+def _record_from_persistent_payload(payload: dict[str, Any] | None, *, path: Path) -> Record | None:
+    if not isinstance(payload, dict):
+        return None
+    timestamp = None
+    raw_timestamp = payload.get("timestamp")
+    if isinstance(raw_timestamp, str) and raw_timestamp:
+        try:
+            timestamp = datetime.fromisoformat(raw_timestamp)
+        except ValueError:
+            timestamp = None
+    return Record(
+        path=str(path),
+        line=int(payload.get("line") or 1),
+        role=str(payload.get("role") or ""),
+        text=str(payload.get("text") or ""),
+        timestamp=timestamp,
+        cwd=str(payload.get("cwd")) if payload.get("cwd") else None,
+        raw_timestamp=str(payload.get("raw_timestamp")) if payload.get("raw_timestamp") else None,
+        raw=None,
+        source_format=str(payload.get("source_format")) if payload.get("source_format") else None,
+        record_id=str(payload.get("record_id")) if payload.get("record_id") else None,
+        parent_id=str(payload.get("parent_id")) if payload.get("parent_id") else None,
+        conversation_id=str(payload.get("conversation_id")) if payload.get("conversation_id") else None,
+    )
+
+
+def _valid_persistent_segment(segment: Any, *, metadata: dict[str, Any]) -> bool:
+    if not isinstance(segment, dict):
+        return False
+    if segment.get("schema_version") != FIELDED_BM25_INDEX_SCHEMA_VERSION:
+        return False
+    if segment.get("parser_version") != FIELDED_BM25_PARSER_VERSION:
+        return False
+    if segment.get("chunking_version") != FIELDED_BM25_CHUNKING_VERSION:
+        return False
+    segment_metadata = segment.get("metadata")
+    if not isinstance(segment_metadata, dict):
+        return False
+    if any(segment_metadata.get(key) != value for key, value in metadata.items()):
+        return False
+    rows = segment.get("rows")
+    return isinstance(rows, list)
 
 
 def _add_raw_chunk(
