@@ -11,6 +11,7 @@ from typing import Any
 from .agent_contract import (
     build_agent_find_payload,
     build_compact_provenance_handoff,
+    context_actions_for_source_ref,
     expansion_action_context_from_source_plan,
     build_source_scope_summary,
     build_stage_diagnostics,
@@ -122,6 +123,7 @@ def build_semantic_debug_payload(
         joins,
         hints,
         expansion_action_context=expansion_action_context,
+        include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
@@ -134,6 +136,7 @@ def build_semantic_debug_payload(
         no_evidence_report=agent_find.get("no_evidence_report"),
         retrieval_pressure=agent_find.get("retrieval_pressure"),
         expansion_action_context=expansion_action_context,
+        include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
@@ -553,40 +556,49 @@ def build_next_reads(
     hints: dict[str, str | None],
     *,
     expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
 ) -> list[dict[str, str]]:
     reads: list[dict[str, Any]] = []
     for candidate in candidates[:5]:
         ref = candidate.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append(
-                {
-                    "kind": "jsonl_source_ref",
-                    "target": target,
-                    "source_ref": dict(ref),
-                    "reason": "confirm candidate snippet in source context",
-                    "expansion_actions": read_more_actions_for_source_ref(
-                        ref,
-                        expansion_action_context=expansion_action_context,
-                    ),
-                }
-            )
+            read = {
+                "kind": "jsonl_source_ref",
+                "target": target,
+                "source_ref": dict(ref),
+                "reason": "confirm candidate snippet in source context",
+                "expansion_actions": read_more_actions_for_source_ref(
+                    ref,
+                    expansion_action_context=expansion_action_context,
+                ),
+            }
+            if include_context_actions:
+                read["context_actions"] = context_actions_for_source_ref(
+                    ref,
+                    expansion_action_context=expansion_action_context,
+                )
+            reads.append(read)
     for event in tool_proof.get("events", [])[:4]:
         ref = event.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append(
-                {
-                    "kind": "tool_event_source_ref",
-                    "target": target,
-                    "source_ref": dict(ref),
-                    "reason": "confirm structured action proof",
-                    "expansion_actions": read_more_actions_for_source_ref(
-                        ref,
-                        expansion_action_context=expansion_action_context,
-                    ),
-                }
-            )
+            read = {
+                "kind": "tool_event_source_ref",
+                "target": target,
+                "source_ref": dict(ref),
+                "reason": "confirm structured action proof",
+                "expansion_actions": read_more_actions_for_source_ref(
+                    ref,
+                    expansion_action_context=expansion_action_context,
+                ),
+            }
+            if include_context_actions:
+                read["context_actions"] = context_actions_for_source_ref(
+                    ref,
+                    expansion_action_context=expansion_action_context,
+                )
+            reads.append(read)
     for item in joins.get("review_evidence", [])[:4]:
         if item.get("path"):
             reads.append({"kind": "task_or_review_artifact", "target": item["path"], "reason": "confirm task/review verdict and claim-action classification"})

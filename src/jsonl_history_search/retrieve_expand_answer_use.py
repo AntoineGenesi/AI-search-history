@@ -453,6 +453,7 @@ def replay_read_more_argv(argv: list[str]) -> dict[str, Any]:
         request=ExpansionRequest(
             target=args.target,
             mode=args.mode,
+            scope=args.scope,
             before=args.before,
             after=args.after,
             next_count=args.next_count,
@@ -470,7 +471,8 @@ def parse_read_more_argv(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="read-more", add_help=False)
     parser.add_argument("command")
     parser.add_argument("target")
-    parser.add_argument("--mode", choices=("record", "window", "next"), default="record")
+    parser.add_argument("--mode", choices=("record", "window", "next", "before", "neighborhood"), default="record")
+    parser.add_argument("--scope", choices=("source", "session", "day"), default="source")
     parser.add_argument("--before", type=int, default=2)
     parser.add_argument("--after", type=int, default=2)
     parser.add_argument("--next-count", type=int, default=3)

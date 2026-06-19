@@ -150,7 +150,11 @@ def build_agent_find_payload(
         source_plan=source_plan,
         search_result=search_result,
         candidates=candidate_dicts,
-        next_reads=next_reads_from_candidates(candidates, expansion_action_context=expansion_action_context),
+        next_reads=next_reads_from_candidates(
+            candidates,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=compact_provenance_handoff,
+        ),
         source_family="local_ai_conversation_jsonl",
         question_family={
             "primary": "agent_find",
@@ -159,6 +163,7 @@ def build_agent_find_payload(
         no_evidence_report=no_evidence_report,
         retrieval_pressure=agent_find.get("retrieval_pressure"),
         expansion_action_context=expansion_action_context,
+        include_context_actions=compact_provenance_handoff,
     )
     agent_find["source_locator_handoff"] = handoff
     if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
@@ -194,7 +199,7 @@ def build_agent_find_payload(
 
 def command_surface() -> dict[str, str]:
     return {
-        "read-more": "Bounded provenance expansion for an exact source_ref: record, window, or next records without rerunning broad search.",
+        "read-more": "Bounded provenance expansion for an exact source_ref: record, window, before/next, or source/session/day neighborhood without rerunning broad search.",
         "source-locator-handoff": "Inspect this before broad search: stable handoff with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
         "find-candidates": "Focused fuzzy/typo/synonym/paraphrase candidate recovery with compact source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
@@ -1826,6 +1831,7 @@ def build_source_locator_handoff(
     no_evidence_report: dict[str, Any] | None = None,
     retrieval_pressure: dict[str, Any] | None = None,
     expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
 ) -> dict[str, Any]:
     """Build the stable agent handoff for deciding where to read next."""
     source_scope = build_source_scope_summary(source_plan, search_result)
@@ -1845,6 +1851,7 @@ def build_source_locator_handoff(
         next_reads=next_read_rows,
         query_plan=query_plan,
         expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
     )
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
@@ -1874,6 +1881,14 @@ def build_source_locator_handoff(
             {"field": "target", "action": "included", "preserves_exact_refs": True},
             {"field": "next_read", "action": "included", "preserves_exact_refs": True},
             {"field": "expansion_actions", "action": "included", "preserves_exact_refs": True},
+            {
+                "field": "context_actions",
+                "action": "included" if include_context_actions else "omitted",
+                "preserves_exact_refs": True,
+                "reason": "compact_provenance_handoff_requested"
+                if include_context_actions
+                else "default_output_size_guard",
+            },
             {"field": "reason_codes", "action": "capped", "limit": SOURCE_WINDOW_REASON_CODE_LIMIT},
             {
                 "field": "text_or_snippets",
@@ -1949,12 +1964,14 @@ def build_source_windows(
     next_reads: list[dict[str, Any]],
     query_plan: dict[str, Any] | None,
     expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
 ) -> list[dict[str, Any]]:
     return build_source_window_package(
         candidates=candidates,
         next_reads=next_reads,
         query_plan=query_plan,
         expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
     )["windows"]
 
 
@@ -1964,6 +1981,7 @@ def build_source_window_package(
     next_reads: list[dict[str, Any]],
     query_plan: dict[str, Any] | None,
     expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
 ) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     next_read_by_candidate = {
@@ -1995,38 +2013,43 @@ def build_source_window_package(
             "source_ref": source_ref,
             "reason": "open source_ref target for surrounding transcript context",
         }
-        next_read = {key: value for key, value in next_read.items() if key != "expansion_actions"}
-        windows.append(
-            {
-                "schema_version": 1,
-                "window_id": f"sw{index:03d}",
-                "candidate_id": candidate_id,
-                "source_ref": source_ref,
-                "target": target,
-                "intent": primary_intent,
-                "window_kind": source_window_kind(primary_intent, window_needs),
-                "selection_reason_code": selected["selection_reason_code"],
-                "role": data.get("role"),
-                "timestamp_utc": data.get("timestamp_utc"),
-                "cwd": data.get("cwd"),
-                "project_hint": project_hint_from_cwd(data.get("cwd")),
-                "reason_codes": list(data.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
-                "next_read": next_read,
-                "expansion_actions": read_more_actions_for_source_ref(
-                    source_ref,
-                    candidate_id=candidate_id,
-                    expansion_action_context=expansion_action_context,
-                ),
-                "text_included": False,
-                "source_window_text_included": False,
-                "reason": "open source_ref target for surrounding transcript context",
-                "open_instruction": "open source_ref target for surrounding transcript context",
-                "searched_scope_boundary": {
-                    "answer_scope": "candidate_from_searched_scope",
-                    "not_all_history_absence": True,
-                },
-            }
-        )
+        next_read = {key: value for key, value in next_read.items() if key not in {"expansion_actions", "context_actions"}}
+        window = {
+            "schema_version": 1,
+            "window_id": f"sw{index:03d}",
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "target": target,
+            "intent": primary_intent,
+            "window_kind": source_window_kind(primary_intent, window_needs),
+            "selection_reason_code": selected["selection_reason_code"],
+            "role": data.get("role"),
+            "timestamp_utc": data.get("timestamp_utc"),
+            "cwd": data.get("cwd"),
+            "project_hint": project_hint_from_cwd(data.get("cwd")),
+            "reason_codes": list(data.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
+            "next_read": next_read,
+            "expansion_actions": read_more_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            ),
+            "text_included": False,
+            "source_window_text_included": False,
+            "reason": "open source_ref target for surrounding transcript context",
+            "open_instruction": "open source_ref target for surrounding transcript context",
+            "searched_scope_boundary": {
+                "answer_scope": "candidate_from_searched_scope",
+                "not_all_history_absence": True,
+            },
+        }
+        if include_context_actions:
+            window["context_actions"] = context_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        windows.append(window)
     selected_ids = {str(item["data"].get("candidate_id") or "") for item in selected_candidates}
     selected_groups = {str(item["group_key"]) for item in selected_candidates}
     omitted_candidates = selection_result["omitted"]
@@ -2305,6 +2328,7 @@ def next_reads_from_candidates(
     candidates: list[dict[str, Any]] | list[CandidateRow],
     *,
     expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
 ) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
     for candidate in candidates[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]:
@@ -2317,20 +2341,25 @@ def next_reads_from_candidates(
         target = source_ref_target(ref)
         if target:
             source_ref = dict(ref)
-            reads.append(
-                {
-                    "kind": "jsonl_source_ref",
-                    "target": target,
-                    "candidate_id": str(candidate_id or ""),
-                    "source_ref": source_ref,
-                    "reason": "open candidate source_ref before broad search",
-                    "expansion_actions": read_more_actions_for_source_ref(
-                        source_ref,
-                        candidate_id=str(candidate_id or ""),
-                        expansion_action_context=expansion_action_context,
-                    ),
-                }
-            )
+            read = {
+                "kind": "jsonl_source_ref",
+                "target": target,
+                "candidate_id": str(candidate_id or ""),
+                "source_ref": source_ref,
+                "reason": "open candidate source_ref before broad search",
+                "expansion_actions": read_more_actions_for_source_ref(
+                    source_ref,
+                    candidate_id=str(candidate_id or ""),
+                    expansion_action_context=expansion_action_context,
+                ),
+            }
+            if include_context_actions:
+                read["context_actions"] = context_actions_for_source_ref(
+                    source_ref,
+                    candidate_id=str(candidate_id or ""),
+                    expansion_action_context=expansion_action_context,
+                )
+            reads.append(read)
     return reads
 
 
@@ -2433,6 +2462,250 @@ def read_more_actions_for_source_ref(
             ]
         )
     return actions
+
+
+def context_actions_for_source_ref(
+    source_ref: dict[str, Any],
+    *,
+    candidate_id: str | None = None,
+    expansion_action_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    target = source_ref_target(source_ref)
+    if not target:
+        return []
+    line = normalized_source_ref_line(source_ref.get("line"))
+    context_argv = expansion_action_context_argv(expansion_action_context)
+    ladder = [
+        context_action(
+            source_ref,
+            target=target,
+            action_id="record",
+            label="record",
+            mode="record",
+            scope="source",
+            argv=["read-more", target, "--mode", "record", "--format", "json", *context_argv],
+            bounds={"max_records": 1},
+            included_semantics="anchor_only",
+            omitted_semantics="adjacent_omitted",
+            continuation_semantics="use_window_or_neighborhood",
+            candidate_id=candidate_id,
+        )
+    ]
+    if not line:
+        return ladder
+    ladder.extend(
+        [
+            context_action(
+                source_ref,
+                target=target,
+                action_id="window",
+                label="source_window",
+                mode="window",
+                scope="source",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "window",
+                    "--scope",
+                    "source",
+                    "--before",
+                    "2",
+                    "--after",
+                    "2",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"before": 2, "after": 2, "max_records": 20},
+                included_semantics="anchor_plus_bounded_source_before_after",
+                omitted_semantics="outside_window_omitted",
+                continuation_semantics="continue_from_boundaries",
+                candidate_id=candidate_id,
+            ),
+            context_action(
+                source_ref,
+                target=target,
+                action_id="before",
+                label="before",
+                mode="before",
+                scope="source",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "before",
+                    "--scope",
+                    "source",
+                    "--before",
+                    "3",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"before": 3, "after": 0, "max_records": 20},
+                included_semantics="bounded_previous_source_rows",
+                omitted_semantics="anchor_after_and_earlier_beyond_bound_omitted",
+                continuation_semantics="continue_before_from_first_returned",
+                candidate_id=candidate_id,
+            ),
+            context_action(
+                source_ref,
+                target=target,
+                action_id="next",
+                label="after",
+                mode="next",
+                scope="source",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "next",
+                    "--scope",
+                    "source",
+                    "--next-count",
+                    "3",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"next_count": 3, "max_records": 20},
+                included_semantics="bounded_next_source_rows",
+                omitted_semantics="anchor_before_and_later_beyond_bound_omitted",
+                continuation_semantics="continue_next_from_last_returned",
+                candidate_id=candidate_id,
+            ),
+            context_action(
+                source_ref,
+                target=target,
+                action_id="source_neighborhood",
+                label="collapsed_or_adjacent_window",
+                mode="neighborhood",
+                scope="source",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "neighborhood",
+                    "--scope",
+                    "source",
+                    "--before",
+                    "4",
+                    "--after",
+                    "4",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"before": 4, "after": 4, "max_records": 20},
+                included_semantics="bounded_same_source_neighborhood",
+                omitted_semantics="outside_neighborhood_omitted",
+                continuation_semantics="continue_with_boundary_reads",
+                candidate_id=candidate_id,
+            ),
+            context_action(
+                source_ref,
+                target=target,
+                action_id="session_neighborhood",
+                label="same_session_neighborhood",
+                mode="neighborhood",
+                scope="session",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "neighborhood",
+                    "--scope",
+                    "session",
+                    "--before",
+                    "6",
+                    "--after",
+                    "6",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"before": 6, "after": 6, "max_records": 20},
+                included_semantics="bounded_same_session_neighborhood",
+                omitted_semantics="outside_bound_or_session_mismatch_omitted",
+                continuation_semantics="fallback_to_source_neighborhood_if_no_session_metadata",
+                candidate_id=candidate_id,
+            ),
+            context_action(
+                source_ref,
+                target=target,
+                action_id="day_neighborhood",
+                label="same_day_neighborhood",
+                mode="neighborhood",
+                scope="day",
+                argv=[
+                    "read-more",
+                    target,
+                    "--mode",
+                    "neighborhood",
+                    "--scope",
+                    "day",
+                    "--before",
+                    "6",
+                    "--after",
+                    "6",
+                    "--format",
+                    "json",
+                    *context_argv,
+                ],
+                bounds={"before": 6, "after": 6, "max_records": 20},
+                included_semantics="bounded_same_day_neighborhood",
+                omitted_semantics="outside_bound_or_day_mismatch_omitted",
+                continuation_semantics="continue_by_source_boundaries",
+                candidate_id=candidate_id,
+            ),
+        ]
+    )
+    return ladder
+
+
+def context_action(
+    source_ref: dict[str, Any],
+    *,
+    target: str,
+    action_id: str,
+    label: str,
+    mode: str,
+    scope: str,
+    argv: list[str],
+    bounds: dict[str, Any],
+    included_semantics: str,
+    omitted_semantics: str,
+    continuation_semantics: str,
+    candidate_id: str | None,
+) -> dict[str, Any]:
+    normalized_bounds = {
+        "scope": scope,
+        "max_records": 20,
+        **bounds,
+    }
+    return {
+        "action_id": action_id,
+        "label": label,
+        "mode": mode,
+        "scope": scope,
+        "target": target,
+        "source_ref": dict(source_ref),
+        "bounds": normalized_bounds,
+        "argv": argv,
+        "semantics": {
+            "included": included_semantics,
+            "omitted": omitted_semantics,
+        },
+        "continuation": {
+            "semantics": continuation_semantics,
+            "bounded": True,
+        },
+        "claim_boundaries": {
+            "broad_search_rerun": False,
+            "ranking_or_cap_changed": False,
+        },
+    }
 
 
 def source_ref_target(source_ref: dict[str, Any]) -> str | None:
