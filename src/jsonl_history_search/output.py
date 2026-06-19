@@ -3406,6 +3406,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
         )
     source_tier_pressure = report.get("source_tier_answerability_pressure") or {}
     source_tier_decision = report.get("source_tier_answerability_pressure_decision") or {}
+    large_history_stage = report.get("large_history_stage_attribution_pressure") or {}
     if source_tier_pressure:
         source_catalog = source_tier_pressure.get("source_catalog") or {}
         source_plan = source_tier_pressure.get("source_plan") or {}
@@ -3561,6 +3562,69 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 f"- Default promotion supported: `{source_tier_decision.get('default_promotion_supported')}`",
             ]
         )
+    if large_history_stage:
+        stage_summary = large_history_stage.get("stage_bottleneck_summary") or {}
+        tool_delta = large_history_stage.get("selected_next_tool_delta") or {}
+        latency_boundary = large_history_stage.get("latency_indexing_boundary") or {}
+        lines.extend(
+            [
+                "",
+                "## Large-History Stage Attribution Pressure",
+                "",
+                f"- Status: `{large_history_stage.get('status')}`",
+                f"- Basis: `{large_history_stage.get('basis')}`",
+                f"- Allowed bottleneck labels: `{large_history_stage.get('allowed_bottleneck_labels')}`",
+                f"- Selected next bottleneck: `{large_history_stage.get('selected_next_bottleneck')}`",
+                f"- Bottleneck stage counts: `{stage_summary.get('bottleneck_stage_counts')}`",
+                f"- Signal counts: `{stage_summary.get('signal_counts')}`",
+                f"- Selection basis: `{stage_summary.get('selection_basis')}`",
+                f"- No decision reason: `{large_history_stage.get('no_decision_reason')}`",
+                f"- Selected next tool delta: `{tool_delta.get('next_tool_delta')}`",
+                f"- Tool delta implemented in this task: `{tool_delta.get('implementation_included')}`",
+            ]
+        )
+        lines.extend(
+            [
+                "",
+                "### Latency Indexing Boundary",
+                "",
+                f"- Selection rule: `{latency_boundary.get('selection_rule')}`",
+                f"- Cap-hit rows: `{latency_boundary.get('cap_hit_rows')}`",
+                f"- Supported or deferred rows: `{latency_boundary.get('supported_or_deferred_rows')}`",
+                f"- Case count: `{latency_boundary.get('case_count')}`",
+                (
+                    "- Retrieval usefulness acceptable: "
+                    f"`{latency_boundary.get('retrieval_usefulness_acceptable')}`"
+                ),
+                (
+                    "- Cap or latency prevents stage reach: "
+                    f"`{latency_boundary.get('cap_or_latency_prevents_stage_reach')}`"
+                ),
+                f"- Fielded BM25 slow phase count: `{latency_boundary.get('fielded_bm25_slow_phase_count')}`",
+                (
+                    "- Persistent index or cache used: "
+                    f"`{latency_boundary.get('persistent_index_or_cache_used')}`"
+                ),
+                (
+                    "- Indexing latency selection supported: "
+                    f"`{latency_boundary.get('indexing_latency_selection_supported')}`"
+                ),
+                (
+                    "- Indexing necessity claim supported: "
+                    f"`{latency_boundary.get('indexing_necessity_claim_supported')}`"
+                ),
+            ]
+        )
+        privacy = large_history_stage.get("privacy") or {}
+        if privacy:
+            lines.extend(["", "### Large-History Stage Privacy", ""])
+            for key, value in privacy.items():
+                lines.append(f"- `{key}`: `{value}`")
+        claims = large_history_stage.get("claim_boundaries") or {}
+        if claims:
+            lines.extend(["", "### Large-History Stage Claim Boundaries", ""])
+            for key, value in claims.items():
+                lines.append(f"- `{key}`: `{value}`")
     omitted = report.get("rows_omitted") or {}
     if omitted:
         lines.extend(
