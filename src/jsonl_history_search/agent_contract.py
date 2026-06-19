@@ -17,6 +17,9 @@ SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT = 5
 COMPACT_PROVENANCE_CANDIDATE_LIMIT = 8
 COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
 COMPACT_PROVENANCE_NEXT_READ_LIMIT = 8
+EVIDENCE_PACKET_LIMIT = 5
+EVIDENCE_PACKET_CHILD_LIMIT = 6
+EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT = 8
 ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE = "supported_in_searched_scope"
 ANSWERABILITY_DEFERRED_SOURCE_NEEDED = "deferred_source_needed"
 ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE = "searched_scope_no_evidence"
@@ -184,6 +187,7 @@ def build_agent_find_payload(
             search_result=search_result,
             retrieval_pressure=agent_find.get("retrieval_pressure"),
             source_window_packaging=handoff.get("source_window_packaging"),
+            evidence_packet_summary=handoff.get("evidence_packet_packaging"),
             compact_context_budget=agent_find["compact_provenance_handoff"].get("context_budget"),
             no_evidence_report=no_evidence_report,
             compact_handoff_requested=True,
@@ -229,6 +233,7 @@ def build_compact_provenance_handoff(
     )
     source_refs = source_ref_candidates[:COMPACT_PROVENANCE_SOURCE_REF_LIMIT]
     source_windows = list(source_locator_handoff.get("source_windows") or [])[:SOURCE_WINDOW_LIMIT]
+    evidence_packets = list(source_locator_handoff.get("evidence_packets") or [])[:EVIDENCE_PACKET_LIMIT]
     compact_next_reads = list(next_reads or [])[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]
     answerability = build_compact_answerability(
         status=status,
@@ -246,6 +251,8 @@ def build_compact_provenance_handoff(
         source_ref_count_considered=len(source_ref_candidates),
         source_refs_included=len(source_refs),
         source_windows_included=len(source_windows),
+        evidence_packet_count_considered=len(source_locator_handoff.get("evidence_packets") or []),
+        evidence_packets_included=len(evidence_packets),
         next_read_count_considered=len(next_reads or []),
         next_reads_included=len(compact_next_reads),
     )
@@ -265,6 +272,7 @@ def build_compact_provenance_handoff(
         "candidates": compact_candidates,
         "source_refs": source_refs,
         "source_windows": source_windows,
+        "evidence_packets": evidence_packets,
         "source_window_packaging": source_locator_handoff.get("source_window_packaging", {}),
         "next_reads": compact_next_reads,
         "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
@@ -353,6 +361,7 @@ def build_stage_diagnostics(
     search_result: dict[str, Any],
     retrieval_pressure: dict[str, Any] | None,
     source_window_packaging: dict[str, Any] | None,
+    evidence_packet_summary: dict[str, Any] | None = None,
     compact_context_budget: dict[str, Any] | None = None,
     no_evidence_report: dict[str, Any] | None = None,
     compact_handoff_requested: bool = False,
@@ -365,6 +374,7 @@ def build_stage_diagnostics(
     pressure = retrieval_pressure or {}
     query_plan = query_plan or {}
     source_window_packaging = source_window_packaging or {}
+    evidence_packet_summary = evidence_packet_summary or {}
     no_evidence_report = no_evidence_report or {}
     compact_output_budget = (compact_context_budget or {}).get("output_budget") or {}
     compact_output_counts = compact_output_budget.get("counts") or {}
@@ -588,6 +598,15 @@ def build_stage_diagnostics(
                 "source_window_text_included": bool(
                     source_window_packaging.get("source_window_text_included", False)
                 ),
+                "evidence_packet_count": int(evidence_packet_summary.get("packet_count") or 0),
+                "evidence_packet_limit": int(evidence_packet_summary.get("packet_limit") or EVIDENCE_PACKET_LIMIT),
+                "evidence_packet_child_count": int(evidence_packet_summary.get("hit_child_count") or 0),
+                "evidence_packet_context_ref_count": int(evidence_packet_summary.get("context_record_count") or 0),
+                "evidence_packet_omitted_child_count": int(evidence_packet_summary.get("omitted_child_count") or 0),
+                "evidence_packet_deduplicated_child_count": int(
+                    evidence_packet_summary.get("deduplicated_child_count") or 0
+                ),
+                "evidence_packet_text_included": bool(evidence_packet_summary.get("raw_text_included", False)),
             },
         ),
         stage_diagnostic(
@@ -610,6 +629,10 @@ def build_stage_diagnostics(
                 "next_reads_included": int(compact_output_counts.get("next_reads_included") or 0),
                 "next_reads_omitted": int(compact_output_counts.get("next_reads_omitted") or 0),
                 "source_windows_included": int(compact_output_counts.get("source_windows_included") or 0),
+                "evidence_packet_limit": int(compact_output_limits.get("evidence_packets") or 0),
+                "evidence_packets_considered": int(compact_output_counts.get("evidence_packets_considered") or 0),
+                "evidence_packets_included": int(compact_output_counts.get("evidence_packets_included") or 0),
+                "evidence_packets_omitted": int(compact_output_counts.get("evidence_packets_omitted") or 0),
             },
         ),
         stage_diagnostic(
@@ -1376,6 +1399,8 @@ def build_compact_handoff_output_budget(
     source_ref_count_considered: int,
     source_refs_included: int,
     source_windows_included: int,
+    evidence_packet_count_considered: int,
+    evidence_packets_included: int,
     next_read_count_considered: int,
     next_reads_included: int,
 ) -> dict[str, Any]:
@@ -1386,6 +1411,9 @@ def build_compact_handoff_output_budget(
             "candidates": COMPACT_PROVENANCE_CANDIDATE_LIMIT,
             "source_refs": COMPACT_PROVENANCE_SOURCE_REF_LIMIT,
             "source_windows": SOURCE_WINDOW_LIMIT,
+            "evidence_packets": EVIDENCE_PACKET_LIMIT,
+            "hit_children_per_packet": EVIDENCE_PACKET_CHILD_LIMIT,
+            "context_records_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
             "next_reads": COMPACT_PROVENANCE_NEXT_READ_LIMIT,
             "expansion_actions_per_ref": 3,
             "reason_codes_per_candidate": SOURCE_WINDOW_REASON_CODE_LIMIT,
@@ -1401,11 +1429,15 @@ def build_compact_handoff_output_budget(
             "next_reads_included": next_reads_included,
             "next_reads_omitted": max(0, next_read_count_considered - next_reads_included),
             "source_windows_included": source_windows_included,
+            "evidence_packets_considered": evidence_packet_count_considered,
+            "evidence_packets_included": evidence_packets_included,
+            "evidence_packets_omitted": max(0, evidence_packet_count_considered - evidence_packets_included),
         },
         "field_actions": {
             "candidates": "included_metadata_capped",
             "source_refs": "included_exact_capped",
             "source_windows": "reused_from_source_locator_handoff",
+            "evidence_packets": "reused_from_source_locator_handoff_metadata_only_capped",
             "query_plan": "preserved",
             "stage_diagnostics": "preserved",
             "no_evidence": "preserved_searched_scope",
@@ -1970,6 +2002,12 @@ def build_source_locator_handoff(
     )
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
+    evidence_packet_result = build_evidence_packet_package(
+        candidates=candidate_rows,
+        search_result=search_result,
+    )
+    evidence_packets = evidence_packet_result["packets"]
+    evidence_packet_packaging = evidence_packet_result["packaging"]
     candidate_window_omitted_count = max(0, candidate_count - len(source_windows))
     source_window_packaging = {
         "schema_version": 1,
@@ -2047,6 +2085,7 @@ def build_source_locator_handoff(
             "root_metadata_raw_paths_included": False,
             "raw_private_text_or_bridge_payload_included": False,
             "raw_private_text_or_snippets_in_source_windows_included": False,
+            "raw_private_text_or_snippets_in_evidence_packets_included": False,
             "source_window_text_included": False,
             "vectors_indexes_or_timestamp_sidecars_created": False,
             "candidate_source_refs_may_point_to_local_transcripts": bool(candidate_count),
@@ -2059,12 +2098,16 @@ def build_source_locator_handoff(
         },
         "non_default_routes": ["embeddings:not_run", "timestamp_sidecars:not_run", "semantic_linter_runtime:not_used", "private_bridges:not_included", "broad_drive_scans:guarded"],
     }
+    if evidence_packet_packaging.get("status") != "not_applicable":
+        payload["evidence_packets"] = evidence_packets
+        payload["evidence_packet_packaging"] = evidence_packet_packaging
     stage_diagnostics = build_stage_diagnostics(
         product_path=product_path,
         query_plan=query_plan,
         search_result=search_result,
         retrieval_pressure=retrieval_pressure,
         source_window_packaging=source_window_packaging,
+        evidence_packet_summary=evidence_packet_packaging,
         no_evidence_report=no_evidence_report,
         compact_handoff_requested=False,
     )
@@ -2212,6 +2255,374 @@ def build_source_window_package(
         "snippets_included": False,
     }
     return {"windows": windows, "selection_policy": selection_policy}
+
+
+def build_evidence_packet_package(
+    *,
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+    search_result: dict[str, Any],
+) -> dict[str, Any]:
+    retrieval_diagnostics = search_result.get("retrieval_diagnostics") or {}
+    retrieval_mode = retrieval_diagnostics.get("retrieval_mode") or search_result.get("retrieval_mode")
+    if retrieval_mode != "fielded-bm25":
+        return {
+            "packets": [],
+            "packaging": {
+                "schema_version": 1,
+                "status": "not_applicable",
+                "retrieval_mode": retrieval_mode or "package",
+                "packet_limit": EVIDENCE_PACKET_LIMIT,
+                "raw_text_included": False,
+                "snippets_included": False,
+            },
+        }
+
+    normalized = normalize_evidence_packet_candidates(candidates)
+    groups: dict[str, dict[str, Any]] = {}
+    duplicate_child_count = 0
+    for item in normalized:
+        group_key = str(item["group_key"])
+        group = groups.setdefault(
+            group_key,
+            {
+                "group_key": group_key,
+                "source_key": item["source_key"],
+                "session": item["session"],
+                "day": item["day"],
+                "children": [],
+                "seen_child_refs": set(),
+            },
+        )
+        child_ref_key = evidence_packet_child_ref_key(item)
+        if child_ref_key in group["seen_child_refs"]:
+            duplicate_child_count += 1
+            continue
+        group["seen_child_refs"].add(child_ref_key)
+        group["children"].append(item)
+
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda group: (
+            min(int(child["rank"]) for child in group["children"]),
+            str(group["source_key"]),
+            min(evidence_packet_line_sort_key(child["source_ref"]) for child in group["children"]),
+            str(group["group_key"]),
+        ),
+    )
+    packets: list[dict[str, Any]] = []
+    omitted_packet_groups = max(0, len(ordered_groups) - EVIDENCE_PACKET_LIMIT)
+    omitted_children_by_packet_limit = sum(len(group["children"]) for group in ordered_groups[EVIDENCE_PACKET_LIMIT:])
+    omitted_children_by_child_limit = 0
+    omitted_context_records = 0
+
+    for packet_index, group in enumerate(ordered_groups[:EVIDENCE_PACKET_LIMIT], 1):
+        children = sorted(
+            group["children"],
+            key=lambda item: (
+                evidence_packet_line_sort_key(item["source_ref"]),
+                int(item["rank"]),
+                str(item["candidate_id"]),
+            ),
+        )
+        hit_children = [evidence_packet_hit_child(child) for child in children[:EVIDENCE_PACKET_CHILD_LIMIT]]
+        omitted_children_by_child_limit += max(0, len(children) - len(hit_children))
+        context_records_all = [evidence_packet_context_record(child) for child in children]
+        context_records = context_records_all[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT]
+        omitted_context_records += max(0, len(context_records_all) - len(context_records))
+        line_values = [
+            evidence_packet_numeric_line(child["source_ref"].get("line"))
+            for child in children
+            if evidence_packet_numeric_line(child["source_ref"].get("line")) is not None
+        ]
+        days = sorted({str(child.get("day")) for child in children if child.get("day")})
+        packet = {
+            "schema_version": 1,
+            "packet_id": f"ep{packet_index:03d}",
+            "packet_kind": "source_window_parent",
+            "parent_ref": {
+                "kind": "metadata_only_source_window",
+                "source_key": group["source_key"],
+                "target": source_ref_target(children[0]["source_ref"]),
+                "session_present": bool(group["session"]),
+                "day": days[0] if len(days) == 1 else None,
+                "days": days[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT],
+                "source_order_bounds": {
+                    "start_line": min(line_values) if line_values else None,
+                    "end_line": max(line_values) if line_values else None,
+                    "basis": "selected_child_candidate_source_order",
+                },
+            },
+            "ordering": {
+                "best_child_rank": min(int(child["rank"]) for child in children),
+                "packet_order_basis": "best_child_rank_then_source_target_then_start_line_then_packet_id",
+                "score_weights_used": False,
+            },
+            "hit_children": hit_children,
+            "context_records": context_records,
+            "bounds": {
+                "packet_limit": EVIDENCE_PACKET_LIMIT,
+                "child_limit_per_packet": EVIDENCE_PACKET_CHILD_LIMIT,
+                "context_record_limit_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
+                "included_child_count": len(hit_children),
+                "omitted_child_count": max(0, len(children) - len(hit_children)),
+                "deduplicated_child_count": duplicate_child_count if packet_index == 1 else 0,
+                "included_context_record_count": len(context_records),
+                "omitted_context_record_count": max(0, len(context_records_all) - len(context_records)),
+                "source_order_context_metadata_only": True,
+                "truncation_reason": evidence_packet_truncation_reason(
+                    omitted_children=max(0, len(children) - len(hit_children)),
+                    omitted_context_records=max(0, len(context_records_all) - len(context_records)),
+                    omitted_packet_groups=omitted_packet_groups if packet_index == EVIDENCE_PACKET_LIMIT else 0,
+                ),
+                "continuation_available_via_next_reads": True,
+            },
+            "privacy": {
+                "raw_text_included": False,
+                "snippets_included": False,
+                "metadata_only": True,
+            },
+        }
+        packets.append(packet)
+
+    hit_child_count = sum(len(packet["hit_children"]) for packet in packets)
+    context_record_count = sum(len(packet["context_records"]) for packet in packets)
+    omitted_child_count = omitted_children_by_packet_limit + omitted_children_by_child_limit
+    packaging = {
+        "schema_version": 1,
+        "status": "packaged" if packets else "no_candidate_packets",
+        "retrieval_mode": "fielded-bm25",
+        "packet_count": len(packets),
+        "packet_limit": EVIDENCE_PACKET_LIMIT,
+        "packet_group_count_considered": len(ordered_groups),
+        "packet_group_count_omitted": omitted_packet_groups,
+        "hit_child_count": hit_child_count,
+        "hit_child_limit_per_packet": EVIDENCE_PACKET_CHILD_LIMIT,
+        "context_record_count": context_record_count,
+        "context_record_limit_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
+        "candidate_count_considered": len(normalized),
+        "deduplicated_child_count": duplicate_child_count,
+        "omitted_child_count": omitted_child_count,
+        "omitted_context_record_count": omitted_context_records,
+        "ordering_basis": "best_child_rank_then_source_target_then_start_line_then_packet_id",
+        "grouping_fields": ["source", "session"],
+        "metadata_fields": ["day"],
+        "raw_text_included": False,
+        "snippets_included": False,
+        "source_order_context_metadata_only": True,
+        "claim_boundaries": {
+            "ranking_changed": False,
+            "score_weights_used": False,
+            "retrieval_units_remain_child_hits": True,
+        },
+    }
+    return {"packets": packets, "packaging": packaging}
+
+
+def normalize_evidence_packet_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for ordinal, candidate in enumerate(candidates):
+        data = evidence_packet_candidate_data(candidate, ordinal=ordinal)
+        source_key = source_window_source_key(data, candidate_id=str(data.get("candidate_id") or ""))
+        day = source_window_day(data.get("timestamp_utc"))
+        session = str(data.get("session") or "")
+        normalized.append(
+            {
+                **data,
+                "source_key": source_key,
+                "day": day,
+                "group_key": "|".join(
+                    [
+                        f"source={source_key}",
+                        f"session={session}" if session else "session=",
+                    ]
+                ),
+            }
+        )
+    return normalized
+
+
+def evidence_packet_candidate_data(candidate: dict[str, Any] | CandidateRow, *, ordinal: int) -> dict[str, Any]:
+    if isinstance(candidate, CandidateRow):
+        return {
+            "ordinal": ordinal,
+            "candidate_id": candidate.candidate_id,
+            "rank": candidate.rank or ordinal + 1,
+            "source_ref": dict(candidate.source_ref or {}),
+            "target": source_ref_target(candidate.source_ref or {}),
+            "line": candidate.line,
+            "role": candidate.role,
+            "session": candidate.session or (candidate.source_ref or {}).get("session"),
+            "timestamp_utc": candidate.timestamp_utc,
+            "confidence": candidate.confidence,
+            "stages": list(candidate.stages or []),
+            "reason_codes": sanitize_evidence_packet_reason_codes(candidate.reason_codes),
+            "reasons": sanitize_evidence_packet_reasons(candidate.reasons),
+            "matched_terms": list(candidate.matched_terms or [])[:SOURCE_WINDOW_REASON_CODE_LIMIT],
+        }
+    source_ref = dict(candidate.get("source_ref") or {})
+    return {
+        "ordinal": ordinal,
+        "candidate_id": str(candidate.get("candidate_id") or f"candidate-{ordinal + 1}"),
+        "rank": int(candidate.get("rank") or ordinal + 1),
+        "source_ref": source_ref,
+        "target": source_ref_target(source_ref),
+        "line": normalized_source_ref_line(source_ref.get("line")) or int(candidate.get("line") or 0),
+        "role": candidate.get("role"),
+        "session": candidate.get("session") or source_ref.get("session"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "confidence": candidate.get("confidence"),
+        "stages": list(candidate.get("stages") or []),
+        "reason_codes": sanitize_evidence_packet_reason_codes(candidate.get("reason_codes") or []),
+        "reasons": sanitize_evidence_packet_reasons(candidate.get("reasons") or []),
+        "matched_terms": list(candidate.get("matched_terms") or [])[:SOURCE_WINDOW_REASON_CODE_LIMIT],
+    }
+
+
+def evidence_packet_child_ref_key(item: dict[str, Any]) -> tuple[str, int, str]:
+    source_ref = item["source_ref"]
+    return (
+        source_ref_target(source_ref),
+        evidence_packet_numeric_line(source_ref.get("line")) or 0,
+        str(item.get("role") or ""),
+    )
+
+
+def evidence_packet_line_sort_key(source_ref: dict[str, Any]) -> int:
+    line = evidence_packet_numeric_line(source_ref.get("line"))
+    return line if line is not None else 0
+
+
+def evidence_packet_numeric_line(line: Any) -> int | None:
+    try:
+        parsed = int(line)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def evidence_packet_hit_child(item: dict[str, Any]) -> dict[str, Any]:
+    source_ref = dict(item["source_ref"])
+    child = {
+        "candidate_id": item["candidate_id"],
+        "rank": item["rank"],
+        "child_order": item["ordinal"] + 1,
+        "source_ref": source_ref,
+        "target": source_ref_target(source_ref),
+        "line": evidence_packet_numeric_line(source_ref.get("line")),
+        "role": item.get("role"),
+        "timestamp_utc": item.get("timestamp_utc"),
+        "confidence": item.get("confidence"),
+        "stages": list(item.get("stages") or []),
+        "reason_codes": list(item.get("reason_codes") or []),
+        "reasons": list(item.get("reasons") or []),
+        "reason_count": len(item.get("reasons") or []),
+        "evidence_channel_labels": evidence_channel_labels_from_reason_codes(item.get("reason_codes") or []),
+    }
+    return {key: value for key, value in child.items() if value not in (None, [], {})}
+
+
+def evidence_packet_context_record(item: dict[str, Any]) -> dict[str, Any]:
+    source_ref = dict(item["source_ref"])
+    return {
+        "source_ref": source_ref,
+        "target": source_ref_target(source_ref),
+        "line": evidence_packet_numeric_line(source_ref.get("line")),
+        "candidate_id": item["candidate_id"],
+        "role": item.get("role"),
+        "timestamp_utc": item.get("timestamp_utc"),
+        "metadata_only": True,
+        "raw_text_included": False,
+        "snippet_included": False,
+    }
+
+
+def evidence_channel_labels_from_reason_codes(reason_codes: list[Any]) -> list[str]:
+    labels: list[str] = []
+    for code in reason_codes:
+        text = str(code)
+        if text.startswith("fielded_"):
+            labels.append(text)
+        elif text in {"exact_term", "normalized_term", "phrase", "role_match", "path_artifact", "temporal"}:
+            labels.append(text)
+    return unique_ordered_strings(labels)
+
+
+def sanitize_evidence_packet_reason_codes(reason_codes: list[Any]) -> list[str]:
+    sanitized: list[str] = []
+    for code in reason_codes:
+        text = str(code)
+        if text.startswith("phrase:"):
+            sanitized.append("phrase_match")
+        elif text.startswith("coverage:base_terms:"):
+            sanitized.append("base_term_coverage")
+        elif text.startswith("project:"):
+            sanitized.append("project_hint")
+        elif text.startswith("fielded_bm25:evidence_channel:"):
+            sanitized.append(text)
+        elif text.startswith("fielded_bm25:"):
+            sanitized.append(text)
+        elif ":" in text:
+            sanitized.append(text.split(":", 1)[0])
+        else:
+            sanitized.append(text)
+    return unique_ordered_strings(sanitized)[:SOURCE_WINDOW_REASON_CODE_LIMIT]
+
+
+def sanitize_evidence_packet_reasons(reasons: list[Any]) -> list[str]:
+    sanitized: list[str] = []
+    for reason in reasons:
+        text = str(reason)
+        if text.startswith("text:"):
+            parts = text.split(":", 2)
+            sanitized.append(f"text:{parts[1]}" if len(parts) > 1 else "text")
+        elif text.startswith("fuzzy:"):
+            sanitized.append("fuzzy:typo_fuzzy")
+        elif text.startswith("phrase:"):
+            sanitized.append("phrase_match")
+        elif text.startswith("coverage:base_terms:"):
+            sanitized.append("coverage:base_terms")
+        elif text.startswith("role:"):
+            sanitized.append("role_match")
+        elif text.startswith("project:"):
+            sanitized.append("project_hint")
+        elif text.startswith("fielded_bm25:evidence_channel:"):
+            sanitized.append(text)
+        elif text.startswith("fielded_bm25:"):
+            sanitized.append(text)
+        elif ":" in text:
+            sanitized.append(text.split(":", 1)[0])
+        else:
+            sanitized.append(text)
+    return unique_ordered_strings(sanitized)[:SOURCE_WINDOW_REASON_CODE_LIMIT]
+
+
+def unique_ordered_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def evidence_packet_truncation_reason(
+    *,
+    omitted_children: int,
+    omitted_context_records: int,
+    omitted_packet_groups: int,
+) -> str:
+    reasons = []
+    if omitted_packet_groups:
+        reasons.append("packet_limit")
+    if omitted_children:
+        reasons.append("child_limit_per_packet")
+    if omitted_context_records:
+        reasons.append("context_record_limit_per_packet")
+    return ",".join(reasons) if reasons else "none"
 
 
 def normalize_source_window_candidates(

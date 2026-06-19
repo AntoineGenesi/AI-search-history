@@ -215,6 +215,7 @@ def build_semantic_debug_payload(
             search_result=result,
             retrieval_pressure=packet.get("retrieval_pressure"),
             source_window_packaging=source_locator_handoff.get("source_window_packaging"),
+            evidence_packet_summary=source_locator_handoff.get("evidence_packet_packaging"),
             compact_context_budget=packet["compact_provenance_handoff"].get("context_budget"),
             no_evidence_report=agent_find.get("no_evidence_report"),
             compact_handoff_requested=True,
