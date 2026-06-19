@@ -446,12 +446,31 @@ def build_stage_diagnostics(
             {
                 "candidate_rows_considered": int(grouping.get("candidate_rows_considered") or 0),
                 "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
+                "candidate_rows_dropped": int(grouping.get("candidate_rows_dropped") or 0),
                 "source_count_considered": int(grouping.get("source_count_considered") or 0),
                 "source_count_selected": int(grouping.get("source_count_selected") or 0),
+                "source_group_count_considered": int(grouping.get("source_group_count_considered") or 0),
+                "source_group_count_selected": int(grouping.get("source_group_count_selected") or 0),
+                "source_group_count_omitted": int(grouping.get("source_group_count_omitted") or 0),
+                "session_group_count_considered": int(grouping.get("session_group_count_considered") or 0),
+                "session_group_count_selected": int(grouping.get("session_group_count_selected") or 0),
+                "session_group_count_omitted": int(grouping.get("session_group_count_omitted") or 0),
+                "day_group_count_considered": int(grouping.get("day_group_count_considered") or 0),
+                "day_group_count_selected": int(grouping.get("day_group_count_selected") or 0),
+                "day_group_count_omitted": int(grouping.get("day_group_count_omitted") or 0),
+                "category_group_count_considered": int(grouping.get("category_group_count_considered") or 0),
+                "category_group_count_selected": int(grouping.get("category_group_count_selected") or 0),
+                "category_group_count_omitted": int(grouping.get("category_group_count_omitted") or 0),
                 "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
                 "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
                 "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
                 "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
+                "representative_reason_counts": sanitize_int_counts(grouping.get("representative_reason_counts")),
+                "selected_representative_reason_counts": sanitize_int_counts(
+                    grouping.get("selected_representative_reason_counts")
+                ),
+                "group_key_categories": [str(category) for category in grouping.get("group_key_categories") or []],
+                "raw_group_keys_included": False,
                 "suppressed_adjacent_row_count": int(
                     ((grouping.get("adjacent_run_collapse") or {}).get("suppressed_adjacent_row_count")) or 0
                 ),
@@ -463,6 +482,9 @@ def build_stage_diagnostics(
                 ),
                 "group_count_selected": int(
                     ((grouping.get("group_interleaving") or {}).get("group_count_selected")) or 0
+                ),
+                "group_count_omitted": int(
+                    ((grouping.get("group_interleaving") or {}).get("group_count_omitted")) or 0
                 ),
                 "distinct_sources_selected": int(
                     ((grouping.get("group_interleaving") or {}).get("distinct_sources_selected")) or 0
@@ -679,8 +701,23 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "strategy": str(fielded_source_grouping.get("strategy") or "disabled"),
             "candidate_rows_considered": int(fielded_source_grouping.get("candidate_rows_considered") or 0),
             "candidate_rows_selected": int(fielded_source_grouping.get("candidate_rows_selected") or 0),
+            "candidate_rows_dropped": int(fielded_source_grouping.get("candidate_rows_dropped") or 0),
             "source_count_considered": int(fielded_source_grouping.get("source_count_considered") or 0),
             "source_count_selected": int(fielded_source_grouping.get("source_count_selected") or 0),
+            "source_group_count_considered": int(fielded_source_grouping.get("source_group_count_considered") or 0),
+            "source_group_count_selected": int(fielded_source_grouping.get("source_group_count_selected") or 0),
+            "source_group_count_omitted": int(fielded_source_grouping.get("source_group_count_omitted") or 0),
+            "session_group_count_considered": int(fielded_source_grouping.get("session_group_count_considered") or 0),
+            "session_group_count_selected": int(fielded_source_grouping.get("session_group_count_selected") or 0),
+            "session_group_count_omitted": int(fielded_source_grouping.get("session_group_count_omitted") or 0),
+            "day_group_count_considered": int(fielded_source_grouping.get("day_group_count_considered") or 0),
+            "day_group_count_selected": int(fielded_source_grouping.get("day_group_count_selected") or 0),
+            "day_group_count_omitted": int(fielded_source_grouping.get("day_group_count_omitted") or 0),
+            "category_group_count_considered": int(
+                fielded_source_grouping.get("category_group_count_considered") or 0
+            ),
+            "category_group_count_selected": int(fielded_source_grouping.get("category_group_count_selected") or 0),
+            "category_group_count_omitted": int(fielded_source_grouping.get("category_group_count_omitted") or 0),
             "dominant_source_share_before": float(
                 fielded_source_grouping.get("dominant_source_share_before") or 0.0
             ),
@@ -689,6 +726,19 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
             "group_interleaved_rows_selected": int(fielded_source_grouping.get("group_interleaved_rows_selected") or 0),
+            "representative_reason_counts": sanitize_int_counts(
+                fielded_source_grouping.get("representative_reason_counts")
+            ),
+            "selected_representative_reason_counts": sanitize_int_counts(
+                fielded_source_grouping.get("selected_representative_reason_counts")
+            ),
+            "representative_reason_categories": [
+                str(category) for category in fielded_source_grouping.get("representative_reason_categories") or []
+            ],
+            "group_key_categories": [
+                str(category) for category in fielded_source_grouping.get("group_key_categories") or []
+            ],
+            "raw_group_keys_included": False,
             "adjacent_run_collapse": sanitize_adjacent_run_collapse(
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
@@ -780,8 +830,23 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "strategy": str(fielded_source_grouping.get("strategy") or "disabled"),
             "candidate_rows_considered": int(fielded_source_grouping.get("candidate_rows_considered") or 0),
             "candidate_rows_selected": int(fielded_source_grouping.get("candidate_rows_selected") or 0),
+            "candidate_rows_dropped": int(fielded_source_grouping.get("candidate_rows_dropped") or 0),
             "source_count_considered": int(fielded_source_grouping.get("source_count_considered") or 0),
             "source_count_selected": int(fielded_source_grouping.get("source_count_selected") or 0),
+            "source_group_count_considered": int(fielded_source_grouping.get("source_group_count_considered") or 0),
+            "source_group_count_selected": int(fielded_source_grouping.get("source_group_count_selected") or 0),
+            "source_group_count_omitted": int(fielded_source_grouping.get("source_group_count_omitted") or 0),
+            "session_group_count_considered": int(fielded_source_grouping.get("session_group_count_considered") or 0),
+            "session_group_count_selected": int(fielded_source_grouping.get("session_group_count_selected") or 0),
+            "session_group_count_omitted": int(fielded_source_grouping.get("session_group_count_omitted") or 0),
+            "day_group_count_considered": int(fielded_source_grouping.get("day_group_count_considered") or 0),
+            "day_group_count_selected": int(fielded_source_grouping.get("day_group_count_selected") or 0),
+            "day_group_count_omitted": int(fielded_source_grouping.get("day_group_count_omitted") or 0),
+            "category_group_count_considered": int(
+                fielded_source_grouping.get("category_group_count_considered") or 0
+            ),
+            "category_group_count_selected": int(fielded_source_grouping.get("category_group_count_selected") or 0),
+            "category_group_count_omitted": int(fielded_source_grouping.get("category_group_count_omitted") or 0),
             "dominant_source_share_before": float(
                 fielded_source_grouping.get("dominant_source_share_before") or 0.0
             ),
@@ -790,6 +855,19 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "source_head_rows_selected": int(fielded_source_grouping.get("source_head_rows_selected") or 0),
             "global_tail_rows_selected": int(fielded_source_grouping.get("global_tail_rows_selected") or 0),
             "group_interleaved_rows_selected": int(fielded_source_grouping.get("group_interleaved_rows_selected") or 0),
+            "representative_reason_counts": sanitize_int_counts(
+                fielded_source_grouping.get("representative_reason_counts")
+            ),
+            "selected_representative_reason_counts": sanitize_int_counts(
+                fielded_source_grouping.get("selected_representative_reason_counts")
+            ),
+            "representative_reason_categories": [
+                str(category) for category in fielded_source_grouping.get("representative_reason_categories") or []
+            ],
+            "group_key_categories": [
+                str(category) for category in fielded_source_grouping.get("group_key_categories") or []
+            ],
+            "raw_group_keys_included": False,
             "adjacent_run_collapse": sanitize_adjacent_run_collapse(
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
@@ -935,6 +1013,7 @@ def sanitize_group_interleaving(value: Any) -> dict[str, Any]:
         "strategy": str(interleaving.get("strategy") or "disabled"),
         "group_count_considered": int(interleaving.get("group_count_considered") or 0),
         "group_count_selected": int(interleaving.get("group_count_selected") or 0),
+        "group_count_omitted": int(interleaving.get("group_count_omitted") or 0),
         "rows_selected_by_interleaving": int(interleaving.get("rows_selected_by_interleaving") or 0),
         "distinct_sources_considered": int(interleaving.get("distinct_sources_considered") or 0),
         "distinct_sessions_considered": int(interleaving.get("distinct_sessions_considered") or 0),

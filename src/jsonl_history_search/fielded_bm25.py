@@ -666,6 +666,9 @@ def _select_source_grouped_candidate_rows(
             selected_stream_counts={},
             dropped_stream_counts=_stream_dropped_counts(stream_rows, set()),
             rows_dropped_by_source_cap=0,
+            group_category_counts=_empty_group_category_counts(),
+            representative_reason_counts={},
+            selected_representative_reason_counts={},
             group_interleaved_rows_selected=0,
             adjacent_run_collapse=_adjacent_run_collapse_diagnostics([], [], {}, {}),
             group_interleaving=_group_interleaving_diagnostics([], {}, {}, {}),
@@ -691,11 +694,20 @@ def _select_source_grouped_candidate_rows(
         index,
         bm25_rank_by_rowid=bm25_rank_by_rowid,
     )
-    selected = _interleave_group_representatives(
+    group_interleaved_rows = _interleave_group_representatives(
         representatives,
         index,
         bm25_rank_by_rowid=bm25_rank_by_rowid,
         selected_limit=bounded_limit,
+    )
+    selected, representative_reason_counts, selected_representative_reason_counts, group_category_counts = (
+        _select_source_session_day_category_representatives(
+            representatives,
+            group_interleaved_rows,
+            index,
+            bm25_rank_by_rowid=bm25_rank_by_rowid,
+            selected_limit=bounded_limit,
+        )
     )
     selected_rowids: set[int] = {int(row[0]) for row in selected}
 
@@ -750,7 +762,10 @@ def _select_source_grouped_candidate_rows(
         selected_stream_counts=selected_stream_counts,
         dropped_stream_counts=dropped_stream_counts,
         rows_dropped_by_source_cap=rows_dropped_by_source_cap,
-        group_interleaved_rows_selected=len(selected),
+        group_category_counts=group_category_counts,
+        representative_reason_counts=representative_reason_counts,
+        selected_representative_reason_counts=selected_representative_reason_counts,
+        group_interleaved_rows_selected=len(group_interleaved_rows),
         adjacent_run_collapse=adjacent_run_collapse,
         group_interleaving=group_interleaving,
     )
@@ -924,13 +939,22 @@ def _line_order_key(ref: FieldedBm25RecordRef) -> tuple[int, int]:
 
 def _source_session_date_grouping_key(ref: FieldedBm25RecordRef) -> tuple[str, str, str]:
     source_key = _source_grouping_key(ref)
-    session_key = _raw_json_string(ref.raw_text, "session_id") or _raw_json_string(ref.raw_text, "session") or source_key
+    session_key = _session_grouping_key(ref) or source_key
+    day_key = _day_grouping_key(ref) or "day_absent"
+    return source_key, session_key, day_key
+
+
+def _session_grouping_key(ref: FieldedBm25RecordRef) -> str | None:
+    return _raw_json_string(ref.raw_text, "session_id") or _raw_json_string(ref.raw_text, "session")
+
+
+def _day_grouping_key(ref: FieldedBm25RecordRef) -> str | None:
     timestamp_bucket = _raw_timestamp_bucket(ref.raw_text)
     bucket_parts = timestamp_bucket.split()
-    day_key = bucket_parts[-1] if bucket_parts and timestamp_bucket != "timestamp_absent" else "day_absent"
-    if len(day_key) == 7:
+    day_key = bucket_parts[-1] if bucket_parts and timestamp_bucket != "timestamp_absent" else None
+    if day_key is not None and len(day_key) == 7:
         day_key = f"{day_key}-xx"
-    return source_key, session_key, day_key
+    return day_key
 
 
 def _collapse_adjacent_candidate_runs(
@@ -1013,6 +1037,121 @@ def _interleave_group_representatives(
     return selected
 
 
+def _select_source_session_day_category_representatives(
+    rows: list[tuple[Any, ...]],
+    stable_fill_rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    bm25_rank_by_rowid: dict[int, int],
+    selected_limit: int,
+) -> tuple[list[tuple[Any, ...]], dict[str, int], dict[str, int], dict[str, dict[str, int]]]:
+    categories = ("source", "session", "day")
+    grouped: dict[str, dict[str, list[tuple[Any, ...]]]] = {category: {} for category in categories}
+    for row in rows:
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        source_key = _source_grouping_key(ref)
+        grouped["source"].setdefault(source_key, []).append(row)
+        session_key = _session_grouping_key(ref)
+        if session_key:
+            grouped["session"].setdefault(session_key, []).append(row)
+        day_key = _day_grouping_key(ref)
+        if day_key:
+            grouped["day"].setdefault(day_key, []).append(row)
+
+    representative_rows_by_category: dict[str, list[tuple[Any, ...]]] = {}
+    group_counts: dict[str, dict[str, int]] = {}
+    for category in categories:
+        category_representatives = [
+            min(group_rows, key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
+            for group_rows in grouped[category].values()
+            if group_rows
+        ]
+        category_representatives.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
+        representative_rows_by_category[category] = category_representatives
+        group_counts[category] = {
+            "groups_considered": len(grouped[category]),
+            "groups_selected": 0,
+            "groups_omitted": len(grouped[category]),
+        }
+
+    selected: list[tuple[Any, ...]] = []
+    selected_rowids: set[int] = set()
+    selected_group_keys: dict[str, set[str]] = {category: set() for category in categories}
+    representative_reason_counts: dict[str, int] = {"adjacent_run_head": len(rows)}
+    selected_representative_reason_counts: dict[str, int] = {}
+
+    max_category_depth = max((len(items) for items in representative_rows_by_category.values()), default=0)
+    for depth in range(max_category_depth):
+        for category in categories:
+            category_rows = representative_rows_by_category[category]
+            if depth >= len(category_rows):
+                continue
+            row = category_rows[depth]
+            rowid = int(row[0])
+            ref = index.records.get(rowid)
+            if ref is None:
+                continue
+            category_key = _category_group_key(ref, category)
+            if category_key is None:
+                continue
+            reason = f"{category}_representative"
+            representative_reason_counts[reason] = representative_reason_counts.get(reason, 0) + 1
+            if rowid in selected_rowids:
+                selected_group_keys[category].add(category_key)
+                selected_representative_reason_counts["duplicate_category_representative"] = (
+                    selected_representative_reason_counts.get("duplicate_category_representative", 0) + 1
+                )
+                continue
+            if len(selected) >= selected_limit:
+                continue
+            selected.append(row)
+            selected_rowids.add(rowid)
+            selected_group_keys[category].add(category_key)
+            selected_representative_reason_counts[reason] = selected_representative_reason_counts.get(reason, 0) + 1
+
+    fill_count = 0
+    for row in stable_fill_rows:
+        if len(selected) >= selected_limit:
+            break
+        rowid = int(row[0])
+        if rowid in selected_rowids:
+            continue
+        selected.append(row)
+        selected_rowids.add(rowid)
+        fill_count += 1
+    if fill_count:
+        selected_representative_reason_counts["source_session_day_group_fill"] = fill_count
+        representative_reason_counts["source_session_day_group_fill"] = fill_count
+
+    for category in categories:
+        selected_count = len(selected_group_keys[category])
+        considered_count = group_counts[category]["groups_considered"]
+        group_counts[category]["groups_selected"] = selected_count
+        group_counts[category]["groups_omitted"] = max(considered_count - selected_count, 0)
+
+    return selected, representative_reason_counts, selected_representative_reason_counts, group_counts
+
+
+def _category_group_key(ref: FieldedBm25RecordRef, category: str) -> str | None:
+    if category == "source":
+        return _source_grouping_key(ref)
+    if category == "session":
+        return _session_grouping_key(ref)
+    if category == "day":
+        return _day_grouping_key(ref)
+    return None
+
+
+def _empty_group_category_counts() -> dict[str, dict[str, int]]:
+    return {
+        category: {"groups_considered": 0, "groups_selected": 0, "groups_omitted": 0}
+        for category in ("source", "session", "day")
+    }
+
+
 def _adjacent_run_collapse_diagnostics(
     rows: list[tuple[Any, ...]],
     representatives: list[tuple[Any, ...]],
@@ -1052,6 +1191,7 @@ def _group_interleaving_diagnostics(
         "strategy": "source_session_date_groups_interleaved_by_within_group_rank_bm25_rank_rowid",
         "group_count_considered": int(len(considered_group_counts)),
         "group_count_selected": int(len(selected_group_counts)),
+        "group_count_omitted": max(int(len(considered_group_counts)) - int(len(selected_group_counts)), 0),
         "rows_selected_by_interleaving": int(len(selected)),
         "distinct_sources_considered": int(len(distinct_sets.get("sources", set()))),
         "distinct_sessions_considered": int(len(distinct_sets.get("sessions", set()))),
@@ -1082,26 +1222,60 @@ def _source_grouping_diagnostics(
     selected_stream_counts: dict[str, int],
     dropped_stream_counts: dict[str, int],
     rows_dropped_by_source_cap: int,
+    group_category_counts: dict[str, dict[str, int]],
+    representative_reason_counts: dict[str, int],
+    selected_representative_reason_counts: dict[str, int],
     group_interleaved_rows_selected: int,
     adjacent_run_collapse: dict[str, Any],
     group_interleaving: dict[str, Any],
 ) -> dict[str, Any]:
     rows_dropped_by_stream_cap = sum(int(count) for count in dropped_stream_counts.values())
+    source_group_counts = group_category_counts.get("source", {})
+    session_group_counts = group_category_counts.get("session", {})
+    day_group_counts = group_category_counts.get("day", {})
+    category_groups_considered = sum(int(counts.get("groups_considered") or 0) for counts in group_category_counts.values())
+    category_groups_selected = sum(int(counts.get("groups_selected") or 0) for counts in group_category_counts.values())
+    category_groups_omitted = sum(int(counts.get("groups_omitted") or 0) for counts in group_category_counts.values())
     return {
         "enabled": True,
-        "strategy": "adjacent_run_collapse_then_source_session_date_group_interleaving",
+        "strategy": "adjacent_run_collapse_then_source_session_day_category_representatives_then_group_interleaving",
         "candidate_rows_considered": int(rows_considered),
         "candidate_rows_selected": int(rows_selected),
+        "candidate_rows_dropped": max(int(rows_considered) - int(rows_selected), 0),
         "candidate_row_limit": int(selected_limit),
         "candidate_row_pool_limit": int(pool_limit),
         "source_count_considered": len(considered_source_counts),
         "source_count_selected": len(selected_source_counts),
+        "source_group_count_considered": int(source_group_counts.get("groups_considered") or 0),
+        "source_group_count_selected": int(source_group_counts.get("groups_selected") or 0),
+        "source_group_count_omitted": int(source_group_counts.get("groups_omitted") or 0),
+        "session_group_count_considered": int(session_group_counts.get("groups_considered") or 0),
+        "session_group_count_selected": int(session_group_counts.get("groups_selected") or 0),
+        "session_group_count_omitted": int(session_group_counts.get("groups_omitted") or 0),
+        "day_group_count_considered": int(day_group_counts.get("groups_considered") or 0),
+        "day_group_count_selected": int(day_group_counts.get("groups_selected") or 0),
+        "day_group_count_omitted": int(day_group_counts.get("groups_omitted") or 0),
+        "category_group_count_considered": int(category_groups_considered),
+        "category_group_count_selected": int(category_groups_selected),
+        "category_group_count_omitted": int(category_groups_omitted),
         "dominant_source_share_before": _dominant_source_share(considered_source_counts),
         "dominant_source_share_after": _dominant_source_share(selected_source_counts),
         "stream_head_rows_selected": 0,
         "source_head_rows_selected": 0,
         "global_tail_rows_selected": 0,
         "group_interleaved_rows_selected": int(group_interleaved_rows_selected),
+        "representative_reason_counts": dict(sorted(representative_reason_counts.items())),
+        "selected_representative_reason_counts": dict(sorted(selected_representative_reason_counts.items())),
+        "representative_reason_categories": [
+            "adjacent_run_head",
+            "source_representative",
+            "session_representative",
+            "day_representative",
+            "duplicate_category_representative",
+            "source_session_day_group_fill",
+        ],
+        "group_key_categories": ["source", "session", "day"],
+        "raw_group_keys_included": False,
         "adjacent_run_collapse": adjacent_run_collapse,
         "group_interleaving": group_interleaving,
         "stream_selection": {
