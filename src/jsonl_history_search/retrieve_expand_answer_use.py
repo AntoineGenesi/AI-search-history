@@ -32,6 +32,7 @@ ALLOWED_BOTTLENECK_LABELS = [
     "indexing_latency",
     "no_decision",
 ]
+SOURCE_CATALOG_LATENCY_PRESSURE_MS = 1000.0
 REQUIRED_QUESTION_FAMILIES = [
     "why",
     "workflow_failure",
@@ -568,14 +569,14 @@ def bottleneck_stage_for_case(
         return "no_decision"
     if not packet.get("query_plan_matches_family"):
         return "query_planning"
-    if packet.get("persistent_index_or_cache_used") is True:
-        return "indexing_latency"
     if not packet.get("packet_has_decision_fields") or not packet.get("claim_boundaries_honest"):
         return "output_behavior"
     if case.get("expected_score_label") == "correctly_deferred":
         if score_label == "correctly_deferred":
             return "no_decision"
         return "output_behavior"
+    if indexing_latency_bottleneck_supported(score_label, packet, expansion):
+        return "indexing_latency"
     if not packet.get("expected_source_refs_present"):
         return "query_planning"
     if not packet.get("expected_source_windows_present") and not packet.get("expected_next_reads_present"):
@@ -587,6 +588,22 @@ def bottleneck_stage_for_case(
     if score_label == "missing_or_wrong_evidence":
         return "within_source_depth" if expansion.get("action_count", 0) else "source_window_choice"
     return "no_decision"
+
+
+def indexing_latency_bottleneck_supported(score_label: str, packet: dict[str, Any], expansion: dict[str, Any]) -> bool:
+    if score_label not in {"answerable_from_packet", "answerable_after_expansion"}:
+        return False
+    if not packet.get("expected_source_refs_present"):
+        return False
+    if expansion.get("malformed_action_count") or expansion.get("execution_failure_count"):
+        return False
+    if packet.get("source_catalog_cap_labels"):
+        return True
+    try:
+        elapsed_ms = float(packet.get("source_catalog_elapsed_ms") or 0.0)
+    except (TypeError, ValueError):
+        elapsed_ms = 0.0
+    return elapsed_ms >= SOURCE_CATALOG_LATENCY_PRESSURE_MS
 
 
 def build_stage_ledger(
@@ -685,7 +702,7 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def summarize_stage_bottlenecks(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    counts = Counter(row.get("bottleneck_stage") or "no_decision" for row in rows)
+    counts = Counter(normalize_bottleneck_stage(row.get("bottleneck_stage")) for row in rows)
     cap_label_counts = Counter(
         label
         for row in rows
@@ -696,16 +713,29 @@ def summarize_stage_bottlenecks(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "bottleneck_stage_counts": dict(sorted(counts.items())),
         "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
         "cap_label_counts": dict(sorted(cap_label_counts.items())),
-        "selection_basis": "first_non_no_decision_stage_by_case_count_else_no_decision",
+        "selection_basis": "dominant_non_no_decision_stage_by_case_count_then_allowed_order_else_no_decision",
     }
 
 
 def select_next_bottleneck(rows: list[dict[str, Any]]) -> str:
-    counts = Counter(row.get("bottleneck_stage") or "no_decision" for row in rows)
+    counts = Counter(normalize_bottleneck_stage(row.get("bottleneck_stage")) for row in rows)
+    non_decision_counts = {
+        label: count
+        for label, count in counts.items()
+        if label in ALLOWED_BOTTLENECK_LABELS and label != "no_decision" and count > 0
+    }
+    if not non_decision_counts:
+        return "no_decision"
+    highest_count = max(non_decision_counts.values())
     for label in ALLOWED_BOTTLENECK_LABELS:
-        if label != "no_decision" and counts.get(label, 0) > 0:
+        if label != "no_decision" and non_decision_counts.get(label) == highest_count:
             return label
     return "no_decision"
+
+
+def normalize_bottleneck_stage(value: Any) -> str:
+    label = str(value or "no_decision")
+    return label if label in ALLOWED_BOTTLENECK_LABELS else "no_decision"
 
 
 def select_next_product_decision(rows: list[dict[str, Any]]) -> str:
