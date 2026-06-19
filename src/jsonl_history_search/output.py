@@ -23,6 +23,8 @@ def render_json(payload: dict) -> str:
 def render_text(payload: dict) -> str:
     if "latest_user_messages" in payload:
         return render_latest_user_messages_text(payload)
+    if "source_expansion" in payload:
+        return render_source_expansion_text(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_text(payload)
     if "capability_diagnostic" in payload:
@@ -148,6 +150,8 @@ def render_text(payload: dict) -> str:
 def render_markdown(payload: dict) -> str:
     if "latest_user_messages" in payload:
         return render_latest_user_messages_markdown(payload)
+    if "source_expansion" in payload:
+        return render_source_expansion_markdown(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_markdown(payload)
     if "capability_diagnostic" in payload:
@@ -246,6 +250,53 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_source_expansion_text(payload: dict) -> str:
+    report = payload["source_expansion"]
+    lines = [
+        f"Status: {report.get('status')}",
+        f"Mode: {report.get('mode')}",
+        f"Target: {report.get('requested_target')}",
+    ]
+    line_range = report.get("line_range") or {}
+    if line_range:
+        lines.append(f"Lines: {line_range.get('start')}..{line_range.get('end')} (anchor {line_range.get('anchor')})")
+    counts = report.get("counts") or {}
+    if counts:
+        lines.append(
+            "Records: "
+            f"{counts.get('included_count', 0)} included, "
+            f"{counts.get('omitted_count', 0)} omitted"
+        )
+    for record in report.get("records", []):
+        lines.append(f"- {record.get('target')}: {record.get('role') or '(role unknown)'}")
+        text = str(record.get("text") or "")
+        if text:
+            lines.append(text)
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_source_expansion_markdown(payload: dict) -> str:
+    report = payload["source_expansion"]
+    lines = [
+        "# Source Expansion",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Mode: `{report.get('mode')}`",
+        f"- Target: `{report.get('requested_target')}`",
+    ]
+    line_range = report.get("line_range") or {}
+    if line_range:
+        lines.append(f"- Lines: `{line_range.get('start')}..{line_range.get('end')}` anchored at `{line_range.get('anchor')}`")
+    counts = report.get("counts") or {}
+    if counts:
+        lines.append(f"- Records: `{counts.get('included_count', 0)}` included, `{counts.get('omitted_count', 0)}` omitted")
+    for record in report.get("records", []):
+        lines.extend(["", f"## {record.get('target')}", "", str(record.get("text") or "")])
+    return "\n".join(lines)
 
 
 def render_expansion_family_audit_text(payload: dict) -> str:

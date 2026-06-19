@@ -111,6 +111,7 @@ from .retrieval_modes import RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrie
 from .scanner import search
 from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
 from .skill_audit import build_skill_audit_payload
+from .source_expansion import ExpansionRequest, build_source_expansion_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
 from .structural_hybrid import search_structural_hybrid_budgeted
 from .timeutil import parse_now, timezone_from_args
@@ -208,6 +209,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=500,
         help="Maximum characters of each message snippet to include; 0 keeps the full text.",
     )
+    read_more = subparsers.add_parser(
+        "read-more",
+        description=(
+            "Bounded provenance expansion for an exact source ref. Reads one "
+            "record, a line window, or the next N records from the same source."
+        ),
+    )
+    read_more.add_argument("target", help="Exact source target as path:line.")
+    add_common_args(read_more)
+    read_more.add_argument("--mode", choices=("record", "window", "next"), default="record")
+    read_more.add_argument("--before", type=int, default=2)
+    read_more.add_argument("--after", type=int, default=2)
+    read_more.add_argument("--next-count", type=int, default=3)
+    read_more.add_argument("--max-records", type=int, default=20)
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
     add_common_args(manifest)
@@ -1940,6 +1955,24 @@ def main(argv: list[str] | None = None) -> int:
         payload = build_latest_user_messages_payload(args)
         print(render(payload, args.format))
         return 0
+    if args.command == "read-more":
+        args.query = args.target
+        _source_plan, _intent, plan = payload_from_args(args)
+        payload = build_source_expansion_payload(
+            request=ExpansionRequest(
+                target=args.target,
+                mode=args.mode,
+                before=args.before,
+                after=args.after,
+                next_count=args.next_count,
+                max_records=args.max_records,
+            ),
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=Path(args.cwd).expanduser().resolve(),
+        )
+        print(render(payload, args.format))
+        return 0 if payload["source_expansion"]["status"] == "expanded" else 1
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(

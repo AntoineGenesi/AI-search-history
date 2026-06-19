@@ -190,6 +190,7 @@ def build_agent_find_payload(
 
 def command_surface() -> dict[str, str]:
     return {
+        "read-more": "Bounded provenance expansion for an exact source_ref: record, window, or next records without rerunning broad search.",
         "source-locator-handoff": "Inspect this before broad search: stable handoff with source family, selected/rejected roots, caps, blind spots, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries.",
         "plan-sources": "Explains selected/rejected roots, caps, ordering, wrong-root warnings, and optional manifest shortlist metadata.",
         "find-candidates": "Focused fuzzy/typo/synonym/paraphrase candidate recovery with compact source refs, timestamps, roles, snippets, stages, reasons, and confidence.",
@@ -1141,6 +1142,7 @@ def build_compact_handoff_output_budget(
             "source_refs": COMPACT_PROVENANCE_SOURCE_REF_LIMIT,
             "source_windows": SOURCE_WINDOW_LIMIT,
             "next_reads": COMPACT_PROVENANCE_NEXT_READ_LIMIT,
+            "expansion_actions_per_ref": 3,
             "reason_codes_per_candidate": SOURCE_WINDOW_REASON_CODE_LIMIT,
         },
         "counts": {
@@ -1163,6 +1165,7 @@ def build_compact_handoff_output_budget(
             "stage_diagnostics": "preserved",
             "no_evidence": "preserved_searched_scope",
             "next_reads": "included_exact_capped",
+            "expansion_actions": "included_exact_capped",
             "snippets": "omitted",
         },
         "claim_boundaries": {
@@ -1740,6 +1743,7 @@ def build_source_locator_handoff(
             {"field": "source_ref", "action": "included", "preserves_exact_refs": True},
             {"field": "target", "action": "included", "preserves_exact_refs": True},
             {"field": "next_read", "action": "included", "preserves_exact_refs": True},
+            {"field": "expansion_actions", "action": "included", "preserves_exact_refs": True},
             {"field": "reason_codes", "action": "capped", "limit": SOURCE_WINDOW_REASON_CODE_LIMIT},
             {
                 "field": "text_or_snippets",
@@ -1853,6 +1857,7 @@ def build_source_window_package(
             "source_ref": source_ref,
             "reason": "open source_ref target for surrounding transcript context",
         }
+        next_read = {key: value for key, value in next_read.items() if key != "expansion_actions"}
         windows.append(
             {
                 "schema_version": 1,
@@ -1869,6 +1874,7 @@ def build_source_window_package(
                 "project_hint": project_hint_from_cwd(data.get("cwd")),
                 "reason_codes": list(data.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
                 "next_read": next_read,
+                "expansion_actions": read_more_actions_for_source_ref(source_ref, candidate_id=candidate_id),
                 "text_included": False,
                 "source_window_text_included": False,
                 "reason": "open source_ref target for surrounding transcript context",
@@ -2060,9 +2066,75 @@ def next_reads_from_candidates(candidates: list[dict[str, Any]] | list[Candidate
                     "candidate_id": str(candidate_id or ""),
                     "source_ref": source_ref,
                     "reason": "open candidate source_ref before broad search",
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        source_ref,
+                        candidate_id=str(candidate_id or ""),
+                    ),
                 }
             )
     return reads
+
+
+def read_more_actions_for_source_ref(
+    source_ref: dict[str, Any],
+    *,
+    candidate_id: str | None = None,
+) -> list[dict[str, Any]]:
+    target = source_ref_target(source_ref)
+    if not target:
+        return []
+    line = normalized_source_ref_line(source_ref.get("line"))
+    common = {
+        "kind": "source_expansion",
+        "command": "jsonl-history-search read-more",
+        "claim_boundaries": {
+            "broad_search_rerun": False,
+            "ranking_or_cap_changed": False,
+        },
+    }
+    actions = [
+        {
+            **common,
+            "mode": "record",
+            "argv": ["read-more", target, "--mode", "record", "--format", "json"],
+        }
+    ]
+    if line:
+        actions.extend(
+            [
+                {
+                    **common,
+                    "mode": "window",
+                    "argv": [
+                        "read-more",
+                        target,
+                        "--mode",
+                        "window",
+                        "--before",
+                        "2",
+                        "--after",
+                        "2",
+                        "--format",
+                        "json",
+                    ],
+                },
+                {
+                    **common,
+                    "mode": "next",
+                    "argv": [
+                        "read-more",
+                        target,
+                        "--mode",
+                        "next",
+                        "--next-count",
+                        "3",
+                        "--format",
+                        "json",
+                    ],
+                },
+            ]
+        )
+    return actions
 
 
 def source_ref_target(source_ref: dict[str, Any]) -> str | None:

@@ -15,6 +15,7 @@ from .agent_contract import (
     build_stage_diagnostics,
     build_source_locator_handoff,
     estimate_tokens,
+    read_more_actions_for_source_ref,
     reduction_ratio,
     source_ref_target,
 )
@@ -489,7 +490,7 @@ def build_uncertainty(
     tool_report: dict[str, Any],
     forensics_payload: dict[str, Any] | None,
     family: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     labels = []
     if agent_find.get("status") == "no_evidence":
         labels.append(("no_candidate_rows", "No candidate rows matched within the searched scope."))
@@ -542,17 +543,33 @@ def build_next_reads(
     joins: dict[str, Any],
     hints: dict[str, str | None],
 ) -> list[dict[str, str]]:
-    reads: list[dict[str, str]] = []
+    reads: list[dict[str, Any]] = []
     for candidate in candidates[:5]:
         ref = candidate.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append({"kind": "jsonl_source_ref", "target": target, "reason": "confirm candidate snippet in source context"})
+            reads.append(
+                {
+                    "kind": "jsonl_source_ref",
+                    "target": target,
+                    "source_ref": dict(ref),
+                    "reason": "confirm candidate snippet in source context",
+                    "expansion_actions": read_more_actions_for_source_ref(ref),
+                }
+            )
     for event in tool_proof.get("events", [])[:4]:
         ref = event.get("source_ref") or {}
         target = source_ref_target(ref)
         if target:
-            reads.append({"kind": "tool_event_source_ref", "target": target, "reason": "confirm structured action proof"})
+            reads.append(
+                {
+                    "kind": "tool_event_source_ref",
+                    "target": target,
+                    "source_ref": dict(ref),
+                    "reason": "confirm structured action proof",
+                    "expansion_actions": read_more_actions_for_source_ref(ref),
+                }
+            )
     for item in joins.get("review_evidence", [])[:4]:
         if item.get("path"):
             reads.append({"kind": "task_or_review_artifact", "target": item["path"], "reason": "confirm task/review verdict and claim-action classification"})
@@ -1021,11 +1038,11 @@ def dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def dedupe_dicts(values: list[dict[str, str]]) -> list[dict[str, str]]:
+def dedupe_dicts(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     result = []
     for item in values:
-        key = tuple(sorted(item.items()))
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
         if key not in seen:
             seen.add(key)
             result.append(item)
