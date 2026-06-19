@@ -311,6 +311,7 @@ def build_fielded_bm25_retrieval_diagnostics(
     cap_labels = cap_labels_from_warnings(warnings)
     fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
     fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
+    fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_summary = {
         "status": fielded_result.get("status"),
         "fallback_reason": fielded_result.get("fallback_reason"),
@@ -320,9 +321,11 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_row_pool_limit": int(fielded_result.get("candidate_row_pool_limit", 0) or 0),
         "candidate_rows_generated": int(fielded_result.get("candidate_rows_generated", 0) or 0),
         "candidate_rows_considered": int(fielded_result.get("candidate_rows_considered", 0) or 0),
+        "candidate_rows_from_query_streams": int(fielded_result.get("candidate_rows_from_query_streams", 0) or 0),
         "candidate_rows_retained": int(fielded_result.get("candidate_rows_retained", 0) or 0),
         "candidate_rows_surfaced": int(fielded_result.get("candidate_rows_surfaced", 0) or 0),
         "query_streams": _fielded_query_streams_diagnostics(fielded_result),
+        "context_neighborhood": fielded_context_neighborhood,
         "searched_files": int(fielded_result.get("searched_files", 0)),
         "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
         "records_considered": int(fielded_result.get("records_considered", 0)),
@@ -371,6 +374,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "source_catalog": source_catalog,
         "source_plan": source_plan,
         "fielded_bm25": fielded_summary,
+        "fielded_context_neighborhood": fielded_context_neighborhood,
         "fielded_source_grouping": fielded_source_grouping,
         "phase_profiles": {
             "total_fielded_bm25_retrieval": _phase_profile(
@@ -440,6 +444,7 @@ def build_rrf_retrieval_diagnostics(
     cap_labels = cap_labels_from_warnings(warnings)
     fielded_materialization = _fielded_materialization_diagnostics(fielded_result)
     fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
+    fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_ordering = _fielded_priority_ordering_diagnostics(
         package_result=package_result,
         planned_file_count=int(planned_jsonl_file_diagnostics.get("file_count") or 0),
@@ -509,6 +514,7 @@ def build_rrf_retrieval_diagnostics(
                 "candidate_rows": int(fielded_result.get("candidate_rows_generated", 0) or 0),
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
                 "query_streams": _fielded_query_streams_diagnostics(fielded_result),
+                "context_neighborhood": fielded_context_neighborhood,
                 "searched_files": int(fielded_result.get("searched_files", 0)),
                 "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
                 "materialization": fielded_materialization,
@@ -530,6 +536,7 @@ def build_rrf_retrieval_diagnostics(
         },
         "fielded_informed_package_ordering": fielded_ordering,
         "fielded_source_grouping": fielded_source_grouping,
+        "fielded_context_neighborhood": fielded_context_neighborhood,
         "duplicate_local_work": {
             "raw_paths_included": False,
             "enumeration_reused": True,
@@ -599,6 +606,39 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def _fielded_context_neighborhood_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    neighborhood = fielded_result.get("fielded_context_neighborhood") if isinstance(fielded_result, dict) else {}
+    if not isinstance(neighborhood, dict):
+        neighborhood = {}
+    return {
+        "enabled": bool(neighborhood.get("enabled", False)),
+        "strategy": str(neighborhood.get("strategy") or "disabled"),
+        "intent_detected": bool(neighborhood.get("intent_detected", False)),
+        "intent_reason_codes": [str(reason) for reason in neighborhood.get("intent_reason_codes") or []],
+        "anchor_rows_considered": int(neighborhood.get("anchor_rows_considered") or 0),
+        "anchor_row_limit": int(neighborhood.get("anchor_row_limit") or 0),
+        "neighbor_radius_before": int(neighborhood.get("neighbor_radius_before") or 0),
+        "neighbor_radius_after": int(neighborhood.get("neighbor_radius_after") or 0),
+        "generated_neighbor_rows": int(neighborhood.get("generated_neighbor_rows") or 0),
+        "selected_neighbor_rows": int(neighborhood.get("selected_neighbor_rows") or 0),
+        "omitted_neighbor_rows": int(neighborhood.get("omitted_neighbor_rows") or 0),
+        "deduped_existing_row_count": int(neighborhood.get("deduped_existing_row_count") or 0),
+        "deduped_generated_row_count": int(neighborhood.get("deduped_generated_row_count") or 0),
+        "participated_in_grouping": bool(neighborhood.get("participated_in_grouping", False)),
+        "selected_by_group_interleaving": int(neighborhood.get("selected_by_group_interleaving") or 0),
+        "dropped_by_group_interleaving": int(neighborhood.get("dropped_by_group_interleaving") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
