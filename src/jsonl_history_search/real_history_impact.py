@@ -2353,6 +2353,11 @@ def _fielded_bm25_source_grouping_stats(value: Any) -> dict[str, Any]:
     grouping = value if isinstance(value, dict) else {}
     collapse = grouping.get("adjacent_run_collapse") if isinstance(grouping.get("adjacent_run_collapse"), dict) else {}
     interleaving = grouping.get("group_interleaving") if isinstance(grouping.get("group_interleaving"), dict) else {}
+    windows = (
+        grouping.get("grouped_source_windows")
+        if isinstance(grouping.get("grouped_source_windows"), dict)
+        else {}
+    )
     return {
         "enabled": bool(grouping.get("enabled", False)),
         "strategy": str(grouping.get("strategy") or "disabled"),
@@ -2364,6 +2369,9 @@ def _fielded_bm25_source_grouping_stats(value: Any) -> dict[str, Any]:
         "dominant_source_share_after": float(grouping.get("dominant_source_share_after") or 0.0),
         "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
         "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
+        "window_group_count_considered": int(grouping.get("window_group_count_considered") or 0),
+        "window_group_count_selected": int(grouping.get("window_group_count_selected") or 0),
+        "window_group_count_omitted": int(grouping.get("window_group_count_omitted") or 0),
         "adjacent_run_collapse": {
             "enabled": bool(collapse.get("enabled", False)),
             "collapsed_adjacent_run_count": int(collapse.get("collapsed_adjacent_run_count") or 0),
@@ -2385,6 +2393,30 @@ def _fielded_bm25_source_grouping_stats(value: Any) -> dict[str, Any]:
             "distinct_days_selected": int(interleaving.get("distinct_days_selected") or 0),
             "dominant_group_share_before": float(interleaving.get("dominant_group_share_before") or 0.0),
             "dominant_group_share_after": float(interleaving.get("dominant_group_share_after") or 0.0),
+        },
+        "grouped_source_windows": {
+            "enabled": bool(windows.get("enabled", False)),
+            "selection_version": str(windows.get("selection_version") or ""),
+            "window_count_considered": int(windows.get("window_count_considered") or 0),
+            "window_count_selected": int(windows.get("window_count_selected") or 0),
+            "window_count_omitted": int(windows.get("window_count_omitted") or 0),
+            "selected_window_head_count": int(windows.get("selected_window_head_count") or 0),
+            "selected_inner_hit_count": int(windows.get("selected_inner_hit_count") or 0),
+            "omitted_inner_hit_count": int(windows.get("omitted_inner_hit_count") or 0),
+            "merged_adjacent_window_count": int(windows.get("merged_adjacent_window_count") or 0),
+            "merged_adjacent_inner_hit_count": int(windows.get("merged_adjacent_inner_hit_count") or 0),
+            "distinct_sources_selected": int(windows.get("distinct_sources_selected") or 0),
+            "distinct_sessions_selected": int(windows.get("distinct_sessions_selected") or 0),
+            "distinct_days_selected": int(windows.get("distinct_days_selected") or 0),
+            "distinct_windows_selected": int(windows.get("distinct_windows_selected") or 0),
+            "omission_reason_counts": _safe_count_dict(windows.get("omission_reason_counts")),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "source_lines_included": False,
+            "line_numbers_included": False,
         },
         "raw_paths_included": False,
         "raw_text_included": False,
@@ -2970,6 +3002,13 @@ def _fielded_bm25_source_grouping_aggregate(rows: list[dict[str, Any]]) -> dict[
             "suppressed_adjacent_row_count": 0,
             "collapsed_adjacent_run_count": 0,
             "group_interleaved_rows_selected": 0,
+            "window_count_considered_total": 0,
+            "window_count_selected_total": 0,
+            "window_count_omitted_total": 0,
+            "selected_inner_hit_count_total": 0,
+            "omitted_inner_hit_count_total": 0,
+            "merged_adjacent_window_count_total": 0,
+            "distinct_windows_selected_total": 0,
             "privacy": _fielded_bm25_privacy(),
         }
     collapse_rows = [
@@ -2981,6 +3020,11 @@ def _fielded_bm25_source_grouping_aggregate(rows: list[dict[str, Any]]) -> dict[
         item.get("group_interleaving")
         for item in selected
         if isinstance(item.get("group_interleaving"), dict)
+    ]
+    window_rows = [
+        item.get("grouped_source_windows")
+        for item in selected
+        if isinstance(item.get("grouped_source_windows"), dict)
     ]
     return {
         "status": "evaluated",
@@ -3014,6 +3058,42 @@ def _fielded_bm25_source_grouping_aggregate(rows: list[dict[str, Any]]) -> dict[
         ),
         "distinct_days_selected_total": sum(
             int(item.get("distinct_days_selected") or 0) for item in interleaving_rows
+        ),
+        "window_group_count_considered_total": sum(
+            int(item.get("window_group_count_considered") or 0) for item in selected
+        ),
+        "window_group_count_selected_total": sum(
+            int(item.get("window_group_count_selected") or 0) for item in selected
+        ),
+        "window_group_count_omitted_total": sum(
+            int(item.get("window_group_count_omitted") or 0) for item in selected
+        ),
+        "window_count_considered_total": sum(
+            int(item.get("window_count_considered") or 0) for item in window_rows
+        ),
+        "window_count_selected_total": sum(
+            int(item.get("window_count_selected") or 0) for item in window_rows
+        ),
+        "window_count_omitted_total": sum(
+            int(item.get("window_count_omitted") or 0) for item in window_rows
+        ),
+        "selected_window_head_count_total": sum(
+            int(item.get("selected_window_head_count") or 0) for item in window_rows
+        ),
+        "selected_inner_hit_count_total": sum(
+            int(item.get("selected_inner_hit_count") or 0) for item in window_rows
+        ),
+        "omitted_inner_hit_count_total": sum(
+            int(item.get("omitted_inner_hit_count") or 0) for item in window_rows
+        ),
+        "merged_adjacent_window_count_total": sum(
+            int(item.get("merged_adjacent_window_count") or 0) for item in window_rows
+        ),
+        "merged_adjacent_inner_hit_count_total": sum(
+            int(item.get("merged_adjacent_inner_hit_count") or 0) for item in window_rows
+        ),
+        "distinct_windows_selected_total": sum(
+            int(item.get("distinct_windows_selected") or 0) for item in window_rows
         ),
         "privacy": _fielded_bm25_privacy(),
     }
