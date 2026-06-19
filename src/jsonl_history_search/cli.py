@@ -218,12 +218,14 @@ def build_parser() -> argparse.ArgumentParser:
         "read-more",
         description=(
             "Bounded provenance expansion for an exact source ref. Reads one "
-            "record, a line window, or the next N records from the same source."
+            "record, a line window, previous/next records, or a bounded "
+            "source/session/day neighborhood from the same source."
         ),
     )
     read_more.add_argument("target", help="Exact source target as path:line.")
     add_common_args(read_more)
-    read_more.add_argument("--mode", choices=("record", "window", "next"), default="record")
+    read_more.add_argument("--mode", choices=("record", "window", "next", "before", "neighborhood"), default="record")
+    read_more.add_argument("--scope", choices=("source", "session", "day"), default="source")
     read_more.add_argument("--before", type=int, default=2)
     read_more.add_argument("--after", type=int, default=2)
     read_more.add_argument("--next-count", type=int, default=3)
@@ -1993,6 +1995,7 @@ def main(argv: list[str] | None = None) -> int:
             request=ExpansionRequest(
                 target=args.target,
                 mode=args.mode,
+                scope=args.scope,
                 before=args.before,
                 after=args.after,
                 next_count=args.next_count,
