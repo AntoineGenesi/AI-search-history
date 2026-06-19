@@ -635,13 +635,14 @@ def _select_source_grouped_candidate_rows(
             selected_stream_counts={},
             dropped_stream_counts=_stream_dropped_counts(stream_rows, set()),
             rows_dropped_by_source_cap=0,
-            source_head_rows_selected=0,
-            stream_head_rows_selected=0,
-            global_tail_rows_selected=0,
+            group_interleaved_rows_selected=0,
+            adjacent_run_collapse=_adjacent_run_collapse_diagnostics([], [], {}, {}),
+            group_interleaving=_group_interleaving_diagnostics([], {}, {}, {}),
         )
 
-    grouped_rows: dict[str, list[tuple[Any, ...]]] = {}
+    bm25_rank_by_rowid = {int(row[0]): rank for rank, row in enumerate(rows, start=1)}
     considered_source_counts: dict[str, int] = {}
+    considered_group_counts: dict[tuple[str, str, str], int] = {}
     row_by_id: dict[int, tuple[Any, ...]] = {}
     for row in rows:
         rowid = int(row[0])
@@ -650,49 +651,25 @@ def _select_source_grouped_candidate_rows(
         if ref is None:
             continue
         source_key = _source_grouping_key(ref)
-        grouped_rows.setdefault(source_key, []).append(row)
+        group_key = _source_session_date_grouping_key(ref)
         considered_source_counts[source_key] = considered_source_counts.get(source_key, 0) + 1
+        considered_group_counts[group_key] = considered_group_counts.get(group_key, 0) + 1
 
-    selected: list[tuple[Any, ...]] = []
-    selected_rowids: set[int] = set()
-    stream_head_rows_selected = 0
-
-    for label, label_rows in stream_rows.items():
-        if len(selected) >= bounded_limit:
-            break
-        for row in label_rows:
-            rowid = int(row[0])
-            if rowid in selected_rowids or rowid not in row_by_id:
-                continue
-            selected.append(row_by_id[rowid])
-            selected_rowids.add(rowid)
-            stream_head_rows_selected += 1
-            break
-
-    source_head_rows_selected = 0
-    for source_rows in grouped_rows.values():
-        if len(selected) >= bounded_limit:
-            break
-        head = source_rows[0]
-        rowid = int(head[0])
-        if rowid in selected_rowids:
-            continue
-        selected.append(head)
-        selected_rowids.add(rowid)
-        source_head_rows_selected += 1
-
-    global_tail_rows_selected = 0
-    for row in rows:
-        if len(selected) >= bounded_limit:
-            break
-        rowid = int(row[0])
-        if rowid in selected_rowids:
-            continue
-        selected.append(row)
-        selected_rowids.add(rowid)
-        global_tail_rows_selected += 1
+    representatives, run_sizes, representative_to_suppressed = _collapse_adjacent_candidate_runs(
+        rows,
+        index,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+    )
+    selected = _interleave_group_representatives(
+        representatives,
+        index,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+        selected_limit=bounded_limit,
+    )
+    selected_rowids: set[int] = {int(row[0]) for row in selected}
 
     selected_source_counts: dict[str, int] = {}
+    selected_group_counts: dict[tuple[str, str, str], int] = {}
     selected_stream_counts: dict[str, int] = {}
     for row in selected:
         rowid = int(row[0])
@@ -700,7 +677,9 @@ def _select_source_grouped_candidate_rows(
         if ref is None:
             continue
         source_key = _source_grouping_key(ref)
+        group_key = _source_session_date_grouping_key(ref)
         selected_source_counts[source_key] = selected_source_counts.get(source_key, 0) + 1
+        selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
         for label in row_stream_labels.get(rowid, set()):
             selected_stream_counts[label] = selected_stream_counts.get(label, 0) + 1
     rows_dropped_by_source_cap = sum(
@@ -708,6 +687,27 @@ def _select_source_grouped_candidate_rows(
         for source_key, count in considered_source_counts.items()
     )
     dropped_stream_counts = _stream_dropped_counts(stream_rows, selected_rowids)
+    group_keys_considered = set(considered_group_counts)
+    group_keys_selected = set(selected_group_counts)
+    adjacent_run_collapse = _adjacent_run_collapse_diagnostics(
+        rows,
+        representatives,
+        run_sizes,
+        representative_to_suppressed,
+    )
+    group_interleaving = _group_interleaving_diagnostics(
+        selected,
+        considered_group_counts,
+        selected_group_counts,
+        {
+            "sources": {key[0] for key in group_keys_considered},
+            "sessions": {key[1] for key in group_keys_considered},
+            "days": {key[2] for key in group_keys_considered},
+            "selected_sources": {key[0] for key in group_keys_selected},
+            "selected_sessions": {key[1] for key in group_keys_selected},
+            "selected_days": {key[2] for key in group_keys_selected},
+        },
+    )
 
     return selected, _source_grouping_diagnostics(
         rows_considered=len(rows),
@@ -719,14 +719,163 @@ def _select_source_grouped_candidate_rows(
         selected_stream_counts=selected_stream_counts,
         dropped_stream_counts=dropped_stream_counts,
         rows_dropped_by_source_cap=rows_dropped_by_source_cap,
-        source_head_rows_selected=source_head_rows_selected,
-        stream_head_rows_selected=stream_head_rows_selected,
-        global_tail_rows_selected=global_tail_rows_selected,
+        group_interleaved_rows_selected=len(selected),
+        adjacent_run_collapse=adjacent_run_collapse,
+        group_interleaving=group_interleaving,
     )
 
 
 def _source_grouping_key(ref: FieldedBm25RecordRef) -> str:
     return str(ref.path)
+
+
+def _source_session_date_grouping_key(ref: FieldedBm25RecordRef) -> tuple[str, str, str]:
+    source_key = _source_grouping_key(ref)
+    session_key = _raw_json_string(ref.raw_text, "session_id") or _raw_json_string(ref.raw_text, "session") or source_key
+    timestamp_bucket = _raw_timestamp_bucket(ref.raw_text)
+    bucket_parts = timestamp_bucket.split()
+    day_key = bucket_parts[-1] if bucket_parts and timestamp_bucket != "timestamp_absent" else "day_absent"
+    if len(day_key) == 7:
+        day_key = f"{day_key}-xx"
+    return source_key, session_key, day_key
+
+
+def _collapse_adjacent_candidate_runs(
+    rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    bm25_rank_by_rowid: dict[int, int],
+) -> tuple[list[tuple[Any, ...]], dict[int, int], dict[int, int]]:
+    row_by_id = {int(row[0]): row for row in rows}
+    sortable: list[tuple[tuple[str, str], int, int, int]] = []
+    for row in rows:
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        source_key, session_key, _day_key = _source_session_date_grouping_key(ref)
+        sortable.append(((source_key, session_key), int(ref.line), rowid, int(ref.line_end or ref.line)))
+    sortable.sort(key=lambda item: (item[0][0], item[0][1], item[1], item[2]))
+
+    run_sizes: dict[int, int] = {}
+    representative_to_suppressed: dict[int, int] = {}
+    representatives: list[tuple[Any, ...]] = []
+    current_key: tuple[str, str] | None = None
+    current_run: list[int] = []
+    previous_line_end: int | None = None
+
+    def flush_run() -> None:
+        if not current_run:
+            return
+        representative = min(current_run, key=lambda rowid: (bm25_rank_by_rowid.get(rowid, 10**12), rowid))
+        run_sizes[representative] = len(current_run)
+        representative_to_suppressed[representative] = max(len(current_run) - 1, 0)
+        row = row_by_id.get(representative)
+        if row is not None:
+            representatives.append(row)
+
+    for key, line, rowid, line_end in sortable:
+        adjacent = current_key == key and previous_line_end is not None and line == previous_line_end + 1
+        if current_key is None or not adjacent:
+            flush_run()
+            current_key = key
+            current_run = [rowid]
+        else:
+            current_run.append(rowid)
+        previous_line_end = line_end
+    flush_run()
+    representatives.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
+    return representatives, run_sizes, representative_to_suppressed
+
+
+def _interleave_group_representatives(
+    rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    bm25_rank_by_rowid: dict[int, int],
+    selected_limit: int,
+) -> list[tuple[Any, ...]]:
+    grouped: dict[tuple[str, str, str], list[tuple[Any, ...]]] = {}
+    for row in rows:
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        grouped.setdefault(_source_session_date_grouping_key(ref), []).append(row)
+    for group_rows in grouped.values():
+        group_rows.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
+    selected: list[tuple[Any, ...]] = []
+    max_group_depth = max((len(group_rows) for group_rows in grouped.values()), default=0)
+    for within_group_rank in range(max_group_depth):
+        round_rows = [
+            group_rows[within_group_rank]
+            for group_rows in grouped.values()
+            if within_group_rank < len(group_rows)
+        ]
+        round_rows.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
+        for row in round_rows:
+            if len(selected) >= selected_limit:
+                return selected
+            selected.append(row)
+    return selected
+
+
+def _adjacent_run_collapse_diagnostics(
+    rows: list[tuple[Any, ...]],
+    representatives: list[tuple[Any, ...]],
+    run_sizes: dict[int, int],
+    representative_to_suppressed: dict[int, int],
+) -> dict[str, Any]:
+    suppressed_rows = sum(int(count) for count in representative_to_suppressed.values())
+    collapsed_runs = sum(1 for count in run_sizes.values() if int(count) > 1)
+    return {
+        "enabled": True,
+        "strategy": "exact_adjacent_same_source_session_provenance_order_best_bm25_representative",
+        "rows_before_collapse": int(len(rows)),
+        "representative_rows_after_collapse": int(len(representatives)),
+        "adjacent_run_count": int(len(run_sizes)),
+        "collapsed_adjacent_run_count": int(collapsed_runs),
+        "suppressed_adjacent_row_count": int(suppressed_rows),
+        "max_adjacent_run_size": max((int(count) for count in run_sizes.values()), default=0),
+        "suppressed_rows_are_aggregate_counters_only": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _group_interleaving_diagnostics(
+    selected: list[tuple[Any, ...]],
+    considered_group_counts: dict[tuple[str, str, str], int],
+    selected_group_counts: dict[tuple[str, str, str], int],
+    distinct_sets: dict[str, set[str]],
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "strategy": "source_session_date_groups_interleaved_by_within_group_rank_bm25_rank_rowid",
+        "group_count_considered": int(len(considered_group_counts)),
+        "group_count_selected": int(len(selected_group_counts)),
+        "rows_selected_by_interleaving": int(len(selected)),
+        "distinct_sources_considered": int(len(distinct_sets.get("sources", set()))),
+        "distinct_sessions_considered": int(len(distinct_sets.get("sessions", set()))),
+        "distinct_days_considered": int(len(distinct_sets.get("days", set()))),
+        "distinct_sources_selected": int(len(distinct_sets.get("selected_sources", set()))),
+        "distinct_sessions_selected": int(len(distinct_sets.get("selected_sessions", set()))),
+        "distinct_days_selected": int(len(distinct_sets.get("selected_days", set()))),
+        "dominant_group_share_before": _dominant_group_share(considered_group_counts),
+        "dominant_group_share_after": _dominant_group_share(selected_group_counts),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
 
 
 def _source_grouping_diagnostics(
@@ -740,16 +889,14 @@ def _source_grouping_diagnostics(
     selected_stream_counts: dict[str, int],
     dropped_stream_counts: dict[str, int],
     rows_dropped_by_source_cap: int,
-    source_head_rows_selected: int,
-    stream_head_rows_selected: int,
-    global_tail_rows_selected: int,
+    group_interleaved_rows_selected: int,
+    adjacent_run_collapse: dict[str, Any],
+    group_interleaving: dict[str, Any],
 ) -> dict[str, Any]:
     rows_dropped_by_stream_cap = sum(int(count) for count in dropped_stream_counts.values())
     return {
         "enabled": True,
-        "strategy": "stream_heads_then_source_heads_then_global_bm25_tail"
-        if selected_stream_counts or stream_head_rows_selected
-        else "source_heads_then_global_bm25_tail",
+        "strategy": "adjacent_run_collapse_then_source_session_date_group_interleaving",
         "candidate_rows_considered": int(rows_considered),
         "candidate_rows_selected": int(rows_selected),
         "candidate_row_limit": int(selected_limit),
@@ -758,11 +905,14 @@ def _source_grouping_diagnostics(
         "source_count_selected": len(selected_source_counts),
         "dominant_source_share_before": _dominant_source_share(considered_source_counts),
         "dominant_source_share_after": _dominant_source_share(selected_source_counts),
-        "stream_head_rows_selected": int(stream_head_rows_selected),
-        "source_head_rows_selected": int(source_head_rows_selected),
-        "global_tail_rows_selected": int(global_tail_rows_selected),
+        "stream_head_rows_selected": 0,
+        "source_head_rows_selected": 0,
+        "global_tail_rows_selected": 0,
+        "group_interleaved_rows_selected": int(group_interleaved_rows_selected),
+        "adjacent_run_collapse": adjacent_run_collapse,
+        "group_interleaving": group_interleaving,
         "stream_selection": {
-            "enabled": bool(selected_stream_counts or dropped_stream_counts or stream_head_rows_selected),
+            "enabled": bool(selected_stream_counts or dropped_stream_counts),
             "selected_rows_by_stream": dict(sorted(selected_stream_counts.items())),
             "rows_dropped_by_stream_cap": dict(sorted(dropped_stream_counts.items())),
             "rows_dropped_by_stream_cap_total": int(rows_dropped_by_stream_cap),
@@ -801,6 +951,13 @@ def _dominant_source_share(source_counts: dict[str, int]) -> float:
     if total <= 0:
         return 0.0
     return round(max(source_counts.values()) / total, 6)
+
+
+def _dominant_group_share(group_counts: dict[tuple[str, str, str], int]) -> float:
+    total = sum(group_counts.values())
+    if total <= 0:
+        return 0.0
+    return round(max(group_counts.values()) / total, 6)
 
 
 def _new_materialization_counters() -> dict[str, int | bool]:
@@ -1030,7 +1187,7 @@ def _query_stream_summary(
     selection = selection if isinstance(selection, dict) else {}
     return {
         "enabled": True,
-        "strategy": "query_plan_fielded_streams_then_stream_source_heads_then_rowid_dedupe",
+        "strategy": "query_plan_fielded_streams_then_adjacent_run_collapse_then_group_interleaving",
         "stream_count": len(streams),
         "streams": diagnostics,
         "candidate_row_pool_limit_per_stream": int(candidate_pool_limit),

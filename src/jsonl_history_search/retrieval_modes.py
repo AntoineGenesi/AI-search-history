@@ -587,8 +587,61 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
         "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
         "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
+        "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
+        "adjacent_run_collapse": _fielded_adjacent_run_collapse_diagnostics(grouping.get("adjacent_run_collapse")),
+        "group_interleaving": _fielded_group_interleaving_diagnostics(grouping.get("group_interleaving")),
         "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
         "stream_selection": _fielded_stream_selection_diagnostics(grouping.get("stream_selection")),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _fielded_adjacent_run_collapse_diagnostics(value: Any) -> dict[str, Any]:
+    collapse = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(collapse.get("enabled", False)),
+        "strategy": str(collapse.get("strategy") or "disabled"),
+        "rows_before_collapse": int(collapse.get("rows_before_collapse") or 0),
+        "representative_rows_after_collapse": int(collapse.get("representative_rows_after_collapse") or 0),
+        "adjacent_run_count": int(collapse.get("adjacent_run_count") or 0),
+        "collapsed_adjacent_run_count": int(collapse.get("collapsed_adjacent_run_count") or 0),
+        "suppressed_adjacent_row_count": int(collapse.get("suppressed_adjacent_row_count") or 0),
+        "max_adjacent_run_size": int(collapse.get("max_adjacent_run_size") or 0),
+        "suppressed_rows_are_aggregate_counters_only": bool(
+            collapse.get("suppressed_rows_are_aggregate_counters_only", True)
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _fielded_group_interleaving_diagnostics(value: Any) -> dict[str, Any]:
+    interleaving = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(interleaving.get("enabled", False)),
+        "strategy": str(interleaving.get("strategy") or "disabled"),
+        "group_count_considered": int(interleaving.get("group_count_considered") or 0),
+        "group_count_selected": int(interleaving.get("group_count_selected") or 0),
+        "rows_selected_by_interleaving": int(interleaving.get("rows_selected_by_interleaving") or 0),
+        "distinct_sources_considered": int(interleaving.get("distinct_sources_considered") or 0),
+        "distinct_sessions_considered": int(interleaving.get("distinct_sessions_considered") or 0),
+        "distinct_days_considered": int(interleaving.get("distinct_days_considered") or 0),
+        "distinct_sources_selected": int(interleaving.get("distinct_sources_selected") or 0),
+        "distinct_sessions_selected": int(interleaving.get("distinct_sessions_selected") or 0),
+        "distinct_days_selected": int(interleaving.get("distinct_days_selected") or 0),
+        "dominant_group_share_before": float(interleaving.get("dominant_group_share_before") or 0.0),
+        "dominant_group_share_after": float(interleaving.get("dominant_group_share_after") or 0.0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,

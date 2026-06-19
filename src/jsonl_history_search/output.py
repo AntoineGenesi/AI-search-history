@@ -3155,6 +3155,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
             ]
         )
     lines.extend(_fielded_bm25_query_stream_pressure_markdown_lines(report))
+    lines.extend(_fielded_bm25_source_grouping_markdown_lines(report))
     lines.extend(_benchmark_gate_markdown_lines(report))
     scope = report.get("report_scope") or {}
     if scope:
@@ -3361,6 +3362,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
         compact_budget = source_tier_pressure.get("compact_context_budget") or {}
         cap_hit = source_tier_pressure.get("cap_hit") or {}
         no_evidence = source_tier_pressure.get("no_evidence") or {}
+        next_read_recovery = source_tier_pressure.get("next_read_recovery") or {}
         lines.extend(
             [
                 "",
@@ -3385,6 +3387,14 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 ),
                 f"- Diagnostic candidate rows: `{source_tier_pressure.get('diagnostic_candidate_rows')}`",
                 f"- Weak candidate diagnostic rows: `{source_tier_pressure.get('weak_candidate_diagnostic_rows')}`",
+                f"- Next-read recoverable rows: `{next_read_recovery.get('recoverable_rows')}`",
+                f"- Next-read recovery kind counts: `{next_read_recovery.get('recovery_kind_counts')}`",
+                f"- Next-read count total: `{next_read_recovery.get('next_read_count_total')}`",
+                f"- Source-window count total: `{next_read_recovery.get('candidate_window_count_total')}`",
+                (
+                    "- Source-grouping selection changed rows: "
+                    f"`{next_read_recovery.get('source_grouping_selection_changed_rows')}`"
+                ),
                 f"- Cap-hit rows: `{cap_hit.get('rows')}`",
                 f"- Cap-hit rows by label: `{cap_hit.get('rows_by_label')}`",
                 f"- No-evidence needed rows: `{no_evidence.get('needed_rows')}`",
@@ -3667,6 +3677,41 @@ def _fielded_bm25_query_stream_pressure_markdown_lines(report: dict) -> list[str
     ]
     if privacy:
         lines.extend(["", "### Fielded BM25 Query-Stream Privacy", ""])
+        for key, value in privacy.items():
+            lines.append(f"- `{key}`: `{value}`")
+    return lines
+
+
+def _fielded_bm25_source_grouping_markdown_lines(report: dict) -> list[str]:
+    source_grouping = ((report.get("aggregate") or {}).get("fielded_bm25") or {}).get("source_grouping") or {}
+    if not isinstance(source_grouping, dict):
+        return []
+    if source_grouping.get("status") == "not_evaluated" and not int(source_grouping.get("runs") or 0):
+        return []
+    privacy = source_grouping.get("privacy") or {}
+    lines = [
+        "",
+        "## Fielded BM25 Source Grouping / Adjacent Collapse",
+        "",
+        f"- Status: `{source_grouping.get('status')}`",
+        f"- Runs: `{source_grouping.get('runs')}`",
+        f"- Candidate rows considered: `{source_grouping.get('candidate_rows_considered')}`",
+        f"- Candidate rows selected: `{source_grouping.get('candidate_rows_selected')}`",
+        f"- Collapsed adjacent run count: `{source_grouping.get('collapsed_adjacent_run_count')}`",
+        f"- Suppressed adjacent row count: `{source_grouping.get('suppressed_adjacent_row_count')}`",
+        f"- Max adjacent run size: `{source_grouping.get('max_adjacent_run_size')}`",
+        f"- Group count considered total: `{source_grouping.get('group_count_considered_total')}`",
+        f"- Group count selected total: `{source_grouping.get('group_count_selected_total')}`",
+        f"- Group-interleaved rows selected: `{source_grouping.get('group_interleaved_rows_selected')}`",
+        f"- Distinct sources selected total: `{source_grouping.get('distinct_sources_selected_total')}`",
+        f"- Distinct sessions selected total: `{source_grouping.get('distinct_sessions_selected_total')}`",
+        f"- Distinct days selected total: `{source_grouping.get('distinct_days_selected_total')}`",
+        f"- Source count considered total: `{source_grouping.get('source_count_considered_total')}`",
+        f"- Source count selected total: `{source_grouping.get('source_count_selected_total')}`",
+        f"- Rows dropped by source cap: `{source_grouping.get('rows_dropped_by_source_cap')}`",
+    ]
+    if privacy:
+        lines.extend(["", "### Fielded BM25 Source Grouping Privacy", ""])
         for key, value in privacy.items():
             lines.append(f"- `{key}`: `{value}`")
     return lines
