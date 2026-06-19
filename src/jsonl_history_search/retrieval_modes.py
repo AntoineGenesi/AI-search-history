@@ -329,7 +329,19 @@ def build_fielded_bm25_retrieval_diagnostics(
     fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
     fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_evidence_channels = _fielded_evidence_channel_diagnostics(fielded_result)
+    fielded_query_streams = _fielded_query_streams_diagnostics(fielded_result)
     child_query_plan = _fielded_child_query_plan_diagnostics(fielded_result)
+    fielded_candidate_stage_loss = build_fielded_candidate_stage_loss_summary(
+        fielded_result=fielded_result,
+        fielded_index_summary=fielded_index_summary,
+        source_catalog=source_catalog,
+        source_plan=source_plan,
+        query_streams=fielded_query_streams,
+        evidence_channels=fielded_evidence_channels,
+        source_grouping=fielded_source_grouping,
+        materialization=fielded_materialization,
+        cap_labels=cap_labels,
+    )
     fielded_summary = {
         "status": fielded_result.get("status"),
         "fallback_reason": fielded_result.get("fallback_reason"),
@@ -344,7 +356,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_rows_from_query_streams": int(fielded_result.get("candidate_rows_from_query_streams", 0) or 0),
         "candidate_rows_retained": int(fielded_result.get("candidate_rows_retained", 0) or 0),
         "candidate_rows_surfaced": int(fielded_result.get("candidate_rows_surfaced", 0) or 0),
-        "query_streams": _fielded_query_streams_diagnostics(fielded_result),
+        "query_streams": fielded_query_streams,
         "evidence_channels": fielded_evidence_channels,
         "context_neighborhood": fielded_context_neighborhood,
         "searched_files": int(fielded_result.get("searched_files", 0)),
@@ -355,6 +367,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_records_deduped": int(fielded_result.get("candidate_records_deduped", 0) or 0),
         "bm25_rank_buckets": dict(fielded_result.get("bm25_rank_buckets") or {}),
         "materialization": fielded_materialization,
+        "fielded_candidate_stage_loss": fielded_candidate_stage_loss,
         "index_summary": fielded_index_summary,
         "elapsed_ms": fielded_elapsed_ms,
         "elapsed_label": elapsed_label(fielded_elapsed_ms),
@@ -399,6 +412,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "fielded_child_query_plan": child_query_plan,
         "fielded_context_neighborhood": fielded_context_neighborhood,
         "fielded_source_grouping": fielded_source_grouping,
+        "fielded_candidate_stage_loss": fielded_candidate_stage_loss,
         "phase_profiles": {
             "total_fielded_bm25_retrieval": _phase_profile(
                 profiles.get("total_fielded_bm25_retrieval"),
@@ -434,6 +448,152 @@ def build_fielded_bm25_retrieval_diagnostics(
             "package_lane_scoped_or_skipped": False,
         },
     }
+
+
+def build_fielded_candidate_stage_loss_summary(
+    *,
+    fielded_result: dict[str, Any],
+    fielded_index_summary: dict[str, Any],
+    source_catalog: dict[str, Any],
+    source_plan: dict[str, Any],
+    query_streams: dict[str, Any],
+    evidence_channels: dict[str, Any],
+    source_grouping: dict[str, Any],
+    materialization: dict[str, Any],
+    cap_labels: list[str],
+) -> dict[str, Any]:
+    planned_sources = _int(source_catalog.get("file_count"))
+    selected_source_value = (
+        source_plan.get("sources_selected") if "sources_selected" in source_plan else source_catalog.get("selected_file_count")
+    )
+    selected_sources = _int(selected_source_value)
+    first_stage_rows = _int(query_streams.get("row_count_after_dedupe"))
+    stream_cap_drops = _int(query_streams.get("rows_dropped_by_stream_cap_total"))
+    saturated_streams = _int(query_streams.get("saturated_stream_count"))
+    fusion_drops = _int(evidence_channels.get("dropped_row_count_after_fusion"))
+    grouping_drops = _int(source_grouping.get("candidate_rows_dropped"))
+    source_cap_drops = _int(source_grouping.get("rows_dropped_by_source_cap"))
+    materialization_failures = _int(materialization.get("candidate_rows_materialization_failed")) + _int(
+        materialization.get("file_reopen_failures")
+    )
+    ranker_drops = _int(fielded_result.get("records_rejected_by_existing_ranker"))
+    final_candidate_count = _candidate_count(fielded_result)
+
+    if planned_sources == 0 or selected_sources == 0:
+        dominant_loss_stage = "source_not_planned"
+    elif first_stage_rows == 0:
+        dominant_loss_stage = "no_first_stage_candidate"
+    elif stream_cap_drops > 0 or saturated_streams > 0:
+        dominant_loss_stage = "stream_cap_drop"
+    elif fusion_drops > 0:
+        dominant_loss_stage = "evidence_fusion_drop"
+    elif source_cap_drops > 0 or grouping_drops > 0:
+        dominant_loss_stage = "source_grouping_drop"
+    elif materialization_failures > 0 or ranker_drops > 0:
+        dominant_loss_stage = "materialization_or_ranker_drop"
+    elif "max_match" in cap_labels:
+        dominant_loss_stage = "final_match_cap"
+    else:
+        dominant_loss_stage = "none"
+
+    records_materialized = (
+        _int(materialization.get("records_materialized_from_in_memory_raw"))
+        + _int(materialization.get("records_materialized_from_cached_record"))
+        + _int(materialization.get("records_materialized_from_file_reopen"))
+    )
+    rows_dropped_total = stream_cap_drops + fusion_drops + grouping_drops
+    candidate_rows_considered = _int(fielded_result.get("candidate_rows_considered"))
+    candidate_rows_from_query_streams = _int(fielded_result.get("candidate_rows_from_query_streams"))
+
+    return {
+        "dominant_loss_stage": dominant_loss_stage,
+        "source_planning": {
+            "planned_file_count": planned_sources,
+            "selected_file_count": selected_sources,
+            "deferred_file_count": _int(source_plan.get("sources_deferred_budget")),
+            "pruned_file_count": _int(source_plan.get("sources_pruned_hard")),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "query_streams": {
+            "stream_count": _int(query_streams.get("stream_count")),
+            "saturated_stream_count": saturated_streams,
+            "rows_before_dedupe": _int(query_streams.get("row_count_before_dedupe")),
+            "rows_after_dedupe": first_stage_rows,
+            "rows_dropped_by_stream_cap_total": stream_cap_drops,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "evidence_channels": {
+            "channel_count": _int(evidence_channels.get("channel_count")),
+            "rows_before_fusion": _int(evidence_channels.get("unique_row_count_before_fusion")),
+            "rows_after_fusion": _int(evidence_channels.get("selected_row_count_after_fusion")),
+            "rows_selected": _int(evidence_channels.get("selected_row_count_after_fusion")),
+            "rows_dropped_by_fusion": fusion_drops,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "source_grouping": {
+            "rows_considered": _int(source_grouping.get("candidate_rows_considered")),
+            "rows_selected": _int(source_grouping.get("candidate_rows_selected")),
+            "rows_dropped_by_source_cap": source_cap_drops,
+            "rows_dropped_total": grouping_drops,
+            "source_group_count_considered": _int(source_grouping.get("source_group_count_considered")),
+            "source_group_count_selected": _int(source_grouping.get("source_group_count_selected")),
+            "session_group_count_considered": _int(source_grouping.get("session_group_count_considered")),
+            "session_group_count_selected": _int(source_grouping.get("session_group_count_selected")),
+            "day_group_count_considered": _int(source_grouping.get("day_group_count_considered")),
+            "day_group_count_selected": _int(source_grouping.get("day_group_count_selected")),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "materialization": {
+            "candidate_rows_materialized": _int(materialization.get("candidate_rows_materialized")),
+            "records_materialized": records_materialized,
+            "file_reopen_attempts": _int(materialization.get("file_reopen_attempts")),
+            "file_reopen_failures": _int(materialization.get("file_reopen_failures")),
+            "candidate_rows_materialization_failed": _int(materialization.get("candidate_rows_materialization_failed")),
+            "candidate_rows_retained": _int(fielded_result.get("candidate_rows_retained")),
+            "candidate_rows_surfaced": _int(fielded_result.get("candidate_rows_surfaced")),
+            "final_candidate_count": final_candidate_count,
+            "records_rejected_by_existing_ranker": ranker_drops,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "memory_pressure": {
+            "memory_pressure_basis": "candidate_materialization_proxy",
+            "indexed_chunks": _int(fielded_index_summary.get("indexed_chunk_count")),
+            "candidate_rows_from_query_streams": candidate_rows_from_query_streams,
+            "candidate_rows_considered": candidate_rows_considered,
+            "candidate_rows_materialized": _int(materialization.get("candidate_rows_materialized")),
+            "rows_dropped_total": rows_dropped_total,
+            "runtime_rss_bytes_available": False,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+        "privacy": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+        },
+    }
+
+
+def _int(value: Any) -> int:
+    return int(value or 0)
 
 
 def build_rrf_retrieval_diagnostics(
