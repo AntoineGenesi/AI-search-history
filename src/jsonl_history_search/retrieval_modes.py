@@ -585,16 +585,38 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "strategy": str(grouping.get("strategy") or "disabled"),
         "candidate_rows_considered": int(grouping.get("candidate_rows_considered") or 0),
         "candidate_rows_selected": int(grouping.get("candidate_rows_selected") or 0),
+        "candidate_rows_dropped": int(grouping.get("candidate_rows_dropped") or 0),
         "candidate_row_limit": int(grouping.get("candidate_row_limit") or 0),
         "candidate_row_pool_limit": int(grouping.get("candidate_row_pool_limit") or 0),
         "source_count_considered": int(grouping.get("source_count_considered") or 0),
         "source_count_selected": int(grouping.get("source_count_selected") or 0),
+        "source_group_count_considered": int(grouping.get("source_group_count_considered") or 0),
+        "source_group_count_selected": int(grouping.get("source_group_count_selected") or 0),
+        "source_group_count_omitted": int(grouping.get("source_group_count_omitted") or 0),
+        "session_group_count_considered": int(grouping.get("session_group_count_considered") or 0),
+        "session_group_count_selected": int(grouping.get("session_group_count_selected") or 0),
+        "session_group_count_omitted": int(grouping.get("session_group_count_omitted") or 0),
+        "day_group_count_considered": int(grouping.get("day_group_count_considered") or 0),
+        "day_group_count_selected": int(grouping.get("day_group_count_selected") or 0),
+        "day_group_count_omitted": int(grouping.get("day_group_count_omitted") or 0),
+        "category_group_count_considered": int(grouping.get("category_group_count_considered") or 0),
+        "category_group_count_selected": int(grouping.get("category_group_count_selected") or 0),
+        "category_group_count_omitted": int(grouping.get("category_group_count_omitted") or 0),
         "dominant_source_share_before": float(grouping.get("dominant_source_share_before") or 0.0),
         "dominant_source_share_after": float(grouping.get("dominant_source_share_after") or 0.0),
         "source_head_rows_selected": int(grouping.get("source_head_rows_selected") or 0),
         "stream_head_rows_selected": int(grouping.get("stream_head_rows_selected") or 0),
         "global_tail_rows_selected": int(grouping.get("global_tail_rows_selected") or 0),
         "group_interleaved_rows_selected": int(grouping.get("group_interleaved_rows_selected") or 0),
+        "representative_reason_counts": _safe_int_counts(grouping.get("representative_reason_counts")),
+        "selected_representative_reason_counts": _safe_int_counts(
+            grouping.get("selected_representative_reason_counts")
+        ),
+        "representative_reason_categories": [
+            str(category) for category in grouping.get("representative_reason_categories") or []
+        ],
+        "group_key_categories": [str(category) for category in grouping.get("group_key_categories") or []],
+        "raw_group_keys_included": False,
         "adjacent_run_collapse": _fielded_adjacent_run_collapse_diagnostics(grouping.get("adjacent_run_collapse")),
         "group_interleaving": _fielded_group_interleaving_diagnostics(grouping.get("group_interleaving")),
         "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
@@ -642,6 +664,11 @@ def _fielded_context_neighborhood_diagnostics(fielded_result: dict[str, Any]) ->
     }
 
 
+def _safe_int_counts(value: Any) -> dict[str, int]:
+    counts = value if isinstance(value, dict) else {}
+    return {str(key): int(count or 0) for key, count in sorted(counts.items())}
+
+
 def _fielded_adjacent_run_collapse_diagnostics(value: Any) -> dict[str, Any]:
     collapse = value if isinstance(value, dict) else {}
     return {
@@ -673,6 +700,7 @@ def _fielded_group_interleaving_diagnostics(value: Any) -> dict[str, Any]:
         "strategy": str(interleaving.get("strategy") or "disabled"),
         "group_count_considered": int(interleaving.get("group_count_considered") or 0),
         "group_count_selected": int(interleaving.get("group_count_selected") or 0),
+        "group_count_omitted": int(interleaving.get("group_count_omitted") or 0),
         "rows_selected_by_interleaving": int(interleaving.get("rows_selected_by_interleaving") or 0),
         "distinct_sources_considered": int(interleaving.get("distinct_sources_considered") or 0),
         "distinct_sessions_considered": int(interleaving.get("distinct_sessions_considered") or 0),
