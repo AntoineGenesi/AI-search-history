@@ -2627,6 +2627,14 @@ def build_evidence_packet_package(
         }
         if evidence_context_window > 0:
             packet["materialized_context"] = materialized_context
+        packet["evidence_passage"] = normalized_evidence_passage(
+            packet=packet,
+            children=children,
+            context_records=context_records,
+            materialized_context=materialized_context,
+            retrieval_mode="fielded-bm25",
+            evidence_context_window=evidence_context_window,
+        )
         packets.append(packet)
 
     hit_child_count = sum(len(packet["hit_children"]) for packet in packets)
@@ -2671,8 +2679,252 @@ def build_evidence_packet_package(
             "candidate_generation_changed": False,
             "default_behavior_changed": False,
         },
+        "passage_shape_probe": evidence_packet_package_shape_probe(
+            packets=packets,
+            normalized_candidate_count=len(normalized),
+            retrieval_mode="fielded-bm25",
+        ),
     }
     return {"packets": packets, "packaging": packaging}
+
+
+def normalized_evidence_passage(
+    *,
+    packet: dict[str, Any],
+    children: list[dict[str, Any]],
+    context_records: list[dict[str, Any]],
+    materialized_context: dict[str, Any],
+    retrieval_mode: str,
+    evidence_context_window: int,
+) -> dict[str, Any]:
+    hit_children = list(packet.get("hit_children") or [])
+    selected_child = hit_children[0] if hit_children else {}
+    selected_source_ref = dict(selected_child.get("source_ref") or {})
+    selected_line = evidence_packet_numeric_line(selected_source_ref.get("line"))
+    reason_codes = unique_ordered_strings(
+        [
+            str(code)
+            for child in hit_children
+            for code in list(child.get("reason_codes") or [])
+            if code
+        ]
+    )
+    reason_labels = unique_ordered_strings(
+        [
+            str(label)
+            for child in hit_children
+            for label in list(child.get("evidence_channel_labels") or [])
+            if label
+        ]
+    )
+    materialized_counts = materialized_context.get("counts") or {}
+    raw_text_included = bool(materialized_context.get("raw_text_included", False))
+    parent_window_records = list(materialized_context.get("records") or []) if raw_text_included else []
+    bounds = packet.get("bounds") or {}
+    parent_ref = packet.get("parent_ref") or {}
+    source_refs = [dict(child.get("source_ref") or {}) for child in hit_children if child.get("source_ref")]
+    source_refs.extend(dict(record.get("source_ref") or {}) for record in context_records if record.get("source_ref"))
+    source_refs = dedupe_source_refs(source_refs)
+    passage_bounds = normalized_evidence_passage_bounds(
+        packet_bounds=bounds,
+        materialized_counts=materialized_counts,
+        raw_text_included=raw_text_included,
+    )
+    return {
+        "schema_version": 1,
+        "passage_id": f"{packet.get('packet_id', 'ep000')}:passage",
+        "match_span": {
+            "source_ref": selected_source_ref,
+            "target": selected_child.get("target") or source_ref_target(selected_source_ref),
+            "line": selected_line,
+            "source_order": selected_line,
+            "candidate_id": selected_child.get("candidate_id"),
+            "rank": selected_child.get("rank"),
+            "record_target_basis": "selected_child_source_ref_line",
+        },
+        "child_chunk": {
+            "candidate_id": selected_child.get("candidate_id"),
+            "rank": selected_child.get("rank"),
+            "child_order": selected_child.get("child_order"),
+            "source_ref": selected_source_ref,
+            "target": selected_child.get("target") or source_ref_target(selected_source_ref),
+            "line": selected_line,
+            "role": selected_child.get("role"),
+            "timestamp_utc": selected_child.get("timestamp_utc"),
+            "confidence": selected_child.get("confidence"),
+            "reason_codes": list(selected_child.get("reason_codes") or []),
+            "reasons": list(selected_child.get("reasons") or []),
+            "evidence_channel_labels": list(selected_child.get("evidence_channel_labels") or []),
+        },
+        "parent_window": {
+            "window_kind": "same_source_conversational_window",
+            "scope": materialized_context.get("scope") or "same_source",
+            "requested_window": evidence_context_window,
+            "status": materialized_context.get("status") or "not_requested",
+            "source_ref": parent_ref,
+            "source_order_bounds": parent_ref.get("source_order_bounds") or {},
+            "records": parent_window_records,
+            "records_metadata_only": not raw_text_included,
+            "text_included": raw_text_included,
+            "bounds": {
+                "requested_record_count": int(materialized_counts.get("requested_record_count") or 0),
+                "included_record_count": int(materialized_counts.get("included_record_count") or 0),
+                "neighbor_before_count": int(materialized_counts.get("neighbor_before_count") or 0),
+                "neighbor_after_count": int(materialized_counts.get("neighbor_after_count") or 0),
+                "unavailable_before_count": int(materialized_counts.get("unavailable_before_count") or 0),
+                "unavailable_after_count": int(materialized_counts.get("unavailable_after_count") or 0),
+                "omitted_or_truncated_count": int(materialized_counts.get("omitted_or_truncated_count") or 0),
+                "truncated_text_record_count": int(materialized_counts.get("truncated_text_record_count") or 0),
+                "context_metadata_record_count": len(context_records),
+            },
+            "metadata_context_records": [] if raw_text_included else list(context_records),
+        },
+        "provenance": {
+            "retrieval_mode": retrieval_mode,
+            "packet_id": packet.get("packet_id"),
+            "packet_kind": packet.get("packet_kind"),
+            "source_refs": source_refs,
+            "target": selected_child.get("target") or source_ref_target(selected_source_ref),
+            "target_fields": ["source_ref", "line", "target"],
+            "source_fields": ["source_ref", "role", "timestamp_utc", "session", "day"],
+            "reason_codes": reason_codes,
+            "channel_labels": reason_labels,
+            "selection_reason": "selected_child_reached_fielded_evidence_packet",
+            "source_metadata_available": bool(source_refs),
+            "session_metadata_available": bool(parent_ref.get("session_present")),
+            "day_metadata_available": bool(parent_ref.get("day") or parent_ref.get("days")),
+            "privacy_flags": {
+                "raw_text_included": raw_text_included,
+                "materialized_context_opt_in": evidence_context_window > 0,
+                "snippets_included": False,
+                "metadata_only": not raw_text_included,
+                "raw_session_ids_included": False,
+                "vectors_or_index_payloads_included": False,
+            },
+        },
+        "bounds": passage_bounds,
+        "passage_shape_probe": evidence_passage_shape_probe(
+            selected_child=selected_child,
+            child_count=len(children),
+            context_record_count=len(context_records),
+            materialized_counts=materialized_counts,
+            raw_text_included=raw_text_included,
+        ),
+    }
+
+
+def normalized_evidence_passage_bounds(
+    *,
+    packet_bounds: dict[str, Any],
+    materialized_counts: dict[str, Any],
+    raw_text_included: bool,
+) -> dict[str, Any]:
+    omitted_context = int(packet_bounds.get("omitted_context_record_count") or 0)
+    materialized_omitted = int(materialized_counts.get("omitted_or_truncated_count") or 0)
+    return {
+        "included_child_count": int(packet_bounds.get("included_child_count") or 0),
+        "omitted_child_count": int(packet_bounds.get("omitted_child_count") or 0),
+        "deduplicated_child_count": int(packet_bounds.get("deduplicated_child_count") or 0),
+        "collapsed_child_count": int(packet_bounds.get("deduplicated_child_count") or 0),
+        "included_context_record_count": int(packet_bounds.get("included_context_record_count") or 0),
+        "included_parent_window_record_count": int(materialized_counts.get("included_record_count") or 0),
+        "omitted_context_record_count": omitted_context,
+        "omitted_parent_window_record_count": materialized_omitted,
+        "omitted_or_truncated_count": omitted_context + materialized_omitted,
+        "truncated_text_record_count": int(materialized_counts.get("truncated_text_record_count") or 0),
+        "window_size": int(packet_bounds.get("materialized_context_window") or 0),
+        "record_limit": int(packet_bounds.get("materialized_context_record_limit_per_packet") or 0),
+        "char_limit_per_packet": int(packet_bounds.get("materialized_context_char_limit_per_packet") or 0),
+        "char_limit_total": int(packet_bounds.get("materialized_context_char_limit_total") or 0),
+        "raw_text_included": raw_text_included,
+        "continuation_available_via_next_reads": bool(packet_bounds.get("continuation_available_via_next_reads")),
+        "next_read_available": bool(packet_bounds.get("continuation_available_via_next_reads")),
+        "truncation_reason": packet_bounds.get("truncation_reason") or "none",
+    }
+
+
+def evidence_passage_shape_probe(
+    *,
+    selected_child: dict[str, Any],
+    child_count: int,
+    context_record_count: int,
+    materialized_counts: dict[str, Any],
+    raw_text_included: bool,
+) -> dict[str, Any]:
+    reached = bool(selected_child.get("source_ref"))
+    included_parent_records = int(materialized_counts.get("included_record_count") or 0)
+    status = (
+        "selected_child_reached_first_stage_and_passage_constructed"
+        if reached
+        else "first_stage_recall_failure_or_no_selected_child"
+    )
+    passage_context_status = (
+        "opt_in_parent_window_materialized"
+        if raw_text_included and included_parent_records
+        else "metadata_only_parent_window"
+    )
+    return {
+        "schema_version": 1,
+        "status": status,
+        "first_stage_candidate_reached": reached,
+        "selected_child_candidate_id": selected_child.get("candidate_id"),
+        "selected_child_source_ref_present": bool(selected_child.get("source_ref")),
+        "selected_child_rank": selected_child.get("rank"),
+        "selected_child_count_in_packet": child_count,
+        "metadata_context_record_count": context_record_count,
+        "materialized_parent_record_count": included_parent_records,
+        "passage_context_status": passage_context_status,
+        "diagnostic_boundary": "synthetic_passage_shape_probe_not_quality_eval",
+        "suggested_failure_class": (
+            "passage_shape_only_if_answer_context_still_insufficient"
+            if reached
+            else "first_stage_recall_failure"
+        ),
+    }
+
+
+def evidence_packet_package_shape_probe(
+    *,
+    packets: list[dict[str, Any]],
+    normalized_candidate_count: int,
+    retrieval_mode: str,
+) -> dict[str, Any]:
+    if packets:
+        return {
+            "schema_version": 1,
+            "status": "selected_fielded_candidates_packaged",
+            "retrieval_mode": retrieval_mode,
+            "first_stage_candidate_reached": True,
+            "packet_count": len(packets),
+            "selected_child_count": sum(len(packet.get("hit_children") or []) for packet in packets),
+            "diagnostic_boundary": "synthetic_passage_shape_probe_not_quality_eval",
+            "suggested_failure_class": "passage_shape_only_if_answer_context_still_insufficient",
+        }
+    return {
+        "schema_version": 1,
+        "status": "no_selected_fielded_candidates_for_passage",
+        "retrieval_mode": retrieval_mode,
+        "first_stage_candidate_reached": False,
+        "packet_count": 0,
+        "selected_child_count": 0,
+        "normalized_candidate_count": normalized_candidate_count,
+        "diagnostic_boundary": "synthetic_passage_shape_probe_not_quality_eval",
+        "suggested_failure_class": "first_stage_recall_failure",
+    }
+
+
+def dedupe_source_refs(source_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for source_ref in source_refs:
+        target = source_ref_target(source_ref) or ""
+        line = str(source_ref.get("line") or "")
+        key = (target, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(source_ref)
+    return deduped[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT]
 
 
 def materialize_evidence_packet_context(
@@ -3151,6 +3403,12 @@ def evidence_packet_candidate_data(candidate: dict[str, Any] | CandidateRow, *, 
             "matched_terms": list(candidate.matched_terms or [])[:SOURCE_WINDOW_REASON_CODE_LIMIT],
         }
     source_ref = dict(candidate.get("source_ref") or {})
+    if not source_ref and candidate.get("path"):
+        source_ref = {"path": str(candidate.get("path"))}
+        if candidate.get("line") is not None:
+            source_ref["line"] = candidate.get("line")
+        if candidate.get("session"):
+            source_ref["session"] = candidate.get("session")
     return {
         "ordinal": ordinal,
         "candidate_id": str(candidate.get("candidate_id") or f"candidate-{ordinal + 1}"),
