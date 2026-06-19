@@ -47,6 +47,13 @@ CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
 CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
 FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY = "sha256_full_source_bytes_for_cache_validation"
+QUERY_PLAN_MODE_AUTO = "auto"
+QUERY_PLAN_MODE_OFF = "off"
+QUERY_PLAN_MODE_DEBUG = "debug"
+QUERY_PLAN_MODES = {QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODE_OFF, QUERY_PLAN_MODE_DEBUG}
+SUPPORTED_CHILD_CHANNEL_INTENTS = {"when_user_said", "workflow_failure"}
+WORKFLOW_FAILURE_MARKERS = ("failure", "failed", "error", "regression", "blocker", "wrong")
+WORKFLOW_REPAIR_MARKERS = ("repair", "retry", "fix", "fixed", "rerun", "retest")
 
 
 @dataclass(frozen=True)
@@ -331,6 +338,11 @@ class FieldedQueryStream:
     query: str
     fields: tuple[str, ...]
     channel: str = "query_stream"
+    intent: str = "generic_history"
+    kind: str = "base"
+    reason_codes: tuple[str, ...] = ()
+    child: bool = False
+    skip_reason_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -577,16 +589,33 @@ def search_with_fielded_bm25(
     mask_context: MaskContext | None = None,
     expected_ref_diagnostics: list[dict] | None = None,
     include_private_diagnostics: bool = False,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_search_materialization")
     warnings = list(index.warnings) + list(plan.warnings)
     query = _fts_query_for_intent(intent)
-    query_streams = _fielded_query_streams_for_intent(intent, query)
+    query_plan_mode = _normalize_query_plan_mode(query_plan_mode)
+    query_streams = _fielded_query_streams_for_intent(intent, query, query_plan_mode=query_plan_mode)
+    child_plan_summary = _child_query_plan_summary(
+        intent=intent,
+        streams=query_streams,
+        query_plan_mode=query_plan_mode,
+        diagnostics=[],
+        candidate_pool_limit=0,
+    )
     expected_diag = _init_fielded_expected_ref_diagnostics(expected_ref_diagnostics)
     _mark_expected_indexed(expected_diag, index)
     if not index.available or index.connection is None:
-        payload = _unavailable_payload(index, started, warnings, query, expected_diag, query_streams=query_streams)
+        payload = _unavailable_payload(
+            index,
+            started,
+            warnings,
+            query,
+            expected_diag,
+            query_streams=query_streams,
+            child_query_plan=child_plan_summary,
+        )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
     if not query_streams:
@@ -599,6 +628,7 @@ def search_with_fielded_bm25(
             expected_diag,
             status="ineligible_query",
             query_streams=query_streams,
+            child_query_plan=child_plan_summary,
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
@@ -622,6 +652,13 @@ def search_with_fielded_bm25(
             status="query_failed",
             query_streams=query_streams,
             query_stream_diagnostics=stream_diagnostics,
+            child_query_plan=_child_query_plan_summary(
+                intent=intent,
+                streams=query_streams,
+                query_plan_mode=query_plan_mode,
+                diagnostics=stream_diagnostics,
+                candidate_pool_limit=candidate_pool_limit,
+            ),
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
@@ -680,6 +717,15 @@ def search_with_fielded_bm25(
         streams=query_streams,
         diagnostics=stream_diagnostics,
         deduped_row_count=len(raw_rows),
+        candidate_pool_limit=candidate_pool_limit,
+        selection=source_grouping.get("stream_selection"),
+        query_plan_mode=query_plan_mode,
+    )
+    child_plan_summary = _child_query_plan_summary(
+        intent=intent,
+        streams=query_streams,
+        query_plan_mode=query_plan_mode,
+        diagnostics=stream_diagnostics,
         candidate_pool_limit=candidate_pool_limit,
         selection=source_grouping.get("stream_selection"),
     )
@@ -770,6 +816,8 @@ def search_with_fielded_bm25(
         "fallback_reason": None,
         "fts": _fts_stats(index, query=query),
         "query_profile": _query_profile(intent, query),
+        "query_plan_mode": query_plan_mode,
+        "fielded_child_query_plan": child_plan_summary,
         "fielded_query_streams": query_stream_summary,
         "fielded_evidence_channels": evidence_channel_summary,
         "candidate_rows": len(rows),
@@ -1934,11 +1982,59 @@ def _fts_query_for_intent(intent: QueryIntent) -> str | None:
     return " OR ".join(parts)
 
 
-def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | None) -> list[FieldedQueryStream]:
+def _fielded_query_streams_for_intent(
+    intent: QueryIntent,
+    base_query: str | None,
+    *,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
+) -> list[FieldedQueryStream]:
+    query_plan_mode = _normalize_query_plan_mode(query_plan_mode)
+    if query_plan_mode == QUERY_PLAN_MODE_OFF:
+        return _legacy_fielded_query_streams_for_intent(intent, base_query)
+
     streams: list[FieldedQueryStream] = []
     if base_query:
         streams.append(
-            FieldedQueryStream(label="base_lexical", query=base_query, fields=("text",), channel="base_lexical")
+            FieldedQueryStream(
+                label="base_lexical",
+                query=base_query,
+                fields=("text",),
+                channel="base_lexical",
+                intent=_primary_intent(intent),
+                kind="base_lexical",
+                reason_codes=("base_query",),
+            )
+        )
+
+    text_query = _field_query("text", _anchor_values_for_fielded_streams(intent))
+    if not text_query:
+        return _unique_streams(streams)
+
+    plan = intent.query_plan
+    primary_intent = plan.primary_intent if plan is not None else "generic_history"
+    if primary_intent == "when_user_said":
+        streams.extend(_when_user_said_child_streams(intent, text_query))
+        return _unique_streams(streams)
+    if primary_intent == "workflow_failure":
+        streams.extend(_workflow_failure_child_streams(intent, text_query))
+        streams.extend(_legacy_fielded_query_streams_for_intent(intent, None))
+        return _unique_streams(streams)
+    return _unique_streams(streams + _legacy_fielded_query_streams_for_intent(intent, None))
+
+
+def _legacy_fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | None) -> list[FieldedQueryStream]:
+    streams: list[FieldedQueryStream] = []
+    if base_query:
+        streams.append(
+            FieldedQueryStream(
+                label="base_lexical",
+                query=base_query,
+                fields=("text",),
+                channel="base_lexical",
+                intent=_primary_intent(intent),
+                kind="base_lexical",
+                reason_codes=("base_query",),
+            )
         )
 
     text_query = _field_query("text", _anchor_values_for_fielded_streams(intent))
@@ -1956,6 +2052,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                 query=phrase_query,
                 fields=("text",),
                 channel="exact_phrase",
+                intent=primary_intent,
+                kind="legacy_exact_phrase",
+                reason_codes=("legacy_intent_phrase",),
             )
         )
     role_hints = _role_hints_for_query_streams(intent)
@@ -1968,6 +2067,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     query=f"{role_query} AND ({text_query})",
                     fields=("role", "text"),
                     channel=f"role_text_{_stream_label_part(role)}",
+                    intent=primary_intent,
+                    kind="legacy_role_text",
+                    reason_codes=("legacy_role_hint",),
                 )
             )
             if phrase_query and primary_intent in {"when_user_said", "why", "workflow_failure"}:
@@ -1977,6 +2079,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                         query=f"{role_query} AND ({phrase_query})",
                         fields=("role", "text"),
                         channel=f"role_phrase_{_stream_label_part(role)}",
+                        intent=primary_intent,
+                        kind="legacy_role_phrase",
+                        reason_codes=("legacy_role_hint", "legacy_intent_phrase"),
                     )
                 )
 
@@ -1989,6 +2094,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     query=f"{timestamp_query} AND ({text_query})",
                     fields=("timestamp_bucket", "text"),
                     channel="timestamp_text",
+                    intent=primary_intent,
+                    kind="legacy_timestamp_text",
+                    reason_codes=("date_window_hint",),
                 )
             )
 
@@ -2000,6 +2108,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                 query=f"{artifact_query} AND ({text_query})",
                 fields=("artifact_task_path", "text"),
                 channel="artifact_path_text",
+                intent=primary_intent,
+                kind="legacy_artifact_path_text",
+                reason_codes=("artifact_hint",),
             )
         )
 
@@ -2012,6 +2123,9 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                     query=f"{tool_query} AND ({text_query})",
                     fields=("tool_event", "text"),
                     channel=f"tool_event_text_{_stream_label_part(primary_intent)}",
+                    intent=primary_intent,
+                    kind="legacy_tool_event_text",
+                    reason_codes=("tool_event_hint",),
                 )
             )
             if phrase_query and primary_intent in {"workflow_failure", "why"}:
@@ -2021,10 +2135,169 @@ def _fielded_query_streams_for_intent(intent: QueryIntent, base_query: str | Non
                         query=f"{tool_query} AND ({phrase_query})",
                         fields=("tool_event", "text"),
                         channel=f"tool_event_phrase_{_stream_label_part(primary_intent)}",
+                        intent=primary_intent,
+                        kind="legacy_tool_event_phrase",
+                        reason_codes=("tool_event_hint", "legacy_intent_phrase"),
                     )
                 )
 
     return _unique_streams(streams)
+
+
+def _when_user_said_child_streams(intent: QueryIntent, text_query: str) -> list[FieldedQueryStream]:
+    phrase_query = _phrase_query("text", _anchor_values_for_fielded_streams(intent))
+    streams: list[FieldedQueryStream] = []
+    if phrase_query:
+        streams.append(
+            _child_stream(
+                "child_when_user_said_exact_phrase_text",
+                phrase_query,
+                ("text",),
+                "when_user_said",
+                "exact_phrase_text",
+                ("intent:when_user_said", "phrase_anchor"),
+            )
+        )
+    streams.append(
+        _child_stream(
+            "child_when_user_said_user_role_text",
+            f'{_field_query("role", ["user"])} AND ({text_query})',
+            ("role", "text"),
+            "when_user_said",
+            "user_role_text",
+            ("intent:when_user_said", "role:user"),
+        )
+    )
+    if phrase_query:
+        streams.append(
+            _child_stream(
+                "child_when_user_said_user_role_phrase",
+                f'{_field_query("role", ["user"])} AND ({phrase_query})',
+                ("role", "text"),
+                "when_user_said",
+                "user_role_phrase",
+                ("intent:when_user_said", "role:user", "phrase_anchor"),
+            )
+        )
+    timestamp_query = _timestamp_query_for_intent(intent)
+    if timestamp_query:
+        streams.append(
+            _child_stream(
+                "child_when_user_said_timestamp_text",
+                f"{timestamp_query} AND ({text_query})",
+                ("timestamp_bucket", "text"),
+                "when_user_said",
+                "timestamp_text",
+                ("date_window_hint",),
+            )
+        )
+    artifact_query = _field_query("artifact_task_path", intent.artifact_hints)
+    if artifact_query:
+        streams.append(
+            _child_stream(
+                "child_when_user_said_artifact_path_text",
+                f"{artifact_query} AND ({text_query})",
+                ("artifact_task_path", "text"),
+                "when_user_said",
+                "artifact_path_text",
+                ("artifact_hint",),
+            )
+        )
+    return streams
+
+
+def _workflow_failure_child_streams(intent: QueryIntent, text_query: str) -> list[FieldedQueryStream]:
+    streams: list[FieldedQueryStream] = [
+        _child_stream(
+            "child_workflow_failure_subject_text",
+            text_query,
+            ("text",),
+            "workflow_failure",
+            "subject_text",
+            ("intent:workflow_failure", "subject_anchor"),
+        )
+    ]
+    failure_query = _field_query("text", WORKFLOW_FAILURE_MARKERS)
+    if failure_query:
+        streams.append(
+            _child_stream(
+                "child_workflow_failure_failure_marker_text",
+                f"({failure_query}) AND ({text_query})",
+                ("text",),
+                "workflow_failure",
+                "failure_marker_text",
+                ("failure_marker_family",),
+            )
+        )
+    repair_query = _field_query("text", WORKFLOW_REPAIR_MARKERS)
+    if repair_query:
+        streams.append(
+            _child_stream(
+                "child_workflow_failure_repair_retry_text",
+                f"({repair_query}) AND ({text_query})",
+                ("text",),
+                "workflow_failure",
+                "repair_retry_text",
+                ("repair_retry_marker_family",),
+            )
+        )
+    tool_query = _field_query("tool_event", _tool_event_query_terms_for_intent("workflow_failure"))
+    if tool_query:
+        streams.append(
+            _child_stream(
+                "child_workflow_failure_tool_event_text",
+                f"{tool_query} AND ({text_query})",
+                ("tool_event", "text"),
+                "workflow_failure",
+                "tool_event_text",
+                ("tool_event_hint",),
+            )
+        )
+    timestamp_query = _timestamp_query_for_intent(intent)
+    if timestamp_query:
+        streams.append(
+            _child_stream(
+                "child_workflow_failure_timestamp_text",
+                f"{timestamp_query} AND ({text_query})",
+                ("timestamp_bucket", "text"),
+                "workflow_failure",
+                "timestamp_text",
+                ("date_window_hint",),
+            )
+        )
+    artifact_query = _field_query("artifact_task_path", intent.artifact_hints)
+    if artifact_query:
+        streams.append(
+            _child_stream(
+                "child_workflow_failure_artifact_path_text",
+                f"{artifact_query} AND ({text_query})",
+                ("artifact_task_path", "text"),
+                "workflow_failure",
+                "artifact_path_text",
+                ("artifact_hint",),
+            )
+        )
+    return streams
+
+
+def _child_stream(
+    label: str,
+    query: str,
+    fields: tuple[str, ...],
+    intent: str,
+    kind: str,
+    reason_codes: tuple[str, ...],
+) -> FieldedQueryStream:
+    return FieldedQueryStream(
+        label=label,
+        query=query,
+        fields=fields,
+        channel=label,
+        intent=intent,
+        kind=kind,
+        reason_codes=reason_codes,
+        child=True,
+    )
 
 
 def _execute_fielded_query_streams(
@@ -2298,6 +2571,7 @@ def _query_stream_summary(
     deduped_row_count: int,
     candidate_pool_limit: int,
     selection: dict[str, Any] | None = None,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
 ) -> dict[str, Any]:
     generated = sum(int(item.get("row_count") or 0) for item in diagnostics)
     deduped_by_stream = sum(int(item.get("deduped_row_count") or 0) for item in diagnostics)
@@ -2310,8 +2584,11 @@ def _query_stream_summary(
     return {
         "enabled": True,
         "strategy": "query_plan_fielded_streams_then_adjacent_run_collapse_then_group_interleaving",
+        "query_plan_mode": _normalize_query_plan_mode(query_plan_mode),
         "stream_count": len(streams),
         "streams": diagnostics,
+        "child_stream_count": sum(1 for stream in streams if stream.child),
+        "child_stream_labels": [stream.label for stream in streams if stream.child],
         "candidate_row_pool_limit_per_stream": int(candidate_pool_limit),
         "per_stream_limit": int(candidate_pool_limit),
         "stream_hit_limit_count": len(saturated_labels),
@@ -2349,6 +2626,11 @@ def _query_stream_diagnostic(
     return {
         "label": stream.label,
         "channel": _safe_evidence_channel_label(stream.channel or stream.label),
+        "intent": stream.intent,
+        "kind": stream.kind,
+        "child": bool(stream.child),
+        "reason_codes": list(stream.reason_codes),
+        "skip_reason_code": stream.skip_reason_code,
         "fields": list(stream.fields),
         "status": status,
         "row_count": int(row_count),
@@ -2365,6 +2647,156 @@ def _query_stream_diagnostic(
         "source_lines_included": False,
         "line_numbers_included": False,
     }
+
+
+def _child_query_plan_summary(
+    *,
+    intent: QueryIntent,
+    streams: list[FieldedQueryStream],
+    query_plan_mode: str,
+    diagnostics: list[dict[str, Any]],
+    candidate_pool_limit: int,
+    selection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    query_plan_mode = _normalize_query_plan_mode(query_plan_mode)
+    primary_intent = _primary_intent(intent)
+    child_streams = [stream for stream in streams if stream.child]
+    diagnostic_by_label = {str(item.get("label")): item for item in diagnostics if isinstance(item, dict)}
+    selected_by_stream = (selection or {}).get("selected_rows_by_stream") if isinstance(selection, dict) else {}
+    dropped_by_stream = (selection or {}).get("rows_dropped_by_stream_cap") if isinstance(selection, dict) else {}
+    supported = primary_intent in SUPPORTED_CHILD_CHANNEL_INTENTS
+    children: list[dict[str, Any]] = []
+    for stream in child_streams:
+        diag = diagnostic_by_label.get(stream.label, {})
+        children.append(
+            {
+                "label": stream.label,
+                "intent": stream.intent,
+                "kind": stream.kind,
+                "fields": list(stream.fields),
+                "status": str(diag.get("status") or "planned"),
+                "skip_reason_code": stream.skip_reason_code,
+                "reason_codes": list(stream.reason_codes),
+                "row_count": int(diag.get("row_count") or 0),
+                "deduped_row_count": int(diag.get("deduped_row_count") or 0),
+                "stream_limit": int(diag.get("stream_limit") or candidate_pool_limit or 0),
+                "hit_limit": bool(diag.get("hit_limit", False)),
+                "selected_rows_after_grouping": int((selected_by_stream or {}).get(stream.label) or 0),
+                "dropped_rows_after_grouping": int((dropped_by_stream or {}).get(stream.label) or 0),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "raw_session_ids_included": False,
+                "raw_cwd_included": False,
+                "vectors_or_persisted_indexes_included": False,
+            }
+        )
+    return {
+        "query_plan_mode": query_plan_mode,
+        "primary_intent": primary_intent,
+        "supported_child_channel_intent": primary_intent if supported else None,
+        "enabled": query_plan_mode != QUERY_PLAN_MODE_OFF and supported,
+        "debug": query_plan_mode == QUERY_PLAN_MODE_DEBUG,
+        "child_channel_count": len(child_streams),
+        "child_channel_labels": [stream.label for stream in child_streams],
+        "children": children,
+        "skipped": _child_query_plan_skipped(primary_intent, query_plan_mode, child_streams),
+        "privacy": {
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "private_transcript_text_included": False,
+            "raw_paths_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _empty_child_query_plan_summary() -> dict[str, Any]:
+    return {
+        "query_plan_mode": QUERY_PLAN_MODE_AUTO,
+        "primary_intent": "generic_history",
+        "supported_child_channel_intent": None,
+        "enabled": False,
+        "debug": False,
+        "child_channel_count": 0,
+        "child_channel_labels": [],
+        "children": [],
+        "skipped": [],
+        "privacy": {
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "private_transcript_text_included": False,
+            "raw_paths_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _child_query_plan_skipped(
+    primary_intent: str,
+    query_plan_mode: str,
+    child_streams: list[FieldedQueryStream],
+) -> list[dict[str, Any]]:
+    if query_plan_mode == QUERY_PLAN_MODE_OFF:
+        return [
+            {
+                "intent": primary_intent,
+                "status": "skipped",
+                "skip_reason_code": "query_plan_mode_off",
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+            }
+        ]
+    if primary_intent not in SUPPORTED_CHILD_CHANNEL_INTENTS:
+        return [
+            {
+                "intent": primary_intent,
+                "status": "skipped",
+                "skip_reason_code": "unsupported_intent",
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+            }
+        ]
+    if not child_streams:
+        return [
+            {
+                "intent": primary_intent,
+                "status": "skipped",
+                "skip_reason_code": "no_child_streams_generated",
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+            }
+        ]
+    return []
+
+
+def _normalize_query_plan_mode(value: str | None) -> str:
+    mode = str(value or QUERY_PLAN_MODE_AUTO).strip().lower()
+    return mode if mode in QUERY_PLAN_MODES else QUERY_PLAN_MODE_AUTO
+
+
+def _primary_intent(intent: QueryIntent) -> str:
+    plan = intent.query_plan
+    return plan.primary_intent if plan is not None else "generic_history"
 
 
 def _unique_streams(streams: list[FieldedQueryStream]) -> list[FieldedQueryStream]:
@@ -2737,6 +3169,7 @@ def _unavailable_payload(
     expected_diag: dict | None,
     query_streams: list[FieldedQueryStream] | None = None,
     query_stream_diagnostics: list[dict[str, Any]] | None = None,
+    child_query_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     query_streams = query_streams or []
     query_stream_diagnostics = query_stream_diagnostics or [
@@ -2756,11 +3189,14 @@ def _unavailable_payload(
         "fallback_reason": "sqlite_fts5_unavailable",
         "fts": _fts_stats(index, query=query),
         "query_profile": {"raw_query_text_included": False, "raw_query_terms_included": False},
+        "query_plan_mode": (child_query_plan or {}).get("query_plan_mode", QUERY_PLAN_MODE_AUTO),
+        "fielded_child_query_plan": child_query_plan or _empty_child_query_plan_summary(),
         "fielded_query_streams": _query_stream_summary(
             streams=query_streams,
             diagnostics=query_stream_diagnostics,
             deduped_row_count=0,
             candidate_pool_limit=0,
+            query_plan_mode=(child_query_plan or {}).get("query_plan_mode", QUERY_PLAN_MODE_AUTO),
         ),
         "candidate_rows": 0,
         "candidate_rows_generated": 0,
@@ -2792,6 +3228,7 @@ def _empty_payload(
     status: str,
     query_streams: list[FieldedQueryStream] | None = None,
     query_stream_diagnostics: list[dict[str, Any]] | None = None,
+    child_query_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _unavailable_payload(
         index,
@@ -2801,6 +3238,7 @@ def _empty_payload(
         expected_diag,
         query_streams=query_streams,
         query_stream_diagnostics=query_stream_diagnostics,
+        child_query_plan=child_query_plan,
     )
     payload["status"] = status
     payload["fallback_reason"] = None

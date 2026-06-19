@@ -112,7 +112,7 @@ from .real_history_timestamp_seek import DEFAULT_MANIFEST as DEFAULT_REAL_HISTOR
 from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE
 from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
 from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
-from .retrieval_modes import RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrieval_mode
+from .retrieval_modes import QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODES, RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrieval_mode
 from .scanner import search
 from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
 from .skill_audit import build_skill_audit_payload
@@ -187,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
                 "Retrieval backend for agent-facing find output. Default package keeps existing behavior; "
                 "fielded-bm25 explicitly opts into direct in-memory SQLite FTS5/BM25 record retrieval; "
                 "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
+            ),
+        )
+        find.add_argument(
+            "--query-plan",
+            choices=QUERY_PLAN_MODES,
+            default=QUERY_PLAN_MODE_AUTO,
+            help=(
+                "Controls deterministic fielded child query channels. auto enables supported intent children; "
+                "off preserves the old fielded stream/channel shape; debug matches auto retrieval and emits "
+                "sanitized child-plan diagnostics."
             ),
         )
     structural_hybrid = subparsers.add_parser(
@@ -372,6 +382,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Retrieval backend for semantic-debug candidate evidence. Default package keeps existing behavior; "
             "fielded-bm25 explicitly opts into direct in-memory SQLite FTS5/BM25 record retrieval; "
             "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
+        ),
+    )
+    semantic_debug.add_argument(
+        "--query-plan",
+        choices=QUERY_PLAN_MODES,
+        default=QUERY_PLAN_MODE_AUTO,
+        help=(
+            "Controls deterministic fielded child query channels. auto enables supported intent children; "
+            "off preserves the old fielded stream/channel shape; debug matches auto retrieval and emits "
+            "sanitized child-plan diagnostics."
         ),
     )
     private_mine = subparsers.add_parser("private-benchmark-mine")
@@ -2096,6 +2116,7 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=mask_context,
             use_rg_prefilter=args.rg_prefilter,
             fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
+            query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
         )
         result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
         manifest_report = (

@@ -394,6 +394,7 @@ def build_stage_diagnostics(
     fielded = pressure.get("fielded_bm25") or {}
     index_summary = fielded.get("index_summary") if isinstance(fielded.get("index_summary"), dict) else {}
     query_streams = fielded.get("query_streams") or {}
+    child_query_plan = pressure.get("fielded_child_query_plan") or fielded.get("child_query_plan") or {}
     evidence_channels = pressure.get("fielded_evidence_channels") or fielded.get("evidence_channels") or {}
     context_neighborhood = pressure.get("fielded_context_neighborhood") or fielded.get("context_neighborhood") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
@@ -413,6 +414,12 @@ def build_stage_diagnostics(
                 "anchor_term_count": len(query_plan.get("anchor_terms") or []),
                 "source_window_need_count": len(query_plan.get("source_window_needs") or []),
                 "has_primary_intent": bool(query_plan.get("primary_intent")),
+                "query_plan_mode": str(child_query_plan.get("query_plan_mode") or "auto"),
+                "supported_child_channel_intent": child_query_plan.get("supported_child_channel_intent"),
+                "child_channel_count": int(child_query_plan.get("child_channel_count") or 0),
+                "child_channel_labels": list(child_query_plan.get("child_channel_labels") or []),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
             },
         ),
         stage_diagnostic(
@@ -466,6 +473,9 @@ def build_stage_diagnostics(
                     or "local_work_reduction_only_not_token_savings_or_final_answer_quality"
                 ),
                 "query_stream_count": int(query_streams.get("stream_count") or 0),
+                "query_plan_mode": str(child_query_plan.get("query_plan_mode") or "auto"),
+                "child_channel_count": int(child_query_plan.get("child_channel_count") or 0),
+                "child_channel_labels": list(child_query_plan.get("child_channel_labels") or []),
                 "stream_hit_limit_count": int(query_streams.get("stream_hit_limit_count") or 0),
                 "saturated_stream_count": int(query_streams.get("saturated_stream_count") or 0),
                 "row_count_before_dedupe": int(query_streams.get("row_count_before_dedupe") or 0),
@@ -914,6 +924,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     index_summary = fielded_bm25.get("index_summary") if isinstance(fielded_bm25.get("index_summary"), dict) else {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     fielded_evidence_channels = diagnostics.get("fielded_evidence_channels") or fielded_bm25.get("evidence_channels") or {}
+    fielded_child_query_plan = diagnostics.get("fielded_child_query_plan") or fielded_bm25.get("child_query_plan") or {}
     fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
     fielded_context_source = fielded_bm25.get("context_source_counters") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
@@ -967,6 +978,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "searched_bytes": int(fielded_bm25.get("searched_bytes") or 0),
             "records_considered": int(fielded_bm25.get("records_considered") or 0),
             "query_streams": sanitize_query_stream_pressure(fielded_bm25.get("query_streams")),
+            "child_query_plan": sanitize_child_query_plan_pressure(fielded_child_query_plan),
             "evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
             "context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
             "context_source_counters": sanitize_context_source_counters(fielded_context_source),
@@ -979,6 +991,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "vectors_or_persisted_indexes_included": False,
         },
         "fielded_evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
+        "fielded_child_query_plan": sanitize_child_query_plan_pressure(fielded_child_query_plan),
         "fielded_context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
         "fielded_source_grouping": {
             "enabled": bool(fielded_source_grouping.get("enabled", False)),
@@ -1066,7 +1079,10 @@ def sanitize_query_stream_pressure(value: Any) -> dict[str, Any]:
     return {
         "enabled": bool(streams.get("enabled", False)),
         "strategy": str(streams.get("strategy") or "disabled"),
+        "query_plan_mode": str(streams.get("query_plan_mode") or "auto"),
         "stream_count": int(streams.get("stream_count") or 0),
+        "child_stream_count": int(streams.get("child_stream_count") or 0),
+        "child_stream_labels": [str(label) for label in streams.get("child_stream_labels") or []],
         "candidate_row_pool_limit_per_stream": int(streams.get("candidate_row_pool_limit_per_stream") or 0),
         "per_stream_limit": int(streams.get("per_stream_limit") or 0),
         "stream_hit_limit_count": int(streams.get("stream_hit_limit_count") or 0),
@@ -1086,6 +1102,82 @@ def sanitize_query_stream_pressure(value: Any) -> dict[str, Any]:
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def sanitize_child_query_plan_pressure(value: Any) -> dict[str, Any]:
+    plan = value if isinstance(value, dict) else {}
+    children: list[dict[str, Any]] = []
+    for item in plan.get("children") or []:
+        if not isinstance(item, dict):
+            continue
+        children.append(
+            {
+                "label": str(item.get("label") or "unknown"),
+                "intent": str(item.get("intent") or "generic_history"),
+                "kind": str(item.get("kind") or "unknown"),
+                "fields": [str(field) for field in item.get("fields") or []],
+                "status": str(item.get("status") or "unknown"),
+                "skip_reason_code": item.get("skip_reason_code")
+                if item.get("skip_reason_code") is None
+                else str(item.get("skip_reason_code")),
+                "reason_codes": [str(reason) for reason in item.get("reason_codes") or []],
+                "row_count": int(item.get("row_count") or 0),
+                "deduped_row_count": int(item.get("deduped_row_count") or 0),
+                "stream_limit": int(item.get("stream_limit") or 0),
+                "hit_limit": bool(item.get("hit_limit", False)),
+                "selected_rows_after_grouping": int(item.get("selected_rows_after_grouping") or 0),
+                "dropped_rows_after_grouping": int(item.get("dropped_rows_after_grouping") or 0),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "raw_session_ids_included": False,
+                "raw_cwd_included": False,
+                "vectors_or_persisted_indexes_included": False,
+            }
+        )
+    skipped: list[dict[str, Any]] = []
+    for item in plan.get("skipped") or []:
+        if not isinstance(item, dict):
+            continue
+        skipped.append(
+            {
+                "intent": str(item.get("intent") or "generic_history"),
+                "status": str(item.get("status") or "skipped"),
+                "skip_reason_code": str(item.get("skip_reason_code") or "unknown"),
+                "raw_query_text_included": False,
+                "raw_query_terms_included": False,
+            }
+        )
+    return {
+        "query_plan_mode": str(plan.get("query_plan_mode") or "auto"),
+        "primary_intent": str(plan.get("primary_intent") or "generic_history"),
+        "supported_child_channel_intent": plan.get("supported_child_channel_intent")
+        if plan.get("supported_child_channel_intent") is None
+        else str(plan.get("supported_child_channel_intent")),
+        "enabled": bool(plan.get("enabled", False)),
+        "debug": bool(plan.get("debug", False)),
+        "child_channel_count": int(plan.get("child_channel_count") or len(children)),
+        "child_channel_labels": [str(label) for label in plan.get("child_channel_labels") or []],
+        "children": children,
+        "skipped": skipped,
+        "privacy": {
+            "raw_query_text_included": False,
+            "raw_query_terms_included": False,
+            "private_transcript_text_included": False,
+            "raw_paths_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
