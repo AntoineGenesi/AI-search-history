@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ INLINE_CANDIDATE_LIMIT = 12
 INLINE_CONTEXT_BYTE_LIMIT = 24_000
 SOURCE_WINDOW_LIMIT = 5
 SOURCE_WINDOW_REASON_CODE_LIMIT = 8
+SOURCE_WINDOW_OMITTED_FACT_LIMIT = 20
 SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT = 5
 COMPACT_PROVENANCE_CANDIDATE_LIMIT = 8
 COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
@@ -1860,7 +1862,7 @@ def build_source_locator_handoff(
         "open_next_metadata_only": True,
         "selection_policy": source_window_selection_policy,
         "budget_policy": {
-            "ordering_basis": "query_plan_intent_tiered_source_head_then_existing_order_fill",
+            "ordering_basis": "collapse_then_group_head_allocate_then_supported_fill",
             "source_windows": "capped",
             "source_refs": "included_exact",
             "next_reads": "included_exact_for_emitted_windows",
@@ -1970,11 +1972,12 @@ def build_source_window_package(
     primary_intent = (query_plan or {}).get("primary_intent") or "generic_history"
     window_needs = list((query_plan or {}).get("source_window_needs") or [])
     normalized_candidates = normalize_source_window_candidates(candidates)
-    selected_candidates = select_source_window_candidates(
+    selection_result = select_source_window_candidates(
         normalized_candidates,
         query_plan=query_plan or {},
         primary_intent=primary_intent,
     )
+    selected_candidates = selection_result["selected"]
     intent_preferred_ids = {
         str(item["data"].get("candidate_id") or "")
         for item in normalized_candidates
@@ -2025,13 +2028,22 @@ def build_source_window_package(
             }
         )
     selected_ids = {str(item["data"].get("candidate_id") or "") for item in selected_candidates}
-    selected_sources = {str(item["source_key"]) for item in selected_candidates}
+    selected_groups = {str(item["group_key"]) for item in selected_candidates}
+    omitted_candidates = selection_result["omitted"]
+    omission_reason_counts = dict(Counter(str(item.get("omission_reason") or "omitted") for item in omitted_candidates))
     selection_policy = {
-        "schema_version": 1,
-        "ordering_basis": "query_plan_intent_tiered_source_head_then_existing_order_fill",
+        "schema_version": 2,
+        "allocator": "group_aware_source_window_allocator",
+        "allocator_version": "jsh-851.v1",
+        "ordering_basis": "collapse_then_group_head_allocate_then_supported_fill",
         "candidate_count_considered": len(normalized_candidates),
+        "selected_count": len(selected_candidates),
+        "omitted_count": len(omitted_candidates),
         "distinct_source_count_considered": len({str(item["source_key"]) for item in normalized_candidates}),
-        "distinct_source_count_selected": len(selected_sources),
+        "distinct_source_count_selected": len({str(item["source_key"]) for item in selected_candidates}),
+        "distinct_group_count_considered": len({str(item["group_key"]) for item in normalized_candidates}),
+        "distinct_group_count_selected": len(selected_groups),
+        "distinct_group_count_omitted": len({str(item["group_key"]) for item in omitted_candidates}),
         "intent_preferred_candidate_count": len(intent_preferred_ids),
         "intent_preferred_window_count": len(selected_ids & intent_preferred_ids),
         "source_head_window_count": sum(
@@ -2042,6 +2054,24 @@ def build_source_window_package(
         "fill_window_count": sum(
             1 for item in selected_candidates if item["selection_reason_code"] == "existing_order_fill"
         ),
+        "dominant_group_second_window_count": selection_result["dominant_group_second_window_count"],
+        "omission_reason_counts": omission_reason_counts,
+        "collapse": {
+            "policy": "metadata_group_key_first_candidate_is_group_head",
+            "grouping_fields": ["source", "session", "day"],
+            "candidate_count_considered": len(normalized_candidates),
+            "distinct_group_count_considered": len({str(item["group_key"]) for item in normalized_candidates}),
+            "collapsed_candidate_count": max(
+                0, len(normalized_candidates) - len({str(item["group_key"]) for item in normalized_candidates})
+            ),
+        },
+        "allocation_passes": [
+            "intent_group_heads" if selection_result["intent_pass_active"] else "group_heads",
+            "represented_group_supported_fill",
+        ],
+        "omitted_candidate_facts": selection_policy_omitted_candidate_facts(omitted_candidates),
+        "raw_text_included": False,
+        "snippets_included": False,
     }
     return {"windows": windows, "selection_policy": selection_policy}
 
@@ -2058,6 +2088,8 @@ def normalize_source_window_candidates(
                 "ordinal": ordinal,
                 "data": data,
                 "source_key": source_window_source_key(data, candidate_id=candidate_id),
+                "group_key": source_window_group_key(data, candidate_id=candidate_id),
+                "metadata": source_window_candidate_metadata(data, ordinal=ordinal, candidate_id=candidate_id),
             }
         )
     return normalized
@@ -2068,10 +2100,10 @@ def select_source_window_candidates(
     *,
     query_plan: dict[str, Any],
     primary_intent: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     selected: list[dict[str, Any]] = []
     selected_ids: set[str] = set()
-    selected_source_keys: set[str] = set()
+    selected_group_keys: set[str] = set()
     intent_candidates = [
         item
         for item in normalized_candidates
@@ -2083,8 +2115,8 @@ def select_source_window_candidates(
         if len(selected) >= SOURCE_WINDOW_LIMIT:
             break
         candidate_id = str(item["data"].get("candidate_id") or "")
-        source_key = str(item["source_key"])
-        if source_key in selected_source_keys:
+        group_key = str(item["group_key"])
+        if group_key in selected_group_keys:
             continue
         selected.append(
             {
@@ -2095,7 +2127,7 @@ def select_source_window_candidates(
             }
         )
         selected_ids.add(candidate_id)
-        selected_source_keys.add(source_key)
+        selected_group_keys.add(group_key)
 
     for item in normalized_candidates:
         if len(selected) >= SOURCE_WINDOW_LIMIT:
@@ -2103,10 +2135,42 @@ def select_source_window_candidates(
         candidate_id = str(item["data"].get("candidate_id") or "")
         if candidate_id in selected_ids:
             continue
+        if not intent_candidates and str(item["group_key"]) not in selected_group_keys:
+            continue
         selected.append({**item, "selection_reason_code": "existing_order_fill"})
         selected_ids.add(candidate_id)
+        selected_group_keys.add(str(item["group_key"]))
 
-    return selected
+    selected_candidate_ids = {str(item["data"].get("candidate_id") or "") for item in selected}
+    omitted = []
+    selected_group_counts = Counter(str(item["group_key"]) for item in selected)
+    candidate_group_counts = Counter(str(item["group_key"]) for item in normalized_candidates)
+    selected_groups = set(selected_group_counts)
+    intent_candidate_ids = {str(item["data"].get("candidate_id") or "") for item in intent_candidates}
+    for item in normalized_candidates:
+        candidate_id = str(item["data"].get("candidate_id") or "")
+        if candidate_id in selected_candidate_ids:
+            continue
+        group_key = str(item["group_key"])
+        if len(selected) >= SOURCE_WINDOW_LIMIT:
+            reason = "window_limit_after_group_allocation"
+        elif group_key not in selected_groups:
+            reason = "unrepresented_group_after_intent_allocation"
+        elif candidate_group_counts[group_key] > 1:
+            reason = "represented_group_over_limit"
+        else:
+            reason = "not_selected"
+        omitted.append({**item, "intent_match": candidate_id in intent_candidate_ids, "omission_reason": reason})
+
+    dominant_group_second_window_count = 0
+    if selected_group_counts:
+        dominant_group_second_window_count = max(0, max(selected_group_counts.values()) - 1)
+    return {
+        "selected": selected,
+        "omitted": omitted,
+        "intent_pass_active": bool(intent_candidates),
+        "dominant_group_second_window_count": dominant_group_second_window_count,
+    }
 
 
 def source_window_source_key(data: dict[str, Any], *, candidate_id: str) -> str:
@@ -2121,6 +2185,57 @@ def source_window_source_key(data: dict[str, Any], *, candidate_id: str) -> str:
     if target:
         return f"target:{target}"
     return f"candidate:{candidate_id}"
+
+
+def source_window_group_key(data: dict[str, Any], *, candidate_id: str) -> str:
+    source_key = source_window_source_key(data, candidate_id=candidate_id)
+    session = str(data.get("session") or "")
+    day = source_window_day(data.get("timestamp_utc"))
+    return "|".join(
+        [
+            f"source={source_key}",
+            f"session={session}" if session else "session=",
+            f"day={day}" if day else "day=",
+        ]
+    )
+
+
+def source_window_day(timestamp_utc: Any) -> str | None:
+    if not timestamp_utc:
+        return None
+    value = str(timestamp_utc)
+    if len(value) >= 10:
+        return value[:10]
+    return None
+
+
+def source_window_candidate_metadata(data: dict[str, Any], *, ordinal: int, candidate_id: str) -> dict[str, Any]:
+    source_ref = data.get("source_ref") or {}
+    return {
+        "ordinal": ordinal,
+        "candidate_id": candidate_id,
+        "source_ref": source_ref,
+        "target": source_ref_target(source_ref),
+        "source_key": source_window_source_key(data, candidate_id=candidate_id),
+        "group_key": source_window_group_key(data, candidate_id=candidate_id),
+        "role": data.get("role"),
+        "session_present": bool(data.get("session")),
+        "day": source_window_day(data.get("timestamp_utc")),
+    }
+
+
+def selection_policy_omitted_candidate_facts(omitted_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    group_counts = Counter(str(item["group_key"]) for item in omitted_candidates)
+    for item in omitted_candidates[:SOURCE_WINDOW_OMITTED_FACT_LIMIT]:
+        metadata = dict(item.get("metadata") or {})
+        metadata["omission_reason"] = str(item.get("omission_reason") or "omitted")
+        metadata["intent_match"] = bool(item.get("intent_match"))
+        metadata["omitted_group_count"] = group_counts[str(item["group_key"])]
+        metadata["raw_text_included"] = False
+        metadata["snippet_included"] = False
+        facts.append(metadata)
+    return facts
 
 
 def source_window_candidate_matches_intent(
