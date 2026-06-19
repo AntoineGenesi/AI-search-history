@@ -171,6 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         find.add_argument(
+            "--evidence-context-window",
+            type=int,
+            default=0,
+            help=(
+                "Explicit opt-in raw evidence packet context window. 0 keeps evidence_packets metadata-only; "
+                "N includes up to N same-source neighboring records around packet hit_children."
+            ),
+        )
+        find.add_argument(
             "--retrieval-mode",
             choices=RETRIEVAL_MODES,
             default=RETRIEVAL_MODE_PACKAGE,
@@ -344,6 +353,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Opt in to an extra compact_provenance_handoff JSON packet derived "
             "from emitted candidates, source refs, next reads, and no-evidence scope."
+        ),
+    )
+    semantic_debug.add_argument(
+        "--evidence-context-window",
+        type=int,
+        default=0,
+        help=(
+            "Explicit opt-in raw evidence packet context window. 0 keeps evidence_packets metadata-only; "
+            "N includes up to N same-source neighboring records around packet hit_children."
         ),
     )
     semantic_debug.add_argument(
@@ -2097,6 +2115,7 @@ def main(argv: list[str] | None = None) -> int:
             output_format=args.format,
             report_output=args.report_output,
             compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
+            evidence_context_window=getattr(args, "evidence_context_window", 0),
         )
     elif args.command == "plan":
         payload = {

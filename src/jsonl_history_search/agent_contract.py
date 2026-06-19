@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .adapters import AdapterReadError, iter_records_for_file
+
 
 INLINE_CANDIDATE_LIMIT = 12
 INLINE_CONTEXT_BYTE_LIMIT = 24_000
@@ -20,6 +22,9 @@ COMPACT_PROVENANCE_NEXT_READ_LIMIT = 8
 EVIDENCE_PACKET_LIMIT = 5
 EVIDENCE_PACKET_CHILD_LIMIT = 6
 EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT = 8
+EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT = 12_000
+EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT = 4_000
+EVIDENCE_PACKET_MATERIALIZED_CONTEXT_RECORD_CHAR_LIMIT = 1_000
 ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE = "supported_in_searched_scope"
 ANSWERABILITY_DEFERRED_SOURCE_NEEDED = "deferred_source_needed"
 ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE = "searched_scope_no_evidence"
@@ -82,6 +87,7 @@ def build_agent_find_payload(
     output_format: str = "json",
     report_output: str | None = None,
     compact_provenance_handoff: bool = False,
+    evidence_context_window: int = 0,
 ) -> dict[str, Any]:
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     candidates = build_candidate_rows(search_result)
@@ -167,6 +173,7 @@ def build_agent_find_payload(
         retrieval_pressure=agent_find.get("retrieval_pressure"),
         expansion_action_context=expansion_action_context,
         include_context_actions=compact_provenance_handoff,
+        evidence_context_window=evidence_context_window,
     )
     agent_find["source_locator_handoff"] = handoff
     if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
@@ -234,6 +241,8 @@ def build_compact_provenance_handoff(
     source_refs = source_ref_candidates[:COMPACT_PROVENANCE_SOURCE_REF_LIMIT]
     source_windows = list(source_locator_handoff.get("source_windows") or [])[:SOURCE_WINDOW_LIMIT]
     evidence_packets = list(source_locator_handoff.get("evidence_packets") or [])[:EVIDENCE_PACKET_LIMIT]
+    evidence_packet_packaging = source_locator_handoff.get("evidence_packet_packaging") or {}
+    evidence_packet_text_included = bool(evidence_packet_packaging.get("raw_text_included", False))
     compact_next_reads = list(next_reads or [])[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]
     answerability = build_compact_answerability(
         status=status,
@@ -255,6 +264,7 @@ def build_compact_provenance_handoff(
         evidence_packets_included=len(evidence_packets),
         next_read_count_considered=len(next_reads or []),
         next_reads_included=len(compact_next_reads),
+        evidence_packet_text_included=evidence_packet_text_included,
     )
     packet: dict[str, Any] = {
         "schema_version": 1,
@@ -287,8 +297,9 @@ def build_compact_provenance_handoff(
         },
         "privacy_boundaries": {
             **source_locator_handoff.get("privacy_boundaries", {}),
-            "raw_private_text_or_snippets_included": False,
+            "raw_private_text_or_snippets_included": evidence_packet_text_included,
             "source_window_text_included": False,
+            "evidence_packet_text_included": evidence_packet_text_included,
             "source_refs_may_point_to_local_transcripts": bool(source_refs),
         },
         "claim_boundaries": {
@@ -605,6 +616,15 @@ def build_stage_diagnostics(
                 "evidence_packet_omitted_child_count": int(evidence_packet_summary.get("omitted_child_count") or 0),
                 "evidence_packet_deduplicated_child_count": int(
                     evidence_packet_summary.get("deduplicated_child_count") or 0
+                ),
+                "evidence_packet_materialized_context_window": int(
+                    evidence_packet_summary.get("materialized_context_window") or 0
+                ),
+                "evidence_packet_materialized_context_record_count": int(
+                    evidence_packet_summary.get("materialized_context_record_count") or 0
+                ),
+                "evidence_packet_materialized_context_omitted_or_truncated_count": int(
+                    evidence_packet_summary.get("materialized_context_omitted_or_truncated_count") or 0
                 ),
                 "evidence_packet_text_included": bool(evidence_packet_summary.get("raw_text_included", False)),
             },
@@ -1403,6 +1423,7 @@ def build_compact_handoff_output_budget(
     evidence_packets_included: int,
     next_read_count_considered: int,
     next_reads_included: int,
+    evidence_packet_text_included: bool = False,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -1437,7 +1458,11 @@ def build_compact_handoff_output_budget(
             "candidates": "included_metadata_capped",
             "source_refs": "included_exact_capped",
             "source_windows": "reused_from_source_locator_handoff",
-            "evidence_packets": "reused_from_source_locator_handoff_metadata_only_capped",
+            "evidence_packets": (
+                "reused_from_source_locator_handoff_with_opt_in_materialized_context_capped"
+                if evidence_packet_text_included
+                else "reused_from_source_locator_handoff_metadata_only_capped"
+            ),
             "query_plan": "preserved",
             "stage_diagnostics": "preserved",
             "no_evidence": "preserved_searched_scope",
@@ -1979,6 +2004,7 @@ def build_source_locator_handoff(
     retrieval_pressure: dict[str, Any] | None = None,
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    evidence_context_window: int = 0,
 ) -> dict[str, Any]:
     """Build the stable agent handoff for deciding where to read next."""
     source_scope = build_source_scope_summary(source_plan, search_result)
@@ -2005,6 +2031,8 @@ def build_source_locator_handoff(
     evidence_packet_result = build_evidence_packet_package(
         candidates=candidate_rows,
         search_result=search_result,
+        source_plan=source_plan,
+        evidence_context_window=evidence_context_window,
     )
     evidence_packets = evidence_packet_result["packets"]
     evidence_packet_packaging = evidence_packet_result["packaging"]
@@ -2085,8 +2113,11 @@ def build_source_locator_handoff(
             "root_metadata_raw_paths_included": False,
             "raw_private_text_or_bridge_payload_included": False,
             "raw_private_text_or_snippets_in_source_windows_included": False,
-            "raw_private_text_or_snippets_in_evidence_packets_included": False,
+            "raw_private_text_or_snippets_in_evidence_packets_included": bool(
+                evidence_packet_packaging.get("raw_text_included", False)
+            ),
             "source_window_text_included": False,
+            "evidence_context_window_requested": max(0, int(evidence_context_window or 0)) > 0,
             "vectors_indexes_or_timestamp_sidecars_created": False,
             "candidate_source_refs_may_point_to_local_transcripts": bool(candidate_count),
         },
@@ -2261,7 +2292,10 @@ def build_evidence_packet_package(
     *,
     candidates: list[dict[str, Any]] | list[CandidateRow],
     search_result: dict[str, Any],
+    source_plan: dict[str, Any] | None = None,
+    evidence_context_window: int = 0,
 ) -> dict[str, Any]:
+    evidence_context_window = max(0, int(evidence_context_window or 0))
     retrieval_diagnostics = search_result.get("retrieval_diagnostics") or {}
     retrieval_mode = retrieval_diagnostics.get("retrieval_mode") or search_result.get("retrieval_mode")
     if retrieval_mode != "fielded-bm25":
@@ -2274,6 +2308,7 @@ def build_evidence_packet_package(
                 "packet_limit": EVIDENCE_PACKET_LIMIT,
                 "raw_text_included": False,
                 "snippets_included": False,
+                "evidence_context_window": 0,
             },
         }
 
@@ -2316,6 +2351,11 @@ def build_evidence_packet_package(
     omitted_children_by_packet_limit = sum(len(group["children"]) for group in ordered_groups[EVIDENCE_PACKET_LIMIT:])
     omitted_children_by_child_limit = 0
     omitted_context_records = 0
+    materialized_total_chars_remaining = EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT
+    materialized_context_included = 0
+    materialized_context_omitted = 0
+    materialized_context_truncated = 0
+    materialized_context_read_error_count = 0
 
     for packet_index, group in enumerate(ordered_groups[:EVIDENCE_PACKET_LIMIT], 1):
         children = sorted(
@@ -2331,6 +2371,19 @@ def build_evidence_packet_package(
         context_records_all = [evidence_packet_context_record(child) for child in children]
         context_records = context_records_all[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT]
         omitted_context_records += max(0, len(context_records_all) - len(context_records))
+        materialized_context = materialize_evidence_packet_context(
+            hit_children=hit_children,
+            source_plan=source_plan or {},
+            evidence_context_window=evidence_context_window,
+            total_chars_remaining=materialized_total_chars_remaining,
+        )
+        materialized_total_chars_remaining = int(materialized_context.pop("_total_chars_remaining"))
+        materialized_counts = materialized_context.get("counts") or {}
+        materialized_context_included += int(materialized_counts.get("included_record_count") or 0)
+        materialized_context_omitted += int(materialized_counts.get("omitted_or_truncated_count") or 0)
+        materialized_context_truncated += int(materialized_counts.get("truncated_text_record_count") or 0)
+        if materialized_context.get("status") in {"read_error", "source_not_found_or_out_of_scope"}:
+            materialized_context_read_error_count += 1
         line_values = [
             evidence_packet_numeric_line(child["source_ref"].get("line"))
             for child in children
@@ -2371,19 +2424,30 @@ def build_evidence_packet_package(
                 "included_context_record_count": len(context_records),
                 "omitted_context_record_count": max(0, len(context_records_all) - len(context_records)),
                 "source_order_context_metadata_only": True,
+                "materialized_context_window": evidence_context_window,
+                "materialized_context_record_limit_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
+                "materialized_context_char_limit_per_packet": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
+                "materialized_context_char_limit_total": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT,
                 "truncation_reason": evidence_packet_truncation_reason(
                     omitted_children=max(0, len(children) - len(hit_children)),
-                    omitted_context_records=max(0, len(context_records_all) - len(context_records)),
+                    omitted_context_records=max(
+                        0,
+                        len(context_records_all) - len(context_records),
+                    )
+                    + int(materialized_counts.get("omitted_or_truncated_count") or 0),
                     omitted_packet_groups=omitted_packet_groups if packet_index == EVIDENCE_PACKET_LIMIT else 0,
                 ),
                 "continuation_available_via_next_reads": True,
             },
             "privacy": {
-                "raw_text_included": False,
+                "raw_text_included": bool(materialized_context.get("raw_text_included", False)),
                 "snippets_included": False,
-                "metadata_only": True,
+                "metadata_only": not bool(materialized_context.get("raw_text_included", False)),
+                "materialized_context_opt_in": evidence_context_window > 0,
             },
         }
+        if evidence_context_window > 0:
+            packet["materialized_context"] = materialized_context
         packets.append(packet)
 
     hit_child_count = sum(len(packet["hit_children"]) for packet in packets)
@@ -2405,19 +2469,310 @@ def build_evidence_packet_package(
         "deduplicated_child_count": duplicate_child_count,
         "omitted_child_count": omitted_child_count,
         "omitted_context_record_count": omitted_context_records,
+        "materialized_context_window": evidence_context_window,
+        "materialized_context_record_count": materialized_context_included,
+        "materialized_context_omitted_or_truncated_count": materialized_context_omitted,
+        "materialized_context_truncated_text_record_count": materialized_context_truncated,
+        "materialized_context_read_error_count": materialized_context_read_error_count,
+        "materialized_context_total_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT,
+        "materialized_context_packet_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
+        "materialized_context_record_char_limit": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_RECORD_CHAR_LIMIT,
         "ordering_basis": "best_child_rank_then_source_target_then_start_line_then_packet_id",
         "grouping_fields": ["source", "session"],
         "metadata_fields": ["day"],
-        "raw_text_included": False,
+        "raw_text_included": materialized_context_included > 0,
         "snippets_included": False,
-        "source_order_context_metadata_only": True,
+        "source_order_context_metadata_only": evidence_context_window == 0,
+        "materialized_context_opt_in": evidence_context_window > 0,
         "claim_boundaries": {
             "ranking_changed": False,
             "score_weights_used": False,
             "retrieval_units_remain_child_hits": True,
+            "candidate_generation_changed": False,
+            "default_behavior_changed": False,
         },
     }
     return {"packets": packets, "packaging": packaging}
+
+
+def materialize_evidence_packet_context(
+    *,
+    hit_children: list[dict[str, Any]],
+    source_plan: dict[str, Any],
+    evidence_context_window: int,
+    total_chars_remaining: int,
+) -> dict[str, Any]:
+    evidence_context_window = max(0, int(evidence_context_window or 0))
+    base = {
+        "schema_version": 1,
+        "requested": evidence_context_window > 0,
+        "window": evidence_context_window,
+        "scope": "same_source",
+        "records": [],
+        "raw_text_included": False,
+        "text_field": "text",
+        "hit_children_separated": True,
+        "limits": {
+            "records_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
+            "chars_per_record": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_RECORD_CHAR_LIMIT,
+            "chars_per_packet": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
+            "chars_total": EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT,
+        },
+        "_total_chars_remaining": max(0, int(total_chars_remaining or 0)),
+    }
+    if evidence_context_window <= 0:
+        return {
+            **base,
+            "status": "not_requested",
+            "counts": materialized_context_counts(),
+        }
+    child_refs = [child.get("source_ref") or {} for child in hit_children if child.get("source_ref")]
+    child_lines = [
+        line
+        for line in (evidence_packet_numeric_line(ref.get("line")) for ref in child_refs)
+        if line is not None
+    ]
+    if not child_refs or not child_lines:
+        return {
+            **base,
+            "status": "missing_child_source_ref",
+            "counts": materialized_context_counts(),
+        }
+    source_path = resolve_evidence_context_source_path(child_refs[0], source_plan=source_plan)
+    if source_path is None:
+        requested_count = len(
+            {
+                line
+                for child_line in child_lines
+                for line in range(child_line - evidence_context_window, child_line + evidence_context_window + 1)
+                if line >= 1
+            }
+        )
+        return {
+            **base,
+            "status": "source_not_found_or_out_of_scope",
+            "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
+        }
+    try:
+        records = list(iter_records_for_file(source_path, evidence_context_source_kind(source_path, source_plan), timezone.utc))
+    except (AdapterReadError, OSError) as exc:
+        requested_count = len(
+            {
+                line
+                for child_line in child_lines
+                for line in range(child_line - evidence_context_window, child_line + evidence_context_window + 1)
+                if line >= 1
+            }
+        )
+        return {
+            **base,
+            "status": "read_error",
+            "error": str(exc),
+            "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
+        }
+
+    total_records = len(records)
+    requested_lines = sorted(
+        {
+            line
+            for child_line in child_lines
+            for line in range(
+                max(1, child_line - evidence_context_window),
+                min(total_records, child_line + evidence_context_window) + 1,
+            )
+        }
+    )
+    selected_lines = requested_lines[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT]
+    omitted_by_record_limit = max(0, len(requested_lines) - len(selected_lines))
+    unavailable_before_count = sum(max(0, evidence_context_window - (child_line - 1)) for child_line in child_lines)
+    unavailable_after_count = sum(max(0, child_line + evidence_context_window - total_records) for child_line in child_lines)
+    child_line_set = set(child_lines)
+    record_by_line = {int(record.line): record for record in records}
+    packet_chars_remaining = min(
+        EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
+        max(0, int(total_chars_remaining or 0)),
+    )
+    materialized_records: list[dict[str, Any]] = []
+    omitted_by_char_limit = 0
+    truncated_text_record_count = 0
+    for line in selected_lines:
+        if packet_chars_remaining <= 0:
+            omitted_by_char_limit += 1
+            continue
+        record = record_by_line.get(line)
+        if record is None:
+            continue
+        context_record = materialized_context_record(
+            record,
+            hit_child=line in child_line_set,
+            char_limit=min(EVIDENCE_PACKET_MATERIALIZED_CONTEXT_RECORD_CHAR_LIMIT, packet_chars_remaining),
+        )
+        text_len = len(str(context_record.get("text") or ""))
+        packet_chars_remaining -= text_len
+        if context_record["text_truncated"]:
+            truncated_text_record_count += 1
+        materialized_records.append(context_record)
+    included_chars = sum(len(str(record.get("text") or "")) for record in materialized_records)
+    next_total_remaining = max(0, int(total_chars_remaining or 0) - included_chars)
+    omitted_or_truncated = omitted_by_record_limit + omitted_by_char_limit + truncated_text_record_count
+    return {
+        **base,
+        "status": "materialized" if materialized_records else "no_records_materialized",
+        "source_ref": {"path": str(source_path), "line": child_lines[0]},
+        "source_order_preserved": True,
+        "dedupe_key": "source_ref.line",
+        "window_bounds": {
+            "requested_child_lines": child_lines,
+            "requested_line_start": requested_lines[0] if requested_lines else None,
+            "requested_line_end": requested_lines[-1] if requested_lines else None,
+            "included_line_start": materialized_records[0]["line"] if materialized_records else None,
+            "included_line_end": materialized_records[-1]["line"] if materialized_records else None,
+            "total_records_in_source": total_records,
+            "line_is_one_based": True,
+        },
+        "counts": materialized_context_counts(
+            requested_count=len(requested_lines),
+            included_record_count=len(materialized_records),
+            neighbor_before_count=sum(1 for line in requested_lines if line < min(child_lines)),
+            neighbor_after_count=sum(1 for line in requested_lines if line > max(child_lines)),
+            unavailable_before_count=unavailable_before_count,
+            unavailable_after_count=unavailable_after_count,
+            omitted_by_record_limit=omitted_by_record_limit,
+            omitted_by_char_limit=omitted_by_char_limit,
+            truncated_text_record_count=truncated_text_record_count,
+            omitted_or_truncated_count=omitted_or_truncated,
+            included_char_count=included_chars,
+        ),
+        "records": materialized_records,
+        "raw_text_included": bool(materialized_records),
+        "_total_chars_remaining": next_total_remaining,
+    }
+
+
+def materialized_context_counts(
+    *,
+    requested_count: int = 0,
+    included_record_count: int = 0,
+    neighbor_before_count: int = 0,
+    neighbor_after_count: int = 0,
+    unavailable_before_count: int = 0,
+    unavailable_after_count: int = 0,
+    omitted_by_record_limit: int = 0,
+    omitted_by_char_limit: int = 0,
+    truncated_text_record_count: int = 0,
+    omitted_or_truncated_count: int = 0,
+    included_char_count: int = 0,
+) -> dict[str, int]:
+    return {
+        "requested_record_count": requested_count,
+        "included_record_count": included_record_count,
+        "neighbor_before_count": neighbor_before_count,
+        "neighbor_after_count": neighbor_after_count,
+        "unavailable_before_count": unavailable_before_count,
+        "unavailable_after_count": unavailable_after_count,
+        "omitted_by_record_limit": omitted_by_record_limit,
+        "omitted_by_char_limit": omitted_by_char_limit,
+        "truncated_text_record_count": truncated_text_record_count,
+        "omitted_or_truncated_count": omitted_or_truncated_count,
+        "included_char_count": included_char_count,
+    }
+
+
+def materialized_context_record(record: Any, *, hit_child: bool, char_limit: int) -> dict[str, Any]:
+    text = str(getattr(record, "text", "") or "")
+    limit = max(0, int(char_limit or 0))
+    truncated = len(text) > limit
+    if truncated:
+        text = text[:limit]
+    return {
+        "source_ref": {
+            "path": str(record.path),
+            "line": int(record.line),
+        },
+        "target": f"{record.path}:{record.line}",
+        "line": int(record.line),
+        "role": record.role,
+        "timestamp": record.raw_timestamp,
+        "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+        "cwd": record.cwd,
+        "record_kind": "hit_child" if hit_child else "neighbor",
+        "text": text,
+        "text_included": True,
+        "text_truncated": truncated,
+    }
+
+
+def resolve_evidence_context_source_path(source_ref: dict[str, Any], *, source_plan: dict[str, Any]) -> Path | None:
+    raw_path_text = str(source_ref.get("path") or "")
+    if not raw_path_text:
+        return None
+    cwd = Path(str(source_plan.get("cwd") or ".")).expanduser()
+    raw_path = Path(raw_path_text).expanduser()
+    candidates = [raw_path if raw_path.is_absolute() else cwd / raw_path]
+    roots = list((source_plan.get("sources") or {}).get("roots") or [])
+    for root in roots:
+        root_path_text = root.get("path")
+        if not root_path_text:
+            continue
+        root_path = Path(str(root_path_text)).expanduser()
+        if root_path.is_dir() and not raw_path.is_absolute():
+            candidates.append(root_path / raw_path)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        if evidence_context_path_allowed(resolved, roots=roots):
+            return resolved
+    return None
+
+
+def evidence_context_path_allowed(path: Path, *, roots: list[dict[str, Any]]) -> bool:
+    if not roots:
+        return True
+    for root in roots:
+        root_path_text = root.get("path")
+        if not root_path_text:
+            continue
+        base = Path(str(root_path_text)).expanduser()
+        try:
+            resolved_base = base.resolve()
+        except OSError:
+            continue
+        if resolved_base.is_file() and path == resolved_base:
+            return True
+        if resolved_base.is_dir() and path_is_inside_evidence_context(path, resolved_base):
+            return True
+    return False
+
+
+def path_is_inside_evidence_context(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def evidence_context_source_kind(path: Path, source_plan: dict[str, Any]) -> str:
+    for root in (source_plan.get("sources") or {}).get("roots") or []:
+        root_path_text = root.get("path")
+        if not root_path_text:
+            continue
+        base = Path(str(root_path_text)).expanduser()
+        try:
+            resolved_base = base.resolve()
+        except OSError:
+            continue
+        if (resolved_base.is_file() and path == resolved_base) or (
+            resolved_base.is_dir() and path_is_inside_evidence_context(path, resolved_base)
+        ):
+            return str(root.get("kind") or "unknown_jsonl")
+    if path.suffix == ".json":
+        return "unknown_json"
+    return "unknown_jsonl"
 
 
 def normalize_evidence_packet_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
