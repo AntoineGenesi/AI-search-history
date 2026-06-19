@@ -371,6 +371,7 @@ def build_stage_diagnostics(
     compact_output_limits = compact_output_budget.get("limits") or {}
     fielded = pressure.get("fielded_bm25") or {}
     query_streams = fielded.get("query_streams") or {}
+    evidence_channels = pressure.get("fielded_evidence_channels") or fielded.get("evidence_channels") or {}
     context_neighborhood = pressure.get("fielded_context_neighborhood") or fielded.get("context_neighborhood") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
@@ -426,6 +427,28 @@ def build_stage_diagnostics(
                 "row_count_before_dedupe": int(query_streams.get("row_count_before_dedupe") or 0),
                 "row_count_after_dedupe": int(query_streams.get("row_count_after_dedupe") or 0),
                 "rows_dropped_by_stream_cap_total": int(query_streams.get("rows_dropped_by_stream_cap_total") or 0),
+                "evidence_channel_count": int(evidence_channels.get("channel_count") or 0),
+                "evidence_channel_labels": [str(label) for label in evidence_channels.get("channel_labels") or []],
+                "evidence_channel_rank_only": bool(evidence_channels.get("rank_only", False)),
+                "evidence_channel_rank_constant": int(evidence_channels.get("rank_constant") or 0),
+                "evidence_channel_raw_scores_used": bool(
+                    evidence_channels.get("raw_score_inputs_used_for_fusion", False)
+                ),
+                "evidence_channel_score_normalization_used": bool(
+                    evidence_channels.get("score_normalization_used", False)
+                ),
+                "evidence_channel_selected_rows_after_fusion": int(
+                    evidence_channels.get("selected_row_count_after_fusion") or 0
+                ),
+                "evidence_channel_dropped_rows_after_fusion": int(
+                    evidence_channels.get("dropped_row_count_after_fusion") or 0
+                ),
+                "evidence_channel_selected_rows_by_channel": sanitize_int_counts(
+                    evidence_channels.get("selected_rows_by_channel_after_grouping")
+                ),
+                "evidence_channel_dropped_rows_by_channel": sanitize_int_counts(
+                    evidence_channels.get("dropped_rows_by_channel_after_grouping")
+                ),
                 "context_neighborhood_intent_detected": bool(context_neighborhood.get("intent_detected", False)),
                 "context_neighborhood_anchor_rows": int(context_neighborhood.get("anchor_rows_considered") or 0),
                 "context_neighborhood_generated_rows": int(context_neighborhood.get("generated_neighbor_rows") or 0),
@@ -787,6 +810,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     source_plan = sanitize_source_plan(diagnostics.get("source_plan") or {})
     fielded_bm25 = diagnostics.get("fielded_bm25") or {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
+    fielded_evidence_channels = diagnostics.get("fielded_evidence_channels") or fielded_bm25.get("evidence_channels") or {}
     fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
     claim_boundaries = diagnostics.get("claim_boundaries") or {}
@@ -822,6 +846,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "searched_bytes": int(fielded_bm25.get("searched_bytes") or 0),
             "records_considered": int(fielded_bm25.get("records_considered") or 0),
             "query_streams": sanitize_query_stream_pressure(fielded_bm25.get("query_streams")),
+            "evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
             "context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
             "materialization": fielded_bm25.get("materialization") or {},
             "index_summary": fielded_bm25.get("index_summary") or {},
@@ -831,6 +856,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "raw_session_ids_included": False,
             "vectors_or_persisted_indexes_included": False,
         },
+        "fielded_evidence_channels": sanitize_evidence_channel_pressure(fielded_evidence_channels),
         "fielded_context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
         "fielded_source_grouping": {
             "enabled": bool(fielded_source_grouping.get("enabled", False)),
@@ -937,6 +963,54 @@ def sanitize_query_stream_pressure(value: Any) -> dict[str, Any]:
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def sanitize_evidence_channel_pressure(value: Any) -> dict[str, Any]:
+    channels = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(channels.get("enabled", False)),
+        "strategy": str(channels.get("strategy") or "disabled"),
+        "fusion_stage": str(channels.get("fusion_stage") or ""),
+        "rank_fusion_style": str(channels.get("rank_fusion_style") or ""),
+        "rank_constant": int(channels.get("rank_constant") or 0),
+        "rank_only": bool(channels.get("rank_only", False)),
+        "raw_score_inputs_used_for_fusion": bool(channels.get("raw_score_inputs_used_for_fusion", False)),
+        "raw_bm25_scores_used_for_fusion": bool(channels.get("raw_bm25_scores_used_for_fusion", False)),
+        "score_normalization_used": bool(channels.get("score_normalization_used", False)),
+        "equal_channel_weights": bool(channels.get("equal_channel_weights", True)),
+        "candidate_row_pool_limit": int(channels.get("candidate_row_pool_limit") or 0),
+        "channel_count": int(channels.get("channel_count") or 0),
+        "channel_labels": [str(label) for label in channels.get("channel_labels") or []],
+        "channel_kinds": {str(label): str(kind) for label, kind in (channels.get("channel_kinds") or {}).items()},
+        "channel_row_counts": sanitize_int_counts(channels.get("channel_row_counts")),
+        "unique_row_count_before_fusion": int(channels.get("unique_row_count_before_fusion") or 0),
+        "selected_row_count_after_fusion": int(channels.get("selected_row_count_after_fusion") or 0),
+        "dropped_row_count_after_fusion": int(channels.get("dropped_row_count_after_fusion") or 0),
+        "selected_rows_by_channel_after_fusion": sanitize_int_counts(
+            channels.get("selected_rows_by_channel_after_fusion")
+        ),
+        "dropped_rows_by_channel_after_fusion": sanitize_int_counts(
+            channels.get("dropped_rows_by_channel_after_fusion")
+        ),
+        "selected_rows_by_channel_after_grouping": sanitize_int_counts(
+            channels.get("selected_rows_by_channel_after_grouping")
+        ),
+        "dropped_rows_by_channel_after_grouping": sanitize_int_counts(
+            channels.get("dropped_rows_by_channel_after_grouping")
+        ),
+        "selected_row_reason_label_prefix": str(
+            channels.get("selected_row_reason_label_prefix") or "fielded_bm25:evidence_channel:"
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
