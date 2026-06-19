@@ -3678,6 +3678,9 @@ def _source_tier_answerability_pressure_row_stats(
     no_evidence_boundary = (
         evidence.get("no_evidence_boundary") if isinstance(evidence.get("no_evidence_boundary"), dict) else {}
     )
+    next_read_recovery = (
+        evidence.get("next_read_recovery") if isinstance(evidence.get("next_read_recovery"), dict) else {}
+    )
     related_policy = (
         evidence.get("related_candidate_policy") if isinstance(evidence.get("related_candidate_policy"), dict) else {}
     )
@@ -3719,6 +3722,28 @@ def _source_tier_answerability_pressure_row_stats(
                 "hard_required_selected": int(source_tier_boundary.get("hard_required_selected") or 0),
                 "raw_paths_included": False,
                 "raw_text_included": False,
+            },
+            "next_read_recovery": {
+                "recoverable_by_opening_next_reads": bool(
+                    next_read_recovery.get("recoverable_by_opening_next_reads", False)
+                ),
+                "recovery_kind": _safe_agent_compact_label(next_read_recovery.get("recovery_kind")),
+                "candidate_window_count": int(next_read_recovery.get("candidate_window_count") or 0),
+                "next_read_count": int(next_read_recovery.get("next_read_count") or 0),
+                "candidate_window_limit": int(next_read_recovery.get("candidate_window_limit") or 0),
+                "candidate_window_omitted_count": int(
+                    next_read_recovery.get("candidate_window_omitted_count") or 0
+                ),
+                "source_grouping_selection_changed": bool(
+                    next_read_recovery.get("source_grouping_selection_changed", False)
+                ),
+                "collapsed_adjacent_run_count": int(next_read_recovery.get("collapsed_adjacent_run_count") or 0),
+                "suppressed_adjacent_row_count": int(next_read_recovery.get("suppressed_adjacent_row_count") or 0),
+                "rows_dropped_by_source_cap": int(next_read_recovery.get("rows_dropped_by_source_cap") or 0),
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "source_lines_included": False,
+                "line_numbers_included": False,
             },
             "no_evidence_boundary": {
                 "needed": bool(no_evidence_boundary.get("needed", False)),
@@ -3785,8 +3810,13 @@ def _source_tier_answerability_pressure_row_stats(
         },
         "no_evidence": {
             "needed": bool(no_evidence.get("needed")),
-            "answer_scope_label": _safe_agent_compact_label(no_evidence.get("answer_scope")),
-            "not_all_history_absence": bool(no_evidence.get("not_all_history_absence")),
+            "answer_scope_label": (
+                _safe_agent_compact_label(no_evidence_boundary.get("answer_scope"))
+                if bool(no_evidence_boundary.get("needed", False))
+                else "not_applicable"
+            ),
+            "not_all_history_absence": bool(no_evidence_boundary.get("needed", False))
+            and bool(no_evidence.get("not_all_history_absence")),
         },
         "stage_diagnostics": {
             "present": bool(stage_diagnostics),
@@ -3839,6 +3869,7 @@ def _source_tier_answerability_pressure_summary(
         }
     stats = [row["source_tier_answerability_pressure"] for row in selected]
     evidence_rows = [item.get("evidence_sufficiency") or {} for item in stats]
+    recovery_rows = [item.get("next_read_recovery") or {} for item in evidence_rows]
     source_plans = [item.get("source_plan") or {} for item in stats]
     source_catalogs = [item.get("source_catalog") or {} for item in stats]
     budgets = [item.get("compact_context_budget") or {} for item in stats]
@@ -3875,6 +3906,33 @@ def _source_tier_answerability_pressure_summary(
             for item in evidence_rows
             if int((item.get("searched_scope_support") or {}).get("weak_or_related_candidate_count") or 0) > 0
         ),
+        "next_read_recovery": {
+            "recoverable_rows": sum(
+                1 for item in recovery_rows if item.get("recoverable_by_opening_next_reads") is True
+            ),
+            "recovery_kind_counts": _counts(item.get("recovery_kind") for item in recovery_rows),
+            "candidate_window_count_total": sum(int(item.get("candidate_window_count") or 0) for item in recovery_rows),
+            "next_read_count_total": sum(int(item.get("next_read_count") or 0) for item in recovery_rows),
+            "candidate_window_omitted_total": sum(
+                int(item.get("candidate_window_omitted_count") or 0) for item in recovery_rows
+            ),
+            "source_grouping_selection_changed_rows": sum(
+                1 for item in recovery_rows if item.get("source_grouping_selection_changed") is True
+            ),
+            "collapsed_adjacent_run_count_total": sum(
+                int(item.get("collapsed_adjacent_run_count") or 0) for item in recovery_rows
+            ),
+            "suppressed_adjacent_row_count_total": sum(
+                int(item.get("suppressed_adjacent_row_count") or 0) for item in recovery_rows
+            ),
+            "rows_dropped_by_source_cap_total": sum(
+                int(item.get("rows_dropped_by_source_cap") or 0) for item in recovery_rows
+            ),
+            "raw_paths_included": any(item.get("raw_paths_included") is True for item in recovery_rows),
+            "raw_text_included": any(item.get("raw_text_included") is True for item in recovery_rows),
+            "source_lines_included": any(item.get("source_lines_included") is True for item in recovery_rows),
+            "line_numbers_included": any(item.get("line_numbers_included") is True for item in recovery_rows),
+        },
         "source_catalog": {
             "present_rows": sum(1 for item in source_catalogs if item.get("present") is True),
             "median_file_count": _median(item.get("file_count") for item in source_catalogs),
@@ -3983,7 +4041,7 @@ def _source_tier_answerability_pressure_decision(summary: dict[str, Any]) -> dic
         "rationale": rationale,
         "next_action": next_action,
         "default_search_behavior_changed": False,
-        "scanner_ranking_source_selection_changed": False,
+        "scanner_ranking_source_selection_changed": True,
         "legacy_output_context_bytes_redefined": False,
         "measured_packet": "agent_find.compact_provenance_handoff",
         "measured_builder": "build_agent_find_payload(compact_provenance_handoff=True)",
@@ -4111,7 +4169,7 @@ def _source_tier_answerability_pressure_claim_boundaries() -> dict[str, bool]:
         "compact_handoff_is_opt_in": True,
         "fielded_bm25_is_explicit_opt_in": True,
         "default_behavior_changed": False,
-        "scanner_ranking_or_source_selection_changed": False,
+        "scanner_ranking_or_source_selection_changed": True,
         "token_savings_claim_supported": False,
         "final_answer_quality_claim_supported": False,
         "product_value_claim_supported": False,

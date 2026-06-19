@@ -3362,6 +3362,7 @@ def render_real_history_impact_markdown(payload: dict) -> str:
         compact_budget = source_tier_pressure.get("compact_context_budget") or {}
         cap_hit = source_tier_pressure.get("cap_hit") or {}
         no_evidence = source_tier_pressure.get("no_evidence") or {}
+        next_read_recovery = source_tier_pressure.get("next_read_recovery") or {}
         lines.extend(
             [
                 "",
@@ -3386,6 +3387,14 @@ def render_real_history_impact_markdown(payload: dict) -> str:
                 ),
                 f"- Diagnostic candidate rows: `{source_tier_pressure.get('diagnostic_candidate_rows')}`",
                 f"- Weak candidate diagnostic rows: `{source_tier_pressure.get('weak_candidate_diagnostic_rows')}`",
+                f"- Next-read recoverable rows: `{next_read_recovery.get('recoverable_rows')}`",
+                f"- Next-read recovery kind counts: `{next_read_recovery.get('recovery_kind_counts')}`",
+                f"- Next-read count total: `{next_read_recovery.get('next_read_count_total')}`",
+                f"- Source-window count total: `{next_read_recovery.get('candidate_window_count_total')}`",
+                (
+                    "- Source-grouping selection changed rows: "
+                    f"`{next_read_recovery.get('source_grouping_selection_changed_rows')}`"
+                ),
                 f"- Cap-hit rows: `{cap_hit.get('rows')}`",
                 f"- Cap-hit rows by label: `{cap_hit.get('rows_by_label')}`",
                 f"- No-evidence needed rows: `{no_evidence.get('needed_rows')}`",

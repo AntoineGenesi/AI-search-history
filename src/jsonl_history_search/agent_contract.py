@@ -226,6 +226,10 @@ def build_compact_provenance_handoff(
         source_locator_handoff=source_locator_handoff,
         no_evidence=no_evidence,
     )
+    source_selection_changed = compact_handoff_source_selection_changed(
+        source_locator_handoff=source_locator_handoff,
+        retrieval_pressure=retrieval_pressure,
+    )
     output_budget = build_compact_handoff_output_budget(
         candidate_count=len(candidates),
         candidates_included=len(compact_candidates),
@@ -273,7 +277,12 @@ def build_compact_provenance_handoff(
             **source_locator_handoff.get("claim_boundaries", {}),
             "compact_handoff_is_opt_in": True,
             "default_behavior_changed": False,
-            "scanner_ranking_or_source_selection_changed": False,
+            "scanner_ranking_or_source_selection_changed": bool(
+                (source_locator_handoff.get("claim_boundaries", {}) or {}).get(
+                    "scanner_ranking_or_source_selection_changed", False
+                )
+                or source_selection_changed
+            ),
             "token_savings_claim_supported": False,
             "final_answer_quality_claim_supported": False,
             "product_value_claim_supported": False,
@@ -291,6 +300,28 @@ def build_compact_provenance_handoff(
         "output_budget": output_budget,
     }
     return packet
+
+
+def compact_handoff_source_selection_changed(
+    *,
+    source_locator_handoff: dict[str, Any],
+    retrieval_pressure: dict[str, Any] | None,
+) -> bool:
+    pressure = retrieval_pressure if isinstance(retrieval_pressure, dict) else {}
+    grouping = pressure.get("fielded_source_grouping") if isinstance(pressure.get("fielded_source_grouping"), dict) else {}
+    if bool(grouping.get("enabled")) and str(grouping.get("strategy") or "disabled") != "disabled":
+        return True
+    for stage in (source_locator_handoff.get("stage_diagnostics") or {}).get("stages") or []:
+        if not isinstance(stage, dict) or stage.get("stage") != "source_grouping_diversity":
+            continue
+        counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+        if (
+            int(counters.get("group_interleaved_rows_selected") or 0) > 0
+            or int(counters.get("collapsed_adjacent_run_count") or 0) > 0
+            or int(counters.get("suppressed_adjacent_row_count") or 0) > 0
+        ):
+            return True
+    return False
 
 
 STAGE_DIAGNOSTIC_LABELS = [
@@ -665,6 +696,13 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             ),
             "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
             "default_behavior_changed": bool(claim_boundaries.get("default_behavior_changed", False)),
+            "scanner_ranking_or_source_selection_changed": bool(
+                claim_boundaries.get("scanner_ranking_or_source_selection_changed", False)
+                or (
+                    bool(fielded_source_grouping.get("enabled", False))
+                    and str(fielded_source_grouping.get("strategy") or "disabled") != "disabled"
+                )
+            ),
             "all_history_completeness_claim_supported": bool(
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
@@ -761,6 +799,13 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             ),
             "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
             "default_behavior_changed": bool(claim_boundaries.get("default_behavior_changed", False)),
+            "scanner_ranking_or_source_selection_changed": bool(
+                claim_boundaries.get("scanner_ranking_or_source_selection_changed", False)
+                or (
+                    bool(fielded_source_grouping.get("enabled", False))
+                    and str(fielded_source_grouping.get("strategy") or "disabled") != "disabled"
+                )
+            ),
             "all_history_completeness_claim_supported": bool(
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
@@ -1161,6 +1206,7 @@ def build_compact_answerability(
     deferred_count = int(source_plan.get("sources_deferred_budget") or 0)
     hard_required_selected = int(selected_counts.get("hard_required") or 0)
     source_plan_present = bool(source_plan.get("source") or source_plan.get("basis") or source_plan.get("source_tiers"))
+    recoverability = compact_answerability_next_read_recovery(source_locator_handoff)
     coverage_rows = [candidate_coverage(candidate) for candidate in candidates]
     strongest_coverage = max(coverage_rows, key=lambda item: item["ratio"], default={"matched": 0, "total": 0, "ratio": 0.0})
     strong_candidates = [
@@ -1180,6 +1226,15 @@ def build_compact_answerability(
         answerable = False
         grounding_state = "no_candidate_support_in_searched_scope"
         reasons = ["no_candidate_rows_survived_searched_scope"]
+    elif not strong_candidates and recoverability["recoverable_by_opening_next_reads"]:
+        support_class = ANSWERABILITY_DEFERRED_SOURCE_NEEDED
+        answerable = False
+        grounding_state = "selected_representatives_require_source_window_read"
+        reasons = [
+            "candidate_presence_is_diagnostic_only",
+            "distinctive_anchor_coverage_insufficient",
+            "selected_source_windows_or_next_reads_available",
+        ]
     elif not strong_candidates:
         support_class = ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE
         answerable = False
@@ -1228,6 +1283,7 @@ def build_compact_answerability(
             "raw_paths_included": False,
             "raw_text_included": False,
         },
+        "next_read_recovery": recoverability,
         "no_evidence_boundary": {
             "needed": support_class == ANSWERABILITY_SEARCHED_SCOPE_NO_EVIDENCE,
             "answer_scope": (
@@ -1242,6 +1298,9 @@ def build_compact_answerability(
             "weak_candidates_remain_as_diagnostics": weak_candidate_count > 0,
             "source_refs_and_windows_preserved": True,
             "do_not_promote_weak_candidates_to_answer": True,
+            "weak_candidates_can_require_next_read_before_answer": bool(
+                recoverability["recoverable_by_opening_next_reads"]
+            ),
         },
         "reasons": reasons,
         "claim_boundaries": {
@@ -1249,6 +1308,44 @@ def build_compact_answerability(
             "final_answer_quality_claim_supported": False,
             "all_history_completeness_claim_supported": False,
         },
+    }
+
+
+def compact_answerability_next_read_recovery(source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
+    source_windows = source_locator_handoff.get("source_windows") or []
+    next_reads = source_locator_handoff.get("next_reads") or []
+    packaging = source_locator_handoff.get("source_window_packaging") or {}
+    stage_diagnostics = source_locator_handoff.get("stage_diagnostics") or {}
+    grouping_counters: dict[str, Any] = {}
+    for stage in stage_diagnostics.get("stages") or []:
+        if isinstance(stage, dict) and stage.get("stage") == "source_grouping_diversity":
+            grouping_counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+            break
+    collapsed_runs = int(grouping_counters.get("collapsed_adjacent_run_count") or 0)
+    suppressed_rows = int(grouping_counters.get("suppressed_adjacent_row_count") or 0)
+    rows_dropped_by_source_cap = int(grouping_counters.get("rows_dropped_by_source_cap") or 0)
+    source_selection_changed = collapsed_runs > 0 or suppressed_rows > 0 or rows_dropped_by_source_cap > 0
+    window_count = int(packaging.get("candidate_window_count") or len(source_windows))
+    next_read_count = len(next_reads)
+    recoverable = bool(
+        (window_count > 0 or next_read_count > 0)
+        and (source_selection_changed or rows_dropped_by_source_cap > 0)
+    )
+    return {
+        "recoverable_by_opening_next_reads": recoverable,
+        "recovery_kind": "source_window_or_next_read" if recoverable else "none",
+        "candidate_window_count": window_count,
+        "next_read_count": next_read_count,
+        "candidate_window_limit": int(packaging.get("candidate_window_limit") or 0),
+        "candidate_window_omitted_count": int(packaging.get("candidate_window_omitted_count") or 0),
+        "source_grouping_selection_changed": bool(source_selection_changed),
+        "collapsed_adjacent_run_count": collapsed_runs,
+        "suppressed_adjacent_row_count": suppressed_rows,
+        "rows_dropped_by_source_cap": rows_dropped_by_source_cap,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
     }
 
 
