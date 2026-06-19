@@ -2291,11 +2291,13 @@ def build_evidence_packet_package(
                 "day": item["day"],
                 "children": [],
                 "seen_child_refs": set(),
+                "duplicate_child_count": 0,
             },
         )
         child_ref_key = evidence_packet_child_ref_key(item)
         if child_ref_key in group["seen_child_refs"]:
             duplicate_child_count += 1
+            group["duplicate_child_count"] += 1
             continue
         group["seen_child_refs"].add(child_ref_key)
         group["children"].append(item)
@@ -2365,7 +2367,7 @@ def build_evidence_packet_package(
                 "context_record_limit_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
                 "included_child_count": len(hit_children),
                 "omitted_child_count": max(0, len(children) - len(hit_children)),
-                "deduplicated_child_count": duplicate_child_count if packet_index == 1 else 0,
+                "deduplicated_child_count": int(group.get("duplicate_child_count") or 0),
                 "included_context_record_count": len(context_records),
                 "omitted_context_record_count": max(0, len(context_records_all) - len(context_records)),
                 "source_order_context_metadata_only": True,
