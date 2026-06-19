@@ -694,6 +694,23 @@ def build_parser() -> argparse.ArgumentParser:
             "provenance handoff builder."
         ),
     )
+    real_history_impact.add_argument(
+        "--checkpoint-output",
+        default=None,
+        help=(
+            "Optional JSONL path for aggregate-safe benchmark progress checkpoints. "
+            "Records contain only stage/count/RSS labels, not private paths, text, queries, sessions, or payloads."
+        ),
+    )
+    real_history_impact.add_argument(
+        "--memory-guard-rss-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Soft current-RSS stop threshold for benchmark pressure runs. 0 disables; "
+            "when exceeded, returns memory_guard_stop with checkpoint evidence if configured."
+        ),
+    )
     real_history_timestamp_seek = subparsers.add_parser("benchmark-real-history-timestamp-seek")
     add_common_args(real_history_timestamp_seek)
     real_history_timestamp_seek.add_argument(

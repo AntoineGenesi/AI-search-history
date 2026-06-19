@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import statistics
 import subprocess
@@ -13,6 +14,7 @@ from typing import Any
 from .agent_contract import build_agent_find_payload
 from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .metric_contract import add_metric_contract, real_history_impact_metrics
+from .profiling import current_rss_bytes
 from .query import QueryIntent, infer_query
 from .real_history_bridge import validate_bridge_files
 from .retrieval_modes import build_fielded_bm25_retrieval_diagnostics, run_rrf_fusion_retrieval
@@ -70,6 +72,90 @@ class Candidate:
     byte_count: int
 
 
+class BenchmarkCheckpointWriter:
+    def __init__(self, output: str | None, *, run_id: str, started: float) -> None:
+        self.output = Path(output).expanduser() if output else None
+        self.run_id = run_id
+        self.started = started
+        self.count = 0
+        self.last_stage: str | None = None
+        if self.output is not None:
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def enabled(self) -> bool:
+        return self.output is not None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "record_count": self.count,
+            "last_stage": self.last_stage,
+            "output_path_included": False,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "source_lines_included": False,
+            "session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        }
+
+    def write(self, stage: str, *, status: str, **counts: Any) -> None:
+        if self.output is None:
+            return
+        rss_current, rss_reason = current_rss_bytes()
+        self.count += 1
+        self.last_stage = stage
+        payload = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "sequence": self.count,
+            "stage": _safe_checkpoint_label(stage),
+            "status": _safe_checkpoint_label(status),
+            "elapsed_ms": _elapsed_ms(self.started),
+            "rss_current_bytes": rss_current,
+            "rss_current_unavailable_reason": rss_reason,
+            "counts": _safe_checkpoint_counts(counts),
+            "privacy": {
+                "raw_paths_included": False,
+                "raw_text_included": False,
+                "raw_query_text_included": False,
+                "source_lines_included": False,
+                "line_numbers_included": False,
+                "session_ids_included": False,
+                "cwd_included": False,
+                "usernames_included": False,
+                "vectors_or_persisted_indexes_included": False,
+            },
+        }
+        with self.output.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _safe_checkpoint_label(value: Any) -> str:
+    text = str(value or "unknown")
+    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", text):
+        return text
+    return "label_redacted"
+
+
+def _safe_checkpoint_counts(values: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in values.items():
+        safe_key = _safe_checkpoint_label(key)
+        if isinstance(value, bool):
+            safe[safe_key] = value
+        elif isinstance(value, int):
+            safe[safe_key] = value
+        elif isinstance(value, float):
+            safe[safe_key] = round(value, 3)
+        elif value is None:
+            safe[safe_key] = None
+        elif isinstance(value, str):
+            safe[safe_key] = _safe_checkpoint_label(value)
+    return safe
+
+
 def build_real_history_impact_payload(args) -> dict[str, Any]:
     started = time.perf_counter()
     phase_started = time.perf_counter()
@@ -110,6 +196,12 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         subset_selection=subset_selection,
     )
     base_report["phase_durations_ms"]["bridge_validation"] = bridge_validation_ms
+    checkpoint_writer = BenchmarkCheckpointWriter(
+        getattr(args, "checkpoint_output", None),
+        run_id=str(base_report["run_id"]),
+        started=started,
+    )
+    base_report["checkpointing"] = checkpoint_writer.metadata()
 
     plan = build_source_plan(
         cwd=Path(args.cwd).expanduser().resolve(),
@@ -126,6 +218,26 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     phase_started = time.perf_counter()
     files, enum_warnings = _enumerate_files(plan)
     base_report["phase_durations_ms"]["source_enumeration"] = _elapsed_ms(phase_started)
+    checkpoint_writer.write(
+        "source_enumeration",
+        status="ok",
+        selected_case_count=len(selected_cases),
+        file_count=len(files),
+        byte_count=sum(int(item.size) for item in files),
+        warning_count=len(enum_warnings),
+    )
+    guard_stop = _memory_guard_stop(args, checkpoint_writer, stage="after_source_enumeration")
+    if guard_stop is not None:
+        return {
+            "real_history_impact_benchmark": _finish_memory_guard_stop(
+                base_report,
+                rows=[],
+                selected_baselines=[],
+                checkpoint_writer=checkpoint_writer,
+                started=started,
+                guard_stop=guard_stop,
+            )
+        }
     safe_warnings = _safe_warnings(enum_warnings)
     cap_hit_labels = _cap_hit_labels(safe_warnings)
     if safe_warnings:
@@ -169,6 +281,28 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 "fielded_bm25_index_build",
             ),
         }
+        checkpoint_writer.write(
+            "fielded_bm25_index_build",
+            status="ok" if fielded_bm25_index.available else "unavailable",
+            indexed_file_count=int(fielded_bm25_index.metrics.get("indexed_files", 0)),
+            indexed_record_count=int(fielded_bm25_index.metrics.get("indexed_records", 0)),
+            indexed_chunk_count=int(fielded_bm25_index.metrics.get("indexed_chunks", 0)),
+            build_bytes=int(fielded_bm25_index.metrics.get("build_bytes", 0)),
+            sources_reused=int(fielded_bm25_index.metrics.get("sources_reused", 0)),
+            sources_reindexed=int(fielded_bm25_index.metrics.get("sources_reindexed", 0)),
+        )
+        guard_stop = _memory_guard_stop(args, checkpoint_writer, stage="after_fielded_bm25_index_build")
+        if guard_stop is not None:
+            return {
+                "real_history_impact_benchmark": _finish_memory_guard_stop(
+                    base_report,
+                    rows=[],
+                    selected_baselines=selected,
+                    checkpoint_writer=checkpoint_writer,
+                    started=started,
+                    guard_stop=guard_stop,
+                )
+            }
     rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
     for case in selected_cases:
@@ -205,6 +339,29 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
                 row, raw_row = runner(**runner_kwargs)
                 rows.append(row)
                 raw_rows.append(raw_row)
+                if baseline == "package_search_fielded_bm25":
+                    checkpoint_writer.write(
+                        "package_search_fielded_bm25_row",
+                        status="ok",
+                        row_count=len(rows),
+                        case_sequence_index=selected_cases.index(case) + 1,
+                        repeat_index=repeat_index,
+                        output_context_bytes=int(row.get("output_context_bytes") or 0),
+                        candidate_count=len(row.get("candidate_ref_ids", []) or []),
+                        warning_count=len(row.get("warnings", []) or []),
+                    )
+                    guard_stop = _memory_guard_stop(args, checkpoint_writer, stage="after_package_search_fielded_bm25_row")
+                    if guard_stop is not None:
+                        return {
+                            "real_history_impact_benchmark": _finish_memory_guard_stop(
+                                base_report,
+                                rows=rows,
+                                selected_baselines=selected,
+                                checkpoint_writer=checkpoint_writer,
+                                started=started,
+                                guard_stop=guard_stop,
+                            )
+                        }
 
     row_warnings = [warning for row in rows for warning in row.get("warnings", [])]
     safe_warnings = _safe_warnings(safe_warnings + row_warnings)
@@ -266,6 +423,13 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
         base_report["structural_sidecar_diagnostic"] = structural_diagnostic
     base_report["headline_findings"] = _headline_findings(base_report["summary"], base_report["aggregate"], cap_hit_labels)
     base_report.update(_evaluate_gate_statuses(rows, base_report["summary"], base_report.get("warnings", [])))
+    checkpoint_writer.write(
+        "final_aggregation",
+        status=str(base_report.get("status") or "unknown"),
+        row_count=len(rows),
+        evaluated_case_count=len({row["case_id"] for row in rows}),
+        cap_hit_label_count=len(base_report.get("cap_hit_labels", []) or []),
+    )
 
     phase_started = time.perf_counter()
     raw_dir = Path(args.raw_output_dir).expanduser()
@@ -309,6 +473,7 @@ def build_real_history_impact_payload(args) -> dict[str, Any]:
     _add_metric_sections(base_report)
     if getattr(args, "aggregate_only_report", False):
         _apply_aggregate_only_report(base_report, row_count=len(rows))
+    base_report["checkpointing"] = checkpoint_writer.metadata()
     return {"real_history_impact_benchmark": base_report}
 
 
@@ -401,6 +566,81 @@ def _finish_without_scan(report: dict[str, Any], status: str, warnings: list[str
     report["cap_hit_labels"] = _cap_hit_labels(warnings)
     report["ranking_quality_gate"] = _gate_status(status="not_evaluated", reasons=[f"benchmark_status_{status}", "no_benchmark_rows"])
     report["rg_prefilter_gate"] = _gate_status(status="not_evaluated", reasons=[f"benchmark_status_{status}", "no_benchmark_rows"])
+    return _add_metric_sections(report)
+
+
+def _memory_guard_stop(
+    args,
+    checkpoint_writer: BenchmarkCheckpointWriter,
+    *,
+    stage: str,
+) -> dict[str, Any] | None:
+    threshold = int(getattr(args, "memory_guard_rss_bytes", 0) or 0)
+    if threshold <= 0:
+        return None
+    rss_current, rss_reason = current_rss_bytes()
+    if rss_current is None:
+        checkpoint_writer.write(
+            "memory_guard_check",
+            status="rss_unavailable",
+            guard_stage=stage,
+            memory_guard_rss_bytes=threshold,
+        )
+        return None
+    if rss_current < threshold:
+        return None
+    checkpoint_writer.write(
+        "memory_guard_stop",
+        status="memory_guard_stop",
+        guard_stage=stage,
+        rss_current_bytes=rss_current,
+        memory_guard_rss_bytes=threshold,
+    )
+    return {
+        "stage": _safe_checkpoint_label(stage),
+        "rss_current_bytes": rss_current,
+        "rss_current_unavailable_reason": rss_reason,
+        "memory_guard_rss_bytes": threshold,
+    }
+
+
+def _finish_memory_guard_stop(
+    report: dict[str, Any],
+    *,
+    rows: list[dict[str, Any]],
+    selected_baselines: list[str],
+    checkpoint_writer: BenchmarkCheckpointWriter,
+    started: float,
+    guard_stop: dict[str, Any],
+) -> dict[str, Any]:
+    warnings = _safe_warnings(list(report.get("warnings") or []) + ["memory_guard_stop"])
+    report["status"] = "memory_guard_stop"
+    report["warnings"] = warnings
+    report["caps_hit"] = bool(_cap_hit_labels(warnings))
+    report["cap_hit_labels"] = _cap_hit_labels(warnings)
+    report["rows"] = rows
+    report["summary"] = _summarize(rows, selected_baselines) if rows else {}
+    report["aggregate"] = _aggregate(rows) if rows else {}
+    report["total_wall_time_ms"] = _elapsed_ms(started)
+    report["memory_guard_stop"] = {
+        **guard_stop,
+        "decision": "stopped_before_success_to_avoid_memory_pressure",
+        "checkpoint_evidence_emitted": checkpoint_writer.enabled,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "session_ids_included": False,
+    }
+    report["checkpointing"] = checkpoint_writer.metadata()
+    report["raw_private_evidence"] = {
+        "stored": False,
+        "storage": "ignored_local_raw_run_artifacts",
+        "committed": False,
+        "reason": "memory_guard_stop_before_raw_evidence_write",
+    }
+    report["ranking_quality_gate"] = _gate_status("not_evaluated", ["memory_guard_stop", "benchmark_incomplete"])
+    report["rg_prefilter_gate"] = _gate_status("not_evaluated", ["memory_guard_stop", "benchmark_incomplete"])
     return _add_metric_sections(report)
 
 
@@ -5079,6 +5319,7 @@ def _safe_warnings(warnings: list[str]) -> list[str]:
                 "arbitrary_root_enabled_with_hard_caps",
                 "weak_partial_candidates_reservoir_capped",
                 "weak_low_evidence_candidates_reservoir_capped",
+                "memory_guard_stop",
             )
         ):
             safe.append(warning)
