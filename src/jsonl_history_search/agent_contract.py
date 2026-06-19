@@ -401,6 +401,7 @@ def build_stage_diagnostics(
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
     source_plan = sanitize_source_plan(pressure.get("source_plan") or diagnostics.get("source_plan") or {})
     grouping = pressure.get("fielded_source_grouping") or {}
+    selection_policy = sanitize_fielded_selection_policy(grouping.get("selection_policy"))
     cap_labels = list(pressure.get("cap_labels") or diagnostics.get("cap_labels") or [])
     candidate_count = int(pressure.get("fielded_bm25", {}).get("candidate_count") or 0)
     no_evidence_needed = bool(no_evidence_report.get("needed"))
@@ -583,6 +584,21 @@ def build_stage_diagnostics(
                 "rows_dropped_by_stream_cap_total": int(
                     ((grouping.get("stream_selection") or {}).get("rows_dropped_by_stream_cap_total")) or 0
                 ),
+                "selection_policy": selection_policy,
+                "selection_policy_version": selection_policy["selection_policy_version"],
+                "selection_strategy": selection_policy["selection_strategy"],
+                "top_exact_rows_selected": selection_policy["top_exact_rows_selected"],
+                "child_channel_rows_selected": selection_policy["child_channel_rows_selected"],
+                "metadata_match_rows_selected": selection_policy["metadata_match_rows_selected"],
+                "nearby_context_rows_selected": selection_policy["nearby_context_rows_selected"],
+                "diversity_fill_rows_selected": selection_policy["diversity_fill_rows_selected"],
+                "duplicate_or_collapsed_row_count": selection_policy["duplicate_or_collapsed_row_count"],
+                "role_group_count_considered": selection_policy["role_group_count_considered"],
+                "role_group_count_selected": selection_policy["role_group_count_selected"],
+                "role_group_count_omitted": selection_policy["role_group_count_omitted"],
+                "omission_reason_counts": selection_policy["omission_reason_counts"],
+                "selected_channel_labels": selection_policy["selected_channel_labels"],
+                "omitted_channel_labels": selection_policy["omitted_channel_labels"],
             },
         ),
         stage_diagnostic(
@@ -885,6 +901,7 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
             "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
+            "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
@@ -1040,6 +1057,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
             "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
+            "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
             "raw_paths_included": False,
@@ -1326,6 +1344,33 @@ def sanitize_group_interleaving(value: Any) -> dict[str, Any]:
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def sanitize_fielded_selection_policy(value: Any) -> dict[str, Any]:
+    policy = value if isinstance(value, dict) else {}
+    return {
+        "selection_policy_version": str(policy.get("selection_policy_version") or ""),
+        "selection_strategy": str(policy.get("selection_strategy") or "disabled"),
+        "top_exact_rows_selected": int(policy.get("top_exact_rows_selected") or 0),
+        "child_channel_rows_selected": int(policy.get("child_channel_rows_selected") or 0),
+        "metadata_match_rows_selected": int(policy.get("metadata_match_rows_selected") or 0),
+        "nearby_context_rows_selected": int(policy.get("nearby_context_rows_selected") or 0),
+        "diversity_fill_rows_selected": int(policy.get("diversity_fill_rows_selected") or 0),
+        "duplicate_or_collapsed_row_count": int(policy.get("duplicate_or_collapsed_row_count") or 0),
+        "role_group_count_considered": int(policy.get("role_group_count_considered") or 0),
+        "role_group_count_selected": int(policy.get("role_group_count_selected") or 0),
+        "role_group_count_omitted": int(policy.get("role_group_count_omitted") or 0),
+        "omission_reason_counts": sanitize_int_counts(policy.get("omission_reason_counts")),
+        "selected_channel_labels": [str(label) for label in policy.get("selected_channel_labels") or []],
+        "omitted_channel_labels": [str(label) for label in policy.get("omitted_channel_labels") or []],
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
+        "index_payloads_included": False,
     }
 
 
