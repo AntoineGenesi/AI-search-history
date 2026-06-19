@@ -140,6 +140,16 @@ def build_source_expansion_payload(
     range_end = selection["range_end"]
     included_count = len(selected)
     omitted_count = max(0, requested_count - included_count)
+    start_of_source_reached = bool(
+        range_start == 1
+        or (
+            request.mode == "before"
+            and requested_count == 0
+            and parsed.line == 1
+            and selection["candidate_start"] is None
+            and selection["candidate_end"] is None
+        )
+    )
     payload = {
         **base_payload,
         "status": "expanded",
@@ -176,7 +186,7 @@ def build_source_expansion_payload(
         },
         "truncated": omitted_count > 0,
         "boundary_flags": {
-            "start_of_source_reached": bool(range_start == 1),
+            "start_of_source_reached": start_of_source_reached,
             "end_of_source_reached": bool(range_end == total_records or (request.mode == "next" and included_count < request.next_count)),
             "start_of_candidate_range_reached": bool(range_start == selection["candidate_start"]),
             "end_of_candidate_range_reached": bool(range_end == selection["candidate_end"]),
