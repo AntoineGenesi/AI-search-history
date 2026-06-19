@@ -24,6 +24,15 @@ from .sources import Limits, build_source_plan
 
 SCHEMA_VERSION = 1
 DEFAULT_FIXTURE = Path("benchmarks/retrieve_expand_answer_use/synthetic_cases.json")
+ALLOWED_BOTTLENECK_LABELS = [
+    "source_window_choice",
+    "within_source_depth",
+    "query_planning",
+    "output_behavior",
+    "indexing_latency",
+    "no_decision",
+]
+SOURCE_CATALOG_LATENCY_PRESSURE_MS = 1000.0
 REQUIRED_QUESTION_FAMILIES = [
     "why",
     "workflow_failure",
@@ -70,6 +79,7 @@ CLAIM_BOUNDARIES = {
     "final_answer_quality_claim_supported": False,
     "broad_retrieval_quality_claim_supported": False,
     "all_history_completeness_claim_supported": False,
+    "indexing_necessity_claim_supported": False,
     "default_promotion_supported": False,
     "llm_judge_gate_used": False,
     "private_transcript_text_used": False,
@@ -112,6 +122,9 @@ def build_retrieve_expand_answer_use_eval(fixture_path: Path = DEFAULT_FIXTURE) 
         "summary": summarize_rows(rows),
         "failure_taxonomy_buckets": FAILURE_TAXONOMY_BUCKETS,
         "selected_next_product_decision": select_next_product_decision(rows),
+        "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+        "selected_next_bottleneck": select_next_bottleneck(rows),
+        "stage_bottleneck_summary": summarize_stage_bottlenecks(rows),
         "claim_boundaries": CLAIM_BOUNDARIES,
     }
 
@@ -135,6 +148,13 @@ def invalid_fixture_report(fixture_path: Path, reason: str) -> dict[str, Any]:
         },
         "failure_taxonomy_buckets": FAILURE_TAXONOMY_BUCKETS,
         "selected_next_product_decision": "fixture_invalid_rerun_after_repair",
+        "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+        "selected_next_bottleneck": "no_decision",
+        "stage_bottleneck_summary": {
+            "case_count": 0,
+            "bottleneck_stage_counts": {},
+            "selection_basis": "fixture_invalid",
+        },
         "claim_boundaries": CLAIM_BOUNDARIES,
     }
 
@@ -160,9 +180,18 @@ def evaluate_case(case: dict[str, Any], *, fixture_path: Path) -> dict[str, Any]
             "score_matches_expected": False,
             "failure_taxonomy": "fixture_or_execution_failure",
             "product_decision_signal": "fixture_invalid_rerun_after_repair",
+            "bottleneck_stage": "no_decision",
             "invalid_fixture_reason": invalid_reason,
             "packet_observation": {},
             "expansion_observation": {},
+            "stage_ledger": build_stage_ledger(
+                row_base,
+                {},
+                {},
+                "invalid_fixture",
+                "fixture_or_execution_failure",
+                "no_decision",
+            ),
         }
 
     try:
@@ -176,19 +205,38 @@ def evaluate_case(case: dict[str, Any], *, fixture_path: Path) -> dict[str, Any]
             "score_matches_expected": False,
             "failure_taxonomy": "fixture_or_execution_failure",
             "product_decision_signal": "fixture_or_eval_execution_needs_repair",
+            "bottleneck_stage": "no_decision",
             "execution_error": exc.__class__.__name__,
             "packet_observation": {},
             "expansion_observation": {},
+            "stage_ledger": build_stage_ledger(
+                row_base,
+                {},
+                {},
+                "fixture_or_execution_failure",
+                "fixture_or_execution_failure",
+                "no_decision",
+            ),
         }
 
     score_label = score_case(case, packet_observation, expansion_observation)
     failure_taxonomy = failure_taxonomy_for_score(case, score_label, packet_observation, expansion_observation)
+    bottleneck_stage = bottleneck_stage_for_case(case, score_label, packet_observation, expansion_observation)
     return {
         **row_base,
         "score_label": score_label,
         "score_matches_expected": score_label == expected_score,
         "failure_taxonomy": failure_taxonomy,
         "product_decision_signal": product_decision_for_failure(failure_taxonomy),
+        "bottleneck_stage": bottleneck_stage,
+        "stage_ledger": build_stage_ledger(
+            row_base,
+            packet_observation,
+            expansion_observation,
+            score_label,
+            failure_taxonomy,
+            bottleneck_stage,
+        ),
         "packet_observation": packet_observation,
         "expansion_observation": expansion_observation,
     }
@@ -222,6 +270,10 @@ def observe_packet(packet_bundle: dict[str, Any], case: dict[str, Any]) -> dict[
     next_reads = list(compact.get("next_reads") or [])
     no_evidence = compact.get("no_evidence") or {}
     claim_boundaries = compact.get("claim_boundaries") or {}
+    output_budget = compact.get("output_budget") or {}
+    output_counts = output_budget.get("counts") if isinstance(output_budget.get("counts"), dict) else {}
+    stage_diagnostics = compact.get("stage_diagnostics") or locator.get("stage_diagnostics") or {}
+    stage_notes = summarize_stage_diagnostics(stage_diagnostics)
     query_plan = locator.get("query_plan") or {}
     expected_targets = [str(item) for item in case.get("expected_source_targets") or []]
     source_ref_targets = normalize_targets(targets_from_source_refs(source_refs), repo_root=repo_root)
@@ -240,9 +292,51 @@ def observe_packet(packet_bundle: dict[str, Any], case: dict[str, Any]) -> dict[
         "expected_source_refs_present": targets_present(expected_targets, source_ref_targets),
         "expected_source_windows_present": targets_present(expected_targets, window_targets),
         "expected_next_reads_present": targets_present(expected_targets, next_read_targets),
+        "output_omission_counts": {
+            "candidates_omitted": int(output_counts.get("candidates_omitted") or 0),
+            "source_refs_omitted": int(output_counts.get("source_refs_omitted") or 0),
+            "source_windows_omitted": int(output_counts.get("source_windows_omitted") or 0),
+            "next_reads_omitted": int(output_counts.get("next_reads_omitted") or 0),
+        },
+        "stage_diagnostics_present": bool(stage_diagnostics),
+        "stage_diagnostic_status_counts": stage_notes["status_counts"],
+        "stage_diagnostic_next_fix_hint_counts": stage_notes["next_fix_hint_counts"],
+        "source_catalog_cap_labels": stage_notes["source_catalog_cap_labels"],
+        "source_catalog_elapsed_ms": stage_notes["source_catalog_elapsed_ms"],
+        "persistent_index_or_cache_used": stage_notes["persistent_index_or_cache_used"],
         "no_evidence_scope_limited": no_evidence_scope_limited(no_evidence, claim_boundaries),
         "claim_boundaries_honest": unsupported_claims_false(claim_boundaries),
         "packet_has_decision_fields": packet_has_decision_fields(compact, locator),
+    }
+
+
+def summarize_stage_diagnostics(stage_diagnostics: dict[str, Any]) -> dict[str, Any]:
+    status_counts: Counter[str] = Counter()
+    next_fix_counts: Counter[str] = Counter()
+    cap_labels: set[str] = set()
+    elapsed_values: list[float] = []
+    persistent_index_used = False
+    for stage in stage_diagnostics.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        status_counts[str(stage.get("status") or "unknown")] += 1
+        next_fix_counts[str(stage.get("next_fix_hint") or "unknown")] += 1
+        counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+        for nested_name in ("source_catalog", "source_plan"):
+            nested = counters.get(nested_name) if isinstance(counters.get(nested_name), dict) else {}
+            cap_labels.update(str(label) for label in nested.get("cap_labels") or [] if label)
+            if nested.get("elapsed_ms") is not None:
+                try:
+                    elapsed_values.append(float(nested.get("elapsed_ms")))
+                except (TypeError, ValueError):
+                    pass
+            persistent_index_used = persistent_index_used or bool(nested.get("persistent_index_or_cache_used"))
+    return {
+        "status_counts": dict(sorted(status_counts.items())),
+        "next_fix_hint_counts": dict(sorted(next_fix_counts.items())),
+        "source_catalog_cap_labels": sorted(cap_labels),
+        "source_catalog_elapsed_ms": round(sum(elapsed_values), 3) if elapsed_values else 0.0,
+        "persistent_index_or_cache_used": persistent_index_used,
     }
 
 
@@ -465,6 +559,105 @@ def product_decision_for_failure(failure_taxonomy: str | None) -> str:
     return "fixture_or_eval_execution_needs_repair"
 
 
+def bottleneck_stage_for_case(
+    case: dict[str, Any],
+    score_label: str,
+    packet: dict[str, Any],
+    expansion: dict[str, Any],
+) -> str:
+    if score_label in {"invalid_fixture", "fixture_or_execution_failure"}:
+        return "no_decision"
+    if not packet.get("query_plan_matches_family"):
+        return "query_planning"
+    if not packet.get("packet_has_decision_fields") or not packet.get("claim_boundaries_honest"):
+        return "output_behavior"
+    if case.get("expected_score_label") == "correctly_deferred":
+        if score_label == "correctly_deferred":
+            return "no_decision"
+        return "output_behavior"
+    if indexing_latency_bottleneck_supported(score_label, packet, expansion):
+        return "indexing_latency"
+    if not packet.get("expected_source_refs_present"):
+        return "query_planning"
+    if not packet.get("expected_source_windows_present") and not packet.get("expected_next_reads_present"):
+        return "source_window_choice"
+    if expansion.get("malformed_action_count") or not expansion.get("required_modes_available"):
+        return "source_window_choice"
+    if expansion.get("execution_failure_count"):
+        return "within_source_depth"
+    if score_label == "missing_or_wrong_evidence":
+        return "within_source_depth" if expansion.get("action_count", 0) else "source_window_choice"
+    return "no_decision"
+
+
+def indexing_latency_bottleneck_supported(score_label: str, packet: dict[str, Any], expansion: dict[str, Any]) -> bool:
+    if score_label not in {"answerable_from_packet", "answerable_after_expansion"}:
+        return False
+    if not packet.get("expected_source_refs_present"):
+        return False
+    if expansion.get("malformed_action_count") or expansion.get("execution_failure_count"):
+        return False
+    if packet.get("source_catalog_cap_labels"):
+        return True
+    try:
+        elapsed_ms = float(packet.get("source_catalog_elapsed_ms") or 0.0)
+    except (TypeError, ValueError):
+        elapsed_ms = 0.0
+    return elapsed_ms >= SOURCE_CATALOG_LATENCY_PRESSURE_MS
+
+
+def build_stage_ledger(
+    row_base: dict[str, Any],
+    packet: dict[str, Any],
+    expansion: dict[str, Any],
+    score_label: str,
+    failure_taxonomy: str | None,
+    bottleneck_stage: str,
+) -> dict[str, Any]:
+    return {
+        "query_intent": {
+            "question_family": row_base.get("question_family"),
+            "query_plan_primary_intent": packet.get("query_plan_primary_intent"),
+            "query_plan_matches_family": packet.get("query_plan_matches_family", False),
+        },
+        "source_candidates": {
+            "source_ref_count": int(packet.get("source_ref_count") or 0),
+            "expected_source_refs_present": bool(packet.get("expected_source_refs_present", False)),
+            "stage_diagnostics_present": bool(packet.get("stage_diagnostics_present", False)),
+        },
+        "selected_windows": {
+            "source_window_count": int(packet.get("source_window_count") or 0),
+            "next_read_count": int(packet.get("next_read_count") or 0),
+            "expected_source_windows_present": bool(packet.get("expected_source_windows_present", False)),
+            "expected_next_reads_present": bool(packet.get("expected_next_reads_present", False)),
+            "expansion_action_count": int(packet.get("expansion_action_count") or 0),
+        },
+        "omission_diagnostics": {
+            "output_omission_counts": packet.get("output_omission_counts") or {},
+            "stage_status_counts": packet.get("stage_diagnostic_status_counts") or {},
+            "stage_next_fix_hint_counts": packet.get("stage_diagnostic_next_fix_hint_counts") or {},
+        },
+        "expansion_replay": {
+            "exact_argv_replayed": bool(expansion.get("exact_argv_replayed", False)),
+            "action_count": int(expansion.get("action_count") or 0),
+            "action_modes_replayed": [str(mode) for mode in expansion.get("action_modes_replayed") or []],
+            "required_modes_available": bool(expansion.get("required_modes_available", False)),
+            "required_modes_matched_gold": bool(expansion.get("required_modes_matched_gold", False)),
+            "gold_marker_match_count": int(expansion.get("gold_marker_match_count") or 0),
+            "malformed_action_count": int(expansion.get("malformed_action_count") or 0),
+            "execution_failure_count": int(expansion.get("execution_failure_count") or 0),
+        },
+        "answer_use_label": score_label,
+        "failure_taxonomy": failure_taxonomy,
+        "bottleneck_stage": bottleneck_stage,
+        "elapsed_cap_notes": {
+            "source_catalog_elapsed_ms": float(packet.get("source_catalog_elapsed_ms") or 0.0),
+            "source_catalog_cap_labels": [str(label) for label in packet.get("source_catalog_cap_labels") or []],
+            "persistent_index_or_cache_used": bool(packet.get("persistent_index_or_cache_used", False)),
+        },
+    }
+
+
 def normalize_target(target: str, *, repo_root: Path) -> str:
     if not target:
         return ""
@@ -508,6 +701,43 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_stage_bottlenecks(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = Counter(normalize_bottleneck_stage(row.get("bottleneck_stage")) for row in rows)
+    cap_label_counts = Counter(
+        label
+        for row in rows
+        for label in (row.get("stage_ledger", {}).get("elapsed_cap_notes", {}).get("source_catalog_cap_labels") or [])
+    )
+    return {
+        "case_count": len(rows),
+        "bottleneck_stage_counts": dict(sorted(counts.items())),
+        "allowed_bottleneck_labels": ALLOWED_BOTTLENECK_LABELS,
+        "cap_label_counts": dict(sorted(cap_label_counts.items())),
+        "selection_basis": "dominant_non_no_decision_stage_by_case_count_then_allowed_order_else_no_decision",
+    }
+
+
+def select_next_bottleneck(rows: list[dict[str, Any]]) -> str:
+    counts = Counter(normalize_bottleneck_stage(row.get("bottleneck_stage")) for row in rows)
+    non_decision_counts = {
+        label: count
+        for label, count in counts.items()
+        if label in ALLOWED_BOTTLENECK_LABELS and label != "no_decision" and count > 0
+    }
+    if not non_decision_counts:
+        return "no_decision"
+    highest_count = max(non_decision_counts.values())
+    for label in ALLOWED_BOTTLENECK_LABELS:
+        if label != "no_decision" and non_decision_counts.get(label) == highest_count:
+            return label
+    return "no_decision"
+
+
+def normalize_bottleneck_stage(value: Any) -> str:
+    label = str(value or "no_decision")
+    return label if label in ALLOWED_BOTTLENECK_LABELS else "no_decision"
+
+
 def select_next_product_decision(rows: list[dict[str, Any]]) -> str:
     signals = {row.get("product_decision_signal") for row in rows}
     for decision in NEXT_DECISION_PRIORITY:
@@ -528,6 +758,7 @@ def render_retrieve_expand_answer_use_markdown(payload: dict[str, Any]) -> str:
         f"- Data source: `{report['data_source']}`",
         f"- Retrieval mode: `{report['retrieval_mode_required']}`",
         f"- Selected next product decision: `{report['selected_next_product_decision']}`",
+        f"- Selected next bottleneck: `{report['selected_next_bottleneck']}`",
         "",
         "## Summary",
     ]
@@ -538,8 +769,8 @@ def render_retrieve_expand_answer_use_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Rows",
             "",
-            "| Case | Family | Surface | Score | Failure Taxonomy | Actions | Gold Markers | Decision Signal |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Case | Family | Surface | Score | Bottleneck | Failure Taxonomy | Actions | Gold Markers | Decision Signal |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in report["rows"]:
@@ -552,6 +783,7 @@ def render_retrieve_expand_answer_use_markdown(payload: dict[str, Any]) -> str:
                     markdown_cell(row["question_family"]),
                     markdown_cell(row["command_surface"]),
                     markdown_cell(row["score_label"]),
+                    markdown_cell(row.get("bottleneck_stage") or "no_decision"),
                     markdown_cell(row["failure_taxonomy"] or "none"),
                     markdown_cell(",".join(expansion.get("action_modes_replayed", []))),
                     markdown_cell(str(expansion.get("gold_marker_match_count", 0))),
@@ -560,6 +792,34 @@ def render_retrieve_expand_answer_use_markdown(payload: dict[str, Any]) -> str:
             )
             + " |"
         )
+    lines.extend(["", "## Stage Ledger"])
+    for row in report["rows"]:
+        ledger = row.get("stage_ledger") or {}
+        query_intent = ledger.get("query_intent") or {}
+        selected = ledger.get("selected_windows") or {}
+        omissions = ledger.get("omission_diagnostics") or {}
+        replay = ledger.get("expansion_replay") or {}
+        elapsed = ledger.get("elapsed_cap_notes") or {}
+        lines.extend(
+            [
+                "",
+                f"### {markdown_cell(row['case_id'])}",
+                f"- Query intent: `{query_intent}`",
+                f"- Source candidates: `{ledger.get('source_candidates') or {}}`",
+                f"- Selected windows: `{selected}`",
+                f"- Omission diagnostics: `{omissions}`",
+                f"- Expansion replay: `{replay}`",
+                f"- Answer-use label: `{ledger.get('answer_use_label')}`",
+                f"- Bottleneck stage: `{ledger.get('bottleneck_stage')}`",
+                f"- Elapsed/cap notes: `{elapsed}`",
+            ]
+        )
+    lines.extend(["", "## Allowed Bottleneck Labels"])
+    for label in report["allowed_bottleneck_labels"]:
+        lines.append(f"- `{label}`")
+    lines.extend(["", "## Stage Bottleneck Summary"])
+    for key, value in report["stage_bottleneck_summary"].items():
+        lines.append(f"- `{key}`: `{value}`")
     lines.extend(["", "## Failure Taxonomy"])
     for bucket in report["failure_taxonomy_buckets"]:
         lines.append(f"- `{bucket}`")
