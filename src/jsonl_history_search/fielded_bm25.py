@@ -46,6 +46,7 @@ CONTEXT_NEIGHBORHOOD_STREAM_LABEL = "context_neighborhood"
 CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
 CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
+FIELDED_EVIDENCE_SELECTION_POLICY_VERSION = "fielded-evidence-selection-v1"
 FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY = "sha256_full_source_bytes_for_cache_validation"
 QUERY_PLAN_MODE_AUTO = "auto"
 QUERY_PLAN_MODE_OFF = "off"
@@ -701,6 +702,7 @@ def search_with_fielded_bm25(
         pool_limit=candidate_pool_limit,
         row_stream_labels=row_stream_labels,
         stream_rows=stream_rows,
+        fusion=fusion,
     )
     context_neighborhood["selected_neighbor_rows"] = sum(
         1 for row in rows if int(row[0]) in context_neighborhood["generated_rowids"]
@@ -1191,10 +1193,12 @@ def _select_source_grouped_candidate_rows(
     pool_limit: int,
     row_stream_labels: dict[int, set[str]] | None = None,
     stream_rows: dict[str, list[tuple[Any, ...]]] | None = None,
+    fusion: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
     bounded_limit = max(int(selected_limit), 0)
     row_stream_labels = row_stream_labels or {}
     stream_rows = stream_rows or {}
+    fusion = fusion or {}
     if bounded_limit <= 0:
         return [], _source_grouping_diagnostics(
             rows_considered=len(rows),
@@ -1212,6 +1216,16 @@ def _select_source_grouped_candidate_rows(
             group_interleaved_rows_selected=0,
             adjacent_run_collapse=_adjacent_run_collapse_diagnostics([], [], {}, {}),
             group_interleaving=_group_interleaving_diagnostics([], {}, {}, {}),
+            selection_policy=_evidence_selection_policy_diagnostics(
+                rows,
+                [],
+                index,
+                row_stream_labels=row_stream_labels,
+                stream_rows=stream_rows,
+                fusion=fusion,
+                representative_to_suppressed={},
+                selected_representative_reason_counts={},
+            ),
         )
 
     bm25_rank_by_rowid = {int(row[0]): rank for rank, row in enumerate(rows, start=1)}
@@ -1234,6 +1248,20 @@ def _select_source_grouped_candidate_rows(
         index,
         bm25_rank_by_rowid=bm25_rank_by_rowid,
     )
+    protected_rows = _protected_evidence_selection_rows(
+        rows,
+        index,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+    )
+    representative_rowids = {int(row[0]) for row in representatives}
+    if protected_rows:
+        representatives = [
+            *representatives,
+            *(row for row in protected_rows if int(row[0]) not in representative_rowids),
+        ]
+        representatives.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
     group_interleaved_rows = _interleave_group_representatives(
         representatives,
         index,
@@ -1247,6 +1275,7 @@ def _select_source_grouped_candidate_rows(
             index,
             bm25_rank_by_rowid=bm25_rank_by_rowid,
             selected_limit=bounded_limit,
+            seed_rows=protected_rows,
         )
     )
     selected_rowids: set[int] = {int(row[0]) for row in selected}
@@ -1308,6 +1337,16 @@ def _select_source_grouped_candidate_rows(
         group_interleaved_rows_selected=len(group_interleaved_rows),
         adjacent_run_collapse=adjacent_run_collapse,
         group_interleaving=group_interleaving,
+        selection_policy=_evidence_selection_policy_diagnostics(
+            rows,
+            selected,
+            index,
+            row_stream_labels=row_stream_labels,
+            stream_rows=stream_rows,
+            fusion=fusion,
+            representative_to_suppressed=representative_to_suppressed,
+            selected_representative_reason_counts=selected_representative_reason_counts,
+        ),
     )
 
 
@@ -1584,6 +1623,7 @@ def _select_source_session_day_category_representatives(
     *,
     bm25_rank_by_rowid: dict[int, int],
     selected_limit: int,
+    seed_rows: list[tuple[Any, ...]] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[str, int], dict[str, int], dict[str, dict[str, int]]]:
     categories = ("source", "session", "day")
     grouped: dict[str, dict[str, list[tuple[Any, ...]]]] = {category: {} for category in categories}
@@ -1617,11 +1657,32 @@ def _select_source_session_day_category_representatives(
             "groups_omitted": len(grouped[category]),
         }
 
+    seed_rows = seed_rows or []
     selected: list[tuple[Any, ...]] = []
     selected_rowids: set[int] = set()
+    selected_row_category_counts: dict[int, int] = {}
     selected_group_keys: dict[str, set[str]] = {category: set() for category in categories}
     representative_reason_counts: dict[str, int] = {"adjacent_run_head": len(rows)}
     selected_representative_reason_counts: dict[str, int] = {}
+
+    for row in seed_rows:
+        if len(selected) >= selected_limit:
+            break
+        rowid = int(row[0])
+        if rowid in selected_rowids:
+            continue
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        selected.append(row)
+        selected_rowids.add(rowid)
+        selected_row_category_counts[rowid] = 0
+        selected_representative_reason_counts["protected_top_exact_or_channel_head"] = (
+            selected_representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
+        )
+        representative_reason_counts["protected_top_exact_or_channel_head"] = (
+            representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
+        )
 
     max_category_depth = max((len(items) for items in representative_rows_by_category.values()), default=0)
     for depth in range(max_category_depth):
@@ -1640,7 +1701,14 @@ def _select_source_session_day_category_representatives(
             reason = f"{category}_representative"
             representative_reason_counts[reason] = representative_reason_counts.get(reason, 0) + 1
             if rowid in selected_rowids:
+                first_selected_category_for_row = int(selected_row_category_counts.get(rowid, 0)) == 0
                 selected_group_keys[category].add(category_key)
+                selected_row_category_counts[rowid] = int(selected_row_category_counts.get(rowid, 0)) + 1
+                if first_selected_category_for_row:
+                    selected_representative_reason_counts[reason] = (
+                        selected_representative_reason_counts.get(reason, 0) + 1
+                    )
+                    continue
                 selected_representative_reason_counts["duplicate_category_representative"] = (
                     selected_representative_reason_counts.get("duplicate_category_representative", 0) + 1
                 )
@@ -1649,6 +1717,7 @@ def _select_source_session_day_category_representatives(
                 continue
             selected.append(row)
             selected_rowids.add(rowid)
+            selected_row_category_counts[rowid] = 1
             selected_group_keys[category].add(category_key)
             selected_representative_reason_counts[reason] = selected_representative_reason_counts.get(reason, 0) + 1
 
@@ -1661,6 +1730,7 @@ def _select_source_session_day_category_representatives(
             continue
         selected.append(row)
         selected_rowids.add(rowid)
+        selected_row_category_counts[rowid] = selected_row_category_counts.get(rowid, 0)
         fill_count += 1
     if fill_count:
         selected_representative_reason_counts["source_session_day_group_fill"] = fill_count
@@ -1768,6 +1838,7 @@ def _source_grouping_diagnostics(
     group_interleaved_rows_selected: int,
     adjacent_run_collapse: dict[str, Any],
     group_interleaving: dict[str, Any],
+    selection_policy: dict[str, Any],
 ) -> dict[str, Any]:
     rows_dropped_by_stream_cap = sum(int(count) for count in dropped_stream_counts.values())
     source_group_counts = group_category_counts.get("source", {})
@@ -1813,11 +1884,13 @@ def _source_grouping_diagnostics(
             "day_representative",
             "duplicate_category_representative",
             "source_session_day_group_fill",
+            "protected_top_exact_or_channel_head",
         ],
         "group_key_categories": ["source", "session", "day"],
         "raw_group_keys_included": False,
         "adjacent_run_collapse": adjacent_run_collapse,
         "group_interleaving": group_interleaving,
+        "selection_policy": selection_policy,
         "stream_selection": {
             "enabled": bool(selected_stream_counts or dropped_stream_counts),
             "selected_rows_by_stream": dict(sorted(selected_stream_counts.items())),
@@ -1841,6 +1914,170 @@ def _source_grouping_diagnostics(
         "line_numbers_included": False,
         "source_lines_included": False,
     }
+
+
+def _protected_evidence_selection_rows(
+    rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+    bm25_rank_by_rowid: dict[int, int],
+) -> list[tuple[Any, ...]]:
+    row_by_id = {int(row[0]): row for row in rows}
+    channel_head_rowids = {int(rowid) for rowid in (fusion.get("channel_head_rowids") or set()) if int(rowid) in row_by_id}
+    row_channel_ranks = fusion.get("row_channel_ranks") if isinstance(fusion.get("row_channel_ranks"), dict) else {}
+    protected_rowids: set[int] = set()
+    for rowid, labels in row_stream_labels.items():
+        if int(rowid) not in row_by_id:
+            continue
+        fusion_labels = (row_channel_ranks.get(int(rowid)) or {}).keys()
+        all_labels = {*labels, *fusion_labels}
+        if any(_selection_channel_bucket(label) == "top_exact" for label in all_labels):
+            protected_rowids.add(int(rowid))
+    protected_rowids.update(
+        rowid
+        for rowid in channel_head_rowids
+        if any(_selection_channel_bucket(label) == "top_exact" for label in (row_channel_ranks.get(rowid) or {}))
+    )
+    return sorted(
+        (row_by_id[rowid] for rowid in protected_rowids if rowid in row_by_id and rowid in index.records),
+        key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])),
+    )
+
+
+def _evidence_selection_policy_diagnostics(
+    rows: list[tuple[Any, ...]],
+    selected: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    stream_rows: dict[str, list[tuple[Any, ...]]],
+    fusion: dict[str, Any],
+    representative_to_suppressed: dict[int, int],
+    selected_representative_reason_counts: dict[str, int],
+) -> dict[str, Any]:
+    selected_rowids = {int(row[0]) for row in selected}
+    considered_rowids = {int(row[0]) for row in rows}
+    selected_channel_labels: set[str] = set()
+    omitted_channel_labels: set[str] = set()
+    selected_bucket_counts: dict[str, int] = {
+        "top_exact": 0,
+        "child_channel": 0,
+        "metadata_match": 0,
+        "nearby_context": 0,
+        "diversity_fill": 0,
+    }
+    row_channel_ranks = fusion.get("row_channel_ranks") if isinstance(fusion.get("row_channel_ranks"), dict) else {}
+    for rowid in considered_rowids:
+        labels = {
+            _safe_evidence_channel_label(label)
+            for label in {*row_stream_labels.get(rowid, set()), *(row_channel_ranks.get(rowid) or {}).keys()}
+            if label
+        }
+        if rowid in selected_rowids:
+            selected_channel_labels.update(labels)
+        else:
+            omitted_channel_labels.update(labels)
+    for row in selected:
+        rowid = int(row[0])
+        buckets = {
+            _selection_channel_bucket(label)
+            for label in {*row_stream_labels.get(rowid, set()), *(row_channel_ranks.get(rowid) or {}).keys()}
+        }
+        if not buckets or buckets == {"diversity_fill"}:
+            buckets = {"diversity_fill"}
+        for bucket in buckets:
+            selected_bucket_counts[bucket] = selected_bucket_counts.get(bucket, 0) + 1
+
+    role_groups_considered = {
+        _role_grouping_key(index.records[rowid])
+        for rowid in considered_rowids
+        if rowid in index.records
+    }
+    role_groups_selected = {
+        _role_grouping_key(index.records[rowid])
+        for rowid in selected_rowids
+        if rowid in index.records
+    }
+    dropped_stream_counts = _stream_dropped_counts(stream_rows, selected_rowids)
+    omission_reason_counts = {
+        "candidate_limit": max(len(considered_rowids) - len(selected_rowids), 0),
+        "adjacent_or_duplicate_collapse": _duplicate_or_collapsed_row_count(
+            rows,
+            stream_rows=stream_rows,
+            representative_to_suppressed=representative_to_suppressed,
+            fusion=fusion,
+        ),
+    }
+    if dropped_stream_counts:
+        omission_reason_counts["channel_not_selected"] = sum(int(count) for count in dropped_stream_counts.values())
+    if role_groups_considered - role_groups_selected:
+        omission_reason_counts["role_group_omitted"] = len(role_groups_considered - role_groups_selected)
+    if omitted_channel_labels:
+        omission_reason_counts["channel_label_omitted"] = len(omitted_channel_labels)
+
+    return {
+        "selection_policy_version": FIELDED_EVIDENCE_SELECTION_POLICY_VERSION,
+        "selection_strategy": "protect_top_exact_and_channel_heads_then_source_session_day_role_diversity_fill",
+        "top_exact_rows_selected": int(selected_bucket_counts.get("top_exact") or 0),
+        "child_channel_rows_selected": int(selected_bucket_counts.get("child_channel") or 0),
+        "metadata_match_rows_selected": int(selected_bucket_counts.get("metadata_match") or 0),
+        "nearby_context_rows_selected": int(selected_bucket_counts.get("nearby_context") or 0),
+        "diversity_fill_rows_selected": int(selected_bucket_counts.get("diversity_fill") or 0),
+        "duplicate_or_collapsed_row_count": int(omission_reason_counts["adjacent_or_duplicate_collapse"]),
+        "role_group_count_considered": int(len(role_groups_considered)),
+        "role_group_count_selected": int(len(role_groups_selected)),
+        "role_group_count_omitted": max(int(len(role_groups_considered)) - int(len(role_groups_selected)), 0),
+        "omission_reason_counts": dict(sorted((key, int(value)) for key, value in omission_reason_counts.items())),
+        "selected_channel_labels": sorted(selected_channel_labels),
+        "omitted_channel_labels": sorted(omitted_channel_labels - selected_channel_labels),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
+        "index_payloads_included": False,
+    }
+
+
+def _selection_channel_bucket(label: str) -> str:
+    safe_label = _safe_evidence_channel_label(label)
+    if safe_label == CONTEXT_NEIGHBORHOOD_STREAM_LABEL:
+        return "nearby_context"
+    if safe_label.startswith("child_"):
+        return "child_channel"
+    if "exact_phrase" in safe_label or safe_label == "exact_phrase":
+        return "top_exact"
+    if (
+        safe_label.startswith("role_")
+        or safe_label.startswith("timestamp_")
+        or safe_label.startswith("artifact_")
+        or safe_label.startswith("tool_event_")
+    ):
+        return "metadata_match"
+    return "diversity_fill"
+
+
+def _role_grouping_key(ref: FieldedBm25RecordRef) -> str:
+    if ref.record is not None:
+        return _role_bucket(ref.record.role)
+    return _raw_role_bucket(ref.raw_text)
+
+
+def _duplicate_or_collapsed_row_count(
+    rows: list[tuple[Any, ...]],
+    *,
+    stream_rows: dict[str, list[tuple[Any, ...]]],
+    representative_to_suppressed: dict[int, int],
+    fusion: dict[str, Any],
+) -> int:
+    stream_row_total = sum(len(channel_rows) for channel_rows in stream_rows.values())
+    duplicate_stream_rows = max(stream_row_total - len({int(row[0]) for channel_rows in stream_rows.values() for row in channel_rows}), 0)
+    fusion_dropped = int(fusion.get("dropped_row_count") or 0)
+    adjacent_suppressed = sum(int(count) for count in representative_to_suppressed.values())
+    return max(duplicate_stream_rows, 0) + max(fusion_dropped, 0) + max(adjacent_suppressed, 0)
 
 
 def _stream_dropped_counts(stream_rows: dict[str, list[tuple[Any, ...]]], selected_rowids: set[int]) -> dict[str, int]:
@@ -2471,6 +2708,7 @@ def _fuse_fielded_evidence_channels(
         "dropped_rows_by_channel": dict(sorted(dropped_by_channel.items())),
         "row_channel_ranks": channel_ranks_by_rowid,
         "selected_rowids": set(selected_rowids),
+        "channel_head_rowids": set(channel_head_rowids),
         "raw_score_inputs_used_for_fusion": False,
         "raw_bm25_scores_used_for_fusion": False,
         "score_normalization_used": False,

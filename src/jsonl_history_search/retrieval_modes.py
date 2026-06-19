@@ -642,6 +642,7 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "raw_group_keys_included": False,
         "adjacent_run_collapse": _fielded_adjacent_run_collapse_diagnostics(grouping.get("adjacent_run_collapse")),
         "group_interleaving": _fielded_group_interleaving_diagnostics(grouping.get("group_interleaving")),
+        "selection_policy": _fielded_selection_policy_diagnostics(grouping.get("selection_policy")),
         "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
         "stream_selection": _fielded_stream_selection_diagnostics(grouping.get("stream_selection")),
         "raw_paths_included": False,
@@ -651,6 +652,33 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def _fielded_selection_policy_diagnostics(value: Any) -> dict[str, Any]:
+    policy = value if isinstance(value, dict) else {}
+    return {
+        "selection_policy_version": str(policy.get("selection_policy_version") or ""),
+        "selection_strategy": str(policy.get("selection_strategy") or "disabled"),
+        "top_exact_rows_selected": int(policy.get("top_exact_rows_selected") or 0),
+        "child_channel_rows_selected": int(policy.get("child_channel_rows_selected") or 0),
+        "metadata_match_rows_selected": int(policy.get("metadata_match_rows_selected") or 0),
+        "nearby_context_rows_selected": int(policy.get("nearby_context_rows_selected") or 0),
+        "diversity_fill_rows_selected": int(policy.get("diversity_fill_rows_selected") or 0),
+        "duplicate_or_collapsed_row_count": int(policy.get("duplicate_or_collapsed_row_count") or 0),
+        "role_group_count_considered": int(policy.get("role_group_count_considered") or 0),
+        "role_group_count_selected": int(policy.get("role_group_count_selected") or 0),
+        "role_group_count_omitted": int(policy.get("role_group_count_omitted") or 0),
+        "omission_reason_counts": _safe_int_counts(policy.get("omission_reason_counts")),
+        "selected_channel_labels": [str(label) for label in policy.get("selected_channel_labels") or []],
+        "omitted_channel_labels": [str(label) for label in policy.get("omitted_channel_labels") or []],
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "vectors_or_persisted_indexes_included": False,
+        "index_payloads_included": False,
     }
 
 
