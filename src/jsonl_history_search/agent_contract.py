@@ -370,6 +370,7 @@ def build_stage_diagnostics(
     compact_output_counts = compact_output_budget.get("counts") or {}
     compact_output_limits = compact_output_budget.get("limits") or {}
     fielded = pressure.get("fielded_bm25") or {}
+    index_summary = fielded.get("index_summary") if isinstance(fielded.get("index_summary"), dict) else {}
     query_streams = fielded.get("query_streams") or {}
     evidence_channels = pressure.get("fielded_evidence_channels") or fielded.get("evidence_channels") or {}
     context_neighborhood = pressure.get("fielded_context_neighborhood") or fielded.get("context_neighborhood") or {}
@@ -419,7 +420,28 @@ def build_stage_diagnostics(
                 "searched_files": int(fielded.get("searched_files") or 0),
                 "searched_bytes": int(fielded.get("searched_bytes") or 0),
                 "planned_file_enumeration_reused": bool(
-                    (fielded.get("index_summary") or {}).get("planned_file_enumeration_reused", False)
+                    index_summary.get("planned_file_enumeration_reused", False)
+                ),
+                "persistent_index_enabled": bool(index_summary.get("persistent_index_enabled", False)),
+                "index_schema_version": str(index_summary.get("index_schema_version") or ""),
+                "parser_version": str(index_summary.get("parser_version") or ""),
+                "chunking_version": str(index_summary.get("chunking_version") or ""),
+                "sources_reused": int(index_summary.get("sources_reused") or 0),
+                "sources_reindexed": int(index_summary.get("sources_reindexed") or 0),
+                "sources_invalidated": int(index_summary.get("sources_invalidated") or 0),
+                "sources_deleted": int(index_summary.get("sources_deleted") or 0),
+                "segments_loaded": int(index_summary.get("segments_loaded") or 0),
+                "segments_written": int(index_summary.get("segments_written") or 0),
+                "warm_query_reused_index": bool(index_summary.get("warm_query_reused_index", False)),
+                "content_fingerprint_validation_enabled": bool(
+                    index_summary.get("content_fingerprint_validation_enabled", False)
+                ),
+                "content_fingerprint_files": int(index_summary.get("content_fingerprint_files") or 0),
+                "content_fingerprint_bytes": int(index_summary.get("content_fingerprint_bytes") or 0),
+                "content_fingerprint_strategy": str(index_summary.get("content_fingerprint_strategy") or ""),
+                "persistent_reuse_claim": str(
+                    index_summary.get("persistent_reuse_claim")
+                    or "local_work_reduction_only_not_token_savings_or_final_answer_quality"
                 ),
                 "query_stream_count": int(query_streams.get("stream_count") or 0),
                 "stream_hit_limit_count": int(query_streams.get("stream_hit_limit_count") or 0),
@@ -809,6 +831,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     source_catalog = sanitize_source_catalog(diagnostics.get("source_catalog") or {})
     source_plan = sanitize_source_plan(diagnostics.get("source_plan") or {})
     fielded_bm25 = diagnostics.get("fielded_bm25") or {}
+    index_summary = fielded_bm25.get("index_summary") if isinstance(fielded_bm25.get("index_summary"), dict) else {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
     fielded_evidence_channels = diagnostics.get("fielded_evidence_channels") or fielded_bm25.get("evidence_channels") or {}
     fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
@@ -823,6 +846,23 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
         "result_completeness": result_completeness,
         "explicit_opt_in_required": bool(fielded_state.get("explicit_opt_in_required", False)),
         "default_behavior_changed": bool(fielded_state.get("default_behavior_changed", False)),
+        "persistent_index_enabled": bool(index_summary.get("persistent_index_enabled", False)),
+        "index_schema_version": str(index_summary.get("index_schema_version") or ""),
+        "parser_version": str(index_summary.get("parser_version") or ""),
+        "chunking_version": str(index_summary.get("chunking_version") or ""),
+        "sources_reused": int(index_summary.get("sources_reused") or 0),
+        "sources_reindexed": int(index_summary.get("sources_reindexed") or 0),
+        "sources_invalidated": int(index_summary.get("sources_invalidated") or 0),
+        "sources_deleted": int(index_summary.get("sources_deleted") or 0),
+        "segments_loaded": int(index_summary.get("segments_loaded") or 0),
+        "segments_written": int(index_summary.get("segments_written") or 0),
+        "warm_query_reused_index": bool(index_summary.get("warm_query_reused_index", False)),
+        "content_fingerprint_validation_enabled": bool(
+            index_summary.get("content_fingerprint_validation_enabled", False)
+        ),
+        "content_fingerprint_files": int(index_summary.get("content_fingerprint_files") or 0),
+        "content_fingerprint_bytes": int(index_summary.get("content_fingerprint_bytes") or 0),
+        "content_fingerprint_strategy": str(index_summary.get("content_fingerprint_strategy") or ""),
         "shared_source_enumeration": {
             "file_count": int(shared_source_enumeration.get("file_count") or 0),
             "byte_count": int(shared_source_enumeration.get("byte_count") or 0),
@@ -934,6 +974,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "all_history_completeness_claim_supported": bool(
                 claim_boundaries.get("all_history_completeness_claim_supported", False)
             ),
+            "persistent_index_or_cache_used": bool(claim_boundaries.get("persistent_index_or_cache_used", False)),
         },
     }
 

@@ -30,6 +30,7 @@ def run_retrieval_mode(
     cwd: str | None,
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
+    fielded_bm25_index_dir: str | None = None,
 ) -> dict[str, Any]:
     if retrieval_mode == RETRIEVAL_MODE_PACKAGE:
         return search(
@@ -56,6 +57,7 @@ def run_retrieval_mode(
             default_tz=default_tz,
             cwd=cwd,
             mask_context=mask_context,
+            fielded_bm25_index_dir=fielded_bm25_index_dir,
         )
     raise ValueError(f"unsupported retrieval mode: {retrieval_mode}")
 
@@ -67,6 +69,7 @@ def run_fielded_bm25_retrieval(
     default_tz: Any,
     cwd: str | None,
     mask_context: Any = None,
+    fielded_bm25_index_dir: str | None = None,
 ) -> dict[str, Any]:
     total_profile_token = start_phase_profile("total_fielded_bm25_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
@@ -81,7 +84,12 @@ def run_fielded_bm25_retrieval(
     selected_jsonl_files, source_plan = build_command_local_source_plan(plan, planned_jsonl_files, intent)
 
     fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
-    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=selected_jsonl_files)
+    fielded_index = build_fielded_bm25_index(
+        plan,
+        default_tz=default_tz,
+        planned_jsonl_files=selected_jsonl_files,
+        persistent_index_dir=fielded_bm25_index_dir,
+    )
     fielded_index_profile = finish_phase_profile(
         fielded_index_profile_token,
         indexed_file_count=int(fielded_index.metrics.get("indexed_files", 0)),
@@ -364,7 +372,7 @@ def build_fielded_bm25_retrieval_diagnostics(
             "default_behavior_changed": False,
             "capped": bool(cap_labels),
             "cap_labels": cap_labels,
-            "persistent_index_or_cache_used": False,
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
             "reason": "fielded_bm25_builds_in_memory_sqlite_fts5_index_from_planned_jsonl_sources",
         },
         "shared_source_enumeration": {
@@ -405,7 +413,7 @@ def build_fielded_bm25_retrieval_diagnostics(
             "final_answer_quality_claim_supported": False,
             "broad_speedup_claim_supported": False,
             "all_history_completeness_claim_supported": False,
-            "persistent_index_or_cache_used": False,
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
             "raw_score_blending_used": False,
             "score_normalization_used": False,
             "tuned_lane_weights_used": False,

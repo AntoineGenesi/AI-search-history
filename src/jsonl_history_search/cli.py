@@ -1290,6 +1290,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Optionally prefilter already-planned JSONL files with ripgrep before Python JSON parsing.",
     )
     parser.add_argument(
+        "--fielded-bm25-index-dir",
+        default=None,
+        help=(
+            "Opt-in local persistent segment cache directory for explicit fielded-bm25 retrieval. "
+            "No cache is written unless this path is supplied."
+        ),
+    )
+    parser.add_argument(
         "--mask-manifest",
         default=None,
         help="False-positive masking manifest for future copied-context search snippets",
@@ -2069,6 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
             cwd=source_plan["cwd"],
             mask_context=mask_context,
             use_rg_prefilter=args.rg_prefilter,
+            fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
         )
         result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
         manifest_report = (
