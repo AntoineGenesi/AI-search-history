@@ -364,6 +364,7 @@ def build_stage_diagnostics(
     compact_output_limits = compact_output_budget.get("limits") or {}
     fielded = pressure.get("fielded_bm25") or {}
     query_streams = fielded.get("query_streams") or {}
+    context_neighborhood = pressure.get("fielded_context_neighborhood") or fielded.get("context_neighborhood") or {}
     source_enumeration = pressure.get("shared_source_enumeration") or {}
     source_catalog = sanitize_source_catalog(pressure.get("source_catalog") or diagnostics.get("source_catalog") or {})
     source_plan = sanitize_source_plan(pressure.get("source_plan") or diagnostics.get("source_plan") or {})
@@ -405,6 +406,7 @@ def build_stage_diagnostics(
                 "candidate_row_limit": int(fielded.get("candidate_row_limit") or 0),
                 "candidate_row_pool_limit": int(fielded.get("candidate_row_pool_limit") or 0),
                 "candidate_rows_generated": int(fielded.get("candidate_rows_generated") or 0),
+                "candidate_rows_from_query_streams": int(fielded.get("candidate_rows_from_query_streams") or 0),
                 "records_considered": int(fielded.get("records_considered") or 0),
                 "searched_files": int(fielded.get("searched_files") or 0),
                 "searched_bytes": int(fielded.get("searched_bytes") or 0),
@@ -417,6 +419,11 @@ def build_stage_diagnostics(
                 "row_count_before_dedupe": int(query_streams.get("row_count_before_dedupe") or 0),
                 "row_count_after_dedupe": int(query_streams.get("row_count_after_dedupe") or 0),
                 "rows_dropped_by_stream_cap_total": int(query_streams.get("rows_dropped_by_stream_cap_total") or 0),
+                "context_neighborhood_intent_detected": bool(context_neighborhood.get("intent_detected", False)),
+                "context_neighborhood_anchor_rows": int(context_neighborhood.get("anchor_rows_considered") or 0),
+                "context_neighborhood_generated_rows": int(context_neighborhood.get("generated_neighbor_rows") or 0),
+                "context_neighborhood_selected_rows": int(context_neighborhood.get("selected_neighbor_rows") or 0),
+                "context_neighborhood_omitted_rows": int(context_neighborhood.get("omitted_neighbor_rows") or 0),
             },
         ),
         stage_diagnostic(
@@ -723,6 +730,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
     source_plan = sanitize_source_plan(diagnostics.get("source_plan") or {})
     fielded_bm25 = diagnostics.get("fielded_bm25") or {}
     fielded_source_grouping = diagnostics.get("fielded_source_grouping") or {}
+    fielded_context_neighborhood = diagnostics.get("fielded_context_neighborhood") or fielded_bm25.get("context_neighborhood") or {}
     phase_profiles = diagnostics.get("phase_profiles") or {}
     claim_boundaries = diagnostics.get("claim_boundaries") or {}
 
@@ -750,12 +758,14 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "candidate_row_pool_limit": int(fielded_bm25.get("candidate_row_pool_limit") or 0),
             "candidate_rows_generated": int(fielded_bm25.get("candidate_rows_generated") or 0),
             "candidate_rows_considered": int(fielded_bm25.get("candidate_rows_considered") or 0),
+            "candidate_rows_from_query_streams": int(fielded_bm25.get("candidate_rows_from_query_streams") or 0),
             "candidate_rows_retained": int(fielded_bm25.get("candidate_rows_retained") or 0),
             "candidate_rows_surfaced": int(fielded_bm25.get("candidate_rows_surfaced") or 0),
             "searched_files": int(fielded_bm25.get("searched_files") or 0),
             "searched_bytes": int(fielded_bm25.get("searched_bytes") or 0),
             "records_considered": int(fielded_bm25.get("records_considered") or 0),
             "query_streams": sanitize_query_stream_pressure(fielded_bm25.get("query_streams")),
+            "context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
             "materialization": fielded_bm25.get("materialization") or {},
             "index_summary": fielded_bm25.get("index_summary") or {},
             "raw_paths_included": False,
@@ -764,6 +774,7 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "raw_session_ids_included": False,
             "vectors_or_persisted_indexes_included": False,
         },
+        "fielded_context_neighborhood": sanitize_context_neighborhood(fielded_context_neighborhood),
         "fielded_source_grouping": {
             "enabled": bool(fielded_source_grouping.get("enabled", False)),
             "strategy": str(fielded_source_grouping.get("strategy") or "disabled"),
@@ -841,6 +852,37 @@ def sanitize_query_stream_pressure(value: Any) -> dict[str, Any]:
         "raw_cwd_included": False,
         "line_numbers_included": False,
         "source_lines_included": False,
+    }
+
+
+def sanitize_context_neighborhood(value: Any) -> dict[str, Any]:
+    neighborhood = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(neighborhood.get("enabled", False)),
+        "strategy": str(neighborhood.get("strategy") or "disabled"),
+        "intent_detected": bool(neighborhood.get("intent_detected", False)),
+        "intent_reason_codes": [str(reason) for reason in neighborhood.get("intent_reason_codes") or []],
+        "anchor_rows_considered": int(neighborhood.get("anchor_rows_considered") or 0),
+        "anchor_row_limit": int(neighborhood.get("anchor_row_limit") or 0),
+        "neighbor_radius_before": int(neighborhood.get("neighbor_radius_before") or 0),
+        "neighbor_radius_after": int(neighborhood.get("neighbor_radius_after") or 0),
+        "generated_neighbor_rows": int(neighborhood.get("generated_neighbor_rows") or 0),
+        "selected_neighbor_rows": int(neighborhood.get("selected_neighbor_rows") or 0),
+        "omitted_neighbor_rows": int(neighborhood.get("omitted_neighbor_rows") or 0),
+        "deduped_existing_row_count": int(neighborhood.get("deduped_existing_row_count") or 0),
+        "deduped_generated_row_count": int(neighborhood.get("deduped_generated_row_count") or 0),
+        "participated_in_grouping": bool(neighborhood.get("participated_in_grouping", False)),
+        "selected_by_group_interleaving": int(neighborhood.get("selected_by_group_interleaving") or 0),
+        "dropped_by_group_interleaving": int(neighborhood.get("dropped_by_group_interleaving") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 

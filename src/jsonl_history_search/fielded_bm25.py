@@ -37,6 +37,9 @@ CHUNK_RECORD_LIMIT = 1
 INDEX_LINE_TEXT_LIMIT = 1200
 FIELDED_SOURCE_GROUPING_POOL_FACTOR = 4
 FTS_FIELD_NAMES = {"role", "timestamp_bucket", "tool_event", "artifact_task_path", "cwd_project", "text"}
+CONTEXT_NEIGHBORHOOD_STREAM_LABEL = "context_neighborhood"
+CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
+CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 
 
 @dataclass(frozen=True)
@@ -319,13 +322,35 @@ def search_with_fielded_bm25(
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
-    rows, source_grouping = _select_source_grouped_candidate_rows(
+    context_neighborhood = _context_neighborhood_candidate_rows(
         raw_rows,
+        index,
+        intent,
+        row_stream_labels=row_stream_labels,
+        stream_rows=stream_rows,
+        row_limit=candidate_limit,
+    )
+    selection_rows = context_neighborhood["rows"] + raw_rows
+    if context_neighborhood["enabled"]:
+        selection_rows = sorted(selection_rows, key=lambda row: _context_neighborhood_selection_key(index, int(row[0])))
+    rows, source_grouping = _select_source_grouped_candidate_rows(
+        selection_rows,
         index,
         selected_limit=candidate_limit,
         pool_limit=candidate_pool_limit,
         row_stream_labels=row_stream_labels,
         stream_rows=stream_rows,
+    )
+    context_neighborhood["selected_neighbor_rows"] = sum(
+        1 for row in rows if int(row[0]) in context_neighborhood["generated_rowids"]
+    )
+    context_neighborhood["omitted_neighbor_rows"] = max(
+        int(context_neighborhood["generated_neighbor_rows"]) - int(context_neighborhood["selected_neighbor_rows"]),
+        0,
+    )
+    context_neighborhood_summary = _context_neighborhood_diagnostics(
+        context_neighborhood,
+        source_grouping=source_grouping,
     )
     query_stream_summary = _query_stream_summary(
         streams=query_streams,
@@ -375,6 +400,10 @@ def search_with_fielded_bm25(
                 continue
             dedupe.add(key)
             score, reasons, artifacts = score_record(record, intent, cwd)
+            if rowid in context_neighborhood["generated_rowids"]:
+                reasons = [*reasons, "fielded_bm25:context_neighborhood"]
+                if score <= 0:
+                    score = 1.0
             if score <= 0:
                 records_rejected_by_ranker += 1
                 if expected_state is not None:
@@ -415,9 +444,11 @@ def search_with_fielded_bm25(
         "candidate_row_limit": candidate_limit,
         "candidate_row_pool_limit": candidate_pool_limit,
         "candidate_rows_generated": len(rows),
-        "candidate_rows_considered": len(raw_rows),
+        "candidate_rows_considered": len(selection_rows),
+        "candidate_rows_from_query_streams": len(raw_rows),
         "candidate_rows_retained": pre_cap_count,
         "candidate_rows_surfaced": len(matches),
+        "fielded_context_neighborhood": context_neighborhood_summary,
         "fielded_source_grouping": source_grouping,
         "bm25_rank_buckets": dict(sorted(bm25_rank_buckets.items())),
         "searched_files": len(opened_paths),
@@ -725,8 +756,170 @@ def _select_source_grouped_candidate_rows(
     )
 
 
+def _context_neighborhood_candidate_rows(
+    anchor_rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    intent: QueryIntent,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    stream_rows: dict[str, list[tuple[Any, ...]]],
+    row_limit: int,
+) -> dict[str, Any]:
+    enabled, reasons = _context_neighborhood_intent(intent)
+    bounded_limit = max(int(row_limit), 0)
+    diagnostics: dict[str, Any] = {
+        "enabled": enabled,
+        "strategy": "disabled" if not enabled else "bounded_same_source_session_adjacent_rows_from_fielded_anchors",
+        "intent_detected": enabled,
+        "intent_reason_codes": reasons,
+        "anchor_rows_considered": int(len(anchor_rows)),
+        "anchor_row_limit": bounded_limit,
+        "neighbor_radius_before": CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE,
+        "neighbor_radius_after": CONTEXT_NEIGHBORHOOD_RADIUS_AFTER,
+        "generated_neighbor_rows": 0,
+        "selected_neighbor_rows": 0,
+        "omitted_neighbor_rows": 0,
+        "deduped_existing_row_count": 0,
+        "deduped_generated_row_count": 0,
+        "rows": [],
+        "generated_rowids": set(),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+    if not enabled or bounded_limit <= 0 or not anchor_rows:
+        return diagnostics
+
+    anchor_rowids = [int(row[0]) for row in anchor_rows]
+    existing_rowids = set(anchor_rowids)
+    row_by_id = {int(row[0]): row for row in anchor_rows}
+    anchor_score_by_rowid = {int(row[0]): float(row[1] or 0.0) for row in anchor_rows}
+    group_positions: dict[tuple[str, str], dict[int, int]] = {}
+    group_rowids: dict[tuple[str, str], list[int]] = {}
+    for rowid, ref in index.records.items():
+        source_key, session_key, _day_key = _source_session_date_grouping_key(ref)
+        group_rowids.setdefault((source_key, session_key), []).append(int(rowid))
+    for key, rowids in group_rowids.items():
+        rowids.sort(key=lambda candidate: (_line_order_key(index.records[candidate]), candidate))
+        group_positions[key] = {rowid: position for position, rowid in enumerate(rowids)}
+
+    generated_rows: list[tuple[Any, ...]] = []
+    generated_rowids: set[int] = set()
+    omitted_by_limit = 0
+    for anchor_row in anchor_rows[:bounded_limit]:
+        anchor_rowid = int(anchor_row[0])
+        anchor_ref = index.records.get(anchor_rowid)
+        if anchor_ref is None:
+            continue
+        source_key, session_key, _day_key = _source_session_date_grouping_key(anchor_ref)
+        group_key = (source_key, session_key)
+        rowids = group_rowids.get(group_key) or []
+        position = group_positions.get(group_key, {}).get(anchor_rowid)
+        if position is None:
+            continue
+        offsets = [
+            *range(-CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE, 0),
+            *range(1, CONTEXT_NEIGHBORHOOD_RADIUS_AFTER + 1),
+        ]
+        for offset in offsets:
+            neighbor_position = position + offset
+            if neighbor_position < 0 or neighbor_position >= len(rowids):
+                continue
+            neighbor_rowid = int(rowids[neighbor_position])
+            row_stream_labels.setdefault(neighbor_rowid, set()).add(CONTEXT_NEIGHBORHOOD_STREAM_LABEL)
+            if neighbor_rowid in existing_rowids:
+                diagnostics["deduped_existing_row_count"] = int(diagnostics["deduped_existing_row_count"]) + 1
+                continue
+            if neighbor_rowid in generated_rowids:
+                diagnostics["deduped_generated_row_count"] = int(diagnostics["deduped_generated_row_count"]) + 1
+                continue
+            if len(generated_rows) >= bounded_limit:
+                omitted_by_limit += 1
+                continue
+            generated_rowids.add(neighbor_rowid)
+            neighbor_row = row_by_id.get(neighbor_rowid)
+            if neighbor_row is None:
+                neighbor_row = (neighbor_rowid, anchor_score_by_rowid.get(anchor_rowid, 0.0))
+            generated_rows.append(neighbor_row)
+            stream_rows.setdefault(CONTEXT_NEIGHBORHOOD_STREAM_LABEL, []).append(neighbor_row)
+
+    diagnostics["rows"] = generated_rows
+    diagnostics["generated_rowids"] = generated_rowids
+    diagnostics["generated_neighbor_rows"] = len(generated_rows)
+    diagnostics["omitted_neighbor_rows"] = omitted_by_limit
+    return diagnostics
+
+
+def _context_neighborhood_intent(intent: QueryIntent) -> tuple[bool, list[str]]:
+    plan = intent.query_plan
+    primary = plan.primary_intent if plan is not None else ""
+    detected = set(plan.detected_intents if plan is not None else [])
+    source_window_needs = set(plan.source_window_needs if plan is not None else [])
+    reasons: list[str] = []
+    if primary == "what_was_i_talking_about" or "what_was_i_talking_about" in detected:
+        reasons.append("intent:what_was_i_talking_about")
+    if "topic_context" in source_window_needs:
+        reasons.append("source_window_need:topic_context")
+    if re.search(r"\b(?:then|around|before|after|nearby|surrounding|context|previous|next|earlier|later)\b", intent.normalized):
+        reasons.append("deictic_or_context_term")
+    if reasons and (intent.base_terms or primary == "what_was_i_talking_about"):
+        return True, _unique_ordered_strings(reasons)
+    return False, _unique_ordered_strings(reasons)
+
+
+def _context_neighborhood_diagnostics(value: dict[str, Any], *, source_grouping: dict[str, Any]) -> dict[str, Any]:
+    stream_selection = source_grouping.get("stream_selection") if isinstance(source_grouping, dict) else {}
+    selected_by_stream = stream_selection.get("selected_rows_by_stream") if isinstance(stream_selection, dict) else {}
+    dropped_by_stream = stream_selection.get("rows_dropped_by_stream_cap") if isinstance(stream_selection, dict) else {}
+    return {
+        "enabled": bool(value.get("enabled", False)),
+        "strategy": str(value.get("strategy") or "disabled"),
+        "intent_detected": bool(value.get("intent_detected", False)),
+        "intent_reason_codes": [str(reason) for reason in value.get("intent_reason_codes") or []],
+        "anchor_rows_considered": int(value.get("anchor_rows_considered") or 0),
+        "anchor_row_limit": int(value.get("anchor_row_limit") or 0),
+        "neighbor_radius_before": int(value.get("neighbor_radius_before") or 0),
+        "neighbor_radius_after": int(value.get("neighbor_radius_after") or 0),
+        "generated_neighbor_rows": int(value.get("generated_neighbor_rows") or 0),
+        "selected_neighbor_rows": int(value.get("selected_neighbor_rows") or 0),
+        "omitted_neighbor_rows": int(value.get("omitted_neighbor_rows") or 0),
+        "deduped_existing_row_count": int(value.get("deduped_existing_row_count") or 0),
+        "deduped_generated_row_count": int(value.get("deduped_generated_row_count") or 0),
+        "participated_in_grouping": bool(value.get("generated_neighbor_rows") or 0),
+        "selected_by_group_interleaving": int(selected_by_stream.get(CONTEXT_NEIGHBORHOOD_STREAM_LABEL) or 0),
+        "dropped_by_group_interleaving": int(dropped_by_stream.get(CONTEXT_NEIGHBORHOOD_STREAM_LABEL) or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _context_neighborhood_selection_key(index: FieldedBm25Index, rowid: int) -> tuple[str, str, int, int]:
+    ref = index.records.get(rowid)
+    if ref is None:
+        return ("", "", 10**12, rowid)
+    source_key, session_key, _day_key = _source_session_date_grouping_key(ref)
+    return (source_key, session_key, int(ref.line), rowid)
+
+
 def _source_grouping_key(ref: FieldedBm25RecordRef) -> str:
     return str(ref.path)
+
+
+def _line_order_key(ref: FieldedBm25RecordRef) -> tuple[int, int]:
+    return int(ref.line), int(ref.line_end or ref.line)
 
 
 def _source_session_date_grouping_key(ref: FieldedBm25RecordRef) -> tuple[str, str, str]:
