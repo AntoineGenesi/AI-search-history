@@ -31,7 +31,7 @@ from .tool_events import detect_events_for_record
 
 
 FIELDED_BM25_VERSION = "fielded-sqlite-fts5-record-chunk-v1"
-FIELDED_BM25_INDEX_SCHEMA_VERSION = "fielded-bm25-segment-cache-v1"
+FIELDED_BM25_INDEX_SCHEMA_VERSION = "fielded-bm25-segment-cache-v2"
 FIELDED_BM25_PARSER_VERSION = "jsonl-record-parser-v1"
 FTS_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/-]*", re.IGNORECASE)
 TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
@@ -56,6 +56,7 @@ class FieldedBm25RecordRef:
     line: int
     source_kind: str
     raw_text: str
+    source_ordinal: int
     raw_materialization_text: str | None = None
     line_end: int | None = None
     record: Record | None = None
@@ -202,6 +203,7 @@ class FieldedBm25PersistentCache:
             "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
             "content_fingerprint_strategy": FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY,
             "content_fingerprint": content_fingerprint,
+            "source_order_metadata": "one_based_source_ordinal_and_line_bounds",
         }
 
     def load_segment(
@@ -507,6 +509,7 @@ def build_fielded_bm25_index(
                         line=int(record.line),
                         source_kind=source_kind,
                         raw_text=record.text,
+                        source_ordinal=file_records,
                         record=record,
                     )
         except AdapterReadError as exc:
@@ -788,6 +791,7 @@ def search_with_fielded_bm25(
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
         "materialization": materialization,
+        "_fielded_context_index": _fielded_context_index(index),
         "groups": group_matches(matches),
         "summary": index.sanitized_summary(),
         "privacy": _privacy_payload(),
@@ -864,6 +868,7 @@ def _persistent_row_from_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
     return {
         "line": int(ref.line),
         "line_end": int(ref.line_end or ref.line),
+        "source_ordinal": int(ref.source_ordinal),
         "source_kind": ref.source_kind,
         "raw_text": ref.raw_text,
         "raw_materialization_text": ref.raw_materialization_text,
@@ -916,6 +921,7 @@ def _load_persistent_segment_rows(
             line_end=int(row.get("line_end") or row.get("line") or 1),
             source_kind=source_kind,
             raw_text=str(row.get("raw_text") or ""),
+            source_ordinal=int(row.get("source_ordinal") or row.get("line") or 1),
             raw_materialization_text=(
                 str(row.get("raw_materialization_text"))
                 if row.get("raw_materialization_text") is not None
@@ -985,7 +991,15 @@ def _valid_persistent_segment(segment: Any, *, metadata: dict[str, Any]) -> bool
     if any(segment_metadata.get(key) != value for key, value in metadata.items()):
         return False
     rows = segment.get("rows")
-    return isinstance(rows, list)
+    if not isinstance(rows, list):
+        return False
+    return all(
+        isinstance(row, dict)
+        and isinstance(row.get("source_ordinal"), int)
+        and isinstance(row.get("line"), int)
+        and isinstance(row.get("line_end"), int)
+        for row in rows
+    )
 
 
 def _source_content_fingerprint(path: Path) -> tuple[str, int]:
@@ -1022,6 +1036,7 @@ def _add_raw_chunk(
         line_end=last_line,
         source_kind=source_kind,
         raw_text=raw_text,
+        source_ordinal=first_line,
         raw_materialization_text=raw_materialization_text,
     )
     index.metrics["indexed_chunks"] += 1
@@ -1822,6 +1837,37 @@ def _new_materialization_counters() -> dict[str, int | bool]:
         "source_lines_included": False,
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_context_index(index: FieldedBm25Index) -> dict[str, Any]:
+    records_by_source: dict[str, list[dict[str, Any]]] = {}
+    for ref in index.records.values():
+        records_by_source.setdefault(str(ref.path), []).append(
+            {
+                "line": int(ref.line),
+                "line_end": int(ref.line_end or ref.line),
+                "source_ordinal": int(ref.source_ordinal),
+                "source_kind": ref.source_kind,
+                "raw_text": ref.raw_text,
+                "raw_materialization_text": ref.raw_materialization_text,
+                "record": _record_to_persistent_payload(ref.record) if ref.record is not None else None,
+                "loaded_from_persistent_segment": bool(index.metrics.get("sources_reused", 0)),
+            }
+        )
+    for rows in records_by_source.values():
+        rows.sort(key=lambda row: (int(row.get("source_ordinal") or 0), int(row.get("line") or 0)))
+    return {
+        "schema_version": 1,
+        "provider": "fielded_bm25_loaded_segment_rows",
+        "persistent_index_enabled": bool(index.metrics.get("persistent_index_enabled", False)),
+        "warm_query_reused_index": bool(index.metrics.get("warm_query_reused_index", False)),
+        "source_count": len(records_by_source),
+        "record_count": sum(len(rows) for rows in records_by_source.values()),
+        "records_by_source": records_by_source,
+        "raw_paths_included": True,
+        "raw_text_included": True,
+        "internal_only": True,
     }
 
 
