@@ -63,8 +63,12 @@ class FieldedBm25RecordRef:
     path: Path
     line: int
     source_kind: str
-    raw_text: str
     source_ordinal: int
+    role_bucket: str = "role_unknown"
+    timestamp_bucket: str = "timestamp_absent"
+    session_key: str | None = None
+    day_key: str | None = None
+    raw_text: str = ""
     raw_materialization_text: str | None = None
     line_end: int | None = None
     record: Record | None = None
@@ -87,10 +91,9 @@ class FieldedBm25Index:
         timestamp_bucket_counts: dict[str, int] = {}
         for ref in self.records.values():
             source_kind_counts[ref.source_kind] = source_kind_counts.get(ref.source_kind, 0) + 1
-            record = ref.record
-            role_bucket = _role_bucket(record.role) if record is not None else _raw_role_bucket(ref.raw_text)
+            role_bucket = ref.role_bucket
             role_bucket_counts[role_bucket] = role_bucket_counts.get(role_bucket, 0) + 1
-            timestamp_bucket = _timestamp_bucket(record) if record is not None else _raw_timestamp_bucket(ref.raw_text)
+            timestamp_bucket = ref.timestamp_bucket
             timestamp_bucket_counts[timestamp_bucket] = timestamp_bucket_counts.get(timestamp_bucket, 0) + 1
         return {
             "version": self.version,
@@ -523,6 +526,10 @@ def build_fielded_bm25_index(
                         source_kind=source_kind,
                         raw_text=record.text,
                         source_ordinal=file_records,
+                        role_bucket=_role_bucket(record.role),
+                        timestamp_bucket=_timestamp_bucket(record),
+                        session_key=_record_session_grouping_key(record),
+                        day_key=_record_day_grouping_key(record),
                         record=record,
                     )
         except AdapterReadError as exc:
@@ -545,7 +552,7 @@ def build_fielded_bm25_index(
         index.metrics["build_bytes"] += file_bytes
         if persistent_cache is not None:
             segment_rows = [
-                _persistent_row_from_ref(index.records[candidate_rowid])
+                _persistent_row_from_ref(connection, index.records[candidate_rowid])
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
                 if candidate_rowid in index.records
             ]
@@ -908,30 +915,52 @@ def _raw_insert_row(rowid: int, raw_text: str, source_kind: str) -> tuple[int, s
     )
 
 
-def _persistent_row_from_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
+def _persistent_row_from_ref(connection: sqlite3.Connection, ref: FieldedBm25RecordRef) -> dict[str, Any]:
+    fts = _fts_payload_for_rowid(connection, ref.rowid, fallback_source_kind=ref.source_kind)
     if ref.record is not None:
-        insert_row = _record_insert_row(0, ref.record, ref.source_kind)
         record_payload = _record_to_persistent_payload(ref.record)
     else:
-        insert_row = _raw_insert_row(0, ref.raw_text, ref.source_kind)
         record_payload = None
     return {
         "line": int(ref.line),
         "line_end": int(ref.line_end or ref.line),
         "source_ordinal": int(ref.source_ordinal),
         "source_kind": ref.source_kind,
-        "raw_text": ref.raw_text,
-        "raw_materialization_text": ref.raw_materialization_text,
+        "role_bucket": ref.role_bucket,
+        "timestamp_bucket": ref.timestamp_bucket,
+        "session_key": ref.session_key,
+        "day_key": ref.day_key,
         "record": record_payload,
-        "fts": {
-            "source_kind": insert_row[1],
-            "role": insert_row[2],
-            "cwd_project": insert_row[3],
-            "timestamp_bucket": insert_row[4],
-            "tool_event": insert_row[5],
-            "artifact_task_path": insert_row[6],
-            "text": insert_row[7],
-        },
+        "fts": fts,
+    }
+
+
+def _fts_payload_for_rowid(
+    connection: sqlite3.Connection,
+    rowid: int,
+    *,
+    fallback_source_kind: str,
+) -> dict[str, str]:
+    try:
+        row = connection.execute(
+            """
+            SELECT source_kind, role, cwd_project, timestamp_bucket, tool_event, artifact_task_path, text
+            FROM records
+            WHERE rowid = ?
+            """,
+            (rowid,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    values = tuple(str(item or "") for item in row) if row is not None else ("", "", "", "", "", "", "")
+    return {
+        "source_kind": values[0] or fallback_source_kind,
+        "role": values[1],
+        "cwd_project": values[2],
+        "timestamp_bucket": values[3],
+        "tool_event": values[4],
+        "artifact_task_path": values[5],
+        "text": values[6],
     }
 
 
@@ -964,19 +993,20 @@ def _load_persistent_segment_rows(
         )
         record_payload = row.get("record") if isinstance(row.get("record"), dict) else None
         record = _record_from_persistent_payload(record_payload, path=path) if record_payload else None
+        fts_text = str(fts.get("text") or row.get("raw_text") or "")
+        role_bucket = str(row.get("role_bucket") or fts.get("role") or _raw_role_bucket(fts_text))
+        timestamp_bucket = str(row.get("timestamp_bucket") or fts.get("timestamp_bucket") or _raw_timestamp_bucket(fts_text))
         index.records[rowid] = FieldedBm25RecordRef(
             rowid=rowid,
             path=path,
             line=int(row.get("line") or 1),
             line_end=int(row.get("line_end") or row.get("line") or 1),
             source_kind=source_kind,
-            raw_text=str(row.get("raw_text") or ""),
             source_ordinal=int(row.get("source_ordinal") or row.get("line") or 1),
-            raw_materialization_text=(
-                str(row.get("raw_materialization_text"))
-                if row.get("raw_materialization_text") is not None
-                else None
-            ),
+            role_bucket=role_bucket,
+            timestamp_bucket=timestamp_bucket,
+            session_key=str(row.get("session_key")) if row.get("session_key") else _raw_session_grouping_key(fts_text),
+            day_key=str(row.get("day_key")) if row.get("day_key") else _day_key_from_timestamp_bucket(timestamp_bucket),
             record=record,
         )
         index.metrics["indexed_chunks"] += 1
@@ -1077,7 +1107,6 @@ def _add_raw_chunk(
     last_line = chunk_lines[-1][0]
     raw_lines = tuple(raw for _line, raw in chunk_lines)
     raw_text = "\n".join(_clip_index_text(raw) for raw in raw_lines)
-    raw_materialization_text = "\n".join(raw_lines)
     insert_buffer.append(_raw_insert_row(rowid, raw_text, source_kind))
     index.records[rowid] = FieldedBm25RecordRef(
         rowid=rowid,
@@ -1085,9 +1114,11 @@ def _add_raw_chunk(
         line=first_line,
         line_end=last_line,
         source_kind=source_kind,
-        raw_text=raw_text,
         source_ordinal=first_line,
-        raw_materialization_text=raw_materialization_text,
+        role_bucket=_raw_role_bucket(raw_text),
+        timestamp_bucket=_raw_timestamp_bucket(raw_text),
+        session_key=_raw_session_grouping_key(raw_text),
+        day_key=_day_key_from_timestamp_bucket(_raw_timestamp_bucket(raw_text)),
     )
     index.metrics["indexed_chunks"] += 1
     if len(insert_buffer) >= 500:
@@ -1524,11 +1555,14 @@ def _source_session_date_grouping_key(ref: FieldedBm25RecordRef) -> tuple[str, s
 
 
 def _session_grouping_key(ref: FieldedBm25RecordRef) -> str | None:
-    return _raw_json_string(ref.raw_text, "session_id") or _raw_json_string(ref.raw_text, "session")
+    return ref.session_key
 
 
 def _day_grouping_key(ref: FieldedBm25RecordRef) -> str | None:
-    timestamp_bucket = _raw_timestamp_bucket(ref.raw_text)
+    return ref.day_key
+
+
+def _day_key_from_timestamp_bucket(timestamp_bucket: str) -> str | None:
     bucket_parts = timestamp_bucket.split()
     day_key = bucket_parts[-1] if bucket_parts and timestamp_bucket != "timestamp_absent" else None
     if day_key is not None and len(day_key) == 7:
@@ -2061,9 +2095,7 @@ def _selection_channel_bucket(label: str) -> str:
 
 
 def _role_grouping_key(ref: FieldedBm25RecordRef) -> str:
-    if ref.record is not None:
-        return _role_bucket(ref.record.role)
-    return _raw_role_bucket(ref.raw_text)
+    return ref.role_bucket
 
 
 def _duplicate_or_collapsed_row_count(
@@ -2126,32 +2158,18 @@ def _new_materialization_counters() -> dict[str, int | bool]:
 
 
 def _fielded_context_index(index: FieldedBm25Index) -> dict[str, Any]:
-    records_by_source: dict[str, list[dict[str, Any]]] = {}
-    for ref in index.records.values():
-        records_by_source.setdefault(str(ref.path), []).append(
-            {
-                "line": int(ref.line),
-                "line_end": int(ref.line_end or ref.line),
-                "source_ordinal": int(ref.source_ordinal),
-                "source_kind": ref.source_kind,
-                "raw_text": ref.raw_text,
-                "raw_materialization_text": ref.raw_materialization_text,
-                "record": _record_to_persistent_payload(ref.record) if ref.record is not None else None,
-                "loaded_from_persistent_segment": bool(index.metrics.get("sources_reused", 0)),
-            }
-        )
-    for rows in records_by_source.values():
-        rows.sort(key=lambda row: (int(row.get("source_ordinal") or 0), int(row.get("line") or 0)))
     return {
         "schema_version": 1,
-        "provider": "fielded_bm25_loaded_segment_rows",
+        "provider": "fielded_bm25_metadata_only_context_fallback",
         "persistent_index_enabled": bool(index.metrics.get("persistent_index_enabled", False)),
         "warm_query_reused_index": bool(index.metrics.get("warm_query_reused_index", False)),
-        "source_count": len(records_by_source),
-        "record_count": sum(len(rows) for rows in records_by_source.values()),
-        "records_by_source": records_by_source,
-        "raw_paths_included": True,
-        "raw_text_included": True,
+        "source_count": int(index.metrics.get("indexed_files", 0)),
+        "record_count": 0,
+        "records_by_source": {},
+        "context_records_omitted": int(index.metrics.get("indexed_chunks", 0)),
+        "fallback_required": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
         "internal_only": True,
     }
 
@@ -3194,6 +3212,10 @@ def _raw_timestamp_bucket(raw_text: str) -> str:
     return "timestamp_absent"
 
 
+def _raw_session_grouping_key(raw_text: str) -> str | None:
+    return _raw_json_string(raw_text, "session_id") or _raw_json_string(raw_text, "session")
+
+
 def _raw_tool_event_terms(raw_text: str) -> str:
     terms: list[str] = []
     payload_type = _raw_json_string(raw_text, "type")
@@ -3243,6 +3265,14 @@ def _timestamp_bucket(record: Record) -> str:
         if match:
             return match.group(1)
     return "timestamp_absent"
+
+
+def _record_session_grouping_key(record: Record) -> str | None:
+    return record.conversation_id or record.parent_id or record.record_id
+
+
+def _record_day_grouping_key(record: Record) -> str | None:
+    return _day_key_from_timestamp_bucket(_timestamp_bucket(record))
 
 
 def _role_bucket(role: str | None) -> str:
