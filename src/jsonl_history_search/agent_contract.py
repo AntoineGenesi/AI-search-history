@@ -565,6 +565,9 @@ def build_stage_diagnostics(
                 "day_group_count_considered": int(grouping.get("day_group_count_considered") or 0),
                 "day_group_count_selected": int(grouping.get("day_group_count_selected") or 0),
                 "day_group_count_omitted": int(grouping.get("day_group_count_omitted") or 0),
+                "window_group_count_considered": int(grouping.get("window_group_count_considered") or 0),
+                "window_group_count_selected": int(grouping.get("window_group_count_selected") or 0),
+                "window_group_count_omitted": int(grouping.get("window_group_count_omitted") or 0),
                 "category_group_count_considered": int(grouping.get("category_group_count_considered") or 0),
                 "category_group_count_selected": int(grouping.get("category_group_count_selected") or 0),
                 "category_group_count_omitted": int(grouping.get("category_group_count_omitted") or 0),
@@ -576,6 +579,7 @@ def build_stage_diagnostics(
                 "selected_representative_reason_counts": sanitize_int_counts(
                     grouping.get("selected_representative_reason_counts")
                 ),
+                "grouped_source_windows": sanitize_grouped_source_windows(grouping.get("grouped_source_windows")),
                 "group_key_categories": [str(category) for category in grouping.get("group_key_categories") or []],
                 "raw_group_keys_included": False,
                 "suppressed_adjacent_row_count": int(
@@ -894,6 +898,12 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "day_group_count_considered": int(fielded_source_grouping.get("day_group_count_considered") or 0),
             "day_group_count_selected": int(fielded_source_grouping.get("day_group_count_selected") or 0),
             "day_group_count_omitted": int(fielded_source_grouping.get("day_group_count_omitted") or 0),
+            "window_group_count_considered": int(fielded_source_grouping.get("window_group_count_considered") or 0),
+            "window_group_count_selected": int(fielded_source_grouping.get("window_group_count_selected") or 0),
+            "window_group_count_omitted": int(fielded_source_grouping.get("window_group_count_omitted") or 0),
+            "window_group_count_considered": int(fielded_source_grouping.get("window_group_count_considered") or 0),
+            "window_group_count_selected": int(fielded_source_grouping.get("window_group_count_selected") or 0),
+            "window_group_count_omitted": int(fielded_source_grouping.get("window_group_count_omitted") or 0),
             "category_group_count_considered": int(
                 fielded_source_grouping.get("category_group_count_considered") or 0
             ),
@@ -924,6 +934,9 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
             "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
+            "grouped_source_windows": sanitize_grouped_source_windows(
+                fielded_source_grouping.get("grouped_source_windows")
+            ),
             "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
@@ -1085,6 +1098,9 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
                 fielded_source_grouping.get("adjacent_run_collapse")
             ),
             "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
+            "grouped_source_windows": sanitize_grouped_source_windows(
+                fielded_source_grouping.get("grouped_source_windows")
+            ),
             "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
@@ -1375,6 +1391,10 @@ def sanitize_fielded_candidate_stage_loss(value: Any) -> dict[str, Any]:
             "day_group_count_considered": int(source_grouping.get("day_group_count_considered") or 0),
             "day_group_count_selected": int(source_grouping.get("day_group_count_selected") or 0),
             "day_group_count_omitted": int(source_grouping.get("day_group_count_omitted") or 0),
+            "window_group_count_considered": int(source_grouping.get("window_group_count_considered") or 0),
+            "window_group_count_selected": int(source_grouping.get("window_group_count_selected") or 0),
+            "window_group_count_omitted": int(source_grouping.get("window_group_count_omitted") or 0),
+            "grouped_source_windows": sanitize_grouped_source_windows(source_grouping.get("grouped_source_windows")),
             "rows_dropped_by_source_cap": int(source_grouping.get("rows_dropped_by_source_cap") or 0),
         },
         "materialization_ranking_final_caps": {
@@ -1512,6 +1532,44 @@ def sanitize_group_interleaving(value: Any) -> dict[str, Any]:
         "distinct_days_selected": int(interleaving.get("distinct_days_selected") or 0),
         "dominant_group_share_before": float(interleaving.get("dominant_group_share_before") or 0.0),
         "dominant_group_share_after": float(interleaving.get("dominant_group_share_after") or 0.0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def sanitize_grouped_source_windows(value: Any) -> dict[str, Any]:
+    windows = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(windows.get("enabled", False)),
+        "selection_version": str(windows.get("selection_version") or ""),
+        "strategy": str(windows.get("strategy") or "disabled"),
+        "window_identity_components": [str(item) for item in windows.get("window_identity_components") or []],
+        "near_contiguous_source_order_gap": int(windows.get("near_contiguous_source_order_gap") or 0),
+        "inner_hit_limit_per_window": int(windows.get("inner_hit_limit_per_window") or 0),
+        "window_count_considered": int(windows.get("window_count_considered") or 0),
+        "window_count_selected": int(windows.get("window_count_selected") or 0),
+        "window_count_omitted": int(windows.get("window_count_omitted") or 0),
+        "selected_window_head_count": int(windows.get("selected_window_head_count") or 0),
+        "selected_inner_hit_count": int(windows.get("selected_inner_hit_count") or 0),
+        "omitted_inner_hit_count": int(windows.get("omitted_inner_hit_count") or 0),
+        "max_inner_hit_count": int(windows.get("max_inner_hit_count") or 0),
+        "merged_adjacent_window_count": int(windows.get("merged_adjacent_window_count") or 0),
+        "merged_adjacent_inner_hit_count": int(windows.get("merged_adjacent_inner_hit_count") or 0),
+        "distinct_sources_considered": int(windows.get("distinct_sources_considered") or 0),
+        "distinct_sessions_considered": int(windows.get("distinct_sessions_considered") or 0),
+        "distinct_days_considered": int(windows.get("distinct_days_considered") or 0),
+        "distinct_sources_selected": int(windows.get("distinct_sources_selected") or 0),
+        "distinct_sessions_selected": int(windows.get("distinct_sessions_selected") or 0),
+        "distinct_days_selected": int(windows.get("distinct_days_selected") or 0),
+        "distinct_windows_selected": int(windows.get("distinct_windows_selected") or 0),
+        "omission_reason_counts": sanitize_int_counts(windows.get("omission_reason_counts")),
+        "selected_window_details_included": False,
+        "raw_window_keys_included": False,
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
