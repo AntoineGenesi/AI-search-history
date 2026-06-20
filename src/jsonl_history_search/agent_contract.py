@@ -901,9 +901,6 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "window_group_count_considered": int(fielded_source_grouping.get("window_group_count_considered") or 0),
             "window_group_count_selected": int(fielded_source_grouping.get("window_group_count_selected") or 0),
             "window_group_count_omitted": int(fielded_source_grouping.get("window_group_count_omitted") or 0),
-            "window_group_count_considered": int(fielded_source_grouping.get("window_group_count_considered") or 0),
-            "window_group_count_selected": int(fielded_source_grouping.get("window_group_count_selected") or 0),
-            "window_group_count_omitted": int(fielded_source_grouping.get("window_group_count_omitted") or 0),
             "category_group_count_considered": int(
                 fielded_source_grouping.get("category_group_count_considered") or 0
             ),
