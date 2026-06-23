@@ -3993,6 +3993,8 @@ def _source_tier_answerability_pressure_row_stats(
     stage_diagnostics = (
         compact_handoff.get("stage_diagnostics")
         if isinstance(compact_handoff.get("stage_diagnostics"), dict)
+        else compact_handoff.get("stage_diagnostics_summary")
+        if isinstance(compact_handoff.get("stage_diagnostics_summary"), dict)
         else {}
     )
     source_catalog = stage_diagnostics.get("source_catalog") if isinstance(stage_diagnostics.get("source_catalog"), dict) else {}
@@ -4704,7 +4706,13 @@ def _large_history_stage_attribution_claim_boundaries() -> dict[str, bool]:
 def _source_tier_stage_counters(stage_diagnostics: dict[str, Any], stage_name: str) -> dict[str, Any]:
     for stage in stage_diagnostics.get("stages") or []:
         if isinstance(stage, dict) and stage.get("stage") == stage_name:
-            counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+            counters = (
+                stage.get("counters")
+                if isinstance(stage.get("counters"), dict)
+                else stage.get("key_counters")
+                if isinstance(stage.get("key_counters"), dict)
+                else {}
+            )
             return {
                 "status": _safe_agent_compact_label(stage.get("status")),
                 "candidate_window_count": int(counters.get("candidate_window_count") or 0),

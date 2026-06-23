@@ -426,7 +426,37 @@ def collect_expansion_actions(compact: dict[str, Any]) -> list[dict[str, Any]]:
     for container_name in ("source_windows", "next_reads"):
         for item in compact.get(container_name) or []:
             actions.extend(action for action in item.get("expansion_actions") or [] if isinstance(action, dict))
+    templates = {
+        str(template.get("template_id")): template
+        for template in compact.get("read_more_action_templates") or []
+        if isinstance(template, dict) and template.get("template_id")
+    }
+    for item in compact.get("next_reads") or []:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target") or "")
+        for template_id in item.get("expansion_action_template_ids") or []:
+            template = templates.get(str(template_id))
+            if template:
+                actions.append(materialize_compact_action_template(template, target=target))
     return actions
+
+
+def materialize_compact_action_template(template: dict[str, Any], *, target: str) -> dict[str, Any]:
+    action = {
+        key: value
+        for key, value in template.items()
+        if key
+        not in {
+            "schema_version",
+            "summary_kind",
+            "template_id",
+            "action_family",
+            "argv_template",
+        }
+    }
+    action["argv"] = ["{target}" if item is None else target if item == "{target}" else item for item in template.get("argv_template") or []]
+    return action
 
 
 def replay_read_more_argv(argv: list[str]) -> dict[str, Any]:
