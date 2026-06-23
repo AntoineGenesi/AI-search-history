@@ -687,6 +687,8 @@ def search_with_fielded_bm25(
         query_streams,
         candidate_pool_limit=candidate_pool_limit,
     )
+    _mark_expected_row_reach(expected_diag, index, _stream_row_values(stream_rows), stage="pre_dedupe")
+    _mark_expected_row_reach(expected_diag, index, raw_rows, stage="query_stream")
     if stream_error_types:
         warnings.append("Fielded BM25 query stream failed: " + ",".join(sorted(stream_error_types)) + ".")
     if not raw_rows and stream_error_types:
@@ -739,6 +741,7 @@ def search_with_fielded_bm25(
         evidence_channels,
         candidate_pool_limit=candidate_pool_limit,
     )
+    _mark_expected_row_reach(expected_diag, index, selection_rows, stage="pre_grouping")
     if context_neighborhood["enabled"]:
         selection_rows = sorted(selection_rows, key=lambda row: _context_neighborhood_selection_key(index, int(row[0])))
     rows, source_grouping = _select_source_grouped_candidate_rows(
@@ -782,6 +785,15 @@ def search_with_fielded_bm25(
         fusion=fusion,
         selected_rows=rows,
         candidate_pool_limit=candidate_pool_limit,
+    )
+    branch_fanout = _fielded_branch_fanout_summary(query_stream_summary)
+    _mark_expected_row_reach(expected_diag, index, rows, stage="grouping")
+    _finalize_expected_reach_diagnostics(
+        expected_diag,
+        query_streams=query_stream_summary,
+        source_grouping=source_grouping,
+        candidate_rows_retained=0,
+        candidate_rows_surfaced=0,
     )
     _mark_expected_candidate_rows(expected_diag, rows)
     matches: list[Match] = []
@@ -854,10 +866,19 @@ def search_with_fielded_bm25(
 
     searched_bytes = sum(int(index.files.get(path, {}).get("byte_count") or 0) for path in opened_paths)
     _mark_expected_pre_final_candidates(expected_diag, matches)
+    _mark_expected_match_reach(expected_diag, matches, stage="windowing")
     matches.sort(key=match_sort_key, reverse=True)
     pre_cap_count = len(matches)
     matches = matches[: plan.limits.max_matches]
     _mark_expected_final_candidates(expected_diag, matches)
+    _mark_expected_match_reach(expected_diag, matches, stage="final")
+    _finalize_expected_reach_diagnostics(
+        expected_diag,
+        query_streams=query_stream_summary,
+        source_grouping=source_grouping,
+        candidate_rows_retained=pre_cap_count,
+        candidate_rows_surfaced=len(matches),
+    )
     if pre_cap_count > len(matches):
         warnings.append("Fielded BM25 candidates were capped at max match cap after ranking.")
     payload = {
@@ -868,6 +889,7 @@ def search_with_fielded_bm25(
         "query_plan_mode": query_plan_mode,
         "fielded_child_query_plan": child_plan_summary,
         "fielded_query_streams": query_stream_summary,
+        "fielded_branch_fanout": branch_fanout,
         "fielded_evidence_channels": evidence_channel_summary,
         "candidate_rows": len(rows),
         "candidate_row_limit": candidate_limit,
@@ -3942,6 +3964,15 @@ def _init_fielded_expected_ref_diagnostics(expected_refs: list[dict] | None) -> 
         state["bm25_candidate_rank_bucket"] = None
         state["score_label_count"] = None
         state["artifact_label_count"] = None
+        state["expected_ref_reach_stage"] = "not_reached"
+        state["first_lost_stage"] = "not_reached"
+        state["pre_grouping_candidate_presence"] = False
+        state["pre_grouping_candidate_count"] = 0
+        state["selected_candidate_proof"] = {}
+        state["omitted_candidate_proof"] = {}
+        state["stage_presence_counts"] = {}
+        state["dropped_by_stage_counts"] = {}
+        state["cap_lower_bound_caveats"] = []
     return expected_diag
 
 
@@ -3957,6 +3988,7 @@ def _mark_expected_indexed(expected_diag: dict | None, index: FieldedBm25Index) 
         state["expected_file_open_order"] = None
         state["expected_record_indexed_by_fielded_bm25"] = any(_ref_contains_line(ref, state) for ref in index.records.values())
         if state["expected_record_indexed_by_fielded_bm25"]:
+            state["expected_ref_reach_stage"] = "query_branch"
             state["pre_reservoir_status"] = "indexed_by_fielded_bm25"
             state["pre_final_status"] = "indexed_not_selected_as_bm25_candidate"
             state["final_status"] = "indexed_not_selected_as_bm25_candidate"
@@ -3971,6 +4003,175 @@ def _mark_expected_candidate_rows(expected_diag: dict | None, rows: list[tuple[A
             continue
         if not any(True for _rowid in rowids):
             state["fielded_candidate_status"] = "no_bm25_candidate_rows"
+
+
+_EXPECTED_REACH_STAGE_ORDER = {
+    "not_reached": 0,
+    "query_branch": 1,
+    "pre_dedupe": 2,
+    "query_stream": 3,
+    "pre_grouping": 4,
+    "grouping": 5,
+    "windowing": 6,
+    "final": 7,
+}
+
+
+def _stream_row_values(stream_rows: dict[str, list[tuple[Any, ...]]]) -> list[tuple[Any, ...]]:
+    values: list[tuple[Any, ...]] = []
+    for rows in stream_rows.values():
+        values.extend(rows)
+    return values
+
+
+def _mark_expected_row_reach(
+    expected_diag: dict | None,
+    index: FieldedBm25Index,
+    rows: list[tuple[Any, ...]],
+    *,
+    stage: str,
+) -> None:
+    if expected_diag is None:
+        return
+    refs = [index.records.get(int(row[0])) for row in rows if row]
+    for state in expected_diag["refs"]:
+        count = sum(1 for ref in refs if ref is not None and _ref_contains_line(ref, state))
+        if count <= 0:
+            continue
+        _set_expected_reach_stage(state, stage)
+        state["stage_presence_counts"][stage] = int(count)
+        if stage == "pre_grouping":
+            state["pre_grouping_candidate_presence"] = True
+            state["pre_grouping_candidate_count"] = int(count)
+
+
+def _mark_expected_match_reach(expected_diag: dict | None, matches: list[Match], *, stage: str) -> None:
+    if expected_diag is None:
+        return
+    for state in expected_diag["refs"]:
+        count = sum(
+            1
+            for match in matches
+            if str(match.path) == state["_path"] and int(match.line or 0) == int(state["_line"])
+        )
+        if count <= 0:
+            continue
+        _set_expected_reach_stage(state, stage)
+        state["stage_presence_counts"][stage] = int(count)
+
+
+def _set_expected_reach_stage(state: dict[str, Any], stage: str) -> None:
+    current = str(state.get("expected_ref_reach_stage") or "not_reached")
+    if _EXPECTED_REACH_STAGE_ORDER.get(stage, 0) >= _EXPECTED_REACH_STAGE_ORDER.get(current, 0):
+        state["expected_ref_reach_stage"] = stage
+
+
+def _finalize_expected_reach_diagnostics(
+    expected_diag: dict | None,
+    *,
+    query_streams: dict[str, Any],
+    source_grouping: dict[str, Any],
+    candidate_rows_retained: int,
+    candidate_rows_surfaced: int,
+) -> None:
+    if expected_diag is None:
+        return
+    caveats = _fielded_reach_cap_caveats(
+        query_streams=query_streams,
+        source_grouping=source_grouping,
+        candidate_rows_retained=candidate_rows_retained,
+        candidate_rows_surfaced=candidate_rows_surfaced,
+    )
+    for state in expected_diag["refs"]:
+        stage = str(state.get("expected_ref_reach_stage") or "not_reached")
+        first_lost = _first_lost_stage_for_reach(stage)
+        state["first_lost_stage"] = first_lost
+        state["cap_lower_bound_caveats"] = list(caveats)
+        state["dropped_by_stage_counts"] = {} if stage == "final" else {first_lost: 1}
+        state["selected_candidate_proof"] = {
+            "pre_grouping_candidate_presence": bool(state.get("pre_grouping_candidate_presence")),
+            "pre_grouping_candidate_count": int(state.get("pre_grouping_candidate_count") or 0),
+            "expected_record_selected_as_bm25_candidate_row": bool(
+                state.get("expected_record_selected_as_bm25_candidate_row")
+            ),
+            "bm25_candidate_rank_bucket": state.get("bm25_candidate_rank_bucket"),
+            "expected_record_present_in_final_candidate_groups": bool(
+                state.get("expected_record_present_in_final_candidate_groups")
+            ),
+            "expected_record_present_in_final_candidate_refs": bool(
+                state.get("expected_record_present_in_final_candidate_refs")
+            ),
+        }
+        state["omitted_candidate_proof"] = {
+            "first_lost_stage": first_lost,
+            "expected_ref_reach_stage": stage,
+            "lost_before_grouping": _EXPECTED_REACH_STAGE_ORDER.get(stage, 0)
+            < _EXPECTED_REACH_STAGE_ORDER["pre_grouping"],
+            "lost_after_pre_grouping": bool(state.get("pre_grouping_candidate_presence"))
+            and _EXPECTED_REACH_STAGE_ORDER.get(stage, 0) < _EXPECTED_REACH_STAGE_ORDER["final"],
+            "cap_lower_bound_caveats": list(caveats),
+        }
+
+
+def _first_lost_stage_for_reach(stage: str) -> str:
+    if stage == "not_reached":
+        return "query_branch"
+    if stage == "query_branch":
+        return "query_stream"
+    if stage in {"pre_dedupe", "query_stream"}:
+        return "pre_grouping"
+    if stage == "pre_grouping":
+        return "grouping"
+    if stage == "grouping":
+        return "windowing"
+    if stage == "windowing":
+        return "final"
+    return "final"
+
+
+def _fielded_reach_cap_caveats(
+    *,
+    query_streams: dict[str, Any],
+    source_grouping: dict[str, Any],
+    candidate_rows_retained: int,
+    candidate_rows_surfaced: int,
+) -> list[str]:
+    caveats: list[str] = []
+    if int(query_streams.get("stream_hit_limit_count") or 0) > 0:
+        caveats.append("query_stream_cap_hit_reach_counts_are_lower_bounds")
+    if int(source_grouping.get("rows_dropped_by_source_cap") or 0) > 0:
+        caveats.append("source_grouping_cap_hit_downstream_counts_are_lower_bounds")
+    if int(candidate_rows_retained) > int(candidate_rows_surfaced):
+        caveats.append("final_candidate_cap_hit_final_reach_is_lower_bound")
+    return caveats
+
+
+def _fielded_branch_fanout_summary(query_streams: dict[str, Any]) -> dict[str, Any]:
+    streams = [item for item in query_streams.get("streams") or [] if isinstance(item, dict)]
+    rows_by_branch = {
+        str(item.get("label")): int(item.get("row_count") or 0)
+        for item in streams
+        if item.get("label")
+    }
+    capped_rows_by_branch = {
+        str(item.get("label")): int(item.get("row_count") or 0)
+        for item in streams
+        if item.get("label") and bool(item.get("hit_limit"))
+    }
+    return {
+        "branches_considered": len(streams),
+        "branches_emitted": sum(1 for count in rows_by_branch.values() if count > 0),
+        "branches_capped": len(capped_rows_by_branch),
+        "rows_by_branch": dict(sorted(rows_by_branch.items())),
+        "capped_rows_by_branch": dict(sorted(capped_rows_by_branch.items())),
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_session_ids_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
 
 
 def _ref_contains_line(ref: FieldedBm25RecordRef, state: dict[str, Any]) -> bool:
@@ -4001,12 +4202,29 @@ def _public_fielded_expected_ref_diagnostics(expected_diag: dict) -> dict:
         ref["bm25_candidate_rank_bucket"] = state.get("bm25_candidate_rank_bucket")
         ref["score_label_count"] = state.get("score_label_count")
         ref["artifact_label_count"] = state.get("artifact_label_count")
+        ref["expected_ref_reach_stage"] = state.get("expected_ref_reach_stage") or "not_reached"
+        ref["first_lost_stage"] = state.get("first_lost_stage") or "not_reached"
+        ref["pre_grouping_candidate_presence"] = bool(state.get("pre_grouping_candidate_presence"))
+        ref["pre_grouping_candidate_count"] = int(state.get("pre_grouping_candidate_count") or 0)
+        ref["selected_candidate_proof"] = dict(state.get("selected_candidate_proof") or {})
+        ref["omitted_candidate_proof"] = dict(state.get("omitted_candidate_proof") or {})
+        ref["stage_presence_counts"] = dict(state.get("stage_presence_counts") or {})
+        ref["dropped_by_stage_counts"] = dict(state.get("dropped_by_stage_counts") or {})
+        ref["cap_lower_bound_caveats"] = list(state.get("cap_lower_bound_caveats") or [])
     public["fielded_bm25_enabled"] = True
     public["fielded_bm25_indexed_expected_record_count"] = sum(
         1 for state in expected_diag["refs"] if state.get("expected_record_indexed_by_fielded_bm25")
     )
     public["fielded_bm25_candidate_expected_ref_count"] = sum(
         1 for state in expected_diag["refs"] if state.get("expected_record_selected_as_bm25_candidate_row")
+    )
+    public["expected_ref_reach_stage_counts"] = {
+        stage: sum(1 for state in expected_diag["refs"] if state.get("expected_ref_reach_stage") == stage)
+        for stage in _EXPECTED_REACH_STAGE_ORDER
+        if sum(1 for state in expected_diag["refs"] if state.get("expected_ref_reach_stage") == stage) > 0
+    }
+    public["pre_grouping_candidate_presence_count"] = sum(
+        1 for state in expected_diag["refs"] if state.get("pre_grouping_candidate_presence")
     )
     return public
 

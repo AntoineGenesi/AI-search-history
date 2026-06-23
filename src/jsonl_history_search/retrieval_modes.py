@@ -330,6 +330,7 @@ def build_fielded_bm25_retrieval_diagnostics(
     fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_evidence_channels = _fielded_evidence_channel_diagnostics(fielded_result)
     child_query_plan = _fielded_child_query_plan_diagnostics(fielded_result)
+    branch_fanout = _fielded_branch_fanout_diagnostics(fielded_result)
     fielded_summary = {
         "status": fielded_result.get("status"),
         "fallback_reason": fielded_result.get("fallback_reason"),
@@ -345,6 +346,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_rows_retained": int(fielded_result.get("candidate_rows_retained", 0) or 0),
         "candidate_rows_surfaced": int(fielded_result.get("candidate_rows_surfaced", 0) or 0),
         "query_streams": _fielded_query_streams_diagnostics(fielded_result),
+        "branch_fanout": branch_fanout,
         "evidence_channels": fielded_evidence_channels,
         "context_neighborhood": fielded_context_neighborhood,
         "searched_files": int(fielded_result.get("searched_files", 0)),
@@ -409,6 +411,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "fielded_candidate_stage_loss": fielded_candidate_stage_loss,
         "fielded_evidence_channels": fielded_evidence_channels,
         "fielded_child_query_plan": child_query_plan,
+        "fielded_branch_fanout": branch_fanout,
         "fielded_context_neighborhood": fielded_context_neighborhood,
         "fielded_source_grouping": fielded_source_grouping,
         "phase_profiles": {
@@ -1195,6 +1198,27 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "source_lines_included": False,
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_branch_fanout_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    fanout = fielded_result.get("fielded_branch_fanout") if isinstance(fielded_result, dict) else {}
+    if not isinstance(fanout, dict):
+        fanout = {}
+    return {
+        "branches_considered": int(fanout.get("branches_considered") or 0),
+        "branches_emitted": int(fanout.get("branches_emitted") or 0),
+        "branches_capped": int(fanout.get("branches_capped") or 0),
+        "rows_by_branch": _safe_int_dict(fanout.get("rows_by_branch")),
+        "capped_rows_by_branch": _safe_int_dict(fanout.get("capped_rows_by_branch")),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
     }
 
 
