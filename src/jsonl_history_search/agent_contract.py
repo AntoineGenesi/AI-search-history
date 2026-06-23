@@ -16,6 +16,8 @@ INLINE_CONTEXT_BYTE_LIMIT = 24_000
 SOURCE_WINDOW_LIMIT = 5
 SOURCE_WINDOW_REASON_CODE_LIMIT = 8
 SOURCE_WINDOW_OMITTED_FACT_LIMIT = 20
+OMITTED_WINDOW_RECOVERY_LIMIT = 5
+OMITTED_WINDOW_RECOVERY_PROMOTION_LIMIT = 3
 SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT = 5
 COMPACT_PROVENANCE_CANDIDATE_LIMIT = 8
 COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
@@ -252,6 +254,9 @@ def build_compact_provenance_handoff(
     evidence_packets = compact_provenance_evidence_packet_summaries(
         evidence_packet_candidates[:EVIDENCE_PACKET_LIMIT]
     )
+    omitted_window_recovery = compact_omitted_window_recovery_summary(
+        source_locator_handoff.get("omitted_window_recovery")
+    )
     evidence_packet_packaging = source_locator_handoff.get("evidence_packet_packaging") or {}
     evidence_packet_text_included = bool(evidence_packet_packaging.get("raw_text_included", False))
     compact_next_reads, read_more_action_templates = compact_next_reads_with_templates(next_reads or [])
@@ -296,6 +301,7 @@ def build_compact_provenance_handoff(
         "source_refs": source_refs,
         "source_windows": source_windows,
         "evidence_packets": evidence_packets,
+        "omitted_window_recovery": omitted_window_recovery,
         "source_window_packaging": compact_source_window_packaging(
             source_locator_handoff.get("source_window_packaging", {})
         ),
@@ -337,6 +343,8 @@ def build_compact_provenance_handoff(
     if retrieval_pressure:
         packet["derived_from"].append("retrieval_pressure_summary")
         packet["retrieval_pressure_summary"] = pressure_summary
+    if omitted_window_recovery.get("status") == "available":
+        packet["derived_from"].append("omitted_window_recovery")
     packet_bytes = len(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     packet["context_budget"] = {
         "payload_bytes": packet_bytes,
@@ -385,6 +393,50 @@ def compact_provenance_source_window_summaries(source_windows: list[dict[str, An
             }
         )
     return summaries
+
+
+def compact_omitted_window_recovery_summary(value: Any) -> dict[str, Any]:
+    recovery = value if isinstance(value, dict) else {}
+    items = recovery.get("items") if isinstance(recovery.get("items"), list) else []
+    compact_items: list[dict[str, Any]] = []
+    for item in items[:OMITTED_WINDOW_RECOVERY_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        compact_items.append(
+            {
+                "schema_version": 1,
+                "summary_kind": "compact_omitted_window_recovery_ref",
+                "recovery_id": item.get("recovery_id"),
+                "candidate_id": item.get("candidate_id"),
+                "source_ref": source_ref,
+                "target": item.get("target") or source_ref_target(source_ref),
+                "omission_reason": item.get("omission_reason"),
+                "intent_match": bool(item.get("intent_match", False)),
+                "read_more_actionable": bool(item.get("read_more_actionable", False)),
+                "promoted_to_next_reads": bool(item.get("promoted_to_next_reads", False)),
+                "omitted_fields": {
+                    "expansion_actions": bool(item.get("expansion_actions")),
+                    "context_actions": bool(item.get("context_actions")),
+                    "text_or_snippets": True,
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "summary_kind": "compact_omitted_window_recovery_summary",
+        "status": "available" if compact_items else "none",
+        "recovery_count": int(recovery.get("recovery_count") or 0),
+        "recovery_limit": int(recovery.get("recovery_limit") or OMITTED_WINDOW_RECOVERY_LIMIT),
+        "promoted_next_read_count": int(recovery.get("promoted_next_read_count") or 0),
+        "items": compact_items,
+        "privacy": {
+            "raw_text_included": False,
+            "snippets_included": False,
+            "raw_paths_included_beyond_source_ref": False,
+            "raw_session_ids_included_beyond_source_ref": False,
+        },
+    }
 
 
 def compact_next_read_ref(next_read: dict[str, Any]) -> dict[str, Any]:
@@ -2948,6 +3000,23 @@ def build_source_locator_handoff(
     )
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
+    omitted_window_recovery = source_window_result["omitted_window_recovery"]
+    next_read_rows, promoted_recovery_count = promote_omitted_window_recovery_next_reads(
+        next_read_rows,
+        omitted_window_recovery.get("items", []),
+        include_context_actions=include_context_actions,
+    )
+    if omitted_window_recovery:
+        omitted_window_recovery = {
+            **omitted_window_recovery,
+            "promoted_next_read_count": promoted_recovery_count,
+            "promotion_policy": {
+                "next_read_limit": COMPACT_PROVENANCE_NEXT_READ_LIMIT,
+                "recovery_promotion_limit": OMITTED_WINDOW_RECOVERY_PROMOTION_LIMIT,
+                "requires_exact_target": True,
+                "bounded": True,
+            },
+        }
     evidence_packet_result = build_evidence_packet_package(
         candidates=candidate_rows,
         search_result=search_result,
@@ -2974,6 +3043,7 @@ def build_source_locator_handoff(
             "source_windows": "capped",
             "source_refs": "included_exact",
             "next_reads": "included_exact_for_emitted_windows",
+            "omitted_window_recovery": "bounded_exact_handles_for_omitted_windows",
             "reason_codes": "capped",
             "text_or_snippets": "omitted",
         },
@@ -2981,6 +3051,7 @@ def build_source_locator_handoff(
             {"field": "source_ref", "action": "included", "preserves_exact_refs": True},
             {"field": "target", "action": "included", "preserves_exact_refs": True},
             {"field": "next_read", "action": "included", "preserves_exact_refs": True},
+            {"field": "omitted_window_recovery", "action": "bounded", "limit": OMITTED_WINDOW_RECOVERY_LIMIT},
             {"field": "expansion_actions", "action": "included", "preserves_exact_refs": True},
             {
                 "field": "context_actions",
@@ -3023,6 +3094,7 @@ def build_source_locator_handoff(
         },
         "source_windows": source_windows,
         "source_window_packaging": source_window_packaging,
+        "omitted_window_recovery": omitted_window_recovery,
         "next_reads": next_read_rows[:COMPACT_PROVENANCE_NEXT_READ_LIMIT],
         "no_evidence_meaning": {
             "answer_scope": "not_found_in_searched_scope",
@@ -3163,6 +3235,7 @@ def build_source_window_package(
     selected_groups = {str(item["group_key"]) for item in selected_candidates}
     omitted_candidates = selection_result["omitted"]
     omission_reason_counts = dict(Counter(str(item.get("omission_reason") or "omitted") for item in omitted_candidates))
+    omitted_candidate_facts = selection_policy_omitted_candidate_facts(omitted_candidates)
     selection_policy = {
         "schema_version": 2,
         "allocator": "group_aware_source_window_allocator",
@@ -3201,11 +3274,19 @@ def build_source_window_package(
             "intent_group_heads" if selection_result["intent_pass_active"] else "group_heads",
             "represented_group_supported_fill",
         ],
-        "omitted_candidate_facts": selection_policy_omitted_candidate_facts(omitted_candidates),
+        "omitted_candidate_facts": omitted_candidate_facts,
         "raw_text_included": False,
         "snippets_included": False,
     }
-    return {"windows": windows, "selection_policy": selection_policy}
+    omitted_window_recovery = build_omitted_window_recovery(
+        omitted_candidate_facts,
+        expansion_action_context=expansion_action_context,
+    )
+    return {
+        "windows": windows,
+        "selection_policy": selection_policy,
+        "omitted_window_recovery": omitted_window_recovery,
+    }
 
 
 def build_evidence_packet_package(
@@ -4482,6 +4563,86 @@ def selection_policy_omitted_candidate_facts(omitted_candidates: list[dict[str, 
     return facts
 
 
+def build_omitted_window_recovery(
+    omitted_candidate_facts: list[dict[str, Any]],
+    *,
+    expansion_action_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for index, fact in enumerate(omitted_candidate_facts[:OMITTED_WINDOW_RECOVERY_LIMIT], 1):
+        if not isinstance(fact, dict):
+            continue
+        source_ref = canonical_source_ref(fact.get("source_ref") if isinstance(fact.get("source_ref"), dict) else {})
+        target = source_ref_target(source_ref)
+        candidate_id = str(fact.get("candidate_id") or "")
+        expansion_actions = read_more_actions_for_source_ref(
+            source_ref,
+            candidate_id=candidate_id,
+            expansion_action_context=expansion_action_context,
+        )
+        context_actions = context_actions_for_source_ref(
+            source_ref,
+            candidate_id=candidate_id,
+            expansion_action_context=expansion_action_context,
+        )
+        read_more_actionable = bool(target and expansion_actions)
+        items.append(
+            {
+                "schema_version": 1,
+                "recovery_id": f"owr{index:03d}",
+                "kind": "omitted_grouped_source_window",
+                "candidate_id": candidate_id,
+                "source_ref": source_ref,
+                "target": target,
+                "omission_reason": str(fact.get("omission_reason") or "omitted"),
+                "intent_match": bool(fact.get("intent_match", False)),
+                "omitted_group_count": int(fact.get("omitted_group_count") or 0),
+                "read_more_actionable": read_more_actionable,
+                "bounded": True,
+                "promoted_to_next_reads": False,
+                "reason": "candidate omitted from grouped source-window budget; open exact source_ref to recover context",
+                "expansion_actions": expansion_actions,
+                "context_actions": context_actions,
+                "privacy": {
+                    "raw_text_included": False,
+                    "snippets_included": False,
+                    "raw_paths_included_beyond_source_ref": False,
+                    "raw_session_ids_included_beyond_source_ref": False,
+                    "raw_cwd_included": False,
+                    "source_lines_included": False,
+                },
+                "claim_boundaries": {
+                    "ranking_or_cap_changed": False,
+                    "broad_search_rerun": False,
+                    "selection_survival_claim_supported": False,
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "available" if items else "none",
+        "recovery_count": len(items),
+        "recovery_limit": OMITTED_WINDOW_RECOVERY_LIMIT,
+        "candidate_omitted_fact_count": len(omitted_candidate_facts),
+        "promoted_next_read_count": 0,
+        "items": items,
+        "privacy": {
+            "raw_text_included": False,
+            "snippets_included": False,
+            "raw_paths_included_beyond_source_ref": False,
+            "raw_session_ids_included_beyond_source_ref": False,
+            "raw_cwd_included": False,
+            "source_lines_included": False,
+        },
+        "claim_boundaries": {
+            "recovery_handles_change_ranking": False,
+            "recovery_handles_raise_caps": False,
+            "selection_survival_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+        },
+    }
+
+
 def source_window_candidate_matches_intent(
     data: dict[str, Any],
     query_plan: dict[str, Any],
@@ -4543,6 +4704,79 @@ def project_hint_from_cwd(cwd: str | None) -> str | None:
     if not cwd:
         return None
     return Path(str(cwd)).name or None
+
+
+def promote_omitted_window_recovery_next_reads(
+    next_reads: list[dict[str, Any]],
+    recovery_items: list[dict[str, Any]],
+    *,
+    include_context_actions: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    promoted: list[dict[str, Any]] = [dict(read) for read in next_reads if isinstance(read, dict)]
+    promoted_count = 0
+    prioritized_recovery = sorted(
+        [item for item in recovery_items if isinstance(item, dict) and item.get("read_more_actionable")],
+        key=lambda item: (
+            not bool(item.get("intent_match", False)),
+            str(item.get("omission_reason") or ""),
+            str(item.get("candidate_id") or ""),
+        ),
+    )
+    for item in prioritized_recovery:
+        if promoted_count >= OMITTED_WINDOW_RECOVERY_PROMOTION_LIMIT:
+            break
+        read = omitted_window_recovery_next_read(item, include_context_actions=include_context_actions)
+        key = next_read_identity_key(read)
+        existing_index = next((index for index, existing in enumerate(promoted) if next_read_identity_key(existing) == key), None)
+        if existing_index is not None:
+            updated_existing = {
+                **promoted[existing_index],
+                "reason": "open omitted grouped source-window candidate before rerunning broad search",
+                "omitted_window_recovery": read["omitted_window_recovery"],
+            }
+            if include_context_actions and read.get("context_actions"):
+                updated_existing["context_actions"] = read["context_actions"]
+            promoted[existing_index] = updated_existing
+            item["promoted_to_next_reads"] = True
+            promoted_count += 1
+            continue
+        if len(promoted) < COMPACT_PROVENANCE_NEXT_READ_LIMIT:
+            promoted.append(read)
+        else:
+            promoted[-1] = read
+        item["promoted_to_next_reads"] = True
+        promoted_count += 1
+    return promoted[:COMPACT_PROVENANCE_NEXT_READ_LIMIT], promoted_count
+
+
+def omitted_window_recovery_next_read(
+    item: dict[str, Any],
+    *,
+    include_context_actions: bool,
+) -> dict[str, Any]:
+    source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+    read = {
+        "kind": "jsonl_source_ref",
+        "target": item.get("target") or source_ref_target(source_ref),
+        "candidate_id": str(item.get("candidate_id") or ""),
+        "source_ref": source_ref,
+        "reason": "open omitted grouped source-window candidate before rerunning broad search",
+        "expansion_actions": list(item.get("expansion_actions") or []),
+        "omitted_window_recovery": {
+            "recovery_id": item.get("recovery_id"),
+            "omission_reason": item.get("omission_reason"),
+            "intent_match": bool(item.get("intent_match", False)),
+            "bounded": True,
+        },
+    }
+    if include_context_actions:
+        read["context_actions"] = list(item.get("context_actions") or [])
+    return read
+
+
+def next_read_identity_key(read: dict[str, Any]) -> tuple[str, str]:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return (str(read.get("candidate_id") or ""), str(read.get("target") or source_ref_target(source_ref) or ""))
 
 
 def next_reads_from_candidates(

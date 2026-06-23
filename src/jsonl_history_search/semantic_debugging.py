@@ -182,6 +182,21 @@ def build_semantic_debug_payload(
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
         evidence_context_window=requested_evidence_context_window,
     )
+    if source_locator_handoff.get("next_reads") != next_reads:
+        next_reads = list(source_locator_handoff.get("next_reads") or next_reads)
+        decision_context["next_reads"] = next_reads[:12]
+        decision_context["next_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=False,
+        )
+        audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
+        audit_plan["replay_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=True,
+        )
+        audit_plan["next_commands"] = decision_context["next_commands"]
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
         Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
