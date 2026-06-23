@@ -1642,6 +1642,9 @@ def main(argv: list[str] | None = None) -> int:
                     "claim_boundaries": packet["claim_boundaries"],
                     "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
                     "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
+                    "support_precision_summary": (
+                        packet.get("forensics_workflow", {}).get("summary", {}).get("support_summary")
+                    ),
                     "decision_context_summary": {
                         "primary_question_family": packet["decision_context"].get("primary_question_family"),
                         "project_time_reconstruction_needed": packet["decision_context"].get(

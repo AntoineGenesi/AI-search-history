@@ -855,11 +855,13 @@ def render_semantic_debug_text(payload: dict) -> str:
     if workflow_summary:
         basis_counts = workflow_summary.get("join_basis_counts") or {}
         provenance = workflow_summary.get("provenance") or {}
+        support_summary = workflow_summary.get("support_summary") or workflow_summary
         lines.append(
             "Forensics workflow: "
             f"phases={workflow_summary.get('phase_count', 0)} "
             f"joins={workflow_summary.get('join_count', 0)} "
             f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'} "
+            f"support={_format_support_counts(support_summary)} "
             f"join_basis={_format_count_map(basis_counts)} "
             f"provenance_commits={provenance.get('commit_count', 0)}"
         )
@@ -917,10 +919,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if workflow_summary:
         basis_counts = workflow_summary.get("join_basis_counts") or {}
         provenance = workflow_summary.get("provenance") or {}
+        support_summary = workflow_summary.get("support_summary") or workflow_summary
         lines[7:7] = [
             f"**Forensics workflow:** phases={workflow_summary.get('phase_count', 0)} "
             f"joins={workflow_summary.get('join_count', 0)} "
             f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'} "
+            f"support={_format_support_counts(support_summary)} "
             f"join_basis={_format_count_map(basis_counts)} "
             f"provenance_commits={provenance.get('commit_count', 0)}",
             "",
@@ -1412,6 +1416,9 @@ def render_forensics_text(payload: dict) -> str:
         basis_counts = provenance_summary.get("join_basis_counts") or {}
         if basis_counts:
             lines.append(f"Join basis: {_format_count_map(basis_counts)}")
+        support_summary = provenance_summary.get("support_summary") or forensic.get("support_summary") or {}
+        if support_summary:
+            lines.append(f"Support precision: {_format_support_counts(support_summary)}")
     git_lifecycle = provenance.get("git_lifecycle") or {}
     lifecycle_commits = git_lifecycle.get("commits") or []
     if lifecycle_commits:
@@ -1440,7 +1447,7 @@ def render_forensics_text(payload: dict) -> str:
     phases = forensic.get("phase_timeline") or []
     if phases:
         lines.append("Phase timeline:")
-        lines.append("  id | phase | evidence | action | confidence | source")
+        lines.append("  id | phase | evidence | action | support | confidence | source")
         for phase in phases[:12]:
             source = _compact_phase_source(phase.get("source_ref") or {})
             lines.append(
@@ -1449,6 +1456,7 @@ def render_forensics_text(payload: dict) -> str:
                 f"{phase.get('phase_kind')} | "
                 f"{phase.get('evidence_kind')} | "
                 f"{phase.get('claim_action')} | "
+                f"{phase.get('support_status') or 'unknown'} | "
                 f"{phase.get('confidence')} | "
                 f"{source}"
             )
@@ -1461,6 +1469,7 @@ def render_forensics_text(payload: dict) -> str:
             "Forensics diagnostics: "
             f"phases={sum((diagnostics.get('phase_counts') or {}).values())} "
             f"joins={diagnostics.get('join_count', 0)} "
+            f"support={_format_support_counts(diagnostics.get('support_summary') or diagnostics)} "
             f"unsupported_claims={diagnostics.get('unsupported_claim_count', 0)} "
             f"missing={','.join(diagnostics.get('missing_evidence_flags', [])) or 'none'}"
         )
@@ -1554,6 +1563,15 @@ def _compact_phase_source(source_ref: dict) -> str:
 
 def _format_count_map(counts: dict) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none"
+
+
+def _format_support_counts(summary: dict) -> str:
+    return (
+        f"exact={int(summary.get('exact_support_count') or 0)},"
+        f"proximity={int(summary.get('proximity_support_count') or 0)},"
+        f"inferred={int(summary.get('inferred_support_count') or 0)},"
+        f"unsupported={int(summary.get('unsupported_support_count') or 0)}"
+    )
 
 
 def render_project_lineage_text(payload: dict) -> str:
