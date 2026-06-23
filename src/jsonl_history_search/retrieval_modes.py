@@ -475,6 +475,11 @@ def _fielded_candidate_stage_loss_diagnostics(
         if isinstance(source_grouping.get("grouped_source_windows"), dict)
         else {}
     )
+    intent_window_allocation = (
+        source_grouping.get("intent_window_allocation")
+        if isinstance(source_grouping.get("intent_window_allocation"), dict)
+        else {}
+    )
     materialized = int((fielded_summary.get("materialization") or {}).get("candidate_rows_materialized") or 0)
     retained = int(fielded_summary.get("candidate_rows_retained") or 0)
     surfaced = int(fielded_summary.get("candidate_rows_surfaced") or 0)
@@ -617,6 +622,7 @@ def _fielded_candidate_stage_loss_diagnostics(
                 "line_numbers_included": False,
                 "source_lines_included": False,
             },
+            "intent_window_allocation": _fielded_intent_window_allocation_diagnostics(intent_window_allocation),
             "rows_dropped_by_source_cap": source_cap_drops,
         },
         "materialization_ranking_final_caps": {
@@ -884,6 +890,9 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
         "grouped_source_windows": _fielded_grouped_source_windows_diagnostics(
             grouping.get("grouped_source_windows")
         ),
+        "intent_window_allocation": _fielded_intent_window_allocation_diagnostics(
+            grouping.get("intent_window_allocation")
+        ),
         "selection_policy": _fielded_selection_policy_diagnostics(grouping.get("selection_policy")),
         "rows_dropped_by_source_cap": int(grouping.get("rows_dropped_by_source_cap") or 0),
         "stream_selection": _fielded_stream_selection_diagnostics(grouping.get("stream_selection")),
@@ -897,11 +906,33 @@ def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict
     }
 
 
+def _fielded_intent_window_allocation_diagnostics(value: Any) -> dict[str, Any]:
+    allocation = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(allocation.get("enabled", False)),
+        "strategy": str(allocation.get("strategy") or "disabled"),
+        "primary_intent": str(allocation.get("primary_intent") or "generic_history"),
+        "source_window_needs": [str(item) for item in allocation.get("source_window_needs") or []],
+        "intent_window_count_considered": int(allocation.get("intent_window_count_considered") or 0),
+        "selected_intent_window_count": int(allocation.get("selected_intent_window_count") or 0),
+        "distinct_intent_sources_selected": int(allocation.get("distinct_intent_sources_selected") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
 def _fielded_selection_policy_diagnostics(value: Any) -> dict[str, Any]:
     policy = value if isinstance(value, dict) else {}
     return {
         "selection_policy_version": str(policy.get("selection_policy_version") or ""),
         "selection_strategy": str(policy.get("selection_strategy") or "disabled"),
+        "primary_intent": str(policy.get("primary_intent") or "generic_history"),
         "top_exact_rows_selected": int(policy.get("top_exact_rows_selected") or 0),
         "child_channel_rows_selected": int(policy.get("child_channel_rows_selected") or 0),
         "metadata_match_rows_selected": int(policy.get("metadata_match_rows_selected") or 0),
