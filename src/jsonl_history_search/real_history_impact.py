@@ -913,7 +913,12 @@ def _run_package_search_fielded_bm25(**kwargs) -> tuple[dict[str, Any], dict[str
         intent,
         default_tz=default_tz,
         cwd=str(Path(args.cwd).expanduser().resolve()),
-        expected_ref_diagnostics=case.get("expected_refs") if getattr(args, "capture_expected_ref_diagnostics", False) else None,
+        expected_ref_diagnostics=case.get("expected_refs")
+        if (
+            getattr(args, "capture_expected_ref_diagnostics", False)
+            or getattr(args, "source_tier_answerability_pressure", False)
+        )
+        else None,
     )
     fielded_warnings = _safe_warnings(result.get("warnings") or [])
     row_cap_hit_labels = sorted(set(kwargs["cap_hit_labels"] or []) | set(_cap_hit_labels(fielded_warnings)))
@@ -2130,6 +2135,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
     privacy = result.get("privacy") if isinstance(result.get("privacy"), dict) else {}
     materialization = _fielded_bm25_materialization_stats(result.get("materialization"))
     query_streams = _fielded_bm25_query_stream_stats(result.get("fielded_query_streams"))
+    branch_fanout = _fielded_bm25_branch_fanout_stats(result.get("fielded_branch_fanout"))
     source_grouping = _fielded_bm25_source_grouping_stats(result.get("fielded_source_grouping"))
     phase_profile = _phase_profile_stats(result.get("profile"), "fielded_bm25_search_materialization")
     index_build_profile = _phase_profile_stats(summary.get("profile"), "fielded_bm25_index_build")
@@ -2155,6 +2161,7 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "candidate_records_deduped": int(result.get("candidate_records_deduped") or 0),
         "bm25_rank_buckets": _safe_count_dict(result.get("bm25_rank_buckets")),
         "query_streams": query_streams,
+        "branch_fanout": branch_fanout,
         "source_grouping": source_grouping,
         "materialization": materialization,
         "phase_profile": phase_profile,
@@ -2268,6 +2275,7 @@ def _fielded_bm25_row_stats_from_rrf_diagnostics(diagnostics: dict[str, Any]) ->
         "candidate_records_deduped": 0,
         "bm25_rank_buckets": {},
         "query_streams": query_streams,
+        "branch_fanout": _fielded_bm25_branch_fanout_stats({}),
         "source_grouping": source_grouping,
         "materialization": materialization,
         "phase_profile": phase_profile,
@@ -2346,6 +2354,24 @@ def _fielded_bm25_query_stream_stats(value: Any) -> dict[str, Any]:
         "raw_cwd_included": False,
         "source_lines_included": False,
         "line_numbers_included": False,
+    }
+
+
+def _fielded_bm25_branch_fanout_stats(value: Any) -> dict[str, Any]:
+    fanout = value if isinstance(value, dict) else {}
+    return {
+        "branches_considered": int(fanout.get("branches_considered") or 0),
+        "branches_emitted": int(fanout.get("branches_emitted") or 0),
+        "branches_capped": int(fanout.get("branches_capped") or 0),
+        "rows_by_branch": _safe_count_dict(fanout.get("rows_by_branch")),
+        "capped_rows_by_branch": _safe_count_dict(fanout.get("capped_rows_by_branch")),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
     }
 
 
@@ -2668,6 +2694,17 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
                 ),
                 "bm25_candidate_rank_label": ref.get("bm25_candidate_rank_label"),
                 "bm25_candidate_rank_bucket": ref.get("bm25_candidate_rank_bucket"),
+                "expected_ref_reach_stage": str(ref.get("expected_ref_reach_stage") or "not_reached"),
+                "first_lost_stage": str(ref.get("first_lost_stage") or "not_reached"),
+                "pre_grouping_candidate_presence": bool(ref.get("pre_grouping_candidate_presence")),
+                "pre_grouping_candidate_count": int(ref.get("pre_grouping_candidate_count") or 0),
+                "selected_candidate_proof": _safe_reach_proof(ref.get("selected_candidate_proof")),
+                "omitted_candidate_proof": _safe_reach_proof(ref.get("omitted_candidate_proof")),
+                "stage_presence_counts": _safe_count_dict(ref.get("stage_presence_counts")),
+                "dropped_by_stage_counts": _safe_count_dict(ref.get("dropped_by_stage_counts")),
+                "cap_lower_bound_caveats": [
+                    str(item) for item in ref.get("cap_lower_bound_caveats") or [] if _safe_counter_label(str(item))
+                ],
             }
         )
     opened_files = []
@@ -2706,8 +2743,35 @@ def _expected_ref_diagnostics_row(result: dict[str, Any]) -> dict[str, Any] | No
         "fielded_bm25_candidate_expected_ref_count": int(
             diagnostics.get("fielded_bm25_candidate_expected_ref_count") or 0
         ),
+        "expected_ref_reach_stage_counts": _safe_count_dict(diagnostics.get("expected_ref_reach_stage_counts")),
+        "pre_grouping_candidate_presence_count": int(
+            diagnostics.get("pre_grouping_candidate_presence_count") or 0
+        ),
         "refs": refs,
     }
+
+
+def _safe_reach_proof(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    proof: dict[str, Any] = {}
+    for key, item in sorted(value.items()):
+        safe_key = str(key)
+        if not _safe_counter_label(safe_key):
+            continue
+        if isinstance(item, bool):
+            proof[safe_key] = item
+        elif isinstance(item, int):
+            proof[safe_key] = item
+        elif isinstance(item, str):
+            proof[safe_key] = _safe_agent_compact_label(item)
+        elif isinstance(item, list):
+            proof[safe_key] = [
+                _safe_agent_compact_label(str(entry))
+                for entry in item
+                if _safe_counter_label(str(entry))
+            ]
+    return proof
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -2909,6 +2973,8 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "candidate_rows_surfaced": 0,
             "bm25_rank_buckets": {},
             "query_streams": _fielded_bm25_query_stream_aggregate([]),
+            "branch_fanout": _fielded_bm25_branch_fanout_aggregate([]),
+            "expected_ref_reach": _expected_ref_reach_aggregate([]),
             "source_grouping": _fielded_bm25_source_grouping_aggregate([]),
             "materialization": _fielded_bm25_materialization_aggregate([]),
             "phase_profiles": _phase_profiles_aggregate([]),
@@ -2934,6 +3000,8 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_records_deduped": sum(int(item.get("candidate_records_deduped") or 0) for item in selected),
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
         "query_streams": _fielded_bm25_query_stream_aggregate(selected),
+        "branch_fanout": _fielded_bm25_branch_fanout_aggregate(selected),
+        "expected_ref_reach": _expected_ref_reach_aggregate(rows),
         "source_grouping": _fielded_bm25_source_grouping_aggregate(selected),
         "materialization": _fielded_bm25_materialization_aggregate(selected),
         "phase_profiles": _fielded_bm25_phase_profiles_aggregate(selected),
@@ -2986,6 +3054,129 @@ def _fielded_bm25_query_stream_aggregate(rows: list[dict[str, Any]]) -> dict[str
             int(item.get("rows_dropped_by_stream_cap_total") or 0) for item in selected
         ),
         "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _fielded_bm25_branch_fanout_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row.get("branch_fanout")
+        for row in rows
+        if isinstance(row.get("branch_fanout"), dict)
+    ]
+    if not selected:
+        return {
+            "status": "not_evaluated",
+            "runs": 0,
+            "branches_considered": 0,
+            "branches_emitted": 0,
+            "branches_capped": 0,
+            "rows_by_branch": {},
+            "capped_rows_by_branch": {},
+            "privacy": _fielded_bm25_privacy(),
+        }
+    rows_by_branch: dict[str, int] = {}
+    capped_rows_by_branch: dict[str, int] = {}
+    for item in selected:
+        for label, count in (item.get("rows_by_branch") or {}).items():
+            rows_by_branch[str(label)] = rows_by_branch.get(str(label), 0) + int(count or 0)
+        for label, count in (item.get("capped_rows_by_branch") or {}).items():
+            capped_rows_by_branch[str(label)] = capped_rows_by_branch.get(str(label), 0) + int(count or 0)
+    return {
+        "status": "evaluated",
+        "runs": len(selected),
+        "branches_considered": sum(int(item.get("branches_considered") or 0) for item in selected),
+        "branches_emitted": sum(int(item.get("branches_emitted") or 0) for item in selected),
+        "branches_capped": sum(int(item.get("branches_capped") or 0) for item in selected),
+        "rows_by_branch": dict(sorted(rows_by_branch.items())),
+        "capped_rows_by_branch": dict(sorted(capped_rows_by_branch.items())),
+        "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _expected_ref_reach_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    refs: list[dict[str, Any]] = []
+    stage_counts: dict[str, int] = {}
+    first_lost_counts: dict[str, int] = {}
+    dropped_by_stage_counts: dict[str, int] = {}
+    stage_presence_counts: dict[str, int] = {}
+    caveat_counts: dict[str, int] = {}
+    for row in rows:
+        diagnostics = row.get("expected_ref_diagnostics")
+        if not isinstance(diagnostics, dict):
+            continue
+        for ref in diagnostics.get("refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            label = f"expected_ref_{len(refs) + 1:03d}"
+            stage = _safe_agent_compact_label(ref.get("expected_ref_reach_stage") or "not_reached")
+            first_lost = _safe_agent_compact_label(ref.get("first_lost_stage") or "not_reached")
+            dropped = _safe_count_dict(ref.get("dropped_by_stage_counts"))
+            presence = _safe_count_dict(ref.get("stage_presence_counts"))
+            caveats = [
+                _safe_agent_compact_label(str(item))
+                for item in ref.get("cap_lower_bound_caveats") or []
+                if _safe_counter_label(str(item))
+            ]
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+            first_lost_counts[first_lost] = first_lost_counts.get(first_lost, 0) + 1
+            for dropped_stage, count in dropped.items():
+                dropped_by_stage_counts[dropped_stage] = dropped_by_stage_counts.get(dropped_stage, 0) + int(count)
+            for presence_stage, count in presence.items():
+                stage_presence_counts[presence_stage] = stage_presence_counts.get(presence_stage, 0) + int(count)
+            for caveat in caveats:
+                caveat_counts[caveat] = caveat_counts.get(caveat, 0) + 1
+            refs.append(
+                {
+                    "expected_ref_label": label,
+                    "expected_ref_reach_stage": stage,
+                    "first_lost_stage": first_lost,
+                    "pre_grouping_candidate_presence": bool(ref.get("pre_grouping_candidate_presence")),
+                    "pre_grouping_candidate_count": int(ref.get("pre_grouping_candidate_count") or 0),
+                    "selected_candidate_proof": _safe_reach_proof(ref.get("selected_candidate_proof")),
+                    "omitted_candidate_proof": _safe_reach_proof(ref.get("omitted_candidate_proof")),
+                    "stage_presence_counts": presence,
+                    "dropped_by_stage_counts": dropped,
+                    "cap_lower_bound_caveats": caveats,
+                }
+            )
+    if not refs:
+        return {
+            "status": "not_evaluated",
+            "expected_ref_count": 0,
+            "refs": [],
+            "expected_ref_reach_stage_counts": {},
+            "first_lost_stage_counts": {},
+            "pre_grouping_candidate_presence_count": 0,
+            "dropped_by_stage_counts": {},
+            "stage_presence_counts": {},
+            "cap_lower_bound_caveats": {},
+            "privacy": _expected_ref_reach_privacy(),
+        }
+    return {
+        "status": "evaluated",
+        "expected_ref_count": len(refs),
+        "refs": refs,
+        "expected_ref_reach_stage_counts": dict(sorted(stage_counts.items())),
+        "first_lost_stage_counts": dict(sorted(first_lost_counts.items())),
+        "pre_grouping_candidate_presence_count": sum(
+            1 for ref in refs if ref.get("pre_grouping_candidate_presence")
+        ),
+        "dropped_by_stage_counts": dict(sorted(dropped_by_stage_counts.items())),
+        "stage_presence_counts": dict(sorted(stage_presence_counts.items())),
+        "cap_lower_bound_caveats": dict(sorted(caveat_counts.items())),
+        "distinguishes_upstream_from_downstream_loss": True,
+        "privacy": _expected_ref_reach_privacy(),
+    }
+
+
+def _expected_ref_reach_privacy() -> dict[str, bool]:
+    return {
+        **_fielded_bm25_privacy(),
+        "aggregate_safe_expected_ref_labels_only": True,
+        "case_ids_included": False,
+        "raw_expected_ref_ids_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
     }
 
 
