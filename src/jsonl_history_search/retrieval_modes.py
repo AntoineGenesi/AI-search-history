@@ -615,6 +615,19 @@ def _fielded_candidate_stage_loss_diagnostics(
                 "distinct_days_selected": int(grouped_source_windows.get("distinct_days_selected") or 0),
                 "distinct_windows_selected": int(grouped_source_windows.get("distinct_windows_selected") or 0),
                 "omission_reason_counts": _safe_int_map(grouped_source_windows.get("omission_reason_counts")),
+                "route_window_count_considered": int(grouped_source_windows.get("route_window_count_considered") or 0),
+                "route_window_count_selected": int(grouped_source_windows.get("route_window_count_selected") or 0),
+                "route_window_head_selection_count": int(
+                    grouped_source_windows.get("route_window_head_selection_count") or 0
+                ),
+                "novelty_fill_window_count": int(grouped_source_windows.get("novelty_fill_window_count") or 0),
+                "duplicate_window_skip_count": int(grouped_source_windows.get("duplicate_window_skip_count") or 0),
+                "duplicate_window_selection_count": int(
+                    grouped_source_windows.get("duplicate_window_selection_count") or 0
+                ),
+                "window_selection": _fielded_grouped_source_window_selection_diagnostics(
+                    grouped_source_windows.get("window_selection")
+                ),
                 "selected_window_details_included": False,
                 "raw_window_keys_included": False,
                 "raw_paths_included": False,
@@ -918,7 +931,12 @@ def _fielded_intent_window_allocation_diagnostics(value: Any) -> dict[str, Any]:
         "source_window_needs": [str(item) for item in allocation.get("source_window_needs") or []],
         "intent_window_count_considered": int(allocation.get("intent_window_count_considered") or 0),
         "selected_intent_window_count": int(allocation.get("selected_intent_window_count") or 0),
+        "selected_route_window_count": int(allocation.get("selected_route_window_count") or 0),
+        "selected_intent_window_head_count": int(allocation.get("selected_intent_window_head_count") or 0),
         "distinct_intent_sources_selected": int(allocation.get("distinct_intent_sources_selected") or 0),
+        "novelty_fill_window_count": int(allocation.get("novelty_fill_window_count") or 0),
+        "duplicate_window_skip_count": int(allocation.get("duplicate_window_skip_count") or 0),
+        "duplicate_window_selection_count": int(allocation.get("duplicate_window_selection_count") or 0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -1121,8 +1139,38 @@ def _fielded_grouped_source_windows_diagnostics(value: Any) -> dict[str, Any]:
         "distinct_days_selected": int(windows.get("distinct_days_selected") or 0),
         "distinct_windows_selected": int(windows.get("distinct_windows_selected") or 0),
         "omission_reason_counts": _safe_int_counts(windows.get("omission_reason_counts")),
+        "route_window_count_considered": int(windows.get("route_window_count_considered") or 0),
+        "route_window_count_selected": int(windows.get("route_window_count_selected") or 0),
+        "route_window_head_selection_count": int(windows.get("route_window_head_selection_count") or 0),
+        "novelty_fill_window_count": int(windows.get("novelty_fill_window_count") or 0),
+        "duplicate_window_skip_count": int(windows.get("duplicate_window_skip_count") or 0),
+        "duplicate_window_selection_count": int(windows.get("duplicate_window_selection_count") or 0),
+        "window_selection": _fielded_grouped_source_window_selection_diagnostics(
+            windows.get("window_selection")
+        ),
         "selected_window_details_included": False,
         "raw_window_keys_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _fielded_grouped_source_window_selection_diagnostics(value: Any) -> dict[str, Any]:
+    selection = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(selection.get("enabled", False)),
+        "strategy": str(selection.get("strategy") or "disabled"),
+        "route_window_count_considered": int(selection.get("route_window_count_considered") or 0),
+        "route_window_count_selected": int(selection.get("route_window_count_selected") or 0),
+        "route_window_head_selection_count": int(selection.get("route_window_head_selection_count") or 0),
+        "novelty_fill_window_count": int(selection.get("novelty_fill_window_count") or 0),
+        "duplicate_window_skip_count": int(selection.get("duplicate_window_skip_count") or 0),
+        "duplicate_window_selection_count": int(selection.get("duplicate_window_selection_count") or 0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
