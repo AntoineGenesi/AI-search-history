@@ -580,6 +580,9 @@ def build_stage_diagnostics(
                     grouping.get("selected_representative_reason_counts")
                 ),
                 "grouped_source_windows": sanitize_grouped_source_windows(grouping.get("grouped_source_windows")),
+                "intent_window_allocation": sanitize_intent_window_allocation(
+                    grouping.get("intent_window_allocation")
+                ),
                 "group_key_categories": [str(category) for category in grouping.get("group_key_categories") or []],
                 "raw_group_keys_included": False,
                 "suppressed_adjacent_row_count": int(
@@ -934,6 +937,9 @@ def build_retrieval_pressure_summary(search_result: dict[str, Any]) -> dict[str,
             "grouped_source_windows": sanitize_grouped_source_windows(
                 fielded_source_grouping.get("grouped_source_windows")
             ),
+            "intent_window_allocation": sanitize_intent_window_allocation(
+                fielded_source_grouping.get("intent_window_allocation")
+            ),
             "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
             "stream_selection": sanitize_stream_selection(fielded_source_grouping.get("stream_selection")),
@@ -1097,6 +1103,9 @@ def build_fielded_bm25_retrieval_pressure_summary(diagnostics: dict[str, Any]) -
             "group_interleaving": sanitize_group_interleaving(fielded_source_grouping.get("group_interleaving")),
             "grouped_source_windows": sanitize_grouped_source_windows(
                 fielded_source_grouping.get("grouped_source_windows")
+            ),
+            "intent_window_allocation": sanitize_intent_window_allocation(
+                fielded_source_grouping.get("intent_window_allocation")
             ),
             "selection_policy": sanitize_fielded_selection_policy(fielded_source_grouping.get("selection_policy")),
             "rows_dropped_by_source_cap": int(fielded_source_grouping.get("rows_dropped_by_source_cap") or 0),
@@ -1392,6 +1401,9 @@ def sanitize_fielded_candidate_stage_loss(value: Any) -> dict[str, Any]:
             "window_group_count_selected": int(source_grouping.get("window_group_count_selected") or 0),
             "window_group_count_omitted": int(source_grouping.get("window_group_count_omitted") or 0),
             "grouped_source_windows": sanitize_grouped_source_windows(source_grouping.get("grouped_source_windows")),
+            "intent_window_allocation": sanitize_intent_window_allocation(
+                source_grouping.get("intent_window_allocation")
+            ),
             "rows_dropped_by_source_cap": int(source_grouping.get("rows_dropped_by_source_cap") or 0),
         },
         "materialization_ranking_final_caps": {
@@ -1577,11 +1589,33 @@ def sanitize_grouped_source_windows(value: Any) -> dict[str, Any]:
     }
 
 
+def sanitize_intent_window_allocation(value: Any) -> dict[str, Any]:
+    allocation = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(allocation.get("enabled", False)),
+        "strategy": str(allocation.get("strategy") or "disabled"),
+        "primary_intent": str(allocation.get("primary_intent") or "generic_history"),
+        "source_window_needs": [str(item) for item in allocation.get("source_window_needs") or []],
+        "intent_window_count_considered": int(allocation.get("intent_window_count_considered") or 0),
+        "selected_intent_window_count": int(allocation.get("selected_intent_window_count") or 0),
+        "distinct_intent_sources_selected": int(allocation.get("distinct_intent_sources_selected") or 0),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
 def sanitize_fielded_selection_policy(value: Any) -> dict[str, Any]:
     policy = value if isinstance(value, dict) else {}
     return {
         "selection_policy_version": str(policy.get("selection_policy_version") or ""),
         "selection_strategy": str(policy.get("selection_strategy") or "disabled"),
+        "primary_intent": str(policy.get("primary_intent") or "generic_history"),
         "top_exact_rows_selected": int(policy.get("top_exact_rows_selected") or 0),
         "child_channel_rows_selected": int(policy.get("child_channel_rows_selected") or 0),
         "metadata_match_rows_selected": int(policy.get("metadata_match_rows_selected") or 0),

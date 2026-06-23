@@ -746,6 +746,7 @@ def search_with_fielded_bm25(
         index,
         selected_limit=candidate_limit,
         pool_limit=candidate_pool_limit,
+        intent=intent,
         row_stream_labels=row_stream_labels,
         stream_rows=stream_rows,
         fusion=fusion,
@@ -1261,6 +1262,7 @@ def _select_source_grouped_candidate_rows(
     *,
     selected_limit: int,
     pool_limit: int,
+    intent: QueryIntent | None = None,
     row_stream_labels: dict[int, set[str]] | None = None,
     stream_rows: dict[str, list[tuple[Any, ...]]] | None = None,
     fusion: dict[str, Any] | None = None,
@@ -1287,10 +1289,12 @@ def _select_source_grouped_candidate_rows(
             adjacent_run_collapse=_adjacent_run_collapse_diagnostics([], [], {}, {}),
             group_interleaving=_group_interleaving_diagnostics([], {}, {}, {}),
             grouped_source_windows=_grouped_source_window_diagnostics([], set(), {}, {}, selected_rowids=set()),
+            intent_allocation=_empty_intent_window_allocation(intent),
             selection_policy=_evidence_selection_policy_diagnostics(
                 rows,
                 [],
                 index,
+                intent=intent,
                 row_stream_labels=row_stream_labels,
                 stream_rows=stream_rows,
                 fusion=fusion,
@@ -1339,15 +1343,22 @@ def _select_source_grouped_candidate_rows(
         index,
         bm25_rank_by_rowid=bm25_rank_by_rowid,
     )
-    selected, representative_reason_counts, selected_representative_reason_counts, group_category_counts = (
-        _select_grouped_source_window_heads(
-            grouped_windows,
-            row_by_id,
-            index,
-            bm25_rank_by_rowid=bm25_rank_by_rowid,
-            selected_limit=bounded_limit,
-            seed_rows=protected_rows,
-        )
+    (
+        selected,
+        representative_reason_counts,
+        selected_representative_reason_counts,
+        group_category_counts,
+        intent_allocation,
+    ) = _select_grouped_source_window_heads(
+        grouped_windows,
+        row_by_id,
+        index,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+        selected_limit=bounded_limit,
+        seed_rows=protected_rows,
+        intent=intent,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
     )
     selected_rowids: set[int] = {int(row[0]) for row in selected}
     selected_window_keys = _selected_window_keys(selected_rowids, grouped_windows)
@@ -1418,10 +1429,12 @@ def _select_source_grouped_candidate_rows(
         adjacent_run_collapse=adjacent_run_collapse,
         group_interleaving=group_interleaving,
         grouped_source_windows=grouped_source_windows,
+        intent_allocation=intent_allocation,
         selection_policy=_evidence_selection_policy_diagnostics(
             rows,
             selected,
             index,
+            intent=intent,
             row_stream_labels=row_stream_labels,
             stream_rows=stream_rows,
             fusion=fusion,
@@ -1776,8 +1789,13 @@ def _select_grouped_source_window_heads(
     bm25_rank_by_rowid: dict[int, int],
     selected_limit: int,
     seed_rows: list[tuple[Any, ...]] | None = None,
-) -> tuple[list[tuple[Any, ...]], dict[str, int], dict[str, int], dict[str, dict[str, int]]]:
+    intent: QueryIntent | None = None,
+    row_stream_labels: dict[int, set[str]] | None = None,
+    fusion: dict[str, Any] | None = None,
+) -> tuple[list[tuple[Any, ...]], dict[str, int], dict[str, int], dict[str, dict[str, int]], dict[str, Any]]:
     categories = ("source", "session", "day", "window")
+    row_stream_labels = row_stream_labels or {}
+    fusion = fusion or {}
     grouped: dict[str, dict[str, list[FieldedGroupedSourceWindow]]] = {category: {} for category in categories}
     for window in windows:
         grouped["source"].setdefault(window.source_key, []).append(window)
@@ -1837,6 +1855,30 @@ def _select_grouped_source_window_heads(
             representative_reason_counts["protected_top_exact_or_channel_head"] = (
                 representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
             )
+
+    intent_windows = _intent_preferred_grouped_source_windows(
+        windows,
+        index,
+        intent=intent,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+    )
+    intent_allocation = _intent_window_allocation_diagnostics(intent, intent_windows)
+    representative_reason_counts["intent_preferred_window_head"] = len(intent_windows)
+    intent_sources_selected: set[str] = set()
+    for window in intent_windows:
+        if len(selected) >= selected_limit:
+            break
+        if window.source_key in intent_sources_selected:
+            continue
+        row = row_by_id.get(window.head_rowid)
+        if row is not None and add_row(row, "intent_preferred_window_head"):
+            intent_sources_selected.add(window.source_key)
+    intent_allocation["selected_intent_window_count"] = int(
+        selected_representative_reason_counts.get("intent_preferred_window_head", 0)
+    )
+    intent_allocation["distinct_intent_sources_selected"] = int(len(intent_sources_selected))
 
     category_heads: dict[str, list[FieldedGroupedSourceWindow]] = {}
     for category in categories:
@@ -1908,7 +1950,174 @@ def _select_grouped_source_window_heads(
         group_counts[category]["groups_selected"] = selected_count
         group_counts[category]["groups_omitted"] = max(considered_count - selected_count, 0)
 
-    return selected, representative_reason_counts, selected_representative_reason_counts, group_counts
+    return selected, representative_reason_counts, selected_representative_reason_counts, group_counts, intent_allocation
+
+
+def _intent_preferred_grouped_source_windows(
+    windows: list[FieldedGroupedSourceWindow],
+    index: FieldedBm25Index,
+    *,
+    intent: QueryIntent | None,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+    bm25_rank_by_rowid: dict[int, int],
+) -> list[FieldedGroupedSourceWindow]:
+    primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
+    if primary_intent == "generic_history":
+        return []
+    preferred = [
+        window
+        for window in windows
+        if _grouped_source_window_matches_intent(
+            window,
+            index,
+            primary_intent=primary_intent,
+            row_stream_labels=row_stream_labels,
+            fusion=fusion,
+        )
+    ]
+    preferred.sort(
+        key=lambda window: (
+            _intent_window_priority(
+                window,
+                index,
+                primary_intent=primary_intent,
+                row_stream_labels=row_stream_labels,
+                fusion=fusion,
+            ),
+            bm25_rank_by_rowid.get(window.head_rowid, 10**12),
+            window.head_rowid,
+        )
+    )
+    return preferred
+
+
+def _grouped_source_window_matches_intent(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    *,
+    primary_intent: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> bool:
+    return any(
+        _row_matches_source_window_intent(
+            rowid,
+            index,
+            primary_intent=primary_intent,
+            row_stream_labels=row_stream_labels,
+            fusion=fusion,
+        )
+        for rowid in window.rowids
+    )
+
+
+def _row_matches_source_window_intent(
+    rowid: int,
+    index: FieldedBm25Index,
+    *,
+    primary_intent: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> bool:
+    ref = index.records.get(rowid)
+    if ref is None:
+        return False
+    labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+    role = str(ref.role_bucket or "").lower()
+    timestamp_present = str(ref.timestamp_bucket or "") != "timestamp_absent"
+    if primary_intent == "when_user_said":
+        return "user" in role or any("when_user_said" in label or "role_text_user" in label for label in labels)
+    if primary_intent == "workflow_failure":
+        return timestamp_present or any("workflow_failure" in label or "failure" in label for label in labels)
+    if primary_intent == "why":
+        return any("why" in label or "tool_event" in label for label in labels) or role in {
+            "role_assistant",
+            "role_user",
+            "role_tool",
+        }
+    if primary_intent == "what_was_i_talking_about":
+        return (
+            CONTEXT_NEIGHBORHOOD_STREAM_LABEL in labels
+            or bool(ref.session_key)
+            or bool(ref.day_key)
+            or timestamp_present
+        )
+    if primary_intent in {"source_next_reads", "next_reads"}:
+        return True
+    return False
+
+
+def _selection_labels_for_row(
+    rowid: int,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> set[str]:
+    row_channel_ranks = fusion.get("row_channel_ranks") if isinstance(fusion.get("row_channel_ranks"), dict) else {}
+    fusion_labels = set((row_channel_ranks.get(rowid) or {}).keys())
+    return {*row_stream_labels.get(rowid, set()), *fusion_labels}
+
+
+def _intent_window_priority(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    *,
+    primary_intent: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> tuple[int, int, int]:
+    best_bucket = 10
+    for rowid in window.rowids:
+        labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+        ref = index.records.get(rowid)
+        role = str(ref.role_bucket or "").lower() if ref is not None else ""
+        timestamp_present = bool(ref is not None and str(ref.timestamp_bucket or "") != "timestamp_absent")
+        if any(_selection_channel_bucket(label) == "top_exact" for label in labels):
+            best_bucket = min(best_bucket, 0)
+        elif primary_intent == "when_user_said" and "user" in role:
+            best_bucket = min(best_bucket, 1)
+        elif primary_intent == "workflow_failure" and any("workflow_failure" in label for label in labels):
+            best_bucket = min(best_bucket, 1)
+        elif primary_intent == "why" and any("tool_event" in label or "why" in label for label in labels):
+            best_bucket = min(best_bucket, 1)
+        elif primary_intent == "what_was_i_talking_about" and CONTEXT_NEIGHBORHOOD_STREAM_LABEL in labels:
+            best_bucket = min(best_bucket, 1)
+        elif timestamp_present:
+            best_bucket = min(best_bucket, 2)
+    return (best_bucket, int(window.start_order), window.head_rowid)
+
+
+def _intent_window_allocation_diagnostics(
+    intent: QueryIntent | None,
+    intent_windows: list[FieldedGroupedSourceWindow],
+) -> dict[str, Any]:
+    plan = intent.query_plan if intent is not None else None
+    primary_intent = plan.primary_intent if plan is not None else "generic_history"
+    source_window_needs = list(plan.source_window_needs if plan is not None else [])
+    return {
+        "enabled": primary_intent != "generic_history",
+        "strategy": "query_plan_intent_preferred_window_heads_before_generic_group_heads"
+        if primary_intent != "generic_history"
+        else "disabled_for_generic_history",
+        "primary_intent": primary_intent,
+        "source_window_needs": source_window_needs,
+        "intent_window_count_considered": int(len(intent_windows)),
+        "selected_intent_window_count": 0,
+        "distinct_intent_sources_selected": 0,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
+
+
+def _empty_intent_window_allocation(intent: QueryIntent | None = None) -> dict[str, Any]:
+    return _intent_window_allocation_diagnostics(intent, [])
 
 
 def _safe_window_group_key(window: FieldedGroupedSourceWindow) -> str:
@@ -2229,6 +2438,7 @@ def _source_grouping_diagnostics(
     adjacent_run_collapse: dict[str, Any],
     group_interleaving: dict[str, Any],
     grouped_source_windows: dict[str, Any],
+    intent_allocation: dict[str, Any],
     selection_policy: dict[str, Any],
 ) -> dict[str, Any]:
     rows_dropped_by_stream_cap = sum(int(count) for count in dropped_stream_counts.values())
@@ -2241,7 +2451,7 @@ def _source_grouping_diagnostics(
     category_groups_omitted = sum(int(counts.get("groups_omitted") or 0) for counts in group_category_counts.values())
     return {
         "enabled": True,
-        "strategy": "adjacent_run_collapse_then_grouped_source_window_heads_then_represented_group_fill",
+        "strategy": "adjacent_run_collapse_then_intent_preferred_grouped_source_windows_then_grouped_source_window_heads_then_represented_group_fill",
         "candidate_rows_considered": int(rows_considered),
         "candidate_rows_selected": int(rows_selected),
         "candidate_rows_dropped": max(int(rows_considered) - int(rows_selected), 0),
@@ -2282,12 +2492,14 @@ def _source_grouping_diagnostics(
             "duplicate_category_representative",
             "represented_group_window_fill",
             "protected_top_exact_or_channel_head",
+            "intent_preferred_window_head",
         ],
         "group_key_categories": ["source", "session", "day", "window"],
         "raw_group_keys_included": False,
         "adjacent_run_collapse": adjacent_run_collapse,
         "group_interleaving": group_interleaving,
         "grouped_source_windows": grouped_source_windows,
+        "intent_window_allocation": intent_allocation,
         "selection_policy": selection_policy,
         "stream_selection": {
             "enabled": bool(selected_stream_counts or dropped_stream_counts),
@@ -2349,6 +2561,7 @@ def _evidence_selection_policy_diagnostics(
     selected: list[tuple[Any, ...]],
     index: FieldedBm25Index,
     *,
+    intent: QueryIntent | None = None,
     row_stream_labels: dict[int, set[str]],
     stream_rows: dict[str, list[tuple[Any, ...]]],
     fusion: dict[str, Any],
@@ -2418,9 +2631,11 @@ def _evidence_selection_policy_diagnostics(
     if window_rows_omitted_by_limit:
         omission_reason_counts["window_inner_hit_omitted"] = int(window_rows_omitted_by_limit)
 
+    primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
     return {
         "selection_policy_version": FIELDED_EVIDENCE_SELECTION_POLICY_VERSION,
-        "selection_strategy": "protect_top_exact_and_channel_heads_then_source_session_day_role_diversity_fill",
+        "selection_strategy": "protect_top_exact_and_channel_heads_then_intent_preferred_source_windows_then_source_session_day_role_diversity_fill",
+        "primary_intent": primary_intent,
         "top_exact_rows_selected": int(selected_bucket_counts.get("top_exact") or 0),
         "child_channel_rows_selected": int(selected_bucket_counts.get("child_channel") or 0),
         "metadata_match_rows_selected": int(selected_bucket_counts.get("metadata_match") or 0),
