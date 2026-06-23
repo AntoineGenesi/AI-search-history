@@ -254,7 +254,7 @@ def build_compact_provenance_handoff(
     )
     evidence_packet_packaging = source_locator_handoff.get("evidence_packet_packaging") or {}
     evidence_packet_text_included = bool(evidence_packet_packaging.get("raw_text_included", False))
-    compact_next_reads = list(next_reads or [])
+    compact_next_reads, read_more_action_templates = compact_next_reads_with_templates(next_reads or [])
     answerability = build_compact_answerability(
         status=status,
         candidates=compact_candidates,
@@ -300,6 +300,7 @@ def build_compact_provenance_handoff(
             source_locator_handoff.get("source_window_packaging", {})
         ),
         "next_reads": compact_next_reads,
+        "read_more_action_templates": read_more_action_templates,
         "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
         "output_budget": output_budget,
         "scope": {
@@ -393,8 +394,109 @@ def compact_next_read_ref(next_read: dict[str, Any]) -> dict[str, Any]:
         "candidate_id": next_read.get("candidate_id"),
         "source_ref": source_ref,
         "target": next_read.get("target") or source_ref_target(source_ref),
-        "exact_actions_preserved_in_top_level_next_reads": True,
+        "exact_actions_preserved_in_top_level_next_reads": False,
+        "exact_targets_preserved_in_top_level_next_reads": True,
+        "exact_actions_available_via_read_more_action_templates": True,
     }
+
+
+def compact_next_reads_with_templates(next_reads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    compact_reads: list[dict[str, Any]] = []
+    templates: list[dict[str, Any]] = []
+    template_ids_by_key: dict[str, str] = {}
+    for index, read in enumerate(next_reads, 1):
+        if not isinstance(read, dict):
+            continue
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        target = str(read.get("target") or source_ref_target(source_ref) or "")
+        expansion_template_ids = compact_action_template_ids(
+            read.get("expansion_actions") or [],
+            target=target,
+            action_family="expansion",
+            templates=templates,
+            template_ids_by_key=template_ids_by_key,
+        )
+        context_template_ids = compact_action_template_ids(
+            read.get("context_actions") or [],
+            target=target,
+            action_family="context",
+            templates=templates,
+            template_ids_by_key=template_ids_by_key,
+        )
+        compact_read: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": read.get("kind", "jsonl_source_ref"),
+            "next_read_id": f"nr{index:03d}",
+            "target": target,
+            "candidate_id": str(read.get("candidate_id") or ""),
+            "source_ref": source_ref,
+            "reason": read.get("reason"),
+            "expansion_action_template_ids": expansion_template_ids,
+            "context_action_template_ids": context_template_ids,
+            "action_materialization": {
+                "template_field": "read_more_action_templates",
+                "target_placeholder": "{target}",
+                "source_ref_field": "source_ref",
+                "exact_target_preserved": bool(target),
+                "exact_source_ref_preserved": bool(source_ref),
+                "full_action_payload_omitted_from_next_read": bool(
+                    read.get("expansion_actions") or read.get("context_actions")
+                ),
+            },
+        }
+        compact_reads.append(compact_read)
+    return compact_reads, templates
+
+
+def compact_action_template_ids(
+    actions: list[dict[str, Any]],
+    *,
+    target: str,
+    action_family: str,
+    templates: list[dict[str, Any]],
+    template_ids_by_key: dict[str, str],
+) -> list[str]:
+    template_ids: list[str] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        template = compact_read_more_action_template(action, target=target, action_family=action_family)
+        key = json.dumps(template, ensure_ascii=False, sort_keys=True)
+        template_id = template_ids_by_key.get(key)
+        if template_id is None:
+            template_id = f"rmt{len(templates) + 1:03d}"
+            template_ids_by_key[key] = template_id
+            templates.append({"template_id": template_id, **template})
+        template_ids.append(template_id)
+    return template_ids
+
+
+def compact_read_more_action_template(action: dict[str, Any], *, target: str, action_family: str) -> dict[str, Any]:
+    argv_template = [
+        "{target}" if target and str(item) == target else item for item in list(action.get("argv") or [])
+    ]
+    template: dict[str, Any] = {
+        "schema_version": 1,
+        "summary_kind": "compact_read_more_action_template",
+        "action_family": action_family,
+        "kind": action.get("kind"),
+        "command": action.get("command"),
+        "mode": action.get("mode"),
+        "argv_template": argv_template,
+        "claim_boundaries": action.get("claim_boundaries", {}),
+    }
+    for key in (
+        "action_id",
+        "label",
+        "scope",
+        "bounds",
+        "included_semantics",
+        "omitted_semantics",
+        "continuation_semantics",
+    ):
+        if key in action:
+            template[key] = action[key]
+    return template
 
 
 def compact_provenance_evidence_packet_summaries(evidence_packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2217,7 +2319,8 @@ def build_compact_handoff_output_budget(
             "hit_children_per_packet": EVIDENCE_PACKET_CHILD_LIMIT,
             "context_records_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
             "next_reads": None,
-            "expansion_actions_per_ref": 3,
+            "read_more_action_templates": None,
+            "expansion_actions_per_ref": None,
             "reason_codes_per_candidate": SOURCE_WINDOW_REASON_CODE_LIMIT,
         },
         "counts": {
@@ -2250,8 +2353,8 @@ def build_compact_handoff_output_budget(
             "stage_diagnostics": "summarized_not_embedded",
             "retrieval_pressure": "summarized_not_embedded",
             "no_evidence": "preserved_searched_scope",
-            "next_reads": "included_exact",
-            "expansion_actions": "included_exact",
+            "next_reads": "included_exact_source_refs_targets_with_action_template_refs",
+            "expansion_actions": "deduped_into_read_more_action_templates",
             "snippets": "omitted",
         },
         "claim_boundaries": {
