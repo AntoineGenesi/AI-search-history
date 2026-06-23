@@ -58,7 +58,7 @@ QUERY_PLAN_MODE_AUTO = "auto"
 QUERY_PLAN_MODE_OFF = "off"
 QUERY_PLAN_MODE_DEBUG = "debug"
 QUERY_PLAN_MODES = {QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODE_OFF, QUERY_PLAN_MODE_DEBUG}
-SUPPORTED_CHILD_CHANNEL_INTENTS = {"when_user_said", "workflow_failure"}
+SUPPORTED_CHILD_CHANNEL_INTENTS = {"when_user_said", "workflow_failure", "why", "what_was_i_talking_about"}
 WORKFLOW_FAILURE_MARKERS = ("failure", "failed", "error", "regression", "blocker", "wrong")
 WORKFLOW_REPAIR_MARKERS = ("repair", "retry", "fix", "fixed", "rerun", "retest")
 
@@ -2894,6 +2894,14 @@ def _fielded_query_streams_for_intent(
         streams.extend(_workflow_failure_child_streams(intent, text_query))
         streams.extend(_legacy_fielded_query_streams_for_intent(intent, None))
         return _unique_streams(streams)
+    if primary_intent == "why":
+        streams.extend(_why_child_streams(intent, text_query))
+        streams.extend(_legacy_fielded_query_streams_for_intent(intent, None))
+        return _unique_streams(streams)
+    if primary_intent == "what_was_i_talking_about":
+        streams.extend(_what_was_i_talking_about_child_streams(intent, text_query))
+        streams.extend(_legacy_fielded_query_streams_for_intent(intent, None))
+        return _unique_streams(streams)
     return _unique_streams(streams + _legacy_fielded_query_streams_for_intent(intent, None))
 
 
@@ -3148,6 +3156,82 @@ def _workflow_failure_child_streams(intent: QueryIntent, text_query: str) -> lis
                 f"{artifact_query} AND ({text_query})",
                 ("artifact_task_path", "text"),
                 "workflow_failure",
+                "artifact_path_text",
+                ("artifact_hint",),
+            )
+        )
+    return streams
+
+
+def _why_child_streams(intent: QueryIntent, text_query: str) -> list[FieldedQueryStream]:
+    streams: list[FieldedQueryStream] = [
+        _child_stream(
+            "child_why_decision_context_text",
+            text_query,
+            ("text",),
+            "why",
+            "decision_context_text",
+            ("intent:why", "source_window_need:decision_context"),
+        )
+    ]
+    tool_query = _field_query("tool_event", _tool_event_query_terms_for_intent("why"))
+    if tool_query:
+        streams.append(
+            _child_stream(
+                "child_why_tool_event_text",
+                f"{tool_query} AND ({text_query})",
+                ("tool_event", "text"),
+                "why",
+                "tool_event_text",
+                ("tool_event_hint",),
+            )
+        )
+    artifact_query = _field_query("artifact_task_path", intent.artifact_hints)
+    if artifact_query:
+        streams.append(
+            _child_stream(
+                "child_why_artifact_path_text",
+                f"{artifact_query} AND ({text_query})",
+                ("artifact_task_path", "text"),
+                "why",
+                "artifact_path_text",
+                ("artifact_hint",),
+            )
+        )
+    return streams
+
+
+def _what_was_i_talking_about_child_streams(intent: QueryIntent, text_query: str) -> list[FieldedQueryStream]:
+    streams: list[FieldedQueryStream] = [
+        _child_stream(
+            "child_what_was_i_talking_about_topic_text",
+            text_query,
+            ("text",),
+            "what_was_i_talking_about",
+            "topic_text",
+            ("intent:what_was_i_talking_about", "source_window_need:topic_context"),
+        )
+    ]
+    timestamp_query = _timestamp_query_for_intent(intent)
+    if timestamp_query:
+        streams.append(
+            _child_stream(
+                "child_what_was_i_talking_about_timestamp_text",
+                f"{timestamp_query} AND ({text_query})",
+                ("timestamp_bucket", "text"),
+                "what_was_i_talking_about",
+                "timestamp_text",
+                ("date_window_hint",),
+            )
+        )
+    artifact_query = _field_query("artifact_task_path", intent.artifact_hints)
+    if artifact_query:
+        streams.append(
+            _child_stream(
+                "child_what_was_i_talking_about_artifact_path_text",
+                f"{artifact_query} AND ({text_query})",
+                ("artifact_task_path", "text"),
+                "what_was_i_talking_about",
                 "artifact_path_text",
                 ("artifact_hint",),
             )
