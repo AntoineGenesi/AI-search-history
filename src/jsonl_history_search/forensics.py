@@ -18,7 +18,15 @@ from .claims import (
     classify_claim_action,
     parse_review_verdict,
 )
-from .gittools import branch_metadata, commit_metadata, current_branch, git_root_for, last_change_for_path
+from .gittools import (
+    branch_metadata,
+    commit_lifecycle,
+    commit_metadata,
+    current_branch,
+    git_root_for,
+    last_change_for_path,
+    worktree_metadata,
+)
 from .masking import MaskContext
 from .query import QueryIntent, infer_query
 from .redaction import RedactionContext
@@ -29,6 +37,7 @@ from .timeutil import parse_datetime, parse_now, timezone_from_args
 
 AROUND_WINDOW_MINUTES = 30
 MAX_ARTIFACT_BYTES = 200_000
+MAX_LIFECYCLE_COMMITS = 5
 
 
 @dataclass(frozen=True)
@@ -179,11 +188,20 @@ def build_forensics_workflow(
         artifact_checks=artifact_checks,
         review_evidence=review_evidence,
     )
+    provenance_lifecycle = _provenance_lifecycle_summary(
+        git_payload=git_payload,
+        phases=phases,
+        joins=joins,
+        review_gate=review_gate,
+        artifact_checks=artifact_checks,
+        review_evidence=review_evidence,
+    )
     return {
         "phase_timeline": phases,
         "claim_action_review_joins": joins,
         "review_gate": review_gate,
         "diagnostics": diagnostics,
+        "provenance_lifecycle": provenance_lifecycle,
     }
 
 
@@ -222,6 +240,7 @@ def _phase_timeline(
                     confidence=match.get("confidence") or confidence_label,
                     uncertainty=_match_uncertainty(match, action),
                     snippet=match.get("snippet"),
+                    artifact_refs=match.get("artifacts") or [],
                 )
             )
 
@@ -336,6 +355,7 @@ def _phase_row(
     confidence: str,
     uncertainty: list[str],
     snippet: str | None = None,
+    artifact_refs: list[str] | None = None,
 ) -> dict:
     row = {
         "phase_id": "",
@@ -352,6 +372,8 @@ def _phase_row(
     }
     if snippet is not None:
         row["snippet"] = snippet
+    if artifact_refs:
+        row["artifact_refs"] = _dedupe_preserve_order([str(item) for item in artifact_refs])
     return row
 
 
@@ -492,15 +514,96 @@ def _join(
     uncertainty = []
     if support_level != "direct":
         uncertainty.append("join_inferred_from_correlated_forensics_bundle")
+    basis = _join_basis(source, target, relation=relation, support_level=support_level)
+    uncertainty.extend(item for item in basis.get("uncertainty", []) if item not in uncertainty)
     return {
         "from_id": source["phase_id"],
         "to_id": target["phase_id"],
         "relation": relation,
         "support_level": support_level,
+        "basis_kind": basis["basis_kind"],
+        "join_basis": basis,
         "source_refs": [source.get("source_ref"), target.get("source_ref")],
-        "confidence": confidence or ("high" if support_level == "direct" else "medium"),
+        "confidence": confidence or basis.get("confidence") or ("high" if support_level == "direct" else "medium"),
         "uncertainty": uncertainty,
     }
+
+
+def _join_basis(source: dict, target: dict, *, relation: str, support_level: str) -> dict:
+    if relation == "precedes":
+        if source.get("timestamp_utc") and target.get("timestamp_utc"):
+            return {
+                "basis_kind": "timestamp_only",
+                "basis_label": "timestamp-only",
+                "matched_fields": ["timestamp_order"],
+                "explanation": "source precedes target only by phase timestamp ordering",
+                "confidence": "medium",
+                "uncertainty": ["timestamp_order_only_no_shared_artifact_or_commit"],
+            }
+        return {
+            "basis_kind": "inferred",
+            "basis_label": "inferred",
+            "matched_fields": [],
+            "explanation": "phase ordering uses fallback ordering because one or both timestamps are missing",
+            "confidence": "low",
+            "uncertainty": ["timestamp_missing_or_fallback_order_key"],
+        }
+    matched_fields = _matched_join_fields(source, target)
+    if matched_fields:
+        return {
+            "basis_kind": "exact_direct",
+            "basis_label": "exact/direct",
+            "matched_fields": matched_fields,
+            "explanation": "source and target share an explicit path, artifact, or commit reference",
+            "confidence": "high",
+            "uncertainty": [],
+        }
+    if support_level == "direct":
+        return {
+            "basis_kind": "direct",
+            "basis_label": "direct",
+            "matched_fields": [],
+            "explanation": "join comes from direct forensics phase relation without a shared explicit ref",
+            "confidence": "medium",
+            "uncertainty": ["direct_phase_relation_without_shared_ref"],
+        }
+    if support_level == "indirect":
+        return {
+            "basis_kind": "indirect_bundle",
+            "basis_label": "indirect/bundle",
+            "matched_fields": [],
+            "explanation": "join is inferred from the bounded forensics evidence bundle",
+            "confidence": "medium",
+            "uncertainty": ["join_inferred_from_correlated_forensics_bundle"],
+        }
+    return {
+        "basis_kind": "inferred",
+        "basis_label": "inferred",
+        "matched_fields": [],
+        "explanation": "join basis is inferred from available phase context",
+        "confidence": "low",
+        "uncertainty": ["join_basis_inferred"],
+    }
+
+
+def _matched_join_fields(source: dict, target: dict) -> list[str]:
+    source_refs = _join_ref_values(source)
+    target_refs = _join_ref_values(target)
+    matches = sorted(source_refs & target_refs)
+    return matches[:8]
+
+
+def _join_ref_values(row: dict) -> set[str]:
+    refs: set[str] = set()
+    source_ref = row.get("source_ref") or {}
+    if isinstance(source_ref, dict):
+        for key in ("path", "commit"):
+            value = source_ref.get(key)
+            if value:
+                refs.add(f"{key}:{value}")
+    for artifact in row.get("artifact_refs") or []:
+        refs.add(f"path:{artifact}")
+    return refs
 
 
 def _dedupe_joins(joins: list[dict]) -> list[dict]:
@@ -515,6 +618,104 @@ def _dedupe_joins(joins: list[dict]) -> list[dict]:
     return result
 
 
+def _provenance_lifecycle_summary(
+    *,
+    git_payload: dict,
+    phases: list[dict],
+    joins: list[dict],
+    review_gate: dict,
+    artifact_checks: list[dict],
+    review_evidence: list[dict],
+) -> dict:
+    lifecycle = git_payload.get("lifecycle") if isinstance(git_payload.get("lifecycle"), dict) else {}
+    branch = git_payload.get("branch") if isinstance(git_payload.get("branch"), dict) else {}
+    commit = git_payload.get("commit") if isinstance(git_payload.get("commit"), dict) else {}
+    path_change = git_payload.get("path_last_change") if isinstance(git_payload.get("path_last_change"), dict) else {}
+    worktree = git_payload.get("worktree") if isinstance(git_payload.get("worktree"), dict) else {}
+    lifecycle_commits = list(lifecycle.get("commits") or [])
+    task_refs = [item.get("path") for item in review_evidence if _provenance_path_kind(item.get("path")) == "task"]
+    review_refs = [item.get("path") for item in review_evidence if _provenance_path_kind(item.get("path")) == "review"]
+    artifact_refs = [item.get("path") for item in artifact_checks if item.get("path")]
+    existing_artifact_refs = [item.get("path") for item in artifact_checks if item.get("exists")]
+    tracked_artifact_refs = [item.get("path") for item in artifact_checks if item.get("git_tracked")]
+    basis_counts: dict[str, int] = {}
+    for join in joins:
+        key = str(join.get("basis_kind") or "unknown")
+        basis_counts[key] = basis_counts.get(key, 0) + 1
+    phase_source_counts: dict[str, int] = {}
+    for phase in phases:
+        key = str(phase.get("source_kind") or "unknown")
+        phase_source_counts[key] = phase_source_counts.get(key, 0) + 1
+
+    commit_refs = _dedupe_preserve_order(
+        [
+            str(item)
+            for item in [
+                *(entry.get("commit") for entry in lifecycle_commits if isinstance(entry, dict)),
+                commit.get("commit"),
+                path_change.get("commit"),
+            ]
+            if item
+        ]
+    )
+    branch_refs = _dedupe_preserve_order(
+        [str(item) for item in [branch.get("name"), git_payload.get("current_branch"), lifecycle.get("ref")] if item]
+    )
+    return {
+        "schema_version": 1,
+        "summary": {
+            "commit_count": len(lifecycle_commits) or (1 if commit.get("commit") else 0),
+            "branch_count": len([item for item in branch_refs if item]),
+            "task_artifact_count": len(task_refs),
+            "review_artifact_count": len(review_refs),
+            "artifact_count": len(artifact_refs),
+            "existing_artifact_count": len(existing_artifact_refs),
+            "tracked_artifact_count": len(tracked_artifact_refs),
+            "worktree_count": 1 if worktree.get("path") else 0,
+            "join_count": len(joins),
+            "join_basis_counts": basis_counts,
+            "phase_source_counts": phase_source_counts,
+            "review_gate_status": review_gate.get("status"),
+        },
+        "git_lifecycle": {
+            "repo": git_payload.get("repo"),
+            "current_branch": git_payload.get("current_branch"),
+            "branch": branch or None,
+            "commit": commit or None,
+            "path_last_change": path_change or None,
+            "commit_order": lifecycle.get("commit_order") or "newest_first",
+            "max_commits": lifecycle.get("max_commits") or MAX_LIFECYCLE_COMMITS,
+            "bounded": bool(lifecycle.get("bounded")),
+            "commits": lifecycle_commits,
+            "commit_refs": commit_refs,
+            "branch_refs": branch_refs,
+        },
+        "task_review_artifacts": {
+            "task_refs": task_refs[:12],
+            "review_refs": review_refs[:12],
+            "review_gate_status": review_gate.get("status"),
+            "review_gate_verdict": review_gate.get("verdict"),
+        },
+        "artifact_provenance": {
+            "artifact_refs": artifact_refs[:20],
+            "existing_refs": existing_artifact_refs[:20],
+            "tracked_refs": tracked_artifact_refs[:20],
+        },
+        "worktree": worktree or None,
+    }
+
+
+def _provenance_path_kind(path: str | None) -> str:
+    if not path:
+        return "unknown"
+    normalized = str(path).replace("\\", "/")
+    if normalized.startswith("tasks/"):
+        return "task"
+    if normalized.startswith("reviews/") or normalized.startswith("codex/state/reviews/"):
+        return "review"
+    return "artifact"
+
+
 def _workflow_diagnostics(
     *,
     phases: list[dict],
@@ -527,8 +728,11 @@ def _workflow_diagnostics(
     for row in phases:
         phase_counts[row["phase_kind"]] = phase_counts.get(row["phase_kind"], 0) + 1
     relation_counts: dict[str, int] = {}
+    basis_counts: dict[str, int] = {}
     for join in joins:
         relation_counts[join["relation"]] = relation_counts.get(join["relation"], 0) + 1
+        basis = str(join.get("basis_kind") or "unknown")
+        basis_counts[basis] = basis_counts.get(basis, 0) + 1
     unsupported_count = sum(1 for row in phases if row.get("claim_action") == UNSUPPORTED)
     inferred_only_count = sum(1 for join in joins if join.get("support_level") == "inferred")
     indirect_count = sum(1 for join in joins if join.get("support_level") == "indirect")
@@ -547,6 +751,7 @@ def _workflow_diagnostics(
         "inferred_or_uncertain_phase_count": sum(1 for row in phases if row.get("uncertainty")),
         "join_count": len(joins),
         "join_relation_counts": relation_counts,
+        "join_basis_counts": basis_counts,
         "join_coverage": {
             "phase_count": len(phases),
             "joined_phase_count": len({join["from_id"] for join in joins} | {join["to_id"] for join in joins}),
@@ -567,9 +772,12 @@ def _git_payload(*, cwd: Path, repo: Path | None, hints: ForensicsHints) -> tupl
         "commit": None,
         "branch": None,
         "path_last_change": None,
+        "worktree": None,
+        "lifecycle": None,
     }
     if repo is None:
         return payload, warnings, None
+    payload["worktree"] = worktree_metadata(repo)
 
     commit_ref = hints.commit
     if commit_ref is None and hints.path:
@@ -589,6 +797,15 @@ def _git_payload(*, cwd: Path, repo: Path | None, hints: ForensicsHints) -> tupl
             warnings.append(f"Could not resolve git branch/ref: {hints.branch}")
         else:
             payload["branch"] = metadata
+    lifecycle_ref = hints.branch or commit_ref or payload.get("current_branch")
+    lifecycle_commits = commit_lifecycle(repo, lifecycle_ref, max_commits=MAX_LIFECYCLE_COMMITS) if lifecycle_ref else []
+    payload["lifecycle"] = {
+        "ref": lifecycle_ref,
+        "commit_order": "newest_first",
+        "max_commits": MAX_LIFECYCLE_COMMITS,
+        "bounded": True,
+        "commits": lifecycle_commits,
+    }
     commit_payload = payload.get("commit") or {}
     inferred_around = commit_payload.get("commit_time") if isinstance(commit_payload, dict) else None
     return payload, warnings, inferred_around
