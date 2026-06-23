@@ -1634,6 +1634,7 @@ def main(argv: list[str] | None = None) -> int:
                     "source_locator_handoff": packet["source_locator_handoff"],
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
                     "claim_boundaries": packet["claim_boundaries"],
+                    "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
                     "next_reads": packet["next_reads"][:5],
                     "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
                 }

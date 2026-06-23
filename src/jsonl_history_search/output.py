@@ -851,6 +851,14 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Packet bytes/tokens: {tradeoffs.get('packet_basis_bytes', 0)} / {tradeoffs.get('packet_basis_estimated_tokens', 0)}",
         "Root cause: not claimed",
     ]
+    workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
+    if workflow_summary:
+        lines.append(
+            "Forensics workflow: "
+            f"phases={workflow_summary.get('phase_count', 0)} "
+            f"joins={workflow_summary.get('join_count', 0)} "
+            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}"
+        )
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
@@ -887,6 +895,14 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "## Source Locator Handoff",
         "",
     ]
+    workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
+    if workflow_summary:
+        lines[7:7] = [
+            f"**Forensics workflow:** phases={workflow_summary.get('phase_count', 0)} "
+            f"joins={workflow_summary.get('join_count', 0)} "
+            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}",
+            "",
+        ]
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     contract = report.get("final_answer_source_use_contract")
@@ -1329,6 +1345,47 @@ def render_forensics_text(payload: dict) -> str:
     if forensic.get("around_window_minutes") is not None:
         lines.append(f"Around window: +/- {forensic['around_window_minutes']} minutes")
 
+    review_gate = forensic.get("review_gate") or {}
+    if review_gate:
+        lines.append(
+            "Review gate: "
+            f"{review_gate.get('status')} "
+            f"verdict={review_gate.get('verdict') or 'unknown'} "
+            f"confidence={review_gate.get('confidence')}"
+        )
+        if review_gate.get("merge_commit"):
+            lines.append(f"Review gate merge commit: {review_gate['merge_commit']}")
+        for blocker in review_gate.get("blockers", [])[:5]:
+            lines.append(f"- review blocker {blocker.get('path')}: {blocker.get('verdict')}")
+
+    phases = forensic.get("phase_timeline") or []
+    if phases:
+        lines.append("Phase timeline:")
+        lines.append("  id | phase | evidence | action | confidence | source")
+        for phase in phases[:12]:
+            source = _compact_phase_source(phase.get("source_ref") or {})
+            lines.append(
+                "  "
+                f"{phase.get('phase_id')} | "
+                f"{phase.get('phase_kind')} | "
+                f"{phase.get('evidence_kind')} | "
+                f"{phase.get('claim_action')} | "
+                f"{phase.get('confidence')} | "
+                f"{source}"
+            )
+        if len(phases) > 12:
+            lines.append(f"  ... {len(phases) - 12} more phases omitted from text output")
+
+    diagnostics = forensic.get("diagnostics") or {}
+    if diagnostics:
+        lines.append(
+            "Forensics diagnostics: "
+            f"phases={sum((diagnostics.get('phase_counts') or {}).values())} "
+            f"joins={diagnostics.get('join_count', 0)} "
+            f"unsupported_claims={diagnostics.get('unsupported_claim_count', 0)} "
+            f"missing={','.join(diagnostics.get('missing_evidence_flags', [])) or 'none'}"
+        )
+
     lines.append(f"Git repo: {git.get('repo') or '(none)'}")
     if git.get("current_branch"):
         lines.append(f"Git current branch: {git['current_branch']}")
@@ -1370,6 +1427,16 @@ def render_forensics_text(payload: dict) -> str:
             label = verdict.get("action") or action
             lines.append(f"- {item['path']}: {label}")
 
+    joins = forensic.get("claim_action_review_joins") or []
+    if joins:
+        counts: dict[str, int] = {}
+        for join in joins:
+            counts[join.get("relation", "unknown")] = counts.get(join.get("relation", "unknown"), 0) + 1
+        lines.append(
+            "Claim/action/review joins: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        )
+
     for warning in payload.get("warnings", []):
         lines.append(f"Warning: {warning}")
     for blind in payload.get("blind_spots", []):
@@ -1390,6 +1457,16 @@ def render_forensics_markdown(payload: dict) -> str:
         else:
             lines.append(line)
     return "\n".join(lines)
+
+
+def _compact_phase_source(source_ref: dict) -> str:
+    if source_ref.get("path") and source_ref.get("line"):
+        return f"{source_ref.get('path')}:{source_ref.get('line')}"
+    if source_ref.get("path"):
+        return str(source_ref.get("path"))
+    if source_ref.get("commit"):
+        return str(source_ref.get("commit"))
+    return "(unknown)"
 
 
 def render_project_lineage_text(payload: dict) -> str:

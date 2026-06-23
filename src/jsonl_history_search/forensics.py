@@ -5,7 +5,19 @@ from datetime import timedelta
 from pathlib import Path
 
 from .artifacts import ArtifactStatus, inspect_artifacts, resolve_artifact_path
-from .claims import classify_claim_action, parse_review_verdict
+from .claims import (
+    BLOCKED,
+    CHANGED,
+    CLAIMED,
+    FAILED,
+    MERGED,
+    PARTIALLY_VERIFIED,
+    RUNNING,
+    UNSUPPORTED,
+    VERIFIED,
+    classify_claim_action,
+    parse_review_verdict,
+)
 from .gittools import branch_metadata, commit_metadata, current_branch, git_root_for, last_change_for_path
 from .masking import MaskContext
 from .query import QueryIntent, infer_query
@@ -130,9 +142,421 @@ def build_forensics_payload(args) -> dict:
         "warnings": sorted(set(warnings)),
         "blind_spots": sorted(set(jsonl_result.get("blind_spots", []) + plan.blind_spots)),
     }
+    workflow = build_forensics_workflow(
+        git_payload=git_payload,
+        jsonl_evidence=jsonl_evidence,
+        artifact_checks=[item.to_dict() for item in artifact_checks],
+        review_evidence=review_evidence,
+        confidence_label=confidence["label"],
+    )
+    payload["forensics"].update(workflow)
     if "masking" in jsonl_result:
         payload["masking"] = jsonl_result["masking"]
     return payload
+
+
+def build_forensics_workflow(
+    *,
+    git_payload: dict,
+    jsonl_evidence: dict,
+    artifact_checks: list[dict],
+    review_evidence: list[dict],
+    confidence_label: str,
+) -> dict:
+    phases = _phase_timeline(
+        git_payload=git_payload,
+        jsonl_evidence=jsonl_evidence,
+        artifact_checks=artifact_checks,
+        review_evidence=review_evidence,
+        confidence_label=confidence_label,
+    )
+    review_gate = _review_gate(git_payload=git_payload, review_evidence=review_evidence)
+    joins = _claim_action_review_joins(phases=phases, review_gate=review_gate)
+    diagnostics = _workflow_diagnostics(
+        phases=phases,
+        joins=joins,
+        review_gate=review_gate,
+        artifact_checks=artifact_checks,
+        review_evidence=review_evidence,
+    )
+    return {
+        "phase_timeline": phases,
+        "claim_action_review_joins": joins,
+        "review_gate": review_gate,
+        "diagnostics": diagnostics,
+    }
+
+
+def _phase_timeline(
+    *,
+    git_payload: dict,
+    jsonl_evidence: dict,
+    artifact_checks: list[dict],
+    review_evidence: list[dict],
+    confidence_label: str,
+) -> list[dict]:
+    rows: list[dict] = []
+
+    for group_index, group in enumerate(jsonl_evidence.get("groups", []), 1):
+        for match_index, match in enumerate(group.get("matches", []), 1):
+            action = (match.get("claim_action") or {}).get("action") or UNSUPPORTED
+            rows.append(
+                _phase_row(
+                    phase_kind=_phase_kind_for_match(match, action),
+                    order_key=_order_key(
+                        match.get("timestamp"),
+                        "jsonl",
+                        group_index,
+                        match_index,
+                        int(match.get("line") or 0),
+                    ),
+                    timestamp_utc=match.get("timestamp"),
+                    source_kind="jsonl",
+                    source_ref={
+                        "path": match.get("path") or group.get("path"),
+                        "line": match.get("line"),
+                    },
+                    evidence_kind="claim" if action in {CLAIMED, UNSUPPORTED} else "tool_action",
+                    claim_action=action,
+                    review_verdict=None,
+                    confidence=match.get("confidence") or confidence_label,
+                    uncertainty=_match_uncertainty(match, action),
+                    snippet=match.get("snippet"),
+                )
+            )
+
+    commit = git_payload.get("commit")
+    if isinstance(commit, dict) and commit.get("commit"):
+        changed_files = commit.get("changed_files") or []
+        if changed_files:
+            for index, changed in enumerate(changed_files, 1):
+                rows.append(
+                    _phase_row(
+                        phase_kind="change",
+                        order_key=_order_key(commit.get("commit_time"), "git", index, 0, 0),
+                        timestamp_utc=commit.get("commit_time"),
+                        source_kind="git",
+                        source_ref={
+                            "commit": commit.get("commit"),
+                            "path": changed.get("path"),
+                            "status": changed.get("status"),
+                        },
+                        evidence_kind="code_change",
+                        claim_action=CHANGED,
+                        review_verdict=None,
+                        confidence="high",
+                        uncertainty=[],
+                    )
+                )
+        else:
+            rows.append(
+                _phase_row(
+                    phase_kind="change",
+                    order_key=_order_key(commit.get("commit_time"), "git", 0, 0, 0),
+                    timestamp_utc=commit.get("commit_time"),
+                    source_kind="git",
+                    source_ref={"commit": commit.get("commit")},
+                    evidence_kind="code_change",
+                    claim_action=CHANGED,
+                    review_verdict=None,
+                    confidence="high",
+                    uncertainty=["commit_has_no_changed_file_list"],
+                )
+            )
+
+    path_change = git_payload.get("path_last_change")
+    if isinstance(path_change, dict) and path_change.get("commit") and not _commit_rows_present(rows, path_change.get("commit")):
+        rows.append(
+            _phase_row(
+                phase_kind="change",
+                order_key=_order_key(path_change.get("commit_time"), "git-path", 0, 0, 0),
+                timestamp_utc=path_change.get("commit_time"),
+                source_kind="git",
+                source_ref={"commit": path_change.get("commit"), "path": path_change.get("path")},
+                evidence_kind="code_change",
+                claim_action=CHANGED,
+                review_verdict=None,
+                confidence="medium",
+                uncertainty=["path_last_change_without_explicit_commit_hint"],
+            )
+        )
+
+    for index, item in enumerate(artifact_checks, 1):
+        if not item.get("exists"):
+            continue
+        rows.append(
+            _phase_row(
+                phase_kind="change",
+                order_key=_order_key(None, "artifact", index, 0, 0),
+                timestamp_utc=None,
+                source_kind="artifact",
+                source_ref={"path": item.get("path")},
+                evidence_kind="artifact",
+                claim_action=CHANGED,
+                review_verdict=None,
+                confidence="medium" if item.get("git_tracked") else "low",
+                uncertainty=[] if item.get("git_tracked") else ["artifact_exists_but_git_tracking_unknown_or_false"],
+            )
+        )
+
+    for index, item in enumerate(review_evidence, 1):
+        verdict = item.get("review_verdict") or {}
+        action = verdict.get("action") or (item.get("claim_action") or {}).get("action") or UNSUPPORTED
+        rows.append(
+            _phase_row(
+                phase_kind="review",
+                order_key=_order_key(_review_timestamp(item), "review", index, 0, 0),
+                timestamp_utc=_review_timestamp(item),
+                source_kind="review",
+                source_ref={"path": item.get("path")},
+                evidence_kind="review_verdict" if verdict else "claim",
+                claim_action=action,
+                review_verdict=verdict or None,
+                confidence="high" if verdict else "medium",
+                uncertainty=[] if verdict else ["review_artifact_without_explicit_verdict"],
+            )
+        )
+
+    rows.sort(key=lambda row: row["order_key"])
+    for index, row in enumerate(rows, 1):
+        row["phase_id"] = f"phase-{index:03d}"
+    return rows
+
+
+def _phase_row(
+    *,
+    phase_kind: str,
+    order_key: str,
+    timestamp_utc: str | None,
+    source_kind: str,
+    source_ref: dict,
+    evidence_kind: str,
+    claim_action: str,
+    review_verdict: dict | None,
+    confidence: str,
+    uncertainty: list[str],
+    snippet: str | None = None,
+) -> dict:
+    row = {
+        "phase_id": "",
+        "phase_kind": phase_kind,
+        "order_key": order_key,
+        "timestamp_utc": timestamp_utc,
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+        "evidence_kind": evidence_kind,
+        "claim_action": claim_action,
+        "review_verdict": review_verdict,
+        "confidence": confidence,
+        "uncertainty": uncertainty,
+    }
+    if snippet is not None:
+        row["snippet"] = snippet
+    return row
+
+
+def _phase_kind_for_match(match: dict, action: str) -> str:
+    role = str(match.get("role") or "").lower()
+    snippet = str(match.get("snippet") or "").lower()
+    if role == "user":
+        return "request"
+    if action in {VERIFIED, PARTIALLY_VERIFIED, FAILED, BLOCKED, MERGED}:
+        return "review"
+    if action == CHANGED:
+        return "action"
+    if action == RUNNING or any(word in snippet for word in ("plan", "will", "going to", "next i")):
+        return "plan"
+    if any(word in snippet for word in ("failed", "error", "bug", "regression", "symptom", "wrong")):
+        return "symptom"
+    return "inference" if action == UNSUPPORTED else "action"
+
+
+def _match_uncertainty(match: dict, action: str) -> list[str]:
+    uncertainty: list[str] = []
+    if not match.get("timestamp"):
+        uncertainty.append("timestamp_missing")
+    if action == UNSUPPORTED:
+        uncertainty.append("unsupported_claim_no_action_signal")
+    if not match.get("artifacts") and action in {CLAIMED, CHANGED, VERIFIED}:
+        uncertainty.append("no_artifact_path_in_jsonl_match")
+    return uncertainty
+
+
+def _order_key(timestamp: str | None, source_kind: str, primary: int, secondary: int, line: int) -> str:
+    stamp = timestamp or "9999-12-31T23:59:59+00:00"
+    return f"{stamp}|{source_kind}|{primary:04d}|{secondary:04d}|{line:08d}"
+
+
+def _commit_rows_present(rows: list[dict], commit: str | None) -> bool:
+    if not commit:
+        return False
+    return any((row.get("source_ref") or {}).get("commit") == commit for row in rows)
+
+
+def _review_timestamp(item: dict) -> str | None:
+    change = item.get("git_last_change") or {}
+    return change.get("commit_time") if isinstance(change, dict) else None
+
+
+def _review_gate(*, git_payload: dict, review_evidence: list[dict]) -> dict:
+    verdicts = [
+        item.get("review_verdict")
+        for item in review_evidence
+        if isinstance(item.get("review_verdict"), dict)
+    ]
+    actions = [item.get("action") for item in verdicts if item.get("action")]
+    if VERIFIED in actions:
+        status = "verified"
+        verdict = VERIFIED
+        confidence = "high"
+    elif MERGED in actions:
+        status = "merged"
+        verdict = MERGED
+        confidence = "high"
+    elif any(action in {FAILED, BLOCKED} for action in actions):
+        status = "blocked"
+        verdict = next(action for action in actions if action in {FAILED, BLOCKED})
+        confidence = "high"
+    elif PARTIALLY_VERIFIED in actions:
+        status = "partial"
+        verdict = PARTIALLY_VERIFIED
+        confidence = "medium"
+    else:
+        status = "unknown"
+        verdict = None
+        confidence = "low"
+    blockers = [
+        {"path": item.get("path"), "verdict": (item.get("review_verdict") or {}).get("action")}
+        for item in review_evidence
+        if (item.get("review_verdict") or {}).get("action") in {FAILED, BLOCKED, PARTIALLY_VERIFIED}
+    ]
+    commit = git_payload.get("commit") if isinstance(git_payload.get("commit"), dict) else {}
+    commit_action = classify_claim_action(" ".join(str(commit.get(key) or "") for key in ("subject", "body"))).action
+    return {
+        "status": status,
+        "verdict": verdict,
+        "gate_source_refs": [{"path": item.get("path")} for item in review_evidence if item.get("path")],
+        "blockers": blockers,
+        "merge_commit": commit.get("commit") if commit_action == MERGED else None,
+        "confidence": confidence,
+        "uncertainty": [] if verdicts else ["review_verdict_not_found"],
+    }
+
+
+def _claim_action_review_joins(*, phases: list[dict], review_gate: dict) -> list[dict]:
+    joins: list[dict] = []
+    claim_rows = [row for row in phases if row.get("evidence_kind") == "claim" and row.get("claim_action") != UNSUPPORTED]
+    unsupported_rows = [row for row in phases if row.get("claim_action") == UNSUPPORTED]
+    action_rows = [row for row in phases if row.get("evidence_kind") in {"tool_action", "code_change", "artifact"}]
+    review_rows = [row for row in phases if row.get("phase_kind") == "review"]
+    change_rows = [row for row in phases if row.get("evidence_kind") in {"code_change", "artifact"}]
+
+    for claim in claim_rows:
+        for action in action_rows[:4]:
+            if claim["phase_id"] == action["phase_id"]:
+                continue
+            joins.append(_join(claim, action, relation="supports", support_level="indirect"))
+
+    for action in action_rows:
+        for change in change_rows[:4]:
+            if action["phase_id"] == change["phase_id"]:
+                continue
+            joins.append(_join(action, change, relation="supports", support_level="direct"))
+
+    for review in review_rows:
+        if review.get("claim_action") in {VERIFIED, MERGED}:
+            targets = change_rows or action_rows or claim_rows
+            for target in targets[:4]:
+                if review["phase_id"] != target["phase_id"]:
+                    joins.append(_join(review, target, relation="verifies", support_level="direct"))
+        elif review.get("claim_action") in {FAILED, BLOCKED, PARTIALLY_VERIFIED}:
+            targets = claim_rows or action_rows
+            for target in targets[:4]:
+                relation = "contradicts" if target.get("claim_action") in {CLAIMED, VERIFIED} else "blocks"
+                joins.append(_join(review, target, relation=relation, support_level="direct"))
+
+    for before, after in zip(phases, phases[1:]):
+        joins.append(_join(before, after, relation="precedes", support_level="direct", confidence="high"))
+
+    return _dedupe_joins(joins)
+
+
+def _join(
+    source: dict,
+    target: dict,
+    *,
+    relation: str,
+    support_level: str,
+    confidence: str | None = None,
+) -> dict:
+    uncertainty = []
+    if support_level != "direct":
+        uncertainty.append("join_inferred_from_correlated_forensics_bundle")
+    return {
+        "from_id": source["phase_id"],
+        "to_id": target["phase_id"],
+        "relation": relation,
+        "support_level": support_level,
+        "source_refs": [source.get("source_ref"), target.get("source_ref")],
+        "confidence": confidence or ("high" if support_level == "direct" else "medium"),
+        "uncertainty": uncertainty,
+    }
+
+
+def _dedupe_joins(joins: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, str]] = set()
+    result: list[dict] = []
+    for join in joins:
+        key = (join["from_id"], join["to_id"], join["relation"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(join)
+    return result
+
+
+def _workflow_diagnostics(
+    *,
+    phases: list[dict],
+    joins: list[dict],
+    review_gate: dict,
+    artifact_checks: list[dict],
+    review_evidence: list[dict],
+) -> dict:
+    phase_counts: dict[str, int] = {}
+    for row in phases:
+        phase_counts[row["phase_kind"]] = phase_counts.get(row["phase_kind"], 0) + 1
+    relation_counts: dict[str, int] = {}
+    for join in joins:
+        relation_counts[join["relation"]] = relation_counts.get(join["relation"], 0) + 1
+    unsupported_count = sum(1 for row in phases if row.get("claim_action") == UNSUPPORTED)
+    inferred_only_count = sum(1 for join in joins if join.get("support_level") == "inferred")
+    indirect_count = sum(1 for join in joins if join.get("support_level") == "indirect")
+    missing_flags = []
+    if not any(row.get("source_kind") == "git" for row in phases):
+        missing_flags.append("git_change_evidence_missing")
+    if not review_evidence:
+        missing_flags.append("review_evidence_missing")
+    if not artifact_checks:
+        missing_flags.append("artifact_evidence_missing")
+    if review_gate.get("status") == "unknown":
+        missing_flags.append("review_gate_unknown")
+    return {
+        "phase_counts": phase_counts,
+        "observed_phase_count": sum(1 for row in phases if not row.get("uncertainty")),
+        "inferred_or_uncertain_phase_count": sum(1 for row in phases if row.get("uncertainty")),
+        "join_count": len(joins),
+        "join_relation_counts": relation_counts,
+        "join_coverage": {
+            "phase_count": len(phases),
+            "joined_phase_count": len({join["from_id"] for join in joins} | {join["to_id"] for join in joins}),
+        },
+        "review_gate_status_counts": {review_gate.get("status") or "unknown": 1},
+        "missing_evidence_flags": missing_flags,
+        "inferred_only_count": inferred_only_count,
+        "indirect_join_count": indirect_count,
+        "unsupported_claim_count": unsupported_count,
+    }
 
 
 def _git_payload(*, cwd: Path, repo: Path | None, hints: ForensicsHints) -> tuple[dict, list[str], str | None]:
