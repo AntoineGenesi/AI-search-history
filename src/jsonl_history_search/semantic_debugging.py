@@ -121,6 +121,7 @@ def build_semantic_debug_payload(
     tool_proof = compact_tool_proof(tool_report)
     joins = compact_joins(forensics_payload, hints)
     joins = merge_local_task_review_joins(joins, hints, cwd=Path(source_plan["cwd"]))
+    forensics_workflow = compact_forensics_workflow(forensics_payload, joins)
     no_evidence = build_no_evidence_section(agent_find, source_scope, tool_report, forensics_payload)
     uncertainty = build_uncertainty(agent_find, source_scope, tool_report, forensics_payload, family)
     next_reads = build_next_reads(
@@ -182,6 +183,7 @@ def build_semantic_debug_payload(
         "timeline": timeline,
         "tool_action_proof": tool_proof,
         "task_review_commit_joins": joins,
+        "forensics_workflow": forensics_workflow,
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
@@ -379,6 +381,133 @@ def compact_joins(forensics_payload: dict[str, Any] | None, hints: dict[str, str
         "artifact_checks": compact_artifact_checks(forensics_payload.get("artifact_checks", [])),
         "review_evidence": compact_review_evidence(forensics_payload.get("review_evidence", [])),
         "missing": missing_join_labels(forensics_payload),
+    }
+
+
+def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not forensics_payload:
+        return {
+            "status": "not_run",
+            "phase_timeline": [],
+            "claim_action_review_joins": [],
+            "review_gate": {
+                "status": "not_run",
+                "verdict": None,
+                "gate_source_refs": [],
+                "blockers": [],
+                "merge_commit": None,
+                "confidence": "low",
+                "uncertainty": ["forensics_not_run_no_commit_path_task_branch_or_around_hint"],
+            },
+            "diagnostics": {
+                "phase_counts": {},
+                "join_count": 0,
+                "missing_evidence_flags": ["forensics_not_run"],
+            },
+            "summary": {
+                "phase_count": 0,
+                "join_count": 0,
+                "review_gate_status": "not_run",
+                "review_gate_verdict": None,
+                "missing_evidence_flags": ["forensics_not_run"],
+            },
+        }
+    workflow = forensics_payload.get("forensics", {})
+    phase_timeline = workflow.get("phase_timeline", [])
+    joins = workflow.get("claim_action_review_joins", [])
+    review_gate = workflow.get("review_gate") or {}
+    diagnostics = workflow.get("diagnostics") or {}
+    if not phase_timeline and joins_payload and joins_payload.get("review_evidence"):
+        phase_timeline = phase_timeline_from_compact_review_evidence(joins_payload.get("review_evidence", []))
+        review_gate = review_gate_from_compact_review_evidence(joins_payload.get("review_evidence", []))
+        diagnostics = {
+            "phase_counts": {"review": len(phase_timeline)},
+            "join_count": 0,
+            "join_relation_counts": {},
+            "join_coverage": {"phase_count": len(phase_timeline), "joined_phase_count": 0},
+            "review_gate_status_counts": {review_gate.get("status") or "unknown": 1},
+            "missing_evidence_flags": ["git_or_jsonl_phase_evidence_missing"] if phase_timeline else ["phase_evidence_missing"],
+            "inferred_only_count": 0,
+            "indirect_join_count": 0,
+            "unsupported_claim_count": 0,
+        }
+    return {
+        "status": "joined" if phase_timeline else "no_phase_evidence",
+        "phase_timeline": phase_timeline,
+        "claim_action_review_joins": joins,
+        "review_gate": review_gate,
+        "diagnostics": diagnostics,
+        "summary": {
+            "phase_count": len(phase_timeline),
+            "join_count": len(joins),
+            "review_gate_status": review_gate.get("status"),
+            "review_gate_verdict": review_gate.get("verdict"),
+            "missing_evidence_flags": diagnostics.get("missing_evidence_flags", []),
+        },
+    }
+
+
+def phase_timeline_from_compact_review_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    phases = []
+    for index, item in enumerate(items[:12], 1):
+        verdict = item.get("review_verdict") or {}
+        action = verdict.get("action") or (item.get("claim_action") or {}).get("action") or "unsupported"
+        phases.append(
+            {
+                "phase_id": f"phase-{index:03d}",
+                "phase_kind": "review",
+                "order_key": f"9999-12-31T23:59:59+00:00|semantic-debug-local-review|{index:04d}",
+                "timestamp_utc": None,
+                "source_kind": "review",
+                "source_ref": {"path": item.get("path")},
+                "evidence_kind": "review_verdict" if verdict else "claim",
+                "claim_action": action,
+                "review_verdict": verdict or None,
+                "confidence": "high" if verdict else "medium",
+                "uncertainty": [] if verdict else ["review_artifact_without_explicit_verdict"],
+            }
+        )
+    return phases
+
+
+def review_gate_from_compact_review_evidence(items: list[dict[str, Any]]) -> dict[str, Any]:
+    actions = [
+        (item.get("review_verdict") or {}).get("action")
+        for item in items
+        if isinstance(item.get("review_verdict"), dict)
+    ]
+    if "verified" in actions:
+        status = "verified"
+        verdict = "verified"
+        confidence = "high"
+    elif "merged" in actions:
+        status = "merged"
+        verdict = "merged"
+        confidence = "high"
+    elif any(action in {"failed", "blocked"} for action in actions):
+        status = "blocked"
+        verdict = next(action for action in actions if action in {"failed", "blocked"})
+        confidence = "high"
+    elif "partially_verified" in actions:
+        status = "partial"
+        verdict = "partially_verified"
+        confidence = "medium"
+    else:
+        status = "unknown"
+        verdict = None
+        confidence = "low"
+    return {
+        "status": status,
+        "verdict": verdict,
+        "gate_source_refs": [{"path": item.get("path")} for item in items if item.get("path")],
+        "blockers": [
+            {"path": item.get("path"), "verdict": (item.get("review_verdict") or {}).get("action")}
+            for item in items
+            if (item.get("review_verdict") or {}).get("action") in {"failed", "blocked", "partially_verified"}
+        ],
+        "merge_commit": None,
+        "confidence": confidence,
+        "uncertainty": [] if verdict else ["review_verdict_not_found"],
     }
 
 
