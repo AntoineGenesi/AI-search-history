@@ -929,6 +929,8 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
                 "review_gate_status": "not_run",
                 "review_gate_verdict": None,
                 "missing_evidence_flags": ["forensics_not_run"],
+                "join_basis_counts": {},
+                "provenance": {},
             },
         }
     workflow = forensics_payload.get("forensics", {})
@@ -936,6 +938,8 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
     joins = workflow.get("claim_action_review_joins", [])
     review_gate = workflow.get("review_gate") or {}
     diagnostics = workflow.get("diagnostics") or {}
+    provenance_lifecycle = workflow.get("provenance_lifecycle") or {}
+    provenance_summary = provenance_lifecycle.get("summary") if isinstance(provenance_lifecycle, dict) else {}
     if not phase_timeline and joins_payload and joins_payload.get("review_evidence"):
         phase_timeline = phase_timeline_from_compact_review_evidence(joins_payload.get("review_evidence", []))
         review_gate = review_gate_from_compact_review_evidence(joins_payload.get("review_evidence", []))
@@ -956,12 +960,15 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
         "claim_action_review_joins": joins,
         "review_gate": review_gate,
         "diagnostics": diagnostics,
+        "provenance_lifecycle": provenance_lifecycle,
         "summary": {
             "phase_count": len(phase_timeline),
             "join_count": len(joins),
             "review_gate_status": review_gate.get("status"),
             "review_gate_verdict": review_gate.get("verdict"),
             "missing_evidence_flags": diagnostics.get("missing_evidence_flags", []),
+            "join_basis_counts": diagnostics.get("join_basis_counts", {}),
+            "provenance": provenance_summary or {},
         },
     }
 

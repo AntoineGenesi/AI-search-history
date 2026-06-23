@@ -853,11 +853,15 @@ def render_semantic_debug_text(payload: dict) -> str:
     ]
     workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
     if workflow_summary:
+        basis_counts = workflow_summary.get("join_basis_counts") or {}
+        provenance = workflow_summary.get("provenance") or {}
         lines.append(
             "Forensics workflow: "
             f"phases={workflow_summary.get('phase_count', 0)} "
             f"joins={workflow_summary.get('join_count', 0)} "
-            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}"
+            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'} "
+            f"join_basis={_format_count_map(basis_counts)} "
+            f"provenance_commits={provenance.get('commit_count', 0)}"
         )
     decision_context = report.get("decision_context") or report.get("decision_context_summary")
     if decision_context:
@@ -911,10 +915,14 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ]
     workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
     if workflow_summary:
+        basis_counts = workflow_summary.get("join_basis_counts") or {}
+        provenance = workflow_summary.get("provenance") or {}
         lines[7:7] = [
             f"**Forensics workflow:** phases={workflow_summary.get('phase_count', 0)} "
             f"joins={workflow_summary.get('join_count', 0)} "
-            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}",
+            f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'} "
+            f"join_basis={_format_count_map(basis_counts)} "
+            f"provenance_commits={provenance.get('commit_count', 0)}",
             "",
         ]
     decision_context = report.get("decision_context") or report.get("decision_context_summary")
@@ -1388,6 +1396,34 @@ def render_forensics_text(payload: dict) -> str:
     if forensic.get("around_window_minutes") is not None:
         lines.append(f"Around window: +/- {forensic['around_window_minutes']} minutes")
 
+    provenance = forensic.get("provenance_lifecycle") or {}
+    provenance_summary = provenance.get("summary") or {}
+    if provenance_summary:
+        lines.append(
+            "Provenance lifecycle: "
+            f"commits={provenance_summary.get('commit_count', 0)} "
+            f"branches={provenance_summary.get('branch_count', 0)} "
+            f"tasks={provenance_summary.get('task_artifact_count', 0)} "
+            f"reviews={provenance_summary.get('review_artifact_count', 0)} "
+            f"artifacts={provenance_summary.get('artifact_count', 0)} "
+            f"worktrees={provenance_summary.get('worktree_count', 0)} "
+            f"review_gate={provenance_summary.get('review_gate_status') or 'unknown'}"
+        )
+        basis_counts = provenance_summary.get("join_basis_counts") or {}
+        if basis_counts:
+            lines.append(f"Join basis: {_format_count_map(basis_counts)}")
+    git_lifecycle = provenance.get("git_lifecycle") or {}
+    lifecycle_commits = git_lifecycle.get("commits") or []
+    if lifecycle_commits:
+        order = git_lifecycle.get("commit_order") or "newest_first"
+        lines.append(
+            "Git lifecycle commits: "
+            f"{len(lifecycle_commits)} shown order={order} bounded={git_lifecycle.get('bounded')}"
+        )
+        for item in lifecycle_commits[:5]:
+            commit_ref = str(item.get("commit") or "")[:12]
+            lines.append(f"- lifecycle commit {commit_ref} {item.get('commit_time')} {item.get('subject')}")
+
     review_gate = forensic.get("review_gate") or {}
     if review_gate:
         lines.append(
@@ -1473,12 +1509,16 @@ def render_forensics_text(payload: dict) -> str:
     joins = forensic.get("claim_action_review_joins") or []
     if joins:
         counts: dict[str, int] = {}
+        basis_counts: dict[str, int] = {}
         for join in joins:
             counts[join.get("relation", "unknown")] = counts.get(join.get("relation", "unknown"), 0) + 1
+            basis = join.get("basis_kind", "unknown")
+            basis_counts[basis] = basis_counts.get(basis, 0) + 1
         lines.append(
             "Claim/action/review joins: "
-            + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            + _format_count_map(counts)
         )
+        lines.append("Claim/action/review join basis: " + _format_count_map(basis_counts))
 
     for warning in payload.get("warnings", []):
         lines.append(f"Warning: {warning}")
@@ -1510,6 +1550,10 @@ def _compact_phase_source(source_ref: dict) -> str:
     if source_ref.get("commit"):
         return str(source_ref.get("commit"))
     return "(unknown)"
+
+
+def _format_count_map(counts: dict) -> str:
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none"
 
 
 def render_project_lineage_text(payload: dict) -> str:
