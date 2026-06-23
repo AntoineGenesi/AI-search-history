@@ -859,6 +859,20 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"joins={workflow_summary.get('join_count', 0)} "
             f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}"
         )
+    decision_context = report.get("decision_context") or report.get("decision_context_summary")
+    if decision_context:
+        lines.append(
+            "Decision context: "
+            f"project_time={decision_context.get('project_time_reconstruction_needed')} "
+            f"routes={','.join(decision_context.get('selected_routes', []))}"
+        )
+    audit_plan = report.get("audit_plan") or report.get("audit_plan_summary")
+    if audit_plan:
+        lines.append(
+            "Audit plan: "
+            f"routes={','.join(audit_plan.get('route_order', []))} "
+            f"watchlist={len(audit_plan.get('watchlist', []))}"
+        )
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
@@ -903,6 +917,35 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'}",
             "",
         ]
+    decision_context = report.get("decision_context") or report.get("decision_context_summary")
+    if decision_context:
+        lines.extend(
+            [
+                "## Decision Context",
+                "",
+                f"- `primary_question_family`: `{decision_context.get('primary_question_family')}`",
+                f"- `project_time_reconstruction_needed`: `{decision_context.get('project_time_reconstruction_needed')}`",
+                f"- `selected_routes`: `{', '.join(decision_context.get('selected_routes', []))}`",
+            ]
+        )
+        confidence = decision_context.get("confidence") or {}
+        if confidence:
+            lines.append(f"- `confidence`: `{confidence.get('level')}`")
+        lines.append("")
+    audit_plan = report.get("audit_plan") or report.get("audit_plan_summary")
+    if audit_plan:
+        lines.extend(
+            [
+                "## Audit Plan",
+                "",
+                f"- `route_order`: `{', '.join(audit_plan.get('route_order', []))}`",
+                f"- `watchlist_count`: `{len(audit_plan.get('watchlist', []))}`",
+            ]
+        )
+        resume = audit_plan.get("resume_from") or {}
+        if resume:
+            lines.append(f"- `resume_from`: `{resume.get('next_read_target') or resume.get('route')}`")
+        lines.append("")
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     contract = report.get("final_answer_source_use_contract")
