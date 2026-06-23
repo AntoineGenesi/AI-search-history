@@ -2229,7 +2229,7 @@ def sanitize_int_counts(value: Any) -> dict[str, int]:
 def compact_provenance_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for candidate in candidates[:COMPACT_PROVENANCE_CANDIDATE_LIMIT]:
-        source_ref = candidate.get("source_ref") or {}
+        source_ref = canonical_source_ref(candidate.get("source_ref") or {})
         rows.append(
             {
                 "candidate_id": candidate.get("candidate_id"),
@@ -2254,16 +2254,17 @@ def compact_provenance_source_ref_candidates(
 ) -> list[dict[str, Any]]:
     refs = []
     for candidate in candidates:
+        source_ref = canonical_source_ref(candidate.get("source_ref") or {})
         refs.append(
             {
                 "kind": "candidate_source_ref",
                 "candidate_id": candidate.get("candidate_id"),
-                "source_ref": candidate.get("source_ref") or {},
-                "target": candidate.get("target") or source_ref_target(candidate.get("source_ref") or {}),
+                "source_ref": source_ref,
+                "target": candidate.get("target") or source_ref_target(source_ref),
             }
         )
     for candidate in locator_candidates[:SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT]:
-        ref = candidate.get("source_ref") or {}
+        ref = canonical_source_ref(candidate.get("source_ref") or {})
         refs.append(
             {
                 "kind": "source_locator_top_candidate_ref",
@@ -2277,7 +2278,7 @@ def compact_provenance_source_ref_candidates(
             {
                 "kind": read.get("kind", "next_read"),
                 "candidate_id": read.get("candidate_id"),
-                "source_ref": read.get("source_ref") or {},
+                "source_ref": canonical_source_ref(read.get("source_ref") or {}),
                 "target": read.get("target"),
             }
         )
@@ -2643,11 +2644,13 @@ def build_candidate_rows(search_result: dict) -> list[CandidateRow]:
                 CandidateRow(
                     rank=0,
                     candidate_id="",
-                    source_ref={
-                        "path": match.get("path") or "",
-                        "line": int(match.get("line") or 0),
-                        "session": match.get("session") or group.get("session"),
-                    },
+                    source_ref=canonical_source_ref(
+                        {
+                            "path": match.get("path") or "",
+                            "line": int(match.get("line") or 0),
+                            "session": match.get("session") or group.get("session"),
+                        }
+                    ),
                     path=match.get("path") or "",
                     line=int(match.get("line") or 0),
                     timestamp=match.get("timestamp"),
@@ -4012,10 +4015,12 @@ def materialized_context_record(record: Any, *, hit_child: bool, char_limit: int
     if truncated:
         text = text[:limit]
     return {
-        "source_ref": {
-            "path": str(record.path),
-            "line": int(record.line),
-        },
+        "source_ref": canonical_source_ref(
+            {
+                "path": str(record.path),
+                "line": int(record.line),
+            }
+        ),
         "target": f"{record.path}:{record.line}",
         "line": int(record.line),
         "role": record.role,
@@ -4131,8 +4136,8 @@ def evidence_packet_candidate_data(candidate: dict[str, Any] | CandidateRow, *, 
             "ordinal": ordinal,
             "candidate_id": candidate.candidate_id,
             "rank": candidate.rank or ordinal + 1,
-            "source_ref": dict(candidate.source_ref or {}),
-            "target": source_ref_target(candidate.source_ref or {}),
+            "source_ref": canonical_source_ref(candidate.source_ref or {}),
+            "target": source_ref_target(canonical_source_ref(candidate.source_ref or {})),
             "line": candidate.line,
             "role": candidate.role,
             "session": candidate.session or (candidate.source_ref or {}).get("session"),
@@ -4143,7 +4148,7 @@ def evidence_packet_candidate_data(candidate: dict[str, Any] | CandidateRow, *, 
             "reasons": sanitize_evidence_packet_reasons(candidate.reasons),
             "matched_terms": list(candidate.matched_terms or [])[:SOURCE_WINDOW_REASON_CODE_LIMIT],
         }
-    source_ref = dict(candidate.get("source_ref") or {})
+    source_ref = canonical_source_ref(candidate.get("source_ref") or {})
     if not source_ref and candidate.get("path"):
         source_ref = {"path": str(candidate.get("path"))}
         if candidate.get("line") is not None:
@@ -4193,7 +4198,7 @@ def evidence_packet_numeric_line(line: Any) -> int | None:
 
 
 def evidence_packet_hit_child(item: dict[str, Any]) -> dict[str, Any]:
-    source_ref = dict(item["source_ref"])
+    source_ref = canonical_source_ref(item["source_ref"])
     child = {
         "candidate_id": item["candidate_id"],
         "rank": item["rank"],
@@ -4214,7 +4219,7 @@ def evidence_packet_hit_child(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def evidence_packet_context_record(item: dict[str, Any]) -> dict[str, Any]:
-    source_ref = dict(item["source_ref"])
+    source_ref = canonical_source_ref(item["source_ref"])
     return {
         "source_ref": source_ref,
         "target": source_ref_target(source_ref),
@@ -4947,6 +4952,24 @@ def normalized_source_ref_line(line: Any) -> str | None:
     return str(line)
 
 
+def canonical_source_ref(source_ref: dict[str, Any] | None) -> dict[str, Any]:
+    ref = source_ref if isinstance(source_ref, dict) else {}
+    canonical: dict[str, Any] = {}
+    path = ref.get("path")
+    if path not in (None, ""):
+        canonical["path"] = str(path)
+    line = ref.get("line")
+    numeric_line = evidence_packet_numeric_line(line)
+    if numeric_line is not None:
+        canonical["line"] = numeric_line
+    elif line not in (None, ""):
+        canonical["line"] = line
+    session = ref.get("session")
+    if session not in (None, ""):
+        canonical["session"] = str(session)
+    return canonical
+
+
 def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[CandidateRow]) -> list[dict[str, Any]]:
     compacted = []
     for candidate in candidates[:SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT]:
@@ -4955,7 +4978,7 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                 {
                     "candidate_id": candidate.candidate_id,
                     "rank": candidate.rank,
-                    "source_ref": candidate.source_ref,
+                    "source_ref": canonical_source_ref(candidate.source_ref),
                     "timestamp_utc": candidate.timestamp_utc,
                     "confidence": candidate.confidence,
                     "stage": candidate.primary_stage,
@@ -4968,7 +4991,7 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                 {
                     "candidate_id": candidate.get("candidate_id"),
                     "rank": candidate.get("rank"),
-                    "source_ref": candidate.get("source_ref"),
+                    "source_ref": canonical_source_ref(candidate.get("source_ref") or {}),
                     "timestamp_utc": candidate.get("timestamp_utc"),
                     "confidence": candidate.get("confidence"),
                     "stage": candidate.get("stage"),

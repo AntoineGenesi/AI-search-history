@@ -1872,12 +1872,6 @@ def _select_grouped_source_window_heads(
         selected_representative_reason_counts[reason] = selected_representative_reason_counts.get(reason, 0) + 1
         return True
 
-    for row in seed_rows or []:
-        if add_row(row, "protected_top_exact_or_channel_head"):
-            representative_reason_counts["protected_top_exact_or_channel_head"] = (
-                representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
-            )
-
     intent_windows = _intent_preferred_grouped_source_windows(
         windows,
         index,
@@ -1901,6 +1895,28 @@ def _select_grouped_source_window_heads(
         selected_representative_reason_counts.get("intent_preferred_window_head", 0)
     )
     intent_allocation["distinct_intent_sources_selected"] = int(len(intent_sources_selected))
+
+    if seed_rows:
+        intent_seed_rows: list[tuple[Any, ...]] = []
+        generic_seed_rows: list[tuple[Any, ...]] = []
+        primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
+        for row in seed_rows:
+            rowid = int(row[0])
+            if primary_intent != "generic_history" and _row_matches_source_window_intent(
+                rowid,
+                index,
+                primary_intent=primary_intent,
+                row_stream_labels=row_stream_labels,
+                fusion=fusion,
+            ):
+                intent_seed_rows.append(row)
+            else:
+                generic_seed_rows.append(row)
+        for row in intent_seed_rows + generic_seed_rows:
+            if add_row(row, "protected_top_exact_or_channel_head"):
+                representative_reason_counts["protected_top_exact_or_channel_head"] = (
+                    representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
+                )
 
     category_heads: dict[str, list[FieldedGroupedSourceWindow]] = {}
     for category in categories:
