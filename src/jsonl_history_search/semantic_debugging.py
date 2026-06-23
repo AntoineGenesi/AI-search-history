@@ -11,6 +11,7 @@ from typing import Any
 from .agent_contract import (
     build_agent_find_payload,
     build_compact_provenance_handoff,
+    compact_retrieval_pressure_summary,
     context_actions_for_source_ref,
     expansion_action_context_from_source_plan,
     build_source_scope_summary,
@@ -228,7 +229,9 @@ def build_semantic_debug_payload(
             source_locator_handoff["stage_diagnostics"] = compact_stage_diagnostics
             if packet.get("retrieval_pressure"):
                 packet["retrieval_pressure"]["stage_diagnostics"] = compact_stage_diagnostics
-                packet["compact_provenance_handoff"]["retrieval_pressure"] = packet["retrieval_pressure"]
+                packet["compact_provenance_handoff"]["retrieval_pressure_summary"] = (
+                    compact_retrieval_pressure_summary(packet["retrieval_pressure"])
+                )
             packet["compact_provenance_handoff"]["stage_diagnostics"] = compact_stage_diagnostics
     return {
         "semantic_debug": packet,
