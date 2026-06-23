@@ -204,7 +204,9 @@ def build_agent_find_payload(
             handoff["stage_diagnostics"] = compact_stage_diagnostics
             if agent_find.get("retrieval_pressure"):
                 agent_find["retrieval_pressure"]["stage_diagnostics"] = compact_stage_diagnostics
-                agent_find["compact_provenance_handoff"]["retrieval_pressure"] = agent_find["retrieval_pressure"]
+                agent_find["compact_provenance_handoff"]["retrieval_pressure_summary"] = (
+                    compact_retrieval_pressure_summary(agent_find["retrieval_pressure"])
+                )
             agent_find["compact_provenance_handoff"]["stage_diagnostics"] = compact_stage_diagnostics
     return {"agent_find": agent_find}
 
@@ -267,6 +269,7 @@ def build_compact_provenance_handoff(
         next_reads_included=len(compact_next_reads),
         evidence_packet_text_included=evidence_packet_text_included,
     )
+    pressure_summary = compact_retrieval_pressure_summary(retrieval_pressure)
     packet: dict[str, Any] = {
         "schema_version": 1,
         "status": "no_evidence" if status == "no_evidence" else "candidates_found",
@@ -320,14 +323,16 @@ def build_compact_provenance_handoff(
         },
     }
     if retrieval_pressure:
-        packet["derived_from"].append("retrieval_pressure")
-        packet["retrieval_pressure"] = retrieval_pressure
+        packet["derived_from"].append("retrieval_pressure_summary")
+        packet["retrieval_pressure_summary"] = pressure_summary
     packet_bytes = len(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     packet["context_budget"] = {
         "payload_bytes": packet_bytes,
         "estimated_tokens": estimate_tokens(packet_bytes),
         "measurement_basis": "compact_provenance_handoff_packet_only",
         "output_budget": output_budget,
+        "retrieval_pressure_embedded": False,
+        "retrieval_pressure_summary_included": bool(retrieval_pressure),
     }
     return packet
 
@@ -352,6 +357,78 @@ def compact_handoff_source_selection_changed(
         ):
             return True
     return False
+
+
+def compact_retrieval_pressure_summary(retrieval_pressure: dict[str, Any] | None) -> dict[str, Any]:
+    pressure = retrieval_pressure if isinstance(retrieval_pressure, dict) else {}
+    stage_diagnostics = pressure.get("stage_diagnostics") if isinstance(pressure.get("stage_diagnostics"), dict) else {}
+    stages = stage_diagnostics.get("stages") if isinstance(stage_diagnostics.get("stages"), list) else []
+    fielded_bm25 = pressure.get("fielded_bm25") if isinstance(pressure.get("fielded_bm25"), dict) else {}
+    query_streams = fielded_bm25.get("query_streams") if isinstance(fielded_bm25.get("query_streams"), dict) else {}
+    source_grouping = (
+        pressure.get("fielded_source_grouping")
+        if isinstance(pressure.get("fielded_source_grouping"), dict)
+        else {}
+    )
+    grouped_windows = (
+        source_grouping.get("grouped_source_windows")
+        if isinstance(source_grouping.get("grouped_source_windows"), dict)
+        else {}
+    )
+    claim_boundaries = pressure.get("claim_boundaries") if isinstance(pressure.get("claim_boundaries"), dict) else {}
+    return {
+        "schema_version": 1,
+        "summary_kind": "bounded_retrieval_pressure_summary",
+        "full_retrieval_pressure_embedded": False,
+        "retrieval_mode": str(pressure.get("retrieval_mode") or ""),
+        "capped": bool(pressure.get("capped", False)),
+        "cap_labels": [str(label) for label in pressure.get("cap_labels") or []],
+        "lower_bound_result": bool(pressure.get("lower_bound_result", False)),
+        "explicit_opt_in_required": bool(pressure.get("explicit_opt_in_required", False)),
+        "default_behavior_changed": bool(pressure.get("default_behavior_changed", False)),
+        "fielded_candidate_count": int(fielded_bm25.get("candidate_count") or 0),
+        "candidate_rows_surfaced": int(fielded_bm25.get("candidate_rows_surfaced") or 0),
+        "query_streams": {
+            "stream_count": int(query_streams.get("stream_count") or 0),
+            "saturated_stream_count": int(query_streams.get("saturated_stream_count") or 0),
+            "rows_dropped_by_stream_cap_total": int(query_streams.get("rows_dropped_by_stream_cap_total") or 0),
+        },
+        "source_grouping": {
+            "enabled": bool(source_grouping.get("enabled", False)),
+            "strategy": str(source_grouping.get("strategy") or "disabled"),
+            "candidate_rows_considered": int(source_grouping.get("candidate_rows_considered") or 0),
+            "candidate_rows_selected": int(source_grouping.get("candidate_rows_selected") or 0),
+            "candidate_rows_dropped": int(source_grouping.get("candidate_rows_dropped") or 0),
+            "rows_dropped_by_source_cap": int(source_grouping.get("rows_dropped_by_source_cap") or 0),
+            "window_count_considered": int(grouped_windows.get("window_count_considered") or 0),
+            "window_count_selected": int(grouped_windows.get("window_count_selected") or 0),
+            "window_count_omitted": int(grouped_windows.get("window_count_omitted") or 0),
+        },
+        "stage_diagnostics": {
+            "present": bool(stage_diagnostics),
+            "dominant_pressure_stage": str(stage_diagnostics.get("dominant_pressure_stage") or ""),
+            "stage_count": len(stages),
+        },
+        "claim_boundaries": {
+            "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
+            "final_answer_quality_claim_supported": bool(
+                claim_boundaries.get("final_answer_quality_claim_supported", False)
+            ),
+            "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
+            "all_history_completeness_claim_supported": bool(
+                claim_boundaries.get("all_history_completeness_claim_supported", False)
+            ),
+        },
+        "privacy": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "line_numbers_included": False,
+            "source_lines_included": False,
+        },
+    }
 
 
 STAGE_DIAGNOSTIC_LABELS = [
@@ -1905,6 +1982,7 @@ def build_compact_handoff_output_budget(
             ),
             "query_plan": "preserved",
             "stage_diagnostics": "preserved",
+            "retrieval_pressure": "summarized_not_embedded",
             "no_evidence": "preserved_searched_scope",
             "next_reads": "included_exact_capped",
             "expansion_actions": "included_exact_capped",
