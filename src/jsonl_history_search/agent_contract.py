@@ -18,6 +18,13 @@ SOURCE_WINDOW_REASON_CODE_LIMIT = 8
 SOURCE_WINDOW_OMITTED_FACT_LIMIT = 20
 OMITTED_WINDOW_RECOVERY_LIMIT = 5
 OMITTED_WINDOW_RECOVERY_PROMOTION_LIMIT = 3
+SUPPORTED_SOURCE_WINDOW_NEEDS = (
+    "failure_timeline",
+    "decision_context",
+    "user_wording",
+    "topic_context",
+    "next_reads",
+)
 SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT = 5
 COMPACT_PROVENANCE_CANDIDATE_LIMIT = 8
 COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
@@ -626,6 +633,19 @@ def compact_source_window_packaging(packaging: dict[str, Any]) -> dict[str, Any]
             "distinct_source_count_selected": int(selection_policy.get("distinct_source_count_selected") or 0),
             "intent_preferred_candidate_count": int(selection_policy.get("intent_preferred_candidate_count") or 0),
             "intent_preferred_window_count": int(selection_policy.get("intent_preferred_window_count") or 0),
+            "source_window_needs_considered_count": int(
+                selection_policy.get("source_window_needs_considered_count") or 0
+            ),
+            "source_window_needs_matched_count": int(
+                selection_policy.get("source_window_needs_matched_count") or 0
+            ),
+            "source_window_needs_selected_count": int(
+                selection_policy.get("source_window_needs_selected_count") or 0
+            ),
+            "need_matching_omitted_candidate_count": int(
+                selection_policy.get("need_matching_omitted_candidate_count") or 0
+            ),
+            "generic_fill_window_count": int(selection_policy.get("generic_fill_window_count") or 0),
             "source_head_window_count": int(selection_policy.get("source_head_window_count") or 0),
             "fill_window_count": int(selection_policy.get("fill_window_count") or 0),
             "omission_reason_counts": sanitize_int_counts(selection_policy.get("omission_reason_counts")),
@@ -1149,11 +1169,34 @@ def build_stage_diagnostics(
                 "intent_preferred_window_count": int(
                     (source_window_packaging.get("selection_policy") or {}).get("intent_preferred_window_count") or 0
                 ),
+                "source_window_needs_considered_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get(
+                        "source_window_needs_considered_count"
+                    )
+                    or 0
+                ),
+                "source_window_needs_matched_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("source_window_needs_matched_count")
+                    or 0
+                ),
+                "source_window_needs_selected_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("source_window_needs_selected_count")
+                    or 0
+                ),
+                "need_matching_omitted_candidate_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get(
+                        "need_matching_omitted_candidate_count"
+                    )
+                    or 0
+                ),
                 "source_head_window_count": int(
                     (source_window_packaging.get("selection_policy") or {}).get("source_head_window_count") or 0
                 ),
                 "fill_window_count": int(
                     (source_window_packaging.get("selection_policy") or {}).get("fill_window_count") or 0
+                ),
+                "generic_fill_window_count": int(
+                    (source_window_packaging.get("selection_policy") or {}).get("generic_fill_window_count") or 0
                 ),
                 "open_next_metadata_only": bool(source_window_packaging.get("open_next_metadata_only", True)),
                 "source_window_text_included": bool(
@@ -3215,6 +3258,9 @@ def build_source_window_package(
         for item in normalized_candidates
         if source_window_candidate_matches_intent(item["data"], query_plan or {}, primary_intent)
     }
+    source_window_needs_considered = selection_result["source_window_needs_considered"]
+    source_window_needs_matched = selection_result["source_window_needs_matched"]
+    source_window_needs_selected = selection_result["source_window_needs_selected"]
     for index, selected in enumerate(selected_candidates, 1):
         data = selected["data"]
         source_ref = data["source_ref"]
@@ -3284,10 +3330,35 @@ def build_source_window_package(
         "distinct_group_count_omitted": len({str(item["group_key"]) for item in omitted_candidates}),
         "intent_preferred_candidate_count": len(intent_preferred_ids),
         "intent_preferred_window_count": len(selected_ids & intent_preferred_ids),
+        "source_window_needs_considered": source_window_needs_considered,
+        "source_window_needs_considered_count": len(source_window_needs_considered),
+        "source_window_needs_matched": source_window_needs_matched,
+        "source_window_needs_matched_count": len(source_window_needs_matched),
+        "source_window_needs_selected": source_window_needs_selected,
+        "source_window_needs_selected_count": len(source_window_needs_selected),
+        "query_plan_need_window_count": sum(
+            1
+            for item in selected_candidates
+            if str(item.get("selection_reason_code") or "").startswith("query_plan_need_")
+        ),
+        "need_matching_omitted_candidate_count": sum(
+            1 for item in omitted_candidates if item.get("source_window_need_matches")
+        ),
+        "need_matching_omitted_candidate_count_by_need": sanitize_int_counts(
+            Counter(
+                need
+                for item in omitted_candidates
+                for need in (item.get("source_window_need_matches") or [])
+            )
+        ),
+        "generic_fill_window_count": sum(
+            1 for item in selected_candidates if item["selection_reason_code"] == "existing_order_fill"
+        ),
         "source_head_window_count": sum(
             1
             for item in selected_candidates
             if item["selection_reason_code"] in {"intent_preferred_distinct_source", "distinct_source"}
+            or str(item["selection_reason_code"]).startswith("query_plan_need_")
         ),
         "fill_window_count": sum(
             1 for item in selected_candidates if item["selection_reason_code"] == "existing_order_fill"
@@ -3303,7 +3374,16 @@ def build_source_window_package(
                 0, len(normalized_candidates) - len({str(item["group_key"]) for item in normalized_candidates})
             ),
         },
-        "allocation_passes": [
+        "allocation_passes": (
+            [
+                "query_plan_source_window_needs"
+                if source_window_needs_matched
+                else "query_plan_source_window_needs_no_match"
+            ]
+            if source_window_needs_considered
+            else []
+        )
+        + [
             "intent_group_heads" if selection_result["intent_pass_active"] else "group_heads",
             "represented_group_supported_fill",
         ],
@@ -4462,11 +4542,54 @@ def select_source_window_candidates(
     selected: list[dict[str, Any]] = []
     selected_ids: set[str] = set()
     selected_group_keys: set[str] = set()
-    intent_candidates = [
-        item
-        for item in normalized_candidates
-        if source_window_candidate_matches_intent(item["data"], query_plan, primary_intent)
+    source_window_needs_considered = source_window_needs_from_query_plan(query_plan)
+    enriched_candidates: list[dict[str, Any]] = []
+    for item in normalized_candidates:
+        need_matches = source_window_candidate_matched_needs(
+            item["data"],
+            query_plan,
+            primary_intent,
+            source_window_needs_considered=source_window_needs_considered,
+        )
+        enriched_candidates.append({**item, "source_window_need_matches": need_matches})
+
+    source_window_needs_matched = [
+        need
+        for need in source_window_needs_considered
+        if any(need in item["source_window_need_matches"] for item in enriched_candidates)
     ]
+    for need in source_window_needs_matched:
+        if len(selected) >= SOURCE_WINDOW_LIMIT:
+            break
+        matches = [item for item in enriched_candidates if need in item["source_window_need_matches"]]
+        if matches and all(str(item["data"].get("candidate_id") or "") in selected_ids for item in matches):
+            continue
+        chosen = next(
+            (
+                item
+                for item in matches
+                if str(item["data"].get("candidate_id") or "") not in selected_ids
+                and str(item["group_key"]) not in selected_group_keys
+            ),
+            None,
+        )
+        if chosen is None:
+            chosen = next(
+                (
+                    item
+                    for item in matches
+                    if str(item["data"].get("candidate_id") or "") not in selected_ids
+                ),
+                None,
+            )
+        if chosen is None:
+            continue
+        candidate_id = str(chosen["data"].get("candidate_id") or "")
+        selected.append({**chosen, "selection_reason_code": f"query_plan_need_{need}"})
+        selected_ids.add(candidate_id)
+        selected_group_keys.add(str(chosen["group_key"]))
+
+    intent_candidates = [item for item in enriched_candidates if item["source_window_need_matches"]]
     first_pass_candidates = intent_candidates if intent_candidates else normalized_candidates
 
     for item in first_pass_candidates:
@@ -4487,7 +4610,7 @@ def select_source_window_candidates(
         selected_ids.add(candidate_id)
         selected_group_keys.add(group_key)
 
-    for item in normalized_candidates:
+    for item in enriched_candidates:
         if len(selected) >= SOURCE_WINDOW_LIMIT:
             break
         candidate_id = str(item["data"].get("candidate_id") or "")
@@ -4502,10 +4625,10 @@ def select_source_window_candidates(
     selected_candidate_ids = {str(item["data"].get("candidate_id") or "") for item in selected}
     omitted = []
     selected_group_counts = Counter(str(item["group_key"]) for item in selected)
-    candidate_group_counts = Counter(str(item["group_key"]) for item in normalized_candidates)
+    candidate_group_counts = Counter(str(item["group_key"]) for item in enriched_candidates)
     selected_groups = set(selected_group_counts)
     intent_candidate_ids = {str(item["data"].get("candidate_id") or "") for item in intent_candidates}
-    for item in normalized_candidates:
+    for item in enriched_candidates:
         candidate_id = str(item["data"].get("candidate_id") or "")
         if candidate_id in selected_candidate_ids:
             continue
@@ -4518,16 +4641,31 @@ def select_source_window_candidates(
             reason = "represented_group_over_limit"
         else:
             reason = "not_selected"
-        omitted.append({**item, "intent_match": candidate_id in intent_candidate_ids, "omission_reason": reason})
+        omitted.append(
+            {
+                **item,
+                "intent_match": candidate_id in intent_candidate_ids,
+                "source_window_need_matches": list(item.get("source_window_need_matches") or []),
+                "omission_reason": reason,
+            }
+        )
 
     dominant_group_second_window_count = 0
     if selected_group_counts:
         dominant_group_second_window_count = max(0, max(selected_group_counts.values()) - 1)
+    selected_need_labels = [
+        need
+        for need in source_window_needs_considered
+        if any(need in (item.get("source_window_need_matches") or []) for item in selected)
+    ]
     return {
         "selected": selected,
         "omitted": omitted,
         "intent_pass_active": bool(intent_candidates),
         "dominant_group_second_window_count": dominant_group_second_window_count,
+        "source_window_needs_considered": source_window_needs_considered,
+        "source_window_needs_matched": source_window_needs_matched,
+        "source_window_needs_selected": selected_need_labels,
     }
 
 
@@ -4585,10 +4723,25 @@ def source_window_candidate_metadata(data: dict[str, Any], *, ordinal: int, cand
 def selection_policy_omitted_candidate_facts(omitted_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
     group_counts = Counter(str(item["group_key"]) for item in omitted_candidates)
-    for item in omitted_candidates[:SOURCE_WINDOW_OMITTED_FACT_LIMIT]:
+    if any(item.get("source_window_need_matches") for item in omitted_candidates):
+        ordered_candidates = sorted(
+            enumerate(omitted_candidates),
+            key=lambda indexed: (
+                not bool(indexed[1].get("source_window_need_matches")),
+                indexed[0],
+            ),
+        )
+        omitted_for_facts = [item for _index, item in ordered_candidates]
+    else:
+        omitted_for_facts = omitted_candidates
+    for item in omitted_for_facts[:SOURCE_WINDOW_OMITTED_FACT_LIMIT]:
         metadata = dict(item.get("metadata") or {})
         metadata["omission_reason"] = str(item.get("omission_reason") or "omitted")
         metadata["intent_match"] = bool(item.get("intent_match"))
+        metadata["source_window_need_matches"] = [
+            need for need in (item.get("source_window_need_matches") or []) if need in SUPPORTED_SOURCE_WINDOW_NEEDS
+        ]
+        metadata["source_window_need_match"] = bool(metadata["source_window_need_matches"])
         metadata["omitted_group_count"] = group_counts[str(item["group_key"])]
         metadata["raw_text_included"] = False
         metadata["snippet_included"] = False
@@ -4629,6 +4782,12 @@ def build_omitted_window_recovery(
                 "target": target,
                 "omission_reason": str(fact.get("omission_reason") or "omitted"),
                 "intent_match": bool(fact.get("intent_match", False)),
+                "source_window_need_matches": [
+                    need
+                    for need in (fact.get("source_window_need_matches") or [])
+                    if need in SUPPORTED_SOURCE_WINDOW_NEEDS
+                ],
+                "source_window_need_match": bool(fact.get("source_window_need_match", False)),
                 "omitted_group_count": int(fact.get("omitted_group_count") or 0),
                 "read_more_actionable": read_more_actionable,
                 "bounded": True,
@@ -4676,24 +4835,64 @@ def build_omitted_window_recovery(
     }
 
 
+def source_window_needs_from_query_plan(query_plan: dict[str, Any]) -> list[str]:
+    needs: list[str] = []
+    for item in query_plan.get("source_window_needs") or []:
+        need = str(item)
+        if need not in SUPPORTED_SOURCE_WINDOW_NEEDS or need in needs:
+            continue
+        needs.append(need)
+    return needs
+
+
+def source_window_candidate_matched_needs(
+    data: dict[str, Any],
+    query_plan: dict[str, Any],
+    primary_intent: str,
+    *,
+    source_window_needs_considered: list[str] | None = None,
+) -> list[str]:
+    considered = (
+        list(source_window_needs_considered)
+        if source_window_needs_considered is not None
+        else source_window_needs_from_query_plan(query_plan)
+    )
+    matches: list[str] = []
+    for need in considered:
+        if source_window_candidate_matches_need(data, query_plan, primary_intent, need):
+            matches.append(need)
+    return matches
+
+
+def source_window_candidate_matches_need(
+    data: dict[str, Any],
+    query_plan: dict[str, Any],
+    primary_intent: str,
+    need: str,
+) -> bool:
+    role = str(data.get("role") or "").lower()
+    if need == "user_wording":
+        return primary_intent == "when_user_said" and "user" in role
+    if need == "failure_timeline":
+        return primary_intent == "workflow_failure" and bool(data.get("timestamp_utc"))
+    if need == "decision_context":
+        if primary_intent != "why":
+            return False
+        hinted_roles = [str(item).lower() for item in (query_plan.get("field_hints") or {}).get("roles") or []]
+        return bool(hinted_roles) and any(hinted_role in role for hinted_role in hinted_roles)
+    if need == "topic_context":
+        return primary_intent == "what_was_i_talking_about" and bool(data.get("cwd") or data.get("timestamp_utc"))
+    if need == "next_reads":
+        return primary_intent in {"source_next_reads", "next_reads"} and bool(source_ref_target(data.get("source_ref") or {}))
+    return False
+
+
 def source_window_candidate_matches_intent(
     data: dict[str, Any],
     query_plan: dict[str, Any],
     primary_intent: str,
 ) -> bool:
-    role = str(data.get("role") or "").lower()
-    if primary_intent == "when_user_said":
-        return "user" in role
-    if primary_intent == "workflow_failure":
-        return bool(data.get("timestamp_utc"))
-    if primary_intent == "why":
-        hinted_roles = [str(item).lower() for item in (query_plan.get("field_hints") or {}).get("roles") or []]
-        return bool(hinted_roles) and any(hinted_role in role for hinted_role in hinted_roles)
-    if primary_intent == "what_was_i_talking_about":
-        return bool(data.get("cwd") or data.get("timestamp_utc"))
-    if primary_intent in {"source_next_reads", "next_reads"}:
-        return bool(source_ref_target(data.get("source_ref") or {}))
-    return False
+    return bool(source_window_candidate_matched_needs(data, query_plan, primary_intent))
 
 
 def candidate_to_source_window_data(candidate: dict[str, Any] | CandidateRow) -> dict[str, Any]:
