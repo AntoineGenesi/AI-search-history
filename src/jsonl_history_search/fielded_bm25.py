@@ -1310,7 +1310,14 @@ def _select_source_grouped_candidate_rows(
             group_interleaved_rows_selected=0,
             adjacent_run_collapse=_adjacent_run_collapse_diagnostics([], [], {}, {}),
             group_interleaving=_group_interleaving_diagnostics([], {}, {}, {}),
-            grouped_source_windows=_grouped_source_window_diagnostics([], set(), {}, {}, selected_rowids=set()),
+            grouped_source_windows=_grouped_source_window_diagnostics(
+                [],
+                set(),
+                {},
+                {},
+                selected_rowids=set(),
+                window_selection={},
+            ),
             intent_allocation=_empty_intent_window_allocation(intent),
             selection_policy=_evidence_selection_policy_diagnostics(
                 rows,
@@ -1371,6 +1378,7 @@ def _select_source_grouped_candidate_rows(
         selected_representative_reason_counts,
         group_category_counts,
         intent_allocation,
+        window_selection,
     ) = _select_grouped_source_window_heads(
         grouped_windows,
         row_by_id,
@@ -1432,6 +1440,7 @@ def _select_source_grouped_candidate_rows(
         considered_group_counts,
         selected_group_counts,
         selected_rowids=selected_rowids,
+        window_selection=window_selection,
     )
 
     return selected, _source_grouping_diagnostics(
@@ -1814,7 +1823,14 @@ def _select_grouped_source_window_heads(
     intent: QueryIntent | None = None,
     row_stream_labels: dict[int, set[str]] | None = None,
     fusion: dict[str, Any] | None = None,
-) -> tuple[list[tuple[Any, ...]], dict[str, int], dict[str, int], dict[str, dict[str, int]], dict[str, Any]]:
+) -> tuple[
+    list[tuple[Any, ...]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, dict[str, int]],
+    dict[str, Any],
+    dict[str, Any],
+]:
     categories = ("source", "session", "day", "window")
     row_stream_labels = row_stream_labels or {}
     fusion = fusion or {}
@@ -1849,6 +1865,23 @@ def _select_grouped_source_window_heads(
     selected_group_keys: dict[str, set[str]] = {category: set() for category in categories}
     representative_reason_counts: dict[str, int] = {"grouped_window_head": len(windows), "adjacent_run_head": len(windows)}
     selected_representative_reason_counts: dict[str, int] = {}
+    window_selection: dict[str, Any] = {
+        "enabled": True,
+        "strategy": "protected_exact_then_route_windows_then_novel_grouped_windows_before_duplicate_windows",
+        "route_window_count_considered": 0,
+        "route_window_count_selected": 0,
+        "route_window_head_selection_count": 0,
+        "novelty_fill_window_count": 0,
+        "duplicate_window_skip_count": 0,
+        "duplicate_window_selection_count": 0,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+        "line_numbers_included": False,
+        "source_lines_included": False,
+    }
 
     def mark_groups(rowid: int) -> None:
         ref = index.records.get(rowid)
@@ -1872,30 +1905,6 @@ def _select_grouped_source_window_heads(
         selected_representative_reason_counts[reason] = selected_representative_reason_counts.get(reason, 0) + 1
         return True
 
-    intent_windows = _intent_preferred_grouped_source_windows(
-        windows,
-        index,
-        intent=intent,
-        row_stream_labels=row_stream_labels,
-        fusion=fusion,
-        bm25_rank_by_rowid=bm25_rank_by_rowid,
-    )
-    intent_allocation = _intent_window_allocation_diagnostics(intent, intent_windows)
-    representative_reason_counts["intent_preferred_window_head"] = len(intent_windows)
-    intent_sources_selected: set[str] = set()
-    for window in intent_windows:
-        if len(selected) >= selected_limit:
-            break
-        if window.source_key in intent_sources_selected:
-            continue
-        row = row_by_id.get(window.head_rowid)
-        if row is not None and add_row(row, "intent_preferred_window_head"):
-            intent_sources_selected.add(window.source_key)
-    intent_allocation["selected_intent_window_count"] = int(
-        selected_representative_reason_counts.get("intent_preferred_window_head", 0)
-    )
-    intent_allocation["distinct_intent_sources_selected"] = int(len(intent_sources_selected))
-
     if seed_rows:
         intent_seed_rows: list[tuple[Any, ...]] = []
         generic_seed_rows: list[tuple[Any, ...]] = []
@@ -1918,31 +1927,96 @@ def _select_grouped_source_window_heads(
                     representative_reason_counts.get("protected_top_exact_or_channel_head", 0) + 1
                 )
 
-    category_heads: dict[str, list[FieldedGroupedSourceWindow]] = {}
-    for category in categories:
-        heads = [group_windows[0] for group_windows in grouped[category].values() if group_windows]
-        heads.sort(key=lambda window: (bm25_rank_by_rowid.get(window.head_rowid, 10**12), window.head_rowid))
-        category_heads[category] = heads
+    for category in ("source", "session", "day"):
+        representative_reason_counts[f"{category}_representative"] = len(grouped[category])
 
-    max_depth = max((len(items) for items in category_heads.values()), default=0)
-    for depth in range(max_depth):
-        for category in categories:
-            heads = category_heads[category]
-            if depth >= len(heads):
-                continue
-            window = heads[depth]
+    intent_windows = _intent_preferred_grouped_source_windows(
+        windows,
+        index,
+        intent=intent,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
+        bm25_rank_by_rowid=bm25_rank_by_rowid,
+    )
+    intent_allocation = _intent_window_allocation_diagnostics(intent, intent_windows)
+    representative_reason_counts["intent_preferred_window_head"] = len(intent_windows)
+    window_selection["route_window_count_considered"] = int(len(intent_windows))
+    route_window_keys = {window.key for window in intent_windows}
+    route_head_selection_count = 0
+    primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
+    while len(selected) < selected_limit:
+        route_candidates = [
+            window
+            for window in intent_windows
+            if window.head_rowid not in selected_rowids
+            and row_by_id.get(window.head_rowid) is not None
+            and _safe_window_group_key(window) not in selected_group_keys["window"]
+        ]
+        if not route_candidates:
+            break
+        window = min(
+            route_candidates,
+            key=lambda candidate: (
+                -_grouped_window_novelty_score(candidate, index, selected_group_keys),
+                _intent_window_priority(
+                    candidate,
+                    index,
+                    primary_intent=primary_intent,
+                    row_stream_labels=row_stream_labels,
+                    fusion=fusion,
+                ),
+                bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
+                candidate.head_rowid,
+            ),
+        )
+        row = row_by_id.get(window.head_rowid)
+        if row is not None and add_row(row, "intent_preferred_window_head"):
+            route_head_selection_count += 1
+            continue
+        break
+
+    novelty_fill_count = 0
+    duplicate_skip_keys: set[tuple[str, str, str, int]] = set()
+    duplicate_selection_count = 0
+    while len(selected) < selected_limit:
+        remaining = [
+            window
+            for window in windows
+            if window.head_rowid not in selected_rowids and row_by_id.get(window.head_rowid) is not None
+        ]
+        if not remaining:
+            break
+        novelty_candidates = [
+            window
+            for window in remaining
+            if _grouped_window_novelty_score(window, index, selected_group_keys) > 0
+        ]
+        if novelty_candidates:
+            duplicate_skip_keys.update(window.key for window in remaining if window not in novelty_candidates)
+            window = min(
+                novelty_candidates,
+                key=lambda candidate: (
+                    -_grouped_window_novelty_score(candidate, index, selected_group_keys),
+                    bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
+                    candidate.head_rowid,
+                ),
+            )
+            reason = _grouped_window_novelty_reason(window, index, selected_group_keys)
             row = row_by_id.get(window.head_rowid)
-            if row is None:
-                continue
-            reason = "grouped_window_head" if category == "window" else f"{category}_representative"
-            representative_reason_counts[reason] = representative_reason_counts.get(reason, 0) + 1
-            if window.head_rowid in selected_rowids:
-                selected_representative_reason_counts["duplicate_category_representative"] = (
-                    selected_representative_reason_counts.get("duplicate_category_representative", 0) + 1
-                )
-                mark_groups(window.head_rowid)
-                continue
-            add_row(row, reason)
+            if row is not None and add_row(row, reason):
+                novelty_fill_count += 1
+            else:
+                break
+            continue
+        window = min(
+            remaining,
+            key=lambda candidate: (bm25_rank_by_rowid.get(candidate.head_rowid, 10**12), candidate.head_rowid),
+        )
+        row = row_by_id.get(window.head_rowid)
+        if row is not None and add_row(row, "represented_group_window_fill"):
+            duplicate_selection_count += 1
+            continue
+        break
 
     inner_fill_count = 0
     selected_window_keys = {
@@ -1970,17 +2044,27 @@ def _select_grouped_source_window_heads(
     if inner_fill_count:
         representative_reason_counts["grouped_window_inner_hit"] = inner_fill_count
 
-    fill_count = 0
-    for window in windows:
-        if len(selected) >= selected_limit:
-            break
-        if window.head_rowid in selected_rowids:
-            continue
-        row = row_by_id.get(window.head_rowid)
-        if row is not None and add_row(row, "represented_group_window_fill"):
-            fill_count += 1
-    if fill_count:
-        representative_reason_counts["represented_group_window_fill"] = fill_count
+    selected_window_keys = {
+        window.key
+        for window in windows
+        if window.head_rowid in selected_rowids or any(rowid in selected_rowids for rowid in window.rowids)
+    }
+    selected_route_window_keys = selected_window_keys & route_window_keys
+    intent_sources_selected = {window.source_key for window in intent_windows if window.key in selected_route_window_keys}
+    intent_allocation["selected_intent_window_count"] = int(len(selected_route_window_keys))
+    intent_allocation["selected_route_window_count"] = int(len(selected_route_window_keys))
+    intent_allocation["selected_intent_window_head_count"] = int(route_head_selection_count)
+    intent_allocation["distinct_intent_sources_selected"] = int(len(intent_sources_selected))
+    intent_allocation["novelty_fill_window_count"] = int(novelty_fill_count)
+    intent_allocation["duplicate_window_skip_count"] = int(len(duplicate_skip_keys))
+    intent_allocation["duplicate_window_selection_count"] = int(duplicate_selection_count)
+    window_selection["route_window_count_selected"] = int(len(selected_route_window_keys))
+    window_selection["route_window_head_selection_count"] = int(route_head_selection_count)
+    window_selection["novelty_fill_window_count"] = int(novelty_fill_count)
+    window_selection["duplicate_window_skip_count"] = int(len(duplicate_skip_keys))
+    window_selection["duplicate_window_selection_count"] = int(duplicate_selection_count)
+    if duplicate_selection_count:
+        representative_reason_counts["represented_group_window_fill"] = duplicate_selection_count
 
     for category in categories:
         selected_count = len(selected_group_keys[category])
@@ -1988,7 +2072,52 @@ def _select_grouped_source_window_heads(
         group_counts[category]["groups_selected"] = selected_count
         group_counts[category]["groups_omitted"] = max(considered_count - selected_count, 0)
 
-    return selected, representative_reason_counts, selected_representative_reason_counts, group_counts, intent_allocation
+    return (
+        selected,
+        representative_reason_counts,
+        selected_representative_reason_counts,
+        group_counts,
+        intent_allocation,
+        window_selection,
+    )
+
+
+def _grouped_window_novelty_categories(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    selected_group_keys: dict[str, set[str]],
+) -> tuple[str, ...]:
+    ref = index.records.get(window.head_rowid)
+    if ref is None:
+        return ()
+    categories: list[str] = []
+    for category in ("source", "session", "day", "window"):
+        category_key = _window_category_group_key(ref, window, category)
+        if category_key is not None and category_key not in selected_group_keys.get(category, set()):
+            categories.append(category)
+    return tuple(categories)
+
+
+def _grouped_window_novelty_score(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    selected_group_keys: dict[str, set[str]],
+) -> int:
+    return len(_grouped_window_novelty_categories(window, index, selected_group_keys))
+
+
+def _grouped_window_novelty_reason(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    selected_group_keys: dict[str, set[str]],
+) -> str:
+    categories = _grouped_window_novelty_categories(window, index, selected_group_keys)
+    for category in ("source", "session", "day"):
+        if category in categories:
+            return f"{category}_representative"
+    if "window" in categories:
+        return "grouped_window_head"
+    return "represented_group_window_fill"
 
 
 def _intent_preferred_grouped_source_windows(
@@ -2397,6 +2526,7 @@ def _grouped_source_window_diagnostics(
     selected_group_counts: dict[tuple[str, str, str], int],
     *,
     selected_rowids: set[int],
+    window_selection: dict[str, Any],
 ) -> dict[str, Any]:
     selected_windows = [window for window in windows if window.key in selected_window_keys]
     selected_sources = {window.source_key for window in selected_windows}
@@ -2425,7 +2555,7 @@ def _grouped_source_window_diagnostics(
     return {
         "enabled": True,
         "selection_version": FIELDED_GROUPED_SOURCE_WINDOW_SELECTION_VERSION,
-        "strategy": "source_session_day_near_contiguous_window_heads_then_represented_group_fill",
+        "strategy": "source_session_day_near_contiguous_window_heads_with_route_aware_novelty_fill",
         "window_identity_components": ["source", "session", "day", "near_contiguous_source_order_window"],
         "near_contiguous_source_order_gap": FIELDED_GROUPED_SOURCE_WINDOW_NEAR_GAP,
         "inner_hit_limit_per_window": FIELDED_GROUPED_SOURCE_WINDOW_INNER_HIT_LIMIT,
@@ -2446,6 +2576,29 @@ def _grouped_source_window_diagnostics(
         "distinct_days_selected": int(len(selected_days)),
         "distinct_windows_selected": int(len(selected_windows)),
         "omission_reason_counts": dict(sorted(omission_reason_counts.items())),
+        "route_window_count_considered": int(window_selection.get("route_window_count_considered") or 0),
+        "route_window_count_selected": int(window_selection.get("route_window_count_selected") or 0),
+        "route_window_head_selection_count": int(window_selection.get("route_window_head_selection_count") or 0),
+        "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
+        "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
+        "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
+        "window_selection": {
+            "enabled": bool(window_selection.get("enabled", False)),
+            "strategy": str(window_selection.get("strategy") or "disabled"),
+            "route_window_count_considered": int(window_selection.get("route_window_count_considered") or 0),
+            "route_window_count_selected": int(window_selection.get("route_window_count_selected") or 0),
+            "route_window_head_selection_count": int(window_selection.get("route_window_head_selection_count") or 0),
+            "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
+            "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
+            "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_query_text_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "line_numbers_included": False,
+            "source_lines_included": False,
+        },
         "selected_window_details_included": False,
         "raw_window_keys_included": False,
         "raw_paths_included": False,
@@ -2489,7 +2642,7 @@ def _source_grouping_diagnostics(
     category_groups_omitted = sum(int(counts.get("groups_omitted") or 0) for counts in group_category_counts.values())
     return {
         "enabled": True,
-        "strategy": "adjacent_run_collapse_then_intent_preferred_grouped_source_windows_then_grouped_source_window_heads_then_represented_group_fill",
+        "strategy": "adjacent_run_collapse_then_protected_exact_route_aware_grouped_windows_then_novelty_fill",
         "candidate_rows_considered": int(rows_considered),
         "candidate_rows_selected": int(rows_selected),
         "candidate_rows_dropped": max(int(rows_considered) - int(rows_selected), 0),
