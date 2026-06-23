@@ -221,6 +221,19 @@ def build_semantic_debug_payload(
         hints=hints,
         source_scope=source_scope,
     )
+    guided_audit_flow = build_guided_audit_flow(
+        status=agent_find["status"],
+        family=family,
+        source_scope=source_scope,
+        decision_context=decision_context,
+        audit_plan=audit_plan,
+        forensics_workflow=forensics_workflow,
+        source_locator_handoff=source_locator_handoff,
+        final_answer_contract=final_answer_contract,
+        no_evidence=no_evidence,
+        next_reads=next_reads,
+        next_commands=decision_context["next_commands"],
+    )
 
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -240,6 +253,7 @@ def build_semantic_debug_payload(
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
+        "guided_audit_flow": guided_audit_flow,
         "next_reads": next_reads,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
@@ -1326,6 +1340,426 @@ def build_final_answer_source_use_contract(
             "jsonl_value_speed_or_token_efficiency_claim": "not_allowed_without_separate_reviewed_evidence",
             "evidence_vs_inference_required": True,
         },
+    }
+
+
+def build_guided_audit_flow(
+    *,
+    status: str,
+    family: dict[str, Any],
+    source_scope: dict[str, Any],
+    decision_context: dict[str, Any],
+    audit_plan: dict[str, Any],
+    forensics_workflow: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+    final_answer_contract: dict[str, Any],
+    no_evidence: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    next_commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    query_plan = source_locator_handoff.get("query_plan") or {}
+    primary_intent = query_plan.get("primary_intent") or "generic_history"
+    primary_family = guided_primary_question_family(
+        family=family,
+        primary_intent=primary_intent,
+        no_evidence=no_evidence,
+    )
+    route_order = guided_route_order(
+        primary_family=primary_family,
+        primary_intent=primary_intent,
+        routes=audit_plan.get("route_order", []),
+    )
+    recovery = guided_recovery(source_locator_handoff)
+    guide_status = guided_status(
+        command_status=status,
+        next_reads=next_reads,
+        recovery=recovery,
+        no_evidence=no_evidence,
+    )
+    answer_gate = guided_answer_gate(
+        primary_family=primary_family,
+        primary_intent=primary_intent,
+        final_answer_contract=final_answer_contract,
+        no_evidence=no_evidence,
+        recovery=recovery,
+    )
+    return {
+        "schema_version": 1,
+        "primary_question_family": primary_family,
+        "primary_intent": primary_intent,
+        "status": guide_status,
+        "route_order": route_order,
+        "stages": guided_stages(
+            route_order=route_order,
+            decision_context=decision_context,
+            audit_plan=audit_plan,
+            forensics_workflow=forensics_workflow,
+            source_locator_handoff=source_locator_handoff,
+            no_evidence=no_evidence,
+            recovery=recovery,
+        ),
+        "scope": guided_scope(source_scope, no_evidence),
+        "evidence_handles": guided_evidence_handles(decision_context.get("evidence_handles", [])),
+        "recovery": recovery,
+        "answer_gate": answer_gate,
+        "next_reads": guided_next_reads(next_reads),
+        "next_commands": guided_next_commands(next_commands),
+        "links": {
+            "decision_context": "semantic_debug.decision_context",
+            "audit_plan": "semantic_debug.audit_plan",
+            "forensics_workflow": "semantic_debug.forensics_workflow",
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+            "final_answer_source_use_contract": "semantic_debug.final_answer_source_use_contract",
+            "no_evidence": "semantic_debug.no_evidence",
+            "omitted_window_recovery": "semantic_debug.source_locator_handoff.omitted_window_recovery",
+        },
+        "privacy_boundaries": {
+            "raw_transcript_text_included": False,
+            "snippets_included": False,
+            "raw_session_ids_included": False,
+            "raw_cwd_included": False,
+            "raw_source_lines_included": False,
+            "private_payloads_included": False,
+        },
+    }
+
+
+def guided_primary_question_family(
+    *,
+    family: dict[str, Any],
+    primary_intent: str,
+    no_evidence: dict[str, Any],
+) -> str:
+    if no_evidence.get("needed"):
+        return "no_evidence"
+    if primary_intent == "workflow_failure":
+        return "workflow_failure"
+    primary = family.get("primary")
+    if primary in {"why_did_this_happen", "claimed_action", "remembered_instruction"}:
+        return str(primary)
+    detected = set(family.get("detected_supported") or [])
+    for label in ("claimed_action", "remembered_instruction", "why_did_this_happen"):
+        if label in detected:
+            return label
+    return str(primary or "why_did_this_happen")
+
+
+def guided_route_order(*, primary_family: str, primary_intent: str, routes: list[str]) -> list[str]:
+    route_set = set(routes)
+    if primary_family == "no_evidence":
+        preferred = ["no_evidence_scoped_report", "source_ref_followup", "conversation_reconstruction"]
+    elif primary_family == "workflow_failure" or primary_intent == "workflow_failure":
+        preferred = ["conversation_reconstruction", "tool_action_proof", "task_review_join", "source_ref_followup", "no_evidence_scoped_report"]
+    elif primary_family == "claimed_action":
+        preferred = ["tool_action_proof", "task_review_join", "conversation_reconstruction", "source_ref_followup", "no_evidence_scoped_report"]
+    elif primary_family == "remembered_instruction":
+        preferred = ["conversation_reconstruction", "source_ref_followup", "no_evidence_scoped_report"]
+    else:
+        preferred = ["conversation_reconstruction", "git_history_reconstruction", "task_review_join", "tool_action_proof", "source_ref_followup", "no_evidence_scoped_report"]
+    ordered = [route for route in preferred if route in route_set]
+    ordered.extend(route for route in routes if route not in ordered)
+    return ordered
+
+
+def guided_status(
+    *,
+    command_status: str,
+    next_reads: list[dict[str, Any]],
+    recovery: dict[str, Any],
+    no_evidence: dict[str, Any],
+) -> str:
+    if no_evidence.get("needed"):
+        return "scoped_no_evidence_ready"
+    if recovery.get("status") == "available":
+        return "evidence_available_with_recovery_reads"
+    if command_status == "no_evidence":
+        return "scoped_no_evidence_ready"
+    if next_reads:
+        return "evidence_available_needs_source_reads"
+    return "needs_followup_evidence"
+
+
+def guided_scope(source_scope: dict[str, Any], no_evidence: dict[str, Any]) -> dict[str, Any]:
+    searched = source_scope.get("searched_scope") or {}
+    not_searched = source_scope.get("not_searched_scope") or {}
+    excluded = source_scope.get("excluded_scope") or {}
+    cap_hit = source_scope.get("cap_hit") or {}
+    source_plan = not_searched.get("source_plan") or {}
+    return {
+        "searched_scope": {
+            "searched_files": searched.get("searched_files", 0),
+            "searched_bytes": searched.get("searched_bytes", 0),
+            "source_plan_selected_files": searched.get("source_plan_selected_files", 0),
+            "source_plan_deferred_files": searched.get("source_plan_deferred_files", 0),
+            "source_plan_pruned_files": searched.get("source_plan_pruned_files", 0),
+            "result_meaning": searched.get("result_meaning"),
+        },
+        "not_searched_scope": {
+            "missing_root_count": not_searched.get("missing_root_count", 0),
+            "outside_selected_roots": not_searched.get("outside_selected_roots"),
+            "source_plan": {
+                "sources_total": source_plan.get("sources_total"),
+                "sources_selected": source_plan.get("sources_selected"),
+                "sources_deferred_budget": source_plan.get("sources_deferred_budget"),
+                "sources_pruned_hard": source_plan.get("sources_pruned_hard"),
+                "exhaustive_available": source_plan.get("exhaustive_available"),
+                "raw_paths_included": source_plan.get("raw_paths_included", False),
+                "raw_text_included": source_plan.get("raw_text_included", False),
+            },
+            "notes": list(not_searched.get("notes") or [])[:5],
+        },
+        "excluded_scope": {
+            "rejected_root_count": excluded.get("rejected_root_count", 0),
+            "meaning": excluded.get("meaning"),
+        },
+        "cap_hit": {
+            "hit": cap_hit.get("hit", False),
+            "caps_hit": list(cap_hit.get("caps_hit") or [])[:8],
+        },
+        "answer_scope": no_evidence.get("answer_scope"),
+        "not_all_history_absence": True,
+    }
+
+
+def guided_evidence_handles(handles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for handle in handles[:12]:
+        row = {key: value for key, value in handle.items() if key != "source_ref"}
+        if isinstance(handle.get("source_ref"), dict):
+            row["source_ref"] = guided_source_ref(handle["source_ref"])
+        compact.append(row)
+    return compact
+
+
+def guided_source_ref(source_ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: source_ref.get(key)
+        for key in ("path", "line", "timestamp_utc")
+        if source_ref.get(key) is not None
+    }
+
+
+def guided_recovery(source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
+    omitted = source_locator_handoff.get("omitted_window_recovery") or {}
+    status = omitted.get("status") or "not_available"
+    items = []
+    for item in list(omitted.get("items") or [])[:5]:
+        row = {
+            "candidate_id": item.get("candidate_id"),
+            "target": item.get("target"),
+            "omission_reason": item.get("omission_reason"),
+            "read_more_actionable": item.get("read_more_actionable"),
+            "intent_match": item.get("intent_match"),
+        }
+        if isinstance(item.get("source_ref"), dict):
+            row["source_ref"] = guided_source_ref(item["source_ref"])
+        items.append({key: value for key, value in row.items() if value is not None})
+    return {
+        "status": status,
+        "source": "source_locator_handoff.omitted_window_recovery",
+        "recovery_count": omitted.get("recovery_count", 0),
+        "promoted_next_read_count": omitted.get("promoted_next_read_count", 0),
+        "items": items,
+        "action": (
+            "open promoted omitted-window next_reads before treating the evidence set as representative"
+            if status == "available"
+            else "no omitted-window recovery handles were emitted for this packet"
+        ),
+    }
+
+
+def guided_stages(
+    *,
+    route_order: list[str],
+    decision_context: dict[str, Any],
+    audit_plan: dict[str, Any],
+    forensics_workflow: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+    no_evidence: dict[str, Any],
+    recovery: dict[str, Any],
+) -> list[dict[str, Any]]:
+    checkpoint_by_route = {
+        item.get("route"): item
+        for item in audit_plan.get("checkpoint_plan", [])
+        if isinstance(item, dict) and item.get("route")
+    }
+    stages = []
+    for index, route in enumerate(route_order, 1):
+        checkpoint = checkpoint_by_route.get(route) or {}
+        stages.append(
+            {
+                "stage_id": f"guided-stage-{index:02d}",
+                "route": route,
+                "status": guided_stage_status(
+                    route=route,
+                    decision_context=decision_context,
+                    forensics_workflow=forensics_workflow,
+                    source_locator_handoff=source_locator_handoff,
+                    no_evidence=no_evidence,
+                    recovery=recovery,
+                ),
+                "inputs": guided_stage_inputs(route),
+                "outputs": guided_stage_outputs(route),
+                "exit_criteria": checkpoint.get("complete_when") or checkpoint_completion(route),
+            }
+        )
+    return stages
+
+
+def guided_stage_status(
+    *,
+    route: str,
+    decision_context: dict[str, Any],
+    forensics_workflow: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+    no_evidence: dict[str, Any],
+    recovery: dict[str, Any],
+) -> str:
+    if route == "conversation_reconstruction":
+        return "ready" if decision_context.get("evidence_handles") else "needs_evidence"
+    if route == "git_history_reconstruction":
+        workflow_summary = forensics_workflow.get("summary") or {}
+        return "available" if workflow_summary.get("phase_count", 0) else "not_run_or_no_hints"
+    if route == "task_review_join":
+        workflow_summary = forensics_workflow.get("summary") or {}
+        return "available" if workflow_summary.get("join_count", 0) else "not_run_or_no_join"
+    if route == "tool_action_proof":
+        return "available" if any(handle.get("kind") == "tool_event_source_ref" for handle in decision_context.get("evidence_handles", [])) else "needs_structured_event_source"
+    if route == "source_ref_followup":
+        if recovery.get("status") == "available":
+            return "recovery_reads_available"
+        return "ready" if source_locator_handoff.get("next_reads") else "needs_source_ref"
+    if route == "no_evidence_scoped_report":
+        return "available" if no_evidence.get("needed") else "guardrail_only"
+    return "ready"
+
+
+def guided_stage_inputs(route: str) -> list[str]:
+    return {
+        "conversation_reconstruction": ["strongest_candidates", "source_locator_handoff.source_windows", "next_reads"],
+        "git_history_reconstruction": ["task_review_commit_joins", "forensics_workflow"],
+        "task_review_join": ["task_review_commit_joins", "forensics_workflow.review_gate"],
+        "tool_action_proof": ["tool_action_proof", "structured_tool_events"],
+        "source_ref_followup": ["source_locator_handoff.next_reads", "source_locator_handoff.omitted_window_recovery"],
+        "no_evidence_scoped_report": ["no_evidence", "scope", "final_answer_source_use_contract.no_evidence_scope"],
+    }.get(route, ["semantic_debug"])
+
+
+def guided_stage_outputs(route: str) -> list[str]:
+    return {
+        "conversation_reconstruction": ["evidence_vs_inference_notes", "candidate_timeline"],
+        "git_history_reconstruction": ["project_time_context", "artifact_state_context"],
+        "task_review_join": ["review_verdict_context", "task_handoff_context"],
+        "tool_action_proof": ["action_claim_support_or_gap"],
+        "source_ref_followup": ["confirmed_context_or_recovery_gap"],
+        "no_evidence_scoped_report": ["searched_scope_only_no_evidence_statement"],
+    }.get(route, ["checked_route"])
+
+
+def guided_answer_gate(
+    *,
+    primary_family: str,
+    primary_intent: str,
+    final_answer_contract: dict[str, Any],
+    no_evidence: dict[str, Any],
+    recovery: dict[str, Any],
+) -> dict[str, Any]:
+    required_actions = list(final_answer_contract.get("required_actions") or [])[:8]
+    family_gate = {
+        "why_did_this_happen": "Separate source-backed observations from candidate-cause inference before saying why.",
+        "workflow_failure": "Use failure-timeline/process evidence from the query-plan route before naming where the workflow went wrong.",
+        "claimed_action": "Confirm structured tool/action proof before saying an agent ran, edited, tested, reviewed, or claimed an action.",
+        "remembered_instruction": "Open source refs for the prior user wording before restating remembered instructions.",
+        "no_evidence": "State not_found_in_searched_scope and list unsearched, missing, or cap-limited scope.",
+    }.get(primary_family, "Use source refs before making factual or provenance claims.")
+    completion_criteria = [
+        family_gate,
+        "At least one source ref or reviewed artifact supports every factual/provenance claim when evidence exists.",
+        "Uncertainty labels remain visible in the final answer.",
+    ]
+    if recovery.get("status") == "available":
+        completion_criteria.append("Promoted omitted-window recovery reads have been opened or explicitly deferred.")
+    if no_evidence.get("needed"):
+        completion_criteria.append("The answer avoids global all-history absence language.")
+    return {
+        "status": "active",
+        "primary_question_family": primary_family,
+        "primary_intent": primary_intent,
+        "answer_scope": final_answer_contract.get("answer_scope"),
+        "source_use_required": final_answer_contract.get("source_use_required"),
+        "required_actions": required_actions,
+        "completion_criteria": completion_criteria,
+        "forbidden_claims": [
+            "root_cause_without_linked_reviewed_evidence",
+            "global_absence_or_all_history_completeness",
+            "jsonl_value_speed_token_or_final_answer_quality_without_separate_reviewed_evidence",
+        ],
+        "claim_boundaries": final_answer_contract.get("claim_boundaries", {}),
+    }
+
+
+def guided_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for read in next_reads[:8]:
+        row = {
+            "kind": read.get("kind"),
+            "target": read.get("target"),
+            "reason": read.get("reason"),
+            "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
+        }
+        if isinstance(read.get("source_ref"), dict):
+            row["source_ref"] = guided_source_ref(read["source_ref"])
+        rows.append({key: value for key, value in row.items() if value is not None})
+    return rows
+
+
+def guided_next_commands(next_commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for command in next_commands[:8]:
+        argv = list(command.get("argv") or [])
+        row = {
+            "command_family": command.get("command_family"),
+            "source": command.get("source"),
+            "target": argv[1] if len(argv) > 1 else None,
+            "mode": command_mode_from_argv(argv),
+            "raw_private_text_included": command.get("raw_private_text_included", False),
+            "argv_omitted_from_guide": True,
+            "omission_reason": "guided_audit_flow avoids raw cwd/root argv; use top-level next_reads expansion_actions for executable commands",
+        }
+        rows.append({key: value for key, value in row.items() if value is not None})
+    return rows
+
+
+def command_mode_from_argv(argv: list[Any]) -> str | None:
+    for index, value in enumerate(argv):
+        if value == "--mode" and index + 1 < len(argv):
+            return str(argv[index + 1])
+    return None
+
+
+def summarize_guided_audit_flow(guide: dict[str, Any]) -> dict[str, Any]:
+    recovery = guide.get("recovery") or {}
+    answer_gate = guide.get("answer_gate") or {}
+    return {
+        "schema_version": guide.get("schema_version", 1),
+        "primary_question_family": guide.get("primary_question_family"),
+        "primary_intent": guide.get("primary_intent"),
+        "status": guide.get("status"),
+        "route_order": list(guide.get("route_order") or [])[:8],
+        "stage_count": len(guide.get("stages") or []),
+        "evidence_handle_count": len(guide.get("evidence_handles") or []),
+        "recovery": {
+            "status": recovery.get("status"),
+            "recovery_count": recovery.get("recovery_count", 0),
+            "promoted_next_read_count": recovery.get("promoted_next_read_count", 0),
+        },
+        "answer_gate": {
+            "answer_scope": answer_gate.get("answer_scope"),
+            "source_use_required": answer_gate.get("source_use_required"),
+            "forbidden_claims": list(answer_gate.get("forbidden_claims") or [])[:3],
+        },
+        "next_read_targets": [item.get("target") for item in list(guide.get("next_reads") or [])[:5] if item.get("target")],
+        "privacy_boundaries": guide.get("privacy_boundaries"),
     }
 
 

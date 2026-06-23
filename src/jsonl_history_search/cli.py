@@ -114,7 +114,7 @@ from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_
 from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
 from .retrieval_modes import QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODES, RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrieval_mode
 from .scanner import search
-from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload
+from .semantic_debugging import DEFAULT_GOLD_MANIFEST, build_semantic_debug_payload, summarize_guided_audit_flow
 from .skill_audit import build_skill_audit_payload
 from .source_expansion import ExpansionRequest, build_source_expansion_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
@@ -1640,6 +1640,7 @@ def main(argv: list[str] | None = None) -> int:
                     "source_locator_handoff": packet["source_locator_handoff"],
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
                     "claim_boundaries": packet["claim_boundaries"],
+                    "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
                     "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
                     "decision_context_summary": {
                         "primary_question_family": packet["decision_context"].get("primary_question_family"),
