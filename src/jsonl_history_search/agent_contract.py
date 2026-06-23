@@ -22,6 +22,7 @@ COMPACT_PROVENANCE_SOURCE_REF_LIMIT = 12
 COMPACT_PROVENANCE_NEXT_READ_LIMIT = 8
 EVIDENCE_PACKET_LIMIT = 5
 EVIDENCE_PACKET_CHILD_LIMIT = 6
+COMPACT_EVIDENCE_PACKET_CHILD_REF_LIMIT = 6
 EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT = 8
 EVIDENCE_PACKET_MATERIALIZED_CONTEXT_TOTAL_CHAR_LIMIT = 12_000
 EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT = 4_000
@@ -207,7 +208,10 @@ def build_agent_find_payload(
                 agent_find["compact_provenance_handoff"]["retrieval_pressure_summary"] = (
                     compact_retrieval_pressure_summary(agent_find["retrieval_pressure"])
                 )
-            agent_find["compact_provenance_handoff"]["stage_diagnostics"] = compact_stage_diagnostics
+            agent_find["compact_provenance_handoff"]["derived_from"].append("stage_diagnostics_summary")
+            agent_find["compact_provenance_handoff"]["stage_diagnostics_summary"] = compact_stage_diagnostics_summary(
+                compact_stage_diagnostics
+            )
     return {"agent_find": agent_find}
 
 
@@ -237,16 +241,20 @@ def build_compact_provenance_handoff(
     """Build an opt-in provenance map from already-emitted agent-facing fields."""
     compact_candidates = compact_provenance_candidates(candidates)
     source_ref_candidates = compact_provenance_source_ref_candidates(
-        compact_candidates,
+        candidates,
         source_locator_handoff.get("candidate_ordering", {}).get("top_candidates", []),
         next_reads,
     )
-    source_refs = source_ref_candidates[:COMPACT_PROVENANCE_SOURCE_REF_LIMIT]
-    source_windows = list(source_locator_handoff.get("source_windows") or [])[:SOURCE_WINDOW_LIMIT]
-    evidence_packets = list(source_locator_handoff.get("evidence_packets") or [])[:EVIDENCE_PACKET_LIMIT]
+    source_refs = source_ref_candidates
+    source_window_candidates = list(source_locator_handoff.get("source_windows") or [])
+    source_windows = compact_provenance_source_window_summaries(source_window_candidates[:SOURCE_WINDOW_LIMIT])
+    evidence_packet_candidates = list(source_locator_handoff.get("evidence_packets") or [])
+    evidence_packets = compact_provenance_evidence_packet_summaries(
+        evidence_packet_candidates[:EVIDENCE_PACKET_LIMIT]
+    )
     evidence_packet_packaging = source_locator_handoff.get("evidence_packet_packaging") or {}
     evidence_packet_text_included = bool(evidence_packet_packaging.get("raw_text_included", False))
-    compact_next_reads = list(next_reads or [])[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]
+    compact_next_reads = list(next_reads or [])
     answerability = build_compact_answerability(
         status=status,
         candidates=compact_candidates,
@@ -262,8 +270,9 @@ def build_compact_provenance_handoff(
         candidates_included=len(compact_candidates),
         source_ref_count_considered=len(source_ref_candidates),
         source_refs_included=len(source_refs),
+        source_window_count_considered=len(source_window_candidates),
         source_windows_included=len(source_windows),
-        evidence_packet_count_considered=len(source_locator_handoff.get("evidence_packets") or []),
+        evidence_packet_count_considered=len(evidence_packet_candidates),
         evidence_packets_included=len(evidence_packets),
         next_read_count_considered=len(next_reads or []),
         next_reads_included=len(compact_next_reads),
@@ -287,7 +296,9 @@ def build_compact_provenance_handoff(
         "source_refs": source_refs,
         "source_windows": source_windows,
         "evidence_packets": evidence_packets,
-        "source_window_packaging": source_locator_handoff.get("source_window_packaging", {}),
+        "source_window_packaging": compact_source_window_packaging(
+            source_locator_handoff.get("source_window_packaging", {})
+        ),
         "next_reads": compact_next_reads,
         "no_evidence": compact_provenance_no_evidence(no_evidence, source_locator_handoff),
         "output_budget": output_budget,
@@ -333,8 +344,145 @@ def build_compact_provenance_handoff(
         "output_budget": output_budget,
         "retrieval_pressure_embedded": False,
         "retrieval_pressure_summary_included": bool(retrieval_pressure),
+        "field_tiers": compact_handoff_field_tiers(output_budget),
     }
     return packet
+
+
+def compact_provenance_source_window_summaries(source_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries = []
+    for window in source_windows:
+        if not isinstance(window, dict):
+            continue
+        source_ref = window.get("source_ref") or {}
+        next_read = window.get("next_read") if isinstance(window.get("next_read"), dict) else {}
+        summaries.append(
+            {
+                "schema_version": 1,
+                "summary_kind": "compact_source_window_ref",
+                "candidate_id": window.get("candidate_id"),
+                "source_ref": source_ref,
+                "target": window.get("target") or source_ref_target(source_ref),
+                "intent": window.get("intent"),
+                "window_kind": window.get("window_kind"),
+                "role": window.get("role"),
+                "timestamp_utc": window.get("timestamp_utc"),
+                "selection_reason_code": window.get("selection_reason_code"),
+                "next_read": compact_next_read_ref(next_read),
+                "searched_scope_boundary": window.get("searched_scope_boundary", {}),
+                "omitted_fields": {
+                    "context_actions": bool(window.get("context_actions")),
+                    "expansion_actions": bool(window.get("expansion_actions")),
+                    "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
+                    "text_or_snippets": False,
+                },
+                "privacy": {
+                    "raw_text_included": False,
+                    "raw_paths_included": False,
+                    "source_window_text_included": False,
+                },
+            }
+        )
+    return summaries
+
+
+def compact_next_read_ref(next_read: dict[str, Any]) -> dict[str, Any]:
+    source_ref = next_read.get("source_ref") or {}
+    return {
+        "kind": next_read.get("kind"),
+        "candidate_id": next_read.get("candidate_id"),
+        "source_ref": source_ref,
+        "target": next_read.get("target") or source_ref_target(source_ref),
+        "exact_actions_preserved_in_top_level_next_reads": True,
+    }
+
+
+def compact_provenance_evidence_packet_summaries(evidence_packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries = []
+    for packet in evidence_packets:
+        if not isinstance(packet, dict):
+            continue
+        child_refs = []
+        for child in (packet.get("hit_children") or [])[:COMPACT_EVIDENCE_PACKET_CHILD_REF_LIMIT]:
+            if not isinstance(child, dict):
+                continue
+            source_ref = child.get("source_ref") or {}
+            child_refs.append(
+                {
+                    "candidate_id": child.get("candidate_id"),
+                    "source_ref": source_ref,
+                    "target": child.get("target") or source_ref_target(source_ref),
+                    "role": child.get("role"),
+                    "timestamp_utc": child.get("timestamp_utc"),
+                }
+            )
+        passage = packet.get("evidence_passage") if isinstance(packet.get("evidence_passage"), dict) else {}
+        summaries.append(
+            {
+                "schema_version": 1,
+                "summary_kind": "compact_evidence_packet_ref",
+                "packet_id": packet.get("packet_id"),
+                "parent_ref": packet.get("parent_ref", {}),
+                "hit_child_refs": child_refs,
+                "bounds": packet.get("bounds", {}),
+                "passage_probe": passage.get("passage_shape_probe", {}),
+                "materialized_context": {
+                    "included": bool(packet.get("materialized_context")),
+                    "omitted_from_compact_handoff": bool(packet.get("materialized_context")),
+                },
+                "omitted_fields": {
+                    "hit_children_full": True,
+                    "context_records": bool(packet.get("context_records")),
+                    "evidence_passage_full": bool(passage),
+                    "materialized_context_full": bool(packet.get("materialized_context")),
+                },
+                "privacy": {
+                    "raw_text_included": False,
+                    "raw_paths_included": False,
+                    "raw_session_ids_included": False,
+                },
+            }
+        )
+    return summaries
+
+
+def compact_source_window_packaging(packaging: dict[str, Any]) -> dict[str, Any]:
+    packaging = packaging if isinstance(packaging, dict) else {}
+    selection_policy = packaging.get("selection_policy") if isinstance(packaging.get("selection_policy"), dict) else {}
+    return {
+        "schema_version": 1,
+        "summary_kind": "compact_source_window_packaging_summary",
+        "status": packaging.get("status"),
+        "candidate_window_count": int(packaging.get("candidate_window_count") or 0),
+        "candidate_window_limit": int(packaging.get("candidate_window_limit") or 0),
+        "candidate_count_considered": int(packaging.get("candidate_count_considered") or 0),
+        "candidate_window_omitted_count": int(packaging.get("candidate_window_omitted_count") or 0),
+        "builder": packaging.get("builder"),
+        "raw_text_included": bool(packaging.get("raw_text_included", False)),
+        "source_window_text_included": bool(packaging.get("source_window_text_included", False)),
+        "open_next_metadata_only": bool(packaging.get("open_next_metadata_only", True)),
+        "selection_policy": {
+            "allocator": selection_policy.get("allocator"),
+            "allocator_version": selection_policy.get("allocator_version"),
+            "ordering_basis": selection_policy.get("ordering_basis"),
+            "candidate_count_considered": int(selection_policy.get("candidate_count_considered") or 0),
+            "selected_count": int(selection_policy.get("selected_count") or 0),
+            "omitted_count": int(selection_policy.get("omitted_count") or 0),
+            "distinct_source_count_considered": int(selection_policy.get("distinct_source_count_considered") or 0),
+            "distinct_source_count_selected": int(selection_policy.get("distinct_source_count_selected") or 0),
+            "intent_preferred_candidate_count": int(selection_policy.get("intent_preferred_candidate_count") or 0),
+            "intent_preferred_window_count": int(selection_policy.get("intent_preferred_window_count") or 0),
+            "source_head_window_count": int(selection_policy.get("source_head_window_count") or 0),
+            "fill_window_count": int(selection_policy.get("fill_window_count") or 0),
+            "omission_reason_counts": sanitize_int_counts(selection_policy.get("omission_reason_counts")),
+        },
+        "budget_policy": packaging.get("budget_policy", {}),
+        "field_budget_diagnostics": packaging.get("field_budget_diagnostics", []),
+        "omitted_fields": {
+            "selection_policy_full": bool(selection_policy),
+            "omitted_candidate_facts": bool(selection_policy.get("omitted_candidate_facts")),
+        },
+    }
 
 
 def compact_handoff_source_selection_changed(
@@ -357,6 +505,121 @@ def compact_handoff_source_selection_changed(
         ):
             return True
     return False
+
+
+def compact_stage_diagnostics_summary(stage_diagnostics: dict[str, Any] | None) -> dict[str, Any]:
+    diagnostics = stage_diagnostics if isinstance(stage_diagnostics, dict) else {}
+    stages = diagnostics.get("stages") if isinstance(diagnostics.get("stages"), list) else []
+    compact_stages = []
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        counters = stage.get("counters") if isinstance(stage.get("counters"), dict) else {}
+        compact_stages.append(
+            {
+                "stage": stage.get("stage"),
+                "status": stage.get("status"),
+                "pressure_signal": stage.get("pressure_signal"),
+                "counter_count": len(counters),
+                "key_counters": compact_stage_key_counters(str(stage.get("stage") or ""), counters),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "summary_kind": "compact_stage_diagnostics_summary",
+        "retrieval_mode": diagnostics.get("retrieval_mode"),
+        "product_path": diagnostics.get("product_path"),
+        "dominant_pressure_stage": diagnostics.get("dominant_pressure_stage"),
+        "stage_count": len(stages),
+        "stages": compact_stages,
+        "fielded_candidate_stage_loss": {
+            "dominant_loss_stage": (
+                (diagnostics.get("fielded_candidate_stage_loss") or {}).get("dominant_loss_stage")
+                if isinstance(diagnostics.get("fielded_candidate_stage_loss"), dict)
+                else ""
+            )
+        },
+        "source_catalog": compact_count_summary(diagnostics.get("source_catalog")),
+        "source_plan": compact_count_summary(diagnostics.get("source_plan")),
+        "claim_boundaries": diagnostics.get("claim_boundaries", {}),
+        "full_stage_diagnostics_embedded": False,
+        "full_stage_diagnostics_available_at": [
+            "source_locator_handoff.stage_diagnostics",
+            "retrieval_pressure.stage_diagnostics",
+        ],
+        "privacy": {
+            "raw_text_included": False,
+            "raw_paths_included": False,
+        },
+    }
+
+
+def compact_stage_key_counters(stage_name: str, counters: dict[str, Any]) -> dict[str, Any]:
+    wanted_by_stage = {
+        "query_planning": ["anchor_term_count", "source_window_need_count", "has_primary_intent"],
+        "source_enumeration": ["file_count", "byte_count", "consumed_by_lane_count"],
+        "fielded_index_search": [
+            "candidate_count",
+            "candidate_rows",
+            "candidate_row_limit",
+            "query_stream_count",
+            "saturated_stream_count",
+            "rows_dropped_by_stream_cap_total",
+            "dominant_loss_stage",
+        ],
+        "candidate_materialization": [
+            "candidate_rows_considered",
+            "candidate_rows_retained",
+            "candidate_rows_surfaced",
+        ],
+        "source_grouping_diversity": [
+            "candidate_rows_considered",
+            "candidate_rows_selected",
+            "candidate_rows_dropped",
+            "rows_dropped_by_source_cap",
+        ],
+        "source_window_packaging": [
+            "candidate_window_count",
+            "candidate_window_limit",
+            "candidate_count_considered",
+            "candidate_window_omitted_count",
+            "evidence_packet_count",
+        ],
+        "compact_handoff_output": [
+            "payload_bytes",
+            "estimated_tokens",
+            "candidate_count",
+            "candidates_included",
+            "source_refs_included",
+            "source_windows_included",
+            "evidence_packets_included",
+        ],
+        "searched_scope_no_evidence": ["needed", "candidate_rows_found", "searched_files", "searched_bytes"],
+    }
+    return {key: counters[key] for key in wanted_by_stage.get(stage_name, []) if key in counters}
+
+
+def compact_count_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    summary: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(item, (bool, int, float, str)) and key in {
+            "schema_version",
+            "source",
+            "basis",
+            "file_count",
+            "selected_file_count",
+            "skipped_file_count",
+            "sources_total",
+            "sources_selected",
+            "sources_pruned_hard",
+            "sources_deferred_budget",
+            "raw_paths_included",
+            "raw_text_included",
+        }:
+            summary[str(key)] = item
+    return summary
 
 
 def compact_retrieval_pressure_summary(retrieval_pressure: dict[str, Any] | None) -> dict[str, Any]:
@@ -1894,7 +2157,7 @@ def compact_provenance_source_ref_candidates(
                 "kind": "candidate_source_ref",
                 "candidate_id": candidate.get("candidate_id"),
                 "source_ref": candidate.get("source_ref") or {},
-                "target": candidate.get("target"),
+                "target": candidate.get("target") or source_ref_target(candidate.get("source_ref") or {}),
             }
         )
     for candidate in locator_candidates[:SOURCE_LOCATOR_TOP_CANDIDATES_LIMIT]:
@@ -1907,7 +2170,7 @@ def compact_provenance_source_ref_candidates(
                 "target": source_ref_target(ref),
             }
         )
-    for read in next_reads[:COMPACT_PROVENANCE_NEXT_READ_LIMIT]:
+    for read in next_reads:
         refs.append(
             {
                 "kind": read.get("kind", "next_read"),
@@ -1935,6 +2198,7 @@ def build_compact_handoff_output_budget(
     candidates_included: int,
     source_ref_count_considered: int,
     source_refs_included: int,
+    source_window_count_considered: int,
     source_windows_included: int,
     evidence_packet_count_considered: int,
     evidence_packets_included: int,
@@ -1947,12 +2211,12 @@ def build_compact_handoff_output_budget(
         "measurement_basis": "compact_provenance_handoff_packet_only",
         "limits": {
             "candidates": COMPACT_PROVENANCE_CANDIDATE_LIMIT,
-            "source_refs": COMPACT_PROVENANCE_SOURCE_REF_LIMIT,
+            "source_refs": None,
             "source_windows": SOURCE_WINDOW_LIMIT,
             "evidence_packets": EVIDENCE_PACKET_LIMIT,
             "hit_children_per_packet": EVIDENCE_PACKET_CHILD_LIMIT,
             "context_records_per_packet": EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT,
-            "next_reads": COMPACT_PROVENANCE_NEXT_READ_LIMIT,
+            "next_reads": None,
             "expansion_actions_per_ref": 3,
             "reason_codes_per_candidate": SOURCE_WINDOW_REASON_CODE_LIMIT,
         },
@@ -1966,26 +2230,28 @@ def build_compact_handoff_output_budget(
             "next_reads_considered": next_read_count_considered,
             "next_reads_included": next_reads_included,
             "next_reads_omitted": max(0, next_read_count_considered - next_reads_included),
+            "source_windows_considered": source_window_count_considered,
             "source_windows_included": source_windows_included,
+            "source_windows_omitted": max(0, source_window_count_considered - source_windows_included),
             "evidence_packets_considered": evidence_packet_count_considered,
             "evidence_packets_included": evidence_packets_included,
             "evidence_packets_omitted": max(0, evidence_packet_count_considered - evidence_packets_included),
         },
         "field_actions": {
             "candidates": "included_metadata_capped",
-            "source_refs": "included_exact_capped",
-            "source_windows": "reused_from_source_locator_handoff",
+            "source_refs": "included_exact",
+            "source_windows": "summarized_refs_not_embedded_full_windows",
             "evidence_packets": (
-                "reused_from_source_locator_handoff_with_opt_in_materialized_context_capped"
+                "summarized_refs_materialized_context_not_embedded"
                 if evidence_packet_text_included
-                else "reused_from_source_locator_handoff_metadata_only_capped"
+                else "summarized_refs_metadata_only"
             ),
-            "query_plan": "preserved",
-            "stage_diagnostics": "preserved",
+            "query_plan": "omitted_from_compact_handoff_use_source_locator_handoff",
+            "stage_diagnostics": "summarized_not_embedded",
             "retrieval_pressure": "summarized_not_embedded",
             "no_evidence": "preserved_searched_scope",
-            "next_reads": "included_exact_capped",
-            "expansion_actions": "included_exact_capped",
+            "next_reads": "included_exact",
+            "expansion_actions": "included_exact",
             "snippets": "omitted",
         },
         "claim_boundaries": {
@@ -1993,6 +2259,37 @@ def build_compact_handoff_output_budget(
             "final_answer_quality_claim_supported": False,
             "all_history_completeness_claim_supported": False,
         },
+    }
+
+
+def compact_handoff_field_tiers(output_budget: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "required_preserved": [
+            "status",
+            "answerability_status",
+            "evidence_sufficiency",
+            "source_refs",
+            "next_reads",
+            "no_evidence",
+            "scope.caps",
+            "retrieval_pressure_summary",
+        ],
+        "capped_summarized": [
+            "candidates",
+            "source_windows",
+            "evidence_packets",
+            "source_window_packaging",
+        ],
+        "debug_parent_only": [
+            "source_locator_handoff.query_plan",
+            "source_locator_handoff.stage_diagnostics",
+            "source_locator_handoff.full_source_windows",
+            "source_locator_handoff.full_evidence_packets",
+            "agent_find.retrieval_pressure",
+        ],
+        "counts": output_budget.get("counts", {}),
+        "claim": "compact_handoff_budget_reduces_model_facing_duplication_without_claiming_retrieval_quality_gain",
     }
 
 
@@ -2213,11 +2510,10 @@ def dedupe_provenance_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     deduped = []
     for ref in refs:
+        source_ref = ref.get("source_ref") or {}
         key = (
-            ref.get("kind"),
-            ref.get("candidate_id"),
-            json.dumps(ref.get("source_ref") or {}, sort_keys=True),
-            ref.get("target"),
+            json.dumps(source_ref, sort_keys=True),
+            ref.get("target") or source_ref_target(source_ref),
         )
         if key in seen:
             continue

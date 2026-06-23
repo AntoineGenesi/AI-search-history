@@ -671,14 +671,28 @@ def source_windows_metadata_only(windows: list[dict[str, Any]]) -> bool:
     for window in windows:
         if "snippet" in window:
             return False
+        if window.get("summary_kind") == "compact_source_window_ref":
+            privacy = window.get("privacy") if isinstance(window.get("privacy"), dict) else {}
+            if privacy.get("source_window_text_included") is not False:
+                return False
+            continue
         if window.get("text_included") is not False or window.get("source_window_text_included") is not False:
             return False
     return True
 
 
 def source_windows_preserve_metadata(windows: list[dict[str, Any]]) -> bool:
-    required = {"source_ref", "target", "role", "timestamp_utc", "cwd", "reason_codes", "next_read"}
-    return all(required.issubset(set(window)) for window in windows)
+    compact_required = {"source_ref", "target", "role", "timestamp_utc", "next_read"}
+    full_required = {"source_ref", "target", "role", "timestamp_utc", "cwd", "reason_codes", "next_read"}
+    for window in windows:
+        keys = set(window)
+        if window.get("summary_kind") == "compact_source_window_ref":
+            if not compact_required.issubset(keys):
+                return False
+            continue
+        if not full_required.issubset(keys):
+            return False
+    return True
 
 
 def stage_diagnostics_fielded_bm25_present(stage_diagnostics: dict[str, Any]) -> bool:
@@ -718,7 +732,9 @@ def compact_packet_decision_fields_present(compact: dict[str, Any], locator: dic
             compact.get("claim_boundaries") is not None,
             compact.get("source_window_packaging") is not None,
             locator.get("query_plan") is not None,
-            compact.get("stage_diagnostics") is not None or locator.get("stage_diagnostics") is not None,
+            compact.get("stage_diagnostics_summary") is not None
+            or compact.get("stage_diagnostics") is not None
+            or locator.get("stage_diagnostics") is not None,
         ]
     )
 
