@@ -38,6 +38,16 @@ from .timeutil import parse_datetime, parse_now, timezone_from_args
 AROUND_WINDOW_MINUTES = 30
 MAX_ARTIFACT_BYTES = 200_000
 MAX_LIFECYCLE_COMMITS = 5
+EXACT_SUPPORTED = "exact_supported"
+PROXIMITY_SUPPORTED = "proximity_supported"
+INFERRED_SUPPORT = "inferred"
+UNSUPPORTED_SUPPORT = "unsupported"
+SUPPORT_COUNT_KEYS = {
+    EXACT_SUPPORTED: "exact_support_count",
+    PROXIMITY_SUPPORTED: "proximity_support_count",
+    INFERRED_SUPPORT: "inferred_support_count",
+    UNSUPPORTED_SUPPORT: "unsupported_support_count",
+}
 
 
 @dataclass(frozen=True)
@@ -118,21 +128,22 @@ def build_forensics_payload(args) -> dict:
     warnings.extend(intent.warnings)
     jsonl_evidence = _classify_jsonl_evidence(jsonl_result, cwd=cwd, repo=repo)
 
-    artifact_checks = _artifact_checks(
+    artifact_statuses = _artifact_checks(
         hints=hints,
         git_payload=git_payload,
         jsonl_evidence=jsonl_evidence,
         cwd=cwd,
         repo=repo,
     )
-    review_evidence = _discover_review_evidence(hints.task, cwd=cwd, repo=repo)
-    warnings.extend(_artifact_warnings(artifact_checks))
+    artifact_checks = _label_artifact_support([item.to_dict() for item in artifact_statuses])
+    review_evidence = _label_review_support(_discover_review_evidence(hints.task, cwd=cwd, repo=repo))
+    warnings.extend(_artifact_warnings(artifact_statuses))
     warnings.extend(item["warning"] for item in review_evidence if item.get("warning"))
 
     confidence = _confidence(
         git_payload=git_payload,
         jsonl_evidence=jsonl_evidence,
-        artifact_checks=artifact_checks,
+        artifact_checks=artifact_statuses,
         review_evidence=review_evidence,
     )
     payload = {
@@ -146,7 +157,7 @@ def build_forensics_payload(args) -> dict:
         "source_plan": source_plan,
         "git": git_payload,
         "jsonl_evidence": jsonl_evidence,
-        "artifact_checks": [item.to_dict() for item in artifact_checks],
+        "artifact_checks": artifact_checks,
         "review_evidence": review_evidence,
         "warnings": sorted(set(warnings)),
         "blind_spots": sorted(set(jsonl_result.get("blind_spots", []) + plan.blind_spots)),
@@ -154,7 +165,7 @@ def build_forensics_payload(args) -> dict:
     workflow = build_forensics_workflow(
         git_payload=git_payload,
         jsonl_evidence=jsonl_evidence,
-        artifact_checks=[item.to_dict() for item in artifact_checks],
+        artifact_checks=artifact_checks,
         review_evidence=review_evidence,
         confidence_label=confidence["label"],
     )
@@ -172,6 +183,8 @@ def build_forensics_workflow(
     review_evidence: list[dict],
     confidence_label: str,
 ) -> dict:
+    artifact_checks = _label_artifact_support(artifact_checks)
+    review_evidence = _label_review_support(review_evidence)
     phases = _phase_timeline(
         git_payload=git_payload,
         jsonl_evidence=jsonl_evidence,
@@ -181,12 +194,19 @@ def build_forensics_workflow(
     )
     review_gate = _review_gate(git_payload=git_payload, review_evidence=review_evidence)
     joins = _claim_action_review_joins(phases=phases, review_gate=review_gate)
+    support_summary = _support_summary(
+        phases=phases,
+        joins=joins,
+        artifact_checks=artifact_checks,
+        review_evidence=review_evidence,
+    )
     diagnostics = _workflow_diagnostics(
         phases=phases,
         joins=joins,
         review_gate=review_gate,
         artifact_checks=artifact_checks,
         review_evidence=review_evidence,
+        support_summary=support_summary,
     )
     provenance_lifecycle = _provenance_lifecycle_summary(
         git_payload=git_payload,
@@ -195,6 +215,7 @@ def build_forensics_workflow(
         review_gate=review_gate,
         artifact_checks=artifact_checks,
         review_evidence=review_evidence,
+        support_summary=support_summary,
     )
     return {
         "phase_timeline": phases,
@@ -202,6 +223,7 @@ def build_forensics_workflow(
         "review_gate": review_gate,
         "diagnostics": diagnostics,
         "provenance_lifecycle": provenance_lifecycle,
+        "support_summary": support_summary,
     }
 
 
@@ -301,7 +323,7 @@ def _phase_timeline(
         )
 
     for index, item in enumerate(artifact_checks, 1):
-        if not item.get("exists"):
+        if not _valid_artifact_support(item):
             continue
         rows.append(
             _phase_row(
@@ -339,6 +361,7 @@ def _phase_timeline(
     rows.sort(key=lambda row: row["order_key"])
     for index, row in enumerate(rows, 1):
         row["phase_id"] = f"phase-{index:03d}"
+    _label_phase_support(rows, artifact_checks)
     return rows
 
 
@@ -516,17 +539,118 @@ def _join(
         uncertainty.append("join_inferred_from_correlated_forensics_bundle")
     basis = _join_basis(source, target, relation=relation, support_level=support_level)
     uncertainty.extend(item for item in basis.get("uncertainty", []) if item not in uncertainty)
+    support_status = _support_status_for_basis_kind(basis["basis_kind"])
     return {
         "from_id": source["phase_id"],
         "to_id": target["phase_id"],
         "relation": relation,
         "support_level": support_level,
         "basis_kind": basis["basis_kind"],
+        "support_status": support_status,
+        "support_basis_kind": basis["basis_kind"],
         "join_basis": basis,
         "source_refs": [source.get("source_ref"), target.get("source_ref")],
         "confidence": confidence or basis.get("confidence") or ("high" if support_level == "direct" else "medium"),
         "uncertainty": uncertainty,
     }
+
+
+def _support_status_for_basis_kind(basis_kind: str | None) -> str:
+    if basis_kind == "exact_direct":
+        return EXACT_SUPPORTED
+    if basis_kind in {"direct", "indirect_bundle", "timestamp_only"}:
+        return PROXIMITY_SUPPORTED
+    if basis_kind == "inferred":
+        return INFERRED_SUPPORT
+    return UNSUPPORTED_SUPPORT
+
+
+def _support_count_key(status: str | None) -> str:
+    return SUPPORT_COUNT_KEYS.get(str(status or ""), "unsupported_support_count")
+
+
+def _empty_support_counts() -> dict[str, int]:
+    return {key: 0 for key in SUPPORT_COUNT_KEYS.values()}
+
+
+def _valid_artifact_support(item: dict) -> bool:
+    return bool(item.get("exists") and item.get("inside_root") and item.get("is_file"))
+
+
+def _label_artifact_support(items: list[dict]) -> list[dict]:
+    labeled = []
+    for item in items:
+        row = dict(item)
+        if _valid_artifact_support(row):
+            row["support_status"] = EXACT_SUPPORTED
+            row["support_basis_kind"] = "exact_direct"
+            row["support_boundary"] = "artifact_file_existence_only_not_content_correctness"
+        else:
+            row["support_status"] = UNSUPPORTED_SUPPORT
+            row["support_basis_kind"] = "inferred"
+            row["support_boundary"] = "missing_unsafe_outside_root_or_non_file_artifacts_do_not_count_as_support"
+        labeled.append(row)
+    return labeled
+
+
+def _label_review_support(items: list[dict]) -> list[dict]:
+    labeled = []
+    for item in items:
+        row = dict(item)
+        verdict = row.get("review_verdict") if isinstance(row.get("review_verdict"), dict) else None
+        action = row.get("claim_action") if isinstance(row.get("claim_action"), dict) else None
+        if not row.get("exists"):
+            status = UNSUPPORTED_SUPPORT
+            basis = "inferred"
+        elif verdict and verdict.get("action"):
+            status = EXACT_SUPPORTED
+            basis = "exact_direct"
+        elif action and action.get("action") and action.get("action") != UNSUPPORTED:
+            status = PROXIMITY_SUPPORTED
+            basis = "direct"
+        else:
+            status = INFERRED_SUPPORT
+            basis = "inferred"
+        row["support_status"] = status
+        row["support_basis_kind"] = basis
+        row["support_boundary"] = "task_or_review_artifact_metadata_and_verdict_only_not_final_answer_quality"
+        labeled.append(row)
+    return labeled
+
+
+def _label_phase_support(phases: list[dict], artifact_checks: list[dict]) -> None:
+    artifact_status_by_path = {str(item.get("path")): item for item in artifact_checks if item.get("path")}
+    for row in phases:
+        status = INFERRED_SUPPORT
+        basis = "inferred"
+        if row.get("claim_action") == UNSUPPORTED:
+            status = UNSUPPORTED_SUPPORT
+        elif row.get("source_kind") == "git" and row.get("evidence_kind") == "code_change":
+            status = EXACT_SUPPORTED
+            basis = "exact_direct"
+        elif row.get("source_kind") == "artifact":
+            source_path = (row.get("source_ref") or {}).get("path")
+            artifact = artifact_status_by_path.get(str(source_path))
+            if artifact and _valid_artifact_support(artifact):
+                status = EXACT_SUPPORTED
+                basis = "exact_direct"
+            else:
+                status = UNSUPPORTED_SUPPORT
+        elif row.get("source_kind") == "review":
+            if row.get("review_verdict"):
+                status = EXACT_SUPPORTED
+                basis = "exact_direct"
+            else:
+                status = PROXIMITY_SUPPORTED
+                basis = "direct"
+        else:
+            artifact_refs = [str(item) for item in row.get("artifact_refs") or []]
+            if any(_valid_artifact_support(artifact_status_by_path.get(ref, {})) for ref in artifact_refs):
+                status = EXACT_SUPPORTED
+                basis = "exact_direct"
+        row["support_status"] = status
+        row["support_basis_kind"] = basis
+        row["support_boundary"] = "phase support labels classify evidence strength, not artifact content correctness"
 
 
 def _join_basis(source: dict, target: dict, *, relation: str, support_level: str) -> dict:
@@ -626,6 +750,7 @@ def _provenance_lifecycle_summary(
     review_gate: dict,
     artifact_checks: list[dict],
     review_evidence: list[dict],
+    support_summary: dict,
 ) -> dict:
     lifecycle = git_payload.get("lifecycle") if isinstance(git_payload.get("lifecycle"), dict) else {}
     branch = git_payload.get("branch") if isinstance(git_payload.get("branch"), dict) else {}
@@ -676,6 +801,8 @@ def _provenance_lifecycle_summary(
             "join_basis_counts": basis_counts,
             "phase_source_counts": phase_source_counts,
             "review_gate_status": review_gate.get("status"),
+            "support_summary": support_summary,
+            **_flat_support_counts(support_summary),
         },
         "git_lifecycle": {
             "repo": git_payload.get("repo"),
@@ -723,6 +850,7 @@ def _workflow_diagnostics(
     review_gate: dict,
     artifact_checks: list[dict],
     review_evidence: list[dict],
+    support_summary: dict,
 ) -> dict:
     phase_counts: dict[str, int] = {}
     for row in phases:
@@ -761,7 +889,61 @@ def _workflow_diagnostics(
         "inferred_only_count": inferred_only_count,
         "indirect_join_count": indirect_count,
         "unsupported_claim_count": unsupported_count,
+        "support_summary": support_summary,
+        **_flat_support_counts(support_summary),
     }
+
+
+def _support_summary(
+    *,
+    phases: list[dict],
+    joins: list[dict],
+    artifact_checks: list[dict],
+    review_evidence: list[dict],
+) -> dict:
+    counts = _empty_support_counts()
+    status_counts: dict[str, int] = {}
+    basis_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    unsupported_artifact_count = 0
+    rows = [
+        ("phase_timeline", row)
+        for row in phases
+    ] + [
+        ("claim_action_review_joins", row)
+        for row in joins
+    ] + [
+        ("artifact_checks", row)
+        for row in artifact_checks
+    ] + [
+        ("review_evidence", row)
+        for row in review_evidence
+    ]
+    for source, row in rows:
+        status = str(row.get("support_status") or UNSUPPORTED_SUPPORT)
+        basis = str(row.get("support_basis_kind") or row.get("basis_kind") or "unknown")
+        counts[_support_count_key(status)] += 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        basis_counts[basis] = basis_counts.get(basis, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if source == "artifact_checks" and status == UNSUPPORTED_SUPPORT:
+            unsupported_artifact_count += 1
+    return {
+        "schema_version": 1,
+        **counts,
+        "support_status_counts": status_counts,
+        "support_basis_counts": basis_counts,
+        "support_source_counts": source_counts,
+        "unsupported_artifact_count": unsupported_artifact_count,
+        "support_boundary": "support labels classify evidence precision only; they do not prove artifact content correctness, root cause, retrieval quality, or final-answer quality",
+    }
+
+
+def _flat_support_counts(support_summary: dict) -> dict[str, int]:
+    counts = _empty_support_counts()
+    for key in counts:
+        counts[key] = int(support_summary.get(key) or 0)
+    return counts
 
 
 def _git_payload(*, cwd: Path, repo: Path | None, hints: ForensicsHints) -> tuple[dict, list[str], str | None]:

@@ -886,9 +886,11 @@ def compact_joins(forensics_payload: dict[str, Any] | None, hints: dict[str, str
             "path_last_change": None,
             "artifact_checks": [],
             "review_evidence": [],
+            "support_summary": empty_support_summary(),
             "missing": ["forensics_not_run_no_commit_path_task_branch_or_around_hint"],
         }
     git = forensics_payload.get("git", {})
+    workflow = forensics_payload.get("forensics") or {}
     return {
         "status": "joined" if any((git.get("commit"), git.get("branch"), git.get("path_last_change"), forensics_payload.get("review_evidence"))) else "no_join_evidence",
         "hints": forensics_payload.get("forensics", {}).get("hints", hints),
@@ -899,6 +901,7 @@ def compact_joins(forensics_payload: dict[str, Any] | None, hints: dict[str, str
         "path_last_change": git.get("path_last_change"),
         "artifact_checks": compact_artifact_checks(forensics_payload.get("artifact_checks", [])),
         "review_evidence": compact_review_evidence(forensics_payload.get("review_evidence", [])),
+        "support_summary": workflow.get("support_summary") or empty_support_summary(),
         "missing": missing_join_labels(forensics_payload),
     }
 
@@ -930,6 +933,8 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
                 "review_gate_verdict": None,
                 "missing_evidence_flags": ["forensics_not_run"],
                 "join_basis_counts": {},
+                "support_summary": empty_support_summary(),
+                **empty_support_counts(),
                 "provenance": {},
             },
         }
@@ -943,6 +948,7 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
     if not phase_timeline and joins_payload and joins_payload.get("review_evidence"):
         phase_timeline = phase_timeline_from_compact_review_evidence(joins_payload.get("review_evidence", []))
         review_gate = review_gate_from_compact_review_evidence(joins_payload.get("review_evidence", []))
+        support_summary = joins_payload.get("support_summary") or empty_support_summary()
         diagnostics = {
             "phase_counts": {"review": len(phase_timeline)},
             "join_count": 0,
@@ -953,7 +959,10 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
             "inferred_only_count": 0,
             "indirect_join_count": 0,
             "unsupported_claim_count": 0,
+            "support_summary": support_summary,
+            **flat_support_counts(support_summary),
         }
+    support_summary = workflow.get("support_summary") or diagnostics.get("support_summary") or empty_support_summary()
     return {
         "status": "joined" if phase_timeline else "no_phase_evidence",
         "phase_timeline": phase_timeline,
@@ -961,6 +970,7 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
         "review_gate": review_gate,
         "diagnostics": diagnostics,
         "provenance_lifecycle": provenance_lifecycle,
+        "support_summary": support_summary,
         "summary": {
             "phase_count": len(phase_timeline),
             "join_count": len(joins),
@@ -968,9 +978,39 @@ def compact_forensics_workflow(forensics_payload: dict[str, Any] | None, joins_p
             "review_gate_verdict": review_gate.get("verdict"),
             "missing_evidence_flags": diagnostics.get("missing_evidence_flags", []),
             "join_basis_counts": diagnostics.get("join_basis_counts", {}),
+            "support_summary": support_summary,
+            **flat_support_counts(support_summary),
             "provenance": provenance_summary or {},
         },
     }
+
+
+def empty_support_counts() -> dict[str, int]:
+    return {
+        "exact_support_count": 0,
+        "proximity_support_count": 0,
+        "inferred_support_count": 0,
+        "unsupported_support_count": 0,
+    }
+
+
+def empty_support_summary() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        **empty_support_counts(),
+        "support_status_counts": {},
+        "support_basis_counts": {},
+        "support_source_counts": {},
+        "unsupported_artifact_count": 0,
+        "support_boundary": "support labels classify evidence precision only; they do not prove artifact content correctness, root cause, retrieval quality, or final-answer quality",
+    }
+
+
+def flat_support_counts(summary: dict[str, Any]) -> dict[str, int]:
+    counts = empty_support_counts()
+    for key in counts:
+        counts[key] = int(summary.get(key) or 0)
+    return counts
 
 
 def phase_timeline_from_compact_review_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -991,6 +1031,8 @@ def phase_timeline_from_compact_review_evidence(items: list[dict[str, Any]]) -> 
                 "review_verdict": verdict or None,
                 "confidence": "high" if verdict else "medium",
                 "uncertainty": [] if verdict else ["review_artifact_without_explicit_verdict"],
+                "support_status": item.get("support_status"),
+                "support_basis_kind": item.get("support_basis_kind"),
             }
         )
     return phases
@@ -1104,6 +1146,8 @@ def compact_artifact_checks(items: list[dict[str, Any]]) -> list[dict[str, Any]]
             "git_tracked": item.get("git_tracked"),
             "git_last_change": item.get("git_last_change"),
             "reason": item.get("reason"),
+            "support_status": item.get("support_status"),
+            "support_basis_kind": item.get("support_basis_kind"),
         }
         for item in items[:12]
     ]
@@ -1118,6 +1162,8 @@ def compact_review_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]
             "claim_action": item.get("claim_action"),
             "git_last_change": item.get("git_last_change"),
             "warning": item.get("warning"),
+            "support_status": item.get("support_status"),
+            "support_basis_kind": item.get("support_basis_kind"),
         }
         for item in items[:12]
     ]
@@ -1313,6 +1359,7 @@ def build_final_answer_source_use_contract(
         "source_locator_next_reads": next_reads,
         "structured_tool_event_count": tool_proof.get("event_count", 0),
         "task_review_join_status": joins.get("status"),
+        "task_review_join_support_summary": joins.get("support_summary") or empty_support_summary(),
         "uncertainty_labels": [item.get("label") for item in uncertainty],
     }
     if status == "no_evidence":
@@ -1346,6 +1393,7 @@ def build_final_answer_source_use_contract(
             "global_absence_claim": "not_allowed",
             "jsonl_value_speed_or_token_efficiency_claim": "not_allowed_without_separate_reviewed_evidence",
             "evidence_vs_inference_required": True,
+            "support_precision_claim": "counts_only_not_artifact_content_correctness",
         },
     }
 
@@ -1696,6 +1744,10 @@ def guided_answer_gate(
         "source_use_required": final_answer_contract.get("source_use_required"),
         "required_actions": required_actions,
         "completion_criteria": completion_criteria,
+        "support_summary": (final_answer_contract.get("evidence_inputs") or {}).get(
+            "task_review_join_support_summary",
+            empty_support_summary(),
+        ),
         "forbidden_claims": [
             "root_cause_without_linked_reviewed_evidence",
             "global_absence_or_all_history_completeness",
