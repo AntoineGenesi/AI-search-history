@@ -38,6 +38,15 @@ INLINE_TIMELINE_LIMIT = 12
 INLINE_EVENT_LIMIT = 12
 DEFAULT_GOLD_MANIFEST = Path("benchmarks/real_history_gold/sanitized_cases.json")
 
+DECISION_CONTEXT_ROUTES = {
+    "conversation_reconstruction",
+    "git_history_reconstruction",
+    "task_review_join",
+    "tool_action_proof",
+    "source_ref_followup",
+    "no_evidence_scoped_report",
+}
+
 SUPPORTED_QUESTION_FAMILIES = {
     "why_did_this_happen": "Vague bug, incident, regression, symptom, or assumption questions.",
     "provenance": "Task, path, branch, commit, review, or artifact provenance questions.",
@@ -132,6 +141,33 @@ def build_semantic_debug_payload(
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
+    decision_context = build_decision_context(
+        query=agent_find["query"]["original"],
+        family=family,
+        source_scope=source_scope,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        joins=joins,
+        no_evidence=no_evidence,
+        uncertainty=uncertainty,
+        next_reads=next_reads,
+        hints=hints,
+        source_plan=source_plan,
+    )
+    audit_plan = build_audit_plan(
+        query=agent_find["query"]["original"],
+        routes=decision_context["selected_routes"],
+        source_scope=source_scope,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        joins=joins,
+        no_evidence=no_evidence,
+        next_reads=next_reads,
+        next_commands=decision_context["next_commands"],
+        uncertainty=uncertainty,
+        hints=hints,
+        watchlist_inputs=list(getattr(args, "watchlist", []) or []),
+    )
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=result,
@@ -184,6 +220,8 @@ def build_semantic_debug_payload(
         "tool_action_proof": tool_proof,
         "task_review_commit_joins": joins,
         "forensics_workflow": forensics_workflow,
+        "decision_context": decision_context,
+        "audit_plan": audit_plan,
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
@@ -278,6 +316,458 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
             {"label": label, "meaning": meaning} for label, meaning in sorted(UNSUPPORTED_QUESTION_FAMILIES.items())
         ],
     }
+
+
+def build_decision_context(
+    *,
+    query: str,
+    family: dict[str, Any],
+    source_scope: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    no_evidence: dict[str, Any],
+    uncertainty: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+    hints: dict[str, str | None],
+    source_plan: dict[str, Any],
+) -> dict[str, Any]:
+    project_time_needed = project_time_reconstruction_needed(query, hints)
+    selected_routes = select_decision_routes(
+        family=family,
+        status=no_evidence.get("answer_scope"),
+        candidates=candidates,
+        tool_proof=tool_proof,
+        joins=joins,
+        project_time_needed=project_time_needed,
+    )
+    return {
+        "primary_question_family": family.get("primary"),
+        "decision_summary": decision_summary(
+            status=no_evidence.get("answer_scope"),
+            candidate_count=len(candidates),
+            route_count=len(selected_routes),
+            project_time_needed=project_time_needed,
+        ),
+        "decision_time_or_window": decision_time_or_window(
+            candidates=candidates,
+            hints=hints,
+            source_plan=source_plan,
+        ),
+        "project_time_reconstruction_needed": project_time_needed,
+        "selected_routes": selected_routes,
+        "evidence_handles": decision_evidence_handles(candidates, tool_proof, joins),
+        "searched_scope": source_scope.get("searched_scope"),
+        "not_searched_scope": source_scope.get("not_searched_scope"),
+        "confidence": decision_confidence(
+            candidates=candidates,
+            tool_proof=tool_proof,
+            joins=joins,
+            no_evidence=no_evidence,
+            source_scope=source_scope,
+        ),
+        "uncertainty": uncertainty,
+        "next_reads": next_reads[:12],
+        "next_commands": build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False),
+    }
+
+
+def build_audit_plan(
+    *,
+    query: str,
+    routes: list[str],
+    source_scope: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    no_evidence: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    next_commands: list[dict[str, Any]],
+    uncertainty: list[dict[str, Any]],
+    hints: dict[str, str | None],
+    watchlist_inputs: list[str],
+) -> dict[str, Any]:
+    route_order = order_decision_routes(routes)
+    return {
+        "watchlist": parse_watchlist(query, watchlist_inputs),
+        "route_order": route_order,
+        "checkpoint_plan": checkpoint_plan(route_order),
+        "resume_from": resume_from(next_reads, route_order),
+        "replay_commands": build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=True),
+        "retained_evidence_ledger": retained_evidence_ledger(candidates, tool_proof, joins),
+        "omitted_or_dropped_scope": omitted_or_dropped_scope(source_scope, no_evidence),
+        "aggregate_report": {
+            "candidate_count": len(candidates),
+            "structured_event_count": tool_proof.get("event_count", 0),
+            "task_review_join_status": joins.get("status"),
+            "no_evidence_answer_scope": no_evidence.get("answer_scope"),
+            "uncertainty_labels": [item.get("label") for item in uncertainty],
+            "route_count": len(route_order),
+        },
+        "cap_pressure_notes": cap_pressure_notes(source_scope),
+        "next_commands": next_commands,
+    }
+
+
+def project_time_reconstruction_needed(query: str, hints: dict[str, str | None]) -> bool:
+    text = query.lower()
+    decision_terms = (
+        "decision",
+        "decide",
+        "decided",
+        "rationale",
+        "why did",
+        "why was",
+        "why were",
+        "time",
+        "date",
+        "when",
+        "around",
+        "before",
+        "after",
+        "commit",
+        "branch",
+        "git",
+        "codebase",
+        "project state",
+        "repo state",
+        "what was i talking about",
+    )
+    return any(hints.get(key) for key in ("commit", "branch", "around", "path")) or any(term in text for term in decision_terms)
+
+
+def select_decision_routes(
+    *,
+    family: dict[str, Any],
+    status: str | None,
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    project_time_needed: bool,
+) -> list[str]:
+    selected = ["conversation_reconstruction"]
+    detected = set(family.get("detected_supported", []))
+    if project_time_needed:
+        selected.append("git_history_reconstruction")
+    if joins.get("status") in {"joined", "no_join_evidence", "not_run"} and (
+        project_time_needed or "provenance" in detected or joins.get("review_evidence")
+    ):
+        selected.append("task_review_join")
+    if tool_proof.get("event_count", 0) or "claimed_action" in detected:
+        selected.append("tool_action_proof")
+    if candidates:
+        selected.append("source_ref_followup")
+    if status == "not_found_in_searched_scope" or "no_evidence" in detected:
+        selected.append("no_evidence_scoped_report")
+    return [route for route in dedupe(selected) if route in DECISION_CONTEXT_ROUTES]
+
+
+def decision_summary(
+    *,
+    status: str | None,
+    candidate_count: int,
+    route_count: int,
+    project_time_needed: bool,
+) -> str:
+    if status == "not_found_in_searched_scope":
+        return "No final decision is claimed; the packet preserves searched-scope no-evidence boundaries and follow-up routes."
+    if candidate_count:
+        suffix = " including project-time reconstruction" if project_time_needed else ""
+        return f"Candidate decision context is available from {candidate_count} bounded evidence handle(s) across {route_count} route(s){suffix}."
+    return "Decision context is not established yet; use the selected routes and next commands to gather source-backed evidence."
+
+
+def decision_time_or_window(
+    *,
+    candidates: list[dict[str, Any]],
+    hints: dict[str, str | None],
+    source_plan: dict[str, Any],
+) -> dict[str, Any]:
+    query_window = (source_plan.get("query") or {}).get("date_window") or {}
+    candidate_times = [item.get("timestamp_utc") for item in candidates if item.get("timestamp_utc")]
+    return {
+        "around_hint": hints.get("around"),
+        "query_date_window": {
+            "start": query_window.get("start"),
+            "end": query_window.get("end"),
+            "reason": query_window.get("reason"),
+        },
+        "candidate_timestamp_min": min(candidate_times) if candidate_times else None,
+        "candidate_timestamp_max": max(candidate_times) if candidate_times else None,
+        "basis": "explicit_hint_or_query_window_or_candidate_timestamps",
+    }
+
+
+def decision_evidence_handles(
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+) -> list[dict[str, Any]]:
+    handles: list[dict[str, Any]] = []
+    for item in candidates[:8]:
+        if item.get("source_ref"):
+            handles.append(
+                {
+                    "kind": "candidate_source_ref",
+                    "candidate_id": item.get("candidate_id"),
+                    "source_ref": item.get("source_ref"),
+                    "confidence": item.get("confidence"),
+                }
+            )
+    for event in tool_proof.get("events", [])[:6]:
+        if event.get("source_ref"):
+            handles.append(
+                {
+                    "kind": "tool_event_source_ref",
+                    "event_id": event.get("event_id"),
+                    "event_type": event.get("event_type"),
+                    "source_ref": event.get("source_ref"),
+                    "confidence": event.get("confidence"),
+                }
+            )
+    for item in joins.get("review_evidence", [])[:6]:
+        if item.get("path"):
+            handles.append(
+                {
+                    "kind": "task_review_artifact",
+                    "path": item.get("path"),
+                    "exists": item.get("exists"),
+                    "review_verdict": item.get("review_verdict"),
+                }
+            )
+    if joins.get("commit"):
+        handles.append({"kind": "git_commit", "commit": joins.get("commit"), "confidence": joins.get("confidence")})
+    if joins.get("branch"):
+        handles.append({"kind": "git_branch", "branch": joins.get("branch"), "confidence": joins.get("confidence")})
+    return handles[:20]
+
+
+def decision_confidence(
+    *,
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    no_evidence: dict[str, Any],
+    source_scope: dict[str, Any],
+) -> dict[str, Any]:
+    if no_evidence.get("needed"):
+        level = "low"
+        reasons = ["no_candidate_rows_in_searched_scope"]
+    else:
+        signals = 0
+        reasons = []
+        if candidates:
+            signals += 1
+            reasons.append("candidate_source_refs_available")
+        if tool_proof.get("event_count", 0):
+            signals += 1
+            reasons.append("structured_tool_events_available")
+        if joins.get("status") == "joined":
+            signals += 1
+            reasons.append("task_review_or_git_join_available")
+        if signals >= 2:
+            level = "medium"
+        elif signals == 1:
+            level = "low"
+        else:
+            level = "low"
+            reasons.append("no_independent_decision_evidence")
+    if source_scope.get("cap_hit", {}).get("hit"):
+        reasons.append("scope_cap_limited")
+    return {
+        "level": level,
+        "basis": reasons,
+        "claim_boundary": "confidence describes route/evidence readiness, not final-answer truth",
+    }
+
+
+def parse_watchlist(query: str, watchlist_inputs: list[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, value in enumerate(watchlist_inputs, 1):
+        text = str(value).strip()
+        if text:
+            rows.append({"predicate": text, "source": "cli", "watch_id": f"watch-{index:03d}"})
+    lowered = query.lower()
+    inferred = {
+        "failure": "failure_or_regression_mentions",
+        "regression": "failure_or_regression_mentions",
+        "blocked": "blocked_or_unverified_workflow",
+        "blocker": "blocked_or_unverified_workflow",
+        "not reviewed": "review_gap",
+        "unreviewed": "review_gap",
+        "claim": "claim_requires_action_proof",
+        "claimed": "claim_requires_action_proof",
+        "assumption": "assumption_or_rationale_gap",
+        "rationale": "assumption_or_rationale_gap",
+    }
+    for term, predicate in inferred.items():
+        if term in lowered and all(item["predicate"] != predicate for item in rows):
+            rows.append({"predicate": predicate, "source": "query_terms", "matched_term": term})
+    return rows
+
+
+def order_decision_routes(routes: list[str]) -> list[str]:
+    preferred = [
+        "conversation_reconstruction",
+        "git_history_reconstruction",
+        "task_review_join",
+        "tool_action_proof",
+        "source_ref_followup",
+        "no_evidence_scoped_report",
+    ]
+    route_set = set(routes)
+    return [route for route in preferred if route in route_set]
+
+
+def checkpoint_plan(route_order: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "checkpoint_id": f"route-{index:02d}",
+            "route": route,
+            "complete_when": checkpoint_completion(route),
+        }
+        for index, route in enumerate(route_order, 1)
+    ]
+
+
+def checkpoint_completion(route: str) -> str:
+    return {
+        "conversation_reconstruction": "candidate source refs have been opened with read-more and evidence vs inference is separated",
+        "git_history_reconstruction": "git commit/branch/path/time commands have been checked without treating git state as user intent alone",
+        "task_review_join": "task and review artifacts have been read for verdicts, blockers, and handoff claims",
+        "tool_action_proof": "structured tool events have been confirmed from source refs before action claims",
+        "source_ref_followup": "next_reads have been replayed for surrounding context as needed",
+        "no_evidence_scoped_report": "searched, not-searched, missing, and cap-limited scope have been stated",
+    }.get(route, "route evidence checked")
+
+
+def resume_from(next_reads: list[dict[str, Any]], route_order: list[str]) -> dict[str, Any]:
+    first_read = next((item for item in next_reads if item.get("target")), None)
+    return {
+        "route": route_order[0] if route_order else None,
+        "next_read_target": first_read.get("target") if first_read else None,
+        "instruction": "start with next_read_target, then follow route_order checkpoints",
+    }
+
+
+def retained_evidence_ledger(
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ledger: list[dict[str, Any]] = []
+    for item in candidates[:8]:
+        ledger.append(
+            {
+                "kind": "candidate",
+                "id": item.get("candidate_id"),
+                "source_ref": item.get("source_ref"),
+                "retained_fields": ["candidate_id", "source_ref", "timestamp_utc", "role", "confidence", "reason_codes"],
+                "omitted_fields": ["raw_private_text"],
+            }
+        )
+    for event in tool_proof.get("events", [])[:6]:
+        ledger.append(
+            {
+                "kind": "tool_event",
+                "id": event.get("event_id"),
+                "source_ref": event.get("source_ref"),
+                "retained_fields": ["event_id", "event_type", "tool_name", "source_ref", "timestamp_utc", "confidence"],
+                "omitted_fields": ["raw_tool_payload"],
+            }
+        )
+    for item in joins.get("review_evidence", [])[:6]:
+        ledger.append(
+            {
+                "kind": "task_review_artifact",
+                "id": item.get("path"),
+                "path": item.get("path"),
+                "retained_fields": ["path", "exists", "review_verdict", "claim_action"],
+                "omitted_fields": ["artifact_body"],
+            }
+        )
+    return ledger[:20]
+
+
+def omitted_or_dropped_scope(source_scope: dict[str, Any], no_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    not_searched = source_scope.get("not_searched_scope") or {}
+    excluded = source_scope.get("excluded_scope") or {}
+    cap_hit = source_scope.get("cap_hit") or {}
+    if not_searched:
+        rows.append({"kind": "not_searched_scope", "details": not_searched})
+    if excluded:
+        rows.append({"kind": "excluded_scope", "details": excluded})
+    if cap_hit.get("hit"):
+        rows.append({"kind": "cap_limited_scope", "details": cap_hit})
+    if no_evidence.get("needed"):
+        rows.append({"kind": "searched_scope_no_evidence", "details": no_evidence.get("searched_scope")})
+    return rows
+
+
+def cap_pressure_notes(source_scope: dict[str, Any]) -> list[dict[str, Any]]:
+    cap_hit = source_scope.get("cap_hit") or {}
+    if not cap_hit.get("hit"):
+        return [{"status": "no_cap_pressure_reported", "caps_hit": []}]
+    return [
+        {
+            "status": "cap_pressure_reported",
+            "caps_hit": list(cap_hit.get("caps_hit", [])),
+            "meaning": "recall may be limited to searched scope; do not claim all-history completeness",
+        }
+    ]
+
+
+def build_next_commands(
+    next_reads: list[dict[str, Any]],
+    *,
+    hints: dict[str, str | None],
+    include_semantic_debug_replay: bool,
+) -> list[dict[str, Any]]:
+    _ = include_semantic_debug_replay
+    commands: list[dict[str, Any]] = []
+    for read in next_reads[:8]:
+        actions = read.get("expansion_actions") or []
+        for action in actions[:1]:
+            argv = action.get("argv")
+            if argv:
+                commands.append(
+                    {
+                        "command_family": "read_more",
+                        "argv": argv,
+                        "source": "next_reads.expansion_actions",
+                        "raw_private_text_included": False,
+                    }
+                )
+                break
+        if not actions and read.get("target"):
+            commands.append(
+                {
+                    "command_family": "read_more",
+                    "argv": ["jsonl-history-search", "read-more", read["target"], "--format", "json"],
+                    "source": "next_reads.target",
+                    "raw_private_text_included": False,
+                }
+            )
+    if hints.get("commit"):
+        commands.append(
+            {
+                "command_family": "git_show",
+                "argv": ["git", "show", "--stat", str(hints["commit"])],
+                "source": "commit_hint",
+                "raw_private_text_included": False,
+            }
+        )
+    if hints.get("path"):
+        commands.append(
+            {
+                "command_family": "git_log_path",
+                "argv": ["git", "log", "--oneline", "--", str(hints["path"])],
+                "source": "path_hint",
+                "raw_private_text_included": False,
+            }
+        )
+    return dedupe_dicts(commands)[:16]
 
 
 def compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

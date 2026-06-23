@@ -340,6 +340,12 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_debug.add_argument("--branch", default=None)
     semantic_debug.add_argument("--around", default=None)
     semantic_debug.add_argument(
+        "--watchlist",
+        action="append",
+        default=[],
+        help="Repeatable semantic-debug audit predicate to preserve in audit_plan.watchlist.",
+    )
+    semantic_debug.add_argument(
         "--gold-manifest",
         default=str(DEFAULT_GOLD_MANIFEST),
         help="Committed sanitized real-history gold manifest for coverage-only caveats; no private bridge is required.",
@@ -1635,6 +1641,20 @@ def main(argv: list[str] | None = None) -> int:
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
                     "claim_boundaries": packet["claim_boundaries"],
                     "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
+                    "decision_context_summary": {
+                        "primary_question_family": packet["decision_context"].get("primary_question_family"),
+                        "project_time_reconstruction_needed": packet["decision_context"].get(
+                            "project_time_reconstruction_needed"
+                        ),
+                        "selected_routes": packet["decision_context"].get("selected_routes", []),
+                        "confidence": packet["decision_context"].get("confidence"),
+                    },
+                    "audit_plan_summary": {
+                        "watchlist": packet["audit_plan"].get("watchlist", [])[:8],
+                        "route_order": packet["audit_plan"].get("route_order", []),
+                        "resume_from": packet["audit_plan"].get("resume_from"),
+                        "cap_pressure_notes": packet["audit_plan"].get("cap_pressure_notes", []),
+                    },
                     "next_reads": packet["next_reads"][:5],
                     "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
                 }
