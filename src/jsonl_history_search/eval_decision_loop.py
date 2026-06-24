@@ -340,6 +340,8 @@ def _dominant_bottleneck(pressure: dict[str, Any]) -> str:
 
 
 def _recommended_target(pressure: dict[str, Any], bottleneck: str) -> str:
+    if pressure.get("status") not in {"capped", "evaluated"}:
+        return _recommendation_for_bottleneck(bottleneck)
     selected = str(pressure.get("selected_next_tool_delta") or "")
     if selected and selected != "run_full_or_large_history_pressure_before_product_claim":
         return selected
@@ -380,9 +382,28 @@ def _limitations(deterministic_status: str, pressure: dict[str, Any]) -> list[st
 def _privacy_contract_ok(*sections: dict[str, Any]) -> bool:
     forbidden_true_keys = {
         "raw_private_text_included",
+        "raw_private_path_included",
+        "raw_private_paths_included",
         "raw_query_text_included",
+        "raw_path_included",
         "raw_paths_included",
+        "private_path_included",
+        "private_paths_included",
+        "path_included",
+        "paths_included",
+        "raw_session_id_included",
+        "raw_session_ids_included",
+        "raw_session_ref_included",
+        "raw_session_refs_included",
+        "session_id_included",
         "session_ids_included",
+        "session_ref_included",
+        "session_refs_included",
+        "raw_username_included",
+        "raw_usernames_included",
+        "username_included",
+        "usernames_included",
+        "local_username_included",
         "local_usernames_included",
         "source_lines_included",
         "line_numbers_included",
