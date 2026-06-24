@@ -221,6 +221,20 @@ def build_semantic_debug_payload(
         hints=hints,
         source_scope=source_scope,
     )
+    answer_readiness = build_answer_readiness(
+        status=agent_find["status"],
+        source_scope=source_scope,
+        source_locator_handoff=source_locator_handoff,
+        final_answer_contract=final_answer_contract,
+        tool_proof=tool_proof,
+        joins=joins,
+        no_evidence=no_evidence,
+        uncertainty=uncertainty,
+        decision_context=decision_context,
+        audit_plan=audit_plan,
+        forensics_workflow=forensics_workflow,
+        next_reads=next_reads,
+    )
     guided_audit_flow = build_guided_audit_flow(
         status=agent_find["status"],
         family=family,
@@ -230,6 +244,7 @@ def build_semantic_debug_payload(
         forensics_workflow=forensics_workflow,
         source_locator_handoff=source_locator_handoff,
         final_answer_contract=final_answer_contract,
+        answer_readiness=answer_readiness,
         no_evidence=no_evidence,
         next_reads=next_reads,
         next_commands=decision_context["next_commands"],
@@ -250,6 +265,7 @@ def build_semantic_debug_payload(
         "forensics_workflow": forensics_workflow,
         "decision_context": decision_context,
         "audit_plan": audit_plan,
+        "answer_readiness": answer_readiness,
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
@@ -1398,6 +1414,298 @@ def build_final_answer_source_use_contract(
     }
 
 
+def build_answer_readiness(
+    *,
+    status: str,
+    source_scope: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+    final_answer_contract: dict[str, Any],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    no_evidence: dict[str, Any],
+    uncertainty: list[dict[str, Any]],
+    decision_context: dict[str, Any],
+    audit_plan: dict[str, Any],
+    forensics_workflow: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    final_evidence_contract = source_locator_handoff.get("final_evidence_contract") or {}
+    ledger = list(final_evidence_contract.get("ledger") or [])
+    surface_counts = final_evidence_contract.get("surface_counts") or {}
+    omitted_window_recovery = source_locator_handoff.get("omitted_window_recovery") or {}
+    route_states = answer_readiness_route_states(
+        route_order=list(audit_plan.get("route_order") or []),
+        tool_proof=tool_proof,
+        joins=joins,
+        forensics_workflow=forensics_workflow,
+    )
+    ledger_id_by_candidate_id = final_evidence_contract.get("ledger_id_by_candidate_id")
+    source_ref_ledger_ids = final_evidence_contract.get("ledger_ids_by_source_ref")
+    default_projection_ledger_count = (
+        len(ledger_id_by_candidate_id) if isinstance(ledger_id_by_candidate_id, dict) else 0
+    )
+    if isinstance(source_ref_ledger_ids, dict):
+        default_projection_ledger_count += sum(
+            len(ids) for ids in source_ref_ledger_ids.values() if isinstance(ids, list)
+        )
+    present_ledger_count = int(surface_counts.get("final_surface_status:present", 0) or 0)
+    if present_ledger_count == 0 and not ledger and default_projection_ledger_count:
+        present_ledger_count = default_projection_ledger_count
+    recovery_ledger_count = int(surface_counts.get("final_surface_status:omitted_with_exact_recovery", 0) or 0)
+    deferred_ledger_count = int(surface_counts.get("final_surface_status:deferred_with_next_read", 0) or 0)
+    no_evidence_ledger_count = int(surface_counts.get("final_surface_status:not_applicable", 0) or 0)
+    recovery_available = omitted_window_recovery.get("status") == "available"
+    audit_route_required = any(route_state["required"] for route_state in route_states if route_state["route"] in AUDIT_ROUTE_NAMES)
+    if no_evidence.get("needed"):
+        readiness_status = "scoped_no_evidence_ready"
+        decision = "state_scoped_no_evidence"
+        allowed_answer_scope = "searched_scope_no_evidence"
+        required_before_answer = list(scope_ready_required_actions(no_evidence))
+    elif recovery_available:
+        readiness_status = "inspect_recovery_first"
+        decision = "inspect_recovery_reads"
+        allowed_answer_scope = "recovery_first"
+        required_before_answer = [
+            "Open promoted omitted-window recovery reads before treating the searched evidence set as representative.",
+        ]
+        if omitted_window_recovery.get("promoted_next_read_count", 0):
+            required_before_answer.append("Review the promoted next_reads tied to omitted-window recovery before answering.")
+    elif audit_route_required:
+        readiness_status = "audit_route_required"
+        decision = "run_audit_route"
+        allowed_answer_scope = "audit_first"
+        required_before_answer = [
+            item
+            for item in [
+                route_required_action(route_state)
+                for route_state in route_states
+                if route_state["required"] and route_state["route"] in AUDIT_ROUTE_NAMES
+            ]
+            if item
+        ]
+    elif present_ledger_count > 0 and final_answer_contract.get("source_use_required"):
+        readiness_status = "answer_ready"
+        decision = "answer_now"
+        allowed_answer_scope = "source_backed"
+        required_before_answer = [
+            "Answer from the source-backed ledger and keep unsupported claims out of the final response.",
+        ]
+    else:
+        readiness_status = "insufficient_evidence"
+        decision = "gather_more_evidence"
+        allowed_answer_scope = "insufficient"
+        required_before_answer = [
+            "Gather more source-backed evidence before answering.",
+        ]
+        if not next_reads and not route_states:
+            required_before_answer.append("No bounded next read or route surfaced; revisit source planning.")
+
+    ready_ledger_ids = [
+        entry.get("ledger_id")
+        for entry in ledger
+        if entry.get("final_surface_status") == "present" and entry.get("ledger_id")
+    ]
+    recovery_ledger_ids = [
+        entry.get("ledger_id")
+        for entry in ledger
+        if entry.get("final_surface_status") == "omitted_with_exact_recovery" and entry.get("ledger_id")
+    ]
+    deferred_ledger_ids = [
+        entry.get("ledger_id")
+        for entry in ledger
+        if entry.get("final_surface_status") == "deferred_with_next_read" and entry.get("ledger_id")
+    ]
+    no_evidence_ledger_ids = [
+        entry.get("ledger_id")
+        for entry in ledger
+        if entry.get("final_surface_status") == "not_applicable" and entry.get("ledger_id")
+    ]
+    next_read_targets = [item.get("target") for item in next_reads[:8] if item.get("target")]
+    return {
+        "schema_version": 1,
+        "status": readiness_status,
+        "decision": decision,
+        "allowed_answer_scope": allowed_answer_scope,
+        "required_before_answer": required_before_answer,
+        "basis": {
+            "status": status,
+            "present_ledger_count": present_ledger_count,
+            "recovery_ledger_count": recovery_ledger_count,
+            "deferred_ledger_count": deferred_ledger_count,
+            "no_evidence_ledger_count": no_evidence_ledger_count,
+            "ledger_count": int(final_evidence_contract.get("ledger_count", 0) or 0),
+            "next_read_count": len(next_reads),
+            "promoted_next_read_count": int(omitted_window_recovery.get("promoted_next_read_count", 0) or 0),
+            "omitted_window_recovery_count": int(omitted_window_recovery.get("recovery_count", 0) or 0),
+            "structured_tool_event_count": int(tool_proof.get("event_count", 0) or 0),
+            "task_review_join_status": joins.get("status"),
+            "task_review_join_count": len(joins.get("review_evidence", []) or []),
+            "forensics_phase_count": int((forensics_workflow.get("summary") or {}).get("phase_count", 0) or 0),
+            "forensics_join_count": int((forensics_workflow.get("summary") or {}).get("join_count", 0) or 0),
+        },
+        "ledger_summary": {
+            "ledger_count": int(final_evidence_contract.get("ledger_count", 0) or 0),
+            "ledger_ids": [entry.get("ledger_id") for entry in ledger[:12] if entry.get("ledger_id")],
+            "ledger_ids_by_surface_status": {
+                "present": ready_ledger_ids[:8],
+                "omitted_with_exact_recovery": recovery_ledger_ids[:8],
+                "deferred_with_next_read": deferred_ledger_ids[:8],
+                "not_applicable": no_evidence_ledger_ids[:8],
+            },
+            "surface_counts": {
+                "present": present_ledger_count,
+                "omitted_with_exact_recovery": recovery_ledger_count,
+                "deferred_with_next_read": deferred_ledger_count,
+                "not_applicable": no_evidence_ledger_count,
+            },
+        },
+        "next_reads": {
+            "count": len(next_reads),
+            "targets": next_read_targets[:8],
+        },
+        "route_summary": {
+            "route_order": list(audit_plan.get("route_order") or [])[:8],
+            "selected_routes": list(decision_context.get("selected_routes") or [])[:8],
+            "route_states": route_states[:8],
+        },
+        "claim_boundaries": {
+            "root_cause_claim": "not_claimed",
+            "global_absence_claim": "not_allowed",
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+            "speed_claim_supported": False,
+            "product_value_claim_supported": False,
+            "all_history_completeness_claim_supported": False,
+            "evidence_vs_inference_required": True,
+            "support_precision_claim": "counts_only_not_artifact_content_correctness",
+        },
+        "privacy_boundaries": {
+            "raw_transcript_text_included": False,
+            "raw_source_lines_included": False,
+            "raw_session_ids_included": False,
+            "vectors_or_indexes_included": False,
+        },
+        "source_use_contract": {
+            "answer_scope": final_answer_contract.get("answer_scope"),
+            "source_use_required": final_answer_contract.get("source_use_required"),
+            "required_actions": list(final_answer_contract.get("required_actions") or [])[:8],
+            "no_evidence_scope": final_answer_contract.get("no_evidence_scope"),
+        },
+        "answer_gate_link": "semantic_debug.guided_audit_flow.answer_gate",
+        "answer_readiness_link": "semantic_debug.answer_readiness",
+        "uncertainty_labels": [item.get("label") for item in uncertainty],
+    }
+
+
+AUDIT_ROUTE_NAMES = {"git_history_reconstruction", "task_review_join", "tool_action_proof"}
+
+
+def route_required_action(route_state: dict[str, Any]) -> str | None:
+    route = route_state.get("route")
+    if route == "git_history_reconstruction":
+        return "Inspect git history reconstruction before answering provenance or repo-state questions."
+    if route == "task_review_join":
+        return "Inspect task/review joins before answering questions that depend on review verdicts or handoff claims."
+    if route == "tool_action_proof":
+        return "Inspect structured tool/action proof before answering claims about what was actually run, edited, tested, or reviewed."
+    return None
+
+
+def scope_ready_required_actions(no_evidence: dict[str, Any]) -> list[str]:
+    actions = [
+        "Answer with `not_found_in_searched_scope`, not global absence.",
+        "Name not-searched, missing, or cap-limited scope before concluding no evidence.",
+    ]
+    if no_evidence.get("searched_scope"):
+        actions.append("Keep the searched scope visible so the answer stays scoped.")
+    return actions
+
+
+def answer_readiness_route_states(
+    *,
+    route_order: list[str],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    forensics_workflow: dict[str, Any],
+) -> list[dict[str, Any]]:
+    workflow_summary = forensics_workflow.get("summary") or {}
+    route_states: list[dict[str, Any]] = []
+    for route in route_order:
+        if route == "git_history_reconstruction":
+            available = bool(
+                workflow_summary.get("phase_count", 0)
+                or joins.get("commit")
+                or joins.get("branch")
+                or joins.get("path_last_change")
+            )
+            route_states.append(
+                {
+                    "route": route,
+                    "status": "available" if available else "required",
+                    "basis": "forensics_workflow.phase_timeline_or_git_join",
+                    "required": not available,
+                }
+            )
+        elif route == "task_review_join":
+            available = joins.get("status") == "joined"
+            route_states.append(
+                {
+                    "route": route,
+                    "status": "available" if available else "required",
+                    "basis": "task_review_join_status",
+                    "required": not available,
+                }
+            )
+        elif route == "tool_action_proof":
+            available = bool(tool_proof.get("event_count", 0))
+            route_states.append(
+                {
+                    "route": route,
+                    "status": "available" if available else "required",
+                    "basis": "structured_tool_event_count",
+                    "required": not available,
+                }
+            )
+        else:
+            route_states.append(
+                {"route": route, "status": "available", "basis": "not_an_audit_route", "required": False}
+            )
+    return route_states
+
+
+def summarize_answer_readiness(answer_readiness: dict[str, Any]) -> dict[str, Any]:
+    basis = answer_readiness.get("basis") or {}
+    ledger_summary = answer_readiness.get("ledger_summary") or {}
+    route_summary = answer_readiness.get("route_summary") or {}
+    return {
+        "schema_version": answer_readiness.get("schema_version", 1),
+        "status": answer_readiness.get("status"),
+        "decision": answer_readiness.get("decision"),
+        "allowed_answer_scope": answer_readiness.get("allowed_answer_scope"),
+        "basis": {
+            "present_ledger_count": basis.get("present_ledger_count", 0),
+            "recovery_ledger_count": basis.get("recovery_ledger_count", 0),
+            "structured_tool_event_count": basis.get("structured_tool_event_count", 0),
+            "task_review_join_status": basis.get("task_review_join_status"),
+            "next_read_count": basis.get("next_read_count", 0),
+            "omitted_window_recovery_count": basis.get("omitted_window_recovery_count", 0),
+        },
+        "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:4],
+        "ledger_summary": {
+            "ledger_count": ledger_summary.get("ledger_count", 0),
+            "present_ledger_ids": list((ledger_summary.get("ledger_ids_by_surface_status") or {}).get("present", []))[
+                :4
+            ],
+        },
+        "route_summary": {
+            "route_order": list(route_summary.get("route_order") or [])[:5],
+            "route_states": list(route_summary.get("route_states") or [])[:5],
+        },
+        "answer_gate_link": answer_readiness.get("answer_gate_link"),
+        "answer_readiness_link": answer_readiness.get("answer_readiness_link"),
+        "claim_boundaries": answer_readiness.get("claim_boundaries"),
+        "privacy_boundaries": answer_readiness.get("privacy_boundaries"),
+    }
 def build_guided_audit_flow(
     *,
     status: str,
@@ -1408,6 +1716,7 @@ def build_guided_audit_flow(
     forensics_workflow: dict[str, Any],
     source_locator_handoff: dict[str, Any],
     final_answer_contract: dict[str, Any],
+    answer_readiness: dict[str, Any],
     no_evidence: dict[str, Any],
     next_reads: list[dict[str, Any]],
     next_commands: list[dict[str, Any]],
@@ -1435,6 +1744,7 @@ def build_guided_audit_flow(
         primary_family=primary_family,
         primary_intent=primary_intent,
         final_answer_contract=final_answer_contract,
+        answer_readiness=answer_readiness,
         no_evidence=no_evidence,
         recovery=recovery,
     )
@@ -1465,6 +1775,7 @@ def build_guided_audit_flow(
             "forensics_workflow": "semantic_debug.forensics_workflow",
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
             "final_answer_source_use_contract": "semantic_debug.final_answer_source_use_contract",
+            "answer_readiness": "semantic_debug.answer_readiness",
             "no_evidence": "semantic_debug.no_evidence",
             "omitted_window_recovery": "semantic_debug.source_locator_handoff.omitted_window_recovery",
         },
@@ -1716,6 +2027,7 @@ def guided_answer_gate(
     primary_family: str,
     primary_intent: str,
     final_answer_contract: dict[str, Any],
+    answer_readiness: dict[str, Any],
     no_evidence: dict[str, Any],
     recovery: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1740,9 +2052,15 @@ def guided_answer_gate(
         "status": "active",
         "primary_question_family": primary_family,
         "primary_intent": primary_intent,
+        "answer_readiness_link": answer_readiness.get("answer_readiness_link"),
+        "answer_readiness_status": answer_readiness.get("status"),
+        "answer_readiness_decision": answer_readiness.get("decision"),
+        "answer_readiness_scope": answer_readiness.get("allowed_answer_scope"),
+        "answer_readiness_summary": summarize_answer_readiness(answer_readiness),
         "answer_scope": final_answer_contract.get("answer_scope"),
         "source_use_required": final_answer_contract.get("source_use_required"),
         "required_actions": required_actions,
+        "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
         "completion_criteria": completion_criteria,
         "support_summary": (final_answer_contract.get("evidence_inputs") or {}).get(
             "task_review_join_support_summary",
@@ -1815,7 +2133,12 @@ def summarize_guided_audit_flow(guide: dict[str, Any]) -> dict[str, Any]:
         "answer_gate": {
             "answer_scope": answer_gate.get("answer_scope"),
             "source_use_required": answer_gate.get("source_use_required"),
+            "answer_readiness_status": answer_gate.get("answer_readiness_status"),
+            "answer_readiness_decision": answer_gate.get("answer_readiness_decision"),
+            "answer_readiness_scope": answer_gate.get("answer_readiness_scope"),
+            "required_before_answer": list(answer_gate.get("required_before_answer") or [])[:4],
             "forbidden_claims": list(answer_gate.get("forbidden_claims") or [])[:3],
+            "answer_readiness_summary": answer_gate.get("answer_readiness_summary"),
         },
         "next_read_targets": [item.get("target") for item in list(guide.get("next_reads") or [])[:5] if item.get("target")],
         "privacy_boundaries": guide.get("privacy_boundaries"),

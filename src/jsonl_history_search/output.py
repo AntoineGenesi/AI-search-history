@@ -895,6 +895,14 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"- source_use_required: {contract.get('source_use_required')}")
         for action in contract.get("required_actions", [])[:5]:
             lines.append(f"- {action}")
+    readiness = report.get("answer_readiness")
+    if readiness:
+        lines.append("Answer Readiness:")
+        lines.append(f"- status: {readiness.get('status')}")
+        lines.append(f"- decision: {readiness.get('decision')}")
+        lines.append(f"- allowed_answer_scope: {readiness.get('allowed_answer_scope')}")
+        for action in readiness.get("required_before_answer", [])[:4]:
+            lines.append(f"- {action}")
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
@@ -975,6 +983,18 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"- `source_use_required`: `{contract.get('source_use_required')}`",
         ])
         for action in contract.get("required_actions", [])[:6]:
+            lines.append(f"- {action}")
+    readiness = report.get("answer_readiness")
+    if readiness:
+        lines.extend([
+            "",
+            "## Answer Readiness",
+            "",
+            f"- `status`: `{readiness.get('status')}`",
+            f"- `decision`: `{readiness.get('decision')}`",
+            f"- `allowed_answer_scope`: `{readiness.get('allowed_answer_scope')}`",
+        ])
+        for action in readiness.get("required_before_answer", [])[:6]:
             lines.append(f"- {action}")
     lines.extend([
         "",
