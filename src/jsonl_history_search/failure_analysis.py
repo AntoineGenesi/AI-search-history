@@ -134,6 +134,7 @@ def build_failure_analysis_payload(
     story_id: str,
     forensics_report: Path | None = None,
     follow_next_reads_report: Path | None = None,
+    follow_through_behavior_labels_report: Path | None = None,
 ) -> dict[str, Any]:
     semantic_loaded = _load_report_packet(semantic_debug_report, "semantic_debug")
     forensics_loaded = _load_report_packet(forensics_report, "forensics") if forensics_report else _not_supplied("forensics")
@@ -142,10 +143,19 @@ def build_failure_analysis_payload(
         if follow_next_reads_report
         else _not_supplied("follow_next_reads")
     )
+    followthrough_labels_loaded = (
+        _load_report_packet(follow_through_behavior_labels_report, "follow_through_behavior_labels")
+        if follow_through_behavior_labels_report
+        else _not_supplied("follow_through_behavior_labels")
+    )
 
     semantic_packet = semantic_loaded.get("packet") if semantic_loaded.get("loaded") else {}
     forensics_packet = forensics_loaded.get("packet") if forensics_loaded.get("loaded") else {}
     follow_packet = follow_loaded.get("packet") if follow_loaded.get("loaded") else {}
+    followthrough_labels_packet = (
+        followthrough_labels_loaded.get("packet") if followthrough_labels_loaded.get("loaded") else {}
+    )
+    followthrough_behavior_label_rows = _sanitized_followthrough_behavior_label_rows(followthrough_labels_packet)
 
     play_by_play = _build_play_by_play(semantic_packet, forensics_packet) if semantic_packet else []
     interesting_moments = _build_interesting_moments(semantic_packet, forensics_packet, follow_packet)
@@ -184,9 +194,11 @@ def build_failure_analysis_payload(
         semantic_loaded,
         forensics_loaded,
         follow_loaded,
+        followthrough_labels_loaded,
         semantic_packet,
         forensics_packet,
         follow_packet,
+        followthrough_behavior_label_rows,
     )
     claim_boundaries = _claim_boundaries(semantic_loaded, forensics_loaded, follow_loaded)
     devlog_story_packet = _build_devlog_story_packet(
@@ -197,12 +209,14 @@ def build_failure_analysis_payload(
         failure_mode_ledger=failure_mode_ledger,
         claim_boundaries=claim_boundaries,
         next_reads=next_reads,
+        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
     )
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
         semantic_packet,
         forensics_packet,
         follow_packet,
+        followthrough_labels_packet,
     )
     privacy_flags["output_contains_only_sanitized_report_summaries"] = True
 
@@ -224,6 +238,7 @@ def build_failure_analysis_payload(
             semantic_loaded=semantic_loaded,
             forensics_loaded=forensics_loaded,
             follow_loaded=follow_loaded,
+            followthrough_labels_loaded=followthrough_labels_loaded,
             semantic_packet=semantic_packet,
             forensics_packet=forensics_packet,
             follow_packet=follow_packet,
@@ -336,9 +351,11 @@ def _build_evidence_backed_summary_inputs(
     semantic_loaded: dict[str, Any],
     forensics_loaded: dict[str, Any],
     follow_loaded: dict[str, Any],
+    followthrough_labels_loaded: dict[str, Any],
     semantic_packet: dict[str, Any],
     forensics_packet: dict[str, Any],
     follow_packet: dict[str, Any],
+    followthrough_behavior_label_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     inputs = [
         {
@@ -379,8 +396,23 @@ def _build_evidence_backed_summary_inputs(
             "still_unreviewed_recovery_count": _int(follow_packet.get("still_unreviewed_recovery_count")),
             "review_gap_recovery_count": _int(follow_packet.get("review_gap_recovery_count")),
         },
+        {
+            "input": "follow_through_behavior_labels",
+            "supplied": followthrough_labels_loaded.get("supplied"),
+            "loaded": followthrough_labels_loaded.get("loaded"),
+            "status": followthrough_labels_loaded.get("status"),
+            "schema_version": followthrough_labels_loaded.get("schema_version"),
+            "sanitized_label_row_count": len(followthrough_behavior_label_rows),
+            "sanitized_label_count": len({row.get("label") for row in followthrough_behavior_label_rows}),
+            "source_surface": "follow_through_behavior_labels.rows",
+        },
     ]
-    for item, loaded in ((inputs[0], semantic_loaded), (inputs[1], forensics_loaded), (inputs[2], follow_loaded)):
+    for item, loaded in (
+        (inputs[0], semantic_loaded),
+        (inputs[1], forensics_loaded),
+        (inputs[2], follow_loaded),
+        (inputs[3], followthrough_labels_loaded),
+    ):
         if loaded.get("invalid_reason"):
             item["invalid_reason"] = loaded["invalid_reason"]
     return inputs
@@ -861,6 +893,7 @@ def _build_devlog_story_packet(
     failure_mode_ledger: list[dict[str, Any]],
     claim_boundaries: dict[str, Any],
     next_reads: dict[str, Any],
+    followthrough_behavior_label_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     readiness_status = str(narrative_readiness.get("status") or "unknown")
     phase_status = str(story_phase_summary.get("status") or "unknown")
@@ -884,6 +917,7 @@ def _build_devlog_story_packet(
         committed_safe_narrative_ledger=committed_safe_narrative_ledger,
         failure_mode_ledger=failure_mode_ledger,
         next_reads=next_reads,
+        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
     )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
@@ -929,6 +963,7 @@ def _build_devlog_story_packet(
             "committed_safe_narrative_ledger_rows": len(committed_safe_narrative_ledger),
             "failure_mode_ledger_rows": len(failure_mode_ledger),
             "behavior_quality_label_rows": len(behavior_quality_labels),
+            "followthrough_behavior_label_rows": len(followthrough_behavior_label_rows),
             "next_read_rows": _int(next_reads.get("count")),
         },
     }
@@ -1383,6 +1418,7 @@ def _devlog_behavior_quality_labels(
     committed_safe_narrative_ledger: list[dict[str, Any]],
     failure_mode_ledger: list[dict[str, Any]],
     next_reads: dict[str, Any],
+    followthrough_behavior_label_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     evidence_rows = _behavior_quality_evidence_rows(
         story_phase_summary=story_phase_summary,
@@ -1390,6 +1426,7 @@ def _devlog_behavior_quality_labels(
         committed_safe_narrative_ledger=committed_safe_narrative_ledger,
         failure_mode_ledger=failure_mode_ledger,
         next_reads=next_reads,
+        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
     )
     labels: list[dict[str, Any]] = []
     for label, spec in BEHAVIOR_QUALITY_LABEL_SPECS.items():
@@ -1410,7 +1447,7 @@ def _devlog_behavior_quality_labels(
                 "support_surfaces": sorted({str(row.get("source_surface")) for row in matched})[:6],
                 "boundaries_non_claims": [
                     spec["boundary"],
-                    "label is inferred only from sanitized labels and safe repo-relative handles already present in failure-analysis structures",
+                    "label is inferred only from sanitized labels and safe repo-relative handles already present in failure-analysis structures or supplied follow-through label rows",
                     "raw private transcript material, private locations, opaque session identifiers, record selections, embedding/search artifacts, command details, and source details are not inspected or emitted",
                     "does not claim live TUI cleanup, model forgetting, global promotion, root cause, all-history completeness, token savings, speed, retrieval improvement, or final prose quality",
                 ],
@@ -1426,6 +1463,7 @@ def _behavior_quality_evidence_rows(
     committed_safe_narrative_ledger: list[dict[str, Any]],
     failure_mode_ledger: list[dict[str, Any]],
     next_reads: dict[str, Any],
+    followthrough_behavior_label_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in _list(repo_handle_chronology.get("rows")):
@@ -1518,6 +1556,25 @@ def _behavior_quality_evidence_rows(
                 "search_text": " ".join(str(item) for item in labels if item),
             }
         )
+    for row in followthrough_behavior_label_rows:
+        handles = _list(row.get("representative_safe_handles"))
+        labels = [
+            row.get("label"),
+            row.get("status"),
+            row.get("evidence_status"),
+            *(_list(row.get("safe_labels"))),
+            *(_list(row.get("support_surfaces"))),
+            *handles,
+        ]
+        rows.append(
+            {
+                "source_surface": "follow_through_behavior_labels.rows",
+                "safe_handle": handles[0] if handles else None,
+                "safe_labels": labels,
+                "search_text": " ".join(str(item) for item in labels if item),
+                "followthrough_safe_handles": handles,
+            }
+        )
     return rows
 
 
@@ -1539,17 +1596,100 @@ def _representative_behavior_handles(rows: list[dict[str, Any]]) -> list[str]:
     handles: list[str] = []
     seen: set[str] = set()
     for row in rows:
-        handle = row.get("safe_handle")
-        if not isinstance(handle, (str, int)):
-            continue
-        text = str(handle)
-        if text in seen:
-            continue
-        seen.add(text)
-        handles.append(text)
-        if len(handles) >= 4:
-            break
+        row_handles = _list(row.get("followthrough_safe_handles")) or [row.get("safe_handle")]
+        for handle in row_handles:
+            if not isinstance(handle, (str, int)):
+                continue
+            text = str(handle)
+            if text in seen:
+                continue
+            seen.add(text)
+            handles.append(text)
+            if len(handles) >= 4:
+                return handles
     return handles
+
+
+def _sanitized_followthrough_behavior_label_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    raw_rows = _list(packet.get("rows") if isinstance(packet, dict) else [])
+    for index, row in enumerate(raw_rows, 1):
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("label") or "")
+        if label not in BEHAVIOR_QUALITY_LABEL_SPECS:
+            continue
+        safe_handles = [
+            handle
+            for handle in (_safe_followthrough_handle(item) for item in _list(row.get("representative_safe_handles")))
+            if handle
+        ][:4]
+        support_surfaces = [
+            str(item)
+            for item in _list(row.get("support_surfaces"))[:6]
+            if _safe_support_surface_label(str(item))
+        ]
+        safe_labels = [
+            str(item)
+            for item in _list(row.get("safe_labels"))[:8]
+            if _safe_followthrough_label_token(str(item))
+        ]
+        if not safe_handles and not support_surfaces and not safe_labels:
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "source_index": index,
+                    "label": label,
+                    "status": _safe_followthrough_status(row.get("status")),
+                    "evidence_status": _safe_followthrough_status(row.get("evidence_status")),
+                    "matched_row_count": _int(row.get("matched_row_count")),
+                    "representative_safe_handles": safe_handles,
+                    "support_surfaces": support_surfaces or ["follow_through_behavior_labels.rows"],
+                    "safe_labels": safe_labels,
+                    "inference_boundary": (
+                        "sanitized follow-through row only; supports behavior-label planning, "
+                        "not raw evidence, root cause, all-history completeness, live TUI cleanup, "
+                        "model forgetting, token/speed claims, global promotion, or final prose"
+                    ),
+                }
+            )
+        )
+    return rows[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _safe_followthrough_handle(value: Any) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    if not text or text.startswith("/") or "\\" in text or ".." in text.split("/"):
+        return None
+    if any(text.startswith(prefix) for prefix, _kind in SAFE_REPO_PATH_PREFIXES):
+        return text
+    return None
+
+
+def _safe_support_surface_label(value: str) -> bool:
+    text = value.strip()
+    if not text or text.startswith("/") or "\\" in text:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_.\-/]+", text))
+
+
+def _safe_followthrough_label_token(value: str) -> bool:
+    text = value.strip()
+    if not text or text.startswith("/") or "\\" in text:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_.:-]+", text))
+
+
+def _safe_followthrough_status(value: Any) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    if not text or not re.fullmatch(r"[A-Za-z0-9_.:-]+", text):
+        return None
+    return text
 
 
 def _devlog_claim_support_ledger(
@@ -2368,6 +2508,7 @@ def _tool_critique(
     semantic_loaded: dict[str, Any],
     forensics_loaded: dict[str, Any],
     follow_loaded: dict[str, Any],
+    followthrough_labels_loaded: dict[str, Any],
     semantic_packet: dict[str, Any],
     forensics_packet: dict[str, Any],
     follow_packet: dict[str, Any],
@@ -2383,6 +2524,7 @@ def _tool_critique(
             "semantic_debug": _input_status(semantic_loaded),
             "forensics": _input_status(forensics_loaded),
             "follow_next_reads": _input_status(follow_loaded),
+            "follow_through_behavior_labels": _input_status(followthrough_labels_loaded),
         },
         "what_the_tool_could_package": {
             "play_by_play_rows": len(play_by_play),
@@ -2400,6 +2542,8 @@ def _tool_critique(
         gaps.append("forensics report was not supplied")
     if not follow_loaded.get("supplied"):
         gaps.append("follow-next-reads report was not supplied")
+    if not followthrough_labels_loaded.get("supplied"):
+        gaps.append("follow-through behavior labels report was not supplied")
     if next_reads.get("status") == "followup_gap":
         gaps.append("no next-read handles were available in supplied reports")
     if audit_plan.get("cap_pressure_notes"):
