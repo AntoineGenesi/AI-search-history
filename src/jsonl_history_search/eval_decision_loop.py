@@ -57,6 +57,13 @@ SEMANTIC_DEBUG_VALID_DECISIONS = {
     "state_scoped_no_evidence",
     "gather_more_evidence",
 }
+SEMANTIC_DEBUG_VALID_READINESS_STATUSES = {
+    "answer_ready",
+    "inspect_recovery_first",
+    "audit_route_required",
+    "scoped_no_evidence_ready",
+    "insufficient_evidence",
+}
 
 
 def build_eval_decision_loop_payload(
@@ -333,18 +340,16 @@ def _build_decision(
     readiness_target = _semantic_debug_readiness_target(semantic_debug_readiness)
     target = readiness_target or pressure_target
     limitations = _limitations(deterministic_status, pressure)
-    if semantic_debug_readiness and semantic_debug_readiness.get("status") not in SEMANTIC_DEBUG_VALID_DECISIONS:
+    if semantic_debug_readiness and not _semantic_debug_readiness_is_valid(semantic_debug_readiness):
         limitations.append("semantic-debug readiness report was invalid or privacy-flagged, so it was not used for routing")
     decision_status = "ok" if deterministic_status == "passing" and pressure_status == "evaluated" else "inconclusive"
-    return {
+    decision = {
         "decision_status": decision_status,
         "packet_eval_status": deterministic_status,
         "source_tier_compact_status": deterministic_status,
         "pressure_status": pressure_status,
         "dominant_bottleneck": bottleneck,
         "recommended_next_product_target": target,
-        "pressure_recommended_next_product_target": pressure_target,
-        "routing_basis": "semantic_debug_readiness" if readiness_target else "aggregate_pressure",
         "limitations": limitations,
         "supported_claims": {
             "deterministic_packet_eval_contracts_pass": deterministic_status == "passing",
@@ -354,6 +359,10 @@ def _build_decision(
         },
         "unsupported_claims": UNPROVEN_CLAIMS,
     }
+    if semantic_debug_readiness is not None:
+        decision["pressure_recommended_next_product_target"] = pressure_target
+        decision["routing_basis"] = "semantic_debug_readiness" if readiness_target else "aggregate_pressure"
+    return decision
 
 
 def _dominant_bottleneck(pressure: dict[str, Any]) -> str:
@@ -380,20 +389,20 @@ def _recommended_target(pressure: dict[str, Any], bottleneck: str) -> str:
 def _semantic_debug_readiness_target(semantic_debug_readiness: dict[str, Any] | None) -> str | None:
     if not semantic_debug_readiness:
         return None
-    if not semantic_debug_readiness.get("privacy_contract_ok", False):
-        return None
-    if semantic_debug_readiness.get("status") not in {
-        "answer_ready",
-        "inspect_recovery_first",
-        "audit_route_required",
-        "scoped_no_evidence_ready",
-        "insufficient_evidence",
-    }:
+    if not _semantic_debug_readiness_is_valid(semantic_debug_readiness):
         return None
     decision = str(semantic_debug_readiness.get("decision") or "")
     if decision in SEMANTIC_DEBUG_VALID_DECISIONS:
         return decision
     return None
+
+
+def _semantic_debug_readiness_is_valid(semantic_debug_readiness: dict[str, Any]) -> bool:
+    return (
+        bool(semantic_debug_readiness.get("privacy_contract_ok", False))
+        and semantic_debug_readiness.get("status") in SEMANTIC_DEBUG_VALID_READINESS_STATUSES
+        and semantic_debug_readiness.get("decision") in SEMANTIC_DEBUG_VALID_DECISIONS
+    )
 
 
 def _recommendation_for_bottleneck(bottleneck: str) -> str:
@@ -643,12 +652,15 @@ def render_eval_decision_loop_markdown(payload: dict[str, Any]) -> str:
         f"- Pressure status: `{decision['pressure_status']}`",
         f"- Dominant bottleneck: `{decision['dominant_bottleneck']}`",
         f"- Recommended next product target: `{decision['recommended_next_product_target']}`",
-        f"- Pressure recommended target: `{decision.get('pressure_recommended_next_product_target')}`",
-        f"- Routing basis: `{decision.get('routing_basis')}`",
         "",
         "## Deterministic Evals",
         "",
     ]
+    if "routing_basis" in decision:
+        lines[10:10] = [
+            f"- Pressure recommended target: `{decision.get('pressure_recommended_next_product_target')}`",
+            f"- Routing basis: `{decision.get('routing_basis')}`",
+        ]
     for name, item in deterministic["evals"].items():
         lines.append(
             f"- `{name}`: status `{item['status']}`, cases `{item['case_count']}`, "
