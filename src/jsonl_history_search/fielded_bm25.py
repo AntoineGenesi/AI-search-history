@@ -905,6 +905,17 @@ def search_with_fielded_bm25(
         if continuation_ledger
         else None
     )
+    continuation_next_read_recovery = (
+        _build_continuation_next_read_recovery(
+            selection_rows=selection_rows,
+            grouped_rows=rows,
+            final_matches=matches,
+            index=index,
+            candidate_limit=candidate_limit,
+        )
+        if continuation_ledger
+        else None
+    )
     payload = {
         "status": "planned_fielded_bm25",
         "fallback_reason": None,
@@ -953,6 +964,8 @@ def search_with_fielded_bm25(
     }
     if continuation_candidate_ledger is not None:
         payload["continuation_candidate_ledger"] = continuation_candidate_ledger
+    if continuation_next_read_recovery is not None:
+        payload["continuation_next_read_recovery"] = continuation_next_read_recovery
     if include_private_diagnostics:
         payload["_searched_file_paths"] = sorted(opened_paths)
     if expected_diag is not None:
@@ -961,6 +974,104 @@ def search_with_fielded_bm25(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def _build_continuation_next_read_recovery(
+    *,
+    selection_rows: list[tuple[Any, ...]],
+    grouped_rows: list[tuple[Any, ...]],
+    final_matches: list[Match],
+    index: FieldedBm25Index,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    grouped_rowids = {int(row[0]) for row in grouped_rows}
+    final_lines_by_path: dict[str, set[int]] = {}
+    for match in final_matches:
+        final_lines_by_path.setdefault(str(match.path), set()).add(int(match.line))
+
+    items: list[dict[str, Any]] = []
+    bounded_item_limit = max(int(candidate_limit), 0)
+    for ordinal, row in enumerate(selection_rows, start=1):
+        if len(items) >= bounded_item_limit:
+            break
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        if rowid not in grouped_rowids or _source_ref_has_final_match(ref, final_lines_by_path):
+            continue
+        source_ref = _live_source_ref(ref)
+        items.append(
+            {
+                "schema_version": 1,
+                "recovery_id": f"clr{len(items) + 1:03d}",
+                "kind": "continuation_candidate_ledger_recoverable_omission",
+                "candidate_id": f"continuation-ledger-{ordinal:04d}",
+                "source_ref": source_ref,
+                "target": _live_source_ref_target(source_ref),
+                "candidate_rank": ordinal,
+                "selected_for_materialization": True,
+                "present_in_final_packet": False,
+                "recoverable_omitted": True,
+                "read_more_actionable": True,
+                "bounded": True,
+                "promoted_to_next_reads": False,
+                "omission_reason": "continuation_ledger_recoverable_omitted_candidate",
+                "intent_match": True,
+                "reason": "recoverable continuation-ledger candidate omitted from final packet; open exact source_ref with read-more",
+                "privacy": {
+                    "raw_text_included": False,
+                    "snippets_included": False,
+                    "raw_paths_included_beyond_source_ref": False,
+                    "raw_session_ids_included_beyond_source_ref": False,
+                    "source_lines_included": False,
+                },
+                "claim_boundaries": {
+                    "ranking_or_cap_changed": False,
+                    "broad_search_rerun": False,
+                    "selection_survival_claim_supported": False,
+                    "final_answer_quality_claim_supported": False,
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "available" if items else "none",
+        "source": "fielded_bm25.continuation_candidate_ledger",
+        "recovery_count": len(items),
+        "recovery_limit": bounded_item_limit,
+        "items": items,
+        "privacy": {
+            "raw_text_included": False,
+            "snippets_included": False,
+            "raw_paths_included_beyond_source_ref": False,
+            "raw_session_ids_included_beyond_source_ref": False,
+            "source_lines_included": False,
+        },
+        "claim_boundaries": {
+            "recovery_handles_change_ranking": False,
+            "recovery_handles_raise_caps": False,
+            "final_answer_quality_claim_supported": False,
+        },
+    }
+
+
+def _live_source_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
+    source_ref: dict[str, Any] = {
+        "path": ref.path.as_posix(),
+        "line": int(ref.line),
+    }
+    if ref.session_key:
+        source_ref["session"] = ref.session_key
+    if ref.day_key:
+        source_ref["day"] = ref.day_key
+    if ref.timestamp_bucket and ref.timestamp_bucket != "timestamp_absent":
+        source_ref["timestamp_bucket"] = ref.timestamp_bucket
+    return source_ref
+
+
+def _live_source_ref_target(source_ref: dict[str, Any]) -> str:
+    return f"{source_ref['path']}:{source_ref['line']}"
 
 
 def _build_continuation_candidate_ledger(

@@ -3144,6 +3144,12 @@ def build_source_locator_handoff(
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
     omitted_window_recovery = source_window_result["omitted_window_recovery"]
+    omitted_window_recovery = merge_continuation_next_read_recovery(
+        omitted_window_recovery,
+        search_result.get("continuation_next_read_recovery"),
+        expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
+    )
     next_read_rows, promoted_recovery_count = promote_omitted_window_recovery_next_reads(
         next_read_rows,
         omitted_window_recovery.get("items", []),
@@ -5297,6 +5303,125 @@ def build_omitted_window_recovery(
             "recovery_handles_change_ranking": False,
             "recovery_handles_raise_caps": False,
             "selection_survival_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+        },
+    }
+
+
+def merge_continuation_next_read_recovery(
+    omitted_window_recovery: dict[str, Any],
+    continuation_recovery: Any,
+    *,
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> dict[str, Any]:
+    recovery = dict(omitted_window_recovery or {})
+    continuation = continuation_recovery if isinstance(continuation_recovery, dict) else {}
+    continuation_items = [
+        item for item in (continuation.get("items") or []) if isinstance(item, dict) and item.get("recoverable_omitted")
+    ]
+    if not continuation_items:
+        return recovery
+
+    existing_items = [dict(item) for item in (recovery.get("items") or []) if isinstance(item, dict)]
+    continuation_rows: list[dict[str, Any]] = []
+    existing_keys = {next_read_identity_key(item) for item in existing_items}
+    for index, item in enumerate(continuation_items, 1):
+        source_ref = canonical_source_ref(item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {})
+        target = source_ref_target(source_ref)
+        if not target:
+            continue
+        candidate_id = str(item.get("candidate_id") or f"continuation-ledger-{index:04d}")
+        expansion_actions = read_more_actions_for_source_ref(
+            source_ref,
+            candidate_id=candidate_id,
+            expansion_action_context=expansion_action_context,
+        )
+        if not expansion_actions:
+            continue
+        merged = {
+            "schema_version": 1,
+            "recovery_id": str(item.get("recovery_id") or f"clr{index:03d}"),
+            "kind": "continuation_candidate_ledger_recoverable_omission",
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "target": target,
+            "omission_reason": str(item.get("omission_reason") or "continuation_ledger_recoverable_omitted_candidate"),
+            "intent_match": bool(item.get("intent_match", True)),
+            "source_window_need_matches": ["next_reads"],
+            "source_window_need_match": True,
+            "candidate_rank": int(item.get("candidate_rank") or 0),
+            "read_more_actionable": True,
+            "bounded": True,
+            "promoted_to_next_reads": False,
+            "reason": "recoverable continuation-ledger candidate omitted from final packet; open exact source_ref to recover context",
+            "expansion_actions": expansion_actions,
+            "privacy": {
+                "raw_text_included": False,
+                "snippets_included": False,
+                "raw_paths_included_beyond_source_ref": False,
+                "raw_session_ids_included_beyond_source_ref": False,
+                "raw_cwd_included": False,
+                "source_lines_included": False,
+            },
+            "claim_boundaries": {
+                "ranking_or_cap_changed": False,
+                "broad_search_rerun": False,
+                "selection_survival_claim_supported": False,
+                "final_answer_quality_claim_supported": False,
+            },
+            "continuation_candidate_ledger": {
+                "source": "search_result.continuation_next_read_recovery",
+                "recoverable_omitted": True,
+                "selected_for_materialization": bool(item.get("selected_for_materialization", True)),
+                "present_in_final_packet": False,
+                "bounded": True,
+            },
+        }
+        if include_context_actions:
+            merged["context_actions"] = context_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        key = next_read_identity_key(merged)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        continuation_rows.append(merged)
+
+    if not continuation_rows:
+        return recovery
+
+    merged_items = [*continuation_rows, *existing_items]
+    sources = list(recovery.get("sources") or [])
+    if "source_windows.omitted_candidates" not in sources and existing_items:
+        sources.append("source_windows.omitted_candidates")
+    if "fielded_bm25.continuation_candidate_ledger" not in sources:
+        sources.append("fielded_bm25.continuation_candidate_ledger")
+    return {
+        **recovery,
+        "status": "available",
+        "recovery_count": min(len(merged_items), OMITTED_WINDOW_RECOVERY_LIMIT),
+        "recovery_limit": int(recovery.get("recovery_limit") or OMITTED_WINDOW_RECOVERY_LIMIT),
+        "candidate_omitted_fact_count": int(recovery.get("candidate_omitted_fact_count") or len(existing_items)),
+        "continuation_recovery_count": len(continuation_rows),
+        "continuation_recovery_source": "search_result.continuation_next_read_recovery",
+        "sources": sources,
+        "items": merged_items[:OMITTED_WINDOW_RECOVERY_LIMIT],
+        "privacy": {
+            **(recovery.get("privacy") if isinstance(recovery.get("privacy"), dict) else {}),
+            "raw_text_included": False,
+            "snippets_included": False,
+            "raw_paths_included_beyond_source_ref": False,
+            "raw_session_ids_included_beyond_source_ref": False,
+            "raw_cwd_included": False,
+            "source_lines_included": False,
+        },
+        "claim_boundaries": {
+            **(recovery.get("claim_boundaries") if isinstance(recovery.get("claim_boundaries"), dict) else {}),
+            "recovery_handles_change_ranking": False,
+            "recovery_handles_raise_caps": False,
             "final_answer_quality_claim_supported": False,
         },
     }
