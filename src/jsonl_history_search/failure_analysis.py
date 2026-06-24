@@ -17,7 +17,8 @@ STORY_PHASE_LIMIT = 30
 DEVLOG_TAKE_LIMIT = 6
 DEVLOG_SUMMARY_LIMIT = 8
 DEVLOG_ARC_ROW_LIMIT = 20
-DEVLOG_CLAIM_LEDGER_LIMIT = 24
+DEVLOG_CLAIM_LEDGER_LIMIT = 40
+DEVLOG_BEHAVIOR_LABEL_LIMIT = 12
 
 TASK_ID_RE = re.compile(r"\b(?:jsh|sl)-\d+[a-z]?\b", re.IGNORECASE)
 COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
@@ -28,6 +29,72 @@ SAFE_REPO_PATH_PREFIXES = (
     ("docs/", "doc_path"),
     ("reports/", "report_path"),
 )
+
+BEHAVIOR_QUALITY_LABEL_SPECS = {
+    "false_positive_model_input_stripping": {
+        "patterns": (
+            "active-model-input-false-positive-stripping",
+            "prompt-assembly-sanitizer",
+            "history-search-copied-context-masking-gate",
+            "model-input-false-positive",
+            "copied-context-masking",
+        ),
+        "story_useful_signal": "False-positive cleanup evidence is tied to model-input, prompt-assembly, or copied-context stripping handles rather than vague cleanup language.",
+        "boundary": "does not prove live TUI cleanup, model forgetting, root cause, or final prose quality",
+    },
+    "runtime_suppression_zero_stdout": {
+        "patterns": (
+            "runtime-ack-to-pending-suppression-hardening",
+            "deferred-sessionstart-pending-suppression",
+            "pending-suppression",
+            "zero-stdout",
+        ),
+        "story_useful_signal": "Runtime suppression evidence points at pending/deferred delivery paths that avoid model-visible stdout while retaining audit evidence.",
+        "boundary": "does not prove global promotion, token savings, speed, or all-history completeness",
+    },
+    "false_positive_boundary_control": {
+        "patterns": (
+            "active-model-input-false-positive-stripping",
+            "normal-tui-row-cleanup-runtime-path",
+            "fork-api-feasibility-spike",
+            "terminal-control-negative-proof",
+            "integrated-proof-and-promotion-gate",
+            "false-positive-boundary",
+        ),
+        "story_useful_signal": "Boundary-control evidence separates supported false-positive cleanup from unsupported model forgetting, transcript rewrite, or sanitized-output substitutes.",
+        "boundary": "does not claim root cause, model forgetting, or canonical transcript cleanup",
+    },
+    "runtime_quality_tui_path": {
+        "patterns": (
+            "normal-tui-row-cleanup-runtime-path",
+            "fork-api-feasibility-spike",
+            "display-only-collapse-prototype",
+            "tui-path",
+            "tui-row-cleanup",
+        ),
+        "story_useful_signal": "Runtime-quality evidence preserves a concrete normal TUI cleanup path as safe repo metadata.",
+        "boundary": "does not prove live TUI cleanup happened in this failure-analysis run",
+    },
+    "negative_proof_against_fake_cleanup": {
+        "patterns": (
+            "terminal-control-negative-proof",
+            "negative-proof",
+            "fake-cleanup",
+        ),
+        "story_useful_signal": "Negative proof evidence records rejected cleanup substitutes as story constraints.",
+        "boundary": "negative proof is not a root-cause finding or a live runtime cleanup claim",
+    },
+    "proof_and_promotion_gate": {
+        "patterns": (
+            "integrated-proof-and-promotion-gate",
+            "proof-and-promotion-gate",
+            "no_promotion",
+            "no-promotion",
+        ),
+        "story_useful_signal": "Proof/promotion evidence ties supported and unsupported claims to review-gate handles and keeps promotion explicit.",
+        "boundary": "does not claim global promotion, live model send, or production default change",
+    },
+}
 
 UNSUPPORTED_CLAIMS = {
     "root_cause_claim_supported": False,
@@ -811,6 +878,13 @@ def _build_devlog_story_packet(
         story_phase_summary=story_phase_summary,
         next_reads=next_reads,
     )
+    behavior_quality_labels = _devlog_behavior_quality_labels(
+        story_phase_summary=story_phase_summary,
+        repo_handle_chronology=repo_handle_chronology,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        failure_mode_ledger=failure_mode_ledger,
+        next_reads=next_reads,
+    )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
         "mode": "deterministic_committed_safe_story_synthesis",
@@ -834,7 +908,9 @@ def _build_devlog_story_packet(
             supported_claims=supported_claims,
             non_claims=non_claims,
             failure_mode_ledger=failure_mode_ledger,
+            behavior_quality_labels=behavior_quality_labels,
         ),
+        "behavior_quality_labels": behavior_quality_labels,
         "supported_claims": supported_claims,
         "explicit_non_claims": non_claims,
         "gaps": gaps,
@@ -852,6 +928,7 @@ def _build_devlog_story_packet(
             "repo_handle_chronology_status": repo_handle_chronology.get("status"),
             "committed_safe_narrative_ledger_rows": len(committed_safe_narrative_ledger),
             "failure_mode_ledger_rows": len(failure_mode_ledger),
+            "behavior_quality_label_rows": len(behavior_quality_labels),
             "next_read_rows": _int(next_reads.get("count")),
         },
     }
@@ -1299,11 +1376,188 @@ def _devlog_next_reads(next_reads: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _devlog_behavior_quality_labels(
+    *,
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    evidence_rows = _behavior_quality_evidence_rows(
+        story_phase_summary=story_phase_summary,
+        repo_handle_chronology=repo_handle_chronology,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        failure_mode_ledger=failure_mode_ledger,
+        next_reads=next_reads,
+    )
+    labels: list[dict[str, Any]] = []
+    for label, spec in BEHAVIOR_QUALITY_LABEL_SPECS.items():
+        matched = _matched_behavior_quality_rows(label, spec, evidence_rows)
+        if not matched:
+            continue
+        representative_handles = _representative_behavior_handles(matched)
+        labels.append(
+            {
+                "label": label,
+                "evidence_strength": {
+                    "matched_row_count": len(matched),
+                    "representative_handle_count": len(representative_handles),
+                    "source_surface_count": len({str(row.get("source_surface")) for row in matched}),
+                },
+                "representative_safe_handles": representative_handles,
+                "story_useful_signal": spec["story_useful_signal"],
+                "support_surfaces": sorted({str(row.get("source_surface")) for row in matched})[:6],
+                "boundaries_non_claims": [
+                    spec["boundary"],
+                    "label is inferred only from sanitized labels and safe repo-relative handles already present in failure-analysis structures",
+                    "raw private transcript material, private locations, opaque session identifiers, record selections, embedding/search artifacts, command details, and source details are not inspected or emitted",
+                    "does not claim live TUI cleanup, model forgetting, global promotion, root cause, all-history completeness, token savings, speed, retrieval improvement, or final prose quality",
+                ],
+            }
+        )
+    return labels[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _behavior_quality_evidence_rows(
+    *,
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _list(repo_handle_chronology.get("rows")):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "source_surface": "repo_handle_chronology.rows",
+                "safe_handle": row.get("handle") if row.get("handle_type") != "commit_hash" else None,
+                "safe_labels": [row.get("status"), row.get("confidence"), row.get("handle_type")],
+                "search_text": " ".join(
+                    str(item)
+                    for item in (
+                        row.get("handle"),
+                        row.get("status"),
+                        row.get("confidence"),
+                        row.get("source"),
+                    )
+                    if item
+                ),
+            }
+        )
+    for row in _list(story_phase_summary.get("rows")):
+        if not isinstance(row, dict):
+            continue
+        handles = row.get("handles") if isinstance(row.get("handles"), dict) else {}
+        for handle_type, values in sorted(handles.items()):
+            for handle in _list(values):
+                rows.append(
+                    {
+                        "source_surface": "story_phase_summary.rows",
+                        "safe_handle": handle if handle_type != "commit_hash" else None,
+                        "safe_labels": [handle_type, row.get("status"), *(_list(row.get("repo_statuses")))],
+                        "search_text": " ".join(
+                            str(item)
+                            for item in (
+                                handle,
+                                handle_type,
+                                row.get("task_id"),
+                                row.get("status"),
+                                *(_list(row.get("repo_statuses"))),
+                                *(_list(row.get("gap_reasons"))),
+                            )
+                            if item
+                        ),
+                    }
+                )
+    for row in committed_safe_narrative_ledger:
+        if not isinstance(row, dict):
+            continue
+        usability = row.get("recovery_usability") if isinstance(row.get("recovery_usability"), dict) else {}
+        labels = [
+            row.get("ledger_kind"),
+            row.get("status"),
+            row.get("recovery_kind"),
+            usability.get("evidence_label"),
+            usability.get("reason_label"),
+            usability.get("decision_id"),
+            *(_list(row.get("reason_codes"))),
+        ]
+        rows.append(
+            {
+                "source_surface": "committed_safe_narrative_ledger",
+                "safe_handle": None,
+                "safe_labels": labels,
+                "search_text": " ".join(str(item) for item in labels if item),
+            }
+        )
+    for row in failure_mode_ledger:
+        if not isinstance(row, dict):
+            continue
+        labels = [row.get("failure_mode"), row.get("status"), row.get("evidence_surface")]
+        rows.append(
+            {
+                "source_surface": "failure_mode_ledger",
+                "safe_handle": None,
+                "safe_labels": labels,
+                "search_text": " ".join(str(item) for item in labels if item),
+            }
+        )
+    for row in _list(next_reads.get("reads")):
+        if not isinstance(row, dict):
+            continue
+        labels = [row.get("kind"), row.get("status"), row.get("failure_reason"), row.get("reason")]
+        rows.append(
+            {
+                "source_surface": "next_reads.reads",
+                "safe_handle": None,
+                "safe_labels": labels,
+                "search_text": " ".join(str(item) for item in labels if item),
+            }
+        )
+    return rows
+
+
+def _matched_behavior_quality_rows(
+    label: str,
+    spec: dict[str, Any],
+    evidence_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for row in evidence_rows:
+        labels = {str(item).lower() for item in _list(row.get("safe_labels")) if item}
+        search_text = str(row.get("search_text") or "").lower()
+        if label in labels or any(str(pattern).lower() in search_text for pattern in spec.get("patterns", ())):
+            matched.append(row)
+    return matched
+
+
+def _representative_behavior_handles(rows: list[dict[str, Any]]) -> list[str]:
+    handles: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        handle = row.get("safe_handle")
+        if not isinstance(handle, (str, int)):
+            continue
+        text = str(handle)
+        if text in seen:
+            continue
+        seen.add(text)
+        handles.append(text)
+        if len(handles) >= 4:
+            break
+    return handles
+
+
 def _devlog_claim_support_ledger(
     *,
     supported_claims: list[dict[str, Any]],
     non_claims: list[dict[str, Any]],
     failure_mode_ledger: list[dict[str, Any]],
+    behavior_quality_labels: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, claim in enumerate(supported_claims, 1):
@@ -1335,6 +1589,18 @@ def _devlog_claim_support_ledger(
                 "claim_id": failure.get("failure_mode"),
                 "support_surfaces": [failure.get("evidence_surface")],
                 "boundary": failure.get("interpretation_boundary"),
+            }
+        )
+    for index, label in enumerate(behavior_quality_labels, 1):
+        rows.append(
+            {
+                "ledger_id": f"behavior-label-{index:03d}",
+                "ledger_kind": "behavior_quality_label",
+                "claim_id": label.get("label"),
+                "support_surfaces": label.get("support_surfaces"),
+                "support_counts": label.get("evidence_strength"),
+                "representative_safe_handles": label.get("representative_safe_handles"),
+                "boundary": "; ".join(str(item) for item in _list(label.get("boundaries_non_claims"))[:2]),
             }
         )
     return rows[:DEVLOG_CLAIM_LEDGER_LIMIT]
