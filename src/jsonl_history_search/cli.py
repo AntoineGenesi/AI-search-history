@@ -746,6 +746,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     real_history_impact.add_argument(
+        "--continuation-ledger",
+        action="store_true",
+        help=(
+            "Opt in to aggregate-safe continuation candidate ledger metrics for explicit "
+            "package_search_fielded_bm25 benchmark rows. Defaults and other baselines stay unchanged."
+        ),
+    )
+    real_history_impact.add_argument(
         "--checkpoint-output",
         default=None,
         help=(
