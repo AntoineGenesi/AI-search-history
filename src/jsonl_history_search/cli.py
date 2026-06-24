@@ -618,6 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional aggregate-only real-history pressure JSON to include in the decision packet.",
     )
     eval_decision_loop.add_argument(
+        "--semantic-debug-report",
+        default=None,
+        help="Optional semantic-debug JSON report whose answer_readiness should drive routing summary.",
+    )
+    eval_decision_loop.add_argument(
         "--report-output",
         default=None,
         help="Optional path where the eval decision packet should be written.",
@@ -1822,7 +1827,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if status == "invalid_fixture" else 0
     if args.command == "eval-decision-loop":
         pressure_report = Path(args.pressure_report).expanduser() if args.pressure_report else None
-        payload = build_eval_decision_loop_payload(pressure_report)
+        semantic_debug_report = (
+            Path(args.semantic_debug_report).expanduser() if args.semantic_debug_report else None
+        )
+        payload = build_eval_decision_loop_payload(
+            pressure_report=pressure_report,
+            semantic_debug_report=semantic_debug_report,
+        )
         rendered = render(payload, args.format)
         if args.report_output:
             output_path = Path(args.report_output).expanduser()
