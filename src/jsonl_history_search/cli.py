@@ -299,6 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional saved follow-next-reads JSON report.",
     )
+    failure_analysis.add_argument(
+        "--follow-through-behavior-labels-report",
+        default=None,
+        help=(
+            "Optional sanitized follow-through behavior-label JSON report. "
+            "Only known labels, safe repo-relative handles, and boundary labels are consumed."
+        ),
+    )
     failure_analysis.add_argument("--format", choices=("text", "json", "markdown"), default="json")
     failure_analysis.add_argument("--report-output", default=None)
     manifest = subparsers.add_parser("manifest")
@@ -1919,6 +1927,9 @@ def main(argv: list[str] | None = None) -> int:
             forensics_report=Path(args.forensics_report).expanduser() if args.forensics_report else None,
             follow_next_reads_report=Path(args.follow_next_reads_report).expanduser()
             if args.follow_next_reads_report
+            else None,
+            follow_through_behavior_labels_report=Path(args.follow_through_behavior_labels_report).expanduser()
+            if args.follow_through_behavior_labels_report
             else None,
         )
         rendered = render(payload, args.format)
