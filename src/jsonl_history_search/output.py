@@ -268,6 +268,7 @@ def render_failure_analysis_text(payload: dict) -> str:
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
     story_packet = report.get("devlog_story_packet") or {}
+    behavior_quality_labels = story_packet.get("behavior_quality_labels") or []
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -282,7 +283,7 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
         f"Narrative readiness: {narrative.get('status')} ({narrative.get('ledger_row_count', len(narrative_ledger))} ledger rows)",
         f"Story phase summary: {story_phase_summary.get('status')} ({story_phase_summary.get('usable_phase_count', 0)}/{story_phase_summary.get('phase_count', 0)} usable)",
-        f"Devlog story packet: {story_packet.get('status')} ({len(story_packet.get('supported_claims') or [])} supported claims, {len(story_packet.get('explicit_non_claims') or [])} non-claims)",
+        f"Devlog story packet: {story_packet.get('status')} ({len(story_packet.get('supported_claims') or [])} supported claims, {len(story_packet.get('explicit_non_claims') or [])} non-claims, {len(behavior_quality_labels)} behavior-quality labels)",
         f"Repo handle chronology: {repo_chronology.get('status')} ({repo_chronology.get('phase_row_count', 0)} rows)",
         f"Repo handle date range: {repo_date_range.get('start')} to {repo_date_range.get('end')}",
         f"Repo handle counts: {', '.join(f'{key}={value}' for key, value in sorted(repo_counts.items())) or 'none'}",
@@ -308,6 +309,14 @@ def render_failure_analysis_text(payload: dict) -> str:
         lines.append(f"- take {item.get('take_id')}: {item.get('take')}")
     for claim in (story_packet.get("supported_claims") or [])[:6]:
         lines.append(f"- supported {claim.get('claim_id')}: {claim.get('claim')}")
+    for label in behavior_quality_labels[:8]:
+        strength = label.get("evidence_strength") or {}
+        handles = ", ".join(str(item) for item in label.get("representative_safe_handles") or []) or "no representative handle"
+        lines.append(
+            f"- behavior-label {label.get('label')}: "
+            f"rows={strength.get('matched_row_count', 0)} handles={strength.get('representative_handle_count', 0)}; "
+            f"{label.get('story_useful_signal')} Handles: {handles}"
+        )
     for non_claim in (story_packet.get("explicit_non_claims") or [])[:8]:
         lines.append(f"- non-claim {non_claim.get('claim_id')}: {non_claim.get('non_claim')}")
     for gap in (story_packet.get("gaps") or [])[:6]:
@@ -351,6 +360,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
     story_packet = report.get("devlog_story_packet") or {}
+    behavior_quality_labels = story_packet.get("behavior_quality_labels") or []
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -366,7 +376,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
         f"- Narrative readiness: `{narrative.get('status')}`",
         f"- Story phase summary: `{story_phase_summary.get('status')}` (`{story_phase_summary.get('usable_phase_count', 0)}`/`{story_phase_summary.get('phase_count', 0)}` usable)",
-        f"- Devlog story packet: `{story_packet.get('status')}` (`{len(story_packet.get('supported_claims') or [])}` supported claims, `{len(story_packet.get('explicit_non_claims') or [])}` non-claims)",
+        f"- Devlog story packet: `{story_packet.get('status')}` (`{len(story_packet.get('supported_claims') or [])}` supported claims, `{len(story_packet.get('explicit_non_claims') or [])}` non-claims, `{len(behavior_quality_labels)}` behavior-quality labels)",
         f"- Repo handle chronology: `{repo_chronology.get('status')}` (`{repo_chronology.get('phase_row_count', 0)}` rows)",
         f"- Repo handle date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
         f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
@@ -413,6 +423,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Mode: `{story_packet.get('mode')}`",
         f"- Dated arc rows: `{len(story_packet.get('dated_arc_rows') or [])}`",
         f"- Claim/support ledger rows: `{len(story_packet.get('claim_support_ledger') or [])}`",
+        f"- Behavior-quality labels: `{len(behavior_quality_labels)}`",
         "",
         "### Take Candidates",
         "",
@@ -441,6 +452,18 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     for claim in story_packet.get("supported_claims") or []:
         surfaces = ", ".join(str(surface) for surface in claim.get("support_surfaces") or [])
         lines.append(f"- `{claim.get('claim_id')}`: {claim.get('claim')} Support: `{surfaces or 'none'}`")
+    lines.extend(["", "### Behavior-Quality Labels", ""])
+    for label in behavior_quality_labels:
+        strength = label.get("evidence_strength") or {}
+        handles = ", ".join(str(item) for item in label.get("representative_safe_handles") or []) or "none"
+        surfaces = ", ".join(str(surface) for surface in label.get("support_surfaces") or []) or "none"
+        boundaries = "; ".join(str(item) for item in label.get("boundaries_non_claims") or [])
+        lines.append(
+            f"- `{label.get('label')}`: `{strength.get('matched_row_count', 0)}` matched rows, "
+            f"`{strength.get('representative_handle_count', 0)}` representative handles. "
+            f"Handles: `{handles}`. Signal: {label.get('story_useful_signal')} "
+            f"Support: `{surfaces}`. Boundaries: {boundaries}"
+        )
     lines.extend(["", "### Explicit Non-Claims", ""])
     for non_claim in story_packet.get("explicit_non_claims") or []:
         lines.append(f"- `{non_claim.get('claim_id')}`: `{non_claim.get('non_claim')}`")
