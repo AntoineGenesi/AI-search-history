@@ -85,13 +85,14 @@ def build_failure_analysis_payload(
         next_reads,
     )
     date_range = _date_range(play_by_play, interesting_moments)
+    transcript_recovery_date_range = _transcript_recovery_date_range(semantic_packet, follow_packet)
     repo_handle_chronology = _build_repo_handle_chronology(
         semantic_packet,
         forensics_packet,
         follow_packet,
         next_reads,
         committed_safe_narrative_ledger,
-        transcript_date_range=date_range,
+        transcript_date_range=transcript_recovery_date_range,
     )
     narrative_readiness = _build_narrative_readiness(
         semantic_loaded,
@@ -1120,6 +1121,24 @@ def _repo_date_range(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "timestamp_count": len(dates),
         "boundary": "derived from saved report repo-handle dates only; separate from transcript date_range",
     }
+
+
+def _transcript_recovery_date_range(semantic_packet: dict[str, Any], follow_packet: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for section in ("timeline", "strongest_candidates"):
+        for row in _list(semantic_packet.get(section)):
+            if isinstance(row, dict):
+                rows.append({"timestamp_utc": row.get("timestamp_utc") or row.get("timestamp")})
+    for row in _list(_nested(semantic_packet, "tool_action_proof").get("events")):
+        if isinstance(row, dict):
+            rows.append({"timestamp_utc": row.get("timestamp_utc") or row.get("timestamp")})
+    for section in ("expanded_reads", "failed_reads"):
+        for row in _list(follow_packet.get(section)):
+            if isinstance(row, dict):
+                rows.append({"timestamp_utc": row.get("timestamp_utc") or row.get("timestamp")})
+    date_range = _date_range(rows)
+    date_range["boundary"] = "derived from semantic-debug and follow-next-reads transcript/recovery timestamps only; excludes repo-handle forensics dates"
+    return date_range
 
 
 def _repo_chronology_gaps(
