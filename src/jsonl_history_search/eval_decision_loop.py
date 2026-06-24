@@ -64,16 +64,20 @@ SEMANTIC_DEBUG_VALID_READINESS_STATUSES = {
     "scoped_no_evidence_ready",
     "insufficient_evidence",
 }
+FOLLOW_NEXT_READ_VALID_STATUSES = {"expanded", "partial_expanded", "no_next_reads", "selected_reads_failed"}
+FOLLOWED_RECOVERY_TARGET = "use_followed_recovery_evidence_for_bounded_answer_decision"
 
 
 def build_eval_decision_loop_payload(
     pressure_report: Path | None = None,
     semantic_debug_report: Path | None = None,
+    follow_next_reads_report: Path | None = None,
 ) -> dict[str, Any]:
     deterministic = _build_deterministic_eval_summaries()
     pressure = _load_pressure_summary(pressure_report)
     semantic_debug_readiness = _load_semantic_debug_readiness_summary(semantic_debug_report)
-    decision = _build_decision(deterministic, pressure, semantic_debug_readiness)
+    recovery_follow_through = _load_recovery_follow_through_summary(follow_next_reads_report)
+    decision = _build_decision(deterministic, pressure, semantic_debug_readiness, recovery_follow_through)
     report = {
         "schema_version": SCHEMA_VERSION,
         "status": decision["decision_status"],
@@ -86,11 +90,19 @@ def build_eval_decision_loop_payload(
             "semantic_debug_report_privacy_contract_ok": semantic_debug_readiness.get("privacy_contract_ok")
             if semantic_debug_readiness
             else None,
+            "follow_next_reads_report_supplied": follow_next_reads_report is not None,
+            "follow_next_reads_report_loaded": bool(recovery_follow_through.get("loaded"))
+            if recovery_follow_through
+            else False,
+            "follow_next_reads_report_privacy_contract_ok": recovery_follow_through.get("privacy_contract_ok")
+            if recovery_follow_through
+            else None,
             "non_live_eval_synthesis_only": True,
         },
         "deterministic_evals": deterministic,
         "pressure_report": pressure,
         **({"semantic_debug_readiness": semantic_debug_readiness} if semantic_debug_readiness is not None else {}),
+        **({"recovery_follow_through": recovery_follow_through} if recovery_follow_through is not None else {}),
         "decision": decision,
         "claim_boundaries": {
             **UNPROVEN_CLAIMS,
@@ -103,6 +115,7 @@ def build_eval_decision_loop_payload(
             "deterministic_eval_rows_omitted": True,
             "pressure_report_path_echoed": False,
             "semantic_debug_report_path_echoed": False,
+            "follow_next_reads_report_path_echoed": False,
         },
     }
     return {"eval_decision_loop": report}
@@ -332,16 +345,22 @@ def _build_decision(
     deterministic: dict[str, Any],
     pressure: dict[str, Any],
     semantic_debug_readiness: dict[str, Any] | None,
+    recovery_follow_through: dict[str, Any] | None,
 ) -> dict[str, Any]:
     deterministic_status = deterministic["status"]
     pressure_status = pressure["status"]
     bottleneck = _dominant_bottleneck(pressure)
     pressure_target = _recommended_target(pressure, bottleneck)
     readiness_target = _semantic_debug_readiness_target(semantic_debug_readiness)
-    target = readiness_target or pressure_target
+    follow_through_target = _recovery_follow_through_target(semantic_debug_readiness, recovery_follow_through)
+    target = follow_through_target or readiness_target or pressure_target
     limitations = _limitations(deterministic_status, pressure)
     if semantic_debug_readiness and not _semantic_debug_readiness_is_valid(semantic_debug_readiness):
         limitations.append("semantic-debug readiness report was invalid or privacy-flagged, so it was not used for routing")
+    if recovery_follow_through and not _recovery_follow_through_is_valid(recovery_follow_through):
+        limitations.append("follow-next-reads report was invalid, unsupported, or privacy-flagged, so it was not used for routing")
+    elif recovery_follow_through and readiness_target == "inspect_recovery_reads" and not follow_through_target:
+        limitations.append("follow-next-reads report did not contain usable expanded recovery evidence")
     decision_status = "ok" if deterministic_status == "passing" and pressure_status == "evaluated" else "inconclusive"
     decision = {
         "decision_status": decision_status,
@@ -362,6 +381,17 @@ def _build_decision(
     if semantic_debug_readiness is not None:
         decision["pressure_recommended_next_product_target"] = pressure_target
         decision["routing_basis"] = "semantic_debug_readiness" if readiness_target else "aggregate_pressure"
+    if recovery_follow_through is not None:
+        decision["pressure_recommended_next_product_target"] = pressure_target
+        if readiness_target:
+            decision["semantic_debug_recommended_next_product_target"] = readiness_target
+        decision["routing_basis"] = (
+            "recovery_follow_through"
+            if follow_through_target
+            else "semantic_debug_readiness"
+            if readiness_target
+            else "aggregate_pressure"
+        )
     return decision
 
 
@@ -402,6 +432,27 @@ def _semantic_debug_readiness_is_valid(semantic_debug_readiness: dict[str, Any])
         bool(semantic_debug_readiness.get("privacy_contract_ok", False))
         and semantic_debug_readiness.get("status") in SEMANTIC_DEBUG_VALID_READINESS_STATUSES
         and semantic_debug_readiness.get("decision") in SEMANTIC_DEBUG_VALID_DECISIONS
+    )
+
+
+def _recovery_follow_through_target(
+    semantic_debug_readiness: dict[str, Any] | None,
+    recovery_follow_through: dict[str, Any] | None,
+) -> str | None:
+    if _semantic_debug_readiness_target(semantic_debug_readiness) != "inspect_recovery_reads":
+        return None
+    if not recovery_follow_through or not _recovery_follow_through_is_valid(recovery_follow_through):
+        return None
+    if _int(recovery_follow_through.get("usable_recovery_evidence_count")) <= 0:
+        return None
+    return FOLLOWED_RECOVERY_TARGET
+
+
+def _recovery_follow_through_is_valid(recovery_follow_through: dict[str, Any]) -> bool:
+    return (
+        bool(recovery_follow_through.get("privacy_contract_ok", False))
+        and recovery_follow_through.get("status") in FOLLOW_NEXT_READ_VALID_STATUSES
+        and bool(recovery_follow_through.get("loaded", False))
     )
 
 
@@ -505,6 +556,119 @@ def _load_semantic_debug_readiness_summary(semantic_debug_report: Path | None) -
             "next_read_targets": list(guided_summary.get("next_read_targets") or [])[:5] if guided_summary else [],
         },
     }
+
+
+def _load_recovery_follow_through_summary(follow_next_reads_report: Path | None) -> dict[str, Any] | None:
+    if follow_next_reads_report is None:
+        return None
+    try:
+        loaded = json.loads(follow_next_reads_report.expanduser().read_text(encoding="utf-8"))
+    except OSError:
+        return _invalid_recovery_follow_through("read_failed")
+    except json.JSONDecodeError:
+        return _invalid_recovery_follow_through("json_invalid")
+    packet = loaded.get("follow_next_reads") if isinstance(loaded, dict) else loaded
+    if not isinstance(packet, dict):
+        return _invalid_recovery_follow_through("follow_next_reads_packet_missing")
+    status = str(packet.get("status") or "missing")
+    source_packet = packet.get("source_packet") if isinstance(packet.get("source_packet"), dict) else {}
+    claim_boundaries = packet.get("claim_boundaries") if isinstance(packet.get("claim_boundaries"), dict) else {}
+    privacy_flags = packet.get("privacy_flags") if isinstance(packet.get("privacy_flags"), dict) else {}
+    privacy_contract_ok = _follow_next_reads_privacy_contract_ok(packet, source_packet, claim_boundaries)
+    failure_reasons = _follow_next_reads_failure_reasons(packet)
+    summary = {
+        "schema_version": _int(packet.get("schema_version")) or 1,
+        "loaded": True,
+        "status": status if privacy_contract_ok else "invalid",
+        "privacy_contract_ok": privacy_contract_ok,
+        "source_packet_status": source_packet.get("status"),
+        "source_packet_type": source_packet.get("packet_type"),
+        "selected_count": _int(packet.get("selected_count")),
+        "expanded_count": _int(packet.get("expanded_count")),
+        "failed_count": _int(packet.get("failed_count")),
+        "usable_recovery_evidence_count": _int(packet.get("usable_recovery_evidence_count")),
+        "failure_reasons": failure_reasons[:8],
+        "claim_boundaries": {
+            "broad_search_rerun": bool(claim_boundaries.get("broad_search_rerun", False)),
+            "ranking_or_cap_changed": bool(claim_boundaries.get("ranking_or_cap_changed", False)),
+            "retrieval_defaults_changed": bool(claim_boundaries.get("retrieval_defaults_changed", False)),
+            "answer_generation_included": bool(claim_boundaries.get("answer_generation_included", False)),
+            "final_answer_claim_supported": bool(claim_boundaries.get("final_answer_claim_supported", False)),
+            "all_history_completeness_claim_supported": bool(
+                claim_boundaries.get("all_history_completeness_claim_supported", False)
+            ),
+        },
+        "privacy_boundaries": {
+            "raw_runtime_source_text_consumed": False,
+            "raw_runtime_source_text_included_in_summary": False,
+            "raw_paths_included_in_summary": False,
+            "line_numbers_included_in_summary": False,
+            "follow_next_reads_report_path_echoed": False,
+            "source_refs_or_targets_echoed": False,
+            "raw_follow_next_reads_packet_may_include_text": bool(privacy_flags.get("raw_text_included", False)),
+            "raw_follow_next_reads_packet_may_include_paths": bool(privacy_flags.get("raw_paths_included", False)),
+        },
+    }
+    if status not in FOLLOW_NEXT_READ_VALID_STATUSES:
+        summary["invalid_reason"] = f"unsupported_status:{status}"
+    if not privacy_contract_ok:
+        summary["invalid_reason"] = "privacy_or_claim_boundary_failed"
+    return summary
+
+
+def _invalid_recovery_follow_through(reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "loaded": False,
+        "status": "invalid",
+        "privacy_contract_ok": False,
+        "source_packet_status": None,
+        "source_packet_type": None,
+        "selected_count": 0,
+        "expanded_count": 0,
+        "failed_count": 0,
+        "usable_recovery_evidence_count": 0,
+        "failure_reasons": [],
+        "claim_boundaries": {},
+        "privacy_boundaries": {
+            "raw_runtime_source_text_consumed": False,
+            "raw_runtime_source_text_included_in_summary": False,
+            "raw_paths_included_in_summary": False,
+            "follow_next_reads_report_path_echoed": False,
+        },
+        "invalid_reason": reason,
+    }
+
+
+def _follow_next_reads_failure_reasons(packet: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if packet.get("failure_reason"):
+        reasons.append(str(packet.get("failure_reason")))
+    for item in packet.get("failed_reads") or []:
+        if isinstance(item, dict) and item.get("failure_reason"):
+            reasons.append(str(item.get("failure_reason")))
+    if not reasons:
+        for item in packet.get("expanded_reads") or []:
+            if isinstance(item, dict) and item.get("status") != "expanded":
+                reasons.append(str(item.get("failure_reason") or item.get("status") or "failed"))
+    return list(dict.fromkeys(reasons))
+
+
+def _follow_next_reads_privacy_contract_ok(*sections: dict[str, Any]) -> bool:
+    forbidden_true_keys = {
+        "broad_search_rerun",
+        "ranking_or_cap_changed",
+        "retrieval_defaults_changed",
+        "answer_generation_included",
+        "final_answer_claim_supported",
+        "all_history_completeness_claim_supported",
+        "vectors_indexes_or_persistent_cache_used",
+    }
+    for section in sections:
+        for key, value in _walk_dict_items(section):
+            if key in forbidden_true_keys and value is True:
+                return False
+    return True
 
 
 def _invalid_semantic_debug_readiness(reason: str) -> dict[str, Any]:
@@ -697,6 +861,26 @@ def render_eval_decision_loop_markdown(payload: dict[str, Any]) -> str:
             lines.append(f"- Route order: `{', '.join(route_summary.get('route_order', []))}`")
         for action in readiness.get("required_before_answer", [])[:4]:
             lines.append(f"- Required before answer: {action}")
+    follow_through = report.get("recovery_follow_through") or {}
+    if follow_through:
+        lines.extend(
+            [
+                "",
+                "## Recovery Follow-Through",
+                "",
+                f"- Loaded: `{follow_through.get('loaded')}`",
+                f"- Privacy contract ok: `{follow_through.get('privacy_contract_ok')}`",
+                f"- Status: `{follow_through.get('status')}`",
+                f"- Selected reads: `{follow_through.get('selected_count', 0)}`",
+                f"- Expanded reads: `{follow_through.get('expanded_count', 0)}`",
+                f"- Failed reads: `{follow_through.get('failed_count', 0)}`",
+                f"- Usable recovery evidence: `{follow_through.get('usable_recovery_evidence_count', 0)}`",
+            ]
+        )
+        if follow_through.get("invalid_reason"):
+            lines.append(f"- Invalid reason: `{follow_through.get('invalid_reason')}`")
+        for reason in follow_through.get("failure_reasons", [])[:4]:
+            lines.append(f"- Failure reason: `{reason}`")
     lines.extend(
         [
             "",

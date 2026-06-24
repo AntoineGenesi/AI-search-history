@@ -72,6 +72,7 @@ def build_follow_next_reads_payload(
             "follow_next_reads": {
                 **base,
                 "status": "unsupported_kind",
+                **follow_next_read_counts([], []),
                 "failure_reason": f"unsupported kind: {kind}",
                 "supported_kinds": sorted(SUPPORTED_FOLLOW_NEXT_READ_KINDS),
                 "source_packet": {"status": "not_read"},
@@ -84,6 +85,7 @@ def build_follow_next_reads_payload(
             "follow_next_reads": {
                 **base,
                 "status": "report_not_found",
+                **follow_next_read_counts([], []),
                 "failure_reason": "from-report path does not exist",
                 "source_packet": {"status": "not_read"},
             }
@@ -93,6 +95,7 @@ def build_follow_next_reads_payload(
             "follow_next_reads": {
                 **base,
                 "status": "report_read_error",
+                **follow_next_read_counts([], []),
                 "failure_reason": str(exc),
                 "source_packet": {"status": "not_read"},
             }
@@ -102,6 +105,7 @@ def build_follow_next_reads_payload(
             "follow_next_reads": {
                 **base,
                 "status": "invalid_report_json",
+                **follow_next_read_counts([], []),
                 "failure_reason": str(exc),
                 "source_packet": {"status": "invalid_json"},
             }
@@ -113,6 +117,7 @@ def build_follow_next_reads_payload(
             "follow_next_reads": {
                 **base,
                 "status": packet_info["status"],
+                **follow_next_read_counts([], []),
                 "failure_reason": packet_info["failure_reason"],
                 "source_packet": packet_info,
             }
@@ -124,10 +129,12 @@ def build_follow_next_reads_payload(
         expand_follow_next_read(read=read, rank=index + 1, plan=plan, default_tz=default_tz, cwd=cwd)
         for index, read in enumerate(selected_reads)
     ]
+    counts = follow_next_read_counts(selected_reads, expanded_reads)
     return {
         "follow_next_reads": {
             **base,
-            "status": "expanded" if expanded_reads else "no_next_reads",
+            "status": follow_next_reads_status(counts),
+            **counts,
             "source_packet": {
                 "status": "supported",
                 "packet_type": packet_info["packet_type"],
@@ -137,6 +144,9 @@ def build_follow_next_reads_payload(
             "selection": {
                 "available_next_read_count": len(reads),
                 "selected_count": len(selected_reads),
+                "expanded_count": counts["expanded_count"],
+                "failed_count": counts["failed_count"],
+                "usable_recovery_evidence_count": counts["usable_recovery_evidence_count"],
                 "limit_applied": max(0, int(limit)),
                 "priority_order": [
                     "promoted_continuation_recovery_clr",
@@ -145,9 +155,60 @@ def build_follow_next_reads_payload(
                 ],
                 "deduplicated_by": "target_or_source_ref",
             },
+            "failed_reads": failed_follow_next_read_summaries(expanded_reads),
             "expanded_reads": expanded_reads,
         }
     }
+
+
+def follow_next_read_counts(selected_reads: list[dict[str, Any]], expanded_reads: list[dict[str, Any]]) -> dict[str, int]:
+    expanded_count = sum(1 for item in expanded_reads if item.get("status") == "expanded")
+    failed_count = sum(1 for item in expanded_reads if item.get("status") != "expanded")
+    usable_recovery_evidence_count = sum(
+        1
+        for item in expanded_reads
+        if item.get("status") == "expanded"
+        and (item.get("recovery") or {}).get("kind") != "ordinary_next_read"
+        and bool(item.get("selected_records"))
+    )
+    return {
+        "selected_count": len(selected_reads),
+        "expanded_count": expanded_count,
+        "failed_count": failed_count,
+        "usable_recovery_evidence_count": usable_recovery_evidence_count,
+    }
+
+
+def follow_next_reads_status(counts: dict[str, int]) -> str:
+    selected_count = counts.get("selected_count", 0)
+    expanded_count = counts.get("expanded_count", 0)
+    failed_count = counts.get("failed_count", 0)
+    if selected_count <= 0:
+        return "no_next_reads"
+    if expanded_count > 0 and failed_count > 0:
+        return "partial_expanded"
+    if expanded_count > 0:
+        return "expanded"
+    return "selected_reads_failed"
+
+
+def failed_follow_next_read_summaries(expanded_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for item in expanded_reads:
+        if item.get("status") == "expanded":
+            continue
+        failures.append(
+            {
+                "rank": item.get("rank"),
+                "target": item.get("target"),
+                "surface": item.get("surface"),
+                "candidate_id": item.get("candidate_id"),
+                "recovery": item.get("recovery"),
+                "status": item.get("status"),
+                "failure_reason": item.get("failure_reason") or item.get("status"),
+            }
+        )
+    return failures[:20]
 
 
 def build_source_expansion_payload(
@@ -391,17 +452,61 @@ def append_next_read_surface(surfaces: list[tuple[str, list[Any]]], label: str, 
 
 def collect_follow_next_reads(packet: dict[str, Any], packet_type: str) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    by_key: dict[str, int] = {}
     for surface, surface_reads in follow_next_read_surfaces(packet, packet_type):
         for item in surface_reads:
             if not isinstance(item, dict):
                 continue
             key = follow_next_read_key(item)
-            if not key or key in seen:
+            if not key:
                 continue
-            seen.add(key)
-            reads.append({**item, "_follow_surface": surface})
+            candidate = {**item, "_follow_surface": surface}
+            if key in by_key:
+                index = by_key[key]
+                reads[index] = merge_duplicate_follow_next_read(reads[index], candidate)
+                continue
+            by_key[key] = len(reads)
+            reads.append(candidate)
     return reads
+
+
+def merge_duplicate_follow_next_read(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    keep, discard = (incoming, existing) if follow_next_read_priority_key(incoming) < follow_next_read_priority_key(existing) else (existing, incoming)
+    duplicate_surfaces = list(dict.fromkeys(list_or_empty(existing.get("_follow_duplicate_surfaces")) + list_or_empty(incoming.get("_follow_duplicate_surfaces"))))
+    for read in (existing, incoming):
+        surface = read.get("_follow_surface")
+        if surface:
+            duplicate_surfaces.append(str(surface))
+    duplicate_surfaces = list(dict.fromkeys(duplicate_surfaces))
+    duplicate_candidate_ids = list(
+        dict.fromkeys(
+            [
+                str(item)
+                for item in (
+                    list_or_empty(existing.get("_follow_duplicate_candidate_ids"))
+                    + list_or_empty(incoming.get("_follow_duplicate_candidate_ids"))
+                    + [existing.get("candidate_id"), incoming.get("candidate_id")]
+                )
+                if item
+            ]
+        )
+    )
+    discarded = list_or_empty(existing.get("_follow_discarded_duplicates")) + list_or_empty(
+        incoming.get("_follow_discarded_duplicates")
+    )
+    discarded.append(
+        {
+            "surface": discard.get("_follow_surface"),
+            "candidate_id": discard.get("candidate_id"),
+            "recovery": recovery_metadata(discard),
+        }
+    )
+    return {
+        **keep,
+        "_follow_duplicate_surfaces": duplicate_surfaces,
+        "_follow_duplicate_candidate_ids": duplicate_candidate_ids,
+        "_follow_discarded_duplicates": discarded[:20],
+    }
 
 
 def prioritize_follow_next_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -441,6 +546,9 @@ def expand_follow_next_read(
         "target": read.get("target") or request.target,
         "source_ref": read.get("source_ref"),
         "surface": read.get("_follow_surface"),
+        "duplicate_surfaces": list_or_empty(read.get("_follow_duplicate_surfaces")),
+        "duplicate_candidate_ids": list_or_empty(read.get("_follow_duplicate_candidate_ids")),
+        "discarded_duplicate_reads": list_or_empty(read.get("_follow_discarded_duplicates")),
         "candidate_id": read.get("candidate_id"),
         "recovery": recovery_metadata(read),
         "request": {
