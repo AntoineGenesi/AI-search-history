@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,17 @@ PLAY_BY_PLAY_LIMIT = 40
 INTERESTING_MOMENT_LIMIT = 20
 NEXT_READ_LIMIT = 20
 NARRATIVE_LEDGER_LIMIT = 40
+REPO_CHRONOLOGY_LIMIT = 80
+
+TASK_ID_RE = re.compile(r"\b(?:jsh|sl)-\d+[a-z]?\b", re.IGNORECASE)
+COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+SAFE_REPO_PATH_PREFIXES = (
+    ("codex/state/reviews/", "review_path"),
+    ("reviews/", "review_path"),
+    ("tasks/", "task_path"),
+    ("docs/", "doc_path"),
+    ("reports/", "report_path"),
+)
 
 UNSUPPORTED_CLAIMS = {
     "root_cause_claim_supported": False,
@@ -72,6 +84,15 @@ def build_failure_analysis_payload(
         follow_packet,
         next_reads,
     )
+    date_range = _date_range(play_by_play, interesting_moments)
+    repo_handle_chronology = _build_repo_handle_chronology(
+        semantic_packet,
+        forensics_packet,
+        follow_packet,
+        next_reads,
+        committed_safe_narrative_ledger,
+        transcript_date_range=date_range,
+    )
     narrative_readiness = _build_narrative_readiness(
         semantic_loaded,
         follow_loaded,
@@ -88,7 +109,6 @@ def build_failure_analysis_payload(
         forensics_packet,
         follow_packet,
     )
-    date_range = _date_range(play_by_play, interesting_moments)
     claim_boundaries = _claim_boundaries(semantic_loaded, forensics_loaded, follow_loaded)
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
@@ -107,6 +127,7 @@ def build_failure_analysis_payload(
         "play_by_play": play_by_play,
         "failure_mode_ledger": failure_mode_ledger,
         "narrative_readiness": narrative_readiness,
+        "repo_handle_chronology": repo_handle_chronology,
         "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
         "interesting_moments": interesting_moments,
         "tool_critique": _tool_critique(
@@ -646,6 +667,480 @@ def _build_narrative_readiness(
         "follow_next_reads_loaded": bool(follow_loaded.get("loaded")),
         "inference_boundary": "readiness classifies committed-safe reconstruction metadata; it does not claim root cause, all-history completeness, final-answer quality, speed, token savings, or product value",
     }
+
+
+def _build_repo_handle_chronology(
+    semantic_packet: dict[str, Any],
+    forensics_packet: dict[str, Any],
+    follow_packet: dict[str, Any],
+    next_reads: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    *,
+    transcript_date_range: dict[str, Any],
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    candidates.extend(_repo_handle_candidates_from_semantic_debug(semantic_packet))
+    candidates.extend(_repo_handle_candidates_from_forensics(forensics_packet))
+    candidates.extend(_repo_handle_candidates_from_follow_next_reads(follow_packet))
+    candidates.extend(_repo_handle_candidates_from_failure_analysis(next_reads, committed_safe_narrative_ledger))
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for candidate in candidates:
+        for handle_type, handle in _safe_repo_handles(candidate.get("values")):
+            date_value, date_source = _safe_repo_date(candidate.get("row"))
+            source = str(candidate.get("source") or "unknown")
+            source_index = _int(candidate.get("source_index"))
+            key = (handle_type, handle, str(date_value or ""), source)
+            if key in seen:
+                continue
+            seen.add(key)
+            row = _clean_row(
+                {
+                    "phase_id": f"repo-phase-{len(rows) + 1:03d}",
+                    "source": source,
+                    "source_index": source_index,
+                    "handle_type": handle_type,
+                    "handle": handle,
+                    "date": date_value,
+                    "date_source": date_source,
+                    "status": _safe_repo_status(candidate.get("row")),
+                    "confidence": _safe_repo_confidence(candidate.get("row")),
+                    "inference_boundary": _repo_inference_boundary(
+                        handle_type=handle_type,
+                        has_date=bool(date_value),
+                        source=source,
+                    ),
+                }
+            )
+            rows.append(row)
+    rows = _sorted_repo_rows(rows)[:REPO_CHRONOLOGY_LIMIT]
+    handle_type_counts = _handle_type_counts(rows)
+    dated_count = sum(1 for row in rows if row.get("date"))
+    date_range = _repo_date_range(rows)
+    gaps = _repo_chronology_gaps(
+        row_count=len(rows),
+        dated_count=dated_count,
+        candidates_considered=len(candidates),
+        handle_type_counts=handle_type_counts,
+    )
+    if rows and dated_count:
+        status = "available"
+    elif rows:
+        status = "partial_no_dates"
+    else:
+        status = "gap"
+    return {
+        "status": status,
+        "phase_row_count": len(rows),
+        "handle_type_counts": handle_type_counts,
+        "date_range": date_range,
+        "transcript_date_range": {
+            "start": transcript_date_range.get("start"),
+            "end": transcript_date_range.get("end"),
+            "timestamp_count": transcript_date_range.get("timestamp_count", 0),
+        },
+        "date_range_boundary": "repo-handle dates are derived only from committed-safe saved-report metadata and are separate from transcript recovery chronology",
+        "gaps": gaps,
+        "inference_boundaries": [
+            "task/review/doc/report paths are preserved only when they can be reduced to safe repo-relative handles",
+            "absolute or private paths are omitted unless a safe repo-relative suffix can be extracted",
+            "commit hashes and git_last_change dates are saved-report metadata, not proof of full development history",
+            "missing dates or joins are reported as chronology gaps, not inferred from raw transcripts",
+        ],
+        "rows": rows,
+    }
+
+
+def _repo_handle_candidates_from_semantic_debug(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    joins = _nested(packet, "task_review_commit_joins")
+    if joins:
+        candidates.append({"source": "semantic_debug.task_review_commit_joins", "source_index": 0, "row": joins, "values": joins})
+        for section in ("review_evidence", "artifact_checks"):
+            for index, row in enumerate(_list(joins.get(section)), 1):
+                if isinstance(row, dict):
+                    candidates.append(
+                        {
+                            "source": f"semantic_debug.task_review_commit_joins.{section}",
+                            "source_index": index,
+                            "row": row,
+                            "values": _repo_candidate_values(row),
+                        }
+                    )
+        for key in ("git", "commit", "path_last_change"):
+            child = joins.get(key)
+            if isinstance(child, dict):
+                candidates.append(
+                    {
+                        "source": f"semantic_debug.task_review_commit_joins.{key}",
+                        "source_index": 1,
+                        "row": child,
+                        "values": _repo_candidate_values(child),
+                    }
+                )
+    for section in ("next_reads",):
+        for index, row in enumerate(_list(packet.get(section)), 1):
+            if isinstance(row, dict):
+                candidates.append(
+                    {
+                        "source": f"semantic_debug.{section}",
+                        "source_index": index,
+                        "row": row,
+                        "values": [row.get("target"), row.get("source_ref")],
+                    }
+                )
+    return candidates
+
+
+def _repo_handle_candidates_from_forensics(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for section in ("phase_timeline", "claim_action_review_joins", "review_evidence", "artifact_checks"):
+        for index, row in enumerate(_list(packet.get(section)), 1):
+            if not isinstance(row, dict):
+                continue
+            values: list[Any] = _repo_candidate_values(row)
+            if section == "claim_action_review_joins":
+                values.extend(row.get("source_refs") for _ in [None])
+                values.append(row.get("join_basis"))
+            candidates.append(
+                {
+                    "source": f"forensics.{section}",
+                    "source_index": index,
+                    "row": row,
+                    "values": values,
+                }
+            )
+    for key in ("git", "review_gate"):
+        child = packet.get(key)
+        if isinstance(child, dict):
+            candidates.append(
+                {
+                    "source": f"forensics.{key}",
+                    "source_index": 1,
+                    "row": child,
+                    "values": _repo_candidate_values(child),
+                }
+            )
+    return candidates
+
+
+def _repo_handle_candidates_from_follow_next_reads(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for section in ("expanded_reads", "failed_reads"):
+        for index, row in enumerate(_list(packet.get(section)), 1):
+            if isinstance(row, dict):
+                candidates.append(
+                    {
+                        "source": f"follow_next_reads.{section}",
+                        "source_index": index,
+                        "row": row,
+                        "values": [row.get("target"), row.get("source_ref"), row.get("recovery")],
+                    }
+                )
+    return candidates
+
+
+def _repo_handle_candidates_from_failure_analysis(
+    next_reads: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for index, row in enumerate(_list(next_reads.get("reads")), 1):
+        if isinstance(row, dict):
+            candidates.append(
+                {
+                    "source": "failure_analysis.next_reads",
+                    "source_index": index,
+                    "row": row,
+                    "values": [row.get("target_handle"), row.get("source_handle")],
+                }
+            )
+    for index, row in enumerate(committed_safe_narrative_ledger, 1):
+        if isinstance(row, dict):
+            candidates.append(
+                {
+                    "source": "failure_analysis.committed_safe_narrative_ledger",
+                    "source_index": index,
+                    "row": row,
+                    "values": [row.get("target_handle"), row.get("source_handle"), row.get("candidate_id")],
+                }
+            )
+    return candidates
+
+
+def _repo_candidate_values(row: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    for key in (
+        "path",
+        "target",
+        "task",
+        "task_id",
+        "commit",
+        "merge_commit",
+        "source_ref",
+        "source_refs",
+        "gate_source_refs",
+        "blockers",
+        "git_last_change",
+        "review_verdict",
+        "claim_action",
+        "changed_files",
+        "path_last_change",
+    ):
+        if key in row:
+            values.append(row.get(key))
+    return values
+
+
+def _safe_repo_handles(value: Any) -> list[tuple[str, str]]:
+    handles: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(handle_type: str, handle: str) -> None:
+        item = (handle_type, handle)
+        if item in seen:
+            return
+        seen.add(item)
+        handles.append(item)
+
+    def visit(item: Any, *, key_hint: str = "") -> None:
+        if item is None:
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in {
+                    "body",
+                    "message",
+                    "note",
+                    "notes",
+                    "reason",
+                    "snippet",
+                    "subject",
+                    "text",
+                    "warning",
+                    "records",
+                    "selected_records",
+                    "command",
+                    "command_payload",
+                    "vectors",
+                    "indexes",
+                    "source_context",
+                    "source_payload",
+                    "payload",
+                    "metadata",
+                    "cwd",
+                    "derived_roots",
+                }:
+                    continue
+                visit(child, key_hint=str(key))
+            return
+        if isinstance(item, list):
+            for child in item:
+                visit(child, key_hint=key_hint)
+            return
+        if not isinstance(item, (str, int)):
+            return
+        text = str(item)
+        for path_type, path in _safe_repo_paths(text):
+            add(path_type, path)
+            for task_id in _task_ids(path):
+                add("task_id", task_id)
+        if "commit" in key_hint.lower() or "hash" in key_hint.lower():
+            for commit in _commit_hashes(text):
+                add("commit_hash", commit)
+        for task_id in _task_ids(text):
+            add("task_id", task_id)
+
+    visit(value)
+    return handles
+
+
+def _safe_repo_paths(text: str) -> list[tuple[str, str]]:
+    normalized = text.replace("\\", "/").strip().strip("`'\"")
+    if not normalized:
+        return []
+    if ":" in normalized:
+        head, tail = normalized.rsplit(":", 1)
+        if tail.isdigit():
+            normalized = head
+    normalized = normalized.split("#", 1)[0].split("?", 1)[0]
+    paths: list[tuple[str, str]] = []
+    for prefix, handle_type in SAFE_REPO_PATH_PREFIXES:
+        start = _safe_path_prefix_index(normalized, prefix)
+        if start < 0:
+            continue
+        candidate = normalized[start:]
+        terminators = [len(candidate)]
+        for marker in (" ", "\n", "\t", ")", "]", "}", ",", ";"):
+            position = candidate.find(marker)
+            if position >= 0:
+                terminators.append(position)
+        candidate = candidate[: min(terminators)].strip().strip("`'\"")
+        candidate = candidate.rstrip(".")
+        if _safe_repo_path(candidate, prefix):
+            paths.append((handle_type, candidate))
+    return list(dict.fromkeys(paths))
+
+
+def _safe_path_prefix_index(value: str, prefix: str) -> int:
+    if value.startswith(prefix):
+        return 0
+    marker = f"/{prefix}"
+    index = value.find(marker)
+    if index >= 0:
+        return index + 1
+    return -1
+
+
+def _safe_repo_path(value: str, prefix: str) -> bool:
+    if not value.startswith(prefix):
+        return False
+    if value.startswith("/") or ".." in value.split("/"):
+        return False
+    if len(value) > 240:
+        return False
+    suffix = value.rsplit("/", 1)[-1]
+    return bool(suffix and re.search(r"\.(?:md|json|html|csv|txt)$", suffix, re.IGNORECASE))
+
+
+def _task_ids(text: str) -> list[str]:
+    return [match.group(0).lower() for match in TASK_ID_RE.finditer(text)]
+
+
+def _commit_hashes(text: str) -> list[str]:
+    return [match.group(0).lower() for match in COMMIT_RE.finditer(text)]
+
+
+def _safe_repo_date(row: Any) -> tuple[str | None, str | None]:
+    if not isinstance(row, dict):
+        return None, None
+    nested_keys = (
+        "git_last_change",
+        "path_last_change",
+        "commit",
+        "merge_commit",
+    )
+    direct_keys = (
+        "commit_time",
+        "author_time",
+        "last_changed_at",
+        "date",
+        "timestamp_utc",
+        "timestamp",
+    )
+    for parent_key in nested_keys:
+        child = row.get(parent_key)
+        if isinstance(child, dict):
+            for key in direct_keys:
+                value = child.get(key)
+                if _looks_like_safe_date(value):
+                    return str(value), f"{parent_key}.{key}"
+    for key in direct_keys:
+        value = row.get(key)
+        if _looks_like_safe_date(value):
+            return str(value), key
+    return None, None
+
+
+def _looks_like_safe_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-]+(?:Z)?)?$", value))
+
+
+def _safe_repo_status(row: Any) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    for key in ("status", "phase_kind", "evidence_kind", "relation", "support_status", "support", "claim_action"):
+        value = row.get(key)
+        if isinstance(value, str) and _safe_short_label(value):
+            return value
+        if isinstance(value, dict):
+            action = value.get("action") or value.get("status") or value.get("label")
+            if isinstance(action, str) and _safe_short_label(action):
+                return action
+    review = row.get("review_verdict")
+    if isinstance(review, dict):
+        action = review.get("action") or review.get("verdict")
+        if isinstance(action, str) and _safe_short_label(action):
+            return action
+    return None
+
+
+def _safe_repo_confidence(row: Any) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    value = row.get("confidence") or row.get("support_level") or row.get("support_basis_kind")
+    if isinstance(value, str) and _safe_short_label(value):
+        return value
+    return None
+
+
+def _safe_short_label(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9_./:-]{1,80}$", value))
+
+
+def _repo_inference_boundary(*, handle_type: str, has_date: bool, source: str) -> str:
+    if not has_date:
+        return "safe handle was present in saved-report metadata, but no safe repo date was supplied"
+    if handle_type == "commit_hash":
+        return "commit hash and date are saved-report metadata; no repository history scan was run"
+    if source.startswith("failure_analysis."):
+        return "handle was derived from already-sanitized failure-analysis rows, not raw source payloads"
+    return "safe repo handle was joined from supplied saved-report metadata only"
+
+
+def _sorted_repo_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("date") or "9999-12-31T23:59:59+00:00"),
+            str(row.get("handle_type") or ""),
+            str(row.get("handle") or ""),
+            str(row.get("source") or ""),
+            int(row.get("source_index") or 0),
+        ),
+    )
+
+
+def _handle_type_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        handle_type = str(row.get("handle_type") or "unknown")
+        counts[handle_type] = counts.get(handle_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _repo_date_range(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    dates = sorted({str(row.get("date")) for row in rows if row.get("date")})
+    return {
+        "start": dates[0] if dates else None,
+        "end": dates[-1] if dates else None,
+        "timestamp_count": len(dates),
+        "boundary": "derived from saved report repo-handle dates only; separate from transcript date_range",
+    }
+
+
+def _repo_chronology_gaps(
+    *,
+    row_count: int,
+    dated_count: int,
+    candidates_considered: int,
+    handle_type_counts: dict[str, int],
+) -> list[str]:
+    gaps: list[str] = []
+    if not row_count:
+        if candidates_considered:
+            gaps.append("saved_report_metadata_contained_no_committed_safe_repo_handles")
+        else:
+            gaps.append("no_repo_handle_metadata_sections_present")
+    if row_count and dated_count < row_count:
+        gaps.append("some_repo_handles_missing_safe_dates")
+    for required in ("task_id", "task_path", "review_path", "doc_path", "commit_hash"):
+        if not handle_type_counts.get(required):
+            gaps.append(f"{required}_not_present")
+    return gaps
 
 
 def _build_next_reads(semantic_packet: dict[str, Any], follow_packet: dict[str, Any]) -> dict[str, Any]:

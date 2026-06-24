@@ -267,6 +267,9 @@ def render_failure_analysis_text(payload: dict) -> str:
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
+    repo_chronology = report.get("repo_handle_chronology") or {}
+    repo_counts = repo_chronology.get("handle_type_counts") or {}
+    repo_date_range = repo_chronology.get("date_range") or {}
     lines = [
         "Failure Analysis",
         f"Status: {report.get('status')}",
@@ -276,9 +279,22 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Play-by-play rows: {len(report.get('play_by_play') or [])}",
         f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
         f"Narrative readiness: {narrative.get('status')} ({narrative.get('ledger_row_count', len(narrative_ledger))} ledger rows)",
+        f"Repo handle chronology: {repo_chronology.get('status')} ({repo_chronology.get('phase_row_count', 0)} rows)",
+        f"Repo handle date range: {repo_date_range.get('start')} to {repo_date_range.get('end')}",
+        f"Repo handle counts: {', '.join(f'{key}={value}' for key, value in sorted(repo_counts.items())) or 'none'}",
         f"Next reads: {next_reads.get('status')} ({next_reads.get('count', 0)})",
-        "Committed-safe narrative ledger:",
+        "Repo handle chronology rows:",
     ]
+    for row in (repo_chronology.get("rows") or [])[:10]:
+        details = [f"{row.get('handle_type')}={row.get('handle')}"]
+        if row.get("date"):
+            details.append(f"date={row.get('date')}")
+        if row.get("status"):
+            details.append(f"status={row.get('status')}")
+        lines.append(f"- {row.get('phase_id')}: {'; '.join(details)}")
+    lines.extend([
+        "Committed-safe narrative ledger:",
+    ])
     for row in narrative_ledger[:10]:
         details = []
         if row.get("candidate_id"):
@@ -304,6 +320,9 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
+    repo_chronology = report.get("repo_handle_chronology") or {}
+    repo_counts = repo_chronology.get("handle_type_counts") or {}
+    repo_date_range = repo_chronology.get("date_range") or {}
     lines = [
         "# Failure Analysis",
         "",
@@ -314,6 +333,8 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Play-by-play rows: `{len(report.get('play_by_play') or [])}`",
         f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
         f"- Narrative readiness: `{narrative.get('status')}`",
+        f"- Repo handle chronology: `{repo_chronology.get('status')}` (`{repo_chronology.get('phase_row_count', 0)}` rows)",
+        f"- Repo handle date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
         f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
         f"- Next reads: `{next_reads.get('status')}` (`{next_reads.get('count', 0)}`)",
         "",
@@ -325,9 +346,33 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Usable recovery evidence: `{narrative.get('usable_recovery_evidence_count', 0)}`",
         f"- Reason codes: `{', '.join(str(item) for item in narrative.get('reason_codes') or []) or 'none'}`",
         "",
-        "## Committed-Safe Narrative Ledger",
+        "## Repo Handle Chronology",
+        "",
+        f"- Status: `{repo_chronology.get('status')}`",
+        f"- Phase rows: `{repo_chronology.get('phase_row_count', 0)}`",
+        f"- Handle counts: `{', '.join(f'{key}={value}' for key, value in sorted(repo_counts.items())) or 'none'}`",
+        f"- Date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
+        f"- Gaps: `{', '.join(str(item) for item in repo_chronology.get('gaps') or []) or 'none'}`",
         "",
     ]
+    for row in repo_chronology.get("rows") or []:
+        bits = [
+            f"`{row.get('phase_id')}`",
+            f"`{row.get('handle_type')}` `{row.get('handle')}`",
+            f"source `{row.get('source')}`",
+        ]
+        if row.get("date"):
+            bits.append(f"date `{row.get('date')}`")
+        if row.get("status"):
+            bits.append(f"status `{row.get('status')}`")
+        if row.get("confidence"):
+            bits.append(f"confidence `{row.get('confidence')}`")
+        lines.append(f"- {'; '.join(bits)}")
+    lines.extend([
+        "",
+        "## Committed-Safe Narrative Ledger",
+        "",
+    ])
     for row in narrative_ledger:
         bits = [
             f"`{row.get('ledger_kind')}`",
