@@ -205,6 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "sanitized child-plan diagnostics."
             ),
         )
+        find.add_argument(
+            "--continuation-ledger",
+            action="store_true",
+            help=(
+                "Opt in to a bounded private-safe continuation candidate ledger for explicit fielded-bm25 "
+                "retrieval diagnostics. Defaults stay unchanged."
+            ),
+        )
     structural_hybrid = subparsers.add_parser(
         "find-structural-hybrid-budgeted",
         description=(
@@ -404,6 +412,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Controls deterministic fielded child query channels. auto enables supported intent children; "
             "off preserves the old fielded stream/channel shape; debug matches auto retrieval and emits "
             "sanitized child-plan diagnostics."
+        ),
+    )
+    semantic_debug.add_argument(
+        "--continuation-ledger",
+        action="store_true",
+        help=(
+            "Opt in to a bounded private-safe continuation candidate ledger for explicit fielded-bm25 "
+            "semantic-debug retrieval diagnostics. Defaults stay unchanged."
         ),
     )
     private_mine = subparsers.add_parser("private-benchmark-mine")
@@ -2205,6 +2221,7 @@ def main(argv: list[str] | None = None) -> int:
             use_rg_prefilter=args.rg_prefilter,
             fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
             query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
+            continuation_ledger=getattr(args, "continuation_ledger", False),
         )
         result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
         manifest_report = (
