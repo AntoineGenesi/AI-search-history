@@ -266,6 +266,7 @@ def render_failure_analysis_text(payload: dict) -> str:
     scope = report.get("story_scope") or {}
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
+    story_phase_summary = report.get("story_phase_summary") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -279,12 +280,28 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Play-by-play rows: {len(report.get('play_by_play') or [])}",
         f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
         f"Narrative readiness: {narrative.get('status')} ({narrative.get('ledger_row_count', len(narrative_ledger))} ledger rows)",
+        f"Story phase summary: {story_phase_summary.get('status')} ({story_phase_summary.get('usable_phase_count', 0)}/{story_phase_summary.get('phase_count', 0)} usable)",
         f"Repo handle chronology: {repo_chronology.get('status')} ({repo_chronology.get('phase_row_count', 0)} rows)",
         f"Repo handle date range: {repo_date_range.get('start')} to {repo_date_range.get('end')}",
         f"Repo handle counts: {', '.join(f'{key}={value}' for key, value in sorted(repo_counts.items())) or 'none'}",
         f"Next reads: {next_reads.get('status')} ({next_reads.get('count', 0)})",
-        "Repo handle chronology rows:",
+        f"Story phase gaps: {', '.join(str(item) for item in story_phase_summary.get('gap_reasons') or []) or 'none'}",
+        f"Story phase next review: {', '.join(str(item) for item in story_phase_summary.get('next_review_needs') or []) or 'none'}",
+        "Story phase rows:",
     ]
+    for row in (story_phase_summary.get("rows") or [])[:10]:
+        details = [f"status={row.get('status')}"]
+        if row.get("task_id"):
+            details.append(f"task={row.get('task_id')}")
+        row_date_range = row.get("date_range") or {}
+        if row_date_range.get("start") or row_date_range.get("end"):
+            details.append(f"dates={row_date_range.get('start')}..{row_date_range.get('end')}")
+        if row.get("gap_reasons"):
+            details.append(f"gaps={','.join(str(item) for item in row.get('gap_reasons') or [])}")
+        lines.append(f"- {row.get('phase_id')}: {'; '.join(details)}")
+    lines.extend([
+        "Repo handle chronology rows:",
+    ])
     for row in (repo_chronology.get("rows") or [])[:10]:
         details = [f"{row.get('handle_type')}={row.get('handle')}"]
         if row.get("date"):
@@ -319,6 +336,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     date_range = report.get("date_range") or {}
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
+    story_phase_summary = report.get("story_phase_summary") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -333,6 +351,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Play-by-play rows: `{len(report.get('play_by_play') or [])}`",
         f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
         f"- Narrative readiness: `{narrative.get('status')}`",
+        f"- Story phase summary: `{story_phase_summary.get('status')}` (`{story_phase_summary.get('usable_phase_count', 0)}`/`{story_phase_summary.get('phase_count', 0)}` usable)",
         f"- Repo handle chronology: `{repo_chronology.get('status')}` (`{repo_chronology.get('phase_row_count', 0)}` rows)",
         f"- Repo handle date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
         f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
@@ -346,6 +365,33 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Usable recovery evidence: `{narrative.get('usable_recovery_evidence_count', 0)}`",
         f"- Reason codes: `{', '.join(str(item) for item in narrative.get('reason_codes') or []) or 'none'}`",
         "",
+        "## Story Phase Summary",
+        "",
+        f"- Status: `{story_phase_summary.get('status')}`",
+        f"- Phases: `{story_phase_summary.get('phase_count', 0)}`",
+        f"- Usable phases: `{story_phase_summary.get('usable_phase_count', 0)}`",
+        f"- Gap reasons: `{', '.join(str(item) for item in story_phase_summary.get('gap_reasons') or []) or 'none'}`",
+        f"- Next review needs: `{', '.join(str(item) for item in story_phase_summary.get('next_review_needs') or []) or 'none'}`",
+        "",
+    ]
+    for row in story_phase_summary.get("rows") or []:
+        row_date_range = row.get("date_range") or {}
+        bits = [
+            f"`{row.get('phase_id')}`",
+            f"status `{row.get('status')}`",
+            f"usable `{row.get('usable')}`",
+        ]
+        if row.get("task_id"):
+            bits.append(f"task `{row.get('task_id')}`")
+        if row_date_range.get("start") or row_date_range.get("end"):
+            bits.append(f"dates `{row_date_range.get('start')}..{row_date_range.get('end')}`")
+        if row.get("handle_types"):
+            bits.append(f"handles `{', '.join(str(item) for item in row.get('handle_types') or [])}`")
+        if row.get("gap_reasons"):
+            bits.append(f"gaps `{', '.join(str(item) for item in row.get('gap_reasons') or [])}`")
+        lines.append(f"- {'; '.join(bits)}")
+    lines.extend([
+        "",
         "## Repo Handle Chronology",
         "",
         f"- Status: `{repo_chronology.get('status')}`",
@@ -354,7 +400,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
         f"- Gaps: `{', '.join(str(item) for item in repo_chronology.get('gaps') or []) or 'none'}`",
         "",
-    ]
+    ])
     for row in repo_chronology.get("rows") or []:
         bits = [
             f"`{row.get('phase_id')}`",

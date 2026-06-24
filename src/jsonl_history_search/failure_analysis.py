@@ -13,6 +13,7 @@ INTERESTING_MOMENT_LIMIT = 20
 NEXT_READ_LIMIT = 20
 NARRATIVE_LEDGER_LIMIT = 40
 REPO_CHRONOLOGY_LIMIT = 80
+STORY_PHASE_LIMIT = 30
 
 TASK_ID_RE = re.compile(r"\b(?:jsh|sl)-\d+[a-z]?\b", re.IGNORECASE)
 COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
@@ -102,6 +103,12 @@ def build_failure_analysis_payload(
         next_reads,
         committed_safe_narrative_ledger,
     )
+    story_phase_summary = _build_story_phase_summary(
+        repo_handle_chronology,
+        committed_safe_narrative_ledger,
+        narrative_readiness,
+        next_reads,
+    )
     evidence_inputs = _build_evidence_backed_summary_inputs(
         semantic_loaded,
         forensics_loaded,
@@ -128,6 +135,7 @@ def build_failure_analysis_payload(
         "play_by_play": play_by_play,
         "failure_mode_ledger": failure_mode_ledger,
         "narrative_readiness": narrative_readiness,
+        "story_phase_summary": story_phase_summary,
         "repo_handle_chronology": repo_handle_chronology,
         "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
         "interesting_moments": interesting_moments,
@@ -668,6 +676,279 @@ def _build_narrative_readiness(
         "follow_next_reads_loaded": bool(follow_loaded.get("loaded")),
         "inference_boundary": "readiness classifies committed-safe reconstruction metadata; it does not claim root cause, all-history completeness, final-answer quality, speed, token savings, or product value",
     }
+
+
+def _build_story_phase_summary(
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    narrative_readiness: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> dict[str, Any]:
+    repo_rows = [row for row in _list(repo_handle_chronology.get("rows")) if isinstance(row, dict)]
+    grouped = _group_story_phase_rows(repo_rows)
+    all_rows: list[dict[str, Any]] = []
+    for index, group in enumerate(grouped, 1):
+        all_rows.append(
+            _story_phase_row(
+                index=index,
+                group=group,
+                narrative_readiness=narrative_readiness,
+            )
+        )
+    rows = all_rows[:STORY_PHASE_LIMIT]
+
+    phase_count = len(grouped)
+    usable_phase_count = sum(1 for row in all_rows if row.get("usable"))
+    ledger_kind_counts = _ledger_kind_counts(committed_safe_narrative_ledger)
+    recovery_opened = bool(narrative_readiness.get("recovery_opened_count"))
+    usable_recovery_count = _int(narrative_readiness.get("usable_recovery_evidence_count"))
+    gap_reasons = _story_phase_gap_reasons(
+        repo_handle_chronology=repo_handle_chronology,
+        narrative_readiness=narrative_readiness,
+        next_reads=next_reads,
+        ledger_kind_counts=ledger_kind_counts,
+        phase_count=phase_count,
+        usable_phase_count=usable_phase_count,
+        usable_recovery_count=usable_recovery_count,
+        recovery_opened=recovery_opened,
+    )
+    status = _story_phase_status(
+        narrative_status=str(narrative_readiness.get("status") or ""),
+        phase_count=phase_count,
+        usable_phase_count=usable_phase_count,
+        usable_recovery_count=usable_recovery_count,
+        recovery_opened=recovery_opened,
+    )
+    return {
+        "status": status,
+        "phase_count": phase_count,
+        "usable_phase_count": usable_phase_count,
+        "rendered_phase_count": len(rows),
+        "gap_reasons": gap_reasons,
+        "next_review_needs": _story_phase_next_review_needs(
+            gap_reasons=gap_reasons,
+            repo_handle_chronology=repo_handle_chronology,
+            narrative_readiness=narrative_readiness,
+            next_reads=next_reads,
+        ),
+        "inference_boundaries": [
+            "story phases are deterministic metadata groups derived only from committed-safe repo chronology, narrative readiness, and narrative ledger rows",
+            "rows may identify usable setup/review/recovery metadata, but they do not include raw transcript text or source payloads",
+            "private transcript interpretation, root cause, all-history completeness, final-answer quality, speed, token savings, and product value remain unsupported unless separately reviewed",
+            "safe next-review needs are labels for local/private review, not generated story prose",
+        ],
+        "input_counts": {
+            "repo_chronology_rows": len(repo_rows),
+            "narrative_ledger_rows": len(committed_safe_narrative_ledger),
+            "next_read_rows": _int(next_reads.get("count")),
+        },
+        "ledger_kind_counts": ledger_kind_counts,
+        "rows": rows,
+    }
+
+
+def _ledger_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ledger_kind = str(row.get("ledger_kind") or "unknown")
+        counts[ledger_kind] = counts.get(ledger_kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _group_story_phase_rows(repo_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    for row in repo_rows:
+        key = _story_phase_group_key(row)
+        if key not in groups:
+            groups[key] = {
+                "key": key,
+                "task_ids": set(),
+                "handles": {},
+                "dates": set(),
+                "statuses": set(),
+                "sources": set(),
+                "repo_phase_ids": [],
+            }
+            ordered_keys.append(key)
+        group = groups[key]
+        handle_type = str(row.get("handle_type") or "unknown")
+        handle = str(row.get("handle") or "")
+        if handle:
+            group["handles"].setdefault(handle_type, set()).add(handle)
+            for task_id in _task_ids(handle):
+                group["task_ids"].add(task_id)
+        if row.get("date"):
+            group["dates"].add(str(row.get("date")))
+        if row.get("status"):
+            group["statuses"].add(str(row.get("status")))
+        if row.get("source"):
+            group["sources"].add(str(row.get("source")))
+        if row.get("phase_id"):
+            group["repo_phase_ids"].append(str(row.get("phase_id")))
+
+    def sort_key(key: str) -> tuple[str, str]:
+        group = groups[key]
+        dates = sorted(group["dates"])
+        task_ids = sorted(group["task_ids"])
+        return (dates[0] if dates else "9999-12-31T23:59:59+00:00", task_ids[0] if task_ids else key)
+
+    return [groups[key] for key in sorted(ordered_keys, key=sort_key)]
+
+
+def _story_phase_group_key(row: dict[str, Any]) -> str:
+    handle_type = str(row.get("handle_type") or "")
+    handle = str(row.get("handle") or "")
+    task_ids = _task_ids(handle)
+    if task_ids:
+        return f"task:{task_ids[0]}"
+    if handle_type in {"task_path", "review_path", "doc_path", "report_path"} and handle:
+        return f"path:{handle}"
+    if handle_type == "commit_hash" and handle:
+        return f"commit:{handle}"
+    return f"{handle_type}:{handle}"
+
+
+def _story_phase_row(
+    *,
+    index: int,
+    group: dict[str, Any],
+    narrative_readiness: dict[str, Any],
+) -> dict[str, Any]:
+    handles = {
+        handle_type: sorted(values)[:3]
+        for handle_type, values in sorted(group["handles"].items())
+        if values
+    }
+    dates = sorted(group["dates"])
+    task_ids = sorted(group["task_ids"])
+    gap_reasons: list[str] = []
+    handle_types = set(handles)
+    if not dates:
+        gap_reasons.append("phase_missing_safe_date")
+    if not (handle_types & {"task_path", "review_path", "doc_path", "report_path"}):
+        gap_reasons.append("phase_missing_safe_artifact_path")
+    if narrative_readiness.get("status") in {"recovery_opened", "needs_private_review"}:
+        gap_reasons.append("phase_requires_private_recovery_review")
+    if narrative_readiness.get("status") == "candidate_found":
+        gap_reasons.append("phase_recovery_not_opened")
+    usable = bool(handles and (dates or task_ids or handle_types & {"task_path", "review_path", "doc_path", "report_path"}))
+    status = "usable_metadata"
+    if not usable:
+        status = "insufficient_safe_metadata"
+    elif "phase_requires_private_recovery_review" in gap_reasons:
+        status = "usable_metadata_private_review_needed"
+    elif gap_reasons:
+        status = "usable_metadata_with_gaps"
+    return _clean_row(
+        {
+            "phase_id": f"story-phase-{index:03d}",
+            "status": status,
+            "usable": usable,
+            "task_id": task_ids[0] if task_ids else None,
+            "date_range": {
+                "start": dates[0] if dates else None,
+                "end": dates[-1] if dates else None,
+                "date_count": len(dates),
+            },
+            "handle_types": sorted(handle_types),
+            "handles": handles,
+            "repo_phase_ids": group["repo_phase_ids"][:6],
+            "source_surfaces": sorted(group["sources"])[:6],
+            "repo_statuses": sorted(group["statuses"])[:6],
+            "gap_reasons": gap_reasons,
+            "next_review_needs": _story_phase_row_next_review_needs(gap_reasons),
+            "inference_boundary": "phase row is a safe metadata grouping for review/story planning; it is not generated narrative prose or a root-cause claim",
+        }
+    )
+
+
+def _story_phase_row_next_review_needs(gap_reasons: list[str]) -> list[str]:
+    needs: list[str] = []
+    if "phase_requires_private_recovery_review" in gap_reasons:
+        needs.append("private_review_opened_recovery_before_devlog_claim")
+    if "phase_recovery_not_opened" in gap_reasons:
+        needs.append("run_or_load_follow_next_reads_for_phase_context")
+    if "phase_missing_safe_date" in gap_reasons:
+        needs.append("add_safe_repo_or_review_date_metadata")
+    if "phase_missing_safe_artifact_path" in gap_reasons:
+        needs.append("add_safe_task_review_doc_or_report_handle")
+    return needs
+
+
+def _story_phase_status(
+    *,
+    narrative_status: str,
+    phase_count: int,
+    usable_phase_count: int,
+    usable_recovery_count: int,
+    recovery_opened: bool,
+) -> str:
+    if not phase_count:
+        return "no_story_phases_available"
+    if not usable_phase_count:
+        return "blocked_on_safe_phase_metadata"
+    if narrative_status == "narrative_ready" and usable_recovery_count:
+        return "story_ready_metadata"
+    if recovery_opened and not usable_recovery_count:
+        return "usable_with_private_review_gaps"
+    if narrative_status in {"needs_private_review", "recovery_opened"}:
+        return "usable_with_private_review_gaps"
+    return "usable_with_recovery_gaps"
+
+
+def _story_phase_gap_reasons(
+    *,
+    repo_handle_chronology: dict[str, Any],
+    narrative_readiness: dict[str, Any],
+    next_reads: dict[str, Any],
+    ledger_kind_counts: dict[str, int],
+    phase_count: int,
+    usable_phase_count: int,
+    usable_recovery_count: int,
+    recovery_opened: bool,
+) -> list[str]:
+    gaps: list[str] = []
+    if not phase_count:
+        gaps.append("no_committed_safe_repo_phases")
+    if phase_count and not usable_phase_count:
+        gaps.append("no_usable_phase_rows")
+    gaps.extend(str(item) for item in _list(repo_handle_chronology.get("gaps"))[:12])
+    gaps.extend(str(item) for item in _list(narrative_readiness.get("reason_codes"))[:12])
+    if ledger_kind_counts.get("recovery_gap"):
+        gaps.append("narrative_ledger_recovery_gaps_present")
+    if recovery_opened and not usable_recovery_count:
+        gaps.append("opened_recovery_has_no_usable_evidence")
+    if next_reads.get("status") in {"followup_gap", "explicit_no_next_reads"}:
+        gaps.append(str(next_reads.get("status")))
+    return list(dict.fromkeys(gaps))
+
+
+def _story_phase_next_review_needs(
+    *,
+    gap_reasons: list[str],
+    repo_handle_chronology: dict[str, Any],
+    narrative_readiness: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> list[str]:
+    needs: list[str] = []
+    if not (repo_handle_chronology.get("rows") or []):
+        needs.append("add_or_load_committed_safe_repo_chronology")
+    if "some_repo_handles_missing_safe_dates" in gap_reasons:
+        needs.append("add_safe_dates_for_undated_repo_handles")
+    if any(reason.endswith("_not_present") for reason in gap_reasons):
+        needs.append("add_missing_safe_task_review_doc_report_or_commit_handles")
+    if "follow_next_reads_not_loaded" in gap_reasons or next_reads.get("status") == "followup_gap":
+        needs.append("load_or_run_follow_next_reads")
+    if narrative_readiness.get("status") in {"recovery_opened", "needs_private_review"}:
+        needs.append("private_review_opened_recovery_evidence")
+    if "opened_recovery_has_no_usable_evidence" in gap_reasons:
+        needs.append("mark_or_recover_usable_evidence_before_story_claim")
+    if not needs:
+        needs.append("review_metadata_phase_rows_before_writing_devlog_prose")
+    return list(dict.fromkeys(needs))
 
 
 def _build_repo_handle_chronology(
