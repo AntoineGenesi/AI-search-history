@@ -913,6 +913,7 @@ def _run_package_search_fielded_bm25(**kwargs) -> tuple[dict[str, Any], dict[str
         intent,
         default_tz=default_tz,
         cwd=str(Path(args.cwd).expanduser().resolve()),
+        continuation_ledger=bool(getattr(args, "continuation_ledger", False)),
         expected_ref_diagnostics=case.get("expected_refs")
         if (
             getattr(args, "capture_expected_ref_diagnostics", False)
@@ -2164,6 +2165,9 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "branch_fanout": branch_fanout,
         "source_grouping": source_grouping,
         "materialization": materialization,
+        "continuation_candidate_ledger": _fielded_bm25_continuation_ledger_row_stats(
+            result.get("continuation_candidate_ledger")
+        ),
         "phase_profile": phase_profile,
         "index_build_profile": index_build_profile,
         "query_profile": query_profile,
@@ -2175,6 +2179,137 @@ def _fielded_bm25_row_stats(result: dict[str, Any]) -> dict[str, Any]:
         "raw_session_ids_included": False,
         "raw_cwd_included": False,
         "vectors_or_persisted_indexes_included": bool(privacy.get("vectors_or_persisted_indexes_included", False)),
+    }
+
+
+def _fielded_bm25_continuation_ledger_row_stats(value: Any) -> dict[str, Any]:
+    ledger = value if isinstance(value, dict) else {}
+    if not ledger:
+        return {
+            "enabled": False,
+            "status": "not_enabled",
+            "mode": "not_enabled",
+            "pass_count": 0,
+            "retrieval_chunk_count": 0,
+            "multi_pass": False,
+            "ledger_item_limit": 0,
+            "ledger_item_count": 0,
+            "candidate_row_pool_limit": 0,
+            "total_candidate_rows_discovered": 0,
+            "candidate_rows_retained_for_materialization": 0,
+            "candidate_rows_materialized": 0,
+            "final_packet_candidate_count": 0,
+            "final_packet_present_count": 0,
+            "recoverable_omitted_count": 0,
+            "still_unreached_count": 0,
+            "continuation_available": False,
+            "classification_counts": {
+                "present_final": 0,
+                "recoverable_omitted": 0,
+                "still_unreached": 0,
+            },
+            "stage_counts": {},
+            "loss_stage_summary": {},
+            "privacy_status": "not_evaluated",
+            "privacy": _fielded_bm25_continuation_ledger_privacy(),
+            "claim_boundaries": _fielded_bm25_continuation_ledger_claim_boundaries(),
+        }
+    privacy = ledger.get("privacy") if isinstance(ledger.get("privacy"), dict) else {}
+    policy = ledger.get("continuation_policy") if isinstance(ledger.get("continuation_policy"), dict) else {}
+    claim_boundaries = (
+        ledger.get("claim_boundaries") if isinstance(ledger.get("claim_boundaries"), dict) else {}
+    )
+    raw_payload_flags = {
+        "raw_paths_included": bool(
+            privacy.get("raw_paths_included")
+            or policy.get("raw_paths_included")
+            or policy.get("raw_path_included")
+        ),
+        "raw_text_included": bool(privacy.get("raw_text_included") or policy.get("raw_text_included")),
+        "raw_snippets_included": bool(
+            privacy.get("raw_snippets_included") or policy.get("raw_snippets_included")
+        ),
+        "source_lines_included": bool(
+            privacy.get("source_lines_included")
+            or policy.get("source_lines_included")
+            or policy.get("source_line_included")
+        ),
+        "line_numbers_included": bool(
+            privacy.get("line_numbers_included") or policy.get("line_numbers_included")
+        ),
+        "raw_session_ids_included": bool(
+            privacy.get("raw_session_ids_included") or policy.get("raw_session_ids_included")
+        ),
+        "vectors_or_persisted_indexes_included": bool(
+            privacy.get("vectors_or_persisted_indexes_included")
+            or policy.get("vectors_or_persisted_indexes_included")
+        ),
+    }
+    privacy_status = (
+        "aggregate_safe"
+        if not any(raw_payload_flags.values())
+        else "privacy_boundary_violation_detected"
+    )
+    final_present = int(ledger.get("final_packet_present_count") or 0)
+    recoverable = int(ledger.get("recoverable_omitted_count") or 0)
+    unreached = int(ledger.get("still_unreached_count") or 0)
+    return {
+        "enabled": bool(ledger.get("enabled", True)),
+        "status": "evaluated",
+        "mode": str(ledger.get("mode") or "fielded_bm25_opt_in_continuation_candidate_ledger"),
+        "version": str(ledger.get("version") or ""),
+        "bounded": bool(ledger.get("bounded", False)),
+        "pass_count": int(ledger.get("pass_count") or 0),
+        "retrieval_chunk_count": int(ledger.get("retrieval_chunk_count") or 0),
+        "multi_pass": bool(ledger.get("multi_pass", False)),
+        "ledger_item_limit": int(ledger.get("ledger_item_limit") or 0),
+        "ledger_item_count": int(ledger.get("ledger_item_count") or 0),
+        "candidate_row_pool_limit": int(ledger.get("candidate_row_pool_limit") or 0),
+        "total_candidate_rows_discovered": int(ledger.get("total_candidate_rows_discovered") or 0),
+        "candidate_rows_retained_for_materialization": int(
+            ledger.get("candidate_rows_retained_for_materialization") or 0
+        ),
+        "candidate_rows_materialized": int(ledger.get("candidate_rows_materialized") or 0),
+        "final_packet_candidate_count": int(ledger.get("final_packet_candidate_count") or 0),
+        "final_packet_present_count": final_present,
+        "recoverable_omitted_count": recoverable,
+        "still_unreached_count": unreached,
+        "continuation_available": bool(ledger.get("continuation_available", False)),
+        "classification_counts": {
+            "present_final": final_present,
+            "recoverable_omitted": recoverable,
+            "still_unreached": unreached,
+        },
+        "stage_counts": _safe_count_dict(ledger.get("stage_counts")),
+        "loss_stage_summary": _safe_count_dict(ledger.get("loss_stage_summary")),
+        "policy": {
+            "cursor_type": str(policy.get("cursor_type") or "none"),
+            "resume_semantics": str(policy.get("resume_semantics") or "none"),
+            "stable_order": str(policy.get("stable_order") or "none"),
+            "materialization": str(policy.get("materialization") or "none"),
+            "default_enabled": bool(policy.get("default_enabled", True)),
+        },
+        "privacy_status": privacy_status,
+        **raw_payload_flags,
+        "privacy": {
+            **_fielded_bm25_continuation_ledger_privacy(),
+            **raw_payload_flags,
+            "aggregate_only": True,
+            "ledger_items_included": False,
+            "cursors_included": False,
+            "source_ref_hashes_included": False,
+        },
+        "claim_boundaries": {
+            **_fielded_bm25_continuation_ledger_claim_boundaries(),
+            "final_answer_quality_claim_supported": bool(
+                claim_boundaries.get("final_answer_quality_claim_supported", False)
+            ),
+            "token_savings_claim_supported": bool(claim_boundaries.get("token_savings_claim_supported", False)),
+            "default_promotion_supported": bool(claim_boundaries.get("default_promotion_supported", False)),
+            "all_history_completeness_claim_supported": bool(
+                claim_boundaries.get("all_history_completeness_claim_supported", False)
+            ),
+        },
     }
 
 
@@ -2974,6 +3109,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "bm25_rank_buckets": {},
             "query_streams": _fielded_bm25_query_stream_aggregate([]),
             "branch_fanout": _fielded_bm25_branch_fanout_aggregate([]),
+            "continuation_candidate_ledger": _fielded_bm25_continuation_ledger_aggregate([]),
             "expected_ref_reach": _expected_ref_reach_aggregate([]),
             "source_grouping": _fielded_bm25_source_grouping_aggregate([]),
             "materialization": _fielded_bm25_materialization_aggregate([]),
@@ -3001,6 +3137,7 @@ def _fielded_bm25_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "bm25_rank_buckets": dict(sorted(rank_buckets.items())),
         "query_streams": _fielded_bm25_query_stream_aggregate(selected),
         "branch_fanout": _fielded_bm25_branch_fanout_aggregate(selected),
+        "continuation_candidate_ledger": _fielded_bm25_continuation_ledger_aggregate(selected),
         "expected_ref_reach": _expected_ref_reach_aggregate(rows),
         "source_grouping": _fielded_bm25_source_grouping_aggregate(selected),
         "materialization": _fielded_bm25_materialization_aggregate(selected),
@@ -3090,6 +3227,104 @@ def _fielded_bm25_branch_fanout_aggregate(rows: list[dict[str, Any]]) -> dict[st
         "rows_by_branch": dict(sorted(rows_by_branch.items())),
         "capped_rows_by_branch": dict(sorted(capped_rows_by_branch.items())),
         "privacy": _fielded_bm25_privacy(),
+    }
+
+
+def _fielded_bm25_continuation_ledger_aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = [
+        row.get("continuation_candidate_ledger")
+        for row in rows
+        if isinstance(row.get("continuation_candidate_ledger"), dict)
+    ]
+    enabled = [item for item in selected if item.get("enabled") is True]
+    if not enabled:
+        return {
+            "status": "not_evaluated",
+            "basis": "continuation_ledger_flag_not_enabled_or_fielded_bm25_rows_not_run",
+            "runs": 0,
+            "fielded_bm25_rows": len(selected),
+            "enabled_rows": 0,
+            "default_off_rows": len([item for item in selected if item.get("enabled") is False]),
+            "continuation_available_rows": 0,
+            "classification_counts": {
+                "present_final": 0,
+                "recoverable_omitted": 0,
+                "still_unreached": 0,
+            },
+            "stage_counts": {},
+            "loss_stage_summary": {},
+            "privacy_status_counts": {},
+            "privacy": _fielded_bm25_continuation_ledger_privacy(),
+            "claim_boundaries": _fielded_bm25_continuation_ledger_claim_boundaries(),
+        }
+    classification_counts = _sum_count_dicts(item.get("classification_counts") for item in enabled)
+    stage_counts = _sum_count_dicts(item.get("stage_counts") for item in enabled)
+    loss_stage_summary = _sum_count_dicts(item.get("loss_stage_summary") for item in enabled)
+    raw_payload_violation_rows = sum(
+        1
+        for item in enabled
+        if any(
+            bool(item.get(flag))
+            for flag in (
+                "raw_paths_included",
+                "raw_text_included",
+                "raw_snippets_included",
+                "source_lines_included",
+                "line_numbers_included",
+                "raw_session_ids_included",
+                "vectors_or_persisted_indexes_included",
+            )
+        )
+    )
+    return {
+        "status": "evaluated",
+        "basis": "opt_in_package_search_fielded_bm25_continuation_ledger_rows",
+        "runs": len(enabled),
+        "fielded_bm25_rows": len(selected),
+        "enabled_rows": len(enabled),
+        "default_off_rows": len([item for item in selected if item.get("enabled") is False]),
+        "status_counts": _counts(item.get("status") for item in selected),
+        "mode_counts": _counts(item.get("mode") for item in enabled),
+        "version_counts": _counts(item.get("version") for item in enabled),
+        "bounded_rows": sum(1 for item in enabled if item.get("bounded") is True),
+        "multi_pass_rows": sum(1 for item in enabled if item.get("multi_pass") is True),
+        "continuation_available_rows": sum(1 for item in enabled if item.get("continuation_available") is True),
+        "total_candidate_rows_discovered": sum(
+            int(item.get("total_candidate_rows_discovered") or 0) for item in enabled
+        ),
+        "ledger_item_count": sum(int(item.get("ledger_item_count") or 0) for item in enabled),
+        "candidate_rows_retained_for_materialization": sum(
+            int(item.get("candidate_rows_retained_for_materialization") or 0) for item in enabled
+        ),
+        "candidate_rows_materialized": sum(int(item.get("candidate_rows_materialized") or 0) for item in enabled),
+        "final_packet_candidate_count": sum(int(item.get("final_packet_candidate_count") or 0) for item in enabled),
+        "final_packet_present_count": sum(int(item.get("final_packet_present_count") or 0) for item in enabled),
+        "recoverable_omitted_count": sum(int(item.get("recoverable_omitted_count") or 0) for item in enabled),
+        "still_unreached_count": sum(int(item.get("still_unreached_count") or 0) for item in enabled),
+        "classification_counts": classification_counts,
+        "stage_counts": stage_counts,
+        "loss_stage_summary": loss_stage_summary,
+        "median_ledger_item_limit": _median(item.get("ledger_item_limit") for item in enabled),
+        "median_ledger_item_count": _median(item.get("ledger_item_count") for item in enabled),
+        "median_candidate_row_pool_limit": _median(item.get("candidate_row_pool_limit") for item in enabled),
+        "median_pass_count": _median(item.get("pass_count") for item in enabled),
+        "median_retrieval_chunk_count": _median(item.get("retrieval_chunk_count") for item in enabled),
+        "policy": {
+            "default_enabled_rows": sum(
+                1 for item in enabled if ((item.get("policy") or {}).get("default_enabled") is True)
+            ),
+            "cursor_type_counts": _counts((item.get("policy") or {}).get("cursor_type") for item in enabled),
+            "resume_semantics_counts": _counts(
+                (item.get("policy") or {}).get("resume_semantics") for item in enabled
+            ),
+        },
+        "privacy_status_counts": _counts(item.get("privacy_status") for item in enabled),
+        "aggregate_privacy_status": (
+            "aggregate_safe" if raw_payload_violation_rows == 0 else "privacy_boundary_violation_detected"
+        ),
+        "raw_payload_violation_rows": raw_payload_violation_rows,
+        "privacy": _fielded_bm25_continuation_ledger_privacy(),
+        "claim_boundaries": _fielded_bm25_continuation_ledger_claim_boundaries(),
     }
 
 
@@ -3526,6 +3761,36 @@ def _fielded_bm25_privacy() -> dict[str, bool]:
         "line_numbers_included": False,
         "session_ids_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_bm25_continuation_ledger_privacy() -> dict[str, bool]:
+    return {
+        "aggregate_only": True,
+        "ledger_items_included": False,
+        "cursors_included": False,
+        "source_ref_hashes_included": False,
+        "raw_private_text_included": False,
+        "raw_query_text_included": False,
+        "raw_query_terms_included": False,
+        "raw_paths_included": False,
+        "raw_snippets_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "session_ids_included": False,
+        "raw_session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
+        "persisted_index_payloads_included": False,
+    }
+
+
+def _fielded_bm25_continuation_ledger_claim_boundaries() -> dict[str, bool]:
+    return {
+        "final_answer_quality_claim_supported": False,
+        "token_savings_claim_supported": False,
+        "speed_claim_supported": False,
+        "default_promotion_supported": False,
+        "all_history_completeness_claim_supported": False,
     }
 
 
