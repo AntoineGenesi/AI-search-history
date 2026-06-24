@@ -10,6 +10,7 @@ SCHEMA_VERSION = 1
 PLAY_BY_PLAY_LIMIT = 40
 INTERESTING_MOMENT_LIMIT = 20
 NEXT_READ_LIMIT = 20
+NARRATIVE_LEDGER_LIMIT = 40
 
 UNSUPPORTED_CLAIMS = {
     "root_cause_claim_supported": False,
@@ -27,7 +28,7 @@ PRIVACY_FLAGS = {
     "raw_session_ids_included": False,
     "raw_query_text_included": False,
     "source_line_payloads_included": False,
-    "vectors_or_indexes_included": False,
+    "private_embedding_artifacts_included": False,
     "saved_report_paths_echoed": False,
     "hashed_source_handles_included": True,
     "line_numbers_included": True,
@@ -66,6 +67,19 @@ def build_failure_analysis_payload(
     interesting_moments = _build_interesting_moments(semantic_packet, forensics_packet, follow_packet)
     next_reads = _build_next_reads(semantic_packet, follow_packet)
     failure_mode_ledger = _build_failure_mode_ledger(semantic_packet, forensics_packet, follow_packet, next_reads)
+    committed_safe_narrative_ledger = _build_committed_safe_narrative_ledger(
+        semantic_packet,
+        follow_packet,
+        next_reads,
+    )
+    narrative_readiness = _build_narrative_readiness(
+        semantic_loaded,
+        follow_loaded,
+        semantic_packet,
+        follow_packet,
+        next_reads,
+        committed_safe_narrative_ledger,
+    )
     evidence_inputs = _build_evidence_backed_summary_inputs(
         semantic_loaded,
         forensics_loaded,
@@ -92,6 +106,8 @@ def build_failure_analysis_payload(
         "evidence_backed_summary_inputs": evidence_inputs,
         "play_by_play": play_by_play,
         "failure_mode_ledger": failure_mode_ledger,
+        "narrative_readiness": narrative_readiness,
+        "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
         "interesting_moments": interesting_moments,
         "tool_critique": _tool_critique(
             semantic_loaded=semantic_loaded,
@@ -457,6 +473,181 @@ def _build_interesting_moments(
     return _sorted_rows(moments)[:INTERESTING_MOMENT_LIMIT]
 
 
+def _build_committed_safe_narrative_ledger(
+    semantic_packet: dict[str, Any],
+    follow_packet: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, candidate in enumerate(_list(semantic_packet.get("strongest_candidates")), 1):
+        if not isinstance(candidate, dict):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "ledger_kind": "candidate_found",
+                    "source": "semantic_debug.strongest_candidates",
+                    "source_index": index,
+                    "timestamp_utc": candidate.get("timestamp_utc") or candidate.get("timestamp"),
+                    "role": candidate.get("role"),
+                    "candidate_id": candidate.get("candidate_id"),
+                    "rank": candidate.get("rank"),
+                    "confidence": candidate.get("confidence"),
+                    "reason_codes": [str(item) for item in _list(candidate.get("reason_codes"))[:8]],
+                    "source_handle": _source_handle(candidate.get("source_ref")),
+                    "inference_boundary": "candidate metadata identifies possible narrative evidence; it is not a root-cause claim",
+                }
+            )
+        )
+    for index, read in enumerate(_list(follow_packet.get("expanded_reads")), 1):
+        if not isinstance(read, dict):
+            continue
+        recovery = _safe_recovery_metadata(read.get("recovery"))
+        status = str(read.get("status") or "unknown")
+        rows.append(
+            _clean_row(
+                {
+                    "ledger_kind": "recovery_opened" if status == "expanded" else "recovery_gap",
+                    "source": "follow_next_reads.expanded_reads",
+                    "source_index": index,
+                    "rank": read.get("rank"),
+                    "status": status,
+                    "candidate_id": read.get("candidate_id") or recovery.get("candidate_id"),
+                    "recovery_kind": recovery.get("kind"),
+                    "recovery_id": recovery.get("recovery_id"),
+                    "reason_codes": [recovery["omission_reason"]] if recovery.get("omission_reason") else [],
+                    "target_handle": _target_handle(read.get("target")),
+                    "source_handle": _source_handle(read.get("source_ref")),
+                    "selected_record_count": len(_list(read.get("selected_records"))),
+                    "counts": _safe_counts(read.get("counts")),
+                    "line_range": _safe_line_range(read.get("line_range")),
+                    "truncated": bool(read.get("truncated")),
+                    "cap_flags": _safe_cap_flags(read),
+                    "inference_boundary": "opened recovery metadata proves follow-through shape only; raw transcript content remains private",
+                }
+            )
+        )
+    for index, read in enumerate(_list(follow_packet.get("failed_reads")), 1):
+        if not isinstance(read, dict):
+            continue
+        recovery = _safe_recovery_metadata(read.get("recovery"))
+        rows.append(
+            _clean_row(
+                {
+                    "ledger_kind": "recovery_gap",
+                    "source": "follow_next_reads.failed_reads",
+                    "source_index": index,
+                    "rank": read.get("rank"),
+                    "status": read.get("status"),
+                    "candidate_id": read.get("candidate_id") or recovery.get("candidate_id"),
+                    "recovery_kind": recovery.get("kind"),
+                    "recovery_id": recovery.get("recovery_id"),
+                    "reason_codes": [str(read.get("failure_reason") or read.get("status") or "failed")],
+                    "target_handle": _target_handle(read.get("target")),
+                    "source_handle": _source_handle(read.get("source_ref")),
+                    "inference_boundary": "failed follow reads are explicit reconstruction gaps, not evidence absence claims",
+                }
+            )
+        )
+    if not rows and next_reads.get("status") in {"followup_gap", "explicit_no_next_reads"}:
+        rows.append(
+            {
+                "ledger_kind": "recovery_gap",
+                "source": "failure_analysis.next_reads",
+                "status": next_reads.get("status"),
+                "reason_codes": ["no_safe_recovery_metadata_available"],
+                "next_read_count": next_reads.get("count", 0),
+                "inference_boundary": "old or sparse saved reports did not expose follow-next-reads metadata",
+            }
+        )
+    return _sorted_rows(rows)[:NARRATIVE_LEDGER_LIMIT]
+
+
+def _build_narrative_readiness(
+    semantic_loaded: dict[str, Any],
+    follow_loaded: dict[str, Any],
+    semantic_packet: dict[str, Any],
+    follow_packet: dict[str, Any],
+    next_reads: dict[str, Any],
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate_count = len(_list(semantic_packet.get("strongest_candidates")))
+    if candidate_count == 0:
+        candidate_count = sum(1 for row in _list(semantic_packet.get("timeline")) if isinstance(row, dict))
+    opened_count = sum(1 for row in ledger if row.get("ledger_kind") == "recovery_opened")
+    usable_recovery_count = _int(follow_packet.get("usable_recovery_evidence_count"))
+    recovery_gap_count = sum(1 for row in ledger if row.get("ledger_kind") == "recovery_gap")
+    dated_candidate_count = sum(
+        1 for row in ledger if row.get("ledger_kind") == "candidate_found" and row.get("timestamp_utc")
+    )
+    recovery_with_line_range_count = sum(
+        1 for row in ledger if row.get("ledger_kind") == "recovery_opened" and row.get("line_range")
+    )
+    recovery_with_counts_count = sum(
+        1 for row in ledger if row.get("ledger_kind") == "recovery_opened" and row.get("selected_record_count")
+    )
+    has_safe_candidate = any(
+        row.get("ledger_kind") == "candidate_found" and row.get("candidate_id") and row.get("source_handle")
+        for row in ledger
+    )
+    has_safe_recovery = any(
+        row.get("ledger_kind") == "recovery_opened"
+        and (row.get("target_handle") or row.get("source_handle"))
+        and (row.get("line_range") or row.get("selected_record_count"))
+        for row in ledger
+    )
+    narrative_ready = bool(
+        semantic_loaded.get("loaded")
+        and candidate_count
+        and opened_count
+        and usable_recovery_count
+        and dated_candidate_count
+        and recovery_with_line_range_count
+        and recovery_with_counts_count
+        and has_safe_candidate
+        and has_safe_recovery
+    )
+    if narrative_ready:
+        status = "narrative_ready"
+    elif opened_count and usable_recovery_count:
+        status = "needs_private_review"
+    elif opened_count:
+        status = "recovery_opened"
+    elif candidate_count:
+        status = "candidate_found"
+    else:
+        status = "no_recovery_available"
+    reason_codes: list[str] = []
+    if not semantic_loaded.get("loaded"):
+        reason_codes.append("semantic_debug_not_loaded")
+    if not candidate_count:
+        reason_codes.append("no_candidate_metadata")
+    if not follow_loaded.get("loaded"):
+        reason_codes.append("follow_next_reads_not_loaded")
+    if candidate_count and not opened_count:
+        reason_codes.append("recovery_not_opened")
+    if opened_count and not usable_recovery_count:
+        reason_codes.append("opened_recovery_not_marked_usable")
+    if opened_count and usable_recovery_count and not narrative_ready:
+        reason_codes.append("safe_metadata_too_thin_for_committed_narrative")
+    if next_reads.get("status") in {"followup_gap", "explicit_no_next_reads"} and not opened_count:
+        reason_codes.append(str(next_reads.get("status")))
+    return {
+        "status": status,
+        "candidate_count": candidate_count,
+        "recovery_opened_count": opened_count,
+        "usable_recovery_evidence_count": usable_recovery_count,
+        "recovery_gap_count": recovery_gap_count,
+        "safe_dated_candidate_count": dated_candidate_count,
+        "safe_recovery_line_range_count": recovery_with_line_range_count,
+        "ledger_row_count": len(ledger),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "recovery_opened": bool(opened_count),
+        "follow_next_reads_loaded": bool(follow_loaded.get("loaded")),
+        "inference_boundary": "readiness classifies committed-safe reconstruction metadata; it does not claim root cause, all-history completeness, final-answer quality, speed, token savings, or product value",
+    }
+
+
 def _build_next_reads(semantic_packet: dict[str, Any], follow_packet: dict[str, Any]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for index, read in enumerate(_list(semantic_packet.get("next_reads")), 1):
@@ -710,6 +901,37 @@ def _recovery_summary(value: Any) -> dict[str, Any] | None:
         if value.get(key) is not None:
             allowed[key] = value.get(key)
     return allowed or None
+
+
+def _safe_recovery_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {}
+    for key in ("kind", "recovery_id", "candidate_id", "omission_reason"):
+        if value.get(key) is not None:
+            allowed[key] = str(value.get(key))
+    return allowed
+
+
+def _safe_line_range(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed: dict[str, Any] = {}
+    for key in ("start", "end", "anchor"):
+        if value.get(key) is not None:
+            allowed[key] = _int(value.get(key))
+    return allowed
+
+
+def _safe_cap_flags(read: dict[str, Any]) -> dict[str, Any]:
+    flags: dict[str, Any] = {}
+    claim_boundaries = read.get("claim_boundaries") if isinstance(read.get("claim_boundaries"), dict) else {}
+    for key in ("ranking_or_cap_changed", "broad_search_rerun", "answer_generation_included"):
+        if claim_boundaries.get(key) is not None:
+            flags[key] = bool(claim_boundaries.get(key))
+    if read.get("truncated") is not None:
+        flags["truncated"] = bool(read.get("truncated"))
+    return flags
 
 
 def _failure_reasons(packet: dict[str, Any]) -> list[str]:
