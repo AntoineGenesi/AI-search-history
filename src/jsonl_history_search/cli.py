@@ -276,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
     follow_next_reads.add_argument("--from-report", required=True, help="Saved agent_find or semantic_debug JSON report.")
     follow_next_reads.add_argument("--kind", choices=("recovery",), default="recovery")
     follow_next_reads.add_argument("--limit", type=int, default=3)
+    follow_next_reads.add_argument(
+        "--reviewed-usability-decisions",
+        default=None,
+        help=(
+            "Optional sanitized JSON decisions file for opened recovery rows. "
+            "Only status labels, counts, IDs, ranks, and hashed handles are consumed."
+        ),
+    )
     failure_analysis = subparsers.add_parser(
         "failure-analysis",
         description=(
@@ -2230,6 +2238,9 @@ def main(argv: list[str] | None = None) -> int:
             plan=plan,
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=Path(args.cwd).expanduser().resolve(),
+            reviewed_usability_decisions_path=Path(args.reviewed_usability_decisions).expanduser()
+            if args.reviewed_usability_decisions
+            else None,
         )
         print(render(payload, args.format))
         packet = payload["follow_next_reads"]
