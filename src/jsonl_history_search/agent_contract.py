@@ -374,34 +374,8 @@ def build_compact_provenance_handoff(
 def compact_final_evidence_contract_projection(value: Any) -> dict[str, Any]:
     contract = value if isinstance(value, dict) else {}
     ledger = contract.get("ledger") if isinstance(contract.get("ledger"), list) else []
-    projection_items: list[dict[str, Any]] = []
-    ledger_id_by_source_ref: dict[str, str] = {}
-    ledger_id_by_evidence_id: dict[str, str] = {}
-    for item in ledger:
-        if not isinstance(item, dict):
-            continue
-        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
-        ledger_id = item.get("ledger_id")
-        evidence_id = item.get("evidence_id")
-        if source_ref and ledger_id:
-            ledger_id_by_source_ref[final_evidence_contract_ref_key(source_ref)] = str(ledger_id)
-        if evidence_id and ledger_id:
-            ledger_id_by_evidence_id[str(evidence_id)] = str(ledger_id)
-        projection_items.append(
-            {
-                "ledger_id": ledger_id,
-                "evidence_id": evidence_id,
-                "source_ref": source_ref,
-                "target": item.get("target") or source_ref_target(source_ref),
-                "membership": item.get("membership") if isinstance(item.get("membership"), dict) else {},
-                "answerability_tier": item.get("answerability_tier"),
-                "final_surface_status": item.get("final_surface_status"),
-                "recovery_handle": item.get("recovery_handle")
-                if isinstance(item.get("recovery_handle"), dict)
-                else None,
-                "next_read_target": item.get("next_read_target"),
-            }
-        )
+    projected = final_evidence_contract_compact_projection(ledger)
+    projection_items = projected["items"] if ledger else contract.get("items") if isinstance(contract.get("items"), list) else []
     return {
         "schema_version": 1,
         "summary_kind": "compact_final_evidence_contract_projection",
@@ -410,10 +384,13 @@ def compact_final_evidence_contract_projection(value: Any) -> dict[str, Any]:
         "consistency": contract.get("consistency") if isinstance(contract.get("consistency"), dict) else {},
         "ledger_id_by_source_ref": contract.get("ledger_id_by_source_ref")
         if isinstance(contract.get("ledger_id_by_source_ref"), dict)
-        else ledger_id_by_source_ref,
+        else projected["ledger_id_by_source_ref"],
+        "ledger_ids_by_source_ref": contract.get("ledger_ids_by_source_ref")
+        if isinstance(contract.get("ledger_ids_by_source_ref"), dict)
+        else projected["ledger_ids_by_source_ref"],
         "ledger_id_by_evidence_id": contract.get("ledger_id_by_evidence_id")
         if isinstance(contract.get("ledger_id_by_evidence_id"), dict)
-        else ledger_id_by_evidence_id,
+        else projected["ledger_id_by_evidence_id"],
         "items": projection_items,
         "privacy": {
             "raw_text_included": False,
@@ -3476,11 +3453,84 @@ def build_final_evidence_contract(
         contract["ledger"] = ledger
         contract["ledger_materialization"] = "full_private_safe_ledger"
     else:
+        compact_projection = final_evidence_contract_compact_projection(
+            ledger,
+            include_source_refs=False,
+            include_membership=False,
+        )
+        ledger_id_by_candidate_id = {
+            str(item.get("candidate_id")): str(item.get("ledger_id"))
+            for item in ledger
+            if item.get("candidate_id") not in (None, "") and item.get("ledger_id")
+        }
         contract = {
             "ledger_count": len(ledger),
-            "missing_ledger_entry_count": consistency["missing_ledger_entry_count"],
+            "ledger_id_by_candidate_id": ledger_id_by_candidate_id,
         }
+        if consistency["missing_ledger_entry_count"]:
+            contract["missing_ledger_entry_count"] = consistency["missing_ledger_entry_count"]
+        source_ref_evidence_ledger_ids = {
+            str(item.get("ledger_id"))
+            for item in compact_projection["items"]
+            if str(item.get("evidence_id") or "").startswith("source_ref:")
+        }
+        source_ref_only_ids = {
+            source_ref_key: [ledger_id for ledger_id in ledger_ids if ledger_id in source_ref_evidence_ledger_ids]
+            for source_ref_key, ledger_ids in compact_projection["ledger_ids_by_source_ref"].items()
+        }
+        source_ref_only_ids = {
+            source_ref_key: ledger_ids for source_ref_key, ledger_ids in source_ref_only_ids.items() if ledger_ids
+        }
+        if source_ref_only_ids:
+            contract["ledger_ids_by_source_ref"] = source_ref_only_ids
     return contract
+
+
+def final_evidence_contract_compact_projection(
+    ledger: list[dict[str, Any]], *, include_source_refs: bool = True, include_membership: bool = True
+) -> dict[str, Any]:
+    projection_items: list[dict[str, Any]] = []
+    ledger_id_by_source_ref: dict[str, str] = {}
+    ledger_ids_by_source_ref: dict[str, list[str]] = {}
+    ledger_id_by_evidence_id: dict[str, str] = {}
+    for item in ledger:
+        if not isinstance(item, dict):
+            continue
+        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        ledger_id = item.get("ledger_id")
+        evidence_id = item.get("evidence_id")
+        if source_ref and ledger_id:
+            source_ref_key = final_evidence_contract_ref_key(source_ref)
+            ledger_id_by_source_ref[source_ref_key] = str(ledger_id)
+            ledger_ids_by_source_ref.setdefault(source_ref_key, []).append(str(ledger_id))
+        if evidence_id and ledger_id:
+            ledger_id_by_evidence_id[str(evidence_id)] = str(ledger_id)
+        projected_item = {
+            "ledger_id": ledger_id,
+            "evidence_id": evidence_id,
+            "answerability_tier": item.get("answerability_tier"),
+            "final_surface_status": item.get("final_surface_status"),
+        }
+        if include_membership:
+            projected_item["membership"] = item.get("membership") if isinstance(item.get("membership"), dict) else {}
+        if include_source_refs:
+            projected_item.update(
+                {
+                    "source_ref": source_ref,
+                    "target": item.get("target") or source_ref_target(source_ref),
+                    "recovery_handle": item.get("recovery_handle")
+                    if isinstance(item.get("recovery_handle"), dict)
+                    else None,
+                    "next_read_target": item.get("next_read_target"),
+                }
+            )
+        projection_items.append(projected_item)
+    return {
+        "items": projection_items,
+        "ledger_id_by_source_ref": ledger_id_by_source_ref,
+        "ledger_ids_by_source_ref": ledger_ids_by_source_ref,
+        "ledger_id_by_evidence_id": ledger_id_by_evidence_id,
+    }
 
 
 def final_evidence_contract_source_ref(source_ref: dict[str, Any]) -> dict[str, Any]:
