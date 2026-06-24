@@ -14,6 +14,10 @@ NEXT_READ_LIMIT = 20
 NARRATIVE_LEDGER_LIMIT = 40
 REPO_CHRONOLOGY_LIMIT = 80
 STORY_PHASE_LIMIT = 30
+DEVLOG_TAKE_LIMIT = 6
+DEVLOG_SUMMARY_LIMIT = 8
+DEVLOG_ARC_ROW_LIMIT = 20
+DEVLOG_CLAIM_LEDGER_LIMIT = 24
 
 TASK_ID_RE = re.compile(r"\b(?:jsh|sl)-\d+[a-z]?\b", re.IGNORECASE)
 COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
@@ -118,6 +122,15 @@ def build_failure_analysis_payload(
         follow_packet,
     )
     claim_boundaries = _claim_boundaries(semantic_loaded, forensics_loaded, follow_loaded)
+    devlog_story_packet = _build_devlog_story_packet(
+        narrative_readiness=narrative_readiness,
+        story_phase_summary=story_phase_summary,
+        repo_handle_chronology=repo_handle_chronology,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        failure_mode_ledger=failure_mode_ledger,
+        claim_boundaries=claim_boundaries,
+        next_reads=next_reads,
+    )
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
         semantic_packet,
@@ -138,6 +151,7 @@ def build_failure_analysis_payload(
         "story_phase_summary": story_phase_summary,
         "repo_handle_chronology": repo_handle_chronology,
         "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
+        "devlog_story_packet": devlog_story_packet,
         "interesting_moments": interesting_moments,
         "tool_critique": _tool_critique(
             semantic_loaded=semantic_loaded,
@@ -769,6 +783,561 @@ def _build_story_phase_summary(
         "ledger_kind_counts": ledger_kind_counts,
         "rows": rows,
     }
+
+
+def _build_devlog_story_packet(
+    *,
+    narrative_readiness: dict[str, Any],
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+    claim_boundaries: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> dict[str, Any]:
+    readiness_status = str(narrative_readiness.get("status") or "unknown")
+    phase_status = str(story_phase_summary.get("status") or "unknown")
+    supported_claims = _devlog_supported_claims(
+        narrative_readiness=narrative_readiness,
+        story_phase_summary=story_phase_summary,
+        repo_handle_chronology=repo_handle_chronology,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        failure_mode_ledger=failure_mode_ledger,
+        next_reads=next_reads,
+    )
+    non_claims = _devlog_explicit_non_claims(claim_boundaries)
+    gaps = _devlog_gaps(
+        narrative_readiness=narrative_readiness,
+        story_phase_summary=story_phase_summary,
+        next_reads=next_reads,
+    )
+    return {
+        "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
+        "mode": "deterministic_committed_safe_story_synthesis",
+        "take_candidates": _devlog_take_candidates(
+            readiness_status=readiness_status,
+            phase_status=phase_status,
+            narrative_readiness=narrative_readiness,
+            story_phase_summary=story_phase_summary,
+            repo_handle_chronology=repo_handle_chronology,
+            committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        ),
+        "evidence_backed_summary_bullets": _devlog_summary_bullets(
+            narrative_readiness=narrative_readiness,
+            story_phase_summary=story_phase_summary,
+            repo_handle_chronology=repo_handle_chronology,
+            failure_mode_ledger=failure_mode_ledger,
+            next_reads=next_reads,
+        ),
+        "dated_arc_rows": _devlog_dated_arc_rows(story_phase_summary, repo_handle_chronology),
+        "claim_support_ledger": _devlog_claim_support_ledger(
+            supported_claims=supported_claims,
+            non_claims=non_claims,
+            failure_mode_ledger=failure_mode_ledger,
+        ),
+        "supported_claims": supported_claims,
+        "explicit_non_claims": non_claims,
+        "gaps": gaps,
+        "next_reads": _devlog_next_reads(next_reads),
+        "inference_privacy_boundaries": [
+            "packet is synthesized only from already-sanitized failure-analysis structures",
+            "take candidates are drafting angles, not generated devlog prose",
+            "repo artifacts may support behavior-quality or false-positive story evidence when safe handles are present, but they do not prove root cause or runtime promotion",
+            "reviewed-negative retained recovery rows are retained as reviewed outcomes and are not promoted to open debt by this packet",
+            "raw private text, absolute private paths, session identifiers, record selections, embedding/search artifacts, command details, and source details are not included",
+        ],
+        "input_surfaces": {
+            "narrative_readiness_status": readiness_status,
+            "story_phase_summary_status": phase_status,
+            "repo_handle_chronology_status": repo_handle_chronology.get("status"),
+            "committed_safe_narrative_ledger_rows": len(committed_safe_narrative_ledger),
+            "failure_mode_ledger_rows": len(failure_mode_ledger),
+            "next_read_rows": _int(next_reads.get("count")),
+        },
+    }
+
+
+def _devlog_story_status(
+    readiness_status: str,
+    phase_status: str,
+    supported_claims: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+) -> str:
+    if readiness_status == "narrative_ready" and phase_status == "story_ready_metadata":
+        return "story_packet_ready"
+    if any(claim.get("claim_id") == "repo_artifacts_support_story_evidence" for claim in supported_claims):
+        if any(gap.get("gap_id") == "private_recovery_review_needed" for gap in gaps):
+            return "story_packet_usable_with_private_review_gaps"
+        return "story_packet_usable_with_boundaries"
+    if supported_claims:
+        return "story_packet_partial"
+    return "story_packet_gap"
+
+
+def _devlog_take_candidates(
+    *,
+    readiness_status: str,
+    phase_status: str,
+    narrative_readiness: dict[str, Any],
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    takes: list[dict[str, Any]] = []
+    if story_phase_summary.get("usable_phase_count"):
+        takes.append(
+            {
+                "take_id": "metadata_arc_available",
+                "take": "Use the safe repo chronology as the story spine before adding private transcript detail.",
+                "support": ["story_phase_summary.rows", "repo_handle_chronology.rows"],
+                "boundary": "drafting angle only; not generated prose or full-history proof",
+            }
+        )
+    if repo_handle_chronology.get("handle_type_counts"):
+        takes.append(
+            {
+                "take_id": "repo_artifacts_carry_behavior_evidence",
+                "take": "Repo artifacts can support behavior-quality and false-positive story evidence when tied to safe task/review/doc/report handles.",
+                "support": ["repo_handle_chronology.handle_type_counts", "story_phase_summary.rows"],
+                "boundary": "supports story evidence quality only; not live runtime cleanup or promotion",
+            }
+        )
+    if readiness_status == "recovery_reviewed_not_useful" or narrative_readiness.get("reviewed_not_useful_recovery_count"):
+        takes.append(
+            {
+                "take_id": "reviewed_negative_recovery_closed",
+                "take": "Retained recovery rows reviewed as not useful should be described as reviewed-negative recovery, not open debt.",
+                "support": ["narrative_readiness.reviewed_not_useful_recovery_count"],
+                "boundary": "does not re-review private transcript content",
+            }
+        )
+    if readiness_status == "narrative_ready":
+        takes.append(
+            {
+                "take_id": "ready_without_prose_generation",
+                "take": "The packet has enough safe metadata for devlog planning without generating final prose.",
+                "support": ["narrative_readiness", "committed_safe_narrative_ledger"],
+                "boundary": "ready metadata is not a final-answer-quality claim",
+            }
+        )
+    if phase_status in {"usable_with_private_review_gaps", "usable_with_recovery_gaps"}:
+        takes.append(
+            {
+                "take_id": "bounded_story_with_gaps",
+                "take": "Draft from safe phases while keeping recovery and next-read gaps explicit.",
+                "support": ["story_phase_summary.gap_reasons", "next_reads"],
+                "boundary": "gaps remain local follow-up guidance, not absence-of-evidence claims",
+            }
+        )
+    if committed_safe_narrative_ledger:
+        takes.append(
+            {
+                "take_id": "ledger_before_interpretation",
+                "take": "Move from ledger rows to claims only where support surfaces are named.",
+                "support": ["committed_safe_narrative_ledger", "claim_support_ledger"],
+                "boundary": "ledger metadata does not prove intent or root cause",
+            }
+        )
+    return takes[:DEVLOG_TAKE_LIMIT]
+
+
+def _devlog_summary_bullets(
+    *,
+    narrative_readiness: dict[str, Any],
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    failure_mode_ledger: list[dict[str, Any]],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    repo_counts = repo_handle_chronology.get("handle_type_counts") if isinstance(repo_handle_chronology.get("handle_type_counts"), dict) else {}
+    bullets = [
+        {
+            "bullet": "Failure-analysis produced a claim-bounded story synthesis packet from saved report metadata.",
+            "support": ["failure_analysis.devlog_story_packet"],
+            "counts": {
+                "story_phases": _int(story_phase_summary.get("phase_count")),
+                "usable_story_phases": _int(story_phase_summary.get("usable_phase_count")),
+            },
+            "boundary": "live packaging behavior only; no prose generation",
+        },
+        {
+            "bullet": "Safe repo handles provide a dated artifact arc separate from transcript recovery chronology.",
+            "support": ["repo_handle_chronology.date_range", "repo_handle_chronology.rows"],
+            "counts": {
+                "repo_rows": _int(repo_handle_chronology.get("phase_row_count")),
+                "handle_types": len(repo_counts),
+            },
+            "boundary": "saved-report chronology, not a full repository history audit",
+        },
+        {
+            "bullet": "Narrative readiness remains bounded by reviewed recovery status and safe metadata thickness.",
+            "support": ["narrative_readiness"],
+            "counts": {
+                "recovery_opened": _int(narrative_readiness.get("recovery_opened_count")),
+                "reviewed_not_useful": _int(narrative_readiness.get("reviewed_not_useful_recovery_count")),
+                "usable_recovery": _int(narrative_readiness.get("usable_recovery_evidence_count")),
+            },
+            "boundary": "readiness is a packaging classification, not an answer-quality claim",
+        },
+        {
+            "bullet": "Failure modes and next reads remain explicit drafting constraints.",
+            "support": ["failure_mode_ledger", "next_reads"],
+            "counts": {
+                "failure_modes": len(failure_mode_ledger),
+                "next_reads": _int(next_reads.get("count")),
+            },
+            "boundary": "constraints guide follow-up; they do not imply all missing evidence is recoverable",
+        },
+    ]
+    return bullets[:DEVLOG_SUMMARY_LIMIT]
+
+
+def _devlog_dated_arc_rows(
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(_list(story_phase_summary.get("rows")), 1):
+        if not isinstance(row, dict):
+            continue
+        date_range = row.get("date_range") if isinstance(row.get("date_range"), dict) else {}
+        rows.append(
+            _clean_row(
+                {
+                    "arc_id": f"arc-{index:03d}",
+                    "source": "story_phase_summary.rows",
+                    "phase_id": row.get("phase_id"),
+                    "task_id": row.get("task_id"),
+                    "start": date_range.get("start"),
+                    "end": date_range.get("end"),
+                    "status": row.get("status"),
+                    "handle_types": row.get("handle_types"),
+                    "safe_handles": _bounded_phase_handles(row.get("handles")),
+                    "support_surfaces": row.get("source_surfaces"),
+                    "gap_reasons": row.get("gap_reasons"),
+                    "inference_boundary": "dated arc row is a safe planning row, not generated narrative prose",
+                }
+            )
+        )
+    if not rows:
+        repo_rows = [row for row in _list(repo_handle_chronology.get("rows")) if isinstance(row, dict)]
+        for index, row in enumerate(repo_rows[:DEVLOG_ARC_ROW_LIMIT], 1):
+            rows.append(
+                _clean_row(
+                    {
+                        "arc_id": f"arc-{index:03d}",
+                        "source": "repo_handle_chronology.rows",
+                        "phase_id": row.get("phase_id"),
+                        "start": row.get("date"),
+                        "end": row.get("date"),
+                        "status": row.get("status"),
+                        "handle_types": [row.get("handle_type")] if row.get("handle_type") else [],
+                        "safe_handles": {row.get("handle_type"): [row.get("handle")]}
+                        if row.get("handle_type") and row.get("handle")
+                        else {},
+                        "support_surfaces": [row.get("source")] if row.get("source") else [],
+                        "inference_boundary": "repo row is a safe planning row, not generated narrative prose",
+                    }
+                )
+            )
+    return rows[:DEVLOG_ARC_ROW_LIMIT]
+
+
+def _bounded_phase_handles(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, list[str]] = {}
+    for key, items in sorted(value.items()):
+        if not isinstance(items, list):
+            continue
+        safe_items = [str(item) for item in items[:3] if isinstance(item, (str, int))]
+        if safe_items:
+            safe[str(key)] = safe_items
+    return safe
+
+
+def _devlog_supported_claims(
+    *,
+    narrative_readiness: dict[str, Any],
+    story_phase_summary: dict[str, Any],
+    repo_handle_chronology: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    if story_phase_summary.get("phase_count"):
+        claims.append(
+            {
+                "claim_id": "story_phase_scaffold_available",
+                "claim": "A committed-safe story phase scaffold is available.",
+                "support_surfaces": ["story_phase_summary.rows"],
+                "support_counts": {
+                    "phase_count": _int(story_phase_summary.get("phase_count")),
+                    "usable_phase_count": _int(story_phase_summary.get("usable_phase_count")),
+                },
+                "boundary": "scaffold availability does not imply final prose readiness",
+            }
+        )
+    if repo_handle_chronology.get("phase_row_count"):
+        claims.append(
+            {
+                "claim_id": "repo_artifacts_support_story_evidence",
+                "claim": "Committed-safe repo artifacts can support behavior-quality or false-positive story evidence.",
+                "support_surfaces": ["repo_handle_chronology.rows", "repo_handle_chronology.handle_type_counts"],
+                "support_counts": {
+                    "repo_rows": _int(repo_handle_chronology.get("phase_row_count")),
+                    "handle_type_count": len(repo_handle_chronology.get("handle_type_counts") or {}),
+                },
+                "boundary": "artifact support is story evidence, not a live Semantic Linter runtime claim",
+            }
+        )
+    if committed_safe_narrative_ledger:
+        claims.append(
+            {
+                "claim_id": "committed_safe_ledger_available",
+                "claim": "A committed-safe narrative ledger is available for claim support checks.",
+                "support_surfaces": ["committed_safe_narrative_ledger"],
+                "support_counts": {"ledger_rows": len(committed_safe_narrative_ledger)},
+                "boundary": "ledger rows expose metadata only",
+            }
+        )
+    if narrative_readiness.get("reviewed_not_useful_recovery_count"):
+        claims.append(
+            {
+                "claim_id": "reviewed_negative_recovery_retained",
+                "claim": "Reviewed-negative retained recovery rows are classified as reviewed outcomes rather than open debt.",
+                "support_surfaces": ["narrative_readiness.reviewed_not_useful_recovery_count"],
+                "support_counts": {
+                    "reviewed_not_useful": _int(narrative_readiness.get("reviewed_not_useful_recovery_count"))
+                },
+                "boundary": "does not reinterpret private recovery content",
+            }
+        )
+    if failure_mode_ledger:
+        claims.append(
+            {
+                "claim_id": "failure_modes_are_explicit",
+                "claim": "Failure-mode constraints are exposed alongside the story packet.",
+                "support_surfaces": ["failure_mode_ledger"],
+                "support_counts": {"failure_mode_rows": len(failure_mode_ledger)},
+                "boundary": "failure-mode labels are deterministic classifications, not root cause",
+            }
+        )
+    if next_reads.get("count"):
+        claims.append(
+            {
+                "claim_id": "next_reads_available",
+                "claim": "Safe next-read handles are available for local follow-up.",
+                "support_surfaces": ["next_reads.reads"],
+                "support_counts": {"next_read_rows": _int(next_reads.get("count"))},
+                "boundary": "next reads are follow-up handles, not raw source content",
+            }
+        )
+    return claims[:DEVLOG_CLAIM_LEDGER_LIMIT]
+
+
+def _devlog_explicit_non_claims(claim_boundaries: dict[str, Any]) -> list[dict[str, Any]]:
+    labels = {
+        "root_cause_claim_supported": "root cause",
+        "all_history_completeness_claim_supported": "all-history completeness",
+        "final_answer_quality_claim_supported": "final answer quality",
+        "speed_claim_supported": "speed",
+        "token_savings_claim_supported": "token savings",
+        "pressure_improvement_claim_supported": "retrieval or pressure improvement",
+        "product_value_claim_supported": "global product value",
+        "llm_prose_generation_used": "generated final devlog prose",
+        "retrieval_rerun": "retrieval rerun",
+        "ranking_or_cap_changed": "ranking or cap change",
+        "live_model_send_used": "live model send",
+    }
+    non_claims: list[dict[str, Any]] = []
+    for key in sorted(labels):
+        if claim_boundaries.get(key) is False:
+            non_claims.append(
+                {
+                    "claim_id": key,
+                    "non_claim": labels[key],
+                    "support_surface": "claim_boundaries",
+                    "boundary": "explicitly unsupported or not performed by failure-analysis",
+                }
+            )
+    non_claims.extend(
+        [
+            {
+                "claim_id": "live_tui_cleanup_claim_supported",
+                "non_claim": "live TUI cleanup",
+                "support_surface": "task_boundary",
+                "boundary": "repo-artifact story evidence does not prove live TUI cleanup",
+            },
+            {
+                "claim_id": "model_forgetting_claim_supported",
+                "non_claim": "model forgetting",
+                "support_surface": "task_boundary",
+                "boundary": "saved report metadata does not prove model memory behavior",
+            },
+            {
+                "claim_id": "global_promotion_claim_supported",
+                "non_claim": "global promotion",
+                "support_surface": "task_boundary",
+                "boundary": "failure-analysis packaging does not promote Semantic Linter behavior globally",
+            },
+        ]
+    )
+    return non_claims
+
+
+def _devlog_gaps(
+    *,
+    narrative_readiness: dict[str, Any],
+    story_phase_summary: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> list[dict[str, Any]]:
+    gaps: list[dict[str, Any]] = []
+    reason_codes = [str(item) for item in _list(narrative_readiness.get("reason_codes"))]
+    phase_gaps = [str(item) for item in _list(story_phase_summary.get("gap_reasons"))]
+    for reason in list(dict.fromkeys(reason_codes + phase_gaps)):
+        if reason == "opened_recovery_reviewed_not_useful":
+            gaps.append(
+                {
+                    "gap_id": "reviewed_negative_recovery_not_open_debt",
+                    "status": "closed_boundary",
+                    "reason": reason,
+                    "next_step": "cite as reviewed-negative recovery only if relevant",
+                    "boundary": "retained reviewed-negative rows do not become open debt in the story packet",
+                }
+            )
+            continue
+        if reason in {"opened_recovery_still_unreviewed", "opened_recovery_review_gap", "phase_requires_private_recovery_review"}:
+            gap_id = "private_recovery_review_needed"
+        elif reason in {"follow_next_reads_not_loaded", "followup_gap", "explicit_no_next_reads"}:
+            gap_id = "next_read_or_followup_gap"
+        elif reason == "opened_recovery_not_marked_usable":
+            gap_id = "usable_recovery_not_marked"
+        else:
+            gap_id = reason
+        gaps.append(
+            {
+                "gap_id": gap_id,
+                "status": "open",
+                "reason": reason,
+                "next_step": _devlog_gap_next_step(gap_id),
+                "boundary": "gap is a drafting/review constraint, not proof that evidence is absent",
+            }
+        )
+    if narrative_readiness.get("status") in {"needs_private_review", "recovery_opened"}:
+        gaps.append(
+            {
+                "gap_id": "private_recovery_review_needed",
+                "status": "open",
+                "reason": str(narrative_readiness.get("status")),
+                "next_step": "privately review opened recovery before making transcript-content claims",
+                "boundary": "private review gap is a drafting constraint, not proof that evidence is absent",
+            }
+        )
+    if next_reads.get("status") == "available":
+        gaps.append(
+            {
+                "gap_id": "next_reads_require_local_review",
+                "status": "open",
+                "reason": "safe_next_read_handles_available",
+                "next_step": "open local next-read handles before adding private transcript claims",
+                "boundary": "handles are safe metadata; raw source content is not included",
+            }
+        )
+    return _dedupe_gap_rows(gaps)
+
+
+def _devlog_gap_next_step(gap_id: str) -> str:
+    if gap_id == "private_recovery_review_needed":
+        return "privately review opened recovery before making transcript-content claims"
+    if gap_id == "next_read_or_followup_gap":
+        return "load or run follow-next-reads if the story needs source context"
+    if gap_id == "usable_recovery_not_marked":
+        return "mark usable evidence only after private review"
+    return "keep this boundary explicit while drafting"
+
+
+def _dedupe_gap_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (str(row.get("gap_id")), str(row.get("status")), str(row.get("reason")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _devlog_next_reads(next_reads: dict[str, Any]) -> dict[str, Any]:
+    reads: list[dict[str, Any]] = []
+    for read in _list(next_reads.get("reads"))[:NEXT_READ_LIMIT]:
+        if not isinstance(read, dict):
+            continue
+        reads.append(
+            _clean_row(
+                {
+                    "rank": read.get("rank"),
+                    "source": read.get("source"),
+                    "kind": read.get("kind"),
+                    "status": read.get("status"),
+                    "failure_reason": read.get("failure_reason"),
+                    "candidate_id": read.get("candidate_id"),
+                    "target_handle": read.get("target_handle"),
+                    "source_handle": read.get("source_handle"),
+                    "reason": read.get("reason"),
+                    "boundary": "safe next-read handle only; open locally for raw context",
+                }
+            )
+        )
+    return {
+        "status": next_reads.get("status"),
+        "count": len(reads),
+        "reads": reads,
+        "explicit_gap": next_reads.get("explicit_gap"),
+    }
+
+
+def _devlog_claim_support_ledger(
+    *,
+    supported_claims: list[dict[str, Any]],
+    non_claims: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, claim in enumerate(supported_claims, 1):
+        rows.append(
+            {
+                "ledger_id": f"claim-{index:03d}",
+                "ledger_kind": "supported_claim",
+                "claim_id": claim.get("claim_id"),
+                "support_surfaces": claim.get("support_surfaces"),
+                "support_counts": claim.get("support_counts"),
+                "boundary": claim.get("boundary"),
+            }
+        )
+    for index, non_claim in enumerate(non_claims, 1):
+        rows.append(
+            {
+                "ledger_id": f"non-claim-{index:03d}",
+                "ledger_kind": "explicit_non_claim",
+                "claim_id": non_claim.get("claim_id"),
+                "support_surfaces": [non_claim.get("support_surface")],
+                "boundary": non_claim.get("boundary"),
+            }
+        )
+    for index, failure in enumerate(failure_mode_ledger, 1):
+        rows.append(
+            {
+                "ledger_id": f"constraint-{index:03d}",
+                "ledger_kind": "drafting_constraint",
+                "claim_id": failure.get("failure_mode"),
+                "support_surfaces": [failure.get("evidence_surface")],
+                "boundary": failure.get("interpretation_boundary"),
+            }
+        )
+    return rows[:DEVLOG_CLAIM_LEDGER_LIMIT]
 
 
 def _ledger_kind_counts(rows: list[dict[str, Any]]) -> dict[str, int]:

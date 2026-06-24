@@ -267,6 +267,7 @@ def render_failure_analysis_text(payload: dict) -> str:
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
+    story_packet = report.get("devlog_story_packet") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -281,6 +282,7 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
         f"Narrative readiness: {narrative.get('status')} ({narrative.get('ledger_row_count', len(narrative_ledger))} ledger rows)",
         f"Story phase summary: {story_phase_summary.get('status')} ({story_phase_summary.get('usable_phase_count', 0)}/{story_phase_summary.get('phase_count', 0)} usable)",
+        f"Devlog story packet: {story_packet.get('status')} ({len(story_packet.get('supported_claims') or [])} supported claims, {len(story_packet.get('explicit_non_claims') or [])} non-claims)",
         f"Repo handle chronology: {repo_chronology.get('status')} ({repo_chronology.get('phase_row_count', 0)} rows)",
         f"Repo handle date range: {repo_date_range.get('start')} to {repo_date_range.get('end')}",
         f"Repo handle counts: {', '.join(f'{key}={value}' for key, value in sorted(repo_counts.items())) or 'none'}",
@@ -299,6 +301,17 @@ def render_failure_analysis_text(payload: dict) -> str:
         if row.get("gap_reasons"):
             details.append(f"gaps={','.join(str(item) for item in row.get('gap_reasons') or [])}")
         lines.append(f"- {row.get('phase_id')}: {'; '.join(details)}")
+    lines.extend([
+        "Devlog story packet:",
+    ])
+    for item in (story_packet.get("take_candidates") or [])[:5]:
+        lines.append(f"- take {item.get('take_id')}: {item.get('take')}")
+    for claim in (story_packet.get("supported_claims") or [])[:6]:
+        lines.append(f"- supported {claim.get('claim_id')}: {claim.get('claim')}")
+    for non_claim in (story_packet.get("explicit_non_claims") or [])[:8]:
+        lines.append(f"- non-claim {non_claim.get('claim_id')}: {non_claim.get('non_claim')}")
+    for gap in (story_packet.get("gaps") or [])[:6]:
+        lines.append(f"- gap {gap.get('gap_id')}: {gap.get('status')} ({gap.get('reason')})")
     lines.extend([
         "Repo handle chronology rows:",
     ])
@@ -337,6 +350,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     next_reads = report.get("next_reads") or {}
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
+    story_packet = report.get("devlog_story_packet") or {}
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     repo_chronology = report.get("repo_handle_chronology") or {}
     repo_counts = repo_chronology.get("handle_type_counts") or {}
@@ -352,6 +366,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
         f"- Narrative readiness: `{narrative.get('status')}`",
         f"- Story phase summary: `{story_phase_summary.get('status')}` (`{story_phase_summary.get('usable_phase_count', 0)}`/`{story_phase_summary.get('phase_count', 0)}` usable)",
+        f"- Devlog story packet: `{story_packet.get('status')}` (`{len(story_packet.get('supported_claims') or [])}` supported claims, `{len(story_packet.get('explicit_non_claims') or [])}` non-claims)",
         f"- Repo handle chronology: `{repo_chronology.get('status')}` (`{repo_chronology.get('phase_row_count', 0)}` rows)",
         f"- Repo handle date range: `{repo_date_range.get('start')}` to `{repo_date_range.get('end')}`",
         f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
@@ -390,6 +405,50 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         if row.get("gap_reasons"):
             bits.append(f"gaps `{', '.join(str(item) for item in row.get('gap_reasons') or [])}`")
         lines.append(f"- {'; '.join(bits)}")
+    lines.extend([
+        "",
+        "## Devlog Story Packet",
+        "",
+        f"- Status: `{story_packet.get('status')}`",
+        f"- Mode: `{story_packet.get('mode')}`",
+        f"- Dated arc rows: `{len(story_packet.get('dated_arc_rows') or [])}`",
+        f"- Claim/support ledger rows: `{len(story_packet.get('claim_support_ledger') or [])}`",
+        "",
+        "### Take Candidates",
+        "",
+    ])
+    for item in story_packet.get("take_candidates") or []:
+        lines.append(f"- `{item.get('take_id')}`: {item.get('take')}")
+    lines.extend(["", "### Evidence-Backed Summary Bullets", ""])
+    for item in story_packet.get("evidence_backed_summary_bullets") or []:
+        support = ", ".join(str(surface) for surface in item.get("support") or [])
+        lines.append(f"- {item.get('bullet')} Support: `{support or 'none'}`")
+    lines.extend(["", "### Dated Arc Rows", ""])
+    for row in (story_packet.get("dated_arc_rows") or [])[:12]:
+        bits = [
+            f"`{row.get('arc_id')}`",
+            f"source `{row.get('source')}`",
+            f"status `{row.get('status')}`",
+        ]
+        if row.get("task_id"):
+            bits.append(f"task `{row.get('task_id')}`")
+        if row.get("start") or row.get("end"):
+            bits.append(f"dates `{row.get('start')}..{row.get('end')}`")
+        if row.get("handle_types"):
+            bits.append(f"handles `{', '.join(str(item) for item in row.get('handle_types') or [])}`")
+        lines.append(f"- {'; '.join(bits)}")
+    lines.extend(["", "### Supported Claims", ""])
+    for claim in story_packet.get("supported_claims") or []:
+        surfaces = ", ".join(str(surface) for surface in claim.get("support_surfaces") or [])
+        lines.append(f"- `{claim.get('claim_id')}`: {claim.get('claim')} Support: `{surfaces or 'none'}`")
+    lines.extend(["", "### Explicit Non-Claims", ""])
+    for non_claim in story_packet.get("explicit_non_claims") or []:
+        lines.append(f"- `{non_claim.get('claim_id')}`: `{non_claim.get('non_claim')}`")
+    lines.extend(["", "### Story Gaps And Next Reads", ""])
+    for gap in story_packet.get("gaps") or []:
+        lines.append(f"- `{gap.get('gap_id')}`: `{gap.get('status')}` via `{gap.get('reason')}`")
+    story_next_reads = story_packet.get("next_reads") or {}
+    lines.append(f"- Next reads: `{story_next_reads.get('status')}` (`{story_next_reads.get('count', 0)}`)")
     lines.extend([
         "",
         "## Repo Handle Chronology",
