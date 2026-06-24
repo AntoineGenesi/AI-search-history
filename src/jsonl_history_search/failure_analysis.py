@@ -1553,9 +1553,7 @@ def _tool_critique(
             "play_by_play_rows": len(play_by_play),
             "next_read_rows": next_reads.get("count", 0),
             "forensics_phase_rows": len(_list(forensics_packet.get("phase_timeline"))),
-            "follow_next_reads_usable_recovery_evidence_count": _int(
-                follow_packet.get("usable_recovery_evidence_count")
-            ),
+            "follow_next_reads_usable_recovery_evidence_count": _usable_recovery_evidence_count(follow_packet),
         },
         "gaps_and_limitations": [],
         "not_changed_or_claimed": NON_GOAL_BOUNDARIES,
