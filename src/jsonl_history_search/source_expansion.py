@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -16,6 +17,12 @@ DEFAULT_WINDOW_AFTER = 2
 DEFAULT_NEXT_COUNT = 3
 DEFAULT_MAX_RECORDS = 20
 SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery"}
+RECOVERY_USABILITY_STATUSES = {
+    "private_reviewed_usable",
+    "reviewed_not_useful",
+    "still_unreviewed",
+    "review_gap",
+}
 
 
 @dataclass(frozen=True)
@@ -45,7 +52,9 @@ def build_follow_next_reads_payload(
     plan: SourcePlan,
     default_tz,
     cwd: Path,
+    reviewed_usability_decisions_path: Path | None = None,
 ) -> dict[str, Any]:
+    decisions_packet = load_recovery_usability_decisions(reviewed_usability_decisions_path)
     base: dict[str, Any] = {
         "schema_version": 1,
         "kind": kind,
@@ -57,6 +66,7 @@ def build_follow_next_reads_payload(
             "source_refs_may_point_to_local_transcripts": True,
             "vectors_indexes_or_persistent_cache_used": False,
         },
+        "reviewed_usability_decisions": decisions_packet["summary"],
         "claim_boundaries": {
             "broad_search_rerun": False,
             "ranking_or_cap_changed": False,
@@ -126,13 +136,26 @@ def build_follow_next_reads_payload(
     reads = prioritize_follow_next_reads(collect_follow_next_reads(packet_info["packet"], packet_info["packet_type"]))
     selected_reads = reads[: max(0, int(limit))]
     expanded_reads = [
-        expand_follow_next_read(read=read, rank=index + 1, plan=plan, default_tz=default_tz, cwd=cwd)
+        expand_follow_next_read(
+            read=read,
+            rank=index + 1,
+            plan=plan,
+            default_tz=default_tz,
+            cwd=cwd,
+            usability_decisions=decisions_packet["decisions"],
+        )
         for index, read in enumerate(selected_reads)
     ]
     counts = follow_next_read_counts(selected_reads, expanded_reads)
+    reviewed_usability_summary = {
+        **decisions_packet["summary"],
+        "matched_count": sum(1 for item in expanded_reads if (item.get("recovery_usability") or {}).get("matched")),
+        "status_counts": recovery_usability_status_counts(expanded_reads),
+    }
     return {
         "follow_next_reads": {
             **base,
+            "reviewed_usability_decisions": reviewed_usability_summary,
             "status": follow_next_reads_status(counts),
             **counts,
             "source_packet": {
@@ -147,6 +170,10 @@ def build_follow_next_reads_payload(
                 "expanded_count": counts["expanded_count"],
                 "failed_count": counts["failed_count"],
                 "usable_recovery_evidence_count": counts["usable_recovery_evidence_count"],
+                "reviewed_usable_recovery_evidence_count": counts["reviewed_usable_recovery_evidence_count"],
+                "reviewed_not_useful_recovery_count": counts["reviewed_not_useful_recovery_count"],
+                "still_unreviewed_recovery_count": counts["still_unreviewed_recovery_count"],
+                "review_gap_recovery_count": counts["review_gap_recovery_count"],
                 "limit_applied": max(0, int(limit)),
                 "priority_order": [
                     "promoted_continuation_recovery_clr",
@@ -161,21 +188,59 @@ def build_follow_next_reads_payload(
     }
 
 
+def recovery_usability_status_counts(expanded_reads: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in expanded_reads:
+        status = str((item.get("recovery_usability") or {}).get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def follow_next_read_counts(selected_reads: list[dict[str, Any]], expanded_reads: list[dict[str, Any]]) -> dict[str, int]:
     expanded_count = sum(1 for item in expanded_reads if item.get("status") == "expanded")
     failed_count = sum(1 for item in expanded_reads if item.get("status") != "expanded")
+    reviewed_usable_count = sum(
+        1
+        for item in expanded_reads
+        if item.get("status") == "expanded"
+        and (item.get("recovery_usability") or {}).get("status") == "private_reviewed_usable"
+    )
     usable_recovery_evidence_count = sum(
         1
         for item in expanded_reads
         if item.get("status") == "expanded"
-        and (item.get("recovery") or {}).get("kind") != "ordinary_next_read"
-        and bool(item.get("selected_records"))
+        and (
+            (
+                (item.get("recovery") or {}).get("kind") != "ordinary_next_read"
+                and bool(item.get("selected_records"))
+            )
+            or (item.get("recovery_usability") or {}).get("status") == "private_reviewed_usable"
+        )
     )
     return {
         "selected_count": len(selected_reads),
         "expanded_count": expanded_count,
         "failed_count": failed_count,
         "usable_recovery_evidence_count": usable_recovery_evidence_count,
+        "reviewed_usable_recovery_evidence_count": reviewed_usable_count,
+        "reviewed_not_useful_recovery_count": sum(
+            1
+            for item in expanded_reads
+            if item.get("status") == "expanded"
+            and (item.get("recovery_usability") or {}).get("status") == "reviewed_not_useful"
+        ),
+        "still_unreviewed_recovery_count": sum(
+            1
+            for item in expanded_reads
+            if item.get("status") == "expanded"
+            and (item.get("recovery_usability") or {}).get("status") == "still_unreviewed"
+        ),
+        "review_gap_recovery_count": sum(
+            1
+            for item in expanded_reads
+            if item.get("status") == "expanded"
+            and (item.get("recovery_usability") or {}).get("status") == "review_gap"
+        ),
     }
 
 
@@ -531,6 +596,7 @@ def expand_follow_next_read(
     plan: SourcePlan,
     default_tz,
     cwd: Path,
+    usability_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     request = expansion_request_from_next_read(read)
     expansion_cwd = derived_follow_read_cwd(read, fallback_cwd=cwd)
@@ -573,9 +639,204 @@ def expand_follow_next_read(
         "privacy_flags": payload.get("privacy_flags", {}),
         "claim_boundaries": payload.get("claim_boundaries", {}),
     }
+    response["recovery_usability"] = recovery_usability_for_read(
+        read=response,
+        original_read=read,
+        decisions=usability_decisions or [],
+    )
     if payload.get("status") != "expanded":
         response["failure_reason"] = payload.get("error") or payload.get("status")
     return response
+
+
+def load_recovery_usability_decisions(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {
+            "decisions": [],
+            "summary": {
+                "status": "not_supplied",
+                "decision_count": 0,
+                "matched_count": 0,
+                "invalid_count": 0,
+                "privacy_boundary": "optional decisions file not supplied",
+            },
+        }
+    try:
+        loaded = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _usability_decision_load_error("not_found", "reviewed usability decisions path does not exist")
+    except (OSError, UnicodeDecodeError):
+        return _usability_decision_load_error("read_error", "reviewed usability decisions path could not be read")
+    except json.JSONDecodeError:
+        return _usability_decision_load_error("invalid_json", "reviewed usability decisions file is not valid JSON")
+
+    raw_decisions = loaded.get("decisions") if isinstance(loaded, dict) else None
+    if raw_decisions is None and isinstance(loaded, dict):
+        raw_decisions = loaded.get("recovery_usability_decisions")
+    if raw_decisions is None and isinstance(loaded, list):
+        raw_decisions = loaded
+    if not isinstance(raw_decisions, list):
+        return _usability_decision_load_error("unsupported_shape", "expected decisions list")
+
+    decisions: list[dict[str, Any]] = []
+    invalid_count = 0
+    for index, item in enumerate(raw_decisions, 1):
+        decision = sanitize_recovery_usability_decision(item, index)
+        if decision is None:
+            invalid_count += 1
+            continue
+        decisions.append(decision)
+    return {
+        "decisions": decisions,
+        "summary": {
+            "status": "loaded",
+            "decision_count": len(decisions),
+            "matched_count": 0,
+            "invalid_count": invalid_count,
+            "allowed_statuses": sorted(RECOVERY_USABILITY_STATUSES),
+            "privacy_boundary": "only sanitized handles/status labels/counts are propagated; raw review notes and transcript payloads are ignored",
+        },
+    }
+
+
+def _usability_decision_load_error(status: str, reason: str) -> dict[str, Any]:
+    return {
+        "decisions": [],
+        "summary": {
+            "status": status,
+            "decision_count": 0,
+            "matched_count": 0,
+            "invalid_count": 0,
+            "failure_reason": reason,
+            "privacy_boundary": "decisions file was not consumed",
+        },
+    }
+
+
+def sanitize_recovery_usability_decision(item: Any, index: int) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    status = str(item.get("status") or item.get("usability") or "").strip()
+    if status not in RECOVERY_USABILITY_STATUSES:
+        return None
+    decision: dict[str, Any] = {
+        "status": status,
+        "decision_index": index,
+        "match_keys": {},
+    }
+    for key in ("decision_id", "candidate_id", "recovery_id", "evidence_label", "reason_label", "reviewer_label"):
+        value = sanitized_decision_label(item.get(key))
+        if value is not None:
+            decision[key] = value
+    if item.get("rank") is not None:
+        rank = int_or_default(item.get("rank"), -1)
+        if rank > 0:
+            decision["rank"] = rank
+    for key in ("target_handle", "source_handle"):
+        value = sanitized_decision_label(item.get(key))
+        if value is not None:
+            decision["match_keys"][key] = value
+    for key in ("reviewed_record_count", "usable_record_count"):
+        value = int_or_default(item.get(key), -1)
+        if value >= 0:
+            decision[key] = value
+    if item.get("committed_safe") is not None:
+        decision["committed_safe"] = bool(item.get("committed_safe"))
+    return decision
+
+
+def sanitized_decision_label(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+    cleaned = "".join(ch for ch in text if ch in allowed)
+    return cleaned[:120] if cleaned else None
+
+
+def recovery_usability_for_read(
+    *,
+    read: dict[str, Any],
+    original_read: dict[str, Any],
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    match_context = recovery_usability_match_context(read, original_read)
+    matched = None
+    matched_by = None
+    for decision in decisions:
+        matched_by = recovery_usability_match_key(match_context, decision)
+        if matched_by:
+            matched = decision
+            break
+    if matched is None:
+        return {
+            "status": "still_unreviewed",
+            "decision_source": "default_unreviewed",
+            "matched": False,
+            "match_context": match_context,
+            "privacy_boundary": "no reviewed usability decision matched this opened recovery row",
+        }
+    result = {
+        "status": matched["status"],
+        "decision_source": "reviewed_usability_decisions",
+        "matched": True,
+        "matched_by": matched_by,
+        "match_context": match_context,
+        "privacy_boundary": "sanitized reviewed-usability metadata only; raw private review text is not propagated",
+    }
+    for key in (
+        "decision_id",
+        "candidate_id",
+        "recovery_id",
+        "evidence_label",
+        "reason_label",
+        "reviewer_label",
+        "reviewed_record_count",
+        "usable_record_count",
+        "committed_safe",
+    ):
+        if key in matched:
+            result[key] = matched[key]
+    return result
+
+
+def recovery_usability_match_context(read: dict[str, Any], original_read: dict[str, Any]) -> dict[str, Any]:
+    recovery = read.get("recovery") if isinstance(read.get("recovery"), dict) else {}
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return {
+        "rank": read.get("rank"),
+        "candidate_id": read.get("candidate_id") or recovery.get("candidate_id"),
+        "recovery_id": recovery.get("recovery_id"),
+        "recovery_kind": recovery.get("kind"),
+        "target_handle": hashed_handle("target", read.get("target")),
+        "source_handle": hashed_handle("source", json.dumps(source_ref, sort_keys=True) if source_ref else None),
+        "original_target_handle": hashed_handle("target", original_read.get("target")),
+    }
+
+
+def recovery_usability_match_key(context: dict[str, Any], decision: dict[str, Any]) -> str | None:
+    for key in ("candidate_id", "recovery_id"):
+        if decision.get(key) and context.get(key) and str(decision.get(key)) == str(context.get(key)):
+            return key
+    if decision.get("rank") and context.get("rank") and int(decision["rank"]) == int(context["rank"]):
+        return "rank"
+    match_keys = decision.get("match_keys") if isinstance(decision.get("match_keys"), dict) else {}
+    for key in ("target_handle", "source_handle"):
+        if match_keys.get(key) and context.get(key) and match_keys.get(key) == context.get(key):
+            return key
+    return None
+
+
+def hashed_handle(prefix: str, value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return None
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
 
 
 def derived_follow_read_cwd(read: dict[str, Any], *, fallback_cwd: Path) -> Path:

@@ -290,7 +290,13 @@ def _build_evidence_backed_summary_inputs(
             "selected_count": _int(follow_packet.get("selected_count")),
             "expanded_count": _int(follow_packet.get("expanded_count")),
             "failed_count": _int(follow_packet.get("failed_count")),
-            "usable_recovery_evidence_count": _int(follow_packet.get("usable_recovery_evidence_count")),
+            "usable_recovery_evidence_count": _usable_recovery_evidence_count(follow_packet),
+            "reviewed_usable_recovery_evidence_count": _int(
+                follow_packet.get("reviewed_usable_recovery_evidence_count")
+            ),
+            "reviewed_not_useful_recovery_count": _int(follow_packet.get("reviewed_not_useful_recovery_count")),
+            "still_unreviewed_recovery_count": _int(follow_packet.get("still_unreviewed_recovery_count")),
+            "review_gap_recovery_count": _int(follow_packet.get("review_gap_recovery_count")),
         },
     ]
     for item, loaded in ((inputs[0], semantic_loaded), (inputs[1], forensics_loaded), (inputs[2], follow_loaded)):
@@ -553,7 +559,8 @@ def _build_committed_safe_narrative_ledger(
                     "line_range": _safe_line_range(read.get("line_range")),
                     "truncated": bool(read.get("truncated")),
                     "cap_flags": _safe_cap_flags(read),
-                    "inference_boundary": "opened recovery metadata proves follow-through shape only; raw transcript content remains private",
+                    "recovery_usability": _safe_recovery_usability(read.get("recovery_usability")),
+                    "inference_boundary": "opened recovery metadata proves follow-through shape and optional reviewed usability only; raw transcript content remains private",
                 }
             )
         )
@@ -605,7 +612,11 @@ def _build_narrative_readiness(
     if candidate_count == 0:
         candidate_count = sum(1 for row in _list(semantic_packet.get("timeline")) if isinstance(row, dict))
     opened_count = sum(1 for row in ledger if row.get("ledger_kind") == "recovery_opened")
-    usable_recovery_count = _int(follow_packet.get("usable_recovery_evidence_count"))
+    usability_counts = _recovery_usability_counts(follow_packet)
+    usable_recovery_count = max(_int(follow_packet.get("usable_recovery_evidence_count")), usability_counts["private_reviewed_usable"])
+    reviewed_not_useful_count = usability_counts["reviewed_not_useful"]
+    still_unreviewed_count = usability_counts["still_unreviewed"]
+    review_gap_count = usability_counts["review_gap"]
     recovery_gap_count = sum(1 for row in ledger if row.get("ledger_kind") == "recovery_gap")
     dated_candidate_count = sum(
         1 for row in ledger if row.get("ledger_kind") == "candidate_found" and row.get("timestamp_utc")
@@ -637,8 +648,11 @@ def _build_narrative_readiness(
         and has_safe_candidate
         and has_safe_recovery
     )
+    reviewed_all_opened = opened_count and not still_unreviewed_count and not review_gap_count
     if narrative_ready:
         status = "narrative_ready"
+    elif opened_count and reviewed_not_useful_count and reviewed_all_opened and not usable_recovery_count:
+        status = "recovery_reviewed_not_useful"
     elif opened_count and usable_recovery_count:
         status = "needs_private_review"
     elif opened_count:
@@ -658,6 +672,12 @@ def _build_narrative_readiness(
         reason_codes.append("recovery_not_opened")
     if opened_count and not usable_recovery_count:
         reason_codes.append("opened_recovery_not_marked_usable")
+    if reviewed_not_useful_count:
+        reason_codes.append("opened_recovery_reviewed_not_useful")
+    if review_gap_count:
+        reason_codes.append("opened_recovery_review_gap")
+    if still_unreviewed_count:
+        reason_codes.append("opened_recovery_still_unreviewed")
     if opened_count and usable_recovery_count and not narrative_ready:
         reason_codes.append("safe_metadata_too_thin_for_committed_narrative")
     if next_reads.get("status") in {"followup_gap", "explicit_no_next_reads"} and not opened_count:
@@ -667,6 +687,10 @@ def _build_narrative_readiness(
         "candidate_count": candidate_count,
         "recovery_opened_count": opened_count,
         "usable_recovery_evidence_count": usable_recovery_count,
+        "reviewed_usable_recovery_evidence_count": usability_counts["private_reviewed_usable"],
+        "reviewed_not_useful_recovery_count": reviewed_not_useful_count,
+        "still_unreviewed_recovery_count": still_unreviewed_count,
+        "review_gap_recovery_count": review_gap_count,
         "recovery_gap_count": recovery_gap_count,
         "safe_dated_candidate_count": dated_candidate_count,
         "safe_recovery_line_range_count": recovery_with_line_range_count,
@@ -832,6 +856,8 @@ def _story_phase_row(
         gap_reasons.append("phase_missing_safe_artifact_path")
     if narrative_readiness.get("status") in {"recovery_opened", "needs_private_review"}:
         gap_reasons.append("phase_requires_private_recovery_review")
+    if narrative_readiness.get("status") == "recovery_reviewed_not_useful":
+        gap_reasons.append("phase_recovery_reviewed_not_story_useful")
     if narrative_readiness.get("status") == "candidate_found":
         gap_reasons.append("phase_recovery_not_opened")
     usable = bool(handles and (dates or task_ids or handle_types & {"task_path", "review_path", "doc_path", "report_path"}))
@@ -892,6 +918,8 @@ def _story_phase_status(
         return "blocked_on_safe_phase_metadata"
     if narrative_status == "narrative_ready" and usable_recovery_count:
         return "story_ready_metadata"
+    if narrative_status == "recovery_reviewed_not_useful":
+        return "usable_with_reviewed_negative_recovery"
     if recovery_opened and not usable_recovery_count:
         return "usable_with_private_review_gaps"
     if narrative_status in {"needs_private_review", "recovery_opened"}:
@@ -944,6 +972,8 @@ def _story_phase_next_review_needs(
         needs.append("load_or_run_follow_next_reads")
     if narrative_readiness.get("status") in {"recovery_opened", "needs_private_review"}:
         needs.append("private_review_opened_recovery_evidence")
+    if narrative_readiness.get("status") == "recovery_reviewed_not_useful":
+        needs.append("decide_whether_reviewed_negative_recovery_blocks_story")
     if "opened_recovery_has_no_usable_evidence" in gap_reasons:
         needs.append("mark_or_recover_usable_evidence_before_story_claim")
     if not needs:
@@ -1592,7 +1622,10 @@ def _evidence_vs_inference(
                 "selected_count": _int(follow_packet.get("selected_count")),
                 "expanded_count": _int(follow_packet.get("expanded_count")),
                 "failed_count": _int(follow_packet.get("failed_count")),
-                "usable_recovery_evidence_count": _int(follow_packet.get("usable_recovery_evidence_count")),
+                "usable_recovery_evidence_count": _usable_recovery_evidence_count(follow_packet),
+                "reviewed_usable_recovery_evidence_count": _int(
+                    follow_packet.get("reviewed_usable_recovery_evidence_count")
+                ),
             },
         ],
         "inference": [
@@ -1706,6 +1739,89 @@ def _safe_recovery_metadata(value: Any) -> dict[str, Any]:
         if value.get(key) is not None:
             allowed[key] = str(value.get(key))
     return allowed
+
+
+def _safe_recovery_usability(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed_statuses = {
+        "private_reviewed_usable",
+        "reviewed_not_useful",
+        "still_unreviewed",
+        "review_gap",
+    }
+    status = str(value.get("status") or "")
+    if status not in allowed_statuses:
+        return {}
+    safe: dict[str, Any] = {
+        "status": status,
+        "matched": bool(value.get("matched")),
+        "decision_source": _safe_label_or_none(value.get("decision_source")),
+        "matched_by": _safe_label_or_none(value.get("matched_by")),
+        "decision_id": _safe_label_or_none(value.get("decision_id")),
+        "candidate_id": _safe_label_or_none(value.get("candidate_id")),
+        "recovery_id": _safe_label_or_none(value.get("recovery_id")),
+        "evidence_label": _safe_label_or_none(value.get("evidence_label")),
+        "reason_label": _safe_label_or_none(value.get("reason_label")),
+        "reviewer_label": _safe_label_or_none(value.get("reviewer_label")),
+    }
+    for key in ("reviewed_record_count", "usable_record_count"):
+        if value.get(key) is not None:
+            safe[key] = _int(value.get(key))
+    if value.get("committed_safe") is not None:
+        safe["committed_safe"] = bool(value.get("committed_safe"))
+    match_context = value.get("match_context") if isinstance(value.get("match_context"), dict) else {}
+    safe_context = {
+        key: _safe_label_or_none(match_context.get(key))
+        for key in ("target_handle", "source_handle", "original_target_handle", "recovery_kind")
+    }
+    if match_context.get("rank") is not None:
+        safe_context["rank"] = _int(match_context.get("rank"))
+    safe_context = {key: item for key, item in safe_context.items() if item not in (None, "", [], {})}
+    if safe_context:
+        safe["match_context"] = safe_context
+    return {key: item for key, item in safe.items() if item not in (None, "", [], {})}
+
+
+def _recovery_usability_counts(follow_packet: dict[str, Any]) -> dict[str, int]:
+    top_level_counts = {
+        "private_reviewed_usable": _int(follow_packet.get("reviewed_usable_recovery_evidence_count")),
+        "reviewed_not_useful": _int(follow_packet.get("reviewed_not_useful_recovery_count")),
+        "still_unreviewed": _int(follow_packet.get("still_unreviewed_recovery_count")),
+        "review_gap": _int(follow_packet.get("review_gap_recovery_count")),
+    }
+    derived_counts = dict.fromkeys(top_level_counts, 0)
+    for read in _list(follow_packet.get("expanded_reads")):
+        if not isinstance(read, dict):
+            continue
+        if str(read.get("status") or "") != "expanded":
+            continue
+        usability = _safe_recovery_usability(read.get("recovery_usability"))
+        status = usability.get("status")
+        if status in derived_counts:
+            derived_counts[status] += 1
+    return {
+        status: max(top_level_counts[status], derived_counts[status])
+        for status in top_level_counts
+    }
+
+
+def _usable_recovery_evidence_count(follow_packet: dict[str, Any]) -> int:
+    return max(
+        _int(follow_packet.get("usable_recovery_evidence_count")),
+        _recovery_usability_counts(follow_packet)["private_reviewed_usable"],
+    )
+
+
+def _safe_label_or_none(value: Any) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > 160:
+        return None
+    if _safe_short_label(text) or re.match(r"^[A-Za-z0-9._:-]+$", text):
+        return text
+    return None
 
 
 def _safe_line_range(value: Any) -> dict[str, Any]:
