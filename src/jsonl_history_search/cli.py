@@ -122,7 +122,7 @@ from .semantic_debugging import (
     summarize_guided_audit_flow,
 )
 from .skill_audit import build_skill_audit_payload
-from .source_expansion import ExpansionRequest, build_source_expansion_payload
+from .source_expansion import ExpansionRequest, build_follow_next_reads_payload, build_source_expansion_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
 from .structural_hybrid import search_structural_hybrid_budgeted
 from .timeutil import parse_now, timezone_from_args
@@ -263,6 +263,18 @@ def build_parser() -> argparse.ArgumentParser:
     read_more.add_argument("--after", type=int, default=2)
     read_more.add_argument("--next-count", type=int, default=3)
     read_more.add_argument("--max-records", type=int, default=20)
+    follow_next_reads = subparsers.add_parser(
+        "follow-next-reads",
+        description=(
+            "Bounded local follow-through for saved find/semantic-debug JSON "
+            "next_reads. Expands exact source refs without rerunning search."
+        ),
+    )
+    add_common_args(follow_next_reads)
+    follow_next_reads.set_defaults(format="json")
+    follow_next_reads.add_argument("--from-report", required=True, help="Saved agent_find or semantic_debug JSON report.")
+    follow_next_reads.add_argument("--kind", choices=("recovery",), default="recovery")
+    follow_next_reads.add_argument("--limit", type=int, default=3)
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
     add_common_args(manifest)
@@ -2165,6 +2177,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(render(payload, args.format))
         return 0 if payload["source_expansion"]["status"] == "expanded" else 1
+    if args.command == "follow-next-reads":
+        args.query = str(args.from_report)
+        _source_plan, _intent, plan = payload_from_args(args)
+        payload = build_follow_next_reads_payload(
+            report_path=Path(args.from_report).expanduser(),
+            kind=args.kind,
+            limit=args.limit,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=Path(args.cwd).expanduser().resolve(),
+        )
+        print(render(payload, args.format))
+        packet = payload["follow_next_reads"]
+        if packet["status"] not in {"expanded", "no_next_reads"}:
+            return 1
+        if any(item.get("status") != "expanded" for item in packet.get("expanded_reads", [])):
+            return 1
+        return 0
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(
