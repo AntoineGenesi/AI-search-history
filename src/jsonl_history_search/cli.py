@@ -39,6 +39,7 @@ from .eval_decision_loop import build_eval_decision_loop_payload
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .expansion import build_expansion_family_audit_report
 from .expansion_family_probe import build_expansion_family_probe_report, supported_family_names
+from .failure_analysis import build_failure_analysis_payload
 from .forensics import build_forensics_payload
 from .generated_metadata import build_generated_metadata_discovery_report
 from .harness_artifacts import (
@@ -275,6 +276,23 @@ def build_parser() -> argparse.ArgumentParser:
     follow_next_reads.add_argument("--from-report", required=True, help="Saved agent_find or semantic_debug JSON report.")
     follow_next_reads.add_argument("--kind", choices=("recovery",), default="recovery")
     follow_next_reads.add_argument("--limit", type=int, default=3)
+    failure_analysis = subparsers.add_parser(
+        "failure-analysis",
+        description=(
+            "Deterministic saved-report synthesis for workflow failure reconstruction. "
+            "Consumes semantic-debug plus optional forensics/follow-next-reads JSON."
+        ),
+    )
+    failure_analysis.add_argument("--semantic-debug-report", required=True, help="Saved semantic-debug JSON report.")
+    failure_analysis.add_argument("--story-id", required=True, help="Stable caller-provided story identifier.")
+    failure_analysis.add_argument("--forensics-report", default=None, help="Optional saved forensics JSON report.")
+    failure_analysis.add_argument(
+        "--follow-next-reads-report",
+        default=None,
+        help="Optional saved follow-next-reads JSON report.",
+    )
+    failure_analysis.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    failure_analysis.add_argument("--report-output", default=None)
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
     add_common_args(manifest)
@@ -1886,6 +1904,22 @@ def main(argv: list[str] | None = None) -> int:
             output_path.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0
+    if args.command == "failure-analysis":
+        payload = build_failure_analysis_payload(
+            semantic_debug_report=Path(args.semantic_debug_report).expanduser(),
+            story_id=args.story_id,
+            forensics_report=Path(args.forensics_report).expanduser() if args.forensics_report else None,
+            follow_next_reads_report=Path(args.follow_next_reads_report).expanduser()
+            if args.follow_next_reads_report
+            else None,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0 if payload["failure_analysis"]["status"] == "ok" else 1
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)
         rendered = render(payload, args.format)
