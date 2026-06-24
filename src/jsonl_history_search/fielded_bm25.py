@@ -48,6 +48,7 @@ CONTEXT_NEIGHBORHOOD_RADIUS_AFTER = 2
 FIELDED_EVIDENCE_RRF_RANK_CONSTANT = 60
 FIELDED_EVIDENCE_SELECTION_POLICY_VERSION = "fielded-evidence-selection-v1"
 FIELDED_GROUPED_SOURCE_WINDOW_SELECTION_VERSION = "fielded-grouped-source-window-selection-v1"
+FIELDED_CONTINUATION_LEDGER_VERSION = "fielded-continuation-candidate-ledger-v1"
 FIELDED_GROUPED_SOURCE_WINDOW_NEAR_GAP = 2
 FIELDED_GROUPED_SOURCE_WINDOW_INNER_HIT_LIMIT = 3
 FIELDED_BM25_CONTENT_FINGERPRINT_STRATEGY = "sha256_full_source_bytes_for_cache_validation"
@@ -644,6 +645,7 @@ def search_with_fielded_bm25(
     expected_ref_diagnostics: list[dict] | None = None,
     include_private_diagnostics: bool = False,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
+    continuation_ledger: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_search_materialization")
@@ -888,6 +890,21 @@ def search_with_fielded_bm25(
     )
     if pre_cap_count > len(matches):
         warnings.append("Fielded BM25 candidates were capped at max match cap after ranking.")
+    continuation_candidate_ledger = (
+        _build_continuation_candidate_ledger(
+            selection_rows=selection_rows,
+            grouped_rows=rows,
+            final_matches=matches,
+            index=index,
+            candidate_limit=candidate_limit,
+            candidate_pool_limit=candidate_pool_limit,
+            query_streams=query_stream_summary,
+            source_grouping=source_grouping,
+            materialization=materialization,
+        )
+        if continuation_ledger
+        else None
+    )
     payload = {
         "status": "planned_fielded_bm25",
         "fallback_reason": None,
@@ -934,6 +951,8 @@ def search_with_fielded_bm25(
             candidate_rows_materialized=int(materialization.get("candidate_rows_materialized") or 0),
         ),
     }
+    if continuation_candidate_ledger is not None:
+        payload["continuation_candidate_ledger"] = continuation_candidate_ledger
     if include_private_diagnostics:
         payload["_searched_file_paths"] = sorted(opened_paths)
     if expected_diag is not None:
@@ -942,6 +961,184 @@ def search_with_fielded_bm25(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def _build_continuation_candidate_ledger(
+    *,
+    selection_rows: list[tuple[Any, ...]],
+    grouped_rows: list[tuple[Any, ...]],
+    final_matches: list[Match],
+    index: FieldedBm25Index,
+    candidate_limit: int,
+    candidate_pool_limit: int,
+    query_streams: dict[str, Any],
+    source_grouping: dict[str, Any],
+    materialization: dict[str, int | bool],
+) -> dict[str, Any]:
+    grouped_rowids = {int(row[0]) for row in grouped_rows}
+    final_lines_by_path: dict[str, set[int]] = {}
+    for match in final_matches:
+        final_lines_by_path.setdefault(str(match.path), set()).add(int(match.line))
+    items: list[dict[str, Any]] = []
+    recoverable_omitted = 0
+    final_present = 0
+    still_unreached = 0
+    bounded_item_limit = max(int(candidate_limit), 0)
+    for ordinal, row in enumerate(selection_rows, start=1):
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        present = _source_ref_has_final_match(ref, final_lines_by_path)
+        selected_for_materialization = rowid in grouped_rowids
+        recoverable = bool(not present and selected_for_materialization)
+        unreached = bool(not present and not selected_for_materialization)
+        if present:
+            final_present += 1
+        if recoverable:
+            recoverable_omitted += 1
+        if unreached:
+            still_unreached += 1
+        if len(items) < bounded_item_limit:
+            items.append(
+                {
+                    "ledger_id": f"cl{len(items) + 1:03d}",
+                    "source_ref_hash": _source_ref_hash(ref),
+                    "cursor": _ledger_cursor(ordinal=ordinal, rowid=rowid, ref=ref),
+                    "candidate_rank": ordinal,
+                    "selected_for_materialization": selected_for_materialization,
+                    "present_in_final_packet": present,
+                    "recoverable_omitted": recoverable,
+                    "still_unreached": unreached,
+                    "evidence_state": (
+                        "present_final"
+                        if present
+                        else "recoverable_omitted"
+                        if recoverable
+                        else "still_unreached"
+                    ),
+                    "source_kind": ref.source_kind,
+                    "role_bucket": ref.role_bucket,
+                    "timestamp_bucket_present": bool(ref.timestamp_bucket),
+                    "day_bucket_present": bool(ref.day_key),
+                    "line_handle_available": True,
+                    "raw_path_included": False,
+                    "raw_text_included": False,
+                    "raw_snippet_included": False,
+                    "source_line_included": False,
+                    "line_numbers_included": False,
+                }
+            )
+    total_candidates = len(selection_rows)
+    retained = len(grouped_rows)
+    final_count = len(final_matches)
+    pass_count = max(int(query_streams.get("stream_count") or 0), 1 if total_candidates else 0)
+    retrieval_chunk_count = (
+        max((total_candidates + bounded_item_limit - 1) // bounded_item_limit, 1)
+        if total_candidates and bounded_item_limit
+        else 0
+    )
+    continuation_available = total_candidates > len(items)
+    return {
+        "schema_version": 1,
+        "version": FIELDED_CONTINUATION_LEDGER_VERSION,
+        "enabled": True,
+        "mode": "fielded_bm25_opt_in_continuation_candidate_ledger",
+        "strategy": "bounded_fielded_bm25_candidate_ledger_with_source_ref_hash_cursors",
+        "bounded": True,
+        "pass_count": pass_count,
+        "retrieval_chunk_count": retrieval_chunk_count,
+        "multi_pass": pass_count > 1 or retrieval_chunk_count > 1,
+        "ledger_item_limit": bounded_item_limit,
+        "candidate_row_pool_limit": int(candidate_pool_limit),
+        "ledger_item_count": len(items),
+        "total_candidate_rows_discovered": total_candidates,
+        "candidate_rows_retained_for_materialization": retained,
+        "candidate_rows_materialized": int(materialization.get("candidate_rows_materialized") or 0),
+        "final_packet_candidate_count": final_count,
+        "final_packet_present_count": final_present,
+        "recoverable_omitted_count": recoverable_omitted,
+        "still_unreached_count": still_unreached,
+        "continuation_available": continuation_available,
+        "next_cursor": items[-1]["cursor"] if items and continuation_available else None,
+        "continuation_policy": {
+            "policy_version": FIELDED_CONTINUATION_LEDGER_VERSION,
+            "cursor_type": "fielded_bm25_source_ref_after",
+            "resume_semantics": "continue_after_rank_with_same_query_plan_and_source_plan",
+            "stable_order": "fielded_bm25_rrf_selection_rank_then_source_ref_hash_cursor",
+            "materialization": "reopen_source_lines_from_selected_ledger_refs",
+            "ledger_item_limit": bounded_item_limit,
+            "candidate_row_pool_limit": int(candidate_pool_limit),
+            "default_enabled": False,
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_snippets_included": False,
+            "source_lines_included": False,
+            "line_numbers_included": False,
+            "raw_session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "stage_counts": {
+            "discovered": total_candidates,
+            "ledger_retained": len(items),
+            "selected_for_materialization": retained,
+            "materialized": int(materialization.get("candidate_rows_materialized") or 0),
+            "final_surfaced": final_count,
+            "recoverable_omitted": recoverable_omitted,
+            "still_unreached": still_unreached,
+        },
+        "loss_stage_summary": {
+            "discovery_to_ledger_drop": max(total_candidates - len(items), 0),
+            "ledger_to_materialization_drop": max(total_candidates - retained, 0),
+            "materialization_to_final_drop": max(retained - final_count, 0),
+            "source_grouping_dropped_rows": int(source_grouping.get("candidate_rows_dropped") or 0),
+        },
+        "items": items,
+        "privacy": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_snippets_included": False,
+            "source_lines_included": False,
+            "line_numbers_included": False,
+            "raw_session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "claim_boundaries": {
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+            "default_promotion_supported": False,
+            "all_history_completeness_claim_supported": False,
+        },
+    }
+
+
+def _source_ref_has_final_match(ref: FieldedBm25RecordRef, final_lines_by_path: dict[str, set[int]]) -> bool:
+    final_lines = final_lines_by_path.get(str(ref.path))
+    if not final_lines:
+        return False
+    line_start = int(ref.line)
+    line_end = int(ref.line_end or ref.line)
+    return any(line_start <= line <= line_end for line in final_lines)
+
+
+def _source_ref_hash(ref: FieldedBm25RecordRef) -> str:
+    basis = f"{ref.source_kind}|{ref.path.as_posix()}|{ref.line}|{ref.line_end or ref.line}"
+    return hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _ledger_cursor(*, ordinal: int, rowid: int, ref: FieldedBm25RecordRef) -> dict[str, Any]:
+    cursor_basis = f"{ordinal}|{rowid}|{ref.source_kind}|{ref.path.as_posix()}|{ref.line}|{ref.line_end or ref.line}"
+    return {
+        "cursor_type": "fielded_bm25_source_ref_after",
+        "rank_after": int(ordinal),
+        "rowid_after_hash": hashlib.sha256(str(rowid).encode("utf-8")).hexdigest()[:12],
+        "source_ref_hash_after": _source_ref_hash(ref),
+        "cursor_hash": hashlib.sha256(cursor_basis.encode("utf-8", errors="replace")).hexdigest()[:24],
+        "raw_path_included": False,
+        "raw_text_included": False,
+        "source_line_included": False,
+        "line_numbers_included": False,
+    }
 
 
 def _insert_record(connection: sqlite3.Connection, rowid: int, record: Record, source_kind: str) -> None:

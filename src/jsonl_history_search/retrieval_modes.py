@@ -36,6 +36,7 @@ def run_retrieval_mode(
     use_rg_prefilter: bool = False,
     fielded_bm25_index_dir: str | None = None,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
+    continuation_ledger: bool = False,
 ) -> dict[str, Any]:
     if retrieval_mode == RETRIEVAL_MODE_PACKAGE:
         return search(
@@ -64,6 +65,7 @@ def run_retrieval_mode(
             mask_context=mask_context,
             fielded_bm25_index_dir=fielded_bm25_index_dir,
             query_plan_mode=query_plan_mode,
+            continuation_ledger=continuation_ledger,
         )
     raise ValueError(f"unsupported retrieval mode: {retrieval_mode}")
 
@@ -77,6 +79,7 @@ def run_fielded_bm25_retrieval(
     mask_context: Any = None,
     fielded_bm25_index_dir: str | None = None,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
+    continuation_ledger: bool = False,
 ) -> dict[str, Any]:
     total_profile_token = start_phase_profile("total_fielded_bm25_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
@@ -116,6 +119,7 @@ def run_fielded_bm25_retrieval(
         mask_context=mask_context,
         include_private_diagnostics=True,
         query_plan_mode=query_plan_mode,
+        continuation_ledger=continuation_ledger,
     )
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
@@ -329,6 +333,9 @@ def build_fielded_bm25_retrieval_diagnostics(
     fielded_source_grouping = _fielded_source_grouping_diagnostics(fielded_result)
     fielded_context_neighborhood = _fielded_context_neighborhood_diagnostics(fielded_result)
     fielded_evidence_channels = _fielded_evidence_channel_diagnostics(fielded_result)
+    continuation_candidate_ledger = _fielded_continuation_candidate_ledger_diagnostics(
+        fielded_result.get("continuation_candidate_ledger")
+    )
     child_query_plan = _fielded_child_query_plan_diagnostics(fielded_result)
     branch_fanout = _fielded_branch_fanout_diagnostics(fielded_result)
     fielded_summary = {
@@ -348,6 +355,11 @@ def build_fielded_bm25_retrieval_diagnostics(
         "query_streams": _fielded_query_streams_diagnostics(fielded_result),
         "branch_fanout": branch_fanout,
         "evidence_channels": fielded_evidence_channels,
+        **(
+            {"continuation_candidate_ledger": continuation_candidate_ledger}
+            if continuation_candidate_ledger
+            else {}
+        ),
         "context_neighborhood": fielded_context_neighborhood,
         "searched_files": int(fielded_result.get("searched_files", 0)),
         "searched_bytes": int(fielded_result.get("searched_bytes", 0)),
@@ -387,6 +399,8 @@ def build_fielded_bm25_retrieval_diagnostics(
         cap_labels=cap_labels,
     )
     fielded_summary["candidate_stage_loss"] = fielded_candidate_stage_loss
+    if continuation_candidate_ledger:
+        fielded_summary["continuation_candidate_ledger"] = continuation_candidate_ledger
     return {
         "retrieval_mode": RETRIEVAL_MODE_FIELDED_BM25,
         "feature_state": "active_explicit_opt_in",
@@ -408,6 +422,11 @@ def build_fielded_bm25_retrieval_diagnostics(
         "source_catalog": source_catalog,
         "source_plan": source_plan,
         "fielded_bm25": fielded_summary,
+        **(
+            {"continuation_candidate_ledger": continuation_candidate_ledger}
+            if continuation_candidate_ledger
+            else {}
+        ),
         "fielded_candidate_stage_loss": fielded_candidate_stage_loss,
         "fielded_evidence_channels": fielded_evidence_channels,
         "fielded_child_query_plan": child_query_plan,
@@ -448,6 +467,129 @@ def build_fielded_bm25_retrieval_diagnostics(
             "scanner_scheduling_constants_changed": False,
             "package_lane_scoped_or_skipped": False,
         },
+    }
+
+
+def _fielded_continuation_candidate_ledger_diagnostics(value: Any) -> dict[str, Any] | None:
+    ledger = value if isinstance(value, dict) else None
+    if not ledger or not bool(ledger.get("enabled", False)):
+        return None
+    items: list[dict[str, Any]] = []
+    for item in ledger.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        cursor = item.get("cursor") if isinstance(item.get("cursor"), dict) else {}
+        items.append(
+            {
+                "ledger_id": str(item.get("ledger_id") or ""),
+                "source_ref_hash": str(item.get("source_ref_hash") or ""),
+                "cursor": {
+                    "cursor_type": str(cursor.get("cursor_type") or ""),
+                    "rank_after": int(cursor.get("rank_after") or 0),
+                    "rowid_after_hash": str(cursor.get("rowid_after_hash") or ""),
+                    "source_ref_hash_after": str(cursor.get("source_ref_hash_after") or ""),
+                    "cursor_hash": str(cursor.get("cursor_hash") or ""),
+                    "raw_path_included": False,
+                    "raw_text_included": False,
+                    "source_line_included": False,
+                    "line_numbers_included": False,
+                },
+                "candidate_rank": int(item.get("candidate_rank") or 0),
+                "selected_for_materialization": bool(item.get("selected_for_materialization", False)),
+                "present_in_final_packet": bool(item.get("present_in_final_packet", False)),
+                "recoverable_omitted": bool(item.get("recoverable_omitted", False)),
+                "still_unreached": bool(item.get("still_unreached", False)),
+                "evidence_state": str(item.get("evidence_state") or "unknown"),
+                "source_kind": str(item.get("source_kind") or "unknown"),
+                "role_bucket": str(item.get("role_bucket") or "unknown"),
+                "timestamp_bucket_present": bool(item.get("timestamp_bucket_present", False)),
+                "day_bucket_present": bool(item.get("day_bucket_present", False)),
+                "line_handle_available": bool(item.get("line_handle_available", False)),
+                "raw_path_included": False,
+                "raw_text_included": False,
+                "raw_snippet_included": False,
+                "source_line_included": False,
+                "line_numbers_included": False,
+            }
+        )
+    next_cursor = ledger.get("next_cursor") if isinstance(ledger.get("next_cursor"), dict) else None
+    sanitized_next_cursor = None
+    if next_cursor:
+        sanitized_next_cursor = {
+            "cursor_type": str(next_cursor.get("cursor_type") or ""),
+            "rank_after": int(next_cursor.get("rank_after") or 0),
+            "rowid_after_hash": str(next_cursor.get("rowid_after_hash") or ""),
+            "source_ref_hash_after": str(next_cursor.get("source_ref_hash_after") or ""),
+            "cursor_hash": str(next_cursor.get("cursor_hash") or ""),
+            "raw_path_included": False,
+            "raw_text_included": False,
+            "source_line_included": False,
+            "line_numbers_included": False,
+        }
+    return {
+        "schema_version": int(ledger.get("schema_version") or 1),
+        "version": str(ledger.get("version") or ""),
+        "enabled": True,
+        "mode": str(ledger.get("mode") or ""),
+        "strategy": str(ledger.get("strategy") or ""),
+        "bounded": bool(ledger.get("bounded", True)),
+        "pass_count": int(ledger.get("pass_count") or 0),
+        "retrieval_chunk_count": int(ledger.get("retrieval_chunk_count") or 0),
+        "multi_pass": bool(ledger.get("multi_pass", False)),
+        "ledger_item_limit": int(ledger.get("ledger_item_limit") or 0),
+        "candidate_row_pool_limit": int(ledger.get("candidate_row_pool_limit") or 0),
+        "ledger_item_count": int(ledger.get("ledger_item_count") or len(items)),
+        "total_candidate_rows_discovered": int(ledger.get("total_candidate_rows_discovered") or 0),
+        "candidate_rows_retained_for_materialization": int(
+            ledger.get("candidate_rows_retained_for_materialization") or 0
+        ),
+        "candidate_rows_materialized": int(ledger.get("candidate_rows_materialized") or 0),
+        "final_packet_candidate_count": int(ledger.get("final_packet_candidate_count") or 0),
+        "final_packet_present_count": int(ledger.get("final_packet_present_count") or 0),
+        "recoverable_omitted_count": int(ledger.get("recoverable_omitted_count") or 0),
+        "still_unreached_count": int(ledger.get("still_unreached_count") or 0),
+        "continuation_available": bool(ledger.get("continuation_available", False)),
+        "next_cursor": sanitized_next_cursor,
+        "continuation_policy": _fielded_continuation_policy_diagnostics(ledger.get("continuation_policy")),
+        "stage_counts": _safe_int_map(ledger.get("stage_counts")),
+        "loss_stage_summary": _safe_int_map(ledger.get("loss_stage_summary")),
+        "items": items,
+        "privacy": {
+            "raw_paths_included": False,
+            "raw_text_included": False,
+            "raw_snippets_included": False,
+            "source_lines_included": False,
+            "line_numbers_included": False,
+            "raw_session_ids_included": False,
+            "vectors_or_persisted_indexes_included": False,
+        },
+        "claim_boundaries": {
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+            "default_promotion_supported": False,
+            "all_history_completeness_claim_supported": False,
+        },
+    }
+
+
+def _fielded_continuation_policy_diagnostics(value: Any) -> dict[str, Any]:
+    policy = value if isinstance(value, dict) else {}
+    return {
+        "policy_version": str(policy.get("policy_version") or ""),
+        "cursor_type": str(policy.get("cursor_type") or ""),
+        "resume_semantics": str(policy.get("resume_semantics") or ""),
+        "stable_order": str(policy.get("stable_order") or ""),
+        "materialization": str(policy.get("materialization") or ""),
+        "ledger_item_limit": int(policy.get("ledger_item_limit") or 0),
+        "candidate_row_pool_limit": int(policy.get("candidate_row_pool_limit") or 0),
+        "default_enabled": bool(policy.get("default_enabled", False)),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_snippets_included": False,
+        "source_lines_included": False,
+        "line_numbers_included": False,
+        "raw_session_ids_included": False,
+        "vectors_or_persisted_indexes_included": False,
     }
 
 
