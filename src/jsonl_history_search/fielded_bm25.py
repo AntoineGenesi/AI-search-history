@@ -59,6 +59,13 @@ QUERY_PLAN_MODE_OFF = "off"
 QUERY_PLAN_MODE_DEBUG = "debug"
 QUERY_PLAN_MODES = {QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODE_OFF, QUERY_PLAN_MODE_DEBUG}
 SUPPORTED_CHILD_CHANNEL_INTENTS = {"when_user_said", "workflow_failure", "why", "what_was_i_talking_about"}
+SUPPORTED_FIELDED_SOURCE_WINDOW_NEEDS = (
+    "failure_timeline",
+    "decision_context",
+    "user_wording",
+    "topic_context",
+    "next_reads",
+)
 WORKFLOW_FAILURE_MARKERS = ("failure", "failed", "error", "regression", "blocker", "wrong")
 WORKFLOW_REPAIR_MARKERS = ("repair", "retry", "fix", "fixed", "rerun", "retest")
 
@@ -1867,10 +1874,17 @@ def _select_grouped_source_window_heads(
     selected_representative_reason_counts: dict[str, int] = {}
     window_selection: dict[str, Any] = {
         "enabled": True,
-        "strategy": "protected_exact_then_route_windows_then_novel_grouped_windows_before_duplicate_windows",
+        "strategy": "protected_exact_then_query_plan_need_windows_then_route_windows_then_novel_grouped_windows_before_duplicate_windows",
         "route_window_count_considered": 0,
         "route_window_count_selected": 0,
         "route_window_head_selection_count": 0,
+        "query_plan_need_window_count_considered": 0,
+        "query_plan_need_window_count_matched": 0,
+        "query_plan_need_window_count_selected": 0,
+        "source_window_needs_considered": [],
+        "source_window_needs_matched": [],
+        "source_window_needs_selected": [],
+        "source_window_needs_omitted": [],
         "novelty_fill_window_count": 0,
         "duplicate_window_skip_count": 0,
         "duplicate_window_selection_count": 0,
@@ -1942,8 +1956,103 @@ def _select_grouped_source_window_heads(
     representative_reason_counts["intent_preferred_window_head"] = len(intent_windows)
     window_selection["route_window_count_considered"] = int(len(intent_windows))
     route_window_keys = {window.key for window in intent_windows}
-    route_head_selection_count = 0
+    source_window_needs_considered = _source_window_needs_for_fielded_intent(intent)
+    window_need_matches = {
+        window.key: _grouped_source_window_matched_needs(
+            window,
+            index,
+            intent=intent,
+            source_window_needs=source_window_needs_considered,
+            row_stream_labels=row_stream_labels,
+            fusion=fusion,
+        )
+        for window in windows
+    }
+    source_window_needs_matched = [
+        need
+        for need in source_window_needs_considered
+        if any(need in matches for matches in window_need_matches.values())
+    ]
+    window_selection["source_window_needs_considered"] = list(source_window_needs_considered)
+    window_selection["source_window_needs_matched"] = list(source_window_needs_matched)
+    window_selection["query_plan_need_window_count_considered"] = int(len(source_window_needs_considered))
+    window_selection["query_plan_need_window_count_matched"] = int(len(source_window_needs_matched))
+    intent_allocation["source_window_needs_considered"] = list(source_window_needs_considered)
+    intent_allocation["source_window_needs_matched"] = list(source_window_needs_matched)
+    intent_allocation["query_plan_need_window_count_considered"] = int(len(source_window_needs_considered))
+    intent_allocation["query_plan_need_window_count_matched"] = int(len(source_window_needs_matched))
+
+    def selected_window_keys_now() -> set[tuple[str, str, str, int]]:
+        return {
+            window.key
+            for window in windows
+            if window.head_rowid in selected_rowids or any(rowid in selected_rowids for rowid in window.rowids)
+        }
+
+    def selected_need_labels_now() -> list[str]:
+        selected_keys = selected_window_keys_now()
+        return [
+            need
+            for need in source_window_needs_considered
+            if any(need in window_need_matches.get(key, ()) for key in selected_keys)
+        ]
+
+    query_plan_need_head_selection_count = 0
     primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
+    for need in source_window_needs_matched:
+        if len(selected) >= selected_limit:
+            break
+        if need in selected_need_labels_now():
+            continue
+        need_candidates = [
+            window
+            for window in windows
+            if need in window_need_matches.get(window.key, ())
+            and window.head_rowid not in selected_rowids
+            and row_by_id.get(window.head_rowid) is not None
+            and _safe_window_group_key(window) not in selected_group_keys["window"]
+        ]
+        if not need_candidates:
+            continue
+        window = min(
+            need_candidates,
+            key=lambda candidate: (
+                -_grouped_window_novelty_score(candidate, index, selected_group_keys),
+                _source_window_need_priority(
+                    candidate,
+                    index,
+                    need=need,
+                    primary_intent=primary_intent,
+                    row_stream_labels=row_stream_labels,
+                    fusion=fusion,
+                ),
+                _intent_window_priority(
+                    candidate,
+                    index,
+                    primary_intent=primary_intent,
+                    row_stream_labels=row_stream_labels,
+                    fusion=fusion,
+                ),
+                bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
+                candidate.head_rowid,
+            ),
+        )
+        row = row_by_id.get(window.head_rowid)
+        if row is not None and add_row(row, "query_plan_need_window_head"):
+            query_plan_need_head_selection_count += 1
+
+    source_window_needs_selected = selected_need_labels_now()
+    source_window_needs_omitted = [
+        need for need in source_window_needs_matched if need not in source_window_needs_selected
+    ]
+    representative_reason_counts["query_plan_need_window_head"] = int(query_plan_need_head_selection_count)
+    window_selection["query_plan_need_window_count_selected"] = int(query_plan_need_head_selection_count)
+    window_selection["source_window_needs_selected"] = list(source_window_needs_selected)
+    window_selection["source_window_needs_omitted"] = list(source_window_needs_omitted)
+    intent_allocation["query_plan_need_window_count_selected"] = int(query_plan_need_head_selection_count)
+    intent_allocation["source_window_needs_selected"] = list(source_window_needs_selected)
+    intent_allocation["source_window_needs_omitted"] = list(source_window_needs_omitted)
+    route_head_selection_count = 0
     while len(selected) < selected_limit:
         route_candidates = [
             window
@@ -2051,15 +2160,23 @@ def _select_grouped_source_window_heads(
     }
     selected_route_window_keys = selected_window_keys & route_window_keys
     intent_sources_selected = {window.source_key for window in intent_windows if window.key in selected_route_window_keys}
+    source_window_needs_selected = selected_need_labels_now()
+    source_window_needs_omitted = [
+        need for need in source_window_needs_matched if need not in source_window_needs_selected
+    ]
     intent_allocation["selected_intent_window_count"] = int(len(selected_route_window_keys))
     intent_allocation["selected_route_window_count"] = int(len(selected_route_window_keys))
     intent_allocation["selected_intent_window_head_count"] = int(route_head_selection_count)
     intent_allocation["distinct_intent_sources_selected"] = int(len(intent_sources_selected))
+    intent_allocation["source_window_needs_selected"] = list(source_window_needs_selected)
+    intent_allocation["source_window_needs_omitted"] = list(source_window_needs_omitted)
     intent_allocation["novelty_fill_window_count"] = int(novelty_fill_count)
     intent_allocation["duplicate_window_skip_count"] = int(len(duplicate_skip_keys))
     intent_allocation["duplicate_window_selection_count"] = int(duplicate_selection_count)
     window_selection["route_window_count_selected"] = int(len(selected_route_window_keys))
     window_selection["route_window_head_selection_count"] = int(route_head_selection_count)
+    window_selection["source_window_needs_selected"] = list(source_window_needs_selected)
+    window_selection["source_window_needs_omitted"] = list(source_window_needs_omitted)
     window_selection["novelty_fill_window_count"] = int(novelty_fill_count)
     window_selection["duplicate_window_skip_count"] = int(len(duplicate_skip_keys))
     window_selection["duplicate_window_selection_count"] = int(duplicate_selection_count)
@@ -2255,6 +2372,131 @@ def _intent_window_priority(
     return (best_bucket, int(window.start_order), window.head_rowid)
 
 
+def _source_window_needs_for_fielded_intent(intent: QueryIntent | None) -> list[str]:
+    plan = intent.query_plan if intent is not None else None
+    needs: list[str] = []
+    for item in (plan.source_window_needs if plan is not None else []):
+        need = str(item)
+        if need not in SUPPORTED_FIELDED_SOURCE_WINDOW_NEEDS or need in needs:
+            continue
+        needs.append(need)
+    return needs
+
+
+def _grouped_source_window_matched_needs(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    *,
+    intent: QueryIntent | None,
+    source_window_needs: list[str],
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> tuple[str, ...]:
+    primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
+    matches: list[str] = []
+    for need in source_window_needs:
+        if any(
+            _row_matches_source_window_need(
+                rowid,
+                index,
+                primary_intent=primary_intent,
+                need=need,
+                row_stream_labels=row_stream_labels,
+                fusion=fusion,
+            )
+            for rowid in window.rowids
+        ):
+            matches.append(need)
+    return tuple(matches)
+
+
+def _row_matches_source_window_need(
+    rowid: int,
+    index: FieldedBm25Index,
+    *,
+    primary_intent: str,
+    need: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> bool:
+    ref = index.records.get(rowid)
+    if ref is None:
+        return False
+    labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+    role = str(ref.role_bucket or "").lower()
+    timestamp_present = str(ref.timestamp_bucket or "") != "timestamp_absent"
+    if need == "user_wording":
+        return primary_intent == "when_user_said" and (
+            "user" in role
+            or any("when_user_said" in label or "role_text_user" in label for label in labels)
+        )
+    if need == "failure_timeline":
+        return primary_intent == "workflow_failure" and (
+            timestamp_present
+            or any("workflow_failure" in label or "failure" in label or "timestamp" in label for label in labels)
+        )
+    if need == "decision_context":
+        return primary_intent == "why" and (
+            any("source_window_need:decision_context" in label or "decision_context" in label for label in labels)
+            or any("why" in label or "tool_event" in label for label in labels)
+            or role in {"assistant", "user", "tool", "role_assistant", "role_user", "role_tool"}
+        )
+    if need == "topic_context":
+        return primary_intent == "what_was_i_talking_about" and (
+            CONTEXT_NEIGHBORHOOD_STREAM_LABEL in labels
+            or any("source_window_need:topic_context" in label or "topic_context" in label for label in labels)
+            or bool(ref.session_key)
+            or bool(ref.day_key)
+            or timestamp_present
+        )
+    if need == "next_reads":
+        return primary_intent in {"source_next_reads", "next_reads"}
+    return False
+
+
+def _source_window_need_priority(
+    window: FieldedGroupedSourceWindow,
+    index: FieldedBm25Index,
+    *,
+    need: str,
+    primary_intent: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> tuple[int, int, int]:
+    best_bucket = 10
+    for rowid in window.rowids:
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+        role = str(ref.role_bucket or "").lower()
+        timestamp_present = str(ref.timestamp_bucket or "") != "timestamp_absent"
+        if any(f"source_window_need:{need}" in label or need in label for label in labels):
+            best_bucket = min(best_bucket, 0)
+        elif any(_selection_channel_bucket(label) == "top_exact" for label in labels):
+            best_bucket = min(best_bucket, 1)
+        elif need == "user_wording" and primary_intent == "when_user_said" and "user" in role:
+            best_bucket = min(best_bucket, 2)
+        elif need == "failure_timeline" and primary_intent == "workflow_failure" and timestamp_present:
+            best_bucket = min(best_bucket, 2)
+        elif need == "decision_context" and primary_intent == "why" and role in {
+            "assistant",
+            "user",
+            "tool",
+            "role_assistant",
+            "role_user",
+            "role_tool",
+        }:
+            best_bucket = min(best_bucket, 2)
+        elif need == "topic_context" and primary_intent == "what_was_i_talking_about" and (
+            bool(ref.session_key) or bool(ref.day_key) or timestamp_present
+        ):
+            best_bucket = min(best_bucket, 2)
+        elif need == "next_reads" and primary_intent in {"source_next_reads", "next_reads"}:
+            best_bucket = min(best_bucket, 2)
+    return (best_bucket, int(window.start_order), window.head_rowid)
+
+
 def _intent_window_allocation_diagnostics(
     intent: QueryIntent | None,
     intent_windows: list[FieldedGroupedSourceWindow],
@@ -2269,6 +2511,13 @@ def _intent_window_allocation_diagnostics(
         else "disabled_for_generic_history",
         "primary_intent": primary_intent,
         "source_window_needs": source_window_needs,
+        "source_window_needs_considered": [],
+        "source_window_needs_matched": [],
+        "source_window_needs_selected": [],
+        "source_window_needs_omitted": [],
+        "query_plan_need_window_count_considered": 0,
+        "query_plan_need_window_count_matched": 0,
+        "query_plan_need_window_count_selected": 0,
         "intent_window_count_considered": int(len(intent_windows)),
         "selected_intent_window_count": 0,
         "distinct_intent_sources_selected": 0,
@@ -2579,6 +2828,27 @@ def _grouped_source_window_diagnostics(
         "route_window_count_considered": int(window_selection.get("route_window_count_considered") or 0),
         "route_window_count_selected": int(window_selection.get("route_window_count_selected") or 0),
         "route_window_head_selection_count": int(window_selection.get("route_window_head_selection_count") or 0),
+        "query_plan_need_window_count_considered": int(
+            window_selection.get("query_plan_need_window_count_considered") or 0
+        ),
+        "query_plan_need_window_count_matched": int(
+            window_selection.get("query_plan_need_window_count_matched") or 0
+        ),
+        "query_plan_need_window_count_selected": int(
+            window_selection.get("query_plan_need_window_count_selected") or 0
+        ),
+        "source_window_needs_considered": [
+            str(item) for item in window_selection.get("source_window_needs_considered") or []
+        ],
+        "source_window_needs_matched": [
+            str(item) for item in window_selection.get("source_window_needs_matched") or []
+        ],
+        "source_window_needs_selected": [
+            str(item) for item in window_selection.get("source_window_needs_selected") or []
+        ],
+        "source_window_needs_omitted": [
+            str(item) for item in window_selection.get("source_window_needs_omitted") or []
+        ],
         "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
         "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
         "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
@@ -2588,6 +2858,27 @@ def _grouped_source_window_diagnostics(
             "route_window_count_considered": int(window_selection.get("route_window_count_considered") or 0),
             "route_window_count_selected": int(window_selection.get("route_window_count_selected") or 0),
             "route_window_head_selection_count": int(window_selection.get("route_window_head_selection_count") or 0),
+            "query_plan_need_window_count_considered": int(
+                window_selection.get("query_plan_need_window_count_considered") or 0
+            ),
+            "query_plan_need_window_count_matched": int(
+                window_selection.get("query_plan_need_window_count_matched") or 0
+            ),
+            "query_plan_need_window_count_selected": int(
+                window_selection.get("query_plan_need_window_count_selected") or 0
+            ),
+            "source_window_needs_considered": [
+                str(item) for item in window_selection.get("source_window_needs_considered") or []
+            ],
+            "source_window_needs_matched": [
+                str(item) for item in window_selection.get("source_window_needs_matched") or []
+            ],
+            "source_window_needs_selected": [
+                str(item) for item in window_selection.get("source_window_needs_selected") or []
+            ],
+            "source_window_needs_omitted": [
+                str(item) for item in window_selection.get("source_window_needs_omitted") or []
+            ],
             "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
             "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
             "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
@@ -2683,6 +2974,7 @@ def _source_grouping_diagnostics(
             "duplicate_category_representative",
             "represented_group_window_fill",
             "protected_top_exact_or_channel_head",
+            "query_plan_need_window_head",
             "intent_preferred_window_head",
         ],
         "group_key_categories": ["source", "session", "day", "window"],

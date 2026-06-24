@@ -2117,6 +2117,13 @@ def sanitize_grouped_source_windows(value: Any) -> dict[str, Any]:
         "route_window_count_considered": int(windows.get("route_window_count_considered") or 0),
         "route_window_count_selected": int(windows.get("route_window_count_selected") or 0),
         "route_window_head_selection_count": int(windows.get("route_window_head_selection_count") or 0),
+        "query_plan_need_window_count_considered": int(windows.get("query_plan_need_window_count_considered") or 0),
+        "query_plan_need_window_count_matched": int(windows.get("query_plan_need_window_count_matched") or 0),
+        "query_plan_need_window_count_selected": int(windows.get("query_plan_need_window_count_selected") or 0),
+        "source_window_needs_considered": [str(item) for item in windows.get("source_window_needs_considered") or []],
+        "source_window_needs_matched": [str(item) for item in windows.get("source_window_needs_matched") or []],
+        "source_window_needs_selected": [str(item) for item in windows.get("source_window_needs_selected") or []],
+        "source_window_needs_omitted": [str(item) for item in windows.get("source_window_needs_omitted") or []],
         "novelty_fill_window_count": int(windows.get("novelty_fill_window_count") or 0),
         "duplicate_window_skip_count": int(windows.get("duplicate_window_skip_count") or 0),
         "duplicate_window_selection_count": int(windows.get("duplicate_window_selection_count") or 0),
@@ -2141,6 +2148,17 @@ def sanitize_grouped_source_window_selection(value: Any) -> dict[str, Any]:
         "route_window_count_considered": int(selection.get("route_window_count_considered") or 0),
         "route_window_count_selected": int(selection.get("route_window_count_selected") or 0),
         "route_window_head_selection_count": int(selection.get("route_window_head_selection_count") or 0),
+        "query_plan_need_window_count_considered": int(
+            selection.get("query_plan_need_window_count_considered") or 0
+        ),
+        "query_plan_need_window_count_matched": int(selection.get("query_plan_need_window_count_matched") or 0),
+        "query_plan_need_window_count_selected": int(selection.get("query_plan_need_window_count_selected") or 0),
+        "source_window_needs_considered": [
+            str(item) for item in selection.get("source_window_needs_considered") or []
+        ],
+        "source_window_needs_matched": [str(item) for item in selection.get("source_window_needs_matched") or []],
+        "source_window_needs_selected": [str(item) for item in selection.get("source_window_needs_selected") or []],
+        "source_window_needs_omitted": [str(item) for item in selection.get("source_window_needs_omitted") or []],
         "novelty_fill_window_count": int(selection.get("novelty_fill_window_count") or 0),
         "duplicate_window_skip_count": int(selection.get("duplicate_window_skip_count") or 0),
         "duplicate_window_selection_count": int(selection.get("duplicate_window_selection_count") or 0),
@@ -2161,6 +2179,17 @@ def sanitize_intent_window_allocation(value: Any) -> dict[str, Any]:
         "strategy": str(allocation.get("strategy") or "disabled"),
         "primary_intent": str(allocation.get("primary_intent") or "generic_history"),
         "source_window_needs": [str(item) for item in allocation.get("source_window_needs") or []],
+        "source_window_needs_considered": [
+            str(item) for item in allocation.get("source_window_needs_considered") or []
+        ],
+        "source_window_needs_matched": [str(item) for item in allocation.get("source_window_needs_matched") or []],
+        "source_window_needs_selected": [str(item) for item in allocation.get("source_window_needs_selected") or []],
+        "source_window_needs_omitted": [str(item) for item in allocation.get("source_window_needs_omitted") or []],
+        "query_plan_need_window_count_considered": int(
+            allocation.get("query_plan_need_window_count_considered") or 0
+        ),
+        "query_plan_need_window_count_matched": int(allocation.get("query_plan_need_window_count_matched") or 0),
+        "query_plan_need_window_count_selected": int(allocation.get("query_plan_need_window_count_selected") or 0),
         "intent_window_count_considered": int(allocation.get("intent_window_count_considered") or 0),
         "selected_intent_window_count": int(allocation.get("selected_intent_window_count") or 0),
         "selected_route_window_count": int(allocation.get("selected_route_window_count") or 0),
