@@ -14,6 +14,7 @@ from .retrieve_expand_answer_use import (
     DEFAULT_FIXTURE as DEFAULT_RETRIEVE_EXPAND_ANSWER_USE_FIXTURE,
     build_retrieve_expand_answer_use_eval_payload,
 )
+from .semantic_debugging import summarize_answer_readiness, summarize_guided_audit_flow
 from .source_tier_answer_use import (
     DEFAULT_FIXTURE as DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE,
     build_source_tier_answer_use_eval_payload,
@@ -49,12 +50,30 @@ NON_LIVE_BOUNDARIES = {
     "auth_handling_used": False,
     "app_server_turn_or_start_used": False,
 }
+SEMANTIC_DEBUG_VALID_DECISIONS = {
+    "answer_now",
+    "inspect_recovery_reads",
+    "run_audit_route",
+    "state_scoped_no_evidence",
+    "gather_more_evidence",
+}
+SEMANTIC_DEBUG_VALID_READINESS_STATUSES = {
+    "answer_ready",
+    "inspect_recovery_first",
+    "audit_route_required",
+    "scoped_no_evidence_ready",
+    "insufficient_evidence",
+}
 
 
-def build_eval_decision_loop_payload(pressure_report: Path | None = None) -> dict[str, Any]:
+def build_eval_decision_loop_payload(
+    pressure_report: Path | None = None,
+    semantic_debug_report: Path | None = None,
+) -> dict[str, Any]:
     deterministic = _build_deterministic_eval_summaries()
     pressure = _load_pressure_summary(pressure_report)
-    decision = _build_decision(deterministic, pressure)
+    semantic_debug_readiness = _load_semantic_debug_readiness_summary(semantic_debug_report)
+    decision = _build_decision(deterministic, pressure, semantic_debug_readiness)
     report = {
         "schema_version": SCHEMA_VERSION,
         "status": decision["decision_status"],
@@ -62,10 +81,16 @@ def build_eval_decision_loop_payload(pressure_report: Path | None = None) -> dic
             "deterministic_eval_builders_reused_in_process": True,
             "pressure_report_supplied": pressure_report is not None,
             "pressure_report_loaded": pressure.get("loaded", False),
+            "semantic_debug_report_supplied": semantic_debug_report is not None,
+            "semantic_debug_report_loaded": bool(semantic_debug_readiness.get("loaded")) if semantic_debug_readiness else False,
+            "semantic_debug_report_privacy_contract_ok": semantic_debug_readiness.get("privacy_contract_ok")
+            if semantic_debug_readiness
+            else None,
             "non_live_eval_synthesis_only": True,
         },
         "deterministic_evals": deterministic,
         "pressure_report": pressure,
+        **({"semantic_debug_readiness": semantic_debug_readiness} if semantic_debug_readiness is not None else {}),
         "decision": decision,
         "claim_boundaries": {
             **UNPROVEN_CLAIMS,
@@ -77,6 +102,7 @@ def build_eval_decision_loop_payload(pressure_report: Path | None = None) -> dic
             "aggregate_only_pressure_fields": True,
             "deterministic_eval_rows_omitted": True,
             "pressure_report_path_echoed": False,
+            "semantic_debug_report_path_echoed": False,
         },
     }
     return {"eval_decision_loop": report}
@@ -302,14 +328,22 @@ def _pressure_classification(case_count: int, caps_hit: bool, stage_pressure: di
     return "evaluated"
 
 
-def _build_decision(deterministic: dict[str, Any], pressure: dict[str, Any]) -> dict[str, Any]:
+def _build_decision(
+    deterministic: dict[str, Any],
+    pressure: dict[str, Any],
+    semantic_debug_readiness: dict[str, Any] | None,
+) -> dict[str, Any]:
     deterministic_status = deterministic["status"]
     pressure_status = pressure["status"]
     bottleneck = _dominant_bottleneck(pressure)
-    target = _recommended_target(pressure, bottleneck)
+    pressure_target = _recommended_target(pressure, bottleneck)
+    readiness_target = _semantic_debug_readiness_target(semantic_debug_readiness)
+    target = readiness_target or pressure_target
     limitations = _limitations(deterministic_status, pressure)
+    if semantic_debug_readiness and not _semantic_debug_readiness_is_valid(semantic_debug_readiness):
+        limitations.append("semantic-debug readiness report was invalid or privacy-flagged, so it was not used for routing")
     decision_status = "ok" if deterministic_status == "passing" and pressure_status == "evaluated" else "inconclusive"
-    return {
+    decision = {
         "decision_status": decision_status,
         "packet_eval_status": deterministic_status,
         "source_tier_compact_status": deterministic_status,
@@ -325,6 +359,10 @@ def _build_decision(deterministic: dict[str, Any], pressure: dict[str, Any]) -> 
         },
         "unsupported_claims": UNPROVEN_CLAIMS,
     }
+    if semantic_debug_readiness is not None:
+        decision["pressure_recommended_next_product_target"] = pressure_target
+        decision["routing_basis"] = "semantic_debug_readiness" if readiness_target else "aggregate_pressure"
+    return decision
 
 
 def _dominant_bottleneck(pressure: dict[str, Any]) -> str:
@@ -346,6 +384,25 @@ def _recommended_target(pressure: dict[str, Any], bottleneck: str) -> str:
     if selected and selected != "run_full_or_large_history_pressure_before_product_claim":
         return selected
     return _recommendation_for_bottleneck(bottleneck)
+
+
+def _semantic_debug_readiness_target(semantic_debug_readiness: dict[str, Any] | None) -> str | None:
+    if not semantic_debug_readiness:
+        return None
+    if not _semantic_debug_readiness_is_valid(semantic_debug_readiness):
+        return None
+    decision = str(semantic_debug_readiness.get("decision") or "")
+    if decision in SEMANTIC_DEBUG_VALID_DECISIONS:
+        return decision
+    return None
+
+
+def _semantic_debug_readiness_is_valid(semantic_debug_readiness: dict[str, Any]) -> bool:
+    return (
+        bool(semantic_debug_readiness.get("privacy_contract_ok", False))
+        and semantic_debug_readiness.get("status") in SEMANTIC_DEBUG_VALID_READINESS_STATUSES
+        and semantic_debug_readiness.get("decision") in SEMANTIC_DEBUG_VALID_DECISIONS
+    )
 
 
 def _recommendation_for_bottleneck(bottleneck: str) -> str:
@@ -377,6 +434,140 @@ def _limitations(deterministic_status: str, pressure: dict[str, Any]) -> list[st
     elif pressure["status"] == "inconclusive":
         limitations.append("real-history pressure fields are insufficient for a product bottleneck decision")
     return limitations
+
+
+def _load_semantic_debug_readiness_summary(semantic_debug_report: Path | None) -> dict[str, Any] | None:
+    if semantic_debug_report is None:
+        return None
+    try:
+        loaded = json.loads(semantic_debug_report.expanduser().read_text(encoding="utf-8"))
+    except OSError:
+        return _invalid_semantic_debug_readiness("read_failed")
+    except json.JSONDecodeError:
+        return _invalid_semantic_debug_readiness("json_invalid")
+    packet = loaded.get("semantic_debug") if isinstance(loaded, dict) else loaded
+    if not isinstance(packet, dict):
+        return _invalid_semantic_debug_readiness("semantic_debug_packet_missing")
+    answer_readiness = packet.get("answer_readiness") if isinstance(packet.get("answer_readiness"), dict) else None
+    guided_audit_flow = packet.get("guided_audit_flow") if isinstance(packet.get("guided_audit_flow"), dict) else None
+    if not answer_readiness:
+        return _invalid_semantic_debug_readiness("answer_readiness_missing")
+    privacy_contract_ok = _semantic_debug_privacy_contract_ok(packet, answer_readiness, guided_audit_flow)
+    readiness_summary = summarize_answer_readiness(answer_readiness)
+    guided_summary = summarize_guided_audit_flow(guided_audit_flow) if guided_audit_flow else {}
+    decision = readiness_summary.get("decision") if privacy_contract_ok else "gather_more_evidence"
+    status = readiness_summary.get("status") if privacy_contract_ok else "invalid"
+    allowed_answer_scope = readiness_summary.get("allowed_answer_scope") if privacy_contract_ok else "invalid"
+    required_before_answer = list(readiness_summary.get("required_before_answer") or [])[:4]
+    if not privacy_contract_ok:
+        required_before_answer = [
+            "Do not route from this semantic-debug report; fix the privacy flags or regenerate a committed-safe report.",
+        ]
+    return {
+        "schema_version": readiness_summary.get("schema_version", 1),
+        "loaded": True,
+        "status": status,
+        "decision": decision,
+        "allowed_answer_scope": allowed_answer_scope,
+        "privacy_contract_ok": privacy_contract_ok,
+        "basis": readiness_summary.get("basis") or {},
+        "required_before_answer": required_before_answer,
+        "route_summary": readiness_summary.get("route_summary") or {},
+        "claim_boundaries": readiness_summary.get("claim_boundaries") or {},
+        "privacy_boundaries": readiness_summary.get("privacy_boundaries") or {},
+        "guided_audit_flow_summary": {
+            "schema_version": guided_summary.get("schema_version", 1) if guided_summary else 1,
+            "status": guided_summary.get("status") if guided_summary else None,
+            "primary_question_family": guided_summary.get("primary_question_family") if guided_summary else None,
+            "primary_intent": guided_summary.get("primary_intent") if guided_summary else None,
+            "stage_count": guided_summary.get("stage_count", 0) if guided_summary else 0,
+            "evidence_handle_count": guided_summary.get("evidence_handle_count", 0) if guided_summary else 0,
+            "route_order": list(guided_summary.get("route_order") or [])[:5] if guided_summary else [],
+            "answer_gate": {
+                "answer_scope": (guided_summary.get("answer_gate") or {}).get("answer_scope") if guided_summary else None,
+                "source_use_required": (guided_summary.get("answer_gate") or {}).get("source_use_required")
+                if guided_summary
+                else None,
+                "answer_readiness_status": (guided_summary.get("answer_gate") or {}).get("answer_readiness_status")
+                if guided_summary
+                else None,
+                "answer_readiness_decision": (guided_summary.get("answer_gate") or {}).get("answer_readiness_decision")
+                if guided_summary
+                else None,
+                "answer_readiness_scope": (guided_summary.get("answer_gate") or {}).get("answer_readiness_scope")
+                if guided_summary
+                else None,
+                "required_before_answer": list((guided_summary.get("answer_gate") or {}).get("required_before_answer") or [])[:4]
+                if guided_summary
+                else [],
+            },
+            "privacy_boundaries": guided_summary.get("privacy_boundaries") if guided_summary else {},
+            "next_read_targets": list(guided_summary.get("next_read_targets") or [])[:5] if guided_summary else [],
+        },
+    }
+
+
+def _invalid_semantic_debug_readiness(reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "loaded": False,
+        "status": "invalid",
+        "decision": "gather_more_evidence",
+        "allowed_answer_scope": "invalid",
+        "privacy_contract_ok": False,
+        "basis": {},
+        "required_before_answer": [
+            "Do not route from this semantic-debug report; fix the privacy flags or regenerate a committed-safe report.",
+        ],
+        "route_summary": {},
+        "claim_boundaries": {},
+        "privacy_boundaries": {},
+        "guided_audit_flow_summary": {},
+        "invalid_reason": reason,
+    }
+
+
+def _semantic_debug_privacy_contract_ok(*sections: dict[str, Any]) -> bool:
+    forbidden_true_keys = {
+        "raw_private_text_included",
+        "raw_private_path_included",
+        "raw_private_paths_included",
+        "raw_query_text_included",
+        "raw_path_included",
+        "raw_paths_included",
+        "private_path_included",
+        "private_paths_included",
+        "path_included",
+        "paths_included",
+        "raw_session_id_included",
+        "raw_session_ids_included",
+        "raw_session_ref_included",
+        "raw_session_refs_included",
+        "session_id_included",
+        "session_ids_included",
+        "session_ref_included",
+        "session_refs_included",
+        "raw_username_included",
+        "raw_usernames_included",
+        "username_included",
+        "usernames_included",
+        "local_username_included",
+        "local_usernames_included",
+        "raw_source_lines_included",
+        "source_lines_included",
+        "line_numbers_included",
+        "raw_text_included",
+        "snippets_included",
+        "raw_cwd_included",
+        "vectors_or_indexes_included",
+        "private_payloads_included",
+        "payloads_included",
+    }
+    for section in sections:
+        for key, value in _walk_dict_items(section):
+            if key in forbidden_true_keys and value is True:
+                return False
+    return True
 
 
 def _privacy_contract_ok(*sections: dict[str, Any]) -> bool:
@@ -465,11 +656,47 @@ def render_eval_decision_loop_markdown(payload: dict[str, Any]) -> str:
         "## Deterministic Evals",
         "",
     ]
+    if "routing_basis" in decision:
+        lines[10:10] = [
+            f"- Pressure recommended target: `{decision.get('pressure_recommended_next_product_target')}`",
+            f"- Routing basis: `{decision.get('routing_basis')}`",
+        ]
     for name, item in deterministic["evals"].items():
         lines.append(
             f"- `{name}`: status `{item['status']}`, cases `{item['case_count']}`, "
             f"positive `{item['positive_count']}`, next `{item['selected_next_product_decision']}`"
         )
+    readiness = report.get("semantic_debug_readiness") or {}
+    if readiness:
+        lines.extend(
+            [
+                "",
+                "## Answer Readiness Routing",
+                "",
+                f"- Loaded: `{readiness.get('loaded')}`",
+                f"- Privacy contract ok: `{readiness.get('privacy_contract_ok')}`",
+                f"- Status: `{readiness.get('status')}`",
+                f"- Decision: `{readiness.get('decision')}`",
+                f"- Allowed answer scope: `{readiness.get('allowed_answer_scope')}`",
+            ]
+        )
+        if readiness.get("invalid_reason"):
+            lines.append(f"- Invalid reason: `{readiness.get('invalid_reason')}`")
+        basis = readiness.get("basis") or {}
+        if basis:
+            lines.extend(
+                [
+                    f"- Present ledger count: `{basis.get('present_ledger_count', 0)}`",
+                    f"- Recovery ledger count: `{basis.get('recovery_ledger_count', 0)}`",
+                    f"- Structured tool event count: `{basis.get('structured_tool_event_count', 0)}`",
+                    f"- Next-read count: `{basis.get('next_read_count', 0)}`",
+                ]
+            )
+        route_summary = readiness.get("route_summary") or {}
+        if route_summary:
+            lines.append(f"- Route order: `{', '.join(route_summary.get('route_order', []))}`")
+        for action in readiness.get("required_before_answer", [])[:4]:
+            lines.append(f"- Required before answer: {action}")
     lines.extend(
         [
             "",
