@@ -35,6 +35,7 @@ from .retrieve_expand_answer_use import (
     render_retrieve_expand_answer_use_markdown,
 )
 from .evaluation import build_efficiency_eval
+from .eval_decision_loop import build_eval_decision_loop_payload
 from .embedding_experiment import DEFAULT_EMBEDDING_SPIKE_FIXTURE, FASTEMBED_MODEL_ID, build_embedding_experiment_payload
 from .expansion import build_expansion_family_audit_report
 from .expansion_family_probe import build_expansion_family_probe_report, supported_family_names
@@ -597,6 +598,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the retrieve -> expand answer-use report should be written.",
+    )
+    eval_decision_loop = subparsers.add_parser(
+        "eval-decision-loop",
+        description=(
+            "Non-live product decision packet that synthesizes deterministic "
+            "answer-use evals with optional aggregate real-history pressure JSON."
+        ),
+    )
+    eval_decision_loop.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    eval_decision_loop.add_argument(
+        "--pressure-report",
+        default=None,
+        help="Optional aggregate-only real-history pressure JSON to include in the decision packet.",
+    )
+    eval_decision_loop.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the eval decision packet should be written.",
     )
     real_history_impact = subparsers.add_parser("benchmark-real-history-impact")
     add_common_args(real_history_impact)
@@ -1795,6 +1814,16 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["retrieve_expand_answer_use_eval"]["status"]
         return 1 if status == "invalid_fixture" else 0
+    if args.command == "eval-decision-loop":
+        pressure_report = Path(args.pressure_report).expanduser() if args.pressure_report else None
+        payload = build_eval_decision_loop_payload(pressure_report)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
     if args.command == "benchmark-real-history-impact":
         payload = build_real_history_impact_payload(args)
         rendered = render(payload, args.format)
