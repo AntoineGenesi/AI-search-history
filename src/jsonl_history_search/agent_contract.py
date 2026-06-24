@@ -261,6 +261,9 @@ def build_compact_provenance_handoff(
     evidence_packets = compact_provenance_evidence_packet_summaries(
         evidence_packet_candidates[:EVIDENCE_PACKET_LIMIT]
     )
+    final_evidence_contract = compact_final_evidence_contract_projection(
+        source_locator_handoff.get("final_evidence_contract")
+    )
     omitted_window_recovery = compact_omitted_window_recovery_summary(
         source_locator_handoff.get("omitted_window_recovery")
     )
@@ -308,6 +311,7 @@ def build_compact_provenance_handoff(
         "source_refs": source_refs,
         "source_windows": source_windows,
         "evidence_packets": evidence_packets,
+        "final_evidence_contract": final_evidence_contract,
         "omitted_window_recovery": omitted_window_recovery,
         "source_window_packaging": compact_source_window_packaging(
             source_locator_handoff.get("source_window_packaging", {})
@@ -352,6 +356,8 @@ def build_compact_provenance_handoff(
         packet["retrieval_pressure_summary"] = pressure_summary
     if omitted_window_recovery.get("status") == "available":
         packet["derived_from"].append("omitted_window_recovery")
+    if final_evidence_contract.get("ledger_count", 0) > 0:
+        packet["derived_from"].append("final_evidence_contract")
     packet_bytes = len(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     packet["context_budget"] = {
         "payload_bytes": packet_bytes,
@@ -363,6 +369,61 @@ def build_compact_provenance_handoff(
         "field_tiers": compact_handoff_field_tiers(output_budget),
     }
     return packet
+
+
+def compact_final_evidence_contract_projection(value: Any) -> dict[str, Any]:
+    contract = value if isinstance(value, dict) else {}
+    ledger = contract.get("ledger") if isinstance(contract.get("ledger"), list) else []
+    projection_items: list[dict[str, Any]] = []
+    ledger_id_by_source_ref: dict[str, str] = {}
+    ledger_id_by_evidence_id: dict[str, str] = {}
+    for item in ledger:
+        if not isinstance(item, dict):
+            continue
+        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        ledger_id = item.get("ledger_id")
+        evidence_id = item.get("evidence_id")
+        if source_ref and ledger_id:
+            ledger_id_by_source_ref[final_evidence_contract_ref_key(source_ref)] = str(ledger_id)
+        if evidence_id and ledger_id:
+            ledger_id_by_evidence_id[str(evidence_id)] = str(ledger_id)
+        projection_items.append(
+            {
+                "ledger_id": ledger_id,
+                "evidence_id": evidence_id,
+                "source_ref": source_ref,
+                "target": item.get("target") or source_ref_target(source_ref),
+                "membership": item.get("membership") if isinstance(item.get("membership"), dict) else {},
+                "answerability_tier": item.get("answerability_tier"),
+                "final_surface_status": item.get("final_surface_status"),
+                "recovery_handle": item.get("recovery_handle")
+                if isinstance(item.get("recovery_handle"), dict)
+                else None,
+                "next_read_target": item.get("next_read_target"),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "summary_kind": "compact_final_evidence_contract_projection",
+        "ledger_count": int(contract.get("ledger_count") or len(projection_items)),
+        "surface_counts": contract.get("surface_counts") if isinstance(contract.get("surface_counts"), dict) else {},
+        "consistency": contract.get("consistency") if isinstance(contract.get("consistency"), dict) else {},
+        "ledger_id_by_source_ref": contract.get("ledger_id_by_source_ref")
+        if isinstance(contract.get("ledger_id_by_source_ref"), dict)
+        else ledger_id_by_source_ref,
+        "ledger_id_by_evidence_id": contract.get("ledger_id_by_evidence_id")
+        if isinstance(contract.get("ledger_id_by_evidence_id"), dict)
+        else ledger_id_by_evidence_id,
+        "items": projection_items,
+        "privacy": {
+            "raw_text_included": False,
+            "snippets_included": False,
+            "raw_paths_included_beyond_source_ref": False,
+            "raw_session_ids_included_beyond_source_ref": False,
+            "source_lines_included": False,
+            "vectors_or_index_payloads_included": False,
+        },
+    }
 
 
 def compact_provenance_source_window_summaries(source_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3130,6 +3191,18 @@ def build_source_locator_handoff(
     )
     evidence_packets = evidence_packet_result["packets"]
     evidence_packet_packaging = evidence_packet_result["packaging"]
+    final_evidence_contract = build_final_evidence_contract(
+        candidates=candidate_rows,
+        source_windows=source_windows,
+        evidence_packets=evidence_packets,
+        next_reads=next_read_rows[:COMPACT_PROVENANCE_NEXT_READ_LIMIT],
+        omitted_window_recovery=omitted_window_recovery,
+        materialize_ledger=bool(
+            include_context_actions
+            or evidence_packets
+            or (omitted_window_recovery.get("status") == "available" if isinstance(omitted_window_recovery, dict) else False)
+        ),
+    )
     candidate_window_omitted_count = max(0, candidate_count - len(source_windows))
     source_window_packaging = {
         "schema_version": 1,
@@ -3200,6 +3273,7 @@ def build_source_locator_handoff(
         "source_windows": source_windows,
         "source_window_packaging": source_window_packaging,
         "omitted_window_recovery": omitted_window_recovery,
+        "final_evidence_contract": final_evidence_contract,
         "next_reads": next_read_rows[:COMPACT_PROVENANCE_NEXT_READ_LIMIT],
         "no_evidence_meaning": {
             "answer_scope": "not_found_in_searched_scope",
@@ -3242,6 +3316,320 @@ def build_source_locator_handoff(
     if stage_diagnostics:
         payload["stage_diagnostics"] = stage_diagnostics
     return payload
+
+
+def build_final_evidence_contract(
+    *,
+    candidates: list[dict[str, Any]] | list[CandidateRow],
+    source_windows: list[dict[str, Any]],
+    evidence_packets: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+    omitted_window_recovery: dict[str, Any],
+    materialize_ledger: bool = True,
+) -> dict[str, Any]:
+    entries: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    def ensure_entry(source_ref: dict[str, Any], candidate_id: Any = None) -> dict[str, Any] | None:
+        safe_ref = final_evidence_contract_source_ref(source_ref)
+        target = source_ref_target(safe_ref)
+        if not target and candidate_id in (None, ""):
+            return None
+        key = final_evidence_contract_entry_key(safe_ref, candidate_id)
+        if key not in entries:
+            order.append(key)
+            entries[key] = {
+                "ledger_id": "",
+                "evidence_id": final_evidence_contract_evidence_id(candidate_id, safe_ref),
+                "candidate_id": str(candidate_id or ""),
+                "source_ref": safe_ref,
+                "membership": {
+                    "source_locator_handoff": True,
+                },
+            }
+        entry = entries[key]
+        if not entry.get("candidate_id") and candidate_id not in (None, ""):
+            entry["candidate_id"] = str(candidate_id)
+            entry["evidence_id"] = final_evidence_contract_evidence_id(candidate_id, safe_ref)
+        return entry
+
+    for candidate in candidates:
+        if isinstance(candidate, CandidateRow):
+            source_ref = candidate.source_ref
+            candidate_id = candidate.candidate_id
+        elif isinstance(candidate, dict):
+            source_ref = candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+            candidate_id = candidate.get("candidate_id")
+        else:
+            continue
+        entry = ensure_entry(source_ref, candidate_id)
+        if entry is not None:
+            entry["membership"]["strongest_candidates"] = True
+
+    for window in source_windows:
+        if not isinstance(window, dict):
+            continue
+        entry = ensure_entry(
+            window.get("source_ref") if isinstance(window.get("source_ref"), dict) else {},
+            window.get("candidate_id"),
+        )
+        if entry is None:
+            continue
+        entry["membership"]["source_windows"] = True
+        target = window.get("target") or source_ref_target(entry["source_ref"])
+        if target:
+            entry["target"] = target
+        final_evidence_contract_add_query_need(
+            entry,
+            final_evidence_query_need_from_window(window),
+        )
+
+    for packet in evidence_packets:
+        if not isinstance(packet, dict):
+            continue
+        for child in packet.get("hit_children") or []:
+            if not isinstance(child, dict):
+                continue
+            entry = ensure_entry(
+                child.get("source_ref") if isinstance(child.get("source_ref"), dict) else {},
+                child.get("candidate_id"),
+            )
+            if entry is None:
+                continue
+            entry["membership"]["evidence_packet_children"] = True
+
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        entry = ensure_entry(source_ref, read.get("candidate_id"))
+        if entry is None:
+            continue
+        entry["membership"]["next_reads"] = True
+        next_read_target = read.get("target") or source_ref_target(entry["source_ref"])
+        omitted = read.get("omitted_window_recovery") if isinstance(read.get("omitted_window_recovery"), dict) else {}
+        if omitted:
+            entry["recovery_handle"] = {
+                "kind": "next_read_omitted_window_recovery",
+                "recovery_id": omitted.get("recovery_id"),
+                "target": next_read_target,
+                "bounded": bool(omitted.get("bounded", True)),
+            }
+            entry["omission_reason"] = sanitize_final_evidence_reason(omitted.get("omission_reason"))
+        elif next_read_target and not (
+            entry["membership"].get("source_windows") or entry["membership"].get("evidence_packet_children")
+        ):
+            entry["next_read_target"] = next_read_target
+
+    recovery_items = omitted_window_recovery.get("items") if isinstance(omitted_window_recovery, dict) else []
+    for item in recovery_items or []:
+        if not isinstance(item, dict):
+            continue
+        entry = ensure_entry(
+            item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {},
+            item.get("candidate_id"),
+        )
+        if entry is None:
+            continue
+        entry["membership"]["omitted_window_recovery"] = True
+        entry["omission_reason"] = sanitize_final_evidence_reason(item.get("omission_reason"))
+        for need in item.get("source_window_need_matches") or []:
+            final_evidence_contract_add_query_need(entry, need)
+        entry["recovery_handle"] = {
+            "kind": "omitted_window_recovery",
+            "recovery_id": item.get("recovery_id"),
+            "target": item.get("target") or entry.get("target"),
+            "read_more_actionable": bool(item.get("read_more_actionable", False)),
+            "bounded": True,
+        }
+
+    ledger: list[dict[str, Any]] = []
+    for index, key in enumerate(order, 1):
+        entry = entries[key]
+        entry["ledger_id"] = f"fec{index:03d}"
+        if entry.get("query_need_labels"):
+            entry["query_need_labels"] = list(entry.get("query_need_labels") or [])
+        entry["answerability_tier"] = final_evidence_answerability_tier(entry)
+        entry["final_surface_status"] = final_evidence_surface_status(entry)
+        ledger.append(entry)
+
+    surface_counts = final_evidence_contract_surface_counts(ledger)
+    consistency = final_evidence_contract_consistency(
+        ledger=ledger,
+        source_windows=source_windows,
+        evidence_packets=evidence_packets,
+        next_reads=next_reads,
+        omitted_window_recovery=omitted_window_recovery,
+    )
+    contract = {
+        "schema_version": 1,
+        "ledger_count": len(ledger),
+        "surface_counts": surface_counts,
+        "consistency": consistency,
+        "privacy_boundaries": {
+            "raw_text_or_snippets_included": False,
+            "raw_session_ids_included": False,
+            "source_lines_or_vectors_included": False,
+        },
+    }
+    if materialize_ledger:
+        contract["ledger"] = ledger
+        contract["ledger_materialization"] = "full_private_safe_ledger"
+    else:
+        contract = {
+            "ledger_count": len(ledger),
+            "missing_ledger_entry_count": consistency["missing_ledger_entry_count"],
+        }
+    return contract
+
+
+def final_evidence_contract_source_ref(source_ref: dict[str, Any]) -> dict[str, Any]:
+    ref = canonical_source_ref(source_ref)
+    ref.pop("session", None)
+    return ref
+
+
+def final_evidence_contract_ref_key(source_ref: dict[str, Any]) -> str:
+    return json.dumps(final_evidence_contract_source_ref(source_ref), ensure_ascii=False, sort_keys=True)
+
+
+def final_evidence_contract_entry_key(source_ref: dict[str, Any], candidate_id: Any = None) -> str:
+    if candidate_id not in (None, ""):
+        return f"candidate:{candidate_id}"
+    return f"source_ref:{final_evidence_contract_ref_key(source_ref)}"
+
+
+def final_evidence_contract_evidence_id(candidate_id: Any, source_ref: dict[str, Any]) -> str:
+    if candidate_id not in (None, ""):
+        return f"candidate:{candidate_id}"
+    target = source_ref_target(source_ref)
+    return f"source_ref:{target}" if target else "source_ref:unknown"
+
+
+def final_evidence_contract_add_query_need(entry: dict[str, Any], label: Any) -> None:
+    label_text = sanitize_final_evidence_reason(label)
+    if not label_text or label_text not in SUPPORTED_SOURCE_WINDOW_NEEDS:
+        return
+    labels = entry.setdefault("query_need_labels", [])
+    if label_text not in labels:
+        labels.append(label_text)
+
+
+def final_evidence_query_need_from_window(window: dict[str, Any]) -> str | None:
+    reason = str(window.get("selection_reason_code") or "")
+    prefix = "query_plan_need_"
+    if reason.startswith(prefix):
+        return reason[len(prefix) :]
+    kind = str(window.get("window_kind") or "")
+    if kind in SUPPORTED_SOURCE_WINDOW_NEEDS:
+        return kind
+    return None
+
+
+def sanitize_final_evidence_reason(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    sanitized = "".join(ch for ch in text if ch.isalnum() or ch == "_")
+    return sanitized[:80] or None
+
+
+def final_evidence_answerability_tier(entry: dict[str, Any]) -> str:
+    membership = entry.get("membership") if isinstance(entry.get("membership"), dict) else {}
+    if membership.get("source_windows") or membership.get("evidence_packet_children"):
+        return "supported_in_searched_scope"
+    if membership.get("omitted_window_recovery"):
+        return "recoverable_omitted"
+    if membership.get("next_reads"):
+        return "deferred_source_needed"
+    return "searched_scope_no_evidence"
+
+
+def final_evidence_surface_status(entry: dict[str, Any]) -> str:
+    membership = entry.get("membership") if isinstance(entry.get("membership"), dict) else {}
+    if membership.get("source_windows") or membership.get("evidence_packet_children"):
+        return "present"
+    if membership.get("omitted_window_recovery"):
+        return "omitted_with_exact_recovery"
+    if membership.get("next_reads"):
+        return "deferred_with_next_read"
+    return "not_applicable"
+
+
+def final_evidence_contract_surface_counts(ledger: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for item in ledger:
+        membership = item.get("membership") if isinstance(item.get("membership"), dict) else {}
+        for key, value in membership.items():
+            if value:
+                counts[str(key)] += 1
+        tier = item.get("answerability_tier")
+        status = item.get("final_surface_status")
+        if tier:
+            counts[f"answerability_tier:{tier}"] += 1
+        if status:
+            counts[f"final_surface_status:{status}"] += 1
+    return sanitize_int_counts(counts)
+
+
+def final_evidence_contract_consistency(
+    *,
+    ledger: list[dict[str, Any]],
+    source_windows: list[dict[str, Any]],
+    evidence_packets: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+    omitted_window_recovery: dict[str, Any],
+) -> dict[str, Any]:
+    ledger_ref_keys = {
+        final_evidence_contract_ref_key(item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {})
+        for item in ledger
+    }
+
+    def has_ledger_ref(source_ref: Any) -> bool:
+        if not isinstance(source_ref, dict):
+            return False
+        return final_evidence_contract_ref_key(source_ref) in ledger_ref_keys
+
+    source_window_refs = [
+        item.get("source_ref")
+        for item in source_windows
+        if isinstance(item, dict) and isinstance(item.get("source_ref"), dict)
+    ]
+    evidence_child_refs = [
+        child.get("source_ref")
+        for packet in evidence_packets
+        if isinstance(packet, dict)
+        for child in (packet.get("hit_children") or [])
+        if isinstance(child, dict) and isinstance(child.get("source_ref"), dict)
+    ]
+    next_read_refs = [
+        item.get("source_ref")
+        for item in next_reads
+        if isinstance(item, dict) and isinstance(item.get("source_ref"), dict)
+    ]
+    recovery_items = omitted_window_recovery.get("items") if isinstance(omitted_window_recovery, dict) else []
+    recovery_refs = [
+        item.get("source_ref")
+        for item in recovery_items or []
+        if isinstance(item, dict) and isinstance(item.get("source_ref"), dict)
+    ]
+    counts = {
+        "source_windows_checked": len(source_window_refs),
+        "source_window_refs_missing_ledger": sum(1 for ref in source_window_refs if not has_ledger_ref(ref)),
+        "evidence_packet_children_checked": len(evidence_child_refs),
+        "evidence_packet_child_refs_missing_ledger": sum(1 for ref in evidence_child_refs if not has_ledger_ref(ref)),
+        "next_reads_checked": len(next_read_refs),
+        "next_read_refs_missing_ledger": sum(1 for ref in next_read_refs if not has_ledger_ref(ref)),
+        "omitted_window_recovery_checked": len(recovery_refs),
+        "omitted_window_recovery_refs_missing_ledger": sum(1 for ref in recovery_refs if not has_ledger_ref(ref)),
+    }
+    missing_total = sum(value for key, value in counts.items() if key.endswith("_missing_ledger"))
+    return {
+        "surface_reference_counts": counts,
+        "all_surface_refs_have_ledger_entries": missing_total == 0,
+        "missing_ledger_entry_count": missing_total,
+        "compact_projection_expected": True,
+    }
 
 
 def build_source_windows(
