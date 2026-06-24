@@ -5,6 +5,7 @@ import json
 from .agent_contract import source_ref_target
 from .metric_contract import TOKEN_FORMULA
 from .harness_loop import render_harness_minimum_loop_report, render_harness_minimum_loop_text
+from .eval_decision_loop import render_eval_decision_loop_markdown
 from .real_history_benchmark_drift import (
     render_real_history_benchmark_drift_markdown,
     render_real_history_benchmark_drift_text,
@@ -67,6 +68,8 @@ def render_text(payload: dict) -> str:
         return render_impact_benchmark_text(payload)
     if "mechanism_eval" in payload:
         return render_mechanism_eval_text(payload)
+    if "eval_decision_loop" in payload:
+        return render_eval_decision_loop_markdown(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_text(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
@@ -194,6 +197,8 @@ def render_markdown(payload: dict) -> str:
         return render_impact_benchmark_markdown(payload)
     if "mechanism_eval" in payload:
         return render_mechanism_eval_markdown(payload)
+    if "eval_decision_loop" in payload:
+        return render_eval_decision_loop_markdown(payload)
     if "real_history_impact_benchmark" in payload:
         return render_real_history_impact_markdown(payload)
     if "real_history_timestamp_seek_benchmark" in payload:
