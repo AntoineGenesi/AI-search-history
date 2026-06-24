@@ -22,6 +22,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "failure_analysis" in payload:
+        return render_failure_analysis_text(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_text(payload)
     if "source_expansion" in payload:
@@ -151,6 +153,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "failure_analysis" in payload:
+        return render_failure_analysis_markdown(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_markdown(payload)
     if "source_expansion" in payload:
@@ -255,6 +259,55 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_failure_analysis_text(payload: dict) -> str:
+    report = payload["failure_analysis"]
+    scope = report.get("story_scope") or {}
+    next_reads = report.get("next_reads") or {}
+    lines = [
+        "Failure Analysis",
+        f"Status: {report.get('status')}",
+        f"Story: {scope.get('story_id')}",
+        f"Question family: {scope.get('primary_question_family')}",
+        f"Date range: {(report.get('date_range') or {}).get('start')} to {(report.get('date_range') or {}).get('end')}",
+        f"Play-by-play rows: {len(report.get('play_by_play') or [])}",
+        f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
+        f"Next reads: {next_reads.get('status')} ({next_reads.get('count', 0)})",
+        "Claim boundaries:",
+    ]
+    for key, value in sorted((report.get("claim_boundaries") or {}).items()):
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+def render_failure_analysis_markdown(payload: dict) -> str:
+    report = payload["failure_analysis"]
+    scope = report.get("story_scope") or {}
+    date_range = report.get("date_range") or {}
+    next_reads = report.get("next_reads") or {}
+    lines = [
+        "# Failure Analysis",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Story: `{scope.get('story_id')}`",
+        f"- Question family: `{scope.get('primary_question_family')}`",
+        f"- Date range: `{date_range.get('start')}` to `{date_range.get('end')}`",
+        f"- Play-by-play rows: `{len(report.get('play_by_play') or [])}`",
+        f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
+        f"- Next reads: `{next_reads.get('status')}` (`{next_reads.get('count', 0)}`)",
+        "",
+        "## Failure Mode Ledger",
+        "",
+    ]
+    for row in report.get("failure_mode_ledger") or []:
+        lines.append(
+            f"- `{row.get('failure_mode')}`: `{row.get('status')}` via `{row.get('evidence_surface')}`"
+        )
+    lines.extend(["", "## Claim Boundaries", ""])
+    for key, value in sorted((report.get("claim_boundaries") or {}).items()):
+        lines.append(f"- `{key}`: `{value}`")
+    return "\n".join(lines)
 
 
 def render_source_expansion_text(payload: dict) -> str:
