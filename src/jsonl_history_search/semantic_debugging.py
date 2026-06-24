@@ -688,7 +688,17 @@ def checkpoint_completion(route: str) -> str:
 
 
 def resume_from(next_reads: list[dict[str, Any]], route_order: list[str]) -> dict[str, Any]:
-    first_read = next((item for item in next_reads if item.get("target")), None)
+    first_read = next(
+        (
+            item
+            for item in next_reads
+            if item.get("target")
+            and str((item.get("omitted_window_recovery") or {}).get("recovery_id", "")).startswith("clr")
+        ),
+        None,
+    )
+    if first_read is None:
+        first_read = next((item for item in next_reads if item.get("target")), None)
     return {
         "route": route_order[0] if route_order else None,
         "next_read_target": first_read.get("target") if first_read else None,
