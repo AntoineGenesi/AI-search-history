@@ -265,6 +265,8 @@ def render_failure_analysis_text(payload: dict) -> str:
     report = payload["failure_analysis"]
     scope = report.get("story_scope") or {}
     next_reads = report.get("next_reads") or {}
+    narrative = report.get("narrative_readiness") or {}
+    narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     lines = [
         "Failure Analysis",
         f"Status: {report.get('status')}",
@@ -273,9 +275,23 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Date range: {(report.get('date_range') or {}).get('start')} to {(report.get('date_range') or {}).get('end')}",
         f"Play-by-play rows: {len(report.get('play_by_play') or [])}",
         f"Failure ledger rows: {len(report.get('failure_mode_ledger') or [])}",
+        f"Narrative readiness: {narrative.get('status')} ({narrative.get('ledger_row_count', len(narrative_ledger))} ledger rows)",
         f"Next reads: {next_reads.get('status')} ({next_reads.get('count', 0)})",
-        "Claim boundaries:",
+        "Committed-safe narrative ledger:",
     ]
+    for row in narrative_ledger[:10]:
+        details = []
+        if row.get("candidate_id"):
+            details.append(f"candidate={row.get('candidate_id')}")
+        if row.get("recovery_kind"):
+            details.append(f"recovery={row.get('recovery_kind')}")
+        if row.get("reason_codes"):
+            details.append(f"reasons={','.join(str(item) for item in row.get('reason_codes') or [])}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        lines.append(f"- {row.get('ledger_kind')}: {row.get('status') or row.get('timestamp_utc') or 'recorded'}{suffix}")
+    lines.append(
+        "Claim boundaries:",
+    )
     for key, value in sorted((report.get("claim_boundaries") or {}).items()):
         lines.append(f"- {key}: {value}")
     return "\n".join(lines)
@@ -286,6 +302,8 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     scope = report.get("story_scope") or {}
     date_range = report.get("date_range") or {}
     next_reads = report.get("next_reads") or {}
+    narrative = report.get("narrative_readiness") or {}
+    narrative_ledger = report.get("committed_safe_narrative_ledger") or []
     lines = [
         "# Failure Analysis",
         "",
@@ -295,11 +313,45 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Date range: `{date_range.get('start')}` to `{date_range.get('end')}`",
         f"- Play-by-play rows: `{len(report.get('play_by_play') or [])}`",
         f"- Failure ledger rows: `{len(report.get('failure_mode_ledger') or [])}`",
+        f"- Narrative readiness: `{narrative.get('status')}`",
+        f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
         f"- Next reads: `{next_reads.get('status')}` (`{next_reads.get('count', 0)}`)",
+        "",
+        "## Narrative Readiness",
+        "",
+        f"- Status: `{narrative.get('status')}`",
+        f"- Candidates: `{narrative.get('candidate_count', 0)}`",
+        f"- Recovery opened: `{narrative.get('recovery_opened_count', 0)}`",
+        f"- Usable recovery evidence: `{narrative.get('usable_recovery_evidence_count', 0)}`",
+        f"- Reason codes: `{', '.join(str(item) for item in narrative.get('reason_codes') or []) or 'none'}`",
+        "",
+        "## Committed-Safe Narrative Ledger",
+        "",
+    ]
+    for row in narrative_ledger:
+        bits = [
+            f"`{row.get('ledger_kind')}`",
+            f"source `{row.get('source')}`",
+        ]
+        if row.get("candidate_id"):
+            bits.append(f"candidate `{row.get('candidate_id')}`")
+        if row.get("recovery_kind"):
+            bits.append(f"recovery `{row.get('recovery_kind')}`")
+        if row.get("timestamp_utc"):
+            bits.append(f"at `{row.get('timestamp_utc')}`")
+        if row.get("line_range"):
+            line_range = row.get("line_range") or {}
+            bits.append(f"lines `{line_range.get('start')}..{line_range.get('end')}`")
+        if row.get("reason_codes"):
+            bits.append(f"reasons `{', '.join(str(item) for item in row.get('reason_codes') or [])}`")
+        lines.append(f"- {'; '.join(bits)}")
+    lines.extend(
+        [
         "",
         "## Failure Mode Ledger",
         "",
-    ]
+        ]
+    )
     for row in report.get("failure_mode_ledger") or []:
         lines.append(
             f"- `{row.get('failure_mode')}`: `{row.get('status')}` via `{row.get('evidence_surface')}`"
