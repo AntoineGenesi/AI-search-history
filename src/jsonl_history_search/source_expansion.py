@@ -8,7 +8,7 @@ from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .agent_contract import source_ref_target
-from .sources import SourcePlan, path_is_inside, source_kind_for_path
+from .sources import PlannedRoot, SourcePlan, path_is_inside, source_kind_for_path
 
 
 DEFAULT_WINDOW_BEFORE = 2
@@ -428,11 +428,13 @@ def expand_follow_next_read(
     cwd: Path,
 ) -> dict[str, Any]:
     request = expansion_request_from_next_read(read)
+    expansion_cwd = derived_follow_read_cwd(read, fallback_cwd=cwd)
+    expansion_plan, derived_roots = plan_with_follow_read_roots(read, plan=plan, cwd=expansion_cwd)
     payload = build_source_expansion_payload(
         request=request,
-        plan=plan,
+        plan=expansion_plan,
         default_tz=default_tz,
-        cwd=cwd,
+        cwd=expansion_cwd,
     )["source_expansion"]
     response: dict[str, Any] = {
         "rank": rank,
@@ -449,6 +451,11 @@ def expand_follow_next_read(
             "next_count": request.next_count,
             "max_records": request.max_records,
         },
+        "source_context": {
+            "cwd": str(expansion_cwd),
+            "derived_root_count": len(derived_roots),
+            "derived_roots": [str(root) for root in derived_roots],
+        },
         "status": payload.get("status"),
         "selected_records": payload.get("records", []),
         "truncated": payload.get("truncated", False),
@@ -461,6 +468,102 @@ def expand_follow_next_read(
     if payload.get("status") != "expanded":
         response["failure_reason"] = payload.get("error") or payload.get("status")
     return response
+
+
+def derived_follow_read_cwd(read: dict[str, Any], *, fallback_cwd: Path) -> Path:
+    action = first_read_more_action(read)
+    candidates = [fallback_cwd]
+    if action:
+        argv = [str(item) for item in list_or_empty(action.get("argv"))]
+        action_cwd = argv_option_value(argv, "--cwd")
+        if action_cwd:
+            candidates.append(Path(action_cwd).expanduser())
+    parsed = parse_expansion_target(read.get("target"), read.get("source_ref") if isinstance(read.get("source_ref"), dict) else None)
+    for candidate in candidates:
+        base = candidate.expanduser()
+        if parsed.path_text and (base / parsed.path_text).exists():
+            return base.resolve()
+    return fallback_cwd
+
+
+def plan_with_follow_read_roots(
+    read: dict[str, Any],
+    *,
+    plan: SourcePlan,
+    cwd: Path,
+) -> tuple[SourcePlan, list[Path]]:
+    parsed = parse_expansion_target(read.get("target"), read.get("source_ref") if isinstance(read.get("source_ref"), dict) else None)
+    target_path = resolved_existing_path(parsed.path_text, cwd=cwd)
+    derived_roots: list[Path] = []
+    for root in follow_read_root_candidates(read, cwd=cwd):
+        resolved = root.expanduser().resolve()
+        if not resolved.exists():
+            continue
+        if target_path and not path_is_inside(target_path, resolved) and target_path != resolved:
+            continue
+        if any(existing.path.expanduser().resolve() == resolved for existing in plan.roots):
+            continue
+        if resolved in derived_roots:
+            continue
+        derived_roots.append(resolved)
+    if not derived_roots and target_path:
+        parent = target_path.parent.resolve()
+        if not any(existing.path.expanduser().resolve() == parent for existing in plan.roots):
+            derived_roots.append(parent)
+    if not derived_roots:
+        return plan, []
+    augmented = SourcePlan(
+        roots=list(plan.roots),
+        rejected_roots=list(plan.rejected_roots),
+        warnings=list(plan.warnings),
+        blind_spots=list(plan.blind_spots),
+        limits=plan.limits,
+    )
+    for root in derived_roots:
+        augmented.roots.append(
+            PlannedRoot(
+                kind="arbitrary_jsonl_root",
+                path=root,
+                reason="derived from saved follow-next-reads read-more action",
+                recursive=root.suffix not in {".jsonl", ".json"},
+                known=False,
+            )
+        )
+    augmented.warnings.append("follow-next-reads derived source scope from saved read-more action metadata.")
+    return augmented, derived_roots
+
+
+def follow_read_root_candidates(read: dict[str, Any], *, cwd: Path) -> list[Path]:
+    action = first_read_more_action(read)
+    if not action:
+        return []
+    argv = [str(item) for item in list_or_empty(action.get("argv"))]
+    roots = argv_option_values(argv, "--root")
+    action_cwd_value = argv_option_value(argv, "--cwd")
+    action_cwd = Path(action_cwd_value).expanduser() if action_cwd_value else None
+    candidates: list[Path] = []
+    for root_text in roots:
+        root = Path(root_text).expanduser()
+        if root.is_absolute():
+            candidates.append(root)
+            continue
+        candidates.append((cwd / root).resolve())
+        if action_cwd is not None:
+            candidates.append((action_cwd / root).resolve())
+        candidates.append(root)
+    return candidates
+
+
+def resolved_existing_path(path_text: str | None, *, cwd: Path) -> Path | None:
+    if not path_text:
+        return None
+    raw = Path(path_text).expanduser()
+    candidates = [raw if raw.is_absolute() else cwd / raw]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.exists():
+            return resolved
+    return None
 
 
 def expansion_request_from_next_read(read: dict[str, Any]) -> ExpansionRequest:
@@ -547,6 +650,18 @@ def argv_option_value(argv: list[str], option: str) -> str | None:
     if index + 1 >= len(argv):
         return None
     return argv[index + 1]
+
+
+def argv_option_values(argv: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == option and index + 1 < len(argv):
+            values.append(argv[index + 1])
+            index += 2
+            continue
+        index += 1
+    return values
 
 
 def int_or_default(value: Any, default: Any) -> int:
