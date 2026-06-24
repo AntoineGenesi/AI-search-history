@@ -651,6 +651,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional semantic-debug JSON report whose answer_readiness should drive routing summary.",
     )
     eval_decision_loop.add_argument(
+        "--follow-next-reads-report",
+        default=None,
+        help="Optional follow-next-reads JSON report whose sanitized recovery outcome should refine readiness routing.",
+    )
+    eval_decision_loop.add_argument(
         "--report-output",
         default=None,
         help="Optional path where the eval decision packet should be written.",
@@ -1866,9 +1871,13 @@ def main(argv: list[str] | None = None) -> int:
         semantic_debug_report = (
             Path(args.semantic_debug_report).expanduser() if args.semantic_debug_report else None
         )
+        follow_next_reads_report = (
+            Path(args.follow_next_reads_report).expanduser() if args.follow_next_reads_report else None
+        )
         payload = build_eval_decision_loop_payload(
             pressure_report=pressure_report,
             semantic_debug_report=semantic_debug_report,
+            follow_next_reads_report=follow_next_reads_report,
         )
         rendered = render(payload, args.format)
         if args.report_output:
@@ -2190,9 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(render(payload, args.format))
         packet = payload["follow_next_reads"]
-        if packet["status"] not in {"expanded", "no_next_reads"}:
-            return 1
-        if any(item.get("status") != "expanded" for item in packet.get("expanded_reads", [])):
+        if packet["status"] not in {"expanded", "partial_expanded", "no_next_reads"}:
             return 1
         return 0
     source_plan, intent, plan = payload_from_args(args)
