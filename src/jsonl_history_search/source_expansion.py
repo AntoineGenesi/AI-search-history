@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ DEFAULT_WINDOW_BEFORE = 2
 DEFAULT_WINDOW_AFTER = 2
 DEFAULT_NEXT_COUNT = 3
 DEFAULT_MAX_RECORDS = 20
+SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery"}
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,119 @@ class ParsedTarget:
     path_text: str | None
     line: int | None
     raw_target: str | None
+
+
+def build_follow_next_reads_payload(
+    *,
+    report_path: Path,
+    kind: str,
+    limit: int,
+    plan: SourcePlan,
+    default_tz,
+    cwd: Path,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "limit": max(0, int(limit)),
+        "report_path": str(report_path),
+        "privacy_flags": {
+            "raw_text_included": True,
+            "raw_paths_included": True,
+            "source_refs_may_point_to_local_transcripts": True,
+            "vectors_indexes_or_persistent_cache_used": False,
+        },
+        "claim_boundaries": {
+            "broad_search_rerun": False,
+            "ranking_or_cap_changed": False,
+            "retrieval_defaults_changed": False,
+            "answer_generation_included": False,
+            "final_answer_claim_supported": False,
+            "all_history_completeness_claim_supported": False,
+        },
+        "expanded_reads": [],
+    }
+    if kind not in SUPPORTED_FOLLOW_NEXT_READ_KINDS:
+        return {
+            "follow_next_reads": {
+                **base,
+                "status": "unsupported_kind",
+                "failure_reason": f"unsupported kind: {kind}",
+                "supported_kinds": sorted(SUPPORTED_FOLLOW_NEXT_READ_KINDS),
+                "source_packet": {"status": "not_read"},
+            }
+        }
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "follow_next_reads": {
+                **base,
+                "status": "report_not_found",
+                "failure_reason": "from-report path does not exist",
+                "source_packet": {"status": "not_read"},
+            }
+        }
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "follow_next_reads": {
+                **base,
+                "status": "report_read_error",
+                "failure_reason": str(exc),
+                "source_packet": {"status": "not_read"},
+            }
+        }
+    except json.JSONDecodeError as exc:
+        return {
+            "follow_next_reads": {
+                **base,
+                "status": "invalid_report_json",
+                "failure_reason": str(exc),
+                "source_packet": {"status": "invalid_json"},
+            }
+        }
+
+    packet_info = detect_follow_packet(report)
+    if packet_info["status"] != "supported":
+        return {
+            "follow_next_reads": {
+                **base,
+                "status": packet_info["status"],
+                "failure_reason": packet_info["failure_reason"],
+                "source_packet": packet_info,
+            }
+        }
+
+    reads = prioritize_follow_next_reads(collect_follow_next_reads(packet_info["packet"], packet_info["packet_type"]))
+    selected_reads = reads[: max(0, int(limit))]
+    expanded_reads = [
+        expand_follow_next_read(read=read, rank=index + 1, plan=plan, default_tz=default_tz, cwd=cwd)
+        for index, read in enumerate(selected_reads)
+    ]
+    return {
+        "follow_next_reads": {
+            **base,
+            "status": "expanded" if expanded_reads else "no_next_reads",
+            "source_packet": {
+                "status": "supported",
+                "packet_type": packet_info["packet_type"],
+                "schema_version": packet_info["schema_version"],
+                "candidate_surfaces": packet_info["candidate_surfaces"],
+            },
+            "selection": {
+                "available_next_read_count": len(reads),
+                "selected_count": len(selected_reads),
+                "limit_applied": max(0, int(limit)),
+                "priority_order": [
+                    "promoted_continuation_recovery_clr",
+                    "omitted_window_recovery",
+                    "ordinary_next_read",
+                ],
+                "deduplicated_by": "target_or_source_ref",
+            },
+            "expanded_reads": expanded_reads,
+        }
+    }
 
 
 def build_source_expansion_payload(
@@ -208,6 +323,237 @@ def build_source_expansion_payload(
         "scope": source_scope(plan),
     }
     return {"source_expansion": payload}
+
+
+def detect_follow_packet(report: Any) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        return {"status": "unsupported_report_shape", "failure_reason": "report JSON must be an object"}
+    candidates: list[tuple[str, Any]] = []
+    if "semantic_debug" in report:
+        candidates.append(("semantic_debug", report.get("semantic_debug")))
+    if "agent_find" in report:
+        candidates.append(("agent_find", report.get("agent_find")))
+    for packet_type, packet in candidates:
+        if not isinstance(packet, dict):
+            continue
+        surfaces = follow_next_read_surfaces(packet, packet_type)
+        if surfaces:
+            return {
+                "status": "supported",
+                "packet_type": packet_type,
+                "packet": packet,
+                "schema_version": packet.get("schema_version"),
+                "candidate_surfaces": [surface for surface, reads in surfaces if reads],
+            }
+    if candidates:
+        return {
+            "status": "stale_or_missing_next_reads",
+            "failure_reason": "recognized packet type does not include current next_reads surfaces",
+        }
+    return {
+        "status": "unsupported_report_shape",
+        "failure_reason": "expected top-level semantic_debug or agent_find packet",
+    }
+
+
+def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[tuple[str, list[Any]]]:
+    surfaces: list[tuple[str, list[Any]]] = []
+    if packet_type == "semantic_debug":
+        append_next_read_surface(surfaces, "semantic_debug.next_reads", packet)
+        append_next_read_surface(
+            surfaces,
+            "semantic_debug.source_locator_handoff.next_reads",
+            packet.get("source_locator_handoff") or {},
+        )
+        append_next_read_surface(
+            surfaces,
+            "semantic_debug.compact_provenance_handoff.next_reads",
+            packet.get("compact_provenance_handoff") or {},
+        )
+    elif packet_type == "agent_find":
+        append_next_read_surface(
+            surfaces,
+            "agent_find.source_locator_handoff.next_reads",
+            packet.get("source_locator_handoff") or {},
+        )
+        append_next_read_surface(
+            surfaces,
+            "agent_find.compact_provenance_handoff.next_reads",
+            packet.get("compact_provenance_handoff") or {},
+        )
+    return surfaces
+
+
+def append_next_read_surface(surfaces: list[tuple[str, list[Any]]], label: str, container: Any) -> None:
+    if isinstance(container, dict) and "next_reads" in container:
+        surfaces.append((label, list_or_empty(container.get("next_reads"))))
+
+
+def collect_follow_next_reads(packet: dict[str, Any], packet_type: str) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for surface, surface_reads in follow_next_read_surfaces(packet, packet_type):
+        for item in surface_reads:
+            if not isinstance(item, dict):
+                continue
+            key = follow_next_read_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            reads.append({**item, "_follow_surface": surface})
+    return reads
+
+
+def prioritize_follow_next_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(reads, key=follow_next_read_priority_key)
+
+
+def follow_next_read_priority_key(read: dict[str, Any]) -> tuple[int, int, str]:
+    recovery_id = str((read.get("omitted_window_recovery") or {}).get("recovery_id") or "")
+    if recovery_id.startswith("clr"):
+        tier = 0
+    elif read.get("omitted_window_recovery"):
+        tier = 1
+    else:
+        tier = 2
+    return (tier, 0 if read.get("target") else 1, str(read.get("target") or ""))
+
+
+def expand_follow_next_read(
+    *,
+    read: dict[str, Any],
+    rank: int,
+    plan: SourcePlan,
+    default_tz,
+    cwd: Path,
+) -> dict[str, Any]:
+    request = expansion_request_from_next_read(read)
+    payload = build_source_expansion_payload(
+        request=request,
+        plan=plan,
+        default_tz=default_tz,
+        cwd=cwd,
+    )["source_expansion"]
+    response: dict[str, Any] = {
+        "rank": rank,
+        "target": read.get("target") or request.target,
+        "source_ref": read.get("source_ref"),
+        "surface": read.get("_follow_surface"),
+        "candidate_id": read.get("candidate_id"),
+        "recovery": recovery_metadata(read),
+        "request": {
+            "mode": request.mode,
+            "scope": request.scope,
+            "before": request.before,
+            "after": request.after,
+            "next_count": request.next_count,
+            "max_records": request.max_records,
+        },
+        "status": payload.get("status"),
+        "selected_records": payload.get("records", []),
+        "truncated": payload.get("truncated", False),
+        "counts": payload.get("counts", {}),
+        "line_range": payload.get("line_range"),
+        "continuation": payload.get("continuation"),
+        "privacy_flags": payload.get("privacy_flags", {}),
+        "claim_boundaries": payload.get("claim_boundaries", {}),
+    }
+    if payload.get("status") != "expanded":
+        response["failure_reason"] = payload.get("error") or payload.get("status")
+    return response
+
+
+def expansion_request_from_next_read(read: dict[str, Any]) -> ExpansionRequest:
+    action = first_read_more_action(read)
+    kwargs: dict[str, Any] = {
+        "target": read.get("target"),
+        "source_ref": read.get("source_ref") if isinstance(read.get("source_ref"), dict) else None,
+        "mode": "record",
+        "scope": "source",
+        "before": DEFAULT_WINDOW_BEFORE,
+        "after": DEFAULT_WINDOW_AFTER,
+        "next_count": DEFAULT_NEXT_COUNT,
+        "max_records": DEFAULT_MAX_RECORDS,
+    }
+    if action:
+        argv = [str(item) for item in list_or_empty(action.get("argv"))]
+        if len(argv) >= 2 and argv[0] == "read-more":
+            kwargs["target"] = argv[1]
+        for option, key in (
+            ("--mode", "mode"),
+            ("--scope", "scope"),
+            ("--before", "before"),
+            ("--after", "after"),
+            ("--next-count", "next_count"),
+            ("--max-records", "max_records"),
+        ):
+            value = argv_option_value(argv, option)
+            if value is not None:
+                kwargs[key] = value if key in {"mode", "scope"} else int_or_default(value, kwargs[key])
+        for key in ("mode", "scope", "before", "after", "next_count", "max_records"):
+            if key in action:
+                kwargs[key] = action[key] if key in {"mode", "scope"} else int_or_default(action[key], kwargs[key])
+    return ExpansionRequest(**kwargs)
+
+
+def first_read_more_action(read: dict[str, Any]) -> dict[str, Any] | None:
+    for action in list_or_empty(read.get("expansion_actions")):
+        if not isinstance(action, dict):
+            continue
+        command = str(action.get("command") or "")
+        argv = list_or_empty(action.get("argv"))
+        if command.endswith("read-more") or (argv and argv[0] == "read-more"):
+            return action
+    return None
+
+
+def recovery_metadata(read: dict[str, Any]) -> dict[str, Any]:
+    recovery = read.get("omitted_window_recovery") if isinstance(read.get("omitted_window_recovery"), dict) else {}
+    recovery_id = str(recovery.get("recovery_id") or "")
+    return {
+        "kind": (
+            "promoted_continuation_recovery"
+            if recovery_id.startswith("clr")
+            else "omitted_window_recovery"
+            if recovery
+            else "ordinary_next_read"
+        ),
+        "recovery_id": recovery.get("recovery_id"),
+        "omission_reason": recovery.get("omission_reason"),
+        "candidate_id": read.get("candidate_id") or recovery.get("candidate_id"),
+        "metadata": recovery,
+    }
+
+
+def follow_next_read_key(read: dict[str, Any]) -> str | None:
+    target = read.get("target")
+    if target:
+        return f"target:{target}"
+    source_ref = read.get("source_ref")
+    if isinstance(source_ref, dict):
+        return f"source_ref:{json.dumps(source_ref, sort_keys=True)}"
+    return None
+
+
+def list_or_empty(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def argv_option_value(argv: list[str], option: str) -> str | None:
+    try:
+        index = argv.index(option)
+    except ValueError:
+        return None
+    if index + 1 >= len(argv):
+        return None
+    return argv[index + 1]
+
+
+def int_or_default(value: Any, default: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def parse_expansion_target(target: str | None, source_ref: dict[str, Any] | None = None) -> ParsedTarget:
