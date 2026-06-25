@@ -268,6 +268,7 @@ def render_failure_analysis_text(payload: dict) -> str:
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
     story_packet = report.get("devlog_story_packet") or {}
+    devlog_brief = report.get("devlog_brief") or {}
     semantic_debugging_categories = story_packet.get("semantic_debugging_categories") or []
     behavior_quality_labels = story_packet.get("behavior_quality_labels") or []
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
@@ -291,8 +292,70 @@ def render_failure_analysis_text(payload: dict) -> str:
         f"Next reads: {next_reads.get('status')} ({next_reads.get('count', 0)})",
         f"Story phase gaps: {', '.join(str(item) for item in story_phase_summary.get('gap_reasons') or []) or 'none'}",
         f"Story phase next review: {', '.join(str(item) for item in story_phase_summary.get('next_review_needs') or []) or 'none'}",
+        f"Devlog brief: {devlog_brief.get('status')} ({len(devlog_brief.get('short_take') or [])} short-take lines, {len(devlog_brief.get('timeline_highlights') or [])} timeline highlights)",
+        "Devlog brief short take:",
+    ]
+    for item in (devlog_brief.get("short_take") or [])[:6]:
+        support = ", ".join(str(surface) for surface in item.get("support") or []) or "no support surface"
+        lines.append(f"- {item.get('take_id')}: {item.get('line')} Support: {support}")
+    lines.append("Devlog brief evidence-backed summary:")
+    for item in (devlog_brief.get("evidence_backed_summary") or [])[:6]:
+        support = ", ".join(str(surface) for surface in item.get("support") or []) or "no support surface"
+        lines.append(f"- {item.get('summary_id')}: {item.get('bullet')} Support: {support}")
+    lines.append("Devlog brief category framing:")
+    for category in (devlog_brief.get("semantic_debugging_category_framing") or [])[:6]:
+        case_labels = ", ".join(str(item) for item in category.get("case_labels") or []) or "none"
+        handles = ", ".join(str(item) for item in category.get("representative_safe_handles") or []) or "no representative handle"
+        lines.append(
+            f"- category {category.get('category_id')} ({category.get('classification_status')}; "
+            f"case labels={case_labels}) Handles: {handles}"
+        )
+    lines.append("Devlog brief failure modes:")
+    for item in (devlog_brief.get("failure_mode_framing") or [])[:6]:
+        lines.append(
+            f"- {item.get('failure_id')}: {item.get('failure_mode')} "
+            f"status={item.get('status')} surface={item.get('evidence_surface')}"
+        )
+    non_claims_and_gaps = devlog_brief.get("non_claims_and_gaps") or {}
+    lines.append("Devlog brief non-claims and gaps:")
+    for item in (non_claims_and_gaps.get("non_claims") or [])[:6]:
+        lines.append(f"- non-claim {item.get('non_claim')}: {item.get('boundary')}")
+    for item in (non_claims_and_gaps.get("gaps") or [])[:6]:
+        lines.append(f"- gap {item.get('gap_id')}: {item.get('status')} via {item.get('reason')}")
+    brief_next_reads = devlog_brief.get("next_reads") or {}
+    lines.append(f"Devlog brief next reads: {brief_next_reads.get('status')} ({brief_next_reads.get('count', 0)})")
+    for read in (brief_next_reads.get("reads") or [])[:6]:
+        lines.append(f"- next-read {read.get('read_id')}: {read.get('kind')} {read.get('source_handle')}")
+    brief_critique = devlog_brief.get("tool_critique") or {}
+    packaged = brief_critique.get("what_the_tool_could_package") or {}
+    lines.append(
+        "Devlog brief tool critique: "
+        f"{', '.join(f'{key}={value}' for key, value in sorted(packaged.items())) or 'none'}"
+    )
+    for gap in (brief_critique.get("gaps_and_limitations") or [])[:6]:
+        lines.append(f"- limitation: {gap}")
+    readiness = devlog_brief.get("readiness") or {}
+    lines.append(
+        "Devlog brief readiness: "
+        f"packet={readiness.get('story_packet_status')} claims={readiness.get('supported_claim_count')} "
+        f"categories={readiness.get('category_count')} gaps={readiness.get('gap_count')} "
+        f"final_prose={readiness.get('brief_is_final_prose')}"
+    )
+    lines.append("Devlog brief claim boundaries:")
+    for boundary in (devlog_brief.get("claim_boundaries") or [])[:6]:
+        lines.append(f"- {boundary}")
+    lines.extend([
+        "Devlog brief timeline highlights:",
+    ])
+    for row in (devlog_brief.get("timeline_highlights") or [])[:6]:
+        dates = row.get("start") or row.get("timestamp_utc") or "undated"
+        if row.get("end") and row.get("end") != row.get("start"):
+            dates = f"{dates}..{row.get('end')}"
+        lines.append(f"- {row.get('timeline_id')}: {dates}; {row.get('source')} status={row.get('status')}")
+    lines.extend([
         "Story phase rows:",
     ]
+    )
     for row in (story_phase_summary.get("rows") or [])[:10]:
         details = [f"status={row.get('status')}"]
         if row.get("task_id"):
@@ -363,6 +426,7 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     narrative = report.get("narrative_readiness") or {}
     story_phase_summary = report.get("story_phase_summary") or {}
     story_packet = report.get("devlog_story_packet") or {}
+    devlog_brief = report.get("devlog_brief") or {}
     semantic_debugging_categories = story_packet.get("semantic_debugging_categories") or []
     behavior_quality_labels = story_packet.get("behavior_quality_labels") or []
     narrative_ledger = report.get("committed_safe_narrative_ledger") or []
@@ -386,6 +450,83 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Committed-safe narrative ledger rows: `{narrative.get('ledger_row_count', len(narrative_ledger))}`",
         f"- Next reads: `{next_reads.get('status')}` (`{next_reads.get('count', 0)}`)",
         "",
+        "## Devlog Brief",
+        "",
+        f"- Status: `{devlog_brief.get('status')}`",
+        f"- Mode: `{devlog_brief.get('mode')}`",
+        f"- Short-take lines: `{len(devlog_brief.get('short_take') or [])}`",
+        f"- Timeline highlights: `{len(devlog_brief.get('timeline_highlights') or [])}`",
+        f"- Semantic-debugging category frames: `{len(devlog_brief.get('semantic_debugging_category_framing') or [])}`",
+        "",
+        "### Short Take",
+        "",
+    ]
+    for item in devlog_brief.get("short_take") or []:
+        support = ", ".join(str(surface) for surface in item.get("support") or [])
+        lines.append(f"- `{item.get('take_id')}`: {item.get('line')} Support: `{support or 'none'}`")
+    lines.extend(["", "### Evidence-Backed Summary", ""])
+    for item in devlog_brief.get("evidence_backed_summary") or []:
+        support = ", ".join(str(surface) for surface in item.get("support") or [])
+        lines.append(f"- {item.get('bullet')} Support: `{support or 'none'}`")
+    lines.extend(["", "### Timeline Highlights", ""])
+    for row in devlog_brief.get("timeline_highlights") or []:
+        bits = [
+            f"`{row.get('timeline_id')}`",
+            f"source `{row.get('source')}`",
+            f"status `{row.get('status')}`",
+        ]
+        if row.get("start") or row.get("end"):
+            bits.append(f"dates `{row.get('start')}..{row.get('end')}`")
+        if row.get("timestamp_utc"):
+            bits.append(f"at `{row.get('timestamp_utc')}`")
+        if row.get("task_id"):
+            bits.append(f"task `{row.get('task_id')}`")
+        lines.append(f"- {'; '.join(bits)}")
+    lines.extend(["", "### Semantic-Debugging Category Framing", ""])
+    for category in devlog_brief.get("semantic_debugging_category_framing") or []:
+        handles = ", ".join(str(item) for item in category.get("representative_safe_handles") or []) or "none"
+        surfaces = ", ".join(str(item) for item in category.get("support_surfaces") or []) or "none"
+        case_labels = ", ".join(str(item) for item in category.get("case_labels") or []) or "none"
+        lines.append(
+            f"- `{category.get('category_id')}` (`{category.get('classification_status')}`): "
+            f"case labels `{case_labels}`; handles `{handles}`; support `{surfaces}`"
+        )
+    lines.extend(["", "### Failure-Mode Framing", ""])
+    for item in devlog_brief.get("failure_mode_framing") or []:
+        lines.append(
+            f"- `{item.get('failure_id')}`: `{item.get('failure_mode')}` "
+            f"status `{item.get('status')}` via `{item.get('evidence_surface')}`. "
+            f"Boundary: {item.get('boundary')}"
+        )
+    non_claims_and_gaps = devlog_brief.get("non_claims_and_gaps") or {}
+    lines.extend(["", "### Non-Claims And Gaps", ""])
+    for item in non_claims_and_gaps.get("non_claims") or []:
+        lines.append(f"- non-claim `{item.get('non_claim')}` via `{item.get('support_surface')}`")
+    for item in non_claims_and_gaps.get("gaps") or []:
+        lines.append(f"- gap `{item.get('gap_id')}`: `{item.get('status')}` via `{item.get('reason')}`")
+    brief_next_reads = devlog_brief.get("next_reads") or {}
+    lines.extend(["", "### Next Reads And Tool Critique", ""])
+    lines.append(f"- Next reads: `{brief_next_reads.get('status')}` (`{brief_next_reads.get('count', 0)}`)")
+    for read in brief_next_reads.get("reads") or []:
+        lines.append(f"- `{read.get('read_id')}`: `{read.get('kind')}` `{read.get('source_handle')}`")
+    brief_critique = devlog_brief.get("tool_critique") or {}
+    lines.append(
+        f"- Tool could package: `{', '.join(f'{key}={value}' for key, value in sorted((brief_critique.get('what_the_tool_could_package') or {}).items())) or 'none'}`"
+    )
+    for gap in brief_critique.get("gaps_and_limitations") or []:
+        lines.append(f"- limitation: {gap}")
+    readiness = devlog_brief.get("readiness") or {}
+    lines.extend(["", "### Readiness And Claim Boundaries", ""])
+    lines.append(f"- Story packet status: `{readiness.get('story_packet_status')}`")
+    lines.append(f"- Supported claims: `{readiness.get('supported_claim_count')}`")
+    lines.append(f"- Semantic-debugging categories: `{readiness.get('category_count')}`")
+    lines.append(f"- Gaps: `{readiness.get('gap_count')}`")
+    lines.append(f"- Brief is final prose: `{readiness.get('brief_is_final_prose')}`")
+    for boundary in devlog_brief.get("claim_boundaries") or []:
+        lines.append(f"- {boundary}")
+    lines.extend(
+        [
+        "",
         "## Narrative Readiness",
         "",
         f"- Status: `{narrative.get('status')}`",
@@ -402,7 +543,8 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Gap reasons: `{', '.join(str(item) for item in story_phase_summary.get('gap_reasons') or []) or 'none'}`",
         f"- Next review needs: `{', '.join(str(item) for item in story_phase_summary.get('next_review_needs') or []) or 'none'}`",
         "",
-    ]
+        ]
+    )
     for row in story_phase_summary.get("rows") or []:
         row_date_range = row.get("date_range") or {}
         bits = [

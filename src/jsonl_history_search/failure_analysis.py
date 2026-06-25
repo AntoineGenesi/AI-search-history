@@ -258,6 +258,26 @@ def build_failure_analysis_payload(
         next_reads=next_reads,
         followthrough_behavior_label_rows=followthrough_behavior_label_rows,
     )
+    tool_critique = _tool_critique(
+        semantic_loaded=semantic_loaded,
+        forensics_loaded=forensics_loaded,
+        follow_loaded=follow_loaded,
+        followthrough_labels_loaded=followthrough_labels_loaded,
+        semantic_packet=semantic_packet,
+        forensics_packet=forensics_packet,
+        follow_packet=follow_packet,
+        play_by_play=play_by_play,
+        next_reads=next_reads,
+    )
+    devlog_brief = _build_devlog_brief(
+        story_id=story_id,
+        date_range=date_range,
+        devlog_story_packet=devlog_story_packet,
+        failure_mode_ledger=failure_mode_ledger,
+        interesting_moments=interesting_moments,
+        next_reads=next_reads,
+        tool_critique=tool_critique,
+    )
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
         semantic_packet,
@@ -280,18 +300,9 @@ def build_failure_analysis_payload(
         "repo_handle_chronology": repo_handle_chronology,
         "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
         "devlog_story_packet": devlog_story_packet,
+        "devlog_brief": devlog_brief,
         "interesting_moments": interesting_moments,
-        "tool_critique": _tool_critique(
-            semantic_loaded=semantic_loaded,
-            forensics_loaded=forensics_loaded,
-            follow_loaded=follow_loaded,
-            followthrough_labels_loaded=followthrough_labels_loaded,
-            semantic_packet=semantic_packet,
-            forensics_packet=forensics_packet,
-            follow_packet=follow_packet,
-            play_by_play=play_by_play,
-            next_reads=next_reads,
-        ),
+        "tool_critique": tool_critique,
         "evidence_vs_inference": _evidence_vs_inference(
             semantic_packet,
             forensics_packet,
@@ -1042,6 +1053,259 @@ def _devlog_story_status(
     if supported_claims:
         return "story_packet_partial"
     return "story_packet_gap"
+
+
+def _build_devlog_brief(
+    *,
+    story_id: str,
+    date_range: dict[str, Any],
+    devlog_story_packet: dict[str, Any],
+    failure_mode_ledger: list[dict[str, Any]],
+    interesting_moments: list[dict[str, Any]],
+    next_reads: dict[str, Any],
+    tool_critique: dict[str, Any],
+) -> dict[str, Any]:
+    categories = _list(devlog_story_packet.get("semantic_debugging_categories"))
+    supported_claims = _list(devlog_story_packet.get("supported_claims"))
+    non_claims = _list(devlog_story_packet.get("explicit_non_claims"))
+    gaps = _list(devlog_story_packet.get("gaps"))
+    brief = {
+        "status": _devlog_brief_status(devlog_story_packet, categories, supported_claims),
+        "mode": "deterministic_committed_safe_devlog_brief",
+        "story_id": story_id,
+        "date_range": date_range,
+        "short_take": _devlog_brief_short_take(devlog_story_packet),
+        "evidence_backed_summary": _devlog_brief_summary(devlog_story_packet),
+        "timeline_highlights": _devlog_brief_timeline(devlog_story_packet, interesting_moments),
+        "semantic_debugging_category_framing": _devlog_brief_categories(categories),
+        "failure_mode_framing": _devlog_brief_failure_modes(failure_mode_ledger),
+        "non_claims_and_gaps": _devlog_brief_non_claims_and_gaps(non_claims, gaps),
+        "next_reads": _devlog_brief_next_reads(next_reads, devlog_story_packet),
+        "tool_critique": _devlog_brief_tool_critique(tool_critique),
+        "readiness": {
+            "story_packet_status": devlog_story_packet.get("status"),
+            "supported_claim_count": len(supported_claims),
+            "category_count": len(categories),
+            "gap_count": len(gaps),
+            "non_claim_count": len(non_claims),
+            "brief_is_final_prose": False,
+        },
+        "claim_boundaries": [
+            "brief is deterministic packaging from already-sanitized failure-analysis fields",
+            "short-take lines are source-backed drafting handles, not final prose",
+            "case labels are secondary to reusable semantic-debugging categories",
+            "brief does not claim root cause, all-history completeness, token savings, speed, retrieval quality, final prose quality, live runtime cleanup, model forgetting, or global promotion",
+        ],
+    }
+    return brief
+
+
+def _devlog_brief_status(
+    devlog_story_packet: dict[str, Any],
+    categories: list[Any],
+    supported_claims: list[Any],
+) -> str:
+    packet_status = str(devlog_story_packet.get("status") or "")
+    if supported_claims and categories and packet_status in {
+        "story_packet_ready",
+        "story_packet_usable_with_boundaries",
+        "story_packet_usable_with_private_review_gaps",
+    }:
+        return "brief_usable_with_boundaries"
+    if supported_claims:
+        return "brief_partial"
+    return "brief_gap"
+
+
+def _devlog_brief_short_take(devlog_story_packet: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(_list(devlog_story_packet.get("take_candidates"))[:6], 1):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "take_id": item.get("take_id") or f"take-{index:03d}",
+                    "line": item.get("take"),
+                    "support": item.get("support"),
+                    "boundary": item.get("boundary"),
+                }
+            )
+        )
+    return rows
+
+
+def _devlog_brief_summary(devlog_story_packet: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(_list(devlog_story_packet.get("evidence_backed_summary_bullets"))[:8], 1):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "summary_id": f"summary-{index:03d}",
+                    "bullet": item.get("bullet"),
+                    "support": item.get("support"),
+                    "counts": item.get("counts"),
+                    "boundary": item.get("boundary"),
+                }
+            )
+        )
+    return rows
+
+
+def _devlog_brief_timeline(
+    devlog_story_packet: dict[str, Any],
+    interesting_moments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _list(devlog_story_packet.get("dated_arc_rows"))[:8]:
+        if not isinstance(row, dict):
+            continue
+        handles = row.get("handle_types") or row.get("handles")
+        rows.append(
+            _clean_row(
+                {
+                    "timeline_id": row.get("arc_id"),
+                    "source": row.get("source"),
+                    "status": row.get("status"),
+                    "start": row.get("start"),
+                    "end": row.get("end"),
+                    "task_id": row.get("task_id"),
+                    "handles": handles,
+                    "boundary": "timeline highlight is a sanitized story arc row, not complete history",
+                }
+            )
+        )
+    if rows:
+        return rows
+    for index, row in enumerate(interesting_moments[:6], 1):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "timeline_id": f"moment-{index:03d}",
+                    "source": row.get("source"),
+                    "timestamp_utc": row.get("timestamp_utc"),
+                    "status": row.get("status"),
+                    "source_handle": row.get("source_handle"),
+                    "boundary": row.get("boundary") or "interesting moment is a sanitized saved-report row",
+                }
+            )
+        )
+    return rows
+
+
+def _devlog_brief_categories(categories: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for category in categories[:8]:
+        if not isinstance(category, dict):
+            continue
+        strength = category.get("evidence_strength") if isinstance(category.get("evidence_strength"), dict) else {}
+        rows.append(
+            _clean_row(
+                {
+                    "category_id": category.get("category_id"),
+                    "classification_status": category.get("classification_status"),
+                    "scope": category.get("scope"),
+                    "case_labels": category.get("case_labels"),
+                    "representative_safe_handles": category.get("representative_safe_handles"),
+                    "support_surfaces": category.get("support_surfaces"),
+                    "matched_row_count": strength.get("matched_row_count"),
+                    "source_boundary": category.get("source_boundary"),
+                }
+            )
+        )
+    return rows
+
+
+def _devlog_brief_failure_modes(failure_mode_ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(failure_mode_ledger[:6], 1):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "failure_id": f"failure-{index:03d}",
+                    "failure_mode": row.get("failure_mode"),
+                    "status": row.get("status"),
+                    "evidence_surface": row.get("evidence_surface"),
+                    "boundary": row.get("interpretation_boundary"),
+                }
+            )
+        )
+    return rows
+
+
+def _devlog_brief_non_claims_and_gaps(
+    non_claims: list[Any],
+    gaps: list[Any],
+) -> dict[str, Any]:
+    return _clean_row(
+        {
+            "non_claims": [
+                _clean_row(
+                    {
+                        "claim_id": row.get("claim_id"),
+                        "non_claim": row.get("non_claim"),
+                        "support_surface": row.get("support_surface"),
+                        "boundary": row.get("boundary"),
+                    }
+                )
+                for row in non_claims[:8]
+                if isinstance(row, dict)
+            ],
+            "gaps": [
+                _clean_row(
+                    {
+                        "gap_id": row.get("gap_id"),
+                        "status": row.get("status"),
+                        "reason": row.get("reason"),
+                        "next_action": row.get("next_action"),
+                    }
+                )
+                for row in gaps[:6]
+                if isinstance(row, dict)
+            ],
+        }
+    )
+
+
+def _devlog_brief_next_reads(next_reads: dict[str, Any], devlog_story_packet: dict[str, Any]) -> dict[str, Any]:
+    story_next_reads = devlog_story_packet.get("next_reads") if isinstance(devlog_story_packet.get("next_reads"), dict) else {}
+    reads = _list(story_next_reads.get("reads")) or _list(next_reads.get("reads"))
+    return _clean_row(
+        {
+            "status": story_next_reads.get("status") or next_reads.get("status"),
+            "count": story_next_reads.get("count") if story_next_reads.get("count") is not None else next_reads.get("count"),
+            "reads": [
+                _clean_row(
+                    {
+                        "read_id": row.get("read_id"),
+                        "kind": row.get("kind"),
+                        "source_handle": row.get("source_handle"),
+                        "reason": row.get("reason"),
+                        "boundary": row.get("boundary"),
+                    }
+                )
+                for row in reads[:6]
+                if isinstance(row, dict)
+            ],
+        }
+    )
+
+
+def _devlog_brief_tool_critique(tool_critique: dict[str, Any]) -> dict[str, Any]:
+    return _clean_row(
+        {
+            "mode": tool_critique.get("mode"),
+            "what_the_tool_could_package": tool_critique.get("what_the_tool_could_package"),
+            "gaps_and_limitations": _list(tool_critique.get("gaps_and_limitations"))[:6],
+            "not_changed_or_claimed": _list(tool_critique.get("not_changed_or_claimed"))[:8],
+        }
+    )
 
 
 def _devlog_take_candidates(

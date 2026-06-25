@@ -308,7 +308,15 @@ def build_parser() -> argparse.ArgumentParser:
             "are retained as unclassified semantic-debug evidence."
         ),
     )
-    failure_analysis.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    failure_analysis.add_argument(
+        "--format",
+        choices=("text", "json", "markdown"),
+        default="json",
+        help=(
+            "Output format. All formats expose failure_analysis.devlog_brief; "
+            "text and Markdown render it under a Devlog Brief heading before the full packet."
+        ),
+    )
     failure_analysis.add_argument("--report-output", default=None)
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("query", nargs="?", default="")
