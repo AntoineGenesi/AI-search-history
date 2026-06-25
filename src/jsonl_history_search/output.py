@@ -298,6 +298,10 @@ def render_failure_analysis_text(payload: dict) -> str:
     for item in (devlog_brief.get("short_take") or [])[:6]:
         support = ", ".join(str(surface) for surface in item.get("support") or []) or "no support surface"
         lines.append(f"- {item.get('take_id')}: {item.get('line')} Support: {support}")
+    lines.append("Devlog brief evidence-backed summary:")
+    for item in (devlog_brief.get("evidence_backed_summary") or [])[:6]:
+        support = ", ".join(str(surface) for surface in item.get("support") or []) or "no support surface"
+        lines.append(f"- {item.get('summary_id')}: {item.get('bullet')} Support: {support}")
     lines.append("Devlog brief category framing:")
     for category in (devlog_brief.get("semantic_debugging_category_framing") or [])[:6]:
         case_labels = ", ".join(str(item) for item in category.get("case_labels") or []) or "none"
@@ -306,6 +310,40 @@ def render_failure_analysis_text(payload: dict) -> str:
             f"- category {category.get('category_id')} ({category.get('classification_status')}; "
             f"case labels={case_labels}) Handles: {handles}"
         )
+    lines.append("Devlog brief failure modes:")
+    for item in (devlog_brief.get("failure_mode_framing") or [])[:6]:
+        lines.append(
+            f"- {item.get('failure_id')}: {item.get('failure_mode')} "
+            f"status={item.get('status')} surface={item.get('evidence_surface')}"
+        )
+    non_claims_and_gaps = devlog_brief.get("non_claims_and_gaps") or {}
+    lines.append("Devlog brief non-claims and gaps:")
+    for item in (non_claims_and_gaps.get("non_claims") or [])[:6]:
+        lines.append(f"- non-claim {item.get('non_claim')}: {item.get('boundary')}")
+    for item in (non_claims_and_gaps.get("gaps") or [])[:6]:
+        lines.append(f"- gap {item.get('gap_id')}: {item.get('status')} via {item.get('reason')}")
+    brief_next_reads = devlog_brief.get("next_reads") or {}
+    lines.append(f"Devlog brief next reads: {brief_next_reads.get('status')} ({brief_next_reads.get('count', 0)})")
+    for read in (brief_next_reads.get("reads") or [])[:6]:
+        lines.append(f"- next-read {read.get('read_id')}: {read.get('kind')} {read.get('source_handle')}")
+    brief_critique = devlog_brief.get("tool_critique") or {}
+    packaged = brief_critique.get("what_the_tool_could_package") or {}
+    lines.append(
+        "Devlog brief tool critique: "
+        f"{', '.join(f'{key}={value}' for key, value in sorted(packaged.items())) or 'none'}"
+    )
+    for gap in (brief_critique.get("gaps_and_limitations") or [])[:6]:
+        lines.append(f"- limitation: {gap}")
+    readiness = devlog_brief.get("readiness") or {}
+    lines.append(
+        "Devlog brief readiness: "
+        f"packet={readiness.get('story_packet_status')} claims={readiness.get('supported_claim_count')} "
+        f"categories={readiness.get('category_count')} gaps={readiness.get('gap_count')} "
+        f"final_prose={readiness.get('brief_is_final_prose')}"
+    )
+    lines.append("Devlog brief claim boundaries:")
+    for boundary in (devlog_brief.get("claim_boundaries") or [])[:6]:
+        lines.append(f"- {boundary}")
     lines.extend([
         "Devlog brief timeline highlights:",
     ])
@@ -453,6 +491,13 @@ def render_failure_analysis_markdown(payload: dict) -> str:
             f"- `{category.get('category_id')}` (`{category.get('classification_status')}`): "
             f"case labels `{case_labels}`; handles `{handles}`; support `{surfaces}`"
         )
+    lines.extend(["", "### Failure-Mode Framing", ""])
+    for item in devlog_brief.get("failure_mode_framing") or []:
+        lines.append(
+            f"- `{item.get('failure_id')}`: `{item.get('failure_mode')}` "
+            f"status `{item.get('status')}` via `{item.get('evidence_surface')}`. "
+            f"Boundary: {item.get('boundary')}"
+        )
     non_claims_and_gaps = devlog_brief.get("non_claims_and_gaps") or {}
     lines.extend(["", "### Non-Claims And Gaps", ""])
     for item in non_claims_and_gaps.get("non_claims") or []:
@@ -470,6 +515,15 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     )
     for gap in brief_critique.get("gaps_and_limitations") or []:
         lines.append(f"- limitation: {gap}")
+    readiness = devlog_brief.get("readiness") or {}
+    lines.extend(["", "### Readiness And Claim Boundaries", ""])
+    lines.append(f"- Story packet status: `{readiness.get('story_packet_status')}`")
+    lines.append(f"- Supported claims: `{readiness.get('supported_claim_count')}`")
+    lines.append(f"- Semantic-debugging categories: `{readiness.get('category_count')}`")
+    lines.append(f"- Gaps: `{readiness.get('gap_count')}`")
+    lines.append(f"- Brief is final prose: `{readiness.get('brief_is_final_prose')}`")
+    for boundary in devlog_brief.get("claim_boundaries") or []:
+        lines.append(f"- {boundary}")
     lines.extend(
         [
         "",
