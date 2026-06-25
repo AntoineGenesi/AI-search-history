@@ -2216,6 +2216,7 @@ def _sanitized_repo_artifact_evidence_rows(packet: dict[str, Any]) -> list[dict[
         ]
         evidence_strength = _repo_artifact_evidence_strength(row)
         category_name = _safe_repo_artifact_category_name(row.get("category_name") or row.get("name"))
+        safe_metadata = _safe_repo_artifact_chronology_metadata(row)
         if not (safe_handles or support_surfaces or category_ids or story_specific_labels or phase_hints):
             continue
         rows.append(
@@ -2230,6 +2231,7 @@ def _sanitized_repo_artifact_evidence_rows(packet: dict[str, Any]) -> list[dict[
                     "representative_safe_handles": safe_handles,
                     "support_surfaces": support_surfaces or ["repo_artifact_evidence.rows"],
                     "matched_safe_terms": matched_safe_terms,
+                    **safe_metadata,
                     "claim_boundaries": claim_boundaries
                     or [
                         "sanitized repo-artifact metadata only; no raw artifact crawling or root-cause claim"
@@ -2243,6 +2245,46 @@ def _sanitized_repo_artifact_evidence_rows(packet: dict[str, Any]) -> list[dict[
             )
         )
     return rows[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _safe_repo_artifact_chronology_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in ("date", "timestamp_utc", "last_changed_at"):
+        value = row.get(key)
+        if _looks_like_safe_date(value):
+            metadata[key] = str(value)
+    status = _safe_repo_status(row)
+    if status and _safe_repo_artifact_metadata_label(status):
+        metadata["status"] = status
+    confidence = _safe_repo_confidence(row)
+    if confidence and _safe_repo_artifact_metadata_label(confidence):
+        metadata["confidence"] = confidence
+    phase_order = _safe_repo_artifact_phase_order(row.get("phase_order"))
+    if phase_order is not None:
+        metadata["phase_order"] = phase_order
+    return metadata
+
+
+def _safe_repo_artifact_metadata_label(value: str) -> bool:
+    if not _safe_short_label(value):
+        return False
+    if value.startswith("/") or "\\" in value or re.match(r"^[A-Za-z]:[\\/]", value):
+        return False
+    return not _private_like_repo_artifact_token(value)
+
+
+def _safe_repo_artifact_phase_order(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        order = value
+    elif isinstance(value, str) and re.fullmatch(r"\d{1,3}", value.strip()):
+        order = int(value.strip())
+    else:
+        return None
+    if 1 <= order <= 999:
+        return order
+    return None
 
 
 def _repo_artifact_values(row: dict[str, Any], *keys: str) -> list[Any]:
@@ -2780,6 +2822,11 @@ def _build_repo_handle_chronology(
                     "handle": handle,
                     "date": date_value,
                     "date_source": date_source,
+                    "phase_order": _safe_repo_artifact_phase_order(
+                        candidate.get("row", {}).get("phase_order")
+                        if isinstance(candidate.get("row"), dict)
+                        else None
+                    ),
                     "status": _safe_repo_status(candidate.get("row")),
                     "confidence": _safe_repo_confidence(candidate.get("row")),
                     "repo_artifact_metadata": _repo_artifact_chronology_metadata(candidate.get("row"), source),
@@ -2985,6 +3032,7 @@ def _repo_artifact_chronology_metadata(row: Any, source: str) -> dict[str, Any] 
             item for item in _list(row.get("support_surfaces")) if isinstance(item, str)
         ][:6],
         "evidence_strength": row.get("evidence_strength") if isinstance(row.get("evidence_strength"), dict) else None,
+        "phase_order": row.get("phase_order") if isinstance(row.get("phase_order"), int) else None,
     }
     return _clean_row(metadata) or None
 
@@ -3218,6 +3266,7 @@ def _sorted_repo_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows,
         key=lambda row: (
             str(row.get("date") or "9999-12-31T23:59:59+00:00"),
+            int(row.get("phase_order") or 999999),
             str(row.get("handle_type") or ""),
             str(row.get("handle") or ""),
             str(row.get("source") or ""),
