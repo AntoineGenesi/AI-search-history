@@ -96,6 +96,53 @@ BEHAVIOR_QUALITY_LABEL_SPECS = {
     },
 }
 
+SEMANTIC_DEBUG_CATEGORY_SPECS = {
+    "evidence_boundary_control": {
+        "name": "Evidence boundary control",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies whether evidence boundaries are controlled without treating case-specific cleanup handles as product taxonomy",
+    },
+    "runtime_delivery_boundary": {
+        "name": "Runtime delivery boundary",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies runtime delivery or suppression evidence without proving live delivery, promotion, speed, or token savings",
+    },
+    "unsupported_claim_boundary": {
+        "name": "Unsupported claim boundary",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies explicit unsupported-claim boundaries without converting them into root-cause or completeness findings",
+    },
+    "implementation_path_evidence": {
+        "name": "Implementation path evidence",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies safe implementation-path handles as evidence leads without proving the path executed in this analysis run",
+    },
+    "negative_proof_boundary": {
+        "name": "Negative proof boundary",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies rejected substitutes and negative proof as constraints, not as root-cause or live-runtime claims",
+    },
+    "promotion_gate_boundary": {
+        "name": "Promotion gate boundary",
+        "scope": "reusable_semantic_debugging_category",
+        "source_boundary": "classifies proof and promotion-gate evidence without claiming global promotion or production default changes",
+    },
+    "unknown_semantic_debugging_evidence": {
+        "name": "Unknown semantic-debug evidence",
+        "scope": "unclassified_semantic_debugging_evidence",
+        "source_boundary": "safe custom follow-through evidence is surfaced for local review without coercion into the case-specific label set",
+    },
+}
+
+BEHAVIOR_LABEL_CATEGORY_IDS = {
+    "false_positive_model_input_stripping": "evidence_boundary_control",
+    "runtime_suppression_zero_stdout": "runtime_delivery_boundary",
+    "false_positive_boundary_control": "unsupported_claim_boundary",
+    "runtime_quality_tui_path": "implementation_path_evidence",
+    "negative_proof_against_fake_cleanup": "negative_proof_boundary",
+    "proof_and_promotion_gate": "promotion_gate_boundary",
+}
+
 UNSUPPORTED_CLAIMS = {
     "root_cause_claim_supported": False,
     "all_history_completeness_claim_supported": False,
@@ -919,6 +966,10 @@ def _build_devlog_story_packet(
         next_reads=next_reads,
         followthrough_behavior_label_rows=followthrough_behavior_label_rows,
     )
+    semantic_debugging_categories = _devlog_semantic_debugging_categories(
+        behavior_quality_labels=behavior_quality_labels,
+        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
+    )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
         "mode": "deterministic_committed_safe_story_synthesis",
@@ -942,8 +993,9 @@ def _build_devlog_story_packet(
             supported_claims=supported_claims,
             non_claims=non_claims,
             failure_mode_ledger=failure_mode_ledger,
-            behavior_quality_labels=behavior_quality_labels,
+            semantic_debugging_categories=semantic_debugging_categories,
         ),
+        "semantic_debugging_categories": semantic_debugging_categories,
         "behavior_quality_labels": behavior_quality_labels,
         "supported_claims": supported_claims,
         "explicit_non_claims": non_claims,
@@ -952,7 +1004,7 @@ def _build_devlog_story_packet(
         "inference_privacy_boundaries": [
             "packet is synthesized only from already-sanitized failure-analysis structures",
             "take candidates are drafting angles, not generated devlog prose",
-            "repo artifacts may support behavior-quality or false-positive story evidence when safe handles are present, but they do not prove root cause or runtime promotion",
+            "repo artifacts may support semantic-debugging categories and case/story labels when safe handles are present, but they do not prove root cause or runtime promotion",
             "reviewed-negative retained recovery rows are retained as reviewed outcomes and are not promoted to open debt by this packet",
             "raw private text, absolute private paths, session identifiers, record selections, embedding/search artifacts, command details, and source details are not included",
         ],
@@ -962,6 +1014,12 @@ def _build_devlog_story_packet(
             "repo_handle_chronology_status": repo_handle_chronology.get("status"),
             "committed_safe_narrative_ledger_rows": len(committed_safe_narrative_ledger),
             "failure_mode_ledger_rows": len(failure_mode_ledger),
+            "semantic_debugging_category_rows": len(semantic_debugging_categories),
+            "unclassified_semantic_debugging_rows": sum(
+                1
+                for row in semantic_debugging_categories
+                if row.get("classification_status") in {"unclassified", "unknown"}
+            ),
             "behavior_quality_label_rows": len(behavior_quality_labels),
             "followthrough_behavior_label_rows": len(followthrough_behavior_label_rows),
             "next_read_rows": _int(next_reads.get("count")),
@@ -1009,7 +1067,7 @@ def _devlog_take_candidates(
         takes.append(
             {
                 "take_id": "repo_artifacts_carry_behavior_evidence",
-                "take": "Repo artifacts can support behavior-quality and false-positive story evidence when tied to safe task/review/doc/report handles.",
+                "take": "Repo artifacts can support reusable semantic-debugging categories with case-specific labels when tied to safe task/review/doc/report handles.",
                 "support": ["repo_handle_chronology.handle_type_counts", "story_phase_summary.rows"],
                 "boundary": "supports story evidence quality only; not live runtime cleanup or promotion",
             }
@@ -1195,7 +1253,7 @@ def _devlog_supported_claims(
         claims.append(
             {
                 "claim_id": "repo_artifacts_support_story_evidence",
-                "claim": "Committed-safe repo artifacts can support behavior-quality or false-positive story evidence.",
+                "claim": "Committed-safe repo artifacts can support semantic-debugging category evidence and bounded case-specific labels.",
                 "support_surfaces": ["repo_handle_chronology.rows", "repo_handle_chronology.handle_type_counts"],
                 "support_counts": {
                     "repo_rows": _int(repo_handle_chronology.get("phase_row_count")),
@@ -1434,9 +1492,19 @@ def _devlog_behavior_quality_labels(
         if not matched:
             continue
         representative_handles = _representative_behavior_handles(matched)
+        category_id = BEHAVIOR_LABEL_CATEGORY_IDS[label]
+        category_spec = SEMANTIC_DEBUG_CATEGORY_SPECS[category_id]
         labels.append(
             {
                 "label": label,
+                "case_label": label,
+                "case_label_scope": "semantic_linter_story_adapter",
+                "story_specific_labels": [label],
+                "category_id": category_id,
+                "category_name": category_spec["name"],
+                "category_scope": category_spec["scope"],
+                "classification_status": "classified",
+                "source_boundary": category_spec["source_boundary"],
                 "evidence_strength": {
                     "matched_row_count": len(matched),
                     "representative_handle_count": len(representative_handles),
@@ -1454,6 +1522,77 @@ def _devlog_behavior_quality_labels(
             }
         )
     return labels[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _devlog_semantic_debugging_categories(
+    *,
+    behavior_quality_labels: list[dict[str, Any]],
+    followthrough_behavior_label_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label_row in behavior_quality_labels:
+        if not isinstance(label_row, dict):
+            continue
+        category_id = str(label_row.get("category_id") or "")
+        category_spec = SEMANTIC_DEBUG_CATEGORY_SPECS.get(category_id)
+        if not category_spec:
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "category_id": category_id,
+                    "category_name": category_spec["name"],
+                    "classification_status": "classified",
+                    "scope": category_spec["scope"],
+                    "source_boundary": category_spec["source_boundary"],
+                    "case_labels": _list(label_row.get("story_specific_labels")) or [label_row.get("label")],
+                    "story_specific_labels": _list(label_row.get("story_specific_labels")) or [label_row.get("label")],
+                    "case_label_scope": label_row.get("case_label_scope"),
+                    "evidence_strength": label_row.get("evidence_strength"),
+                    "representative_safe_handles": label_row.get("representative_safe_handles"),
+                    "support_surfaces": label_row.get("support_surfaces"),
+                    "boundaries_non_claims": label_row.get("boundaries_non_claims"),
+                }
+            )
+        )
+
+    classified_labels = {str(row.get("label")) for row in behavior_quality_labels if isinstance(row, dict)}
+    for row in followthrough_behavior_label_rows:
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("label") or "")
+        if label in classified_labels or label in BEHAVIOR_QUALITY_LABEL_SPECS:
+            continue
+        category_spec = SEMANTIC_DEBUG_CATEGORY_SPECS["unknown_semantic_debugging_evidence"]
+        safe_handles = _list(row.get("representative_safe_handles"))
+        rows.append(
+            _clean_row(
+                {
+                    "category_id": "unknown_semantic_debugging_evidence",
+                    "category_name": category_spec["name"],
+                    "classification_status": "unclassified",
+                    "scope": category_spec["scope"],
+                    "source_boundary": category_spec["source_boundary"],
+                    "case_labels": [label] if label else [],
+                    "story_specific_labels": [label] if label else [],
+                    "case_label_scope": "custom_followthrough_behavior_evidence",
+                    "evidence_strength": {
+                        "matched_row_count": _int(row.get("matched_row_count")) or 1,
+                        "representative_handle_count": len(safe_handles),
+                        "source_surface_count": len({str(surface) for surface in _list(row.get("support_surfaces"))}),
+                    },
+                    "representative_safe_handles": safe_handles,
+                    "support_surfaces": row.get("support_surfaces"),
+                    "safe_labels": row.get("safe_labels"),
+                    "boundaries_non_claims": [
+                        "unclassified follow-through row is retained as safe semantic-debug evidence for local review; it is not coerced into the Semantic Linter case-label set",
+                        "raw private transcript material, private locations, opaque session identifiers, record selections, embedding/search artifacts, command details, and source details are not inspected or emitted",
+                        "does not claim product understanding, root cause, all-history completeness, live TUI cleanup, model forgetting, global promotion, token savings, speed, retrieval improvement, or final prose quality",
+                    ],
+                }
+            )
+        )
+    return rows[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
 
 
 def _behavior_quality_evidence_rows(
@@ -1617,7 +1756,8 @@ def _sanitized_followthrough_behavior_label_rows(packet: dict[str, Any]) -> list
         if not isinstance(row, dict):
             continue
         label = str(row.get("label") or "")
-        if label not in BEHAVIOR_QUALITY_LABEL_SPECS:
+        known_case_label = label in BEHAVIOR_QUALITY_LABEL_SPECS
+        if not known_case_label and not _safe_unknown_followthrough_case_label(label):
             continue
         safe_handles = [
             handle
@@ -1641,6 +1781,10 @@ def _sanitized_followthrough_behavior_label_rows(packet: dict[str, Any]) -> list
                 {
                     "source_index": index,
                     "label": label,
+                    "classification_status": "classified" if known_case_label else "unclassified",
+                    "case_label_scope": (
+                        "semantic_linter_story_adapter" if known_case_label else "custom_followthrough_behavior_evidence"
+                    ),
                     "status": _safe_followthrough_status(row.get("status")),
                     "evidence_status": _safe_followthrough_status(row.get("evidence_status")),
                     "matched_row_count": _int(row.get("matched_row_count")),
@@ -1648,8 +1792,8 @@ def _sanitized_followthrough_behavior_label_rows(packet: dict[str, Any]) -> list
                     "support_surfaces": support_surfaces or ["follow_through_behavior_labels.rows"],
                     "safe_labels": safe_labels,
                     "inference_boundary": (
-                        "sanitized follow-through row only; supports behavior-label planning, "
-                        "not raw evidence, root cause, all-history completeness, live TUI cleanup, "
+                        "sanitized follow-through row only; supports semantic-debug evidence planning, "
+                        "not raw evidence, product understanding, root cause, all-history completeness, live TUI cleanup, "
                         "model forgetting, token/speed claims, global promotion, or final prose"
                     ),
                 }
@@ -1683,6 +1827,15 @@ def _safe_followthrough_label_token(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_.:-]+", text))
 
 
+def _safe_unknown_followthrough_case_label(value: str) -> bool:
+    if not _safe_followthrough_label_token(value):
+        return False
+    lowered = value.lower()
+    if any(marker in lowered for marker in ("private", "raw", "session", "secret", "token", "payload")):
+        return False
+    return True
+
+
 def _safe_followthrough_status(value: Any) -> str | None:
     if not isinstance(value, (str, int)):
         return None
@@ -1697,7 +1850,7 @@ def _devlog_claim_support_ledger(
     supported_claims: list[dict[str, Any]],
     non_claims: list[dict[str, Any]],
     failure_mode_ledger: list[dict[str, Any]],
-    behavior_quality_labels: list[dict[str, Any]],
+    semantic_debugging_categories: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, claim in enumerate(supported_claims, 1):
@@ -1731,16 +1884,19 @@ def _devlog_claim_support_ledger(
                 "boundary": failure.get("interpretation_boundary"),
             }
         )
-    for index, label in enumerate(behavior_quality_labels, 1):
+    for index, category in enumerate(semantic_debugging_categories, 1):
         rows.append(
             {
-                "ledger_id": f"behavior-label-{index:03d}",
-                "ledger_kind": "behavior_quality_label",
-                "claim_id": label.get("label"),
-                "support_surfaces": label.get("support_surfaces"),
-                "support_counts": label.get("evidence_strength"),
-                "representative_safe_handles": label.get("representative_safe_handles"),
-                "boundary": "; ".join(str(item) for item in _list(label.get("boundaries_non_claims"))[:2]),
+                "ledger_id": f"semantic-debug-category-{index:03d}",
+                "ledger_kind": "semantic_debugging_category",
+                "claim_id": category.get("category_id"),
+                "classification_status": category.get("classification_status"),
+                "case_labels": category.get("case_labels"),
+                "support_surfaces": category.get("support_surfaces"),
+                "support_counts": category.get("evidence_strength"),
+                "representative_safe_handles": category.get("representative_safe_handles"),
+                "boundary": "; ".join(str(item) for item in _list(category.get("boundaries_non_claims"))[:2])
+                or category.get("source_boundary"),
             }
         )
     return rows[:DEVLOG_CLAIM_LEDGER_LIMIT]
