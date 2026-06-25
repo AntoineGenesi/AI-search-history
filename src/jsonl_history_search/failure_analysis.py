@@ -231,6 +231,7 @@ def build_failure_analysis_payload(
         follow_packet,
         next_reads,
         committed_safe_narrative_ledger,
+        repo_artifact_evidence_rows,
         transcript_date_range=transcript_recovery_date_range,
     )
     narrative_readiness = _build_narrative_readiness(
@@ -2748,6 +2749,7 @@ def _build_repo_handle_chronology(
     follow_packet: dict[str, Any],
     next_reads: dict[str, Any],
     committed_safe_narrative_ledger: list[dict[str, Any]],
+    repo_artifact_evidence_rows: list[dict[str, Any]],
     *,
     transcript_date_range: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2756,6 +2758,7 @@ def _build_repo_handle_chronology(
     candidates.extend(_repo_handle_candidates_from_forensics(forensics_packet))
     candidates.extend(_repo_handle_candidates_from_follow_next_reads(follow_packet))
     candidates.extend(_repo_handle_candidates_from_failure_analysis(next_reads, committed_safe_narrative_ledger))
+    candidates.extend(_repo_handle_candidates_from_repo_artifact_evidence(repo_artifact_evidence_rows))
 
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -2779,6 +2782,7 @@ def _build_repo_handle_chronology(
                     "date_source": date_source,
                     "status": _safe_repo_status(candidate.get("row")),
                     "confidence": _safe_repo_confidence(candidate.get("row")),
+                    "repo_artifact_metadata": _repo_artifact_chronology_metadata(candidate.get("row"), source),
                     "inference_boundary": _repo_inference_boundary(
                         handle_type=handle_type,
                         has_date=bool(date_value),
@@ -2940,6 +2944,49 @@ def _repo_handle_candidates_from_failure_analysis(
                 }
             )
     return candidates
+
+
+def _repo_handle_candidates_from_repo_artifact_evidence(
+    repo_artifact_evidence_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for index, row in enumerate(repo_artifact_evidence_rows, 1):
+        if not isinstance(row, dict):
+            continue
+        handles = [
+            handle
+            for handle in _list(row.get("representative_safe_handles"))
+            if isinstance(handle, str)
+        ]
+        if not handles:
+            continue
+        candidates.append(
+            {
+                "source": "repo_artifact_evidence.rows",
+                "source_index": _int(row.get("source_index")) or index,
+                "row": row,
+                "values": handles,
+            }
+        )
+    return candidates
+
+
+def _repo_artifact_chronology_metadata(row: Any, source: str) -> dict[str, Any] | None:
+    if source != "repo_artifact_evidence.rows" or not isinstance(row, dict):
+        return None
+    metadata = {
+        "category_ids": [
+            item for item in _list(row.get("category_ids")) if isinstance(item, str)
+        ][:6],
+        "phase_hints": [
+            item for item in _list(row.get("phase_hints")) if isinstance(item, str)
+        ][:6],
+        "support_surfaces": [
+            item for item in _list(row.get("support_surfaces")) if isinstance(item, str)
+        ][:6],
+        "evidence_strength": row.get("evidence_strength") if isinstance(row.get("evidence_strength"), dict) else None,
+    }
+    return _clean_row(metadata) or None
 
 
 def _repo_candidate_values(row: dict[str, Any]) -> list[Any]:
@@ -3161,6 +3208,8 @@ def _repo_inference_boundary(*, handle_type: str, has_date: bool, source: str) -
         return "commit hash and date are saved-report metadata; no repository history scan was run"
     if source.startswith("failure_analysis."):
         return "handle was derived from already-sanitized failure-analysis rows, not raw source payloads"
+    if source == "repo_artifact_evidence.rows":
+        return "handle was derived from sanitized repo-artifact evidence metadata only; no artifact contents were crawled"
     return "safe repo handle was joined from supplied saved-report metadata only"
 
 
