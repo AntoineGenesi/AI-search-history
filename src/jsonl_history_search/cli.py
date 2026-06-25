@@ -304,7 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional sanitized follow-through behavior-label JSON report. "
-            "Only known labels, safe repo-relative handles, and boundary labels are consumed."
+            "Known case labels are classified; safe custom labels with repo-relative handles "
+            "are retained as unclassified semantic-debug evidence."
         ),
     )
     failure_analysis.add_argument("--format", choices=("text", "json", "markdown"), default="json")
