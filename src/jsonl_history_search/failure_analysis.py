@@ -2409,7 +2409,7 @@ def _safe_repo_artifact_category_name(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not text or len(text) > 80 or _private_like_repo_artifact_token(text):
+    if not text or text.startswith("/") or len(text) > 80 or _private_like_repo_artifact_token(text):
         return None
     if not re.fullmatch(r"[A-Za-z0-9_ .:/-]+", text):
         return None
