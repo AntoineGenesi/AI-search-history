@@ -182,6 +182,7 @@ def build_failure_analysis_payload(
     forensics_report: Path | None = None,
     follow_next_reads_report: Path | None = None,
     follow_through_behavior_labels_report: Path | None = None,
+    repo_artifact_evidence_report: Path | None = None,
 ) -> dict[str, Any]:
     semantic_loaded = _load_report_packet(semantic_debug_report, "semantic_debug")
     forensics_loaded = _load_report_packet(forensics_report, "forensics") if forensics_report else _not_supplied("forensics")
@@ -195,6 +196,11 @@ def build_failure_analysis_payload(
         if follow_through_behavior_labels_report
         else _not_supplied("follow_through_behavior_labels")
     )
+    repo_artifact_evidence_loaded = (
+        _load_report_packet(repo_artifact_evidence_report, "repo_artifact_evidence")
+        if repo_artifact_evidence_report
+        else _not_supplied("repo_artifact_evidence")
+    )
 
     semantic_packet = semantic_loaded.get("packet") if semantic_loaded.get("loaded") else {}
     forensics_packet = forensics_loaded.get("packet") if forensics_loaded.get("loaded") else {}
@@ -203,6 +209,10 @@ def build_failure_analysis_payload(
         followthrough_labels_loaded.get("packet") if followthrough_labels_loaded.get("loaded") else {}
     )
     followthrough_behavior_label_rows = _sanitized_followthrough_behavior_label_rows(followthrough_labels_packet)
+    repo_artifact_evidence_packet = (
+        repo_artifact_evidence_loaded.get("packet") if repo_artifact_evidence_loaded.get("loaded") else {}
+    )
+    repo_artifact_evidence_rows = _sanitized_repo_artifact_evidence_rows(repo_artifact_evidence_packet)
 
     play_by_play = _build_play_by_play(semantic_packet, forensics_packet) if semantic_packet else []
     interesting_moments = _build_interesting_moments(semantic_packet, forensics_packet, follow_packet)
@@ -246,6 +256,8 @@ def build_failure_analysis_payload(
         forensics_packet,
         follow_packet,
         followthrough_behavior_label_rows,
+        repo_artifact_evidence_loaded,
+        repo_artifact_evidence_rows,
     )
     claim_boundaries = _claim_boundaries(semantic_loaded, forensics_loaded, follow_loaded)
     devlog_story_packet = _build_devlog_story_packet(
@@ -257,12 +269,14 @@ def build_failure_analysis_payload(
         claim_boundaries=claim_boundaries,
         next_reads=next_reads,
         followthrough_behavior_label_rows=followthrough_behavior_label_rows,
+        repo_artifact_evidence_rows=repo_artifact_evidence_rows,
     )
     tool_critique = _tool_critique(
         semantic_loaded=semantic_loaded,
         forensics_loaded=forensics_loaded,
         follow_loaded=follow_loaded,
         followthrough_labels_loaded=followthrough_labels_loaded,
+        repo_artifact_evidence_loaded=repo_artifact_evidence_loaded,
         semantic_packet=semantic_packet,
         forensics_packet=forensics_packet,
         follow_packet=follow_packet,
@@ -284,6 +298,7 @@ def build_failure_analysis_payload(
         forensics_packet,
         follow_packet,
         followthrough_labels_packet,
+        repo_artifact_evidence_packet,
     )
     privacy_flags["output_contains_only_sanitized_report_summaries"] = True
 
@@ -330,6 +345,8 @@ def _load_report_packet(path: Path | None, packet_key: str) -> dict[str, Any]:
     packet = loaded.get(packet_key) if isinstance(loaded, dict) else None
     if not isinstance(packet, dict) and packet_key == "semantic_debug" and isinstance(loaded, dict):
         packet = loaded if loaded.get("schema_version") or loaded.get("answer_readiness") else None
+    if not isinstance(packet, dict) and packet_key == "repo_artifact_evidence" and isinstance(loaded, dict):
+        packet = loaded if loaded.get("schema_version") or loaded.get("rows") else None
     if not isinstance(packet, dict):
         return _invalid_input(packet_key, f"{packet_key}_packet_missing")
     return {
@@ -414,6 +431,8 @@ def _build_evidence_backed_summary_inputs(
     forensics_packet: dict[str, Any],
     follow_packet: dict[str, Any],
     followthrough_behavior_label_rows: list[dict[str, Any]],
+    repo_artifact_evidence_loaded: dict[str, Any],
+    repo_artifact_evidence_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     inputs = [
         {
@@ -464,12 +483,29 @@ def _build_evidence_backed_summary_inputs(
             "sanitized_label_count": len({row.get("label") for row in followthrough_behavior_label_rows}),
             "source_surface": "follow_through_behavior_labels.rows",
         },
+        {
+            "input": "repo_artifact_evidence",
+            "supplied": repo_artifact_evidence_loaded.get("supplied"),
+            "loaded": repo_artifact_evidence_loaded.get("loaded"),
+            "status": repo_artifact_evidence_loaded.get("status"),
+            "schema_version": repo_artifact_evidence_loaded.get("schema_version"),
+            "sanitized_evidence_row_count": len(repo_artifact_evidence_rows),
+            "sanitized_category_count": len(
+                {
+                    category_id
+                    for row in repo_artifact_evidence_rows
+                    for category_id in _list(row.get("category_ids"))
+                }
+            ),
+            "source_surface": "repo_artifact_evidence.rows",
+        },
     ]
     for item, loaded in (
         (inputs[0], semantic_loaded),
         (inputs[1], forensics_loaded),
         (inputs[2], follow_loaded),
         (inputs[3], followthrough_labels_loaded),
+        (inputs[4], repo_artifact_evidence_loaded),
     ):
         if loaded.get("invalid_reason"):
             item["invalid_reason"] = loaded["invalid_reason"]
@@ -952,6 +988,7 @@ def _build_devlog_story_packet(
     claim_boundaries: dict[str, Any],
     next_reads: dict[str, Any],
     followthrough_behavior_label_rows: list[dict[str, Any]],
+    repo_artifact_evidence_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     readiness_status = str(narrative_readiness.get("status") or "unknown")
     phase_status = str(story_phase_summary.get("status") or "unknown")
@@ -980,6 +1017,7 @@ def _build_devlog_story_packet(
     semantic_debugging_categories = _devlog_semantic_debugging_categories(
         behavior_quality_labels=behavior_quality_labels,
         followthrough_behavior_label_rows=followthrough_behavior_label_rows,
+        repo_artifact_evidence_rows=repo_artifact_evidence_rows,
     )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
@@ -1033,6 +1071,7 @@ def _build_devlog_story_packet(
             ),
             "behavior_quality_label_rows": len(behavior_quality_labels),
             "followthrough_behavior_label_rows": len(followthrough_behavior_label_rows),
+            "repo_artifact_evidence_rows": len(repo_artifact_evidence_rows),
             "next_read_rows": _int(next_reads.get("count")),
         },
     }
@@ -1792,6 +1831,7 @@ def _devlog_semantic_debugging_categories(
     *,
     behavior_quality_labels: list[dict[str, Any]],
     followthrough_behavior_label_rows: list[dict[str, Any]],
+    repo_artifact_evidence_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for label_row in behavior_quality_labels:
@@ -1852,6 +1892,54 @@ def _devlog_semantic_debugging_categories(
                         "unclassified follow-through row is retained as safe semantic-debug evidence for local review; it is not coerced into the Semantic Linter case-label set",
                         "raw private transcript material, private locations, opaque session identifiers, record selections, embedding/search artifacts, command details, and source details are not inspected or emitted",
                         "does not claim product understanding, root cause, all-history completeness, live TUI cleanup, model forgetting, global promotion, token savings, speed, retrieval improvement, or final prose quality",
+                    ],
+                }
+            )
+        )
+    for repo_row in repo_artifact_evidence_rows:
+        if not isinstance(repo_row, dict):
+            continue
+        category_ids = _list(repo_row.get("category_ids")) or ["unknown_semantic_debugging_evidence"]
+        primary_category_id = str(category_ids[0])
+        category_spec = SEMANTIC_DEBUG_CATEGORY_SPECS.get(primary_category_id)
+        category_name = (
+            category_spec["name"]
+            if category_spec
+            else str(repo_row.get("category_name") or primary_category_id.replace("_", " ").replace("-", " ").title())
+        )
+        classification_status = "classified" if category_spec else "unclassified"
+        scope = category_spec["scope"] if category_spec else "generic_repo_artifact_evidence"
+        source_boundary = (
+            category_spec["source_boundary"]
+            if category_spec
+            else "safe generic repo-artifact evidence is surfaced for local review without coercion into Semantic Linter behavior labels"
+        )
+        safe_handles = _list(repo_row.get("representative_safe_handles"))
+        support_surfaces = _list(repo_row.get("support_surfaces")) or ["repo_artifact_evidence.rows"]
+        story_specific_labels = _list(repo_row.get("story_specific_labels"))
+        rows.append(
+            _clean_row(
+                {
+                    "category_id": primary_category_id,
+                    "category_name": category_name,
+                    "classification_status": classification_status,
+                    "scope": scope,
+                    "source_boundary": source_boundary,
+                    "case_labels": story_specific_labels,
+                    "story_specific_labels": story_specific_labels,
+                    "case_label_scope": "generic_repo_artifact_evidence",
+                    "category_candidates": category_ids,
+                    "phase_hints": repo_row.get("phase_hints"),
+                    "evidence_strength": repo_row.get("evidence_strength"),
+                    "representative_safe_handles": safe_handles,
+                    "support_surfaces": support_surfaces,
+                    "matched_safe_terms": repo_row.get("matched_safe_terms"),
+                    "claim_boundaries": repo_row.get("claim_boundaries"),
+                    "boundaries_non_claims": [
+                        *(_list(repo_row.get("claim_boundaries"))[:4]),
+                        "repo artifact evidence rows are supplied as sanitized metadata only; failure-analysis does not crawl repository artifacts",
+                        "generic repo-artifact categories are not forced into Semantic Linter behavior-quality labels",
+                        "raw private transcript material, absolute paths, private labels, opaque session identifiers, record selections, embedding/search artifacts, command details, and source payloads are not inspected or emitted",
                     ],
                 }
             )
@@ -2064,6 +2152,284 @@ def _sanitized_followthrough_behavior_label_rows(packet: dict[str, Any]) -> list
             )
         )
     return rows[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _sanitized_repo_artifact_evidence_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    raw_rows = _list(packet.get("rows") if isinstance(packet, dict) else [])
+    for index, row in enumerate(raw_rows, 1):
+        if not isinstance(row, dict):
+            continue
+        if _repo_artifact_row_has_forbidden_payload(row):
+            continue
+        if _repo_artifact_row_has_private_label_values(row):
+            continue
+        if _repo_artifact_row_has_unsafe_handle_or_surface_values(row):
+            continue
+        safe_handles = _safe_repo_artifact_handles(row)
+        support_surfaces = [
+            str(item)
+            for item in _repo_artifact_values(row, "support_surface", "support_surfaces", "surface", "surfaces")[:6]
+            if _safe_support_surface_label(str(item))
+        ]
+        category_ids = [
+            str(item)
+            for item in _repo_artifact_values(
+                row,
+                "category_id",
+                "category_ids",
+                "category_candidate",
+                "category_candidates",
+                "semantic_debugging_category",
+                "semantic_debugging_categories",
+            )[:6]
+            if _safe_repo_artifact_label_token(str(item))
+        ]
+        story_specific_labels = [
+            str(item)
+            for item in _repo_artifact_values(
+                row,
+                "story_specific_label",
+                "story_specific_labels",
+                "story_label",
+                "story_labels",
+                "safe_label",
+                "safe_labels",
+            )[:6]
+            if _safe_repo_artifact_story_label(str(item))
+        ]
+        phase_hints = [
+            str(item)
+            for item in _repo_artifact_values(row, "phase_hint", "phase_hints", "story_phase", "story_phases", "phase")[:6]
+            if _safe_repo_artifact_label_token(str(item))
+        ]
+        matched_safe_terms = [
+            str(item)
+            for item in _repo_artifact_values(row, "matched_safe_term", "matched_safe_terms", "safe_terms")[:8]
+            if _safe_repo_artifact_label_token(str(item))
+        ]
+        claim_boundaries = [
+            str(item)
+            for item in _repo_artifact_values(row, "claim_boundary", "claim_boundaries", "boundary", "boundaries")[:6]
+            if _safe_repo_artifact_boundary(str(item))
+        ]
+        evidence_strength = _repo_artifact_evidence_strength(row)
+        category_name = _safe_repo_artifact_category_name(row.get("category_name") or row.get("name"))
+        if not (safe_handles or support_surfaces or category_ids or story_specific_labels or phase_hints):
+            continue
+        rows.append(
+            _clean_row(
+                {
+                    "source_index": index,
+                    "category_ids": category_ids or ["unknown_semantic_debugging_evidence"],
+                    "category_name": category_name,
+                    "story_specific_labels": story_specific_labels,
+                    "phase_hints": phase_hints,
+                    "evidence_strength": evidence_strength,
+                    "representative_safe_handles": safe_handles,
+                    "support_surfaces": support_surfaces or ["repo_artifact_evidence.rows"],
+                    "matched_safe_terms": matched_safe_terms,
+                    "claim_boundaries": claim_boundaries
+                    or [
+                        "sanitized repo-artifact metadata only; no raw artifact crawling or root-cause claim"
+                    ],
+                    "inference_boundary": (
+                        "sanitized repo-artifact evidence row only; supports semantic-debug category framing, "
+                        "not Semantic Linter behavior-label classification, root cause, all-history completeness, "
+                        "token/speed claims, global promotion, final prose, or raw source inspection"
+                    ),
+                }
+            )
+        )
+    return rows[:DEVLOG_BEHAVIOR_LABEL_LIMIT]
+
+
+def _repo_artifact_values(row: dict[str, Any], *keys: str) -> list[Any]:
+    values: list[Any] = []
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value is not None:
+            values.append(value)
+    return values
+
+
+def _repo_artifact_row_has_forbidden_payload(row: dict[str, Any]) -> bool:
+    forbidden_keys = {
+        "body",
+        "command",
+        "command_payload",
+        "commands",
+        "cwd",
+        "index",
+        "indexes",
+        "payload",
+        "raw",
+        "raw_body",
+        "raw_text",
+        "record",
+        "records",
+        "selected_record",
+        "selected_records",
+        "session",
+        "session_id",
+        "session_ids",
+        "snippet",
+        "source",
+        "source_payload",
+        "source_ref",
+        "source_refs",
+        "text",
+        "vector",
+        "vectors",
+    }
+    for key, _value in _walk_items(row):
+        lowered = str(key).lower()
+        if lowered in forbidden_keys:
+            return True
+        if "payload" in lowered or "session" in lowered or "vector" in lowered or lowered in {"indexes", "records"}:
+            return True
+    return False
+
+
+def _repo_artifact_row_has_private_label_values(row: dict[str, Any]) -> bool:
+    for value in _repo_artifact_values(
+        row,
+        "category_id",
+        "category_ids",
+        "category_candidate",
+        "category_candidates",
+        "semantic_debugging_category",
+        "semantic_debugging_categories",
+        "story_specific_label",
+        "story_specific_labels",
+        "story_label",
+        "story_labels",
+        "safe_label",
+        "safe_labels",
+        "phase_hint",
+        "phase_hints",
+        "story_phase",
+        "story_phases",
+        "phase",
+        "matched_safe_term",
+        "matched_safe_terms",
+        "safe_terms",
+    ):
+        if isinstance(value, str) and _private_like_repo_artifact_token(value):
+            return True
+    return False
+
+
+def _repo_artifact_row_has_unsafe_handle_or_surface_values(row: dict[str, Any]) -> bool:
+    for value in _repo_artifact_values(
+        row,
+        "handle",
+        "handles",
+        "safe_handle",
+        "safe_handles",
+        "repo_relative_handle",
+        "repo_relative_handles",
+        "representative_safe_handle",
+        "representative_safe_handles",
+    ):
+        if _safe_followthrough_handle(value) is None:
+            return True
+    for value in _repo_artifact_values(row, "support_surface", "support_surfaces", "surface", "surfaces"):
+        if not _safe_support_surface_label(str(value)):
+            return True
+    return False
+
+
+def _safe_repo_artifact_handles(row: dict[str, Any]) -> list[str]:
+    handles: list[str] = []
+    seen: set[str] = set()
+    for value in _repo_artifact_values(
+        row,
+        "handle",
+        "handles",
+        "safe_handle",
+        "safe_handles",
+        "repo_relative_handle",
+        "repo_relative_handles",
+        "representative_safe_handle",
+        "representative_safe_handles",
+    ):
+        safe = _safe_followthrough_handle(value)
+        if not safe or safe in seen:
+            continue
+        seen.add(safe)
+        handles.append(safe)
+        if len(handles) >= 4:
+            break
+    return handles
+
+
+def _safe_repo_artifact_label_token(value: str) -> bool:
+    if not _safe_followthrough_label_token(value):
+        return False
+    return not _private_like_repo_artifact_token(value)
+
+
+def _safe_repo_artifact_story_label(value: str) -> bool:
+    if not _safe_repo_artifact_label_token(value):
+        return False
+    return len(value) <= 80
+
+
+def _private_like_repo_artifact_token(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "private",
+            "raw",
+            "secret",
+            "session",
+            "payload",
+            "vector",
+            "index",
+            "command",
+        )
+    )
+
+
+def _safe_repo_artifact_boundary(value: str) -> bool:
+    text = value.strip()
+    if not text or len(text) > 180 or text.startswith("/") or "\\" in text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("private", "raw ", "session", "payload", "secret", "vector", "index")):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_.,:;()' /-]+", text))
+
+
+def _safe_repo_artifact_category_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or text.startswith("/")
+        or re.match(r"^[A-Za-z]:[\\/]", text)
+        or len(text) > 80
+        or _private_like_repo_artifact_token(text)
+    ):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_ .:/-]+", text):
+        return None
+    return text
+
+
+def _repo_artifact_evidence_strength(row: dict[str, Any]) -> dict[str, int]:
+    strength = row.get("evidence_strength") if isinstance(row.get("evidence_strength"), dict) else {}
+    counts = {
+        "matched_row_count": _int(row.get("matched_row_count") or strength.get("matched_row_count")),
+        "evidence_count": _int(row.get("evidence_count") or strength.get("evidence_count")),
+        "support_count": _int(row.get("support_count") or strength.get("support_count")),
+    }
+    return {key: value for key, value in counts.items() if value > 0} or {"matched_row_count": 1}
 
 
 def _safe_followthrough_handle(value: Any) -> str | None:
@@ -2929,6 +3295,7 @@ def _tool_critique(
     forensics_loaded: dict[str, Any],
     follow_loaded: dict[str, Any],
     followthrough_labels_loaded: dict[str, Any],
+    repo_artifact_evidence_loaded: dict[str, Any],
     semantic_packet: dict[str, Any],
     forensics_packet: dict[str, Any],
     follow_packet: dict[str, Any],
@@ -2945,6 +3312,7 @@ def _tool_critique(
             "forensics": _input_status(forensics_loaded),
             "follow_next_reads": _input_status(follow_loaded),
             "follow_through_behavior_labels": _input_status(followthrough_labels_loaded),
+            "repo_artifact_evidence": _input_status(repo_artifact_evidence_loaded),
         },
         "what_the_tool_could_package": {
             "play_by_play_rows": len(play_by_play),
@@ -2964,6 +3332,8 @@ def _tool_critique(
         gaps.append("follow-next-reads report was not supplied")
     if not followthrough_labels_loaded.get("supplied"):
         gaps.append("follow-through behavior labels report was not supplied")
+    if not repo_artifact_evidence_loaded.get("supplied"):
+        gaps.append("repo-artifact evidence report was not supplied")
     if next_reads.get("status") == "followup_gap":
         gaps.append("no next-read handles were available in supplied reports")
     if audit_plan.get("cap_pressure_notes"):

@@ -309,6 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     failure_analysis.add_argument(
+        "--repo-artifact-evidence-report",
+        default=None,
+        help=(
+            "Optional sanitized generic repo-artifact evidence JSON report. "
+            "Safe repo-relative handles, support surfaces, category candidates, phase hints, "
+            "matched safe terms, counts, and claim boundaries can frame semantic-debug categories "
+            "without becoming Semantic Linter behavior labels."
+        ),
+    )
+    failure_analysis.add_argument(
         "--format",
         choices=("text", "json", "markdown"),
         default="json",
@@ -1939,6 +1949,9 @@ def main(argv: list[str] | None = None) -> int:
             else None,
             follow_through_behavior_labels_report=Path(args.follow_through_behavior_labels_report).expanduser()
             if args.follow_through_behavior_labels_report
+            else None,
+            repo_artifact_evidence_report=Path(args.repo_artifact_evidence_report).expanduser()
+            if args.repo_artifact_evidence_report
             else None,
         )
         rendered = render(payload, args.format)
