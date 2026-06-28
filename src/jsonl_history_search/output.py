@@ -1329,6 +1329,15 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
+    handoff = report.get("answer_ready_handoff")
+    if handoff:
+        lines.append(
+            "Answer-ready handoff: "
+            f"decision={handoff.get('decision')} "
+            f"answer_readiness_status={handoff.get('answer_readiness_status')} "
+            f"gate={handoff.get('answer_gate_status')} "
+            f"next={handoff.get('do_next')}"
+        )
     contract = report.get("final_answer_source_use_contract")
     if contract:
         lines.append("Final Answer Contract:")
@@ -1422,6 +1431,17 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.append("")
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
+    handoff = report.get("answer_ready_handoff")
+    if handoff:
+        lines.extend([
+            "",
+            "## Answer-Ready Handoff",
+            "",
+            f"- `decision`: `{handoff.get('decision')}`",
+            f"- `answer_readiness_status`: `{handoff.get('answer_readiness_status')}`",
+            f"- `answer_gate_status`: `{handoff.get('answer_gate_status')}`",
+            f"- `do_next`: `{handoff.get('do_next')}`",
+        ])
     contract = report.get("final_answer_source_use_contract")
     if contract:
         lines.extend([
