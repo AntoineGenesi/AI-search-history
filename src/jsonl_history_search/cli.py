@@ -1768,6 +1768,9 @@ def main(argv: list[str] | None = None) -> int:
                     "source_locator_handoff": packet["source_locator_handoff"],
                     "agent_instruction": packet["agent_instruction"],
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
+                    "answer_source_discipline_summary": (
+                        packet["final_answer_source_use_contract"].get("answer_source_discipline")
+                    ),
                     "claim_boundaries": packet["claim_boundaries"],
                     "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
                     "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
