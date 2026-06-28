@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from collections import Counter
 from datetime import datetime
@@ -250,6 +251,14 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         next_commands=decision_context["next_commands"],
     )
+    agent_instruction = build_agent_instruction(
+        query=agent_find["query"]["original"],
+        report_output=getattr(args, "report_output", None),
+        answer_readiness=answer_readiness,
+        guided_audit_flow=guided_audit_flow,
+        next_reads=next_reads,
+        hints=hints,
+    )
 
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -267,6 +276,7 @@ def build_semantic_debug_payload(
         "decision_context": decision_context,
         "audit_plan": audit_plan,
         "answer_readiness": answer_readiness,
+        "agent_instruction": agent_instruction,
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
         "uncertainty": uncertainty,
@@ -791,6 +801,7 @@ def build_next_commands(
                     {
                         "command_family": "read_more",
                         "argv": argv,
+                        "command": shell_command(argv),
                         "source": "next_reads.expansion_actions",
                         "raw_private_text_included": False,
                     }
@@ -801,6 +812,9 @@ def build_next_commands(
                 {
                     "command_family": "read_more",
                     "argv": ["jsonl-history-search", "read-more", read["target"], "--format", "json"],
+                    "command": shell_command(
+                        ["jsonl-history-search", "read-more", read["target"], "--format", "json"]
+                    ),
                     "source": "next_reads.target",
                     "raw_private_text_included": False,
                 }
@@ -810,6 +824,7 @@ def build_next_commands(
             {
                 "command_family": "git_show",
                 "argv": ["git", "show", "--stat", str(hints["commit"])],
+                "command": shell_command(["git", "show", "--stat", str(hints["commit"])]),
                 "source": "commit_hint",
                 "raw_private_text_included": False,
             }
@@ -819,11 +834,177 @@ def build_next_commands(
             {
                 "command_family": "git_log_path",
                 "argv": ["git", "log", "--oneline", "--", str(hints["path"])],
+                "command": shell_command(["git", "log", "--oneline", "--", str(hints["path"])]),
                 "source": "path_hint",
                 "raw_private_text_included": False,
             }
         )
     return dedupe_dicts(commands)[:16]
+
+
+def shell_command(argv: list[Any]) -> str:
+    normalized = [str(part) for part in argv]
+    if normalized and normalized[0] != "jsonl-history-search" and normalized[0] in {
+        "read-more",
+        "follow-next-reads",
+        "failure-analysis",
+        "semantic-debug",
+    }:
+        normalized.insert(0, "jsonl-history-search")
+    return " ".join(shlex.quote(part) for part in normalized)
+
+
+def build_agent_instruction(
+    *,
+    query: str,
+    report_output: str | None,
+    answer_readiness: dict[str, Any],
+    guided_audit_flow: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    hints: dict[str, str | None],
+) -> dict[str, Any]:
+    readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
+    primary_family = guided_audit_flow.get("primary_question_family")
+    recovery_first = readiness_decision == "inspect_recovery_reads" or bool(next_reads)
+    if readiness_decision == "answer_now":
+        decision = "answer_now"
+        required_next_action = "answer_from_source_backed_packet"
+    elif readiness_decision in {"inspect_recovery_reads", "run_audit_route", "gather_more_evidence"} and primary_family in {
+        "workflow_failure",
+        "why_did_this_happen",
+    }:
+        decision = "needs_investigation" if not recovery_first else "inspect_recovery_reads"
+        required_next_action = "expand_recovery_context_then_run_failure_analysis"
+    elif readiness_decision == "state_scoped_no_evidence":
+        decision = "answer_now"
+        required_next_action = "answer_scoped_no_evidence"
+    else:
+        decision = readiness_decision
+        required_next_action = "inspect_required_routes_or_gather_more_evidence"
+
+    report_path = str(Path(report_output).expanduser()) if report_output else None
+    follow_report = "follow-next-reads.json"
+    commands: list[dict[str, Any]] = []
+    if report_path:
+        follow_argv = [
+            "jsonl-history-search",
+            "follow-next-reads",
+            "--from-report",
+            report_path,
+            "--kind",
+            "recovery",
+            "--limit",
+            "3",
+            "--format",
+            "json",
+            "--report-output",
+            follow_report,
+        ]
+        commands.append(
+            {
+                "command_id": "expand_recovery_context",
+                "required_for_decisions": ["inspect_recovery_reads", "needs_investigation"],
+                "argv": follow_argv,
+                "command": shell_command(follow_argv),
+                "output_path": follow_report,
+                "purpose": "Expand bounded source context around semantic_debug.next_reads without rerunning broad search.",
+            }
+        )
+        failure_argv = [
+            "jsonl-history-search",
+            "failure-analysis",
+            "--semantic-debug-report",
+            report_path,
+            "--follow-next-reads-report",
+            follow_report,
+            "--story-id",
+            "investigation-brief",
+            "--format",
+            "json",
+        ]
+        commands.append(
+            {
+                "command_id": "build_investigation_brief",
+                "required_for_decisions": ["needs_investigation"],
+                "argv": failure_argv,
+                "command": shell_command(failure_argv),
+                "purpose": "Synthesize a deterministic devlog_brief from saved semantic-debug and recovery packets.",
+            }
+        )
+    else:
+        commands.append(
+            {
+                "command_id": "save_semantic_debug_report_first",
+                "required_for_decisions": ["inspect_recovery_reads", "needs_investigation"],
+                "argv": [
+                    "jsonl-history-search",
+                    "semantic-debug",
+                    query,
+                    "--report-output",
+                    "semantic-debug-report.json",
+                    "--format",
+                    "json",
+                ],
+                "command": shell_command(
+                    [
+                        "jsonl-history-search",
+                        "semantic-debug",
+                        query,
+                        "--report-output",
+                        "semantic-debug-report.json",
+                        "--format",
+                        "json",
+                    ]
+                ),
+                "purpose": "Create a saved semantic-debug report so recovery and investigation commands can refer to it.",
+            }
+        )
+
+    for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
+        commands.append(
+            {
+                "command_id": f"inspect_exact_source_{len(commands) + 1}",
+                "required_for_decisions": ["inspect_recovery_reads"],
+                "argv": command.get("argv"),
+                "command": command.get("command") or shell_command(command.get("argv") or []),
+                "purpose": "Open one exact source ref from the evidence packet when a targeted read is preferable.",
+            }
+        )
+
+    constraints = [
+        "Do not answer from snippets alone when decision is inspect_recovery_reads or needs_investigation.",
+        "Run the recovery command before synthesis when next_reads or omitted-window recovery are present.",
+        "Use failure-analysis/devlog_brief for timeline, supported claims, non-claims, gaps, and next reads before producing devlog-style conclusions.",
+        "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
+    ]
+    if decision == "answer_now":
+        constraints.insert(0, "Answer only within the allowed_answer_scope and cite/source the supporting handles.")
+
+    return {
+        "schema_version": 1,
+        "decision": decision,
+        "answer_readiness_decision": readiness_decision,
+        "required_next_action": required_next_action,
+        "answer_gate": {
+            "status": answer_readiness.get("status"),
+            "allowed_answer_scope": answer_readiness.get("allowed_answer_scope"),
+            "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
+        },
+        "commands": commands[:8],
+        "do_not_answer_until": constraints,
+        "workflow_layers": [
+            {"layer": "evidence_packet", "surface": "semantic_debug", "status": "current_packet"},
+            {"layer": "recovery_packet", "surface": "follow_next_reads", "status": "required_before_synthesis" if recovery_first else "optional"},
+            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "required_for_devlog_questions"},
+        ],
+        "privacy_boundaries": {
+            "raw_private_transcript_included": False,
+            "raw_session_ids_included": False,
+            "private_embedding_artifacts_included": False,
+            "commands_may_include_local_report_paths": bool(report_path),
+        },
+        "claim_boundaries": answer_readiness.get("claim_boundaries"),
+    }
 
 
 def compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

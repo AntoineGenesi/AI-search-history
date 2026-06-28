@@ -326,6 +326,14 @@ def render_failure_analysis_text(payload: dict) -> str:
     lines.append(f"Devlog brief next reads: {brief_next_reads.get('status')} ({brief_next_reads.get('count', 0)})")
     for read in (brief_next_reads.get("reads") or [])[:6]:
         lines.append(f"- next-read {read.get('read_id')}: {read.get('kind')} {read.get('source_handle')}")
+    instruction = report.get("agent_instruction") or {}
+    if instruction:
+        lines.append(
+            f"Agent instruction: {instruction.get('decision')} -> {instruction.get('required_next_action')}"
+        )
+        for command in (instruction.get("commands") or [])[:3]:
+            if command.get("command"):
+                lines.append(f"- {command.get('command_id')}: {command.get('command')}")
     brief_critique = devlog_brief.get("tool_critique") or {}
     packaged = brief_critique.get("what_the_tool_could_package") or {}
     lines.append(
@@ -509,6 +517,12 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     lines.append(f"- Next reads: `{brief_next_reads.get('status')}` (`{brief_next_reads.get('count', 0)}`)")
     for read in brief_next_reads.get("reads") or []:
         lines.append(f"- `{read.get('read_id')}`: `{read.get('kind')}` `{read.get('source_handle')}`")
+    instruction = report.get("agent_instruction") or {}
+    if instruction:
+        lines.append(f"- Agent instruction: `{instruction.get('decision')}` -> `{instruction.get('required_next_action')}`")
+        for command in (instruction.get("commands") or [])[:3]:
+            if command.get("command"):
+                lines.append(f"- `{command.get('command_id')}`: `{command.get('command')}`")
     brief_critique = devlog_brief.get("tool_critique") or {}
     lines.append(
         f"- Tool could package: `{', '.join(f'{key}={value}' for key, value in sorted((brief_critique.get('what_the_tool_could_package') or {}).items())) or 'none'}`"
@@ -1330,6 +1344,14 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"- allowed_answer_scope: {readiness.get('allowed_answer_scope')}")
         for action in readiness.get("required_before_answer", [])[:4]:
             lines.append(f"- {action}")
+    instruction = report.get("agent_instruction")
+    if instruction:
+        lines.append("Agent Instruction:")
+        lines.append(f"- decision: {instruction.get('decision')}")
+        lines.append(f"- required_next_action: {instruction.get('required_next_action')}")
+        for command in instruction.get("commands", [])[:3]:
+            if command.get("command"):
+                lines.append(f"- {command.get('command_id')}: {command.get('command')}")
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
@@ -1423,6 +1445,18 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         ])
         for action in readiness.get("required_before_answer", [])[:6]:
             lines.append(f"- {action}")
+    instruction = report.get("agent_instruction")
+    if instruction:
+        lines.extend([
+            "",
+            "## Agent Instruction",
+            "",
+            f"- `decision`: `{instruction.get('decision')}`",
+            f"- `required_next_action`: `{instruction.get('required_next_action')}`",
+        ])
+        for command in instruction.get("commands", [])[:5]:
+            if command.get("command"):
+                lines.append(f"- `{command.get('command_id')}`: `{command.get('command')}`")
     lines.extend([
         "",
         "## Strongest Candidates",

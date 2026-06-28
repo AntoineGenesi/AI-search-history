@@ -284,6 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Only status labels, counts, IDs, ranks, and hashed handles are consumed."
         ),
     )
+    follow_next_reads.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the follow-next-reads recovery packet should be written as JSON.",
+    )
     failure_analysis = subparsers.add_parser(
         "failure-analysis",
         description=(
@@ -1761,6 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
                     "candidate_count": len(packet["strongest_candidates"]),
                     "event_count": packet["tool_action_proof"]["event_count"],
                     "source_locator_handoff": packet["source_locator_handoff"],
+                    "agent_instruction": packet["agent_instruction"],
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
                     "claim_boundaries": packet["claim_boundaries"],
                     "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
@@ -2277,6 +2283,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(render(payload, args.format))
         packet = payload["follow_next_reads"]
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(render(payload, args.format), encoding="utf-8")
         if packet["status"] not in {"expanded", "partial_expanded", "no_next_reads"}:
             return 1
         return 0
