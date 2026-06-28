@@ -353,12 +353,15 @@ def _build_failure_analysis_agent_instruction(
 ) -> dict[str, Any]:
     brief_status = str(devlog_brief.get("status") or "")
     readiness_status = str(narrative_readiness.get("status") or "")
-    if brief_status in {"brief_usable_with_boundaries", "brief_partial"}:
-        decision = "answer_now"
-        required_next_action = "use_devlog_brief_with_boundaries"
-    elif not follow_next_reads_report and next_reads.get("status") == "available":
+    recovery_available_unopened = next_reads.get("status") == "available" and not narrative_readiness.get(
+        "recovery_opened"
+    )
+    if recovery_available_unopened:
         decision = "inspect_recovery_reads"
         required_next_action = "run_follow_next_reads_before_brief_synthesis"
+    elif brief_status in {"brief_usable_with_boundaries", "brief_partial"}:
+        decision = "answer_now"
+        required_next_action = "use_devlog_brief_with_boundaries"
     else:
         decision = "needs_investigation"
         required_next_action = "gather_more_safe_evidence_or_repo_artifact_evidence"

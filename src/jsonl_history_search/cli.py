@@ -2280,6 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
             reviewed_usability_decisions_path=Path(args.reviewed_usability_decisions).expanduser()
             if args.reviewed_usability_decisions
             else None,
+            recovery_report_output_path=Path(args.report_output).expanduser() if args.report_output else None,
         )
         print(render(payload, args.format))
         packet = payload["follow_next_reads"]

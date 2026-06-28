@@ -54,6 +54,7 @@ def build_follow_next_reads_payload(
     default_tz,
     cwd: Path,
     reviewed_usability_decisions_path: Path | None = None,
+    recovery_report_output_path: Path | None = None,
 ) -> dict[str, Any]:
     decisions_packet = load_recovery_usability_decisions(reviewed_usability_decisions_path)
     base: dict[str, Any] = {
@@ -187,6 +188,7 @@ def build_follow_next_reads_payload(
             "expanded_reads": expanded_reads,
             "agent_instruction": build_follow_next_reads_agent_instruction(
                 report_path=report_path,
+                recovery_report_output_path=recovery_report_output_path,
                 status=follow_next_reads_status(counts),
                 counts=counts,
             ),
@@ -197,6 +199,7 @@ def build_follow_next_reads_payload(
 def build_follow_next_reads_agent_instruction(
     *,
     report_path: Path,
+    recovery_report_output_path: Path | None,
     status: str,
     counts: dict[str, int],
 ) -> dict[str, Any]:
@@ -209,7 +212,8 @@ def build_follow_next_reads_agent_instruction(
     else:
         decision = "gather_more_evidence"
         required_next_action = "fix_or_rerun_recovery_reads_before_synthesis"
-    follow_report = "follow-next-reads.json"
+    follow_report = str(recovery_report_output_path) if recovery_report_output_path else "<saved-follow-next-reads-report.json>"
+    command_copy_pasteable = recovery_report_output_path is not None
     failure_argv = [
         "jsonl-history-search",
         "failure-analysis",
@@ -232,6 +236,7 @@ def build_follow_next_reads_agent_instruction(
                 "argv": failure_argv,
                 "command": " ".join(shlex.quote(str(part)) for part in failure_argv),
                 "requires_saved_follow_next_reads_report": follow_report,
+                "command_copy_pasteable": command_copy_pasteable,
                 "purpose": "Use this recovery packet with the original semantic-debug report to produce failure_analysis.devlog_brief.",
             }
         ],
