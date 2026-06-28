@@ -1358,9 +1358,8 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append("Agent Instruction:")
         lines.append(f"- decision: {instruction.get('decision')}")
         lines.append(f"- required_next_action: {instruction.get('required_next_action')}")
-        for command in instruction.get("commands", [])[:3]:
-            if command.get("command"):
-                lines.append(f"- {command.get('command_id')}: {command.get('command')}")
+        lines.append(f"- command_count: {len(instruction.get('commands', []))}")
+        lines.append("- commands: omitted from text output; use JSON for executable read-more commands")
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
@@ -1473,10 +1472,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             "",
             f"- `decision`: `{instruction.get('decision')}`",
             f"- `required_next_action`: `{instruction.get('required_next_action')}`",
+            f"- `command_count`: `{len(instruction.get('commands', []))}`",
+            "- `commands`: omitted from Markdown output; use JSON for executable read-more commands",
         ])
-        for command in instruction.get("commands", [])[:5]:
-            if command.get("command"):
-                lines.append(f"- `{command.get('command_id')}`: `{command.get('command')}`")
     lines.extend([
         "",
         "## Strongest Candidates",

@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from statistics import median
 from typing import Any
 
@@ -939,6 +940,7 @@ def build_answer_ready_handoff(
         next_reads=next_reads,
         hints=hints,
     )
+    command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
     source_use_summary = {
         "answer_scope": final_answer_contract.get("answer_scope"),
         "source_use_required": final_answer_contract.get("source_use_required"),
@@ -974,6 +976,14 @@ def build_answer_ready_handoff(
             "raw_transcript_text_included": False,
             "raw_source_lines_included": False,
             "raw_private_paths_included_in_commands": False,
+            "raw_private_payloads_included_in_commands": False,
+            "copy_paste_command_targets_include_local_path_like": command_target_privacy[
+                "any_local_path_like"
+            ],
+            "copy_paste_command_targets_include_absolute_path_like": command_target_privacy[
+                "any_absolute_path_like"
+            ],
+            "copy_paste_command_target_privacy_note": command_target_privacy["privacy_note"],
             "task_review_artifact_raw_text_included": False,
         },
         "links": {
@@ -1024,6 +1034,7 @@ def answer_ready_copy_paste_commands(
         if target not in command_targets:
             continue
         argv = ["jsonl-history-search", "read-more", str(target), "--mode", "window", "--format", "json"]
+        target_privacy = classify_command_target_privacy(target)
         commands.append(
             {
                 "command_family": "read_more",
@@ -1032,6 +1043,9 @@ def answer_ready_copy_paste_commands(
                 "source": "semantic_debug.next_reads",
                 "raw_private_text_included": False,
                 "raw_private_path_included": False,
+                "target_local_path_like": target_privacy["local_path_like"],
+                "target_absolute_path_like": target_privacy["absolute_path_like"],
+                "path_privacy_note": target_privacy["path_privacy_note"],
             }
         )
         if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
@@ -1039,18 +1053,114 @@ def answer_ready_copy_paste_commands(
     if len(commands) < ANSWER_READY_HANDOFF_COMMAND_CAP:
         for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False):
             if command.get("command_family") != "read_more":
+                target = command_target_from_command(command)
+                target_privacy = classify_command_target_privacy(target)
                 commands.append(
                     {
                         "command_family": command.get("command_family"),
+                        "target": target,
                         "command": command.get("command"),
                         "source": command.get("source"),
                         "raw_private_text_included": command.get("raw_private_text_included", False),
                         "raw_private_path_included": False,
+                        "target_local_path_like": target_privacy["local_path_like"],
+                        "target_absolute_path_like": target_privacy["absolute_path_like"],
+                        "path_privacy_note": target_privacy["path_privacy_note"],
                     }
                 )
             if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
                 break
     return dedupe_dicts(commands)[:ANSWER_READY_HANDOFF_COMMAND_CAP]
+
+
+def command_target_from_command(command: dict[str, Any]) -> str | None:
+    argv = list(command.get("argv") or [])
+    if len(argv) >= 2:
+        return str(argv[1])
+    command_text = command.get("command")
+    if not command_text:
+        return None
+    try:
+        parsed = shlex.split(str(command_text))
+    except ValueError:
+        return None
+    if len(parsed) >= 3 and parsed[0] == "jsonl-history-search" and parsed[1] == "read-more":
+        return parsed[2]
+    if len(parsed) >= 2 and parsed[0] == "read-more":
+        return parsed[1]
+    return None
+
+
+def classify_command_target_privacy(target: Any) -> dict[str, Any]:
+    text = "" if target is None else str(target)
+    target_without_line = source_target_path_part(text)
+    absolute_path_like = is_absolute_path_like(target_without_line)
+    local_path_like = bool(target_without_line) and (
+        absolute_path_like
+        or "/" in target_without_line
+        or "\\" in target_without_line
+        or target_without_line.endswith(".jsonl")
+        or target_without_line.startswith(".")
+    )
+    if absolute_path_like:
+        note = (
+            "Command target is an absolute local source-locator path. It is a path-like handle, "
+            "not raw transcript text, source lines, snippets, or payload text."
+        )
+    elif local_path_like:
+        note = (
+            "Command target is a local source-locator path-like handle. It is not raw transcript "
+            "text, source lines, snippets, or payload text."
+        )
+    else:
+        note = (
+            "Command target is not path-like. Command metadata does not include raw transcript "
+            "text, source lines, snippets, or payload text."
+        )
+    return {
+        "local_path_like": local_path_like,
+        "absolute_path_like": absolute_path_like,
+        "path_privacy_note": note,
+    }
+
+
+def summarize_command_target_privacy(commands: list[dict[str, Any]]) -> dict[str, Any]:
+    any_local = any(bool(command.get("target_local_path_like")) for command in commands)
+    any_absolute = any(bool(command.get("target_absolute_path_like")) for command in commands)
+    if any_absolute:
+        note = (
+            "One or more copy-paste command targets are absolute local source-locator paths. "
+            "These are path-like handles, not raw transcript/source-line/snippet/payload text."
+        )
+    elif any_local:
+        note = (
+            "One or more copy-paste command targets are local path-like source-locator handles. "
+            "No command metadata includes raw transcript/source-line/snippet/payload text."
+        )
+    else:
+        note = (
+            "Copy-paste command targets are not local path-like handles, and command metadata "
+            "does not include raw transcript/source-line/snippet/payload text."
+        )
+    return {
+        "any_local_path_like": any_local,
+        "any_absolute_path_like": any_absolute,
+        "privacy_note": note,
+    }
+
+
+def source_target_path_part(target: str) -> str:
+    if not target:
+        return ""
+    if len(target) > 2 and target.rsplit(":", 1)[-1].isdigit():
+        return target.rsplit(":", 1)[0]
+    return target
+
+
+def is_absolute_path_like(target: str) -> bool:
+    if not target:
+        return False
+    return PurePosixPath(target).is_absolute() or PureWindowsPath(target).is_absolute()
 
 
 def is_jsonl_read_target(target: Any) -> bool:
