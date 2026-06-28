@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +294,13 @@ def build_failure_analysis_payload(
         next_reads=next_reads,
         tool_critique=tool_critique,
     )
+    agent_instruction = _build_failure_analysis_agent_instruction(
+        semantic_debug_report=semantic_debug_report,
+        follow_next_reads_report=follow_next_reads_report,
+        devlog_brief=devlog_brief,
+        narrative_readiness=narrative_readiness,
+        next_reads=next_reads,
+    )
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
         semantic_packet,
@@ -317,6 +325,7 @@ def build_failure_analysis_payload(
         "committed_safe_narrative_ledger": committed_safe_narrative_ledger,
         "devlog_story_packet": devlog_story_packet,
         "devlog_brief": devlog_brief,
+        "agent_instruction": agent_instruction,
         "interesting_moments": interesting_moments,
         "tool_critique": tool_critique,
         "evidence_vs_inference": _evidence_vs_inference(
@@ -332,6 +341,113 @@ def build_failure_analysis_payload(
         "privacy_flags": privacy_flags,
     }
     return {"failure_analysis": packet}
+
+
+def _build_failure_analysis_agent_instruction(
+    *,
+    semantic_debug_report: Path,
+    follow_next_reads_report: Path | None,
+    devlog_brief: dict[str, Any],
+    narrative_readiness: dict[str, Any],
+    next_reads: dict[str, Any],
+) -> dict[str, Any]:
+    brief_status = str(devlog_brief.get("status") or "")
+    readiness_status = str(narrative_readiness.get("status") or "")
+    recovery_available_unopened = next_reads.get("status") == "available" and not narrative_readiness.get(
+        "recovery_opened"
+    )
+    if recovery_available_unopened:
+        decision = "inspect_recovery_reads"
+        required_next_action = "run_follow_next_reads_before_brief_synthesis"
+    elif brief_status in {"brief_usable_with_boundaries", "brief_partial"}:
+        decision = "answer_now"
+        required_next_action = "use_devlog_brief_with_boundaries"
+    else:
+        decision = "needs_investigation"
+        required_next_action = "gather_more_safe_evidence_or_repo_artifact_evidence"
+
+    commands: list[dict[str, Any]] = []
+    follow_report = "follow-next-reads.json"
+    if not follow_next_reads_report and next_reads.get("status") == "available":
+        follow_argv = [
+            "jsonl-history-search",
+            "follow-next-reads",
+            "--from-report",
+            str(semantic_debug_report),
+            "--kind",
+            "recovery",
+            "--limit",
+            "3",
+            "--format",
+            "json",
+            "--report-output",
+            follow_report,
+        ]
+        commands.append(
+            {
+                "command_id": "expand_recovery_context",
+                "argv": follow_argv,
+                "command": " ".join(shlex.quote(str(part)) for part in follow_argv),
+                "output_path": follow_report,
+                "purpose": "Open bounded source context around semantic_debug.next_reads before relying on this brief.",
+            }
+        )
+    failure_argv = [
+        "jsonl-history-search",
+        "failure-analysis",
+        "--semantic-debug-report",
+        str(semantic_debug_report),
+        "--story-id",
+        "investigation-brief",
+        "--format",
+        "json",
+    ]
+    if follow_next_reads_report:
+        failure_argv.extend(["--follow-next-reads-report", str(follow_next_reads_report)])
+    else:
+        failure_argv.extend(["--follow-next-reads-report", follow_report])
+    commands.append(
+        {
+            "command_id": "rerun_investigation_brief_after_recovery",
+            "argv": failure_argv,
+            "command": " ".join(shlex.quote(str(part)) for part in failure_argv),
+            "purpose": "Regenerate failure_analysis.devlog_brief after recovery or extra safe repo-artifact evidence is available.",
+        }
+    )
+    return {
+        "schema_version": 1,
+        "decision": decision,
+        "required_next_action": required_next_action,
+        "answer_gate": {
+            "brief_status": brief_status,
+            "narrative_readiness_status": readiness_status,
+            "next_reads_status": next_reads.get("status"),
+            "recovery_opened": narrative_readiness.get("recovery_opened"),
+            "reason_codes": list(narrative_readiness.get("reason_codes") or [])[:8],
+        },
+        "commands": commands[:4],
+        "do_not_answer_until": [
+            "Use devlog_brief.short_take, timeline_highlights, supported claims, non-claims, gaps, and next_reads as the answer boundary.",
+            "If recovery_not_opened is present, run follow-next-reads or explicitly state that only candidate-level evidence was available.",
+            "Do not turn story-specific labels into product defaults.",
+            "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value.",
+        ],
+        "workflow_layers": [
+            {"layer": "evidence_packet", "surface": "semantic_debug", "status": "loaded"},
+            {
+                "layer": "recovery_packet",
+                "surface": "follow_next_reads",
+                "status": "loaded" if follow_next_reads_report else "not_supplied",
+            },
+            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": brief_status},
+        ],
+        "privacy_boundaries": {
+            "raw_private_transcript_included": False,
+            "raw_session_ids_included": False,
+            "private_embedding_artifacts_included": False,
+            "commands_may_include_local_report_paths": True,
+        },
+    }
 
 
 def _load_report_packet(path: Path | None, packet_key: str) -> dict[str, Any]:

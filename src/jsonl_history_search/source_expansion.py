@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shlex
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ def build_follow_next_reads_payload(
     default_tz,
     cwd: Path,
     reviewed_usability_decisions_path: Path | None = None,
+    recovery_report_output_path: Path | None = None,
 ) -> dict[str, Any]:
     decisions_packet = load_recovery_usability_decisions(reviewed_usability_decisions_path)
     base: dict[str, Any] = {
@@ -184,7 +186,75 @@ def build_follow_next_reads_payload(
             },
             "failed_reads": failed_follow_next_read_summaries(expanded_reads),
             "expanded_reads": expanded_reads,
+            "agent_instruction": build_follow_next_reads_agent_instruction(
+                report_path=report_path,
+                recovery_report_output_path=recovery_report_output_path,
+                status=follow_next_reads_status(counts),
+                counts=counts,
+            ),
         }
+    }
+
+
+def build_follow_next_reads_agent_instruction(
+    *,
+    report_path: Path,
+    recovery_report_output_path: Path | None,
+    status: str,
+    counts: dict[str, int],
+) -> dict[str, Any]:
+    if status in {"expanded", "partial_expanded"} and counts.get("expanded_count", 0):
+        decision = "needs_investigation"
+        required_next_action = "run_failure_analysis_with_recovery_report"
+    elif status == "no_next_reads":
+        decision = "answer_now"
+        required_next_action = "answer_with_explicit_no_next_reads_boundary"
+    else:
+        decision = "gather_more_evidence"
+        required_next_action = "fix_or_rerun_recovery_reads_before_synthesis"
+    follow_report = str(recovery_report_output_path) if recovery_report_output_path else "<saved-follow-next-reads-report.json>"
+    command_copy_pasteable = recovery_report_output_path is not None
+    failure_argv = [
+        "jsonl-history-search",
+        "failure-analysis",
+        "--semantic-debug-report",
+        str(report_path),
+        "--follow-next-reads-report",
+        follow_report,
+        "--story-id",
+        "investigation-brief",
+        "--format",
+        "json",
+    ]
+    return {
+        "schema_version": 1,
+        "decision": decision,
+        "required_next_action": required_next_action,
+        "commands": [
+            {
+                "command_id": "build_investigation_brief",
+                "argv": failure_argv,
+                "command": " ".join(shlex.quote(str(part)) for part in failure_argv),
+                "requires_saved_follow_next_reads_report": follow_report,
+                "command_copy_pasteable": command_copy_pasteable,
+                "purpose": "Use this recovery packet with the original semantic-debug report to produce failure_analysis.devlog_brief.",
+            }
+        ],
+        "do_not_answer_until": [
+            "Do not synthesize devlog-style conclusions until expanded recovery reads have been reviewed or marked unusable.",
+            "Use failure_analysis.devlog_brief for supported claims, timeline/play-by-play, non-claims, gaps, and next reads.",
+            "Do not claim root cause, all-history completeness, final-answer quality, token savings, speed, or product value.",
+        ],
+        "workflow_layers": [
+            {"layer": "evidence_packet", "surface": "semantic_debug", "status": "already_saved"},
+            {"layer": "recovery_packet", "surface": "follow_next_reads", "status": status},
+            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "next"},
+        ],
+        "privacy_boundaries": {
+            "raw_text_included_in_this_packet": True,
+            "raw_paths_included_in_this_packet": True,
+            "committed_safe_without_sanitization": False,
+        },
     }
 
 
