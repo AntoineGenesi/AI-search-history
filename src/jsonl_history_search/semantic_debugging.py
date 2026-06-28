@@ -24,6 +24,7 @@ from .agent_contract import (
     reduction_ratio,
     source_ref_target,
 )
+from .answer_source_discipline import answer_source_discipline_summary, build_answer_source_discipline
 from .claims import classify_claim_action, parse_review_verdict
 from .forensics import build_forensics_payload
 from .query import infer_query
@@ -237,6 +238,23 @@ def build_semantic_debug_payload(
         forensics_workflow=forensics_workflow,
         next_reads=next_reads,
     )
+    answer_source_discipline = build_answer_source_discipline(
+        candidates=candidates,
+        source_locator_handoff=source_locator_handoff,
+        tool_proof=tool_proof,
+        joins=joins,
+        no_evidence=no_evidence,
+        next_reads=next_reads,
+        decision_context=decision_context,
+        answer_readiness=answer_readiness,
+    )
+    discipline_summary = answer_source_discipline_summary(answer_source_discipline)
+    final_answer_contract["answer_source_discipline"] = discipline_summary
+    answer_readiness["answer_source_discipline"] = discipline_summary
+    answer_readiness["basis"]["answer_source_discipline_blocked_facets"] = list(
+        (answer_source_discipline.get("answer_gate") or {}).get("blocked_facets") or []
+    )[:8]
+    answer_readiness["source_use_contract"]["answer_source_discipline"] = discipline_summary
     guided_audit_flow = build_guided_audit_flow(
         status=agent_find["status"],
         family=family,
@@ -250,6 +268,7 @@ def build_semantic_debug_payload(
         no_evidence=no_evidence,
         next_reads=next_reads,
         next_commands=decision_context["next_commands"],
+        answer_source_discipline=answer_source_discipline,
     )
     agent_instruction = build_agent_instruction(
         query=agent_find["query"]["original"],
@@ -258,6 +277,7 @@ def build_semantic_debug_payload(
         guided_audit_flow=guided_audit_flow,
         next_reads=next_reads,
         hints=hints,
+        answer_source_discipline=answer_source_discipline,
     )
 
     packet = {
@@ -282,6 +302,7 @@ def build_semantic_debug_payload(
         "uncertainty": uncertainty,
         "guided_audit_flow": guided_audit_flow,
         "next_reads": next_reads,
+        "answer_source_discipline": answer_source_discipline,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
@@ -862,6 +883,7 @@ def build_agent_instruction(
     guided_audit_flow: dict[str, Any],
     next_reads: list[dict[str, Any]],
     hints: dict[str, str | None],
+    answer_source_discipline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
     primary_family = guided_audit_flow.get("primary_question_family")
@@ -979,6 +1001,16 @@ def build_agent_instruction(
     ]
     if decision == "answer_now":
         constraints.insert(0, "Answer only within the allowed_answer_scope and cite/source the supporting handles.")
+    discipline_summary = answer_source_discipline_summary(answer_source_discipline)
+    discipline_gate = (
+        answer_source_discipline.get("answer_gate")
+        if isinstance(answer_source_discipline, dict) and isinstance(answer_source_discipline.get("answer_gate"), dict)
+        else {}
+    )
+    if discipline_gate:
+        constraints.append("Do not cite candidate-only or unsupported-extra handles as final support.")
+        if discipline_gate.get("missing_proof_must_be_stated"):
+            constraints.append("State missing proof/action facets instead of filling them with broad source lists.")
 
     return {
         "schema_version": 1,
@@ -989,6 +1021,7 @@ def build_agent_instruction(
             "status": answer_readiness.get("status"),
             "allowed_answer_scope": answer_readiness.get("allowed_answer_scope"),
             "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
+            "answer_source_discipline": discipline_summary,
         },
         "commands": commands[:8],
         "do_not_answer_until": constraints,
@@ -1912,6 +1945,7 @@ def build_guided_audit_flow(
     no_evidence: dict[str, Any],
     next_reads: list[dict[str, Any]],
     next_commands: list[dict[str, Any]],
+    answer_source_discipline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     query_plan = source_locator_handoff.get("query_plan") or {}
     primary_intent = query_plan.get("primary_intent") or "generic_history"
@@ -1939,6 +1973,7 @@ def build_guided_audit_flow(
         answer_readiness=answer_readiness,
         no_evidence=no_evidence,
         recovery=recovery,
+        answer_source_discipline=answer_source_discipline,
     )
     return {
         "schema_version": 1,
@@ -1968,6 +2003,7 @@ def build_guided_audit_flow(
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
             "final_answer_source_use_contract": "semantic_debug.final_answer_source_use_contract",
             "answer_readiness": "semantic_debug.answer_readiness",
+            "answer_source_discipline": "semantic_debug.answer_source_discipline",
             "no_evidence": "semantic_debug.no_evidence",
             "omitted_window_recovery": "semantic_debug.source_locator_handoff.omitted_window_recovery",
         },
@@ -2222,6 +2258,7 @@ def guided_answer_gate(
     answer_readiness: dict[str, Any],
     no_evidence: dict[str, Any],
     recovery: dict[str, Any],
+    answer_source_discipline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     required_actions = list(final_answer_contract.get("required_actions") or [])[:8]
     family_gate = {
@@ -2240,6 +2277,16 @@ def guided_answer_gate(
         completion_criteria.append("Promoted omitted-window recovery reads have been opened or explicitly deferred.")
     if no_evidence.get("needed"):
         completion_criteria.append("The answer avoids global all-history absence language.")
+    discipline_summary = answer_source_discipline_summary(answer_source_discipline)
+    discipline_gate = (
+        answer_source_discipline.get("answer_gate")
+        if isinstance(answer_source_discipline, dict) and isinstance(answer_source_discipline.get("answer_gate"), dict)
+        else {}
+    )
+    if discipline_gate:
+        completion_criteria.append("Candidate-only and unsupported-extra handles are not used as final support.")
+        if (discipline_summary.get("missing_proof_buckets") or []):
+            completion_criteria.append("Missing proof/action buckets are stated as gaps before synthesis.")
     return {
         "status": "active",
         "primary_question_family": primary_family,
@@ -2258,10 +2305,13 @@ def guided_answer_gate(
             "task_review_join_support_summary",
             empty_support_summary(),
         ),
+        "answer_source_discipline": discipline_summary,
         "forbidden_claims": [
             "root_cause_without_linked_reviewed_evidence",
             "global_absence_or_all_history_completeness",
             "jsonl_value_speed_token_or_final_answer_quality_without_separate_reviewed_evidence",
+            "candidate_only_or_unsupported_extra_handle_as_final_support",
+            "unstated_missing_proof_action_facet",
         ],
         "claim_boundaries": final_answer_contract.get("claim_boundaries", {}),
     }
@@ -2331,6 +2381,7 @@ def summarize_guided_audit_flow(guide: dict[str, Any]) -> dict[str, Any]:
             "required_before_answer": list(answer_gate.get("required_before_answer") or [])[:4],
             "forbidden_claims": list(answer_gate.get("forbidden_claims") or [])[:3],
             "answer_readiness_summary": answer_gate.get("answer_readiness_summary"),
+            "answer_source_discipline": answer_gate.get("answer_source_discipline"),
         },
         "next_read_targets": [item.get("target") for item in list(guide.get("next_reads") or [])[:5] if item.get("target")],
         "privacy_boundaries": guide.get("privacy_boundaries"),

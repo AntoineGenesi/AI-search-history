@@ -7,6 +7,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from .answer_source_discipline import answer_source_discipline_summary, update_recovery_read_accountability
+
 
 SCHEMA_VERSION = 1
 PLAY_BY_PLAY_LIMIT = 40
@@ -214,6 +216,7 @@ def build_failure_analysis_payload(
         repo_artifact_evidence_loaded.get("packet") if repo_artifact_evidence_loaded.get("loaded") else {}
     )
     repo_artifact_evidence_rows = _sanitized_repo_artifact_evidence_rows(repo_artifact_evidence_packet)
+    answer_source_discipline = _build_downstream_answer_source_discipline(semantic_packet, follow_packet)
 
     play_by_play = _build_play_by_play(semantic_packet, forensics_packet) if semantic_packet else []
     interesting_moments = _build_interesting_moments(semantic_packet, forensics_packet, follow_packet)
@@ -301,6 +304,10 @@ def build_failure_analysis_payload(
         narrative_readiness=narrative_readiness,
         next_reads=next_reads,
     )
+    if answer_source_discipline:
+        agent_instruction["answer_gate"]["answer_source_discipline"] = answer_source_discipline_summary(
+            answer_source_discipline
+        )
     privacy_flags = dict(PRIVACY_FLAGS)
     privacy_flags["input_reports_may_contain_raw_private_material"] = _input_reports_may_contain_raw_private_material(
         semantic_packet,
@@ -326,6 +333,7 @@ def build_failure_analysis_payload(
         "devlog_story_packet": devlog_story_packet,
         "devlog_brief": devlog_brief,
         "agent_instruction": agent_instruction,
+        "answer_source_discipline": answer_source_discipline,
         "interesting_moments": interesting_moments,
         "tool_critique": tool_critique,
         "evidence_vs_inference": _evidence_vs_inference(
@@ -446,6 +454,37 @@ def _build_failure_analysis_agent_instruction(
             "raw_session_ids_included": False,
             "private_embedding_artifacts_included": False,
             "commands_may_include_local_report_paths": True,
+        },
+    }
+
+
+def _build_downstream_answer_source_discipline(
+    semantic_packet: dict[str, Any],
+    follow_packet: dict[str, Any],
+) -> dict[str, Any]:
+    discipline = (
+        semantic_packet.get("answer_source_discipline")
+        if isinstance(semantic_packet.get("answer_source_discipline"), dict)
+        else {}
+    )
+    if not discipline:
+        return {}
+    updated = update_recovery_read_accountability(
+        discipline,
+        follow_next_reads=follow_packet if follow_packet else None,
+    )
+    return {
+        **updated,
+        "downstream_consumption": {
+            "surface": "failure_analysis",
+            "semantic_debug_answer_source_discipline_loaded": True,
+            "follow_next_reads_reflected": bool(follow_packet),
+            "summary": answer_source_discipline_summary(updated),
+            "privacy": {
+                "raw_private_text_included": False,
+                "raw_paths_included": False,
+                "raw_session_ids_included": False,
+            },
         },
     }
 
