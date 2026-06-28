@@ -279,6 +279,15 @@ def build_semantic_debug_payload(
         hints=hints,
         answer_source_discipline=answer_source_discipline,
     )
+    answer_ready_handoff = build_answer_ready_handoff(
+        answer_readiness=answer_readiness,
+        guided_audit_flow=guided_audit_flow,
+        answer_source_discipline=answer_source_discipline,
+        final_answer_contract=final_answer_contract,
+        next_reads=next_reads,
+        hints=hints,
+        no_evidence=no_evidence,
+    )
 
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -302,6 +311,7 @@ def build_semantic_debug_payload(
         "uncertainty": uncertainty,
         "guided_audit_flow": guided_audit_flow,
         "next_reads": next_reads,
+        "answer_ready_handoff": answer_ready_handoff,
         "answer_source_discipline": answer_source_discipline,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
@@ -873,6 +883,180 @@ def shell_command(argv: list[Any]) -> str:
     }:
         normalized.insert(0, "jsonl-history-search")
     return " ".join(shlex.quote(part) for part in normalized)
+
+
+ANSWER_READY_HANDOFF_READ_CAP = 5
+ANSWER_READY_HANDOFF_COMMAND_CAP = 3
+
+
+def build_answer_ready_handoff(
+    *,
+    answer_readiness: dict[str, Any],
+    guided_audit_flow: dict[str, Any],
+    answer_source_discipline: dict[str, Any],
+    final_answer_contract: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    hints: dict[str, str | None],
+    no_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    answer_gate = guided_audit_flow.get("answer_gate") or {}
+    discipline_gate = answer_source_discipline.get("answer_gate") or {}
+    discipline_summary = answer_source_discipline_summary(answer_source_discipline)
+    blocked_facets = list(discipline_gate.get("blocked_facets") or discipline_summary.get("blocked_facets") or [])[
+        :8
+    ]
+    readiness_status = answer_readiness.get("status")
+    readiness_decision = answer_readiness.get("decision")
+    no_evidence_needed = bool(no_evidence.get("needed"))
+
+    if readiness_decision == "answer_now":
+        decision = "answerable"
+        do_next = "answer_from_source_backed_packet"
+    elif readiness_decision == "state_scoped_no_evidence":
+        decision = "scoped_no_evidence"
+        do_next = "answer_not_found_in_searched_scope_only"
+    elif readiness_decision == "inspect_recovery_reads":
+        decision = "recovery_first"
+        do_next = "open_bounded_next_reads_before_answering"
+    elif readiness_decision == "run_audit_route":
+        decision = "audit_required"
+        do_next = "run_required_audit_route_before_answering"
+    else:
+        decision = "insufficient_evidence"
+        do_next = "gather_more_source_backed_evidence"
+
+    do_not_answer_until = list(answer_readiness.get("required_before_answer") or [])[:6]
+    if blocked_facets:
+        facet_text = ", ".join(blocked_facets)
+        do_not_answer_until.append(f"State or resolve answer_source_discipline blocked facets: {facet_text}.")
+    if no_evidence_needed:
+        do_not_answer_until.append("Keep no-evidence claims scoped to searched scope; do not claim all-history absence.")
+    do_not_answer_until = dedupe(do_not_answer_until)[:8]
+
+    bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
+    copy_paste_commands = answer_ready_copy_paste_commands(
+        bounded_next_reads=bounded_next_reads,
+        next_reads=next_reads,
+        hints=hints,
+    )
+    source_use_summary = {
+        "answer_scope": final_answer_contract.get("answer_scope"),
+        "source_use_required": final_answer_contract.get("source_use_required"),
+        "required_action_count": len(final_answer_contract.get("required_actions") or []),
+        "bounded_next_read_count": len(bounded_next_reads),
+        "copy_paste_command_count": len(copy_paste_commands),
+        "blocked_facets": blocked_facets,
+        "missing_proof_buckets": list(discipline_summary.get("missing_proof_buckets") or [])[:8],
+        "candidate_only_citation_allowed": discipline_summary.get("candidate_only_citation_allowed"),
+        "unsupported_extra_handle_citation_allowed": discipline_summary.get(
+            "unsupported_extra_handle_citation_allowed"
+        ),
+        "scoped_no_evidence_only": no_evidence_needed,
+    }
+    return {
+        "schema_version": 1,
+        "decision": decision,
+        "answer_readiness_status": readiness_status,
+        "answer_gate_status": answer_gate.get("status") or "active",
+        "do_next": do_next,
+        "do_not_answer_until": do_not_answer_until,
+        "bounded_next_reads": bounded_next_reads,
+        "copy_paste_commands": copy_paste_commands,
+        "cap_policy": {
+            "bounded_next_reads": ANSWER_READY_HANDOFF_READ_CAP,
+            "copy_paste_commands": ANSWER_READY_HANDOFF_COMMAND_CAP,
+            "deterministic_order": "semantic_debug.next_reads order; jsonl read-more commands first",
+        },
+        "source_use_summary": source_use_summary,
+        "claim_boundaries": answer_readiness.get("claim_boundaries"),
+        "privacy_boundaries": {
+            **(answer_readiness.get("privacy_boundaries") or {}),
+            "raw_transcript_text_included": False,
+            "raw_source_lines_included": False,
+            "raw_private_paths_included_in_commands": False,
+            "task_review_artifact_raw_text_included": False,
+        },
+        "links": {
+            "answer_readiness": "semantic_debug.answer_readiness",
+            "guided_audit_flow": "semantic_debug.guided_audit_flow",
+            "answer_gate": "semantic_debug.guided_audit_flow.answer_gate",
+            "answer_source_discipline": "semantic_debug.answer_source_discipline",
+            "final_answer_source_use_contract": "semantic_debug.final_answer_source_use_contract",
+            "next_reads": "semantic_debug.next_reads",
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+            "no_evidence": "semantic_debug.no_evidence",
+        },
+    }
+
+
+def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for read in next_reads[:ANSWER_READY_HANDOFF_READ_CAP]:
+        target = read.get("target")
+        kind = read.get("kind")
+        guidance = (
+            "run bounded read-more command"
+            if is_jsonl_read_target(target)
+            else "inspect/open this local task, review, or artifact handle without pasting raw private text"
+        )
+        row = {
+            "kind": kind,
+            "target": target,
+            "reason": read.get("reason"),
+            "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
+            "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
+            "action": guidance,
+        }
+        rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
+    return rows
+
+
+def answer_ready_copy_paste_commands(
+    *,
+    bounded_next_reads: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+    hints: dict[str, str | None],
+) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    command_targets = {read.get("target") for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))}
+    for read in next_reads:
+        target = read.get("target")
+        if target not in command_targets:
+            continue
+        argv = ["jsonl-history-search", "read-more", str(target), "--mode", "window", "--format", "json"]
+        commands.append(
+            {
+                "command_family": "read_more",
+                "target": target,
+                "command": shell_command(argv),
+                "source": "semantic_debug.next_reads",
+                "raw_private_text_included": False,
+                "raw_private_path_included": False,
+            }
+        )
+        if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
+            break
+    if len(commands) < ANSWER_READY_HANDOFF_COMMAND_CAP:
+        for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False):
+            if command.get("command_family") != "read_more":
+                commands.append(
+                    {
+                        "command_family": command.get("command_family"),
+                        "command": command.get("command"),
+                        "source": command.get("source"),
+                        "raw_private_text_included": command.get("raw_private_text_included", False),
+                        "raw_private_path_included": False,
+                    }
+                )
+            if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
+                break
+    return dedupe_dicts(commands)[:ANSWER_READY_HANDOFF_COMMAND_CAP]
+
+
+def is_jsonl_read_target(target: Any) -> bool:
+    if not target:
+        return False
+    return ".jsonl" in str(target)
 
 
 def build_agent_instruction(
