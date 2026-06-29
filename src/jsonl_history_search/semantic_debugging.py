@@ -1505,6 +1505,12 @@ def build_source_window_action_proof(
     ][:ACTION_PROOF_BUCKET_RECORD_CAP]
     change_records = changed_check_review_commit_records(tool_events, joins)
     adjacent_records = adjacent_artifact_records(joins, next_reads)
+    verification_reads = [
+        read
+        for read in next_reads
+        if isinstance(read.get("action_proof_source_selection"), dict)
+        and read["action_proof_source_selection"].get("source_window_verification_required") is True
+    ]
 
     buckets = {
         "user_concern_request": action_bucket(
@@ -1571,11 +1577,14 @@ def build_source_window_action_proof(
             "missing_labels": action_proof_missing_labels(buckets),
             "answer_source_discipline_decision": discipline_gate.get("decision"),
             "answer_source_discipline_blocked_facets": list(discipline_gate.get("blocked_facets") or [])[:8],
+            "source_window_verification_required": bool(verification_reads),
+            "verification_required_next_read_count": len(verification_reads),
         },
         "guidance": {
             "use_for_claimed_action_questions": True,
             "assistant_claim_boundary": "final_assistant_answer_claim records show what was claimed, not whether the action happened",
             "missing_evidence_policy": "missing buckets are labeled explicitly; do not infer action proof from adjacent artifacts or assistant prose",
+            "source_window_boundary": "action-proof next_reads are candidate source windows; verify the opened window is the requested original source window before answering",
         },
         "links": {
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
@@ -1601,6 +1610,7 @@ def build_source_window_action_proof(
             "assistant_prose_satisfies_action_proof": False,
             "adjacent_artifact_satisfies_primary_action_proof": False,
             "missing_output_inferred_from_call": False,
+            "candidate_next_read_proves_original_source_window": False,
         },
     }
 
@@ -1617,6 +1627,8 @@ def source_window_action_proof_guidance(bundle: dict[str, Any]) -> dict[str, Any
         "primary_record_count": summary.get("primary_record_count", 0),
         "adjacent_record_count": summary.get("adjacent_record_count", 0),
         "missing_buckets": list(summary.get("missing_buckets") or [])[:8],
+        "source_window_verification_required": bool(summary.get("source_window_verification_required", False)),
+        "source_window_boundary": "candidate next_reads require window verification before original-source claims",
         "bucket_statuses": {
             key: value.get("status")
             for key, value in buckets.items()
@@ -2907,7 +2919,7 @@ def action_proof_source_next_reads(
             "target": source_ref_target(source_ref),
             "candidate_id": candidate_id,
             "source_ref": source_ref,
-            "reason": "open original action-proof source window before later echo records",
+            "reason": "inspect candidate action-proof source window; verify original window before answering",
             "action_proof_source_selection": {
                 "schema_version": 1,
                 "selection_reason": item["selection_reason"],
@@ -2916,6 +2928,8 @@ def action_proof_source_next_reads(
                 "query_term_overlap_count": len(item.get("matched_query_terms") or []),
                 "raw_text_included": False,
                 "bounded_to_surfaced_source_files": True,
+                "source_window_verification_required": True,
+                "claim_boundary": "candidate_action_window_not_proof_of_original_source_window",
             },
             "expansion_actions": read_more_actions_for_source_ref(
                 source_ref,
