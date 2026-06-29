@@ -412,6 +412,155 @@ def render_follow_next_reads_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+_RECOVERY_REVIEW_COUNT_KEYS = (
+    "recovery_opened",
+    "reviewed_usable",
+    "reviewed_not_useful",
+    "still_unreviewed",
+    "review_gap",
+    "review_debt",
+)
+
+
+def _failure_analysis_recovery_review_text_lines(story_packet: dict) -> list[str]:
+    handoff = story_packet.get("recovery_review_handoff") or {}
+    summary = story_packet.get("reviewed_recovery_summary") or {}
+    if not handoff and not summary:
+        return []
+
+    summary_counts = summary.get("counts") or {}
+    handoff_counts = handoff.get("counts") or {}
+    summary_count_text = ", ".join(
+        f"{key}={summary_counts.get(key, 0)}" for key in _RECOVERY_REVIEW_COUNT_KEYS
+    )
+    handoff_count_text = ", ".join(
+        f"{key}={handoff_counts.get(key, 0)}"
+        for key in (
+            "review_debt",
+            "safe_review_item_count",
+            "not_rendered_due_to_limit",
+        )
+        if key in handoff_counts
+    ) or "none"
+    no_open_debt = "yes" if not summary.get("review_debt_remaining") else "no"
+    lines = [
+        "Recovery review:",
+        (
+            f"- summary: {summary.get('status')} handoff={summary.get('recovery_review_handoff_status')} "
+            f"story_packet={summary.get('story_packet_status')} no_open_review_debt={no_open_debt}"
+        ),
+        f"- counts: {summary_count_text}",
+        f"- handoff counts: {handoff_count_text}",
+    ]
+
+    remaining_gaps = summary.get("remaining_review_gaps") or []
+    if remaining_gaps:
+        for gap in remaining_gaps[:6]:
+            lines.append(
+                f"- remaining review gap {gap.get('gap_id')}: "
+                f"{gap.get('reason')} count={gap.get('count', 0)}"
+            )
+    else:
+        lines.append("- remaining review gaps: none")
+
+    blocked_claims = [
+        row for row in (handoff.get("blocked_claims_until_review") or []) if row.get("blocked")
+    ]
+    if blocked_claims:
+        claim_ids = ", ".join(str(row.get("claim_id")) for row in blocked_claims[:8])
+        lines.append(f"- blocked claims until review: {claim_ids}")
+    else:
+        lines.append("- blocked claims until review: none")
+
+    for item in (handoff.get("review_items") or [])[:6]:
+        target = item.get("target_handle") or {}
+        source = item.get("source_handle") or {}
+        line_range = item.get("line_range") or {}
+        lines.append(
+            f"- review item {item.get('review_item_id')}: status={item.get('status')} "
+            f"target={target.get('target_handle')} source={source.get('path_handle')} "
+            f"lines={line_range.get('start')}..{line_range.get('end')} "
+            f"reason={item.get('reason') or item.get('reason_label')}"
+        )
+
+    return lines
+
+
+def _failure_analysis_recovery_review_markdown_lines(story_packet: dict) -> list[str]:
+    handoff = story_packet.get("recovery_review_handoff") or {}
+    summary = story_packet.get("reviewed_recovery_summary") or {}
+    if not handoff and not summary:
+        return []
+
+    summary_counts = summary.get("counts") or {}
+    handoff_counts = handoff.get("counts") or {}
+    lines = [
+        "",
+        "### Recovery Review",
+        "",
+        f"- Summary status: `{summary.get('status')}`",
+        f"- Handoff status: `{summary.get('recovery_review_handoff_status')}`",
+        f"- Story packet status: `{summary.get('story_packet_status')}`",
+        f"- No open review debt: `{'yes' if not summary.get('review_debt_remaining') else 'no'}`",
+        (
+            "- Review counts: "
+            + ", ".join(
+                f"`{key}={summary_counts.get(key, 0)}`" for key in _RECOVERY_REVIEW_COUNT_KEYS
+            )
+        ),
+    ]
+    if handoff_counts:
+        lines.append(
+            "- Handoff counts: "
+            + ", ".join(
+                f"`{key}={handoff_counts.get(key, 0)}`"
+                for key in (
+                    "review_debt",
+                    "safe_review_item_count",
+                    "not_rendered_due_to_limit",
+                )
+                if key in handoff_counts
+            )
+        )
+
+    remaining_gaps = summary.get("remaining_review_gaps") or []
+    if remaining_gaps:
+        lines.append("- Remaining review gaps:")
+        for gap in remaining_gaps[:6]:
+            lines.append(
+                f"  - `{gap.get('gap_id')}`: `{gap.get('reason')}` count `{gap.get('count', 0)}`"
+            )
+    else:
+        lines.append("- Remaining review gaps: `none`")
+
+    blocked_claims = [
+        row for row in (handoff.get("blocked_claims_until_review") or []) if row.get("blocked")
+    ]
+    if blocked_claims:
+        lines.append(
+            "- Blocked claims until review: "
+            + ", ".join(f"`{row.get('claim_id')}`" for row in blocked_claims[:8])
+        )
+    else:
+        lines.append("- Blocked claims until review: `none`")
+
+    review_items = handoff.get("review_items") or []
+    if review_items:
+        lines.append("- Safe review items:")
+        for item in review_items[:6]:
+            target = item.get("target_handle") or {}
+            source = item.get("source_handle") or {}
+            line_range = item.get("line_range") or {}
+            lines.append(
+                f"  - `{item.get('review_item_id')}` status `{item.get('status')}`; "
+                f"target `{target.get('target_handle')}`; source `{source.get('path_handle')}`; "
+                f"lines `{line_range.get('start')}..{line_range.get('end')}`; "
+                f"reason `{item.get('reason') or item.get('reason_label')}`"
+            )
+
+    return lines
+
+
 def render_failure_analysis_text(payload: dict) -> str:
     report = payload["failure_analysis"]
     scope = report.get("story_scope") or {}
@@ -546,6 +695,7 @@ def render_failure_analysis_text(payload: dict) -> str:
         lines.append(f"- non-claim {non_claim.get('claim_id')}: {non_claim.get('non_claim')}")
     for gap in (story_packet.get("gaps") or [])[:6]:
         lines.append(f"- gap {gap.get('gap_id')}: {gap.get('status')} ({gap.get('reason')})")
+    lines.extend(_failure_analysis_recovery_review_text_lines(story_packet))
     lines.extend([
         "Repo handle chronology rows:",
     ])
@@ -736,6 +886,9 @@ def render_failure_analysis_markdown(payload: dict) -> str:
         f"- Claim/support ledger rows: `{len(story_packet.get('claim_support_ledger') or [])}`",
         f"- Semantic-debugging categories: `{len(semantic_debugging_categories)}`",
         f"- Compatibility case labels: `{len(behavior_quality_labels)}`",
+    ])
+    lines.extend(_failure_analysis_recovery_review_markdown_lines(story_packet))
+    lines.extend([
         "",
         "### Take Candidates",
         "",
