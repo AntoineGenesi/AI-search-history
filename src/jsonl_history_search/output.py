@@ -1476,6 +1476,9 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"routes={','.join(audit_plan.get('route_order', []))} "
             f"watchlist={len(audit_plan.get('watchlist', []))}"
         )
+    investigation_state = report.get("investigation_state")
+    if investigation_state:
+        lines.extend(render_investigation_state_text(investigation_state))
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
@@ -1579,6 +1582,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         if resume:
             lines.append(f"- `resume_from`: `{resume.get('next_read_target') or resume.get('route')}`")
         lines.append("")
+    investigation_state = report.get("investigation_state")
+    if investigation_state:
+        lines.extend(render_investigation_state_markdown(investigation_state))
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     handoff = report.get("answer_ready_handoff")
@@ -1645,6 +1651,105 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     for item in report.get("uncertainty", [])[:8]:
         lines.append(f"- `{item.get('label')}` {item.get('meaning')}")
     return "\n".join(lines)
+
+
+def render_investigation_state_text(investigation_state: dict) -> list[str]:
+    question_intent = investigation_state.get("question_intent") or {}
+    retrieval = investigation_state.get("retrieval") or {}
+    recommendation = retrieval.get("conservative_recommendation") or {}
+    actionable_next = investigation_state.get("actionable_next") or {}
+    unresolved_gaps = investigation_state.get("unresolved_gaps") or {}
+    answer_readiness = investigation_state.get("answer_readiness") or {}
+    claim_boundaries = retrieval.get("claim_boundaries") or {}
+    source_boundaries = investigation_state.get("source_boundary_reminders") or {}
+
+    lines = [
+        "Investigation state: "
+        f"status={investigation_state.get('status')} "
+        f"family={question_intent.get('primary_question_family')} "
+        f"intent={question_intent.get('primary_intent')} "
+        f"mode_used={retrieval.get('mode_used')} "
+        f"recommended_mode={recommendation.get('mode')} "
+        f"next={answer_readiness.get('recommended_next_step')} "
+        f"read_next={actionable_next.get('read_next_count', 0)} "
+        f"gaps={unresolved_gaps.get('gap_count', 0)}",
+    ]
+    gap_labels = _investigation_gap_labels(unresolved_gaps)
+    if gap_labels:
+        lines.append(f"- gaps: {', '.join(gap_labels)}")
+    lines.append(
+        "Source/claim boundaries: "
+        f"searched_scope_only={_investigation_nested(source_boundaries, 'no_evidence', 'searched_scope_only')} "
+        f"adjacent_artifacts_present={_investigation_nested(source_boundaries, 'adjacent_artifacts', 'present')} "
+        f"primary_source_rules={len(source_boundaries.get('primary_sources') or [])} "
+        f"forbidden_claims={len(source_boundaries.get('forbidden_claims') or [])} "
+        f"ranking_changed={claim_boundaries.get('ranking_changed_by_investigation_state')} "
+        f"rrf_default_promoted={claim_boundaries.get('rrf_default_promoted')} "
+        f"rrf_default_allowed={recommendation.get('rrf_default_allowed')}"
+    )
+    return lines
+
+
+def render_investigation_state_markdown(investigation_state: dict) -> list[str]:
+    question_intent = investigation_state.get("question_intent") or {}
+    retrieval = investigation_state.get("retrieval") or {}
+    recommendation = retrieval.get("conservative_recommendation") or {}
+    actionable_next = investigation_state.get("actionable_next") or {}
+    unresolved_gaps = investigation_state.get("unresolved_gaps") or {}
+    answer_readiness = investigation_state.get("answer_readiness") or {}
+    claim_boundaries = retrieval.get("claim_boundaries") or {}
+    source_boundaries = investigation_state.get("source_boundary_reminders") or {}
+
+    lines = [
+        "## Investigation State",
+        "",
+        f"- `status`: `{investigation_state.get('status')}`",
+        f"- `primary_question_family`: `{question_intent.get('primary_question_family')}`",
+        f"- `primary_intent`: `{question_intent.get('primary_intent')}`",
+        f"- `mode_used`: `{retrieval.get('mode_used')}`",
+        f"- `recommended_mode`: `{recommendation.get('mode')}`",
+        f"- `recommended_next_step`: `{answer_readiness.get('recommended_next_step')}`",
+        f"- `read_next_count`: `{actionable_next.get('read_next_count', 0)}`",
+        f"- `gap_count`: `{unresolved_gaps.get('gap_count', 0)}`",
+    ]
+    gap_labels = _investigation_gap_labels(unresolved_gaps)
+    if gap_labels:
+        lines.append(f"- `gap_labels`: `{', '.join(gap_labels)}`")
+    lines.extend(
+        [
+            (
+                "- `source_boundaries`: "
+                f"searched_scope_only=`{_investigation_nested(source_boundaries, 'no_evidence', 'searched_scope_only')}`; "
+                f"adjacent_artifacts_present=`{_investigation_nested(source_boundaries, 'adjacent_artifacts', 'present')}`; "
+                f"primary_source_rules=`{len(source_boundaries.get('primary_sources') or [])}`; "
+                f"forbidden_claims=`{len(source_boundaries.get('forbidden_claims') or [])}`"
+            ),
+            (
+                "- `claim_boundaries`: "
+                f"ranking_changed=`{claim_boundaries.get('ranking_changed_by_investigation_state')}`; "
+                f"rrf_default_promoted=`{claim_boundaries.get('rrf_default_promoted')}`; "
+                f"rrf_default_allowed=`{recommendation.get('rrf_default_allowed')}`"
+            ),
+            "",
+        ]
+    )
+    return lines
+
+
+def _investigation_gap_labels(unresolved_gaps: dict) -> list[str]:
+    labels: list[str] = []
+    for item in (unresolved_gaps.get("items") or [])[:4]:
+        label = item.get("label")
+        if label:
+            labels.append(str(label))
+    return labels
+
+
+def _investigation_nested(source: dict, first: str, second: str) -> object:
+    value = source.get(first) or {}
+    if not isinstance(value, dict):
+        return None
+    return value.get(second)
 
 
 def render_jsonl_candidate_discovery_text(payload: dict) -> str:
