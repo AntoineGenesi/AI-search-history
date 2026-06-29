@@ -5,12 +5,13 @@ import re
 import shlex
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 from statistics import median
 from typing import Any
 
+from .adapters import AdapterReadError, iter_records_for_file
 from .agent_contract import (
     build_agent_find_payload,
     build_compact_provenance_handoff,
@@ -149,6 +150,7 @@ def build_semantic_debug_payload(
         tool_proof,
         joins,
         hints,
+        query=agent_find["query"]["original"],
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
@@ -2744,6 +2746,7 @@ def build_next_reads(
     joins: dict[str, Any],
     hints: dict[str, str | None],
     *,
+    query: str = "",
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
 ) -> list[dict[str, str]]:
@@ -2797,7 +2800,268 @@ def build_next_reads(
             reads.append({"kind": "artifact", "target": item["path"], "reason": "confirm local artifact state"})
     if hints.get("path") and not any(read.get("target") == hints["path"] for read in reads):
         reads.append({"kind": "hint_path", "target": hints["path"] or "", "reason": "caller supplied path hint"})
-    return dedupe_dicts(reads)[:12]
+    promoted_reads = action_proof_source_next_reads(
+        query=query,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
+    )
+    return dedupe_dicts(promoted_reads + reads)[:12]
+
+
+ACTION_PROOF_SCAN_FILE_LIMIT = 8
+ACTION_PROOF_PROMOTION_LIMIT = 2
+ACTION_PROOF_QUERY_TERMS = {
+    "actually",
+    "assistant",
+    "agent",
+    "check",
+    "checked",
+    "checks",
+    "commit",
+    "committed",
+    "edit",
+    "edited",
+    "files",
+    "observed",
+    "overwrite",
+    "overwritten",
+    "ran",
+    "run",
+    "tested",
+    "tool",
+    "untouched",
+    "worktree",
+}
+ACTION_PROOF_STOPWORDS = {
+    "about",
+    "after",
+    "around",
+    "before",
+    "dated",
+    "from",
+    "include",
+    "into",
+    "local",
+    "made",
+    "and",
+    "asked",
+    "been",
+    "codex",
+    "did",
+    "had",
+    "session",
+    "user",
+    "was",
+    "that",
+    "the",
+    "this",
+    "those",
+    "time",
+    "were",
+    "whether",
+    "with",
+}
+ACTION_PROOF_TEXT_RE = re.compile(r"[a-z0-9][a-z0-9_/-]*")
+
+
+def action_proof_source_next_reads(
+    *,
+    query: str,
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    if not action_proof_source_selection_wanted(query):
+        return []
+    query_terms = action_proof_query_terms(query)
+    if not query_terms:
+        return []
+    source_paths = action_proof_candidate_paths(candidates, tool_proof)
+    if not source_paths:
+        return []
+    tool_proof_paths = {
+        str((event.get("source_ref") or {}).get("path") or "")
+        for event in tool_proof.get("events", [])
+        if isinstance(event, dict)
+    }
+    scored: list[dict[str, Any]] = []
+    for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
+        scored.extend(action_proof_records_for_path(path, query_terms=query_terms, tool_proof_paths=tool_proof_paths))
+    scored.sort(
+        key=lambda item: (
+            -float(item["score"]),
+            str(item.get("timestamp_utc") or ""),
+            str((item.get("source_ref") or {}).get("path") or ""),
+            int((item.get("source_ref") or {}).get("line") or 0),
+        )
+    )
+    reads: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:ACTION_PROOF_PROMOTION_LIMIT], 1):
+        source_ref = item["source_ref"]
+        candidate_id = f"action-proof-source-{index:03d}"
+        read = {
+            "kind": "jsonl_source_ref",
+            "target": source_ref_target(source_ref),
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "reason": "open original action-proof source window before later echo records",
+            "action_proof_source_selection": {
+                "schema_version": 1,
+                "selection_reason": item["selection_reason"],
+                "role": item.get("role"),
+                "score": item["score"],
+                "query_term_overlap_count": len(item.get("matched_query_terms") or []),
+                "raw_text_included": False,
+                "bounded_to_surfaced_source_files": True,
+            },
+            "expansion_actions": read_more_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            ),
+        }
+        if include_context_actions:
+            read["context_actions"] = context_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        if read["target"]:
+            reads.append(read)
+    return reads
+
+
+def action_proof_source_selection_wanted(query: str) -> bool:
+    text = str(query or "").lower()
+    action_cue = any(term in text for term in ACTION_PROOF_QUERY_TERMS)
+    question_cue = any(phrase in text for phrase in ("did the", "did you", "whether", "actually", "was ", "were "))
+    overwrite_cue = "overwrite" in text or "overwritten" in text
+    proof_cue = any(term in text for term in ("files observed", "checks run", "commit", "worktree", "tool"))
+    return action_cue and (question_cue or overwrite_cue or proof_cue)
+
+
+def action_proof_query_terms(query: str) -> set[str]:
+    terms = {
+        term
+        for term in ACTION_PROOF_TEXT_RE.findall(str(query or "").lower())
+        if len(term) >= 3 and term not in ACTION_PROOF_STOPWORDS
+    }
+    expanded = set(terms)
+    if "overwritten" in terms:
+        expanded.add("overwrite")
+    if "overwrite" in terms:
+        expanded.add("overwritten")
+    if "planner" in terms:
+        expanded.add("planners")
+    if "planners" in terms:
+        expanded.add("planner")
+    if "split" in terms:
+        expanded.add("spliting")
+    return expanded
+
+
+def action_proof_candidate_paths(candidates: list[dict[str, Any]], tool_proof: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for item in candidates[:INLINE_CANDIDATE_LIMIT]:
+        ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        path = ref.get("path")
+        if path:
+            paths.append(Path(str(path)).expanduser())
+    for event in tool_proof.get("events", [])[:INLINE_EVENT_LIMIT]:
+        ref = event.get("source_ref") if isinstance(event, dict) and isinstance(event.get("source_ref"), dict) else {}
+        path = ref.get("path")
+        if path:
+            paths.append(Path(str(path)).expanduser())
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def action_proof_records_for_path(
+    path: Path,
+    *,
+    query_terms: set[str],
+    tool_proof_paths: set[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        records = iter_records_for_file(path, "unknown_jsonl", timezone.utc)
+        for record in records:
+            score, matched_terms, selection_reason = score_action_proof_record(
+                text=record.text,
+                role=record.role,
+                line=int(record.line),
+                query_terms=query_terms,
+                tool_proof_path_bonus=str(path) in tool_proof_paths,
+            )
+            if score <= 0:
+                continue
+            rows.append(
+                {
+                    "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
+                    "role": record.role,
+                    "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+                    "score": score,
+                    "matched_query_terms": sorted(matched_terms),
+                    "selection_reason": selection_reason,
+                }
+            )
+    except (AdapterReadError, OSError, ValueError):
+        return []
+    return rows
+
+
+def score_action_proof_record(
+    *,
+    text: str,
+    role: str,
+    line: int,
+    query_terms: set[str],
+    tool_proof_path_bonus: bool,
+) -> tuple[float, set[str], str]:
+    lowered = str(text or "").lower()
+    role_text = str(role or "").lower()
+    tokens = set(ACTION_PROOF_TEXT_RE.findall(lowered))
+    matched = {term for term in query_terms if term in tokens or ("/" in term and term in lowered)}
+    if not matched:
+        return 0.0, set(), "no_query_overlap"
+    score = float(len(matched) * 4)
+    reason = "query_term_overlap"
+    if any(token in role_text for token in ("user", "human")):
+        score += 24
+        reason = "user_action_concern"
+    elif any(token in role_text for token in ("assistant", "agent")):
+        score += 14
+        reason = "assistant_action_answer"
+    elif "tool" in role_text or "function_call" in role_text:
+        score += 8
+        reason = "tool_action_record"
+    if any(term in lowered for term in ("did not overwrite", "not overwrite", "overwrite", "overwritten")):
+        score += 12
+    if any(term in lowered for term in ("git diff --check", "git diff --stat", "git commit", "committed")):
+        score += 10
+    if tool_proof_path_bonus:
+        score += 8
+    if line <= 20:
+        score -= 22
+    if any(token in role_text for token in ("compacted", "turn_context", "token_count", "patch_apply")):
+        score -= 60
+    if "custom_tool_call" in role_text:
+        score -= 36
+    if any(token in role_text for token in ("developer", "system")):
+        score -= 30
+    if "function_call_output" in role_text and len(lowered) > 1200:
+        score -= 24
+    return score, matched, reason
 
 
 def build_final_answer_source_use_contract(
