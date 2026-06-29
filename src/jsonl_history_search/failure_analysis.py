@@ -1194,8 +1194,14 @@ def _build_devlog_story_packet(
         committed_safe_narrative_ledger=committed_safe_narrative_ledger,
         claim_boundaries=claim_boundaries,
     )
+    packet_status = _devlog_story_status(readiness_status, phase_status, supported_claims, gaps)
+    reviewed_recovery_summary = _devlog_reviewed_recovery_summary(
+        narrative_readiness=narrative_readiness,
+        story_packet_status=packet_status,
+        recovery_review_handoff=recovery_review_handoff,
+    )
     return {
-        "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
+        "status": packet_status,
         "mode": "deterministic_committed_safe_story_synthesis",
         "take_candidates": _devlog_take_candidates(
             readiness_status=readiness_status,
@@ -1227,6 +1233,7 @@ def _build_devlog_story_packet(
         "gaps": gaps,
         "next_reads": _devlog_next_reads(next_reads),
         "recovery_review_handoff": recovery_review_handoff,
+        "reviewed_recovery_summary": reviewed_recovery_summary,
         "inference_privacy_boundaries": [
             "packet is synthesized only from already-sanitized failure-analysis structures",
             "take candidates are drafting angles, not generated devlog prose",
@@ -1257,6 +1264,7 @@ def _build_devlog_story_packet(
             "repo_artifact_evidence_rows": len(repo_artifact_evidence_rows),
             "next_read_rows": _int(next_reads.get("count")),
             "recovery_review_handoff_rows": len(_list(recovery_review_handoff.get("review_items"))),
+            "reviewed_recovery_summary_status": reviewed_recovery_summary.get("status"),
         },
     }
 
@@ -1963,6 +1971,9 @@ def _devlog_recovery_review_handoff(
     claim_boundaries: dict[str, Any],
 ) -> dict[str, Any]:
     opened_count = _int(narrative_readiness.get("recovery_opened_count"))
+    usable_recovery_count = _int(narrative_readiness.get("usable_recovery_evidence_count"))
+    reviewed_usable_count = _int(narrative_readiness.get("reviewed_usable_recovery_evidence_count"))
+    reviewed_not_useful_count = _int(narrative_readiness.get("reviewed_not_useful_recovery_count"))
     still_unreviewed_count = _int(narrative_readiness.get("still_unreviewed_recovery_count"))
     review_gap_count = _int(narrative_readiness.get("review_gap_recovery_count"))
     review_debt_count = still_unreviewed_count + review_gap_count
@@ -1972,10 +1983,20 @@ def _devlog_recovery_review_handoff(
             "opened_recovery_remains_unreviewed": False,
             "counts": {
                 "recovery_opened": opened_count,
+                "usable_recovery_evidence": usable_recovery_count,
+                "reviewed_usable": reviewed_usable_count,
+                "reviewed_not_useful": reviewed_not_useful_count,
                 "still_unreviewed": still_unreviewed_count,
                 "review_gap": review_gap_count,
+                "review_debt": review_debt_count,
             },
+            "review_debt_remaining": False,
             "boundary": "no opened recovery review handoff is required unless follow-next-reads has opened recovery that remains unreviewed or review-gapped",
+            "classification_boundary": (
+                "reviewed usable and reviewed-not-useful recovery classifications are committed-safe metadata; "
+                "they do not add raw transcript content or prove root cause, all-history completeness, final-answer "
+                "quality, token/speed, or product value"
+            ),
         }
 
     review_items: list[dict[str, Any]] = []
@@ -2018,14 +2039,16 @@ def _devlog_recovery_review_handoff(
         "source_surface": "failure_analysis.committed_safe_narrative_ledger",
         "counts": {
             "recovery_opened": opened_count,
-            "usable_recovery_evidence": _int(narrative_readiness.get("usable_recovery_evidence_count")),
-            "reviewed_usable": _int(narrative_readiness.get("reviewed_usable_recovery_evidence_count")),
-            "reviewed_not_useful": _int(narrative_readiness.get("reviewed_not_useful_recovery_count")),
+            "usable_recovery_evidence": usable_recovery_count,
+            "reviewed_usable": reviewed_usable_count,
+            "reviewed_not_useful": reviewed_not_useful_count,
             "still_unreviewed": still_unreviewed_count,
             "review_gap": review_gap_count,
+            "review_debt": review_debt_count,
             "safe_review_item_count": len(review_items),
             "not_rendered_due_to_limit": max(0, review_debt_count - len(review_items)),
         },
+        "review_debt_remaining": True,
         "reason_codes": reason_codes,
         "review_items": review_items,
         "blocked_claims_until_review": _recovery_review_blocked_claims(claim_boundaries),
@@ -2042,6 +2065,138 @@ def _devlog_recovery_review_handoff(
         "claim_boundary": (
             "root cause, all-history completeness, final-answer quality, token/speed, and product-value "
             "claims remain unsupported unless separate reviewed evidence supports them"
+        ),
+    }
+
+
+def _devlog_reviewed_recovery_summary(
+    *,
+    narrative_readiness: dict[str, Any],
+    story_packet_status: str,
+    recovery_review_handoff: dict[str, Any],
+) -> dict[str, Any]:
+    opened_count = _int(narrative_readiness.get("recovery_opened_count"))
+    usable_recovery_count = _int(narrative_readiness.get("usable_recovery_evidence_count"))
+    reviewed_usable_count = _int(narrative_readiness.get("reviewed_usable_recovery_evidence_count"))
+    reviewed_not_useful_count = _int(narrative_readiness.get("reviewed_not_useful_recovery_count"))
+    still_unreviewed_count = _int(narrative_readiness.get("still_unreviewed_recovery_count"))
+    review_gap_count = _int(narrative_readiness.get("review_gap_recovery_count"))
+    review_debt_count = still_unreviewed_count + review_gap_count
+    reviewed_count = reviewed_usable_count + reviewed_not_useful_count
+
+    if not opened_count:
+        status = "no_opened_recovery"
+    elif review_debt_count:
+        status = "review_debt_remaining"
+    elif reviewed_usable_count and reviewed_not_useful_count:
+        status = "reviewed_mixed_no_open_debt"
+    elif reviewed_usable_count:
+        status = "reviewed_usable_no_open_debt"
+    elif reviewed_not_useful_count:
+        status = "reviewed_not_useful_no_open_debt"
+    else:
+        status = "opened_recovery_without_review_classification"
+
+    remaining_review_gaps: list[dict[str, Any]] = []
+    if still_unreviewed_count:
+        remaining_review_gaps.append(
+            {
+                "gap_id": "private_recovery_review_needed",
+                "reason": "opened_recovery_still_unreviewed",
+                "count": still_unreviewed_count,
+                "effect": "keeps the story packet review-gapped and keeps recovery_review_handoff review_required",
+            }
+        )
+    if review_gap_count:
+        remaining_review_gaps.append(
+            {
+                "gap_id": "private_recovery_review_needed",
+                "reason": "opened_recovery_review_gap",
+                "count": review_gap_count,
+                "effect": "keeps the story packet review-gapped and keeps recovery_review_handoff review_required",
+            }
+        )
+
+    classification_effects: list[dict[str, Any]] = []
+    if reviewed_usable_count:
+        classification_effects.append(
+            {
+                "classification": "private_reviewed_usable",
+                "count": reviewed_usable_count,
+                "packet_effect": (
+                    "counts as usable recovery evidence for narrative readiness when safe candidate, date, "
+                    "line-range, and record-count metadata are otherwise present"
+                ),
+                "remaining_gap_effect": "does not create private recovery review debt",
+            }
+        )
+    if reviewed_not_useful_count:
+        classification_effects.append(
+            {
+                "classification": "reviewed_not_useful",
+                "count": reviewed_not_useful_count,
+                "packet_effect": (
+                    "retained as a reviewed-negative recovery outcome and closed boundary instead of open debt"
+                ),
+                "remaining_gap_effect": "does not by itself require a recovery-review handoff",
+            }
+        )
+    if review_debt_count:
+        classification_effects.append(
+            {
+                "classification": "unreviewed_or_review_gap",
+                "count": review_debt_count,
+                "packet_effect": "keeps devlog story status private-review-gapped",
+                "remaining_gap_effect": "requires local private recovery review before transcript-content claims",
+            }
+        )
+    if opened_count and not reviewed_count and not review_debt_count:
+        classification_effects.append(
+            {
+                "classification": "no_committed_safe_recovery_usability",
+                "count": opened_count,
+                "packet_effect": "leaves story readiness dependent on other safe recovery metadata",
+                "remaining_gap_effect": "does not create review debt unless recovery_usability marks a review gap",
+            }
+        )
+
+    if review_debt_count:
+        packet_status_effect = "remaining unreviewed/review-gap recovery keeps private-review gaps open"
+    elif reviewed_usable_count:
+        packet_status_effect = "reviewed usable recovery can allow story_packet_ready when other safe story metadata is ready"
+    elif reviewed_not_useful_count:
+        packet_status_effect = "reviewed not-useful recovery is kept as a boundary outcome, not as open review debt"
+    elif opened_count:
+        packet_status_effect = "opened recovery has no remaining review debt but no reviewed usable/not-useful classification"
+    else:
+        packet_status_effect = "no opened recovery is available to classify"
+
+    return {
+        "status": status,
+        "source_surface": "failure_analysis.narrative_readiness",
+        "counts": {
+            "recovery_opened": opened_count,
+            "usable_recovery_evidence": usable_recovery_count,
+            "reviewed_usable": reviewed_usable_count,
+            "reviewed_not_useful": reviewed_not_useful_count,
+            "reviewed_total": reviewed_count,
+            "still_unreviewed": still_unreviewed_count,
+            "review_gap": review_gap_count,
+            "review_debt": review_debt_count,
+        },
+        "review_debt_remaining": bool(review_debt_count),
+        "story_packet_status": story_packet_status,
+        "packet_status_effect": packet_status_effect,
+        "recovery_review_handoff_status": recovery_review_handoff.get("status"),
+        "remaining_review_gaps": remaining_review_gaps,
+        "classification_effects": classification_effects,
+        "claim_boundary": (
+            "review classifications are committed-safe metadata only; root-cause, all-history completeness, "
+            "final-answer quality, token/speed, and product-value claims remain unsupported unless separately reviewed"
+        ),
+        "privacy_boundary": (
+            "summary includes only counts, statuses, and generic effects; it excludes raw transcript text, raw source "
+            "lines, private paths, session IDs, embedding artifacts, search artifacts, command details, and record selections"
         ),
     }
 
