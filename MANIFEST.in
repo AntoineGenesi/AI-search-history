@@ -1,5 +1,6 @@
 include README.md
 include LICENSE
+include CHANGELOG.md
 include pyproject.toml
 recursive-include benchmarks *.json
 recursive-include docs *.md
@@ -17,5 +18,6 @@ include reports/jsh-036-archive-protection-plan-diagnostic-and-gate.md
 include reports/jsh-037-retrieval-index-and-sidecar-architecture.md
 include reports/jsh-038-worth-installing-proof-and-public-release-pack.md
 include reports/jsh-039c-release-privacy-checklist-and-final-smoke.md
+include reports/jsh-973-release-candidate-smoke.md
 include reports/semantic-debugger-question-decision-trees.md
 include reports/html/jsh-038-worth-installing-proof-and-public-release-pack.html
