@@ -360,6 +360,8 @@ def build_semantic_debug_payload(
         answer_source_discipline=answer_source_discipline,
         source_handle_routing=source_handle_routing,
     )
+    guided_audit_flow["links"]["investigation_state"] = "semantic_debug.investigation_state"
+    guided_audit_flow["investigation_state_summary"] = summarize_investigation_state(investigation_state)
     agent_instruction = build_agent_instruction(
         query=agent_find["query"]["original"],
         report_output=getattr(args, "report_output", None),
@@ -388,9 +390,6 @@ def build_semantic_debug_payload(
         "status": investigation_state.get("status"),
         "recommended_next_step": investigation_state.get("answer_readiness", {}).get("recommended_next_step"),
     }
-    guided_audit_flow["links"]["investigation_state"] = "semantic_debug.investigation_state"
-    guided_audit_flow["investigation_state_summary"] = summarize_investigation_state(investigation_state)
-
     packet = {
         "schema_version": SCHEMA_VERSION,
         "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
@@ -2224,6 +2223,14 @@ def build_agent_instruction(
             }
         )
 
+    mode_command = fielded_bm25_rerun_command(
+        query=query,
+        guided_audit_flow=guided_audit_flow,
+        next_reads=next_reads,
+    )
+    if mode_command:
+        commands.append(mode_command)
+
     for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
         commands.append(
             {
@@ -2286,6 +2293,85 @@ def build_agent_instruction(
         },
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
     }
+
+
+SEMANTIC_DEBUG_RERUN_VALUE_FLAGS = {
+    "--cwd",
+    "--root",
+    "--hard-cap-files",
+    "--hard-cap-bytes",
+    "--max-files",
+    "--max-bytes",
+    "--max-matches",
+}
+SEMANTIC_DEBUG_RERUN_BOOL_FLAGS = {"--allow-arbitrary-root"}
+
+
+def fielded_bm25_rerun_command(
+    *,
+    query: str,
+    guided_audit_flow: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    summary = guided_audit_flow.get("investigation_state_summary") or {}
+    if summary.get("retrieval_mode_used") != RETRIEVAL_MODE_PACKAGE:
+        return None
+    if summary.get("retrieval_mode_recommended") != "fielded-bm25":
+        return None
+    scope_args = semantic_debug_rerun_scope_args(next_reads)
+    argv = [
+        "jsonl-history-search",
+        "semantic-debug",
+        query,
+        "--retrieval-mode",
+        "fielded-bm25",
+        *scope_args,
+        "--format",
+        "json",
+    ]
+    return {
+        "command_id": "rerun_with_fielded_bm25",
+        "command_family": "semantic_debug_rerun",
+        "required_for_decisions": ["scoped_no_evidence", "inspect_recovery_reads", "needs_investigation"],
+        "argv": argv,
+        "command": shell_command(argv),
+        "purpose": "Rerun the same bounded semantic-debug query with explicit fielded-bm25 retrieval when package mode is weak or no-evidence.",
+        "retrieval_mode": {
+            "current": RETRIEVAL_MODE_PACKAGE,
+            "recommended": "fielded-bm25",
+            "package_default_changed": False,
+            "rrf_default_allowed": False,
+        },
+        "privacy_boundaries": {
+            "raw_private_transcript_included": False,
+            "raw_source_lines_included": False,
+            "private_bridge_payloads_included": False,
+        },
+    }
+
+
+def semantic_debug_rerun_scope_args(next_reads: list[dict[str, Any]]) -> list[str]:
+    scope_args: list[str] = []
+    seen_flags: set[str] = set()
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        for action in read.get("expansion_actions") or []:
+            argv = list(action.get("argv") or []) if isinstance(action, dict) else []
+            index = 0
+            while index < len(argv):
+                item = str(argv[index])
+                if item in SEMANTIC_DEBUG_RERUN_BOOL_FLAGS and item not in seen_flags:
+                    scope_args.append(item)
+                    seen_flags.add(item)
+                elif item in SEMANTIC_DEBUG_RERUN_VALUE_FLAGS and index + 1 < len(argv) and item not in seen_flags:
+                    scope_args.extend([item, str(argv[index + 1])])
+                    seen_flags.add(item)
+                    index += 1
+                index += 1
+        if seen_flags:
+            break
+    return scope_args
 
 
 def compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
