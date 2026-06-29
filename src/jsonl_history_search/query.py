@@ -242,7 +242,13 @@ def build_query_plan(
     detected: list[str] = []
     if re.search(r"\b(when\s+did\s+i\s+(?:say|tell|mention)|when\s+did\s+user\s+say|what\s+date\s+did\s+i\s+say)\b", normalized):
         detected.append("when_user_said")
-    if re.search(r"\b(where\s+did\b.*\b(?:go\s+wrong|fail)|where\b.*\bworkflow\b.*\bwrong|went\s+wrong|workflow\s+failure|failure|failed|regression|error)\b", normalized):
+    if re.search(
+        r"\b(where\s+did\b.*\b(?:go\s+wrong|fail)|where\b.*\bworkflow\b.*\bwrong|went\s+wrong|"
+        r"workflow\s+failure|failure|failed|regression|error|coordinator\s+rot|context\s+drift|"
+        r"process\s+(?:focus\s+)?over\s+product|process\s+drift|wrong\s+layer|rabbit\s+hole|"
+        r"rabbit\s+holes?|churn|stalled?|stalling)\b",
+        normalized,
+    ):
         detected.append("workflow_failure")
     if re.search(r"\b(why|reason|because|cause|caused|decision|decide|decided|rationale)\b", normalized):
         detected.append("why")
