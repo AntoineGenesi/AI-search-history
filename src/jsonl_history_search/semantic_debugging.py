@@ -298,6 +298,35 @@ def build_semantic_debug_payload(
         (answer_source_discipline.get("answer_gate") or {}).get("blocked_facets") or []
     )[:8]
     answer_readiness["source_use_contract"]["answer_source_discipline"] = discipline_summary
+    source_window_action_proof = build_source_window_action_proof(
+        query=agent_find["query"]["original"],
+        family=family,
+        candidates=candidates,
+        timeline=timeline,
+        source_locator_handoff=source_locator_handoff,
+        next_reads=next_reads,
+        tool_proof=tool_proof,
+        joins=joins,
+        answer_source_discipline=answer_source_discipline,
+    )
+    action_proof_guidance = source_window_action_proof_guidance(source_window_action_proof)
+    final_answer_contract["evidence_inputs"]["source_window_action_proof"] = action_proof_guidance
+    final_answer_contract["links"] = {
+        **(final_answer_contract.get("links") or {}),
+        "source_window_action_proof": "semantic_debug.source_window_action_proof",
+    }
+    if action_proof_guidance.get("use_for_claimed_action_questions"):
+        final_answer_contract["required_actions"] = dedupe(
+            list(final_answer_contract.get("required_actions") or [])
+            + [
+                "For claimed-action questions, inspect semantic_debug.source_window_action_proof before relying on assistant prose.",
+            ]
+        )
+    answer_readiness["source_window_action_proof"] = action_proof_guidance
+    answer_readiness["basis"]["source_window_action_proof_missing_buckets"] = list(
+        action_proof_guidance.get("missing_buckets") or []
+    )[:8]
+    answer_readiness["source_use_contract"]["source_window_action_proof"] = action_proof_guidance
     guided_audit_flow = build_guided_audit_flow(
         status=agent_find["status"],
         family=family,
@@ -334,6 +363,7 @@ def build_semantic_debug_payload(
         no_evidence=no_evidence,
         report_output=getattr(args, "report_output", None),
         source_handle_routing=source_handle_routing,
+        source_window_action_proof=source_window_action_proof,
     )
 
     packet = {
@@ -348,6 +378,7 @@ def build_semantic_debug_payload(
         "strongest_candidates": candidates,
         "timeline": timeline,
         "tool_action_proof": tool_proof,
+        "source_window_action_proof": source_window_action_proof,
         "task_review_commit_joins": joins,
         "forensics_workflow": forensics_workflow,
         "decision_context": decision_context,
@@ -1227,6 +1258,8 @@ def shell_command(argv: list[Any]) -> str:
 
 ANSWER_READY_HANDOFF_READ_CAP = 5
 ANSWER_READY_HANDOFF_COMMAND_CAP = 3
+ACTION_PROOF_BUCKET_RECORD_CAP = 8
+ACTION_PROOF_TEXT_LIMIT = 220
 
 
 def build_answer_ready_handoff(
@@ -1240,6 +1273,7 @@ def build_answer_ready_handoff(
     no_evidence: dict[str, Any],
     report_output: str | None = None,
     source_handle_routing: dict[str, Any] | None = None,
+    source_window_action_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     answer_gate = guided_audit_flow.get("answer_gate") or {}
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
@@ -1302,6 +1336,9 @@ def build_answer_ready_handoff(
         ),
         "scoped_no_evidence_only": no_evidence_needed,
     }
+    action_proof_summary = source_window_action_proof_guidance(source_window_action_proof or {})
+    if action_proof_summary:
+        source_use_summary["source_window_action_proof"] = action_proof_summary
     return {
         "schema_version": 1,
         "decision": decision,
@@ -1345,6 +1382,7 @@ def build_answer_ready_handoff(
             "answer_gate": "semantic_debug.guided_audit_flow.answer_gate",
             "answer_source_discipline": "semantic_debug.answer_source_discipline",
             "final_answer_source_use_contract": "semantic_debug.final_answer_source_use_contract",
+            "source_window_action_proof": "semantic_debug.source_window_action_proof",
             "next_reads": "semantic_debug.next_reads",
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
             "no_evidence": "semantic_debug.no_evidence",
@@ -1377,6 +1415,474 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
         }
         rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
     return rows
+
+
+def build_source_window_action_proof(
+    *,
+    query: str,
+    family: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+    source_locator_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+    answer_source_discipline: dict[str, Any],
+) -> dict[str, Any]:
+    source_windows = bounded_action_proof_source_windows(source_locator_handoff, next_reads)
+    search_rows = dedupe_action_records(
+        [candidate_action_record(item, source="strongest_candidates") for item in candidates]
+        + [candidate_action_record(item, source="timeline") for item in timeline]
+    )
+    user_records = [item for item in search_rows if item.get("role") in {"user", "human"}][
+        :ACTION_PROOF_BUCKET_RECORD_CAP
+    ]
+    if not user_records:
+        user_records = [
+            {
+                "record_type": "current_user_request",
+                "record_source": "semantic_debug.query",
+                "source_status": "missing_transcript_source_ref",
+                "missing_source_label": "current_query_not_a_transcript_record",
+                "role": "user",
+                "text_excerpt": bounded_action_text(query),
+                "primary_action_proof": False,
+                "proof_role": "requested_action_or_concern",
+            }
+        ]
+    assistant_records = [
+        item
+        for item in search_rows
+        if item.get("role") in {"assistant", "agent", "assistant_message", "agent_message"}
+        and looks_like_final_answer_or_claim(item.get("text_excerpt"))
+    ][:ACTION_PROOF_BUCKET_RECORD_CAP]
+    if not assistant_records:
+        assistant_records = [
+            item
+            for item in search_rows
+            if item.get("role") in {"assistant", "agent", "assistant_message", "agent_message"}
+        ][: min(2, ACTION_PROOF_BUCKET_RECORD_CAP)]
+    for item in assistant_records:
+        item["primary_action_proof"] = False
+        item["proof_role"] = "assistant_claim_not_tool_proof"
+
+    tool_events = list(tool_proof.get("events") or [])
+    call_records = [
+        tool_event_action_record(event, proof_role="command_or_tool_call", primary=True)
+        for event in tool_events
+        if is_action_call_event(event)
+    ][:ACTION_PROOF_BUCKET_RECORD_CAP]
+    output_records = [
+        tool_event_action_record(event, proof_role="command_or_tool_output", primary=True)
+        for event in tool_events
+        if is_output_evidence_event(event)
+    ][:ACTION_PROOF_BUCKET_RECORD_CAP]
+    change_records = changed_check_review_commit_records(tool_events, joins)
+    adjacent_records = adjacent_artifact_records(joins, next_reads)
+
+    buckets = {
+        "user_concern_request": action_bucket(
+            "user_concern_request",
+            user_records,
+            missing_label="missing_user_concern_source_record",
+        ),
+        "command_tool_call": action_bucket(
+            "command_tool_call",
+            call_records,
+            missing_label="missing_structured_command_or_tool_call",
+        ),
+        "command_tool_output": action_bucket(
+            "command_tool_output",
+            output_records,
+            missing_label="missing_structured_command_or_tool_output",
+        ),
+        "changed_check_review_commit_evidence": action_bucket(
+            "changed_check_review_commit_evidence",
+            change_records,
+            missing_label="missing_changed_check_review_commit_evidence",
+        ),
+        "final_assistant_answer_claim": action_bucket(
+            "final_assistant_answer_claim",
+            assistant_records,
+            missing_label="missing_final_assistant_answer_or_claim",
+        ),
+        "adjacent_artifact_evidence": action_bucket(
+            "adjacent_artifact_evidence",
+            adjacent_records,
+            missing_label="no_adjacent_artifact_evidence",
+            adjacent_only=True,
+        ),
+    }
+    missing_buckets = [
+        bucket_name
+        for bucket_name, bucket in buckets.items()
+        if bucket.get("status") != "present" and bucket_name != "adjacent_artifact_evidence"
+    ]
+    primary_count = sum(bucket.get("primary_record_count", 0) for bucket in buckets.values())
+    adjacent_count = len(buckets["adjacent_artifact_evidence"].get("records") or [])
+    discipline_gate = answer_source_discipline.get("answer_gate") or {}
+    status = (
+        "action_proof_available"
+        if buckets["command_tool_call"]["status"] == "present"
+        and buckets["command_tool_output"]["status"] == "present"
+        else "partial_action_proof"
+        if primary_count
+        else "missing_action_proof"
+    )
+    return {
+        "schema_version": 1,
+        "status": status,
+        "question_family": {
+            "primary": family.get("primary"),
+            "claimed_action_detected": "claimed_action" in list(family.get("detected_supported") or []),
+        },
+        "source_windows": source_windows,
+        "buckets": buckets,
+        "summary": {
+            "primary_record_count": primary_count,
+            "adjacent_record_count": adjacent_count,
+            "missing_buckets": missing_buckets,
+            "missing_labels": action_proof_missing_labels(buckets),
+            "answer_source_discipline_decision": discipline_gate.get("decision"),
+            "answer_source_discipline_blocked_facets": list(discipline_gate.get("blocked_facets") or [])[:8],
+        },
+        "guidance": {
+            "use_for_claimed_action_questions": True,
+            "assistant_claim_boundary": "final_assistant_answer_claim records show what was claimed, not whether the action happened",
+            "missing_evidence_policy": "missing buckets are labeled explicitly; do not infer action proof from adjacent artifacts or assistant prose",
+        },
+        "links": {
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+            "tool_action_proof": "semantic_debug.tool_action_proof",
+            "task_review_commit_joins": "semantic_debug.task_review_commit_joins",
+            "answer_source_discipline": "semantic_debug.answer_source_discipline",
+            "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+        },
+        "cap_policy": {
+            "records_per_bucket": ACTION_PROOF_BUCKET_RECORD_CAP,
+            "source_windows": ACTION_PROOF_BUCKET_RECORD_CAP,
+            "text_excerpt_chars": ACTION_PROOF_TEXT_LIMIT,
+            "deterministic_order": "candidate/timeline order, then structured tool-event order, then join/next-read order",
+        },
+        "privacy_boundaries": {
+            "raw_transcript_dump_included": False,
+            "raw_tool_payload_dump_included": False,
+            "raw_artifact_content_included": False,
+            "text_excerpts_bounded": True,
+            "private_payloads_committed": False,
+        },
+        "claim_boundaries": {
+            "assistant_prose_satisfies_action_proof": False,
+            "adjacent_artifact_satisfies_primary_action_proof": False,
+            "missing_output_inferred_from_call": False,
+        },
+    }
+
+
+def source_window_action_proof_guidance(bundle: dict[str, Any]) -> dict[str, Any]:
+    if not bundle:
+        return {}
+    summary = bundle.get("summary") or {}
+    buckets = bundle.get("buckets") or {}
+    return {
+        "status": bundle.get("status"),
+        "link": "semantic_debug.source_window_action_proof",
+        "use_for_claimed_action_questions": True,
+        "primary_record_count": summary.get("primary_record_count", 0),
+        "adjacent_record_count": summary.get("adjacent_record_count", 0),
+        "missing_buckets": list(summary.get("missing_buckets") or [])[:8],
+        "bucket_statuses": {
+            key: value.get("status")
+            for key, value in buckets.items()
+            if isinstance(value, dict)
+        },
+        "adjacent_artifact_primary_proof_allowed": False,
+    }
+
+
+def bounded_action_proof_source_windows(
+    source_locator_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    target_by_ref = {
+        action_source_ref_key(read.get("source_ref")): read.get("target")
+        for read in next_reads
+        if isinstance(read.get("source_ref"), dict)
+    }
+    rows: list[dict[str, Any]] = []
+    for window in list(source_locator_handoff.get("source_windows") or [])[:ACTION_PROOF_BUCKET_RECORD_CAP]:
+        ref = compact_action_source_ref(window.get("source_ref"))
+        rows.append(
+            {
+                "source_ref": ref,
+                "source_status": "present" if ref else "missing_source_ref",
+                "window_kind": window.get("window_kind"),
+                "intent": window.get("intent"),
+                "reason": window.get("reason"),
+                "next_read_target": target_by_ref.get(action_source_ref_key(window.get("source_ref"))),
+                "text_included": bool(window.get("text_included") or window.get("source_window_text_included")),
+            }
+        )
+    return rows
+
+
+def candidate_action_record(item: dict[str, Any], *, source: str) -> dict[str, Any]:
+    ref = compact_action_source_ref(item.get("source_ref"))
+    return {
+        "record_type": "conversation_record",
+        "record_source": f"semantic_debug.{source}",
+        "source_ref": ref,
+        "source_status": "present" if ref else "missing_source_ref",
+        "timestamp_utc": item.get("timestamp_utc"),
+        "role": normalize_action_role(item.get("role")),
+        "confidence": item.get("confidence"),
+        "candidate_id": item.get("candidate_id"),
+        "phase_hint": item.get("phase_hint") or phase_hint(item.get("snippet", "")),
+        "text_excerpt": bounded_action_text(item.get("snippet")),
+        "primary_action_proof": False,
+        "proof_role": "conversation_context",
+    }
+
+
+def tool_event_action_record(event: dict[str, Any], *, proof_role: str, primary: bool) -> dict[str, Any]:
+    record = {
+        "record_type": event.get("event_type") or "tool_event",
+        "record_source": "semantic_debug.tool_action_proof.events",
+        "event_id": event.get("event_id"),
+        "source_ref": compact_action_source_ref(event.get("source_ref")),
+        "source_status": "present" if compact_action_source_ref(event.get("source_ref")) else "missing_source_ref",
+        "timestamp_utc": event.get("timestamp_utc"),
+        "event_family": event.get("event_family"),
+        "action": event.get("action"),
+        "tool_name": event.get("tool_name"),
+        "command": event.get("command"),
+        "targets": list(event.get("targets") or [])[:4],
+        "output_paths": list(event.get("output_paths") or [])[:4],
+        "confidence": event.get("confidence"),
+        "evidence_basis": list(event.get("evidence_basis") or [])[:6],
+        "primary_action_proof": primary,
+        "proof_role": proof_role,
+    }
+    return {key: value for key, value in record.items() if value not in (None, [], {})}
+
+
+def changed_check_review_commit_records(tool_events: list[dict[str, Any]], joins: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for event in tool_events:
+        if not is_change_check_review_commit_event(event):
+            continue
+        records.append(tool_event_action_record(event, proof_role="changed_check_or_commit_evidence", primary=True))
+    if joins.get("commit"):
+        records.append(
+            {
+                "record_type": "commit_metadata",
+                "record_source": "semantic_debug.task_review_commit_joins.commit",
+                "source_status": "join_metadata_no_transcript_source_ref",
+                "commit": joins.get("commit"),
+                "primary_action_proof": True,
+                "proof_role": "commit_evidence",
+            }
+        )
+    if joins.get("path_last_change"):
+        records.append(
+            {
+                "record_type": "path_last_change",
+                "record_source": "semantic_debug.task_review_commit_joins.path_last_change",
+                "source_status": "join_metadata_no_transcript_source_ref",
+                "path_last_change": joins.get("path_last_change"),
+                "primary_action_proof": True,
+                "proof_role": "changed_file_evidence",
+            }
+        )
+    for item in list(joins.get("review_evidence") or [])[:ACTION_PROOF_BUCKET_RECORD_CAP]:
+        records.append(
+            {
+                "record_type": "review_evidence",
+                "record_source": "semantic_debug.task_review_commit_joins.review_evidence",
+                "source_status": "artifact_path_no_transcript_source_ref",
+                "path": item.get("path"),
+                "exists": item.get("exists"),
+                "review_verdict": item.get("review_verdict"),
+                "claim_action": item.get("claim_action"),
+                "support_status": item.get("support_status"),
+                "support_basis_kind": item.get("support_basis_kind"),
+                "primary_action_proof": True,
+                "proof_role": "review_evidence",
+            }
+        )
+    return dedupe_action_records(records)[:ACTION_PROOF_BUCKET_RECORD_CAP]
+
+
+def adjacent_artifact_records(joins: dict[str, Any], next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in list(joins.get("artifact_checks") or [])[:ACTION_PROOF_BUCKET_RECORD_CAP]:
+        records.append(
+            {
+                "record_type": "artifact_check",
+                "record_source": "semantic_debug.task_review_commit_joins.artifact_checks",
+                "source_status": "artifact_path_no_transcript_source_ref",
+                "path": item.get("path"),
+                "exists": item.get("exists"),
+                "is_file": item.get("is_file"),
+                "git_tracked": item.get("git_tracked"),
+                "support_status": item.get("support_status"),
+                "support_basis_kind": item.get("support_basis_kind"),
+                "primary_action_proof": False,
+                "adjacent_evidence_only": True,
+                "proof_role": "adjacent_artifact_context",
+            }
+        )
+    for read in next_reads:
+        if read.get("kind") != "artifact":
+            continue
+        records.append(
+            {
+                "record_type": "artifact_next_read",
+                "record_source": "semantic_debug.next_reads",
+                "source_status": "next_read_target_no_transcript_source_ref",
+                "target": read.get("target"),
+                "reason": read.get("reason"),
+                "primary_action_proof": False,
+                "adjacent_evidence_only": True,
+                "proof_role": "adjacent_artifact_context",
+            }
+        )
+    return dedupe_action_records(records)[:ACTION_PROOF_BUCKET_RECORD_CAP]
+
+
+def action_bucket(
+    name: str,
+    records: list[dict[str, Any]],
+    *,
+    missing_label: str,
+    adjacent_only: bool = False,
+) -> dict[str, Any]:
+    clean_records = [
+        {key: value for key, value in record.items() if value not in (None, [], {})}
+        for record in records[:ACTION_PROOF_BUCKET_RECORD_CAP]
+    ]
+    status = "present" if clean_records else "not_present"
+    primary_count = sum(1 for record in clean_records if record.get("primary_action_proof") is True)
+    return {
+        "bucket": name,
+        "status": status,
+        "records": clean_records,
+        "record_count": len(clean_records),
+        "primary_record_count": 0 if adjacent_only else primary_count,
+        "adjacent_evidence_only": adjacent_only,
+        "missing_labels": [] if clean_records else [missing_label],
+    }
+
+
+def action_proof_missing_labels(buckets: dict[str, dict[str, Any]]) -> list[str]:
+    labels: list[str] = []
+    for bucket in buckets.values():
+        labels.extend(str(label) for label in bucket.get("missing_labels") or [])
+    return dedupe(labels)
+
+
+def is_action_call_event(event: dict[str, Any]) -> bool:
+    if is_output_evidence_event(event):
+        return False
+    if event.get("event_type") in {
+        "tool_call",
+        "command_run",
+        "file_edit",
+        "file_read",
+        "file_search",
+        "test_run",
+        "git_event",
+        "review_artifact",
+        "changed_path",
+    }:
+        return True
+    basis = set(event.get("evidence_basis") or [])
+    return bool(basis & {"structured_function_call", "structured_tool_record", "command_argument", "structured_edit_tool"})
+
+
+def is_output_evidence_event(event: dict[str, Any]) -> bool:
+    basis = set(event.get("evidence_basis") or [])
+    return bool(
+        basis
+        & {
+            "structured_tool_output",
+            "test_summary_output",
+            "git_output",
+            "git_output_path",
+            "artifact_output_path",
+            "review_artifact_path",
+        }
+    ) or event.get("action") in {"test_summary", "git_output"}
+
+
+def is_change_check_review_commit_event(event: dict[str, Any]) -> bool:
+    if is_output_evidence_event(event):
+        return True
+    return event.get("event_type") in {"file_edit", "changed_path", "test_run", "git_event", "review_artifact"}
+
+
+def looks_like_final_answer_or_claim(text: str | None) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "final",
+            "answer",
+            "claim",
+            "claimed",
+            "done",
+            "implemented",
+            "completed",
+            "i ran",
+            "i tested",
+            "i reviewed",
+            "verified",
+        )
+    )
+
+
+def bounded_action_text(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= ACTION_PROOF_TEXT_LIMIT:
+        return text
+    return text[: ACTION_PROOF_TEXT_LIMIT - 1].rstrip() + "..."
+
+
+def compact_action_source_ref(source_ref: Any) -> dict[str, Any]:
+    if not isinstance(source_ref, dict):
+        return {}
+    compact = {
+        "path": source_ref.get("path"),
+        "line": source_ref.get("line"),
+    }
+    if source_ref.get("record_id"):
+        compact["record_id"] = source_ref.get("record_id")
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def action_source_ref_key(source_ref: Any) -> str:
+    return json.dumps(compact_action_source_ref(source_ref), sort_keys=True)
+
+
+def normalize_action_role(role: Any) -> str:
+    lowered = str(role or "").lower()
+    if lowered in {"user", "human"}:
+        return "user"
+    if lowered in {"assistant", "agent", "assistant_message", "agent_message"}:
+        return "assistant"
+    return lowered
+
+
+def dedupe_action_records(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 def answer_ready_copy_paste_commands(
