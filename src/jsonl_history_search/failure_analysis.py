@@ -265,17 +265,6 @@ def build_failure_analysis_payload(
         repo_artifact_evidence_rows,
     )
     claim_boundaries = _claim_boundaries(semantic_loaded, forensics_loaded, follow_loaded)
-    devlog_story_packet = _build_devlog_story_packet(
-        narrative_readiness=narrative_readiness,
-        story_phase_summary=story_phase_summary,
-        repo_handle_chronology=repo_handle_chronology,
-        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
-        failure_mode_ledger=failure_mode_ledger,
-        claim_boundaries=claim_boundaries,
-        next_reads=next_reads,
-        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
-        repo_artifact_evidence_rows=repo_artifact_evidence_rows,
-    )
     tool_critique = _tool_critique(
         semantic_loaded=semantic_loaded,
         forensics_loaded=forensics_loaded,
@@ -287,6 +276,20 @@ def build_failure_analysis_payload(
         follow_packet=follow_packet,
         play_by_play=play_by_play,
         next_reads=next_reads,
+    )
+    devlog_story_packet = _build_devlog_story_packet(
+        narrative_readiness=narrative_readiness,
+        story_phase_summary=story_phase_summary,
+        repo_handle_chronology=repo_handle_chronology,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        play_by_play=play_by_play,
+        failure_mode_ledger=failure_mode_ledger,
+        interesting_moments=interesting_moments,
+        tool_critique=tool_critique,
+        claim_boundaries=claim_boundaries,
+        next_reads=next_reads,
+        followthrough_behavior_label_rows=followthrough_behavior_label_rows,
+        repo_artifact_evidence_rows=repo_artifact_evidence_rows,
     )
     devlog_brief = _build_devlog_brief(
         story_id=story_id,
@@ -1140,7 +1143,10 @@ def _build_devlog_story_packet(
     story_phase_summary: dict[str, Any],
     repo_handle_chronology: dict[str, Any],
     committed_safe_narrative_ledger: list[dict[str, Any]],
+    play_by_play: list[dict[str, Any]],
     failure_mode_ledger: list[dict[str, Any]],
+    interesting_moments: list[dict[str, Any]],
+    tool_critique: dict[str, Any],
     claim_boundaries: dict[str, Any],
     next_reads: dict[str, Any],
     followthrough_behavior_label_rows: list[dict[str, Any]],
@@ -1175,6 +1181,13 @@ def _build_devlog_story_packet(
         followthrough_behavior_label_rows=followthrough_behavior_label_rows,
         repo_artifact_evidence_rows=repo_artifact_evidence_rows,
     )
+    story_sections = _devlog_story_sections(
+        narrative_readiness=narrative_readiness,
+        play_by_play=play_by_play,
+        failure_mode_ledger=failure_mode_ledger,
+        interesting_moments=interesting_moments,
+        tool_critique=tool_critique,
+    )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
         "mode": "deterministic_committed_safe_story_synthesis",
@@ -1200,6 +1213,7 @@ def _build_devlog_story_packet(
             failure_mode_ledger=failure_mode_ledger,
             semantic_debugging_categories=semantic_debugging_categories,
         ),
+        "story_sections": story_sections,
         "semantic_debugging_categories": semantic_debugging_categories,
         "behavior_quality_labels": behavior_quality_labels,
         "supported_claims": supported_claims,
@@ -1218,6 +1232,11 @@ def _build_devlog_story_packet(
             "story_phase_summary_status": phase_status,
             "repo_handle_chronology_status": repo_handle_chronology.get("status"),
             "committed_safe_narrative_ledger_rows": len(committed_safe_narrative_ledger),
+            "story_section_rows": story_sections.get("row_count", 0),
+            "packet_play_by_play_rows": len(_list(story_sections.get("play_by_play"))),
+            "packet_failure_mode_rows": len(_list(story_sections.get("failure_modes"))),
+            "packet_interesting_moment_rows": len(_list(story_sections.get("interesting_moments"))),
+            "packet_tool_critique_rows": len(_list(story_sections.get("tool_critique"))),
             "failure_mode_ledger_rows": len(failure_mode_ledger),
             "semantic_debugging_category_rows": len(semantic_debugging_categories),
             "unclassified_semantic_debugging_rows": sum(
@@ -1926,6 +1945,181 @@ def _devlog_next_reads(next_reads: dict[str, Any]) -> dict[str, Any]:
         "reads": reads,
         "explicit_gap": next_reads.get("explicit_gap"),
     }
+
+
+def _devlog_story_sections(
+    *,
+    narrative_readiness: dict[str, Any],
+    play_by_play: list[dict[str, Any]],
+    failure_mode_ledger: list[dict[str, Any]],
+    interesting_moments: list[dict[str, Any]],
+    tool_critique: dict[str, Any],
+) -> dict[str, Any]:
+    section_rows = {
+        "play_by_play": _devlog_story_play_by_play_rows(play_by_play),
+        "failure_modes": _devlog_story_failure_mode_rows(failure_mode_ledger),
+        "interesting_moments": _devlog_story_interesting_moment_rows(interesting_moments),
+        "tool_critique": _devlog_story_tool_critique_rows(tool_critique),
+    }
+    row_count = sum(len(rows) for rows in section_rows.values())
+    return {
+        "status": "available" if row_count else "empty",
+        "synthesis_source": "promoted_from_existing_failure_analysis_sections",
+        "readiness_status": narrative_readiness.get("status"),
+        "recovery_opened": bool(_int(narrative_readiness.get("recovery_opened_count"))),
+        "usable_recovery_evidence_count": _int(narrative_readiness.get("usable_recovery_evidence_count")),
+        "row_count": row_count,
+        **section_rows,
+        "inference_privacy_boundary": (
+            "story-section rows are deterministic promotions of existing sanitized failure-analysis metadata; "
+            "they include safe handles, counts, statuses, labels, and source surfaces only"
+        ),
+    }
+
+
+def _devlog_story_play_by_play_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    promoted: list[dict[str, Any]] = []
+    for index, row in enumerate(rows[:PLAY_BY_PLAY_LIMIT], 1):
+        if not isinstance(row, dict):
+            continue
+        promoted.append(
+            _clean_row(
+                {
+                    "row_id": f"play-{index:03d}",
+                    "source_surface": row.get("source"),
+                    "source_index": row.get("source_index"),
+                    "timestamp_utc": row.get("timestamp_utc"),
+                    "candidate_id": _safe_label_or_none(row.get("candidate_id")),
+                    "status": _safe_label_or_none(row.get("status")),
+                    "role": _safe_label_or_none(row.get("role")),
+                    "event_type": _safe_label_or_none(row.get("event_type")),
+                    "event_family": _safe_label_or_none(row.get("event_family")),
+                    "tool_name": _safe_label_or_none(row.get("tool_name")),
+                    "phase_hint": _safe_label_or_none(row.get("phase_hint") or row.get("phase_kind")),
+                    "confidence": _safe_label_or_none(row.get("confidence")),
+                    "source_handle": row.get("source_handle"),
+                    "boundary": "packet-level play-by-play row uses saved metadata only, not transcript text or command payloads",
+                }
+            )
+        )
+    return promoted
+
+
+def _devlog_story_failure_mode_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    promoted: list[dict[str, Any]] = []
+    for index, row in enumerate(rows[:DEVLOG_CLAIM_LEDGER_LIMIT], 1):
+        if not isinstance(row, dict):
+            continue
+        promoted.append(
+            _clean_row(
+                {
+                    "row_id": f"failure-{index:03d}",
+                    "source_surface": row.get("evidence_surface"),
+                    "failure_mode": _safe_label_or_none(row.get("failure_mode")),
+                    "status": _safe_label_or_none(row.get("status")),
+                    "decision": _safe_label_or_none(row.get("decision")),
+                    "failure_reasons": [
+                        item for item in (_safe_label_or_none(reason) for reason in _list(row.get("failure_reasons"))) if item
+                    ][:8],
+                    "basis": row.get("basis"),
+                    "counts": _story_section_counts(row),
+                    "boundary": row.get("interpretation_boundary")
+                    or "failure-mode row is a deterministic classification, not a root-cause claim",
+                }
+            )
+        )
+    return promoted
+
+
+def _devlog_story_interesting_moment_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    promoted: list[dict[str, Any]] = []
+    for index, row in enumerate(rows[:INTERESTING_MOMENT_LIMIT], 1):
+        if not isinstance(row, dict):
+            continue
+        promoted.append(
+            _clean_row(
+                {
+                    "row_id": f"moment-{index:03d}",
+                    "source_surface": row.get("source"),
+                    "source_index": row.get("source_index"),
+                    "kind": _safe_label_or_none(row.get("kind")),
+                    "timestamp_utc": row.get("timestamp_utc"),
+                    "candidate_id": _safe_label_or_none(row.get("candidate_id")),
+                    "rank": _int(row.get("rank")) if row.get("rank") is not None else None,
+                    "status": _safe_label_or_none(row.get("status")),
+                    "verdict": _safe_label_or_none(row.get("verdict")),
+                    "support": _safe_label_or_none(row.get("support")),
+                    "confidence": _safe_label_or_none(row.get("confidence")),
+                    "failure_reason": _safe_label_or_none(row.get("failure_reason")),
+                    "reason_codes": [
+                        item for item in (_safe_label_or_none(reason) for reason in _list(row.get("reason_codes"))) if item
+                    ][:8],
+                    "source_handle": row.get("source_handle"),
+                    "boundary": "interesting moment is a sanitized saved-report row, not a transcript excerpt",
+                }
+            )
+        )
+    return promoted
+
+
+def _devlog_story_tool_critique_rows(tool_critique: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(tool_critique, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    could_package = (
+        tool_critique.get("what_the_tool_could_package")
+        if isinstance(tool_critique.get("what_the_tool_could_package"), dict)
+        else {}
+    )
+    package_counts = {
+        key: _int(value)
+        for key, value in could_package.items()
+    }
+    if package_counts:
+        rows.append(
+            {
+                "row_id": "critique-001",
+                "source_surface": "tool_critique.what_the_tool_could_package",
+                "status": "packaging_counts_available",
+                "counts": package_counts,
+                "boundary": "counts describe saved-report packaging capacity only",
+            }
+        )
+    for index, gap in enumerate(_list(tool_critique.get("gaps_and_limitations"))[:6], len(rows) + 1):
+        label = _safe_label_or_none(gap)
+        if not label:
+            continue
+        rows.append(
+            {
+                "row_id": f"critique-{index:03d}",
+                "source_surface": "tool_critique.gaps_and_limitations",
+                "status": "gap_or_limitation",
+                "label": label,
+                "boundary": "tool critique gap is a workflow limitation, not proof of missing evidence",
+            }
+        )
+    non_goals = tool_critique.get("not_changed_or_claimed")
+    if isinstance(non_goals, dict):
+        unchanged = sorted(key for key, value in non_goals.items() if value is False)
+        if unchanged:
+            rows.append(
+                {
+                    "row_id": f"critique-{len(rows) + 1:03d}",
+                    "source_surface": "tool_critique.not_changed_or_claimed",
+                    "status": "non_goals_retained",
+                    "labels": unchanged[:8],
+                    "boundary": "non-goal labels prevent promotion into retrieval, ranking, release, harness, or broad quality claims",
+                }
+            )
+    return rows
+
+
+def _story_section_counts(row: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for key, value in row.items():
+        if str(key).endswith("_count") or str(key) in {"next_read_count"}:
+            counts[str(key)] = _int(value)
+    return counts
 
 
 def _devlog_behavior_quality_labels(
