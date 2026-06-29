@@ -66,6 +66,7 @@ SEMANTIC_DEBUG_VALID_READINESS_STATUSES = {
 }
 FOLLOW_NEXT_READ_VALID_STATUSES = {"expanded", "partial_expanded", "no_next_reads", "selected_reads_failed"}
 FOLLOWED_RECOVERY_TARGET = "use_followed_recovery_evidence_for_bounded_answer_decision"
+REVIEWED_FOLLOWED_RECOVERY_TARGET = "answer_only_for_reviewed_usable_facets_and_state_remaining_gaps"
 
 
 def build_eval_decision_loop_payload(
@@ -385,6 +386,14 @@ def _build_decision(
         decision["pressure_recommended_next_product_target"] = pressure_target
         if readiness_target:
             decision["semantic_debug_recommended_next_product_target"] = readiness_target
+        reviewed_gate = recovery_follow_through.get("reviewed_follow_through_answer_gate") or {}
+        if reviewed_gate:
+            decision["answer_eval_decision"] = {
+                "status": reviewed_gate.get("status"),
+                "decision": reviewed_gate.get("decision"),
+                "answer_ready_without_boundaries": reviewed_gate.get("answer_ready_without_boundaries"),
+                "source_discipline_blockers": reviewed_gate.get("source_discipline_blockers", []),
+            }
         decision["routing_basis"] = (
             "recovery_follow_through"
             if follow_through_target
@@ -443,6 +452,9 @@ def _recovery_follow_through_target(
         return None
     if not recovery_follow_through or not _recovery_follow_through_is_valid(recovery_follow_through):
         return None
+    reviewed_gate = recovery_follow_through.get("reviewed_follow_through_answer_gate")
+    if isinstance(reviewed_gate, dict) and reviewed_gate.get("decision"):
+        return str(reviewed_gate["decision"])
     if _int(recovery_follow_through.get("usable_recovery_evidence_count")) <= 0:
         return None
     return FOLLOWED_RECOVERY_TARGET
@@ -576,6 +588,9 @@ def _load_recovery_follow_through_summary(follow_next_reads_report: Path | None)
     privacy_flags = packet.get("privacy_flags") if isinstance(packet.get("privacy_flags"), dict) else {}
     privacy_contract_ok = _follow_next_reads_privacy_contract_ok(packet, source_packet, claim_boundaries)
     failure_reasons = _follow_next_reads_failure_reasons(packet)
+    reviewed_counts_available = _reviewed_recovery_counts_available(packet)
+    reviewed_counts = _reviewed_recovery_counts(packet)
+    reviewed_gate = _reviewed_follow_through_answer_gate(reviewed_counts, packet) if reviewed_counts_available else None
     summary = {
         "schema_version": _int(packet.get("schema_version")) or 1,
         "loaded": True,
@@ -587,6 +602,8 @@ def _load_recovery_follow_through_summary(follow_next_reads_report: Path | None)
         "expanded_count": _int(packet.get("expanded_count")),
         "failed_count": _int(packet.get("failed_count")),
         "usable_recovery_evidence_count": _int(packet.get("usable_recovery_evidence_count")),
+        **reviewed_counts,
+        **({"reviewed_follow_through_answer_gate": reviewed_gate} if reviewed_gate is not None else {}),
         "failure_reasons": failure_reasons[:8],
         "claim_boundaries": {
             "broad_search_rerun": bool(claim_boundaries.get("broad_search_rerun", False)),
@@ -628,6 +645,22 @@ def _invalid_recovery_follow_through(reason: str) -> dict[str, Any]:
         "expanded_count": 0,
         "failed_count": 0,
         "usable_recovery_evidence_count": 0,
+        "reviewed_usable_recovery_evidence_count": 0,
+        "reviewed_not_useful_recovery_count": 0,
+        "still_unreviewed_recovery_count": 0,
+        "review_gap_recovery_count": 0,
+        "reviewed_follow_through_answer_gate": {
+            "status": "invalid",
+            "decision": "gather_more_evidence",
+            "answer_ready_without_boundaries": False,
+            "source_discipline_blockers": ["invalid_follow_next_reads_report"],
+            "basis": {
+                "reviewed_usable_recovery_evidence_count": 0,
+                "reviewed_not_useful_recovery_count": 0,
+                "still_unreviewed_recovery_count": 0,
+                "review_gap_recovery_count": 0,
+            },
+        },
         "failure_reasons": [],
         "claim_boundaries": {},
         "privacy_boundaries": {
@@ -637,6 +670,100 @@ def _invalid_recovery_follow_through(reason: str) -> dict[str, Any]:
             "follow_next_reads_report_path_echoed": False,
         },
         "invalid_reason": reason,
+    }
+
+
+def _reviewed_recovery_counts(packet: dict[str, Any]) -> dict[str, int]:
+    selection = packet.get("selection") if isinstance(packet.get("selection"), dict) else {}
+    return {
+        "reviewed_usable_recovery_evidence_count": _int(
+            packet.get("reviewed_usable_recovery_evidence_count")
+            if "reviewed_usable_recovery_evidence_count" in packet
+            else selection.get("reviewed_usable_recovery_evidence_count")
+        ),
+        "reviewed_not_useful_recovery_count": _int(
+            packet.get("reviewed_not_useful_recovery_count")
+            if "reviewed_not_useful_recovery_count" in packet
+            else selection.get("reviewed_not_useful_recovery_count")
+        ),
+        "still_unreviewed_recovery_count": _int(
+            packet.get("still_unreviewed_recovery_count")
+            if "still_unreviewed_recovery_count" in packet
+            else selection.get("still_unreviewed_recovery_count")
+        ),
+        "review_gap_recovery_count": _int(
+            packet.get("review_gap_recovery_count")
+            if "review_gap_recovery_count" in packet
+            else selection.get("review_gap_recovery_count")
+        ),
+    }
+
+
+def _reviewed_recovery_counts_available(packet: dict[str, Any]) -> bool:
+    selection = packet.get("selection") if isinstance(packet.get("selection"), dict) else {}
+    keys = {
+        "reviewed_usable_recovery_evidence_count",
+        "reviewed_not_useful_recovery_count",
+        "still_unreviewed_recovery_count",
+        "review_gap_recovery_count",
+    }
+    return any(key in packet or key in selection for key in keys)
+
+
+def _reviewed_follow_through_answer_gate(
+    counts: dict[str, int],
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    reviewed_usable = counts["reviewed_usable_recovery_evidence_count"]
+    reviewed_negative = counts["reviewed_not_useful_recovery_count"]
+    still_unreviewed = counts["still_unreviewed_recovery_count"]
+    review_gap = counts["review_gap_recovery_count"]
+    expanded = _int(packet.get("expanded_count"))
+    failed = _int(packet.get("failed_count"))
+    if expanded and reviewed_usable and not still_unreviewed and not review_gap and not reviewed_negative:
+        status = "reviewed_recovery_answer_usable_with_boundaries"
+        decision = "answer_with_reviewed_recovery_and_source_discipline_boundaries"
+    elif expanded and reviewed_usable:
+        status = "reviewed_recovery_partially_answer_usable"
+        decision = REVIEWED_FOLLOWED_RECOVERY_TARGET
+    elif expanded and (reviewed_negative or review_gap):
+        status = "reviewed_recovery_not_answer_ready"
+        decision = "do_not_answer_from_recovery_without_more_source_discipline"
+    elif expanded and still_unreviewed:
+        status = "followthrough_opened_but_recovery_unreviewed"
+        decision = "review_opened_recovery_before_answering"
+    elif failed:
+        status = "followthrough_attempted_but_reads_failed"
+        decision = "fix_or_rerun_recovery_reads_before_answering"
+    else:
+        status = "followthrough_no_recovery_opened"
+        decision = "do_not_answer_without_gap_boundary"
+
+    blockers: list[str] = []
+    if still_unreviewed:
+        blockers.append("opened_recovery_not_reviewed_for_usability")
+    if review_gap:
+        blockers.append("reviewed_recovery_has_source_discipline_gap")
+    if reviewed_negative:
+        blockers.append("reviewed_recovery_contains_explicit_negative_evidence")
+    if failed:
+        blockers.append("follow_next_reads_failures_present")
+
+    return {
+        "status": status,
+        "decision": decision,
+        "answer_ready_without_boundaries": False,
+        "source_discipline_blockers": blockers,
+        "basis": {
+            **counts,
+            "expanded_count": expanded,
+            "failed_count": failed,
+            "usable_recovery_evidence_count": _int(packet.get("usable_recovery_evidence_count")),
+        },
+        "claim_boundary": (
+            "derived from sanitized follow-next-reads reviewed usability counters; "
+            "not a final-answer quality or all-history completeness claim"
+        ),
     }
 
 
@@ -875,8 +1002,24 @@ def render_eval_decision_loop_markdown(payload: dict[str, Any]) -> str:
                 f"- Expanded reads: `{follow_through.get('expanded_count', 0)}`",
                 f"- Failed reads: `{follow_through.get('failed_count', 0)}`",
                 f"- Usable recovery evidence: `{follow_through.get('usable_recovery_evidence_count', 0)}`",
+                f"- Reviewed usable recovery evidence: `{follow_through.get('reviewed_usable_recovery_evidence_count', 0)}`",
+                f"- Reviewed negative recovery evidence: `{follow_through.get('reviewed_not_useful_recovery_count', 0)}`",
+                f"- Still-unreviewed recovery evidence: `{follow_through.get('still_unreviewed_recovery_count', 0)}`",
+                f"- Review-gap recovery evidence: `{follow_through.get('review_gap_recovery_count', 0)}`",
             ]
         )
+        reviewed_gate = follow_through.get("reviewed_follow_through_answer_gate") or {}
+        if reviewed_gate:
+            lines.extend(
+                [
+                    f"- Reviewed answer-gate status: `{reviewed_gate.get('status')}`",
+                    f"- Reviewed answer-gate decision: `{reviewed_gate.get('decision')}`",
+                    f"- Answer ready without boundaries: `{reviewed_gate.get('answer_ready_without_boundaries')}`",
+                ]
+            )
+            blockers = reviewed_gate.get("source_discipline_blockers") or []
+            if blockers:
+                lines.append(f"- Reviewed source-discipline blockers: `{', '.join(blockers)}`")
         if follow_through.get("invalid_reason"):
             lines.append(f"- Invalid reason: `{follow_through.get('invalid_reason')}`")
         for reason in follow_through.get("failure_reasons", [])[:4]:
