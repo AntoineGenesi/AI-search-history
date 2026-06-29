@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import time
 from collections import Counter
@@ -40,6 +41,12 @@ INLINE_CANDIDATE_LIMIT = 8
 INLINE_TIMELINE_LIMIT = 12
 INLINE_EVENT_LIMIT = 12
 DEFAULT_GOLD_MANIFEST = Path("benchmarks/real_history_gold/sanitized_cases.json")
+HANDLE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+){2,})(?![A-Za-z0-9_.-])")
+BACKTICK_HANDLE_RE = re.compile(r"`([^`\n]{3,120})`")
+LABELED_HANDLE_RE = re.compile(
+    r"\b(?:reviewed\s+source\s+case|source\s+case|source\s+handle|case\s+handle|case\s+id|task\s+handle|task\s+case|source\s+ref)\s*:?\s*`?([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+)`?",
+    re.IGNORECASE,
+)
 
 DECISION_CONTEXT_ROUTES = {
     "conversation_reconstruction",
@@ -145,6 +152,17 @@ def build_semantic_debug_payload(
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
+    source_handle_routing = build_source_handle_routing(
+        agent_find["query"]["original"],
+        candidates=candidates,
+        next_reads=next_reads,
+    )
+    next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+    source_handle_routing = build_source_handle_routing(
+        agent_find["query"]["original"],
+        candidates=candidates,
+        next_reads=next_reads,
+    )
     decision_context = build_decision_context(
         query=agent_find["query"]["original"],
         family=family,
@@ -157,6 +175,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         hints=hints,
         source_plan=source_plan,
+        source_handle_routing=source_handle_routing,
     )
     audit_plan = build_audit_plan(
         query=agent_find["query"]["original"],
@@ -171,6 +190,7 @@ def build_semantic_debug_payload(
         uncertainty=uncertainty,
         hints=hints,
         watchlist_inputs=list(getattr(args, "watchlist", []) or []),
+        source_handle_routing=source_handle_routing,
     )
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
@@ -188,12 +208,26 @@ def build_semantic_debug_payload(
     )
     if source_locator_handoff.get("next_reads") != next_reads:
         next_reads = list(source_locator_handoff.get("next_reads") or next_reads)
+        source_handle_routing = build_source_handle_routing(
+            agent_find["query"]["original"],
+            candidates=candidates,
+            next_reads=next_reads,
+        )
+        next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+        source_handle_routing = build_source_handle_routing(
+            agent_find["query"]["original"],
+            candidates=candidates,
+            next_reads=next_reads,
+        )
+        source_locator_handoff["next_reads"] = next_reads
         decision_context["next_reads"] = next_reads[:12]
         decision_context["next_commands"] = build_next_commands(
             next_reads,
             hints=hints,
             include_semantic_debug_replay=False,
         )
+        decision_context["source_handle_routing"] = source_handle_routing
+        decision_context["route_guidance"] = decision_context_route_guidance(source_handle_routing)
         audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
         audit_plan["replay_commands"] = build_next_commands(
             next_reads,
@@ -201,6 +235,12 @@ def build_semantic_debug_payload(
             include_semantic_debug_replay=True,
         )
         audit_plan["next_commands"] = decision_context["next_commands"]
+        audit_plan["source_handle_routing"] = audit_source_handle_guidance(source_handle_routing)
+        audit_plan["checkpoint_plan"] = source_handle_checkpoint_plan(
+            audit_plan.get("checkpoint_plan", []),
+            source_handle_routing,
+        )
+    source_locator_handoff["source_handle_routing"] = source_handle_routing
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
         Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
@@ -224,6 +264,7 @@ def build_semantic_debug_payload(
         uncertainty=uncertainty,
         hints=hints,
         source_scope=source_scope,
+        source_handle_routing=source_handle_routing,
     )
     answer_readiness = build_answer_readiness(
         status=agent_find["status"],
@@ -238,6 +279,7 @@ def build_semantic_debug_payload(
         audit_plan=audit_plan,
         forensics_workflow=forensics_workflow,
         next_reads=next_reads,
+        source_handle_routing=source_handle_routing,
     )
     answer_source_discipline = build_answer_source_discipline(
         candidates=candidates,
@@ -270,6 +312,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         next_commands=decision_context["next_commands"],
         answer_source_discipline=answer_source_discipline,
+        source_handle_routing=source_handle_routing,
     )
     agent_instruction = build_agent_instruction(
         query=agent_find["query"]["original"],
@@ -279,6 +322,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         hints=hints,
         answer_source_discipline=answer_source_discipline,
+        source_handle_routing=source_handle_routing,
     )
     answer_ready_handoff = build_answer_ready_handoff(
         answer_readiness=answer_readiness,
@@ -289,6 +333,7 @@ def build_semantic_debug_payload(
         hints=hints,
         no_evidence=no_evidence,
         report_output=getattr(args, "report_output", None),
+        source_handle_routing=source_handle_routing,
     )
 
     packet = {
@@ -298,6 +343,7 @@ def build_semantic_debug_payload(
         "question_family": family,
         "scope": source_scope,
         "routes": routes,
+        "source_handle_routing": source_handle_routing,
         "source_locator_handoff": source_locator_handoff,
         "strongest_candidates": candidates,
         "timeline": timeline,
@@ -407,6 +453,292 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
     }
 
 
+def empty_source_handle_routing() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "detected_handles": [],
+        "status": "not_requested",
+        "route_guidance": "No reviewed/source/case handle was detected in the query; use normal semantic-debug retrieval order.",
+        "matched_next_reads": [],
+        "matched_candidate_refs": [],
+        "unresolved_handles": [],
+        "claim_boundaries": source_handle_claim_boundaries(),
+        "privacy_boundaries": source_handle_privacy_boundaries(),
+    }
+
+
+def source_handle_claim_boundaries() -> dict[str, bool]:
+    return {
+        "source_refs_fabricated": False,
+        "private_bridge_data_required": False,
+        "answer_key_or_final_answer_claimed": False,
+        "all_history_completeness_claimed": False,
+    }
+
+
+def source_handle_privacy_boundaries() -> dict[str, bool]:
+    return {
+        "raw_private_text_included": False,
+        "raw_paths_included": False,
+        "raw_source_lines_included": False,
+        "raw_session_ids_included": False,
+    }
+
+
+def normalize_source_handle(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def source_handle_like(value: str | None, *, quoted_or_labeled: bool = False) -> bool:
+    text = str(value or "").strip().strip("`'\"")
+    if not (3 <= len(text) <= 120):
+        return False
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", text):
+        return False
+    if "-" not in text and "_" not in text:
+        return False
+    normalized = normalize_source_handle(text)
+    parts = [part for part in normalized.split("-") if part]
+    if len(parts) < 2:
+        return False
+    if any(part in {"http", "https", "www", "json", "format"} for part in parts[:2]):
+        return False
+    prefixish = {"real", "jsh", "case", "task", "source", "review", "reviewed", "fixture"}
+    return quoted_or_labeled or any(char.isdigit() for char in text) or parts[0] in prefixish
+
+
+def detect_source_handles(query: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def add(handle: str, basis: str) -> None:
+        cleaned = handle.strip().strip("`'\".,;:()[]{}")
+        if not source_handle_like(cleaned, quoted_or_labeled=basis in {"backtick", "labeled"}):
+            return
+        normalized = normalize_source_handle(cleaned)
+        if not normalized or any(row["normalized"] == normalized for row in rows):
+            return
+        rows.append({"handle": cleaned, "normalized": normalized, "detection_basis": basis})
+
+    for match in LABELED_HANDLE_RE.finditer(query):
+        add(match.group(1), "labeled")
+    for match in BACKTICK_HANDLE_RE.finditer(query):
+        add(match.group(1), "backtick")
+    for match in HANDLE_TOKEN_RE.finditer(query):
+        add(match.group(1), "token")
+    return rows[:8]
+
+
+def detect_source_handle_hints(query: str) -> dict[str, Any]:
+    handles = detect_source_handles(query)
+    return {
+        "schema_version": 1,
+        "status": "detected" if handles else "no_handles",
+        "count": len(handles),
+        "detected_handles": handles,
+        "claim_boundaries": source_handle_claim_boundaries(),
+        "privacy_boundaries": source_handle_privacy_boundaries(),
+    }
+
+
+def source_handle_match_texts(item: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for key in ("target", "candidate_id", "reason", "kind", "snippet"):
+        value = item.get(key)
+        if value:
+            texts.append(str(value))
+    source_ref = item.get("source_ref")
+    if isinstance(source_ref, dict):
+        for key in ("path", "line"):
+            if source_ref.get(key) is not None:
+                texts.append(str(source_ref.get(key)))
+        target = source_ref_target(source_ref)
+        if target:
+            texts.append(target)
+    for key in ("artifacts", "tasks", "reason_codes", "stages"):
+        values = item.get(key) or []
+        if isinstance(values, list):
+            texts.extend(str(value) for value in values if value is not None)
+    return texts
+
+
+def source_handle_item_matches(handle: dict[str, Any], item: dict[str, Any]) -> bool:
+    needle = handle.get("normalized")
+    if not needle:
+        return False
+    return any(needle in normalize_source_handle(text) for text in source_handle_match_texts(item))
+
+
+def build_source_handle_routing(
+    query: str,
+    *,
+    candidates: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    handle_hints = detect_source_handle_hints(query)
+    handles = list(handle_hints.get("detected_handles") or [])
+    if not handles:
+        return empty_source_handle_routing()
+    matched_reads: list[dict[str, Any]] = []
+    matched_candidates: list[dict[str, Any]] = []
+    resolved: set[str] = set()
+    for handle in handles:
+        handle_read_count = 0
+        for index, read in enumerate(next_reads):
+            if not source_handle_item_matches(handle, read):
+                continue
+            resolved.add(handle["normalized"])
+            handle_read_count += 1
+            matched_reads.append(
+                {
+                    "handle": handle["handle"],
+                    "target": read.get("target"),
+                    "kind": read.get("kind"),
+                    "reason": "matching handle evidence already exists in semantic_debug.next_reads",
+                    "priority": "before_broad_search",
+                    "original_order": index,
+                }
+            )
+        for candidate in candidates[:INLINE_CANDIDATE_LIMIT]:
+            if not source_handle_item_matches(handle, candidate):
+                continue
+            resolved.add(handle["normalized"])
+            ref = candidate.get("source_ref") or {}
+            matched_candidates.append(
+                {
+                    "handle": handle["handle"],
+                    "candidate_id": candidate.get("candidate_id"),
+                    "source_ref": dict(ref) if isinstance(ref, dict) else {},
+                    "target": source_ref_target(ref) if isinstance(ref, dict) else None,
+                    "reason": "matching handle evidence already exists in semantic_debug.strongest_candidates",
+                }
+            )
+        if handle_read_count == 0:
+            for candidate in matched_candidates:
+                if candidate.get("handle") == handle["handle"] and candidate.get("target"):
+                    matched_reads.append(
+                        {
+                            "handle": handle["handle"],
+                            "target": candidate.get("target"),
+                            "kind": "jsonl_source_ref",
+                            "reason": "candidate ref matches detected handle; open before broad search",
+                            "priority": "before_broad_search",
+                            "original_order": None,
+                        }
+                    )
+                    break
+    unresolved = [handle for handle in handles if handle["normalized"] not in resolved]
+    status = "matched" if matched_reads or matched_candidates else "unresolved"
+    if matched_reads or matched_candidates:
+        guidance = (
+            "Detected reviewed/source/case handle(s); resolve/open matching source refs from "
+            "source_handle_routing.matched_next_reads before broad search."
+        )
+    else:
+        guidance = (
+            "Detected reviewed/source/case handle(s), but this packet has no matching candidate or next-read source ref; "
+            "state no matching source ref was found in searched scope, report the handle as unresolved, and do not fabricate source refs."
+        )
+    return {
+        "schema_version": 1,
+        "detected_handles": handles,
+        "status": status,
+        "route_guidance": guidance,
+        "matched_next_reads": dedupe_dicts(matched_reads)[:8],
+        "matched_candidate_refs": dedupe_dicts(matched_candidates)[:8],
+        "unresolved_handles": unresolved,
+        "claim_boundaries": source_handle_claim_boundaries(),
+        "privacy_boundaries": source_handle_privacy_boundaries(),
+    }
+
+
+def prioritize_source_handle_next_reads(
+    next_reads: list[dict[str, Any]],
+    source_handle_routing: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    matched_targets = {
+        item.get("target")
+        for item in routing.get("matched_next_reads", [])
+        if item.get("target")
+    }
+    if not matched_targets:
+        return next_reads
+    promoted: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    for read in next_reads:
+        row = dict(read)
+        if row.get("target") in matched_targets:
+            reasons = list(row.get("routing_reasons") or [])
+            reasons.append("source_handle_match")
+            row["routing_reasons"] = dedupe(reasons)
+            row["source_handle_priority"] = "before_broad_search"
+            promoted.append(row)
+        else:
+            remaining.append(row)
+    return dedupe_dicts(promoted + remaining)[:12]
+
+
+def decision_context_route_guidance(source_handle_routing: dict[str, Any] | None) -> list[dict[str, Any]]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    if not routing.get("detected_handles"):
+        return []
+    return [
+        {
+            "route": "source_ref_followup",
+            "priority": "before_broad_search",
+            "status": routing.get("status"),
+            "instruction": routing.get("route_guidance"),
+            "matched_next_read_count": len(routing.get("matched_next_reads") or []),
+            "unresolved_handle_count": len(routing.get("unresolved_handles") or []),
+        }
+    ]
+
+
+def audit_source_handle_guidance(source_handle_routing: dict[str, Any] | None) -> dict[str, Any]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    return {
+        "status": routing.get("status"),
+        "detected_handles": list(routing.get("detected_handles") or []),
+        "matched_next_reads": list(routing.get("matched_next_reads") or [])[:5],
+        "unresolved_handles": list(routing.get("unresolved_handles") or []),
+        "audit_instruction": routing.get("route_guidance"),
+        "claim_boundaries": routing.get("claim_boundaries") or source_handle_claim_boundaries(),
+    }
+
+
+def source_handle_handoff_summary(source_handle_routing: dict[str, Any] | None) -> dict[str, Any]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    return {
+        "status": routing.get("status"),
+        "detected_handle_count": len(routing.get("detected_handles") or []),
+        "matching_candidate_count": len(routing.get("matched_candidate_refs") or []),
+        "matching_next_read_count": len(routing.get("matched_next_reads") or []),
+        "unresolved_handle_count": len(routing.get("unresolved_handles") or []),
+        "route_guidance": routing.get("route_guidance"),
+        "matched_next_read_targets": [
+            item.get("target") for item in list(routing.get("matched_next_reads") or [])[:5] if item.get("target")
+        ],
+        "claim_boundaries": routing.get("claim_boundaries") or source_handle_claim_boundaries(),
+    }
+
+
+def source_handle_checkpoint_plan(
+    checkpoints: list[dict[str, Any]],
+    source_handle_routing: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    if not routing.get("detected_handles"):
+        return checkpoints
+    first = {
+        "route": "source_ref_followup",
+        "checkpoint": "resolve_detected_source_handle_before_broad_search",
+        "required": bool(routing.get("matched_next_reads")),
+        "status": routing.get("status"),
+        "instruction": routing.get("route_guidance"),
+    }
+    return [first, *checkpoints]
+
+
 def build_decision_context(
     *,
     query: str,
@@ -420,6 +752,7 @@ def build_decision_context(
     next_reads: list[dict[str, Any]],
     hints: dict[str, str | None],
     source_plan: dict[str, Any],
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_time_needed = project_time_reconstruction_needed(query, hints)
     selected_routes = select_decision_routes(
@@ -456,6 +789,8 @@ def build_decision_context(
             source_scope=source_scope,
         ),
         "uncertainty": uncertainty,
+        "source_handle_routing": source_handle_routing or empty_source_handle_routing(),
+        "route_guidance": decision_context_route_guidance(source_handle_routing),
         "next_reads": next_reads[:12],
         "next_commands": build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False),
     }
@@ -475,14 +810,17 @@ def build_audit_plan(
     uncertainty: list[dict[str, Any]],
     hints: dict[str, str | None],
     watchlist_inputs: list[str],
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     route_order = order_decision_routes(routes)
+    checkpoint_rows = checkpoint_plan(route_order)
     return {
         "watchlist": parse_watchlist(query, watchlist_inputs),
         "route_order": route_order,
-        "checkpoint_plan": checkpoint_plan(route_order),
+        "checkpoint_plan": source_handle_checkpoint_plan(checkpoint_rows, source_handle_routing),
         "resume_from": resume_from(next_reads, route_order),
         "replay_commands": build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=True),
+        "source_handle_routing": audit_source_handle_guidance(source_handle_routing),
         "retained_evidence_ledger": retained_evidence_ledger(candidates, tool_proof, joins),
         "omitted_or_dropped_scope": omitted_or_dropped_scope(source_scope, no_evidence),
         "aggregate_report": {
@@ -901,6 +1239,7 @@ def build_answer_ready_handoff(
     hints: dict[str, str | None],
     no_evidence: dict[str, Any],
     report_output: str | None = None,
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     answer_gate = guided_audit_flow.get("answer_gate") or {}
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
@@ -934,6 +1273,10 @@ def build_answer_ready_handoff(
         do_not_answer_until.append(f"State or resolve answer_source_discipline blocked facets: {facet_text}.")
     if no_evidence_needed:
         do_not_answer_until.append("Keep no-evidence claims scoped to searched scope; do not claim all-history absence.")
+    if (source_handle_routing or {}).get("detected_handles"):
+        do_not_answer_until.append(
+            "Resolve/open matching source refs for detected source handles first, or state no matching source ref was found in searched scope."
+        )
     do_not_answer_until = dedupe(do_not_answer_until)[:8]
 
     bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
@@ -979,6 +1322,7 @@ def build_answer_ready_handoff(
             ),
         },
         "source_use_summary": source_use_summary,
+        "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
         "privacy_boundaries": {
             **(answer_readiness.get("privacy_boundaries") or {}),
@@ -1237,6 +1581,7 @@ def build_agent_instruction(
     next_reads: list[dict[str, Any]],
     hints: dict[str, str | None],
     answer_source_discipline: dict[str, Any] | None = None,
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
     primary_family = guided_audit_flow.get("primary_question_family")
@@ -1364,6 +1709,11 @@ def build_agent_instruction(
         constraints.append("Do not cite candidate-only or unsupported-extra handles as final support.")
         if discipline_gate.get("missing_proof_must_be_stated"):
             constraints.append("State missing proof/action facets instead of filling them with broad source lists.")
+    if (source_handle_routing or {}).get("detected_handles"):
+        constraints.insert(
+            0,
+            "For detected reviewed/source/case handles, first open matching source refs from source_handle_routing or state that no matching source ref exists in searched scope.",
+        )
 
     return {
         "schema_version": 1,
@@ -1378,6 +1728,7 @@ def build_agent_instruction(
         },
         "commands": commands[:8],
         "do_not_answer_until": constraints,
+        "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "workflow_layers": [
             {"layer": "evidence_packet", "surface": "semantic_debug", "status": "current_packet"},
             {"layer": "recovery_packet", "surface": "follow_next_reads", "status": "required_before_synthesis" if recovery_first else "optional"},
@@ -1930,6 +2281,7 @@ def build_final_answer_source_use_contract(
     uncertainty: list[dict[str, str]],
     hints: dict[str, str | None],
     source_scope: dict[str, Any],
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_refs = [
         candidate.get("source_ref")
@@ -1948,6 +2300,11 @@ def build_final_answer_source_use_contract(
         "Preserve uncertainty labels instead of smoothing them into a stronger claim.",
         "Do not claim root cause, exhaustive all-history absence, JSONL superiority, speed, value, or token-efficiency unless separate reviewed evidence supports it.",
     ]
+    if (source_handle_routing or {}).get("detected_handles"):
+        required_actions.insert(
+            0,
+            "Resolve/open matching source refs for detected reviewed/source/case handles before broad answer claims, or state no matching source ref was found in searched scope.",
+        )
     evidence_inputs = {
         "strongest_candidate_source_refs": candidate_refs,
         "source_locator_next_reads": next_reads,
@@ -1955,6 +2312,7 @@ def build_final_answer_source_use_contract(
         "task_review_join_status": joins.get("status"),
         "task_review_join_support_summary": joins.get("support_summary") or empty_support_summary(),
         "uncertainty_labels": [item.get("label") for item in uncertainty],
+        "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
     }
     if status == "no_evidence":
         required_actions.insert(0, "Answer with `not_found_in_searched_scope`, not global absence.")
@@ -2006,6 +2364,7 @@ def build_answer_readiness(
     audit_plan: dict[str, Any],
     forensics_workflow: dict[str, Any],
     next_reads: list[dict[str, Any]],
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     final_evidence_contract = source_locator_handoff.get("final_evidence_contract") or {}
     ledger = list(final_evidence_contract.get("ledger") or [])
@@ -2077,6 +2436,10 @@ def build_answer_readiness(
         ]
         if not next_reads and not route_states:
             required_before_answer.append("No bounded next read or route surfaced; revisit source planning.")
+    if (source_handle_routing or {}).get("detected_handles"):
+        required_before_answer.append(
+            "Resolve/open matching source refs for detected source handles first, or state no matching source ref was found in searched scope."
+        )
 
     ready_ledger_ids = [
         entry.get("ledger_id")
@@ -2120,7 +2483,10 @@ def build_answer_readiness(
             "task_review_join_count": len(joins.get("review_evidence", []) or []),
             "forensics_phase_count": int((forensics_workflow.get("summary") or {}).get("phase_count", 0) or 0),
             "forensics_join_count": int((forensics_workflow.get("summary") or {}).get("join_count", 0) or 0),
+            "source_handle_count": len((source_handle_routing or {}).get("detected_handles") or []),
+            "source_handle_matching_next_read_count": len((source_handle_routing or {}).get("matched_next_reads") or []),
         },
+        "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "ledger_summary": {
             "ledger_count": int(final_evidence_contract.get("ledger_count", 0) or 0),
             "ledger_ids": [entry.get("ledger_id") for entry in ledger[:12] if entry.get("ledger_id")],
@@ -2299,6 +2665,7 @@ def build_guided_audit_flow(
     next_reads: list[dict[str, Any]],
     next_commands: list[dict[str, Any]],
     answer_source_discipline: dict[str, Any] | None = None,
+    source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     query_plan = source_locator_handoff.get("query_plan") or {}
     primary_intent = query_plan.get("primary_intent") or "generic_history"
@@ -2346,6 +2713,7 @@ def build_guided_audit_flow(
         "scope": guided_scope(source_scope, no_evidence),
         "evidence_handles": guided_evidence_handles(decision_context.get("evidence_handles", [])),
         "recovery": recovery,
+        "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "answer_gate": answer_gate,
         "next_reads": guided_next_reads(next_reads),
         "next_commands": guided_next_commands(next_commands),
