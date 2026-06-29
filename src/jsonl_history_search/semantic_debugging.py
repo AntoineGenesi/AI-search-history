@@ -2812,6 +2812,13 @@ def build_next_reads(
             reads.append({"kind": "artifact", "target": item["path"], "reason": "confirm local artifact state"})
     if hints.get("path") and not any(read.get("target") == hints["path"] for read in reads):
         reads.append({"kind": "hint_path", "target": hints["path"] or "", "reason": "caller supplied path hint"})
+    correction_reads = correction_window_source_next_reads(
+        query=query,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
+    )
     promoted_reads = action_proof_source_next_reads(
         query=query,
         candidates=candidates,
@@ -2819,7 +2826,7 @@ def build_next_reads(
         expansion_action_context=expansion_action_context,
         include_context_actions=include_context_actions,
     )
-    return dedupe_dicts(promoted_reads + reads)[:12]
+    return dedupe_dicts(correction_reads + promoted_reads + reads)[:12]
 
 
 ACTION_PROOF_SCAN_FILE_LIMIT = 8
@@ -2876,6 +2883,142 @@ ACTION_PROOF_STOPWORDS = {
     "with",
 }
 ACTION_PROOF_TEXT_RE = re.compile(r"[a-z0-9][a-z0-9_/-]*")
+
+
+def correction_window_source_next_reads(
+    *,
+    query: str,
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    if not correction_window_source_selection_wanted(query):
+        return []
+    source_paths = action_proof_candidate_paths(candidates, tool_proof)
+    if not source_paths:
+        return []
+    scored: list[dict[str, Any]] = []
+    for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
+        scored.extend(correction_window_records_for_path(path))
+    scored.sort(
+        key=lambda item: (
+            -float(item["score"]),
+            str(item.get("timestamp_utc") or ""),
+            str((item.get("source_ref") or {}).get("path") or ""),
+            int((item.get("source_ref") or {}).get("line") or 0),
+        )
+    )
+    reads: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:ACTION_PROOF_PROMOTION_LIMIT], 1):
+        source_ref = item["source_ref"]
+        candidate_id = f"correction-window-source-{index:03d}"
+        read = {
+            "kind": "jsonl_source_ref",
+            "target": source_ref_target(source_ref),
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "reason": "inspect candidate correction source window; verify original challenge and correction before answering",
+            "correction_window_source_selection": {
+                "schema_version": 1,
+                "selection_reason": item["selection_reason"],
+                "role": item.get("role"),
+                "score": item["score"],
+                "raw_text_included": False,
+                "bounded_to_surfaced_source_files": True,
+                "source_window_verification_required": True,
+                "claim_boundary": "candidate_correction_window_not_proof_of_original_source_window",
+            },
+            "expansion_actions": read_more_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            ),
+        }
+        if include_context_actions:
+            read["context_actions"] = context_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        if read["target"]:
+            reads.append(read)
+    return reads
+
+
+def correction_window_source_selection_wanted(query: str) -> bool:
+    text = str(query or "").lower()
+    source_window_cue = "source window" in text or "source case" in text or "stable-history" in text
+    correction_cue = any(term in text for term in ("correction", "corrected", "follow-up challenge", "challenged"))
+    coordinator_cue = "persistent coordinator" in text and ("wait" in text or "poll" in text)
+    return source_window_cue and correction_cue and coordinator_cue
+
+
+def correction_window_records_for_path(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+        for index, record in enumerate(records):
+            score, selection_reason = score_correction_window_record(records, index)
+            if score <= 0:
+                continue
+            rows.append(
+                {
+                    "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
+                    "role": record.role,
+                    "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+                    "score": score,
+                    "selection_reason": selection_reason,
+                }
+            )
+    except (AdapterReadError, OSError, ValueError):
+        return []
+    return rows
+
+
+def score_correction_window_record(records: list[Any], index: int) -> tuple[float, str]:
+    record = records[index]
+    role_text = str(record.role or "").lower()
+    lowered = str(record.text or "").lower()
+    if "persistent coordinator" not in lowered:
+        return 0.0, "no_correction_window_topic"
+    wait_cue = "wait" in lowered or "poll" in lowered
+    if not wait_cue:
+        return 0.0, "no_wait_or_poll_cue"
+    score = 0.0
+    reason = "correction_window_topic_overlap"
+    if any(token in role_text for token in ("user", "human")) and any(
+        term in lowered for term in ("challenged", "different", "same", "not", "confusing")
+    ):
+        score = 64.0
+        reason = "user_followup_or_original_challenge"
+    if any(token in role_text for token in ("assistant", "agent")):
+        first_distinction = ("tmux" in lowered or "injector" in lowered) and (
+            "foreground" in lowered or "current session" in lowered or "current turn" in lowered
+        )
+        correction = any(term in lowered for term in ("you're right", "you’re right", "conflated", "actual distinction"))
+        if first_distinction:
+            score = max(score, 88.0)
+            reason = "assistant_persistent_vs_wait_distinction"
+        if correction:
+            score = max(score, 116.0)
+            reason = "assistant_followup_correction"
+    if "function_call" in role_text and any(
+        term in lowered
+        for term in (
+            "persistent-coordinator-pattern",
+            "coordinator-inject",
+            "codex-config-pack",
+            "improvements-to-codex",
+        )
+    ):
+        score = max(score, 72.0)
+        reason = "source_inspection_for_correction_window"
+    if any(token in role_text for token in ("developer", "system", "turn_context", "token_count", "reasoning")):
+        score -= 80
+    if "function_call_output" in role_text and len(lowered) > 1200:
+        score -= 32
+    return score, reason
 
 
 def action_proof_source_next_reads(
@@ -3664,7 +3807,12 @@ def investigation_retrieval_recommendation(
             "hard investigation",
         )
     )
-    needs_broad_context = hard_prompt or family.get("primary") in {"why_did_this_happen", "claimed_action"}
+    hard_source_window_prompt = (
+        ("source window" in text or "source case" in text or "stable-history" in text)
+        and ("challenged" in text or "correction" in text or "follow-up" in text)
+        and ("persistent coordinator" in text or "wait/poll" in text or "wait poll" in text)
+    )
+    needs_broad_context = hard_prompt or hard_source_window_prompt or family.get("primary") in {"why_did_this_happen", "claimed_action"}
     if retrieval_mode == "rrf-fusion":
         return {
             "mode": "rrf-fusion",
