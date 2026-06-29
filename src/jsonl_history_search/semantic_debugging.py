@@ -3090,11 +3090,39 @@ def correction_window_source_next_reads(
 
 
 def correction_window_source_selection_wanted(query: str) -> bool:
+    return persistent_coordinator_correction_route_wanted(query)
+
+
+def persistent_coordinator_correction_route_wanted(query: str) -> bool:
     text = str(query or "").lower()
-    source_window_cue = "source window" in text or "source case" in text or "stable-history" in text
-    correction_cue = any(term in text for term in ("correction", "corrected", "follow-up challenge", "challenged"))
     coordinator_cue = "persistent coordinator" in text and ("wait" in text or "poll" in text)
-    return source_window_cue and correction_cue and coordinator_cue
+    correction_cue = any(
+        term in text
+        for term in (
+            "correction",
+            "corrected",
+            "follow-up challenge",
+            "followup challenge",
+            "challenged",
+            "challenge",
+            "distinction",
+            "differed",
+            "different",
+        )
+    )
+    route_cue = any(
+        term in text
+        for term in (
+            "source window",
+            "source case",
+            "stable-history",
+            "codex session",
+            "what was",
+            "what distinction",
+            "what correction",
+        )
+    )
+    return coordinator_cue and correction_cue and route_cue
 
 
 def correction_window_records_for_path(path: Path) -> list[dict[str, Any]]:
@@ -3950,11 +3978,7 @@ def investigation_retrieval_recommendation(
             "hard investigation",
         )
     )
-    hard_source_window_prompt = (
-        ("source window" in text or "source case" in text or "stable-history" in text)
-        and ("challenged" in text or "correction" in text or "follow-up" in text)
-        and ("persistent coordinator" in text or "wait/poll" in text or "wait poll" in text)
-    )
+    hard_source_window_prompt = persistent_coordinator_correction_route_wanted(text)
     needs_broad_context = hard_prompt or hard_source_window_prompt or family.get("primary") in {"why_did_this_happen", "claimed_action"}
     if retrieval_mode == "rrf-fusion":
         return {
