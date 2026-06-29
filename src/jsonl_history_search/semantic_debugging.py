@@ -288,6 +288,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         hints=hints,
         no_evidence=no_evidence,
+        report_output=getattr(args, "report_output", None),
     )
 
     packet = {
@@ -899,6 +900,7 @@ def build_answer_ready_handoff(
     next_reads: list[dict[str, Any]],
     hints: dict[str, str | None],
     no_evidence: dict[str, Any],
+    report_output: str | None = None,
 ) -> dict[str, Any]:
     answer_gate = guided_audit_flow.get("answer_gate") or {}
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
@@ -939,6 +941,8 @@ def build_answer_ready_handoff(
         bounded_next_reads=bounded_next_reads,
         next_reads=next_reads,
         hints=hints,
+        report_output=report_output,
+        prefer_follow_next_reads_bundle=decision == "recovery_first",
     )
     command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
     source_use_summary = {
@@ -967,7 +971,12 @@ def build_answer_ready_handoff(
         "cap_policy": {
             "bounded_next_reads": ANSWER_READY_HANDOFF_READ_CAP,
             "copy_paste_commands": ANSWER_READY_HANDOFF_COMMAND_CAP,
-            "deterministic_order": "semantic_debug.next_reads order; jsonl read-more commands first",
+            "deterministic_order": (
+                "saved follow-next-reads bundle first when recovery reads are present; "
+                "individual jsonl read-more commands are fallback in semantic_debug.next_reads order"
+                if report_output and decision == "recovery_first"
+                else "semantic_debug.next_reads order; jsonl read-more commands first"
+            ),
         },
         "source_use_summary": source_use_summary,
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
@@ -995,6 +1004,11 @@ def build_answer_ready_handoff(
             "next_reads": "semantic_debug.next_reads",
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
             "no_evidence": "semantic_debug.no_evidence",
+            "preferred_recovery_workflow": (
+                "semantic_debug.agent_instruction.commands.expand_recovery_context"
+                if report_output and decision == "recovery_first"
+                else None
+            ),
         },
     }
 
@@ -1026,10 +1040,55 @@ def answer_ready_copy_paste_commands(
     bounded_next_reads: list[dict[str, Any]],
     next_reads: list[dict[str, Any]],
     hints: dict[str, str | None],
+    report_output: str | None = None,
+    prefer_follow_next_reads_bundle: bool = False,
 ) -> list[dict[str, Any]]:
     commands: list[dict[str, Any]] = []
+    if prefer_follow_next_reads_bundle and report_output and any(
+        read.get("omitted_window_recovery") for read in next_reads
+    ):
+        follow_report = "follow-next-reads.json"
+        follow_argv = [
+            "jsonl-history-search",
+            "follow-next-reads",
+            "--from-report",
+            str(Path(report_output).expanduser()),
+            "--kind",
+            "recovery",
+            "--limit",
+            "3",
+            "--format",
+            "json",
+            "--report-output",
+            follow_report,
+        ]
+        commands.append(
+            {
+                "command_family": "follow_next_reads",
+                "command_id": "expand_recovery_context",
+                "target": "semantic_debug.next_reads",
+                "command": shell_command(follow_argv),
+                "source": "semantic_debug.agent_instruction",
+                "output_path": follow_report,
+                "replaces_individual_read_more_count": min(
+                    ANSWER_READY_HANDOFF_COMMAND_CAP,
+                    sum(1 for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))),
+                ),
+                "fallback_individual_read_more_commands_follow": True,
+                "raw_private_text_included": False,
+                "raw_private_path_included": False,
+                "target_local_path_like": False,
+                "target_absolute_path_like": False,
+                "path_privacy_note": (
+                    "Command points at the saved semantic-debug report and emits a saved follow-next-reads "
+                    "packet; it does not include raw transcript text, source lines, snippets, or payload text."
+                ),
+            }
+        )
     command_targets = {read.get("target") for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))}
     for read in next_reads:
+        if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
+            break
         target = read.get("target")
         if target not in command_targets:
             continue
