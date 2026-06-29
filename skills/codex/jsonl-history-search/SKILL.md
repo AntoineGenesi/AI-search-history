@@ -20,7 +20,12 @@ Trigger JSONL even when the user does not name it. Route these asks first:
 | "Did the agent actually run/edit/test/review X?" | Agent action/proof audit | `jsonl-history-search semantic-debug "did the agent actually run/edit/test/review <thing>" --cwd "$PWD" --format json` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `jsonl-history-search semantic-debug "why did this happen?" --task <task-slug> --path <path> --cwd "$PWD" --format json` |
 
-Use `latest-user-messages` first for last/recent user-message wording. It sorts high-confidence Codex user messages by normalized timestamp and does not use semantic search, phrase matching, query expansion, or score ranking. Use `semantic-debug` as the first packet command for the other workflows because it returns `question_family`, `source_locator_handoff`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, `source_window_action_proof`, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. For claimed-action questions, inspect `semantic_debug.source_window_action_proof`; it separates user concern, command/tool call, command/tool output, final assistant claim, and adjacent artifact evidence so assistant prose or adjacent artifacts do not become primary action proof. When you need a smaller provenance map for handoff between agent turns, you may opt in with `--compact-provenance-handoff`; this adds `compact_provenance_handoff` derived from already emitted candidates, source refs, next reads, and no-evidence scope. It is not default behavior and is not proof of token savings, answer quality, product value, or default-promotion readiness. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
+Use `latest-user-messages` first for last/recent user-message wording. It sorts high-confidence Codex user messages by normalized timestamp and does not use semantic search, phrase matching, query expansion, or score ranking. Use `semantic-debug` as the first packet command for the other workflows because it returns `question_family`, `source_locator_handoff`, searched/not-searched scope, routes, candidates, timeline, structured tool/action proof, `source_window_action_proof`, task/review/commit joins, no-evidence, uncertainty, next reads, token/byte tradeoffs, and claim boundaries. Inspect `source_locator_handoff` before broad search: it names the source family, selected/rejected roots, caps, blind spots, not-searched scope, candidate ordering, next reads, no-evidence meaning, and privacy/claim boundaries. For claimed-action questions, inspect `semantic_debug.source_window_action_proof` before relying on assistant prose: it separates user concern, command/tool call, command/tool output, changed-check/review/commit evidence, final assistant claim, and adjacent artifact evidence. Adjacent artifacts are leads only, not primary action proof. When you need a smaller provenance map for handoff between agent turns, you may opt in with `--compact-provenance-handoff`; this adds `compact_provenance_handoff` derived from already emitted candidates, source refs, next reads, and no-evidence scope. It is not default behavior and is not proof of token savings, answer quality, product value, or default-promotion readiness. Drop to `find`, `structured-tool-events`, `forensics`, or the helper only for a focused follow-up or latest/timestamp recovery need.
+
+JSONL is a direct local conversation-history tool. Evidence packets, source refs,
+compact outputs, and reports are implementation surfaces that help you answer
+the user's history/debugging question; do not turn them into release
+bureaucracy or a required export handoff for another agent.
 
 Route quality-sensitive asks to the package before the helper:
 
@@ -28,13 +33,26 @@ Route quality-sensitive asks to the package before the helper:
 - Use `find` for a focused fuzzy, typo, synonym, or paraphrase candidate search when the full router packet is unnecessary.
 - Use the helper only for fast operational recovery: latest/today/most-recent lookup, timestamp-window lookup, exact-phrase lookup, or broad-term recovery where the important words are expected to appear in the logs.
 
-Retrieval mode ladder for `find` and `semantic-debug`:
+## Retrieval Mode Ladder
 
-- Start with default `package` mode for normal remembered-instruction, provenance, and action-proof questions.
-- Use `--retrieval-mode fielded-bm25` when default search misses or the question is a harder semantic/history search.
-- Use `--retrieval-mode rrf-fusion` for high-recall hard questions when recall matters more than local runtime/cap pressure.
+Use the default `package` mode first for `find` and `semantic-debug`; it is the conservative public default.
 
-`fielded-bm25` and `rrf-fusion` are explicit opt-ins. Do not promote RRF to the default, and do not claim token savings, final-answer quality, or product superiority from retrieval mode choice alone.
+Use opt-in `fielded-bm25` when the default misses, the question is a harder semantic/history search, or record-level retrieval is worth extra local work:
+
+```bash
+jsonl-history-search find "what did I say about release readiness?" --retrieval-mode fielded-bm25
+```
+
+Use opt-in `rrf-fusion` for high-recall hard questions only when local runtime, indexing/materialization work, and caps are acceptable:
+
+```bash
+jsonl-history-search semantic-debug "did the agent overwrite those edits?" \
+  --retrieval-mode rrf-fusion \
+  --cwd "$PWD" \
+  --format json
+```
+
+RRF stays opt-in. Do not make `rrf-fusion` the default, and do not treat it as token-savings proof, final-answer-quality proof, broad utility proof, or release-readiness proof.
 
 ## Search Order
 
@@ -170,7 +188,7 @@ The router composes existing evidence commands:
 - skill behavior -> `jsonl-history-search skill-audit`;
 - repeated automation opportunity -> `jsonl-history-search workflow-repeat-finder`.
 
-Read `semantic_debug` fields first: `question_family`, `source_locator_handoff`, `scope`, `routes`, `strongest_candidates`, `timeline`, `tool_action_proof`, `task_review_commit_joins`, `candidate_causes`, `no_evidence`, `uncertainty`, `next_reads`, `token_byte_tradeoffs`, and `claim_boundaries`. Use `source_locator_handoff.next_reads` and `source_locator_handoff.candidate_ordering.top_candidates` before starting a wider scan. The legacy interpretation packet fields are `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`.
+Read `semantic_debug` fields first: `question_family`, `source_locator_handoff`, `scope`, `routes`, `strongest_candidates`, `timeline`, `tool_action_proof`, `source_window_action_proof`, `task_review_commit_joins`, `candidate_causes`, `no_evidence`, `uncertainty`, `next_reads`, `token_byte_tradeoffs`, and `claim_boundaries`. Use `source_locator_handoff.next_reads` and `source_locator_handoff.candidate_ordering.top_candidates` before starting a wider scan. The legacy interpretation packet fields are `user_request`, `agent_plan`, `code_change`, `review_outcome`, `later_symptom`, `likely_wrong_assumption`, `evidence`, `inference`, `uncertainty`, and `next_reads`.
 
 If a follow-up agent only needs provenance anchors, `semantic-debug` and `find` support `--compact-provenance-handoff`. The extra packet keeps legacy fields in place and omits snippet/source-window text; use its source refs and `next_reads` as a narrow handoff aid, not as a replacement for reading evidence or as a token-savings claim.
 
