@@ -22,6 +22,7 @@ DEVLOG_SUMMARY_LIMIT = 8
 DEVLOG_ARC_ROW_LIMIT = 20
 DEVLOG_CLAIM_LEDGER_LIMIT = 40
 DEVLOG_BEHAVIOR_LABEL_LIMIT = 12
+DEVLOG_RECOVERY_REVIEW_ROW_LIMIT = 12
 
 TASK_ID_RE = re.compile(r"\b(?:jsh|sl)-\d+[a-z]?\b", re.IGNORECASE)
 COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
@@ -1188,6 +1189,11 @@ def _build_devlog_story_packet(
         interesting_moments=interesting_moments,
         tool_critique=tool_critique,
     )
+    recovery_review_handoff = _devlog_recovery_review_handoff(
+        narrative_readiness=narrative_readiness,
+        committed_safe_narrative_ledger=committed_safe_narrative_ledger,
+        claim_boundaries=claim_boundaries,
+    )
     return {
         "status": _devlog_story_status(readiness_status, phase_status, supported_claims, gaps),
         "mode": "deterministic_committed_safe_story_synthesis",
@@ -1220,11 +1226,13 @@ def _build_devlog_story_packet(
         "explicit_non_claims": non_claims,
         "gaps": gaps,
         "next_reads": _devlog_next_reads(next_reads),
+        "recovery_review_handoff": recovery_review_handoff,
         "inference_privacy_boundaries": [
             "packet is synthesized only from already-sanitized failure-analysis structures",
             "take candidates are drafting angles, not generated devlog prose",
             "repo artifacts may support semantic-debugging categories and case/story labels when safe handles are present, but they do not prove root cause or runtime promotion",
             "reviewed-negative retained recovery rows are retained as reviewed outcomes and are not promoted to open debt by this packet",
+            "unreviewed opened recovery is surfaced only as bounded local-review handles and blocked-claim boundaries",
             "raw private text, absolute private paths, session identifiers, record selections, embedding/search artifacts, command details, and source details are not included",
         ],
         "input_surfaces": {
@@ -1248,6 +1256,7 @@ def _build_devlog_story_packet(
             "followthrough_behavior_label_rows": len(followthrough_behavior_label_rows),
             "repo_artifact_evidence_rows": len(repo_artifact_evidence_rows),
             "next_read_rows": _int(next_reads.get("count")),
+            "recovery_review_handoff_rows": len(_list(recovery_review_handoff.get("review_items"))),
         },
     }
 
@@ -1258,11 +1267,11 @@ def _devlog_story_status(
     supported_claims: list[dict[str, Any]],
     gaps: list[dict[str, Any]],
 ) -> str:
+    if any(gap.get("gap_id") == "private_recovery_review_needed" for gap in gaps):
+        return "story_packet_usable_with_private_review_gaps"
     if readiness_status == "narrative_ready" and phase_status == "story_ready_metadata":
         return "story_packet_ready"
     if any(claim.get("claim_id") == "repo_artifacts_support_story_evidence" for claim in supported_claims):
-        if any(gap.get("gap_id") == "private_recovery_review_needed" for gap in gaps):
-            return "story_packet_usable_with_private_review_gaps"
         return "story_packet_usable_with_boundaries"
     if supported_claims:
         return "story_packet_partial"
@@ -1945,6 +1954,184 @@ def _devlog_next_reads(next_reads: dict[str, Any]) -> dict[str, Any]:
         "reads": reads,
         "explicit_gap": next_reads.get("explicit_gap"),
     }
+
+
+def _devlog_recovery_review_handoff(
+    *,
+    narrative_readiness: dict[str, Any],
+    committed_safe_narrative_ledger: list[dict[str, Any]],
+    claim_boundaries: dict[str, Any],
+) -> dict[str, Any]:
+    opened_count = _int(narrative_readiness.get("recovery_opened_count"))
+    still_unreviewed_count = _int(narrative_readiness.get("still_unreviewed_recovery_count"))
+    review_gap_count = _int(narrative_readiness.get("review_gap_recovery_count"))
+    review_debt_count = still_unreviewed_count + review_gap_count
+    if not opened_count or not review_debt_count:
+        return {
+            "status": "not_needed",
+            "opened_recovery_remains_unreviewed": False,
+            "counts": {
+                "recovery_opened": opened_count,
+                "still_unreviewed": still_unreviewed_count,
+                "review_gap": review_gap_count,
+            },
+            "boundary": "no opened recovery review handoff is required unless follow-next-reads has opened recovery that remains unreviewed or review-gapped",
+        }
+
+    review_items: list[dict[str, Any]] = []
+    unmarked_opened_rows: list[dict[str, Any]] = []
+    for row in committed_safe_narrative_ledger:
+        if not isinstance(row, dict) or row.get("ledger_kind") != "recovery_opened":
+            continue
+        usability = row.get("recovery_usability") if isinstance(row.get("recovery_usability"), dict) else {}
+        usability_status = str(usability.get("status") or "")
+        if usability_status in {"still_unreviewed", "review_gap"}:
+            review_items.append(_recovery_review_handoff_item(row, usability_status, len(review_items) + 1))
+        elif not usability_status:
+            unmarked_opened_rows.append(row)
+
+    for row in unmarked_opened_rows:
+        if len(review_items) >= review_debt_count:
+            break
+        review_items.append(
+            _recovery_review_handoff_item(
+                row,
+                "opened_recovery_without_review_marker",
+                len(review_items) + 1,
+            )
+        )
+
+    review_items = review_items[:DEVLOG_RECOVERY_REVIEW_ROW_LIMIT]
+    reason_codes = [
+        str(item)
+        for item in _list(narrative_readiness.get("reason_codes"))
+        if str(item) in {"opened_recovery_still_unreviewed", "opened_recovery_review_gap"}
+    ]
+    if still_unreviewed_count and "opened_recovery_still_unreviewed" not in reason_codes:
+        reason_codes.append("opened_recovery_still_unreviewed")
+    if review_gap_count and "opened_recovery_review_gap" not in reason_codes:
+        reason_codes.append("opened_recovery_review_gap")
+
+    return {
+        "status": "review_required",
+        "opened_recovery_remains_unreviewed": True,
+        "source_surface": "failure_analysis.committed_safe_narrative_ledger",
+        "counts": {
+            "recovery_opened": opened_count,
+            "usable_recovery_evidence": _int(narrative_readiness.get("usable_recovery_evidence_count")),
+            "reviewed_usable": _int(narrative_readiness.get("reviewed_usable_recovery_evidence_count")),
+            "reviewed_not_useful": _int(narrative_readiness.get("reviewed_not_useful_recovery_count")),
+            "still_unreviewed": still_unreviewed_count,
+            "review_gap": review_gap_count,
+            "safe_review_item_count": len(review_items),
+            "not_rendered_due_to_limit": max(0, review_debt_count - len(review_items)),
+        },
+        "reason_codes": reason_codes,
+        "review_items": review_items,
+        "blocked_claims_until_review": _recovery_review_blocked_claims(claim_boundaries),
+        "next_step": (
+            "Privately review the listed safe recovery handles locally, classify each as "
+            "private_reviewed_usable or reviewed_not_useful in committed-safe recovery_usability metadata, "
+            "then rerun failure-analysis before making transcript-content claims."
+        ),
+        "privacy_boundary": (
+            "handoff includes only safe handles, counts, statuses, labels, line ranges, and reasons; "
+            "it excludes raw transcript text, raw source lines, absolute private paths, session IDs, "
+            "vectors/indexes, command payloads, and record selections"
+        ),
+        "claim_boundary": (
+            "root cause, all-history completeness, final-answer quality, token/speed, and product-value "
+            "claims remain unsupported unless separate reviewed evidence supports them"
+        ),
+    }
+
+
+def _recovery_review_handoff_item(
+    row: dict[str, Any],
+    review_status: str,
+    index: int,
+) -> dict[str, Any]:
+    usability = row.get("recovery_usability") if isinstance(row.get("recovery_usability"), dict) else {}
+    reasons = [
+        str(item)
+        for item in [
+            *_list(row.get("reason_codes")),
+            usability.get("reason_label"),
+            usability.get("evidence_label"),
+            review_status,
+        ]
+        if item
+    ]
+    return _clean_row(
+        {
+            "review_item_id": f"recovery-review-{index:03d}",
+            "status": review_status,
+            "source_index": row.get("source_index"),
+            "rank": row.get("rank"),
+            "candidate_id": _safe_label_or_none(row.get("candidate_id")),
+            "recovery_kind": _safe_label_or_none(row.get("recovery_kind")),
+            "recovery_id": _safe_label_or_none(row.get("recovery_id")),
+            "target_handle": row.get("target_handle"),
+            "source_handle": row.get("source_handle"),
+            "line_range": row.get("line_range"),
+            "selected_record_count": _int(row.get("selected_record_count")),
+            "counts": row.get("counts"),
+            "cap_flags": row.get("cap_flags"),
+            "recovery_usability": usability,
+            "reasons": list(dict.fromkeys(reasons))[:8],
+            "why_review_needed": (
+                "opened recovery has safe metadata but still needs local private review before "
+                "transcript-content or stronger narrative claims"
+            ),
+            "boundary": "safe handle only; open locally for raw context and do not commit raw recovery content",
+        }
+    )
+
+
+def _recovery_review_blocked_claims(claim_boundaries: dict[str, Any]) -> list[dict[str, Any]]:
+    blocked_specs = [
+        (
+            "private_transcript_content_claims",
+            "private transcript content",
+            "opened recovery has not all been locally reviewed",
+            False,
+        ),
+        (
+            "root_cause_claim_supported",
+            "root cause",
+            "root-cause claims require reviewed local evidence and remain outside this packet",
+            bool(claim_boundaries.get("root_cause_claim_supported")),
+        ),
+        (
+            "all_history_completeness_claim_supported",
+            "all-history completeness",
+            "unreviewed recovery prevents completeness claims",
+            bool(claim_boundaries.get("all_history_completeness_claim_supported")),
+        ),
+        (
+            "final_answer_quality_claim_supported",
+            "final answer quality",
+            "failure-analysis packages evidence handles but does not grade final prose quality",
+            bool(claim_boundaries.get("final_answer_quality_claim_supported")),
+        ),
+        (
+            "absence_of_evidence_claims",
+            "absence of evidence",
+            "unreviewed opened recovery is open review debt, not proof that evidence is absent",
+            False,
+        ),
+    ]
+    return [
+        {
+            "claim_id": claim_id,
+            "claim": claim,
+            "blocked": not current_support,
+            "current_support": current_support,
+            "reason": reason,
+            "boundary": "do not make this claim from the committed-safe handoff alone",
+        }
+        for claim_id, claim, reason, current_support in blocked_specs
+    ]
 
 
 def _devlog_story_sections(
