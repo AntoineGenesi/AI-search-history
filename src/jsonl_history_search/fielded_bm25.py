@@ -405,7 +405,6 @@ class FieldedGroupedWindowSignal:
     provenance_family_count: int = 0
     channel_family_count: int = 0
     role_family_count: int = 0
-    anchor_family_count: int = 0
     bounded_inner_hit_count: int = 0
     timestamp_available: bool = False
     session_available: bool = False
@@ -415,7 +414,6 @@ class FieldedGroupedWindowSignal:
     def score(self) -> tuple[int, int, int, int, int, int, int, int, int]:
         substantive = (
             self.matched_need_count > 0
-            or self.anchor_family_count > 0
             or self.provenance_family_count > 0
             or self.channel_family_count > 1
         )
@@ -423,7 +421,6 @@ class FieldedGroupedWindowSignal:
             return (0, 0, 0, 0, 0, 0, 0, 0, 0)
         return (
             self.matched_need_count,
-            self.anchor_family_count,
             self.provenance_family_count,
             self.channel_family_count,
             self.role_family_count,
@@ -431,6 +428,7 @@ class FieldedGroupedWindowSignal:
             int(self.session_available),
             int(self.day_available),
             self.bounded_inner_hit_count,
+            0,
         )
 
 
@@ -2231,8 +2229,6 @@ def _select_grouped_source_window_heads(
         "source_window_needs_selected": [],
         "source_window_needs_omitted": [],
         "signal_family_window_counts": {"considered": {}, "selected": {}, "omitted": {}},
-        "anchor_family_window_count": 0,
-        "anchor_family_selected_window_count": 0,
         "provenance_rich_window_count": 0,
         "provenance_rich_selected_window_count": 0,
         "novelty_fill_window_count": 0,
@@ -2545,12 +2541,6 @@ def _select_grouped_source_window_heads(
     window_selection["source_window_needs_omitted"] = list(source_window_needs_omitted)
     signal_counts = _grouped_window_signal_count_projection(windows, selected_window_keys, window_signals)
     window_selection["signal_family_window_counts"] = signal_counts
-    window_selection["anchor_family_window_count"] = int(
-        signal_counts["considered"].get("anchor_family_coverage", 0)
-    )
-    window_selection["anchor_family_selected_window_count"] = int(
-        signal_counts["selected"].get("anchor_family_coverage", 0)
-    )
     window_selection["provenance_rich_window_count"] = int(
         sum(1 for signal in window_signals.values() if signal.provenance_family_count > 1)
     )
@@ -2955,13 +2945,11 @@ def _annotate_grouped_source_windows(
     row_stream_labels: dict[int, set[str]],
     fusion: dict[str, Any],
 ) -> dict[tuple[str, str, str, int], FieldedGroupedWindowSignal]:
-    anchor_terms = _grouped_window_anchor_terms(intent)
     annotated: dict[tuple[str, str, str, int], FieldedGroupedWindowSignal] = {}
     for window in windows:
         channel_families: set[str] = set()
         provenance_families: set[str] = set()
         role_families: set[str] = set()
-        anchor_families: set[str] = set()
         timestamp_available = False
         session_available = False
         day_available = False
@@ -2981,12 +2969,6 @@ def _annotate_grouped_source_windows(
                 channel_families.add(family)
                 if family in {"top_exact", "child_channel", "metadata_match", "nearby_context"}:
                     provenance_families.add(family)
-            anchor_families.update(
-                _anchor_families_present_in_text(
-                    _fielded_row_text_for_anchor_scan(index, rowid, ref),
-                    anchor_terms,
-                )
-            )
         families: set[str] = set()
         if window_need_matches.get(window.key):
             families.add("source_window_need_match")
@@ -3004,8 +2986,6 @@ def _annotate_grouped_source_windows(
             families.add("day_available")
         if window.inner_hit_count:
             families.add("bounded_inner_hits")
-        if anchor_families:
-            families.add("anchor_family_coverage")
         annotated[window.key] = FieldedGroupedWindowSignal(
             key=window.key,
             families=tuple(sorted(families)),
@@ -3013,7 +2993,6 @@ def _annotate_grouped_source_windows(
             provenance_family_count=len(provenance_families),
             channel_family_count=len(channel_families),
             role_family_count=len(role_families),
-            anchor_family_count=len(anchor_families),
             bounded_inner_hit_count=min(
                 int(window.inner_hit_count),
                 FIELDED_GROUPED_SOURCE_WINDOW_INNER_HIT_LIMIT,
@@ -3023,71 +3002,6 @@ def _annotate_grouped_source_windows(
             day_available=day_available,
         )
     return annotated
-
-
-def _grouped_window_anchor_terms(intent: QueryIntent | None) -> tuple[tuple[str, str], ...]:
-    if intent is None:
-        return ()
-    anchors: dict[str, str] = {}
-    plan = intent.query_plan
-    for raw in (plan.anchor_terms if plan is not None else []):
-        family = _grouped_window_anchor_family(str(raw))
-        if family is not None:
-            anchors[str(raw).strip().lower()] = family
-    for raw in intent.artifact_hints or []:
-        family = _grouped_window_anchor_family(str(raw))
-        if family is not None:
-            anchors[str(raw).strip().lower()] = family
-    return tuple(sorted((value, family) for value, family in anchors.items()))
-
-
-def _grouped_window_anchor_family(value: str) -> str | None:
-    text = value.strip().lower()
-    if len(text) < 4:
-        return None
-    if re.fullmatch(r"[a-f0-9]{7,40}", text):
-        return "hash_anchor"
-    if "/" in text or "\\" in text or "." in text:
-        return "artifact_or_path_anchor"
-    if "_" in text or "-" in text or re.search(r"[a-z][0-9]|[0-9][a-z]", text):
-        return "code_identifier_anchor"
-    if len(text.split()) > 1:
-        return "phrase_anchor"
-    if len(text) >= 8:
-        return "distinctive_term_anchor"
-    return None
-
-
-def _anchor_families_present_in_text(
-    text: str,
-    anchor_terms: tuple[tuple[str, str], ...],
-) -> set[str]:
-    if not text or not anchor_terms:
-        return set()
-    lowered = text.lower()
-    families: set[str] = set()
-    for anchor, family in anchor_terms:
-        if anchor and anchor in lowered:
-            families.add(family)
-    return families
-
-
-def _fielded_row_text_for_anchor_scan(
-    index: FieldedBm25Index,
-    rowid: int,
-    ref: FieldedBm25RecordRef,
-) -> str:
-    if ref.raw_text:
-        return ref.raw_text
-    if index.connection is None:
-        return ""
-    try:
-        row = index.connection.execute("SELECT text FROM records WHERE rowid = ?", (int(rowid),)).fetchone()
-    except sqlite3.Error:
-        return ""
-    if row is None:
-        return ""
-    return str(row[0] or "")
 
 
 def _grouped_window_signal_priority(
@@ -3414,10 +3328,6 @@ def _grouped_source_window_diagnostics(
         "signal_family_window_counts": _safe_signal_family_window_counts(
             window_selection.get("signal_family_window_counts")
         ),
-        "anchor_family_window_count": int(window_selection.get("anchor_family_window_count") or 0),
-        "anchor_family_selected_window_count": int(
-            window_selection.get("anchor_family_selected_window_count") or 0
-        ),
         "provenance_rich_window_count": int(window_selection.get("provenance_rich_window_count") or 0),
         "provenance_rich_selected_window_count": int(
             window_selection.get("provenance_rich_selected_window_count") or 0
@@ -3454,10 +3364,6 @@ def _grouped_source_window_diagnostics(
             ],
             "signal_family_window_counts": _safe_signal_family_window_counts(
                 window_selection.get("signal_family_window_counts")
-            ),
-            "anchor_family_window_count": int(window_selection.get("anchor_family_window_count") or 0),
-            "anchor_family_selected_window_count": int(
-                window_selection.get("anchor_family_selected_window_count") or 0
             ),
             "provenance_rich_window_count": int(window_selection.get("provenance_rich_window_count") or 0),
             "provenance_rich_selected_window_count": int(
