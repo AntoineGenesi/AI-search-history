@@ -28,6 +28,8 @@ def render_text(payload: dict) -> str:
         return render_latest_user_messages_text(payload)
     if "source_expansion" in payload:
         return render_source_expansion_text(payload)
+    if "follow_next_reads" in payload:
+        return render_follow_next_reads_text(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_text(payload)
     if "capability_diagnostic" in payload:
@@ -159,6 +161,8 @@ def render_markdown(payload: dict) -> str:
         return render_latest_user_messages_markdown(payload)
     if "source_expansion" in payload:
         return render_source_expansion_markdown(payload)
+    if "follow_next_reads" in payload:
+        return render_follow_next_reads_markdown(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_markdown(payload)
     if "capability_diagnostic" in payload:
@@ -259,6 +263,88 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_follow_next_reads_text(payload: dict) -> str:
+    report = payload["follow_next_reads"]
+    instruction = report.get("agent_instruction") or {}
+    reviewed = report.get("reviewed_usability_decisions") or {}
+    status_counts = reviewed.get("status_counts") or {}
+    lines = [
+        "Follow Next Reads",
+        f"Status: {report.get('status')}",
+        f"Selected: {report.get('selected_count', 0)}",
+        f"Expanded: {report.get('expanded_count', 0)}",
+        f"Failed: {report.get('failed_count', 0)}",
+        f"Usable recovery evidence: {report.get('usable_recovery_evidence_count', 0)}",
+        f"Reviewed usable recovery evidence: {report.get('reviewed_usable_recovery_evidence_count', 0)}",
+    ]
+    if status_counts:
+        lines.append(
+            "Reviewed usability statuses: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items()))
+        )
+    if instruction:
+        commands = instruction.get("commands") or []
+        command_ids = [str(command.get("command_id")) for command in commands if command.get("command_id")]
+        lines.extend(
+            [
+                "Agent Instruction:",
+                f"- decision: {instruction.get('decision')}",
+                f"- required_next_action: {instruction.get('required_next_action')}",
+                f"- command_count: {len(commands)}",
+                f"- command_ids: {', '.join(command_ids) if command_ids else 'none'}",
+                "- commands: omitted from text output; use JSON for executable saved-report commands",
+            ]
+        )
+        for item in (instruction.get("do_not_answer_until") or [])[:4]:
+            lines.append(f"- gate: {item}")
+    lines.append("Claim boundaries:")
+    for key, value in sorted((report.get("claim_boundaries") or {}).items()):
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+def render_follow_next_reads_markdown(payload: dict) -> str:
+    report = payload["follow_next_reads"]
+    instruction = report.get("agent_instruction") or {}
+    reviewed = report.get("reviewed_usability_decisions") or {}
+    status_counts = reviewed.get("status_counts") or {}
+    lines = [
+        "# Follow Next Reads",
+        "",
+        f"- `status`: `{report.get('status')}`",
+        f"- `selected_count`: `{report.get('selected_count', 0)}`",
+        f"- `expanded_count`: `{report.get('expanded_count', 0)}`",
+        f"- `failed_count`: `{report.get('failed_count', 0)}`",
+        f"- `usable_recovery_evidence_count`: `{report.get('usable_recovery_evidence_count', 0)}`",
+        f"- `reviewed_usable_recovery_evidence_count`: `{report.get('reviewed_usable_recovery_evidence_count', 0)}`",
+    ]
+    if status_counts:
+        lines.append(
+            f"- `reviewed_usability_statuses`: `{', '.join(f'{key}={value}' for key, value in sorted(status_counts.items()))}`"
+        )
+    if instruction:
+        commands = instruction.get("commands") or []
+        command_ids = [str(command.get("command_id")) for command in commands if command.get("command_id")]
+        lines.extend(
+            [
+                "",
+                "## Agent Instruction",
+                "",
+                f"- `decision`: `{instruction.get('decision')}`",
+                f"- `required_next_action`: `{instruction.get('required_next_action')}`",
+                f"- `command_count`: `{len(commands)}`",
+                f"- `command_ids`: `{', '.join(command_ids) if command_ids else 'none'}`",
+                "- `commands`: omitted from Markdown output; use JSON for executable saved-report commands",
+            ]
+        )
+        for item in (instruction.get("do_not_answer_until") or [])[:4]:
+            lines.append(f"- Gate: {item}")
+    lines.extend(["", "## Claim Boundaries", ""])
+    for key, value in sorted((report.get("claim_boundaries") or {}).items()):
+        lines.append(f"- `{key}`: `{value}`")
+    return "\n".join(lines)
 
 
 def render_failure_analysis_text(payload: dict) -> str:
