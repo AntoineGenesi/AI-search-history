@@ -77,6 +77,24 @@ python3 ~/.codex/skills/jsonl-history-search/scripts/search_jsonl_history.py "tw
 
 If the helper is insufficient, use `rg -n --glob '*.jsonl'` on the locations above, then parse nearby JSON objects for timestamps, roles, and message text.
 
+## Relative Status Anchors
+
+For admin/status questions such as "what happened since my last message?", "what did you do while I was asleep/away?", or "what happened after I told you to keep working?", resolve the intended anchor before answering.
+
+Do:
+
+- Treat "last message" as ambiguous when the immediately previous user turn is a status check, correction, or admin interruption.
+- Prefer the last substantive work instruction or unattended-work boundary when the user mentions elapsed time, sleep, being away from keyboard, autonomous work, loops, or says "not the one just then".
+- State the anchor used before summarizing, for example: "Anchoring to your 2026-06-29 autonomous-work instruction..."
+- Reconstruct from durable evidence: git commits, task/review artifacts, pipeline state, generated reports, and JSONL logs.
+- Answer both what changed and the handoff state: completed tasks, current task/loop, blockers, verification, and next work.
+
+Do not:
+
+- Literalize the newest chat turn if that would only summarize the last minute and miss the user's actual question.
+- Summarize only the most recent task when the question is about a long unattended window.
+- Hide ambiguity; if two anchors are plausible, name them and default to the wider substantive work anchor.
+
 ## Output Pattern
 
 Return:
