@@ -397,6 +397,43 @@ class FieldedGroupedSourceWindow:
         return max(len(self.rowids) - 1, 0)
 
 
+@dataclass(frozen=True)
+class FieldedGroupedWindowSignal:
+    key: tuple[str, str, str, int]
+    families: tuple[str, ...]
+    matched_need_count: int = 0
+    provenance_family_count: int = 0
+    channel_family_count: int = 0
+    role_family_count: int = 0
+    anchor_family_count: int = 0
+    bounded_inner_hit_count: int = 0
+    timestamp_available: bool = False
+    session_available: bool = False
+    day_available: bool = False
+
+    @property
+    def score(self) -> tuple[int, int, int, int, int, int, int, int, int]:
+        substantive = (
+            self.matched_need_count > 0
+            or self.anchor_family_count > 0
+            or self.provenance_family_count > 0
+            or self.channel_family_count > 1
+        )
+        if not substantive:
+            return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return (
+            self.matched_need_count,
+            self.anchor_family_count,
+            self.provenance_family_count,
+            self.channel_family_count,
+            self.role_family_count,
+            int(self.timestamp_available),
+            int(self.session_available),
+            int(self.day_available),
+            self.bounded_inner_hit_count,
+        )
+
+
 def sqlite_fts5_available() -> bool:
     try:
         connection = sqlite3.connect(":memory:")
@@ -2193,9 +2230,15 @@ def _select_grouped_source_window_heads(
         "source_window_needs_matched": [],
         "source_window_needs_selected": [],
         "source_window_needs_omitted": [],
+        "signal_family_window_counts": {"considered": {}, "selected": {}, "omitted": {}},
+        "anchor_family_window_count": 0,
+        "anchor_family_selected_window_count": 0,
+        "provenance_rich_window_count": 0,
+        "provenance_rich_selected_window_count": 0,
         "novelty_fill_window_count": 0,
         "duplicate_window_skip_count": 0,
         "duplicate_window_selection_count": 0,
+        "raw_anchor_terms_included": False,
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -2276,6 +2319,14 @@ def _select_grouped_source_window_heads(
         )
         for window in windows
     }
+    window_signals = _annotate_grouped_source_windows(
+        windows,
+        index,
+        intent=intent,
+        window_need_matches=window_need_matches,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
+    )
     source_window_needs_matched = [
         need
         for need in source_window_needs_considered
@@ -2341,6 +2392,7 @@ def _select_grouped_source_window_heads(
                     row_stream_labels=row_stream_labels,
                     fusion=fusion,
                 ),
+                tuple(-value for value in _grouped_window_signal_priority(candidate, window_signals)),
                 bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
                 candidate.head_rowid,
             ),
@@ -2382,6 +2434,7 @@ def _select_grouped_source_window_heads(
                     row_stream_labels=row_stream_labels,
                     fusion=fusion,
                 ),
+                tuple(-value for value in _grouped_window_signal_priority(candidate, window_signals)),
                 bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
                 candidate.head_rowid,
             ),
@@ -2414,6 +2467,7 @@ def _select_grouped_source_window_heads(
                 novelty_candidates,
                 key=lambda candidate: (
                     -_grouped_window_novelty_score(candidate, index, selected_group_keys),
+                    tuple(-value for value in _grouped_window_signal_priority(candidate, window_signals)),
                     bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
                     candidate.head_rowid,
                 ),
@@ -2427,7 +2481,11 @@ def _select_grouped_source_window_heads(
             continue
         window = min(
             remaining,
-            key=lambda candidate: (bm25_rank_by_rowid.get(candidate.head_rowid, 10**12), candidate.head_rowid),
+            key=lambda candidate: (
+                tuple(-value for value in _grouped_window_signal_priority(candidate, window_signals)),
+                bm25_rank_by_rowid.get(candidate.head_rowid, 10**12),
+                candidate.head_rowid,
+            ),
         )
         row = row_by_id.get(window.head_rowid)
         if row is not None and add_row(row, "represented_group_window_fill"):
@@ -2485,6 +2543,24 @@ def _select_grouped_source_window_heads(
     window_selection["route_window_head_selection_count"] = int(route_head_selection_count)
     window_selection["source_window_needs_selected"] = list(source_window_needs_selected)
     window_selection["source_window_needs_omitted"] = list(source_window_needs_omitted)
+    signal_counts = _grouped_window_signal_count_projection(windows, selected_window_keys, window_signals)
+    window_selection["signal_family_window_counts"] = signal_counts
+    window_selection["anchor_family_window_count"] = int(
+        signal_counts["considered"].get("anchor_family_coverage", 0)
+    )
+    window_selection["anchor_family_selected_window_count"] = int(
+        signal_counts["selected"].get("anchor_family_coverage", 0)
+    )
+    window_selection["provenance_rich_window_count"] = int(
+        sum(1 for signal in window_signals.values() if signal.provenance_family_count > 1)
+    )
+    window_selection["provenance_rich_selected_window_count"] = int(
+        sum(
+            1
+            for key, signal in window_signals.items()
+            if key in selected_window_keys and signal.provenance_family_count > 1
+        )
+    )
     window_selection["novelty_fill_window_count"] = int(novelty_fill_count)
     window_selection["duplicate_window_skip_count"] = int(len(duplicate_skip_keys))
     window_selection["duplicate_window_selection_count"] = int(duplicate_selection_count)
@@ -2870,6 +2946,184 @@ def _selected_window_keys(
     return selected
 
 
+def _annotate_grouped_source_windows(
+    windows: list[FieldedGroupedSourceWindow],
+    index: FieldedBm25Index,
+    *,
+    intent: QueryIntent | None,
+    window_need_matches: dict[tuple[str, str, str, int], tuple[str, ...]],
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> dict[tuple[str, str, str, int], FieldedGroupedWindowSignal]:
+    anchor_terms = _grouped_window_anchor_terms(intent)
+    annotated: dict[tuple[str, str, str, int], FieldedGroupedWindowSignal] = {}
+    for window in windows:
+        channel_families: set[str] = set()
+        provenance_families: set[str] = set()
+        role_families: set[str] = set()
+        anchor_families: set[str] = set()
+        timestamp_available = False
+        session_available = False
+        day_available = False
+        for rowid in window.rowids:
+            ref = index.records.get(rowid)
+            if ref is None:
+                continue
+            role = str(ref.role_bucket or "")
+            if role:
+                role_families.add(role)
+            timestamp_available = timestamp_available or str(ref.timestamp_bucket or "") != "timestamp_absent"
+            session_available = session_available or bool(ref.session_key)
+            day_available = day_available or bool(ref.day_key)
+            labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+            for label in labels:
+                family = _selection_channel_bucket(label)
+                channel_families.add(family)
+                if family in {"top_exact", "child_channel", "metadata_match", "nearby_context"}:
+                    provenance_families.add(family)
+            anchor_families.update(
+                _anchor_families_present_in_text(
+                    _fielded_row_text_for_anchor_scan(index, rowid, ref),
+                    anchor_terms,
+                )
+            )
+        families: set[str] = set()
+        if window_need_matches.get(window.key):
+            families.add("source_window_need_match")
+        if provenance_families:
+            families.add("route_or_channel_provenance")
+        if len(channel_families) > 1:
+            families.add("channel_family_diversity")
+        if role_families:
+            families.add("role_bucket_available")
+        if timestamp_available:
+            families.add("timestamp_available")
+        if session_available:
+            families.add("session_available")
+        if day_available:
+            families.add("day_available")
+        if window.inner_hit_count:
+            families.add("bounded_inner_hits")
+        if anchor_families:
+            families.add("anchor_family_coverage")
+        annotated[window.key] = FieldedGroupedWindowSignal(
+            key=window.key,
+            families=tuple(sorted(families)),
+            matched_need_count=len(window_need_matches.get(window.key, ())),
+            provenance_family_count=len(provenance_families),
+            channel_family_count=len(channel_families),
+            role_family_count=len(role_families),
+            anchor_family_count=len(anchor_families),
+            bounded_inner_hit_count=min(
+                int(window.inner_hit_count),
+                FIELDED_GROUPED_SOURCE_WINDOW_INNER_HIT_LIMIT,
+            ),
+            timestamp_available=timestamp_available,
+            session_available=session_available,
+            day_available=day_available,
+        )
+    return annotated
+
+
+def _grouped_window_anchor_terms(intent: QueryIntent | None) -> tuple[tuple[str, str], ...]:
+    if intent is None:
+        return ()
+    anchors: dict[str, str] = {}
+    plan = intent.query_plan
+    for raw in (plan.anchor_terms if plan is not None else []):
+        family = _grouped_window_anchor_family(str(raw))
+        if family is not None:
+            anchors[str(raw).strip().lower()] = family
+    for raw in intent.artifact_hints or []:
+        family = _grouped_window_anchor_family(str(raw))
+        if family is not None:
+            anchors[str(raw).strip().lower()] = family
+    return tuple(sorted((value, family) for value, family in anchors.items()))
+
+
+def _grouped_window_anchor_family(value: str) -> str | None:
+    text = value.strip().lower()
+    if len(text) < 4:
+        return None
+    if re.fullmatch(r"[a-f0-9]{7,40}", text):
+        return "hash_anchor"
+    if "/" in text or "\\" in text or "." in text:
+        return "artifact_or_path_anchor"
+    if "_" in text or "-" in text or re.search(r"[a-z][0-9]|[0-9][a-z]", text):
+        return "code_identifier_anchor"
+    if len(text.split()) > 1:
+        return "phrase_anchor"
+    if len(text) >= 8:
+        return "distinctive_term_anchor"
+    return None
+
+
+def _anchor_families_present_in_text(
+    text: str,
+    anchor_terms: tuple[tuple[str, str], ...],
+) -> set[str]:
+    if not text or not anchor_terms:
+        return set()
+    lowered = text.lower()
+    families: set[str] = set()
+    for anchor, family in anchor_terms:
+        if anchor and anchor in lowered:
+            families.add(family)
+    return families
+
+
+def _fielded_row_text_for_anchor_scan(
+    index: FieldedBm25Index,
+    rowid: int,
+    ref: FieldedBm25RecordRef,
+) -> str:
+    if ref.raw_text:
+        return ref.raw_text
+    if index.connection is None:
+        return ""
+    try:
+        row = index.connection.execute("SELECT text FROM records WHERE rowid = ?", (int(rowid),)).fetchone()
+    except sqlite3.Error:
+        return ""
+    if row is None:
+        return ""
+    return str(row[0] or "")
+
+
+def _grouped_window_signal_priority(
+    window: FieldedGroupedSourceWindow,
+    signals: dict[tuple[str, str, str, int], FieldedGroupedWindowSignal],
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    signal = signals.get(window.key)
+    if signal is None:
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return signal.score
+
+
+def _grouped_window_signal_count_projection(
+    windows: list[FieldedGroupedSourceWindow],
+    selected_window_keys: set[tuple[str, str, str, int]],
+    signals: dict[tuple[str, str, str, int], FieldedGroupedWindowSignal],
+) -> dict[str, dict[str, int]]:
+    selected_counts: dict[str, int] = {}
+    omitted_counts: dict[str, int] = {}
+    for window in windows:
+        signal = signals.get(window.key)
+        if signal is None:
+            continue
+        target = selected_counts if window.key in selected_window_keys else omitted_counts
+        for family in signal.families:
+            target[family] = target.get(family, 0) + 1
+    considered_counts = dict(selected_counts)
+    for family, count in omitted_counts.items():
+        considered_counts[family] = considered_counts.get(family, 0) + int(count)
+    return {
+        "considered": dict(sorted(considered_counts.items())),
+        "selected": dict(sorted(selected_counts.items())),
+        "omitted": dict(sorted(omitted_counts.items())),
+    }
+
+
 def _select_source_session_day_category_representatives(
     rows: list[tuple[Any, ...]],
     stable_fill_rows: list[tuple[Any, ...]],
@@ -3157,6 +3411,17 @@ def _grouped_source_window_diagnostics(
         "source_window_needs_omitted": [
             str(item) for item in window_selection.get("source_window_needs_omitted") or []
         ],
+        "signal_family_window_counts": _safe_signal_family_window_counts(
+            window_selection.get("signal_family_window_counts")
+        ),
+        "anchor_family_window_count": int(window_selection.get("anchor_family_window_count") or 0),
+        "anchor_family_selected_window_count": int(
+            window_selection.get("anchor_family_selected_window_count") or 0
+        ),
+        "provenance_rich_window_count": int(window_selection.get("provenance_rich_window_count") or 0),
+        "provenance_rich_selected_window_count": int(
+            window_selection.get("provenance_rich_selected_window_count") or 0
+        ),
         "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
         "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
         "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
@@ -3187,9 +3452,21 @@ def _grouped_source_window_diagnostics(
             "source_window_needs_omitted": [
                 str(item) for item in window_selection.get("source_window_needs_omitted") or []
             ],
+            "signal_family_window_counts": _safe_signal_family_window_counts(
+                window_selection.get("signal_family_window_counts")
+            ),
+            "anchor_family_window_count": int(window_selection.get("anchor_family_window_count") or 0),
+            "anchor_family_selected_window_count": int(
+                window_selection.get("anchor_family_selected_window_count") or 0
+            ),
+            "provenance_rich_window_count": int(window_selection.get("provenance_rich_window_count") or 0),
+            "provenance_rich_selected_window_count": int(
+                window_selection.get("provenance_rich_selected_window_count") or 0
+            ),
             "novelty_fill_window_count": int(window_selection.get("novelty_fill_window_count") or 0),
             "duplicate_window_skip_count": int(window_selection.get("duplicate_window_skip_count") or 0),
             "duplicate_window_selection_count": int(window_selection.get("duplicate_window_selection_count") or 0),
+            "raw_anchor_terms_included": False,
             "raw_paths_included": False,
             "raw_text_included": False,
             "raw_query_text_included": False,
@@ -3200,6 +3477,7 @@ def _grouped_source_window_diagnostics(
         },
         "selected_window_details_included": False,
         "raw_window_keys_included": False,
+        "raw_anchor_terms_included": False,
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -3208,6 +3486,26 @@ def _grouped_source_window_diagnostics(
         "line_numbers_included": False,
         "source_lines_included": False,
     }
+
+
+def _safe_signal_family_window_counts(value: Any) -> dict[str, dict[str, int]]:
+    buckets = ("considered", "selected", "omitted")
+    if not isinstance(value, dict):
+        return {bucket: {} for bucket in buckets}
+    projected: dict[str, dict[str, int]] = {}
+    for bucket in buckets:
+        raw_counts = value.get(bucket)
+        if not isinstance(raw_counts, dict):
+            projected[bucket] = {}
+            continue
+        projected[bucket] = dict(
+            sorted(
+                (str(key), int(count))
+                for key, count in raw_counts.items()
+                if str(key).strip()
+            )
+        )
+    return projected
 
 
 def _source_grouping_diagnostics(
