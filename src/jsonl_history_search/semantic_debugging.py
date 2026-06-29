@@ -3008,8 +3008,8 @@ def action_proof_records_for_path(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        records = iter_records_for_file(path, "unknown_jsonl", timezone.utc)
-        for record in records:
+        records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+        for index, record in enumerate(records):
             score, matched_terms, selection_reason = score_action_proof_record(
                 text=record.text,
                 role=record.role,
@@ -3017,6 +3017,10 @@ def action_proof_records_for_path(
                 query_terms=query_terms,
                 tool_proof_path_bonus=str(path) in tool_proof_paths,
             )
+            neighborhood_bonus, neighborhood_reason = action_proof_neighborhood_bonus(records, index)
+            if neighborhood_bonus:
+                score += neighborhood_bonus
+                selection_reason = neighborhood_reason
             if score <= 0:
                 continue
             rows.append(
@@ -3032,6 +3036,32 @@ def action_proof_records_for_path(
     except (AdapterReadError, OSError, ValueError):
         return []
     return rows
+
+
+def action_proof_neighborhood_bonus(records: list[Any], index: int) -> tuple[float, str]:
+    record = records[index]
+    role_text = str(record.role or "").lower()
+    lowered = str(record.text or "").lower()
+    if not any(token in role_text for token in ("assistant", "agent")):
+        return 0.0, ""
+    if not any(term in lowered for term in ("did not overwrite", "not overwrite", "committed", "left untouched")):
+        return 0.0, ""
+    window = records[max(0, index - 10) : min(len(records), index + 3)]
+    nearby_tool_action = False
+    nearby_state_output = False
+    for nearby in window:
+        nearby_role = str(nearby.role or "").lower()
+        nearby_text = str(nearby.text or "").lower()
+        if "function_call" in nearby_role or "tool" in nearby_role:
+            if any(term in nearby_text for term in ("git diff", "git status", "git commit", "find ", "test -f", "rg ")):
+                nearby_tool_action = True
+            if any(term in nearby_text for term in ("modified:", "nothing to commit", "working tree", "commit", "files changed")):
+                nearby_state_output = True
+    if nearby_tool_action and nearby_state_output:
+        return 36.0, "assistant_answer_with_nearby_tool_action_proof"
+    if nearby_tool_action:
+        return 20.0, "assistant_answer_with_nearby_tool_action"
+    return 0.0, ""
 
 
 def score_action_proof_record(
@@ -3063,6 +3093,29 @@ def score_action_proof_record(
         score += 12
     if any(term in lowered for term in ("git diff --check", "git diff --stat", "git commit", "committed")):
         score += 10
+    if any(token in role_text for token in ("assistant", "agent")) and any(
+        term in lowered for term in ("did not overwrite", "not overwrite")
+    ):
+        concrete_facets = sum(
+            1
+            for terms in (
+                ("committed", "git commit", "commit "),
+                ("codex-orchestration.md", "agent-workflow.md"),
+                ("worktree", "draft"),
+                ("git diff --check", "git diff --stat", "diff --check", "diff --stat"),
+            )
+            if any(term in lowered for term in terms)
+        )
+        if concrete_facets >= 2:
+            score += 32
+            reason = "assistant_concrete_action_answer"
+    if any(token in role_text for token in ("user", "human")) and (
+        "using reviewed source case" in lowered
+        or "use local source refs" in lowered
+        or "answer whether the agent actually" in lowered
+    ):
+        score -= 80
+        reason = "investigation_query_echo"
     if tool_proof_path_bonus:
         score += 8
     if line <= 20:
