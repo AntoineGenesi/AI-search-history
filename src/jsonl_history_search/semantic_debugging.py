@@ -1989,9 +1989,10 @@ def answer_ready_copy_paste_commands(
 ) -> list[dict[str, Any]]:
     commands: list[dict[str, Any]] = []
     if prefer_follow_next_reads_bundle and report_output and any(
-        read.get("omitted_window_recovery") for read in next_reads
+        is_jsonl_read_target(read.get("target")) for read in bounded_next_reads
     ):
         follow_report = "follow-next-reads.json"
+        fallback_count = sum(1 for read in bounded_next_reads if is_jsonl_read_target(read.get("target")))
         follow_argv = [
             "jsonl-history-search",
             "follow-next-reads",
@@ -2014,11 +2015,9 @@ def answer_ready_copy_paste_commands(
                 "command": shell_command(follow_argv),
                 "source": "semantic_debug.agent_instruction",
                 "output_path": follow_report,
-                "replaces_individual_read_more_count": min(
-                    ANSWER_READY_HANDOFF_COMMAND_CAP,
-                    sum(1 for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))),
-                ),
-                "fallback_individual_read_more_commands_follow": True,
+                "replaces_individual_read_more_count": fallback_count,
+                "fallback_individual_read_more_commands_follow": False,
+                "fallback_individual_read_more_commands_suppressed_count": fallback_count,
                 "raw_private_text_included": False,
                 "raw_private_path_included": False,
                 "target_local_path_like": False,
@@ -2029,6 +2028,7 @@ def answer_ready_copy_paste_commands(
                 ),
             }
         )
+        return commands
     command_targets = {read.get("target") for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))}
     for read in next_reads:
         if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
