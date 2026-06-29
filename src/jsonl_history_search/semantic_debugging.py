@@ -327,6 +327,21 @@ def build_semantic_debug_payload(
         action_proof_guidance.get("missing_buckets") or []
     )[:8]
     answer_readiness["source_use_contract"]["source_window_action_proof"] = action_proof_guidance
+    investigation_state = build_investigation_state(
+        query=agent_find["query"]["original"],
+        family=family,
+        source_locator_handoff=source_locator_handoff,
+        search_result=result,
+        agent_find=agent_find,
+        source_scope=source_scope,
+        next_reads=next_reads,
+        no_evidence=no_evidence,
+        uncertainty=uncertainty,
+        answer_readiness=answer_readiness,
+        source_handle_routing=source_handle_routing,
+        source_window_action_proof=source_window_action_proof,
+    )
+    answer_readiness["investigation_state_link"] = "semantic_debug.investigation_state"
     guided_audit_flow = build_guided_audit_flow(
         status=agent_find["status"],
         family=family,
@@ -365,12 +380,21 @@ def build_semantic_debug_payload(
         source_handle_routing=source_handle_routing,
         source_window_action_proof=source_window_action_proof,
     )
+    answer_ready_handoff["links"]["investigation_state"] = "semantic_debug.investigation_state"
+    answer_ready_handoff["source_use_summary"]["investigation_state"] = {
+        "link": "semantic_debug.investigation_state",
+        "status": investigation_state.get("status"),
+        "recommended_next_step": investigation_state.get("answer_readiness", {}).get("recommended_next_step"),
+    }
+    guided_audit_flow["links"]["investigation_state"] = "semantic_debug.investigation_state"
+    guided_audit_flow["investigation_state_summary"] = summarize_investigation_state(investigation_state)
 
     packet = {
         "schema_version": SCHEMA_VERSION,
         "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
         "query": agent_find["query"]["original"],
         "question_family": family,
+        "investigation_state": investigation_state,
         "scope": source_scope,
         "routes": routes,
         "source_handle_routing": source_handle_routing,
@@ -3156,6 +3180,348 @@ def summarize_answer_readiness(answer_readiness: dict[str, Any]) -> dict[str, An
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
         "privacy_boundaries": answer_readiness.get("privacy_boundaries"),
     }
+
+
+def build_investigation_state(
+    *,
+    query: str,
+    family: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+    search_result: dict[str, Any],
+    agent_find: dict[str, Any],
+    source_scope: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    no_evidence: dict[str, Any],
+    uncertainty: list[dict[str, Any]],
+    answer_readiness: dict[str, Any],
+    source_handle_routing: dict[str, Any],
+    source_window_action_proof: dict[str, Any],
+) -> dict[str, Any]:
+    query_plan = source_locator_handoff.get("query_plan") or {}
+    retrieval_diagnostics = search_result.get("retrieval_diagnostics") or {}
+    retrieval_pressure = agent_find.get("retrieval_pressure") or {}
+    retrieval_mode = (
+        retrieval_diagnostics.get("retrieval_mode")
+        or retrieval_pressure.get("retrieval_mode")
+        or search_result.get("retrieval_mode")
+        or RETRIEVAL_MODE_PACKAGE
+    )
+    recommendation = investigation_retrieval_recommendation(
+        retrieval_mode=str(retrieval_mode),
+        primary_intent=str(query_plan.get("primary_intent") or ""),
+        family=family,
+        query=query,
+    )
+    gaps = investigation_unresolved_gaps(
+        source_scope=source_scope,
+        no_evidence=no_evidence,
+        uncertainty=uncertainty,
+        answer_readiness=answer_readiness,
+        source_handle_routing=source_handle_routing,
+        source_window_action_proof=source_window_action_proof,
+        source_locator_handoff=source_locator_handoff,
+    )
+    answer_state = {
+        "status": answer_readiness.get("status"),
+        "decision": answer_readiness.get("decision"),
+        "allowed_answer_scope": answer_readiness.get("allowed_answer_scope"),
+        "recommended_next_step": investigation_recommended_next_step(answer_readiness),
+        "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
+        "link": "semantic_debug.answer_readiness",
+    }
+    return {
+        "schema_version": 1,
+        "status": investigation_status(answer_state, gaps),
+        "question_intent": {
+            "query": query,
+            "primary_question_family": family.get("primary"),
+            "detected_supported": list(family.get("detected_supported") or [])[:8],
+            "detected_unsupported": list(family.get("detected_unsupported") or [])[:8],
+            "primary_intent": query_plan.get("primary_intent") or "generic_history",
+            "query_plan_link": "semantic_debug.source_locator_handoff.query_plan",
+        },
+        "retrieval": {
+            "mode_used": retrieval_mode,
+            "mode_source": (
+                "semantic_debug.retrieval_diagnostics"
+                if retrieval_diagnostics
+                else "semantic_debug.default_retrieval_mode"
+            ),
+            "conservative_recommendation": recommendation,
+            "retrieval_pressure_link": (
+                "semantic_debug.retrieval_pressure" if retrieval_pressure else None
+            ),
+            "claim_boundaries": {
+                "rrf_default_promoted": False,
+                "ranking_changed_by_investigation_state": False,
+                "high_recall_cost_hidden": False,
+            },
+        },
+        "actionable_next": {
+            "read_next_refs": investigation_read_next_refs(next_reads),
+            "read_next_count": len(next_reads),
+            "preferred_recovery_workflow": (
+                "semantic_debug.agent_instruction.commands.expand_recovery_context"
+                if answer_readiness.get("decision") == "inspect_recovery_reads"
+                else None
+            ),
+            "links": {
+                "next_reads": "semantic_debug.next_reads",
+                "source_locator_handoff": "semantic_debug.source_locator_handoff",
+                "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+            },
+        },
+        "unresolved_gaps": gaps,
+        "source_boundary_reminders": investigation_source_boundary_reminders(
+            no_evidence=no_evidence,
+            source_window_action_proof=source_window_action_proof,
+        ),
+        "answer_readiness": answer_state,
+        "privacy_boundaries": {
+            "raw_transcript_text_included": False,
+            "raw_source_lines_included": False,
+            "raw_session_ids_included": False,
+            "private_bridge_payloads_included": False,
+        },
+        "links": {
+            "answer_readiness": "semantic_debug.answer_readiness",
+            "guided_audit_flow": "semantic_debug.guided_audit_flow",
+            "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+            "source_window_action_proof": "semantic_debug.source_window_action_proof",
+            "no_evidence": "semantic_debug.no_evidence",
+            "source_handle_routing": "semantic_debug.source_handle_routing",
+        },
+    }
+
+
+def summarize_investigation_state(state: dict[str, Any]) -> dict[str, Any]:
+    retrieval = state.get("retrieval") or {}
+    recommendation = retrieval.get("conservative_recommendation") or {}
+    actionable = state.get("actionable_next") or {}
+    readiness = state.get("answer_readiness") or {}
+    gaps = state.get("unresolved_gaps") or {}
+    return {
+        "schema_version": state.get("schema_version", 1),
+        "status": state.get("status"),
+        "primary_question_family": (state.get("question_intent") or {}).get("primary_question_family"),
+        "primary_intent": (state.get("question_intent") or {}).get("primary_intent"),
+        "retrieval_mode_used": retrieval.get("mode_used"),
+        "retrieval_mode_recommended": recommendation.get("mode"),
+        "read_next_count": actionable.get("read_next_count", 0),
+        "gap_count": gaps.get("gap_count", 0),
+        "answer_readiness_status": readiness.get("status"),
+        "recommended_next_step": readiness.get("recommended_next_step"),
+    }
+
+
+def investigation_retrieval_recommendation(
+    *,
+    retrieval_mode: str,
+    primary_intent: str,
+    family: dict[str, Any],
+    query: str,
+) -> dict[str, Any]:
+    text = query.lower()
+    hard_prompt = primary_intent == "workflow_failure" or any(
+        phrase in text
+        for phrase in (
+            "workflow failure",
+            "process drift",
+            "context drift",
+            "where did",
+            "why did",
+            "hard investigation",
+        )
+    )
+    needs_broad_context = hard_prompt or family.get("primary") in {"why_did_this_happen", "claimed_action"}
+    if retrieval_mode == "rrf-fusion":
+        return {
+            "mode": "rrf-fusion",
+            "reason": "Already using explicit high-recall RRF fusion.",
+            "use_when": "Use only when broad recall is worth extra local work.",
+            "rrf_default_allowed": False,
+            "cost_boundary": "higher_local_work_than_package_or_fielded_bm25",
+        }
+    if retrieval_mode == "fielded-bm25":
+        return {
+            "mode": "fielded-bm25",
+            "reason": "Current mode is the conservative broad-recall workflow for semantic-debug investigations.",
+            "use_when": "Keep this mode for workflow-failure, claimed-action, provenance, or hard why prompts.",
+            "rrf_default_allowed": False,
+            "cost_boundary": "does_not_promote_rrf_or_claim_completeness",
+        }
+    if needs_broad_context:
+        return {
+            "mode": "fielded-bm25",
+            "reason": "This query shape benefits from fielded source planning before escalating to explicit RRF.",
+            "use_when": "Retry with --retrieval-mode fielded-bm25 if current evidence is thin or gaps remain.",
+            "rrf_default_allowed": False,
+            "cost_boundary": "fielded_bm25_can_cost_more_local_work_than_package_default",
+        }
+    return {
+        "mode": retrieval_mode,
+        "reason": "No harder semantic-debug route was inferred from the existing packet fields.",
+        "use_when": "Keep the current mode unless unresolved gaps require broader recall.",
+        "rrf_default_allowed": False,
+        "cost_boundary": "no_default_mode_change",
+    }
+
+
+def investigation_read_next_refs(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for read in next_reads[:6]:
+        row = {
+            "kind": read.get("kind"),
+            "target": read.get("target"),
+            "reason": read.get("reason"),
+            "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
+        }
+        if isinstance(read.get("source_ref"), dict):
+            row["source_ref"] = guided_source_ref(read["source_ref"])
+        refs.append({key: value for key, value in row.items() if value not in (None, [], {})})
+    return refs
+
+
+def investigation_unresolved_gaps(
+    *,
+    source_scope: dict[str, Any],
+    no_evidence: dict[str, Any],
+    uncertainty: list[dict[str, Any]],
+    answer_readiness: dict[str, Any],
+    source_handle_routing: dict[str, Any],
+    source_window_action_proof: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+) -> dict[str, Any]:
+    omitted = source_locator_handoff.get("omitted_window_recovery") or {}
+    action_summary = source_window_action_proof.get("summary") or {}
+    gaps: list[dict[str, Any]] = []
+    for item in uncertainty[:8]:
+        if item.get("label"):
+            gaps.append({"kind": "uncertainty", "label": item.get("label"), "meaning": item.get("meaning")})
+    if no_evidence.get("needed"):
+        gaps.append(
+            {
+                "kind": "missing_evidence_boundary",
+                "label": "not_found_in_searched_scope_only",
+                "meaning": no_evidence.get("why_not_confident"),
+            }
+        )
+    if source_scope.get("cap_hit", {}).get("hit"):
+        gaps.append(
+            {
+                "kind": "searched_scope_boundary",
+                "label": "cap_limited_scope",
+                "meaning": "Search caps may have limited recall; do not claim all-history completeness.",
+            }
+        )
+    unresolved_handles = list(source_handle_routing.get("unresolved_handles") or [])[:6]
+    if unresolved_handles:
+        gaps.append(
+            {
+                "kind": "source_handle_boundary",
+                "label": "unresolved_source_handles",
+                "handles": unresolved_handles,
+                "meaning": source_handle_routing.get("route_guidance"),
+            }
+        )
+    missing_buckets = list(action_summary.get("missing_buckets") or [])[:8]
+    if missing_buckets:
+        gaps.append(
+            {
+                "kind": "action_proof_boundary",
+                "label": "missing_action_proof_buckets",
+                "missing_buckets": missing_buckets,
+                "meaning": "Do not infer missing command/output/final-answer proof from adjacent artifacts.",
+            }
+        )
+    adjacent = ((source_window_action_proof.get("buckets") or {}).get("adjacent_artifact_evidence") or {})
+    if adjacent.get("status") == "present":
+        gaps.append(
+            {
+                "kind": "adjacent_artifact_boundary",
+                "label": "adjacent_artifact_not_primary_action_proof",
+                "meaning": "Adjacent artifacts can corroborate context but do not replace primary JSONL action proof.",
+            }
+        )
+    if omitted.get("status") == "available":
+        gaps.append(
+            {
+                "kind": "recovery_boundary",
+                "label": "omitted_window_recovery_available",
+                "recovery_count": omitted.get("recovery_count", 0),
+                "meaning": "Open promoted omitted-window recovery reads before treating the packet as representative.",
+            }
+        )
+    return {
+        "gap_count": len(gaps),
+        "items": gaps[:12],
+        "missing_evidence_boundaries": {
+            "not_all_history_absence": True,
+            "searched_scope_only": bool(no_evidence.get("needed")),
+            "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
+        },
+        "links": {
+            "uncertainty": "semantic_debug.uncertainty",
+            "no_evidence": "semantic_debug.no_evidence",
+            "source_window_action_proof": "semantic_debug.source_window_action_proof",
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+        },
+    }
+
+
+def investigation_source_boundary_reminders(
+    *,
+    no_evidence: dict[str, Any],
+    source_window_action_proof: dict[str, Any],
+) -> dict[str, Any]:
+    adjacent = ((source_window_action_proof.get("buckets") or {}).get("adjacent_artifact_evidence") or {})
+    return {
+        "primary_sources": [
+            "Use JSONL source refs, source windows, structured tool/action events, and reviewed task/review artifacts as support.",
+            "Every factual or provenance claim needs a linked source surface when evidence exists.",
+        ],
+        "adjacent_artifacts": {
+            "present": adjacent.get("status") == "present",
+            "reminder": "Adjacent artifacts are context only unless linked to primary JSONL action proof.",
+        },
+        "no_evidence": {
+            "searched_scope_only": bool(no_evidence.get("needed")),
+            "reminder": "No-evidence means not found in searched scope, not absent from all possible logs.",
+        },
+        "forbidden_claims": [
+            "root_cause_without_linked_evidence",
+            "global_absence_or_all_history_completeness",
+            "jsonl_speed_token_value_or_final_answer_quality_without_separate_review",
+            "adjacent_artifact_as_primary_action_proof",
+        ],
+    }
+
+
+def investigation_recommended_next_step(answer_readiness: dict[str, Any]) -> str:
+    decision = answer_readiness.get("decision")
+    if decision == "answer_now":
+        return "answer_from_source_backed_packet"
+    if decision == "state_scoped_no_evidence":
+        return "answer_not_found_in_searched_scope_only"
+    if decision == "inspect_recovery_reads":
+        return "open_bounded_next_reads_before_answering"
+    if decision == "run_audit_route":
+        return "run_required_audit_route_before_answering"
+    return "gather_more_source_backed_evidence"
+
+
+def investigation_status(answer_state: dict[str, Any], gaps: dict[str, Any]) -> str:
+    if answer_state.get("decision") == "answer_now" and not gaps.get("gap_count"):
+        return "ready_to_answer"
+    if answer_state.get("decision") == "state_scoped_no_evidence":
+        return "scoped_no_evidence_ready"
+    if answer_state.get("decision") == "inspect_recovery_reads":
+        return "needs_recovery_reads"
+    if answer_state.get("decision") == "run_audit_route":
+        return "needs_audit_route"
+    return "needs_more_evidence"
+
+
 def build_guided_audit_flow(
     *,
     status: str,

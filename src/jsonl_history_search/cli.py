@@ -1766,6 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
                     "candidate_count": len(packet["strongest_candidates"]),
                     "event_count": packet["tool_action_proof"]["event_count"],
                     "source_locator_handoff": packet["source_locator_handoff"],
+                    "investigation_state": packet["investigation_state"],
                     "answer_ready_handoff": packet["answer_ready_handoff"],
                     "agent_instruction": packet["agent_instruction"],
                     "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
