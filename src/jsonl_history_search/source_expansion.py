@@ -24,6 +24,7 @@ RECOVERY_USABILITY_STATUSES = {
     "still_unreviewed",
     "review_gap",
 }
+REVIEWED_FOLLOWED_RECOVERY_TARGET = "answer_only_for_reviewed_usable_facets_and_state_remaining_gaps"
 
 
 @dataclass(frozen=True)
@@ -154,12 +155,27 @@ def build_follow_next_reads_payload(
         "matched_count": sum(1 for item in expanded_reads if (item.get("recovery_usability") or {}).get("matched")),
         "status_counts": recovery_usability_status_counts(expanded_reads),
     }
+    answer_gate = build_reviewed_follow_through_answer_gate(counts, {**base, **counts})
+    workflow_step_summary = recovery_workflow_step_summary(
+        saved_follow_next_reads_report=recovery_report_output_path is not None,
+        expanded_count=counts["expanded_count"],
+        reviewed_counts_available=True,
+    )
     return {
         "follow_next_reads": {
             **base,
             "reviewed_usability_decisions": reviewed_usability_summary,
             "status": follow_next_reads_status(counts),
             **counts,
+            "recovery_bundle": build_recovery_bundle_summary(
+                reads=reads,
+                selected_reads=selected_reads,
+                expanded_reads=expanded_reads,
+                limit=max(0, int(limit)),
+                counts=counts,
+            ),
+            "reviewed_follow_through_answer_gate": answer_gate,
+            "workflow_step_summary": workflow_step_summary,
             "source_packet": {
                 "status": "supported",
                 "packet_type": packet_info["packet_type"],
@@ -191,6 +207,8 @@ def build_follow_next_reads_payload(
                 recovery_report_output_path=recovery_report_output_path,
                 status=follow_next_reads_status(counts),
                 counts=counts,
+                reviewed_follow_through_answer_gate=answer_gate,
+                workflow_step_summary=workflow_step_summary,
             ),
         }
     }
@@ -202,6 +220,8 @@ def build_follow_next_reads_agent_instruction(
     recovery_report_output_path: Path | None,
     status: str,
     counts: dict[str, int],
+    reviewed_follow_through_answer_gate: dict[str, Any] | None = None,
+    workflow_step_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if status in {"expanded", "partial_expanded"} and counts.get("expanded_count", 0):
         decision = "needs_investigation"
@@ -256,21 +276,29 @@ def build_follow_next_reads_agent_instruction(
                 "requires_saved_follow_next_reads_report": follow_report,
                 "command_copy_pasteable": True,
                 "handoff_layer": "answer_eval_gate",
+                "optional_when_embedded_gate_available": bool(reviewed_follow_through_answer_gate),
                 "purpose": (
                     "Use this saved semantic-debug report plus saved follow-next-reads report "
-                    "to decide whether followed recovery is reviewed enough to answer."
+                    "to recheck whether followed recovery is reviewed enough to answer."
                 ),
             }
         )
+    embedded_gate_available = bool(command_copy_pasteable and reviewed_follow_through_answer_gate)
+    if command_copy_pasteable and decision == "needs_investigation" and embedded_gate_available:
+        next_action = "use_embedded_answer_gate_before_answer"
+    elif command_copy_pasteable and decision == "needs_investigation":
+        next_action = "run_eval_decision_gate_before_answer"
+    else:
+        next_action = required_next_action
     return {
         "schema_version": 1,
         "decision": decision,
-        "required_next_action": "run_eval_decision_gate_before_answer"
-        if command_copy_pasteable and decision == "needs_investigation"
-        else required_next_action,
+        "required_next_action": next_action,
+        "reviewed_follow_through_answer_gate": reviewed_follow_through_answer_gate,
+        "workflow_step_summary": workflow_step_summary or {},
         "commands": commands,
         "do_not_answer_until": [
-            "If this packet was saved with --report-output, run the answer_eval_gate command before answering from followed recovery when reviewed usability counts are relevant.",
+            "Use reviewed_follow_through_answer_gate before answering from followed recovery; run answer_eval_gate only when an independent recheck is needed.",
             "Do not synthesize devlog-style conclusions until expanded recovery reads have been reviewed or marked unusable.",
             "Use failure_analysis.devlog_brief for supported claims, timeline/play-by-play, non-claims, gaps, and next reads.",
             "Do not claim root cause, all-history completeness, final-answer quality, token savings, speed, or product value.",
@@ -281,7 +309,7 @@ def build_follow_next_reads_agent_instruction(
             {
                 "layer": "answer_eval_gate",
                 "surface": "eval_decision_loop.reviewed_follow_through_answer_gate",
-                "status": "next" if command_copy_pasteable else "requires_saved_follow_next_reads_report",
+                "status": "embedded" if embedded_gate_available else "next" if command_copy_pasteable else "requires_saved_follow_next_reads_report",
             },
             {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "available"},
         ],
@@ -290,6 +318,184 @@ def build_follow_next_reads_agent_instruction(
             "raw_paths_included_in_this_packet": True,
             "committed_safe_without_sanitization": False,
         },
+    }
+
+
+def build_recovery_bundle_summary(
+    *,
+    reads: list[dict[str, Any]],
+    selected_reads: list[dict[str, Any]],
+    expanded_reads: list[dict[str, Any]],
+    limit: int,
+    counts: dict[str, int],
+) -> dict[str, Any]:
+    categories: dict[str, dict[str, Any]] = {}
+    for read in selected_reads:
+        kind = recovery_metadata(read).get("kind") or "ordinary_next_read"
+        categories.setdefault(kind, recovery_category_row(kind))["selected_count"] += 1
+    for item in expanded_reads:
+        recovery = item.get("recovery") if isinstance(item.get("recovery"), dict) else {}
+        kind = str(recovery.get("kind") or "ordinary_next_read")
+        category = categories.setdefault(kind, recovery_category_row(kind))
+        if item.get("status") == "expanded":
+            category["expanded_count"] += 1
+        else:
+            category["failed_count"] += 1
+        usability = item.get("recovery_usability") if isinstance(item.get("recovery_usability"), dict) else {}
+        usability_status = str(usability.get("status") or "unknown")
+        category["reviewed_status_counts"][usability_status] = (
+            category["reviewed_status_counts"].get(usability_status, 0) + 1
+        )
+        category["evidence_handles"].append(recovery_bundle_evidence_handle(item))
+
+    available_count = len(reads)
+    selected_count = len(selected_reads)
+    expanded_count = counts.get("expanded_count", 0)
+    failed_count = counts.get("failed_count", 0)
+    return {
+        "schema_version": 1,
+        "status": "bounded_recovery_bundle",
+        "expanded_evidence_categories": [
+            {
+                **row,
+                "reviewed_status_counts": dict(sorted(row["reviewed_status_counts"].items())),
+                "evidence_handles": row["evidence_handles"][:5],
+            }
+            for _kind, row in sorted(categories.items())
+        ],
+        "category_counts": {
+            key: {
+                "selected_count": row["selected_count"],
+                "expanded_count": row["expanded_count"],
+                "failed_count": row["failed_count"],
+            }
+            for key, row in sorted(categories.items())
+        },
+        "omitted_or_recovery_boundaries": {
+            "available_next_read_count": available_count,
+            "selected_count": selected_count,
+            "expanded_count": expanded_count,
+            "failed_count": failed_count,
+            "limit_applied": limit,
+            "unselected_recovery_count": max(0, available_count - selected_count),
+            "unexpanded_selected_count": max(0, selected_count - expanded_count - failed_count),
+            "all_history_completeness_claim_supported": False,
+            "answer_generation_included": False,
+            "ranking_or_cap_changed": False,
+            "broad_search_rerun": False,
+        },
+        "privacy_boundaries": {
+            "raw_text_included_in_bundle_summary": False,
+            "raw_paths_included_in_bundle_summary": False,
+            "source_refs_or_targets_replaced_by_handles": True,
+            "expanded_reads_may_include_raw_text_and_paths": True,
+        },
+    }
+
+
+def recovery_category_row(kind: str) -> dict[str, Any]:
+    return {
+        "category": kind,
+        "selected_count": 0,
+        "expanded_count": 0,
+        "failed_count": 0,
+        "reviewed_status_counts": {},
+        "evidence_handles": [],
+    }
+
+
+def recovery_bundle_evidence_handle(item: dict[str, Any]) -> dict[str, Any]:
+    recovery = item.get("recovery") if isinstance(item.get("recovery"), dict) else {}
+    usability = item.get("recovery_usability") if isinstance(item.get("recovery_usability"), dict) else {}
+    source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+    return {
+        "rank": item.get("rank"),
+        "candidate_id": item.get("candidate_id"),
+        "recovery_id": recovery.get("recovery_id"),
+        "status": item.get("status"),
+        "reviewed_usability_status": usability.get("status"),
+        "target_handle": hashed_handle("target", item.get("target")),
+        "source_handle": hashed_handle("source", json.dumps(source_ref, sort_keys=True) if source_ref else None),
+    }
+
+
+def recovery_workflow_step_summary(
+    *,
+    saved_follow_next_reads_report: bool,
+    expanded_count: int,
+    reviewed_counts_available: bool,
+) -> dict[str, Any]:
+    bundled_ready = bool(saved_follow_next_reads_report and expanded_count and reviewed_counts_available)
+    previous_required = ["expand_recovery_context", "answer_eval_gate"]
+    bundled_required = ["expand_recovery_context"] if bundled_ready else previous_required
+    return {
+        "schema_version": 1,
+        "comparison_scope": "same reviewed follow-next-reads categories",
+        "previous_split_required_command_ids": previous_required,
+        "bundled_required_command_ids": bundled_required,
+        "separate_recovery_command_steps_avoided": max(0, len(previous_required) - len(bundled_required)),
+        "answer_gate_metadata_embedded": bundled_ready,
+        "claim_boundary": (
+            "counts only separate package command steps in the reviewed follow-through path; "
+            "does not claim elapsed time, token savings, cost, final-answer quality, or release readiness"
+        ),
+    }
+
+
+def build_reviewed_follow_through_answer_gate(
+    counts: dict[str, int],
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    reviewed_usable = counts["reviewed_usable_recovery_evidence_count"]
+    reviewed_negative = counts["reviewed_not_useful_recovery_count"]
+    still_unreviewed = counts["still_unreviewed_recovery_count"]
+    review_gap = counts["review_gap_recovery_count"]
+    expanded = int_or_default(packet.get("expanded_count"), 0)
+    failed = int_or_default(packet.get("failed_count"), 0)
+    if expanded and reviewed_usable and not still_unreviewed and not review_gap and not reviewed_negative:
+        status = "reviewed_recovery_answer_usable_with_boundaries"
+        decision = "answer_with_reviewed_recovery_and_source_discipline_boundaries"
+    elif expanded and reviewed_usable:
+        status = "reviewed_recovery_partially_answer_usable"
+        decision = REVIEWED_FOLLOWED_RECOVERY_TARGET
+    elif expanded and (reviewed_negative or review_gap):
+        status = "reviewed_recovery_not_answer_ready"
+        decision = "do_not_answer_from_recovery_without_more_source_discipline"
+    elif expanded and still_unreviewed:
+        status = "followthrough_opened_but_recovery_unreviewed"
+        decision = "review_opened_recovery_before_answering"
+    elif failed:
+        status = "followthrough_attempted_but_reads_failed"
+        decision = "fix_or_rerun_recovery_reads_before_answering"
+    else:
+        status = "followthrough_no_recovery_opened"
+        decision = "do_not_answer_without_gap_boundary"
+
+    blockers: list[str] = []
+    if still_unreviewed:
+        blockers.append("opened_recovery_not_reviewed_for_usability")
+    if review_gap:
+        blockers.append("reviewed_recovery_has_source_discipline_gap")
+    if reviewed_negative:
+        blockers.append("reviewed_recovery_contains_explicit_negative_evidence")
+    if failed:
+        blockers.append("follow_next_reads_failures_present")
+
+    return {
+        "status": status,
+        "decision": decision,
+        "answer_ready_without_boundaries": False,
+        "source_discipline_blockers": blockers,
+        "basis": {
+            **counts,
+            "expanded_count": expanded,
+            "failed_count": failed,
+            "usable_recovery_evidence_count": int_or_default(packet.get("usable_recovery_evidence_count"), 0),
+        },
+        "claim_boundary": (
+            "derived from sanitized follow-next-reads reviewed usability counters; "
+            "not a final-answer quality or all-history completeness claim"
+        ),
     }
 
 

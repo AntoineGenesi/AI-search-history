@@ -270,6 +270,9 @@ def render_follow_next_reads_text(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     reviewed = report.get("reviewed_usability_decisions") or {}
     status_counts = reviewed.get("status_counts") or {}
+    gate = report.get("reviewed_follow_through_answer_gate") or {}
+    bundle = report.get("recovery_bundle") or {}
+    step_summary = report.get("workflow_step_summary") or {}
     lines = [
         "Follow Next Reads",
         f"Status: {report.get('status')}",
@@ -283,6 +286,33 @@ def render_follow_next_reads_text(payload: dict) -> str:
         lines.append(
             "Reviewed usability statuses: "
             + ", ".join(f"{key}={value}" for key, value in sorted(status_counts.items()))
+        )
+    if bundle:
+        boundaries = bundle.get("omitted_or_recovery_boundaries") or {}
+        category_counts = bundle.get("category_counts") or {}
+        lines.extend(
+            [
+                "Recovery Bundle:",
+                f"- category_count: {len(category_counts)}",
+                f"- unselected_recovery_count: {boundaries.get('unselected_recovery_count', 0)}",
+                f"- failed_recovery_count: {boundaries.get('failed_count', 0)}",
+                "- evidence_handles: hashed in JSON; raw targets and paths omitted from text output",
+            ]
+        )
+    if gate:
+        lines.extend(
+            [
+                "Reviewed Answer Gate:",
+                f"- status: {gate.get('status')}",
+                f"- decision: {gate.get('decision')}",
+                f"- answer_ready_without_boundaries: {gate.get('answer_ready_without_boundaries')}",
+            ]
+        )
+    if step_summary:
+        lines.append(
+            "Workflow steps: bundled_required_command_ids="
+            + ", ".join(step_summary.get("bundled_required_command_ids") or [])
+            + f"; avoided={step_summary.get('separate_recovery_command_steps_avoided', 0)}"
         )
     if instruction:
         commands = instruction.get("commands") or []
@@ -310,6 +340,9 @@ def render_follow_next_reads_markdown(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     reviewed = report.get("reviewed_usability_decisions") or {}
     status_counts = reviewed.get("status_counts") or {}
+    gate = report.get("reviewed_follow_through_answer_gate") or {}
+    bundle = report.get("recovery_bundle") or {}
+    step_summary = report.get("workflow_step_summary") or {}
     lines = [
         "# Follow Next Reads",
         "",
@@ -323,6 +356,38 @@ def render_follow_next_reads_markdown(payload: dict) -> str:
     if status_counts:
         lines.append(
             f"- `reviewed_usability_statuses`: `{', '.join(f'{key}={value}' for key, value in sorted(status_counts.items()))}`"
+        )
+    if bundle:
+        boundaries = bundle.get("omitted_or_recovery_boundaries") or {}
+        category_counts = bundle.get("category_counts") or {}
+        lines.extend(
+            [
+                "",
+                "## Recovery Bundle",
+                "",
+                f"- `category_count`: `{len(category_counts)}`",
+                f"- `unselected_recovery_count`: `{boundaries.get('unselected_recovery_count', 0)}`",
+                f"- `failed_recovery_count`: `{boundaries.get('failed_count', 0)}`",
+                "- `evidence_handles`: hashed in JSON; raw targets and paths omitted from Markdown output",
+            ]
+        )
+    if gate:
+        lines.extend(
+            [
+                "",
+                "## Reviewed Answer Gate",
+                "",
+                f"- `status`: `{gate.get('status')}`",
+                f"- `decision`: `{gate.get('decision')}`",
+                f"- `answer_ready_without_boundaries`: `{gate.get('answer_ready_without_boundaries')}`",
+            ]
+        )
+    if step_summary:
+        lines.append(
+            f"- `bundled_required_command_ids`: `{', '.join(step_summary.get('bundled_required_command_ids') or [])}`"
+        )
+        lines.append(
+            f"- `separate_recovery_command_steps_avoided`: `{step_summary.get('separate_recovery_command_steps_avoided', 0)}`"
         )
     if instruction:
         commands = instruction.get("commands") or []
