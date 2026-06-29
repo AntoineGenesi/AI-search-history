@@ -1364,9 +1364,16 @@ def build_answer_ready_handoff(
     action_proof_summary = source_window_action_proof_guidance(source_window_action_proof or {})
     if action_proof_summary:
         source_use_summary["source_window_action_proof"] = action_proof_summary
+    answer_support = answer_support_classification(
+        decision=decision,
+        discipline_summary=discipline_summary,
+        source_window_action_proof=source_window_action_proof or {},
+    )
+    source_use_summary["answer_support_classification"] = answer_support
     return {
         "schema_version": 1,
         "decision": decision,
+        "answer_support_classification": answer_support,
         "answer_readiness_status": readiness_status,
         "answer_gate_status": answer_gate.get("status") or "active",
         "do_next": do_next,
@@ -1416,6 +1423,56 @@ def build_answer_ready_handoff(
                 if report_output and decision == "recovery_first"
                 else None
             ),
+        },
+    }
+
+
+def answer_support_classification(
+    *,
+    decision: str,
+    discipline_summary: dict[str, Any],
+    source_window_action_proof: dict[str, Any],
+) -> dict[str, Any]:
+    buckets = source_window_action_proof.get("buckets") if isinstance(source_window_action_proof.get("buckets"), dict) else {}
+    adjacent = buckets.get("adjacent_artifact_evidence") if isinstance(buckets.get("adjacent_artifact_evidence"), dict) else {}
+    action_status = str(source_window_action_proof.get("status") or "")
+    missing_proof_buckets = list(discipline_summary.get("missing_proof_buckets") or [])
+    blocked_facets = list(discipline_summary.get("blocked_facets") or [])
+    adjacent_present = adjacent.get("status") == "present"
+
+    if action_status == "action_proof_available":
+        current = "primary_source_answer"
+        reason = "primary_action_proof_available"
+    elif adjacent_present and action_status != "action_proof_available":
+        current = "answer_with_caveat"
+        reason = "adjacent_artifact_context_without_primary_action_proof"
+    elif decision in {"recovery_first", "audit_required", "insufficient_evidence"}:
+        current = "read_more_required"
+        reason = "answer_readiness_requires_more_source_work"
+    elif missing_proof_buckets or blocked_facets:
+        current = "read_more_required"
+        reason = "missing_primary_proof_or_blocked_facets"
+    elif decision == "scoped_no_evidence":
+        current = "read_more_required"
+        reason = "scoped_no_evidence_not_primary_source_answer"
+    else:
+        current = "primary_source_answer"
+        reason = "primary_source_surfaces_available_for_answer_scope"
+
+    return {
+        "schema_version": 1,
+        "current": current,
+        "reason": reason,
+        "states": ["primary_source_answer", "answer_with_caveat", "read_more_required"],
+        "adjacent_artifact_present": adjacent_present,
+        "adjacent_artifact_counts_as_primary_source": False,
+        "action_proof_status": action_status or "not_applicable",
+        "missing_proof_buckets": missing_proof_buckets[:8],
+        "blocked_facets": blocked_facets[:8],
+        "claim_boundaries": {
+            "primary_source_grounding_claim_allowed": current == "primary_source_answer",
+            "adjacent_artifact_success_requires_caveat": current == "answer_with_caveat",
+            "read_more_required_before_clean_answer": current == "read_more_required",
         },
     }
 
