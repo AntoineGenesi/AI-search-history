@@ -226,21 +226,51 @@ def build_follow_next_reads_agent_instruction(
         "--format",
         "json",
     ]
+    commands = [
+        {
+            "command_id": "build_investigation_brief",
+            "argv": failure_argv,
+            "command": " ".join(shlex.quote(str(part)) for part in failure_argv),
+            "requires_saved_follow_next_reads_report": follow_report,
+            "command_copy_pasteable": command_copy_pasteable,
+            "handoff_layer": "investigation_brief",
+            "purpose": "Use this recovery packet with the original semantic-debug report to produce failure_analysis.devlog_brief.",
+        }
+    ]
+    if recovery_report_output_path is not None:
+        eval_argv = [
+            "jsonl-history-search",
+            "eval-decision-loop",
+            "--semantic-debug-report",
+            str(report_path),
+            "--follow-next-reads-report",
+            follow_report,
+            "--format",
+            "json",
+        ]
+        commands.append(
+            {
+                "command_id": "answer_eval_gate",
+                "argv": eval_argv,
+                "command": " ".join(shlex.quote(str(part)) for part in eval_argv),
+                "requires_saved_follow_next_reads_report": follow_report,
+                "command_copy_pasteable": True,
+                "handoff_layer": "answer_eval_gate",
+                "purpose": (
+                    "Use this saved semantic-debug report plus saved follow-next-reads report "
+                    "to decide whether followed recovery is reviewed enough to answer."
+                ),
+            }
+        )
     return {
         "schema_version": 1,
         "decision": decision,
-        "required_next_action": required_next_action,
-        "commands": [
-            {
-                "command_id": "build_investigation_brief",
-                "argv": failure_argv,
-                "command": " ".join(shlex.quote(str(part)) for part in failure_argv),
-                "requires_saved_follow_next_reads_report": follow_report,
-                "command_copy_pasteable": command_copy_pasteable,
-                "purpose": "Use this recovery packet with the original semantic-debug report to produce failure_analysis.devlog_brief.",
-            }
-        ],
+        "required_next_action": "run_eval_decision_gate_before_answer"
+        if command_copy_pasteable and decision == "needs_investigation"
+        else required_next_action,
+        "commands": commands,
         "do_not_answer_until": [
+            "If this packet was saved with --report-output, run the answer_eval_gate command before answering from followed recovery when reviewed usability counts are relevant.",
             "Do not synthesize devlog-style conclusions until expanded recovery reads have been reviewed or marked unusable.",
             "Use failure_analysis.devlog_brief for supported claims, timeline/play-by-play, non-claims, gaps, and next reads.",
             "Do not claim root cause, all-history completeness, final-answer quality, token savings, speed, or product value.",
@@ -248,7 +278,12 @@ def build_follow_next_reads_agent_instruction(
         "workflow_layers": [
             {"layer": "evidence_packet", "surface": "semantic_debug", "status": "already_saved"},
             {"layer": "recovery_packet", "surface": "follow_next_reads", "status": status},
-            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "next"},
+            {
+                "layer": "answer_eval_gate",
+                "surface": "eval_decision_loop.reviewed_follow_through_answer_gate",
+                "status": "next" if command_copy_pasteable else "requires_saved_follow_next_reads_report",
+            },
+            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "available"},
         ],
         "privacy_boundaries": {
             "raw_text_included_in_this_packet": True,
