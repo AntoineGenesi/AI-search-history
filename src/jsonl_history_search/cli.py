@@ -341,6 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
     read_more.add_argument("--after", type=int, default=2)
     read_more.add_argument("--next-count", type=int, default=3)
     read_more.add_argument("--max-records", type=int, default=20)
+    read_more.add_argument("--projection", choices=("full", "compact"), default="full")
+    read_more.add_argument("--compact-text-limit", type=int, default=1200)
     follow_next_reads = subparsers.add_parser(
         "follow-next-reads",
         description=(
@@ -2470,6 +2472,8 @@ def main(argv: list[str] | None = None) -> int:
                 after=args.after,
                 next_count=args.next_count,
                 max_records=args.max_records,
+                projection=args.projection,
+                compact_text_limit=args.compact_text_limit,
             ),
             plan=plan,
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
