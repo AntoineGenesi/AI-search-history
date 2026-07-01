@@ -24,6 +24,31 @@ class AskRoute:
 
 ROUTES: tuple[AskRoute, ...] = (
     AskRoute(
+        route_family="source_window_semantic_debug",
+        chosen_route="source-window / semantic-debug",
+        why_it_applies=(
+            "The wording names a reviewed source case, specific session/date, "
+            "or source-window-only boundary, so route directly to semantic-debug "
+            "source refs before artifact currentness or broad repo search."
+        ),
+        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        read_specialization="references/semantic-debugging.md",
+        inspect_after=(
+            "semantic_debug.answer_ready_handoff.primary_source_followthrough",
+            "semantic_debug.source_locator_handoff / top source refs",
+            "next_reads for bounded source-window follow-through",
+        ),
+        stop_guidance=(
+            "Run text-first semantic-debug before artifact currentness or broad "
+            "rg, then open the promoted source-window reads. Stop broad searching "
+            "once the reviewed source window answers the prompt."
+        ),
+        manual_search_guidance=(
+            "Manual rg is a follow-up only for a named missing facet after "
+            "semantic-debug source-window follow-through, not before it."
+        ),
+    ),
+    AskRoute(
         route_family="action_proof",
         chosen_route="action-proof / semantic-debug",
         why_it_applies=(
@@ -191,28 +216,31 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 def classify_ask_route(query: str) -> AskRoute:
     normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
 
+    if _looks_like_reviewed_source_window_prompt(normalized):
+        return ROUTES[0]
+
     if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
         normalized, ("agent", "edits", "edit", "changed", "action")
     ):
-        return ROUTES[0]
-
-    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
         return ROUTES[1]
 
-    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
+    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
         return ROUTES[2]
 
-    if is_worktree_cleanup_currentness_query(query):
+    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[3]
 
-    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+    if is_worktree_cleanup_currentness_query(query):
         return ROUTES[4]
+
+    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+        return ROUTES[5]
 
     if _looks_like_ticket_currentness(normalized):
-        return ROUTES[4]
+        return ROUTES[5]
 
     if _has_any(normalized, ("keep yelling", "yelling about", "complain", "complained", "semantic wrap-up", "wrap up")):
-        return ROUTES[5]
+        return ROUTES[6]
 
     return AskRoute(
         route_family="semantic_debug",
@@ -241,6 +269,14 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
+    reviewed_source = "reviewed source case" in normalized or re.search(r"\breal-jsh[0-9a-z-]*\b", normalized)
+    source_window = "source window" in normalized or "source refs" in normalized or "source case" in normalized
+    dated_session = bool(re.search(r"\b20\d\d-\d\d-\d\d\b", normalized)) or "session dated" in normalized
+    boundary = _has_any(normalized, ("only", "not from current docs", "not current docs", "answer from"))
+    return bool(reviewed_source and source_window and (dated_session or boundary))
 
 
 def _looks_like_ticket_currentness(normalized: str) -> bool:
