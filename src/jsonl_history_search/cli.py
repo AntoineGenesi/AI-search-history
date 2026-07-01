@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
@@ -1581,6 +1582,11 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         hard_cap_bytes=args.hard_cap_bytes,
     )
     intent = infer_query(args.query, now=now, role=args.role)
+    current_session_only = (
+        getattr(args, "command", None) == "semantic-wrapup"
+        and not args.root
+        and current_session_wording(args.query)
+    )
     plan = build_source_plan(
         cwd=cwd,
         codex_home=codex_home,
@@ -1588,6 +1594,7 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         roots=[Path(item).expanduser() for item in args.root] if args.root else None,
         allow_arbitrary_root=args.allow_arbitrary_root,
         limits=limits,
+        current_session_only=current_session_only,
     )
     source_plan = {
         "query": intent.to_dict(),
@@ -1611,6 +1618,14 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
             RedactionContext.from_path(redaction_path),
         )
     return source_plan, intent, plan
+
+
+def current_session_wording(query: str) -> bool:
+    normalized = " ".join(str(query or "").casefold().split())
+    return bool(
+        re.search(r"\b(this|current|active|latest)\s+(session|chat|thread|conversation|run)\b", normalized)
+        or re.search(r"\b(this|current)\s+conversation\b", normalized)
+    )
 
 
 def _redaction_source_metadata(path: Path, context: RedactionContext) -> dict:

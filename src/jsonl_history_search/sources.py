@@ -83,6 +83,7 @@ class SourcePlan:
     warnings: list[str] = field(default_factory=list)
     blind_spots: list[str] = field(default_factory=list)
     limits: Limits = field(default_factory=Limits)
+    scope_resolution: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -91,6 +92,7 @@ class SourcePlan:
             "warnings": self.warnings,
             "blind_spots": self.blind_spots,
             "limits": self.limits.to_dict(),
+            "scope_resolution": self.scope_resolution,
             "selected_root_count": len(self.roots),
             "private_root_count": len(self.roots),
             "rejected_root_count": len(self.rejected_roots),
@@ -501,10 +503,36 @@ def build_source_plan(
     roots: list[Path] | None,
     allow_arbitrary_root: bool,
     limits: Limits,
+    current_session_only: bool = False,
 ) -> SourcePlan:
     plan = SourcePlan(limits=limits)
     known = known_roots(codex_home, claude_home)
-    requested = roots or [codex_home / "sessions", codex_home / "history.jsonl", claude_home / "projects"]
+    requested = roots
+    if requested is None and current_session_only:
+        latest, latest_warning = latest_known_session_file(codex_home, claude_home)
+        if latest is None:
+            plan.scope_resolution = {
+                "status": "ambiguous_current_session",
+                "strategy": "no_default_broad_history_sweep",
+                "reason": "current-session wording was detected, but no known Codex/Claude session JSONL file was discoverable",
+            }
+            plan.blind_spots.append(
+                "Current-session wording detected, but no known session JSONL file was found; rerun with an exact --root session JSONL."
+            )
+            if latest_warning:
+                plan.warnings.append(latest_warning)
+            return plan
+        requested = [latest]
+        plan.scope_resolution = {
+            "status": "scoped_to_latest_known_session",
+            "strategy": "latest_known_codex_or_claude_session_file",
+            "reason": "current-session wording detected; broad default history sweep was avoided",
+        }
+        plan.warnings.append("Current-session wording detected; scoped to the latest known session file by default.")
+        if latest_warning:
+            plan.warnings.append(latest_warning)
+    elif requested is None:
+        requested = [codex_home / "sessions", codex_home / "history.jsonl", claude_home / "projects"]
 
     if allow_arbitrary_root and (limits.hard_cap_files is None or limits.hard_cap_bytes is None):
         plan.rejected_roots.extend(RejectedRoot(str(root), "arbitrary root override requires --hard-cap-files and --hard-cap-bytes") for root in requested)
@@ -517,7 +545,7 @@ def build_source_plan(
             if danger:
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
                 continue
-            kind = known.get(resolved)
+            kind = known_kind_for_resolved_path(resolved, known)
             if not kind and not allow_arbitrary_root:
                 plan.rejected_roots.append(RejectedRoot(str(root), "not a known Codex/Claude transcript root; pass --allow-arbitrary-root with explicit hard caps"))
                 continue
@@ -547,6 +575,67 @@ def known_roots(codex_home: Path, claude_home: Path) -> dict[Path, str]:
         safe_resolve(codex_home / "history.jsonl"): "codex_history",
         safe_resolve(claude_home / "projects"): "claude_projects",
     }
+
+
+def known_kind_for_resolved_path(resolved: Path, known: dict[Path, str]) -> str | None:
+    direct = known.get(resolved)
+    if direct:
+        return direct
+    if resolved.suffix != ".jsonl":
+        return None
+    for root, root_kind in known.items():
+        if root_kind == "codex_history":
+            continue
+        if resolved_path_is_inside(resolved, root):
+            if root_kind == "codex_sessions":
+                return "codex_session_file"
+            if root_kind == "claude_projects":
+                return "claude_session_file"
+            return root_kind
+    return None
+
+
+def resolved_path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path | None, str | None]:
+    candidates: list[tuple[float, str, Path]] = []
+    warning: str | None = None
+    started = time.monotonic()
+    visited = 0
+    max_candidates = 5000
+    max_elapsed = 2.0
+    for base in (codex_home / "sessions", claude_home / "projects"):
+        base = base.expanduser()
+        if not base.exists() or not base.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            if time.monotonic() - started > max_elapsed:
+                warning = "Stopped current-session discovery at max elapsed cap; rerun with explicit --root if the latest session is missing."
+                break
+            dirnames[:] = [name for name in sorted(dirnames) if name not in {".git", ".cache", "node_modules", "__pycache__"}]
+            for filename in filenames:
+                if not filename.endswith(".jsonl"):
+                    continue
+                path = Path(dirpath) / filename
+                candidates.append((stat_mtime(path), path.as_posix(), path))
+                visited += 1
+                if visited >= max_candidates:
+                    warning = "Stopped current-session discovery at metadata cap; rerun with explicit --root if the latest session is missing."
+                    break
+            if warning:
+                break
+        if warning:
+            break
+    if not candidates:
+        return None, warning
+    _mtime, _label, path = max(candidates, key=lambda item: (item[0], item[1]))
+    return path, warning
 
 
 def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) -> list[Path]:

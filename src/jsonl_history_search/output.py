@@ -763,11 +763,20 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         (
             "Summary: "
             f"{summary.get('complaint_signal_count', 0)} complaint signals, "
-            f"{summary.get('failure_mode_count', 0)} failure modes, "
-            f"{summary.get('fix_suggestion_count', 0)} fix suggestions"
+            f"{summary.get('failure_mode_returned_count', summary.get('failure_mode_count', 0))}/"
+            f"{summary.get('failure_mode_total_count', summary.get('failure_mode_count', 0))} failure modes returned, "
+            f"{summary.get('fix_suggestion_returned_count', summary.get('fix_suggestion_count', 0))}/"
+            f"{summary.get('fix_suggestion_total_count', summary.get('fix_suggestion_count', 0))} fix suggestions returned"
         ),
         "Selection required: yes; no fixes were auto-applied.",
     ])
+    if summary.get("failure_mode_truncated") or summary.get("fix_suggestion_truncated"):
+        lines.append(f"Truncation: inline arrays are limited to {summary.get('inline_limit')} items; totals are shown above.")
+    scope_resolution = report.get("scope_resolution") or {}
+    if scope_resolution.get("status"):
+        lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
+    if scope_resolution.get("first_action"):
+        lines.append(f"First action: {scope_resolution.get('first_action')}")
     if report.get("failure_modes"):
         lines.append("Failure modes:")
         for mode in report["failure_modes"][:8]:
@@ -841,13 +850,31 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         "",
         (
             f"**Summary:** {summary.get('complaint_signal_count', 0)} complaint signals, "
-            f"{summary.get('failure_mode_count', 0)} failure modes, "
-            f"{summary.get('fix_suggestion_count', 0)} fix suggestions"
+            f"{summary.get('failure_mode_returned_count', summary.get('failure_mode_count', 0))}/"
+            f"{summary.get('failure_mode_total_count', summary.get('failure_mode_count', 0))} failure modes returned, "
+            f"{summary.get('fix_suggestion_returned_count', summary.get('fix_suggestion_count', 0))}/"
+            f"{summary.get('fix_suggestion_total_count', summary.get('fix_suggestion_count', 0))} fix suggestions returned"
         ),
         "",
         "> Selection required: no fixes were auto-applied.",
         "",
     ])
+    if summary.get("failure_mode_truncated") or summary.get("fix_suggestion_truncated"):
+        lines.extend([
+            f"**Truncation:** inline arrays are limited to `{summary.get('inline_limit')}` items; totals are shown above.",
+            "",
+        ])
+    scope_resolution = report.get("scope_resolution") or {}
+    if scope_resolution.get("status"):
+        lines.extend([
+            f"**Scope:** `{scope_resolution.get('status')}` via `{scope_resolution.get('strategy')}`",
+            "",
+        ])
+    if scope_resolution.get("first_action"):
+        lines.extend([
+            f"**First action:** `{scope_resolution.get('first_action')}`",
+            "",
+        ])
     if report.get("failure_modes"):
         lines.extend(["## Failure Modes", ""])
         for mode in report["failure_modes"][:10]:

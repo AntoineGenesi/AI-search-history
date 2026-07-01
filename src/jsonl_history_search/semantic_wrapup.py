@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any
@@ -197,25 +198,37 @@ def build_semantic_wrapup_payload(
     scan = scan_records(plan, default_tz=default_tz, mask_context=mask_context)
     records = scan["records"]
     signals = _complaint_signals(records)
-    failure_modes = _failure_modes(signals)
+    all_failure_modes = _failure_modes(signals)
+    failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     behavior_system = detect_behavior_system(cwd)
-    fix_suggestions = _fix_suggestions(failure_modes, behavior_system)
+    all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
+    fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
+    status = _semantic_wrapup_status(plan, all_failure_modes)
+    scope_resolution = _scope_resolution(plan, source_plan, query)
     payload = {
         "semantic_wrapup": {
             "schema_version": SCHEMA_VERSION,
-            "status": "found" if failure_modes else "no_failure_modes_found",
+            "status": status,
             "query": query,
             "route": "semantic_wrapup_frustration_mining",
             "summary": {
                 "complaint_signal_count": len(signals),
                 "failure_mode_count": len(failure_modes),
+                "failure_mode_returned_count": len(failure_modes),
+                "failure_mode_total_count": len(all_failure_modes),
+                "failure_mode_truncated": len(all_failure_modes) > len(failure_modes),
                 "fix_suggestion_count": len(fix_suggestions),
+                "fix_suggestion_returned_count": len(fix_suggestions),
+                "fix_suggestion_total_count": len(all_fix_suggestions),
+                "fix_suggestion_truncated": len(all_fix_suggestions) > len(fix_suggestions),
+                "inline_limit": INLINE_FAILURE_MODE_LIMIT,
                 "behavior_system_destination_count": len(behavior_system["destinations"]),
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
-            "failure_modes": failure_modes[:INLINE_FAILURE_MODE_LIMIT],
-            "fix_suggestions": fix_suggestions[:INLINE_FAILURE_MODE_LIMIT],
+            "failure_modes": failure_modes,
+            "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
+            "scope_resolution": scope_resolution,
             "agent_instruction": {
                 "selection_required": True,
                 "do_not_auto_apply": True,
@@ -245,6 +258,43 @@ def build_semantic_wrapup_payload(
     return payload
 
 
+def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
+    if not plan.roots:
+        if plan.scope_resolution.get("status") == "ambiguous_current_session":
+            return "scope_ambiguous"
+        if plan.rejected_roots:
+            return "root_rejected"
+        return "no_roots"
+    return "found" if failure_modes else "no_failure_modes_found"
+
+
+def _scope_resolution(plan: SourcePlan, source_plan: dict, query: str) -> dict:
+    resolution = dict(plan.scope_resolution)
+    if not resolution:
+        resolution = {
+            "status": "explicit_or_default_source_plan",
+            "strategy": "shared_source_plan",
+        }
+    resolution.update(
+        {
+            "selected_root_count": len(plan.roots),
+            "rejected_root_count": len(plan.rejected_roots),
+            "no_broad_history_sweep_for_current_session": plan.scope_resolution.get("status")
+            in {"scoped_to_latest_known_session", "ambiguous_current_session"},
+        }
+    )
+    if not plan.roots:
+        resolution["first_action"] = (
+            "Rerun with an exact known Codex/Claude session JSONL, for example: "
+            f"jsonl-history-search semantic-wrapup {shlex.quote(query)} --root <path-to-session.jsonl> --cwd \"$PWD\" --format json"
+        )
+    elif plan.scope_resolution.get("status") == "scoped_to_latest_known_session":
+        root = (source_plan.get("sources") or {}).get("roots", [{}])[0]
+        resolution["selected_kind"] = root.get("kind")
+        resolution["selected_root_known"] = root.get("known")
+    return resolution
+
+
 def detect_behavior_system(cwd: Path) -> dict:
     destinations: list[dict] = []
     seen: set[str] = set()
@@ -267,6 +317,9 @@ def detect_behavior_system(cwd: Path) -> dict:
         ("pipeline_state", "codex/state/pipeline-state.md"),
     ]
     for kind, rel in exact_candidates:
+        _add_destination(destinations, seen, cwd, kind, rel)
+
+    for kind, rel in _active_task_destinations(cwd):
         _add_destination(destinations, seen, cwd, kind, rel)
 
     for kind, rel in _discover_behavior_destinations(cwd):
@@ -330,6 +383,22 @@ def _discover_behavior_destinations(cwd: Path) -> list[tuple[str, str]]:
     return discovered
 
 
+def _active_task_destinations(cwd: Path) -> list[tuple[str, str]]:
+    state = cwd / "codex/state/pipeline-state.md"
+    if not state.exists() or not state.is_file():
+        return []
+    try:
+        text = state.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    destinations = []
+    for match in re.findall(r"tasks/[A-Za-z0-9._/\-]+\.md", text):
+        if (cwd / match).is_file():
+            destinations.append(("active_task", match))
+            break
+    return destinations
+
+
 def _iter_existing(cwd: Path, patterns: list[str]) -> list[str]:
     rels: list[str] = []
     for pattern in patterns:
@@ -347,7 +416,14 @@ def _iter_existing(cwd: Path, patterns: list[str]) -> list[str]:
 
 def _skip_destination_path(path: Path) -> bool:
     ignored = {".git", ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv"}
-    return any(part in ignored for part in path.parts)
+    parts = set(path.parts)
+    if any(part in ignored for part in path.parts):
+        return True
+    if ".private" in parts:
+        return True
+    if ".tmp" in parts and "plugins" in parts:
+        return True
+    return False
 
 
 def _add_destination(destinations: list[dict], seen: set[str], cwd: Path, kind: str, rel: str) -> None:
@@ -483,24 +559,13 @@ def _pattern_for(label: str) -> dict[str, Any]:
 
 def _select_destination(pattern: dict[str, Any], destinations: list[dict], mode: dict) -> dict:
     preferred = str(pattern.get("preferred_path") or "")
-    for item in destinations:
-        if item.get("path") == preferred:
-            return item
-    for item in destinations:
-        if preferred.startswith(str(item.get("path", ""))):
-            return item
-    evidence_text = " ".join(str(item.get("snippet") or "") for item in mode.get("evidence", [])).casefold()
-    for item in destinations:
-        path = str(item.get("path") or "").casefold()
-        if path and path in evidence_text:
-            return item
-    preferred_kinds = tuple(pattern.get("preferred_kinds") or ())
-    for kind in preferred_kinds:
-        for item in destinations:
-            if item.get("kind") == kind:
-                return item
-    if destinations:
-        return destinations[0]
+    ranked = sorted(
+        destinations,
+        key=lambda item: _destination_rank(item, pattern, mode, preferred),
+        reverse=True,
+    )
+    if ranked:
+        return ranked[0]
     return {
         "kind": "user_decision_needed",
         "path": preferred,
@@ -508,6 +573,58 @@ def _select_destination(pattern: dict[str, Any], destinations: list[dict], mode:
         "source_refs": [],
         "destination_ref": None,
     }
+
+
+def _destination_rank(item: dict, pattern: dict[str, Any], mode: dict, preferred: str) -> tuple[int, int, str]:
+    path = str(item.get("path") or "")
+    kind = str(item.get("kind") or "")
+    score = _destination_kind_score(kind)
+    if preferred and path == preferred:
+        score += 1000
+    elif preferred and path.startswith(preferred):
+        score += 850
+    elif preferred and preferred.startswith(path):
+        score += 700
+
+    evidence_text = " ".join(str(entry.get("snippet") or "") for entry in mode.get("evidence", [])).casefold()
+    if path and path.casefold() in evidence_text:
+        score += 250
+
+    preferred_kinds = tuple(pattern.get("preferred_kinds") or ())
+    if kind in preferred_kinds:
+        score += max(0, 300 - 20 * preferred_kinds.index(kind))
+
+    if _looks_archived_or_private_destination(path):
+        score -= 2000
+    if kind == "task_files" and not path.casefold() in evidence_text:
+        score -= 120
+    return score, -len(path), path
+
+
+def _destination_kind_score(kind: str) -> int:
+    return {
+        "pipeline_state": 760,
+        "task_front_door": 740,
+        "active_task": 720,
+        "project_front_door": 690,
+        "orchestration_rule": 680,
+        "fsm_plan": 660,
+        "skill_router": 640,
+        "skill_reference": 620,
+        "learning_index": 600,
+        "product_contract": 580,
+        "product_examples": 560,
+        "project_rule": 540,
+        "memory_or_notes": 460,
+        "issue_tracker": 440,
+        "optional_wrap_up_skill": 360,
+        "task_files": 220,
+    }.get(kind, 100)
+
+
+def _looks_archived_or_private_destination(path: str) -> bool:
+    lowered = path.casefold()
+    return lowered.startswith(".private/") or lowered.startswith(".tmp/plugins/") or "/.private/" in lowered or "/.tmp/plugins/" in lowered
 
 
 def _proposed_action(label: str, destination: dict) -> str:
@@ -610,6 +727,7 @@ def _destination_reason(kind: str) -> str:
         "product_examples": "project has source-backed product examples",
         "fsm_plan": "project has an active FSM loop plan",
         "pipeline_state": "project has front-door pipeline state",
+        "active_task": "current active task is named in pipeline/front-door state",
     }.get(kind, "local behavior destination detected")
 
 
