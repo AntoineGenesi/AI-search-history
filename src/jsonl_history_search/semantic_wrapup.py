@@ -15,6 +15,9 @@ from .sources import SourcePlan
 SCHEMA_VERSION = 1
 INLINE_FAILURE_MODE_LIMIT = 10
 DESTINATION_SCAN_LIMIT = 200
+ORCHESTRATION_EVIDENCE_LIMIT = 20
+
+SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
 
 FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
     {
@@ -161,6 +164,42 @@ FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
             "A selected memory/learning destination should capture the source-backed rule.",
         ),
     },
+    {
+        "label": "reviewer_proof_claim_boundary",
+        "terms": ("reviewer proof", "independent reviewer", "review artifact", "claim boundary", "acceptance criteria", "partially_verified", "partially verified", "overclaim"),
+        "fix_type": "review/proof workflow update",
+        "preferred_path": "CODEX-ORCHESTRATION.md",
+        "preferred_kinds": ("orchestration_rule", "pipeline_state", "project_rule"),
+        "inferred_steps": (
+            "Review/proof boundaries shaped whether the agent could claim the task was fixed.",
+            "The session evidence must separate source-backed reviewer findings from agent summaries.",
+            "Future runs need clear proof and claim-boundary instructions before handoff.",
+        ),
+    },
+    {
+        "label": "product_delta_integration_staleness",
+        "terms": ("product delta integration audit", "stale baseline", "dirty parent", "branch-only", "branch only", "reviewed not integrated", "baseline correction"),
+        "fix_type": "integration/currentness workflow update",
+        "preferred_path": "codex/state/pipeline-state.md",
+        "preferred_kinds": ("pipeline_state", "orchestration_rule", "active_task"),
+        "inferred_steps": (
+            "A prior product delta or baseline had ambiguous integration state.",
+            "Later work risked building on branch-local, dirty, stale, or unreviewed state.",
+            "The next action must reconcile integration/currentness before claiming product progress.",
+        ),
+    },
+    {
+        "label": "same_task_repair_boundary",
+        "terms": ("same-task", "same task", "review_failed_fixable", "review failed fixable", "fix_review_findings", "fix review findings", "install refresh", "small setup fix", "small setup fixes"),
+        "fix_type": "task/review retry boundary update",
+        "preferred_path": "CODEX-ORCHESTRATION.md",
+        "preferred_kinds": ("orchestration_rule", "pipeline_state", "project_rule"),
+        "inferred_steps": (
+            "The session distinguished small proof/setup repairs from separate product blockers.",
+            "Fixable review findings should stay inside the same task envelope.",
+            "Only distinct substantial product blockers should become follow-up work.",
+        ),
+    },
 )
 
 FRICTION_MARKERS = (
@@ -199,9 +238,12 @@ def build_semantic_wrapup_payload(
     scan = scan_records(plan, default_tz=default_tz, mask_context=mask_context)
     records = scan["records"]
     signals = _complaint_signals(records, query=query)
+    substantive_signals = _substantive_signals(signals)
+    setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
     ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
-    all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(signals)
+    all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
+    orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
     behavior_system = detect_behavior_system(cwd)
     all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
     fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
@@ -217,6 +259,8 @@ def build_semantic_wrapup_payload(
             "route": "semantic_wrapup_frustration_mining",
             "summary": {
                 "complaint_signal_count": len(signals),
+                "substantive_signal_count": len(substantive_signals),
+                "setup_echo_signal_count": len(setup_echo_signals),
                 "failure_mode_count": len(failure_modes),
                 "failure_mode_returned_count": len(failure_modes),
                 "failure_mode_total_count": len(all_failure_modes),
@@ -227,14 +271,25 @@ def build_semantic_wrapup_payload(
                 "fix_suggestion_truncated": len(all_fix_suggestions) > len(fix_suggestions),
                 "inline_limit": INLINE_FAILURE_MODE_LIMIT,
                 "behavior_system_destination_count": len(behavior_system["destinations"]),
+                "orchestration_evidence_count": orchestration_evidence["returned_count"],
+                "orchestration_evidence_total_count": orchestration_evidence["total_count"],
+                "orchestration_evidence_truncated": orchestration_evidence["truncated"],
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             "failure_modes": failure_modes,
+            "signal_classification": {
+                "substantive_signal_count": len(substantive_signals),
+                "setup_echo_signal_count": len(setup_echo_signals),
+                "substantive_source_refs": [signal["source_ref"] for signal in substantive_signals[:8]],
+                "setup_echo_source_refs": [signal["source_ref"] for signal in setup_echo_signals[:8]],
+                "failure_modes_exclude_setup_echoes": True,
+            },
+            "orchestration_evidence": orchestration_evidence,
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
             "agent_instruction": _agent_instruction(status, scope_resolution),
-            "next_reads": _semantic_next_reads(failure_modes),
+            "next_reads": _semantic_next_reads(failure_modes, orchestration_evidence),
             "privacy": {
                 "raw_text_included": True,
                 "source_refs_included": True,
@@ -316,7 +371,7 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
     if not signals:
         return None
     setup_echo_signals = [
-        signal for signal in signals if signal.get("scope_signal_kind") in {"semantic_wrapup_prompt", "current_session_setup_echo"}
+        signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS
     ]
     if not setup_echo_signals:
         return None
@@ -525,10 +580,146 @@ def _complaint_signals(records, *, query: str) -> list[dict]:
                 "labels": labels,
                 "friction_markers": friction_markers,
                 "scope_signal_kind": _scope_signal_kind(normalized, query),
+                "actor_label": _actor_label(item.record.role, normalized),
                 **row,
             }
         )
     return signals
+
+
+def _substantive_signals(signals: list[dict]) -> list[dict]:
+    return [signal for signal in signals if signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS]
+
+
+def _orchestration_evidence(records, *, signals: list[dict], query: str) -> dict:
+    signal_by_ref = {
+        (signal["source_ref"]["path"], int(signal["source_ref"]["line"])): signal
+        for signal in signals
+        if signal.get("source_ref")
+    }
+    evidence: list[dict] = []
+    for item in records:
+        row = context_row(item)
+        ref = row.get("source_ref") or {}
+        signal = signal_by_ref.get((str(ref.get("path") or ""), int(ref.get("line") or 0)))
+        categories = _orchestration_categories(item.text, role=item.record.role, query=query, signal=signal)
+        if not categories:
+            continue
+        setup_echo = bool(signal and signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS)
+        if not signal:
+            echo = setup_echo_classification(item.text, query=query)
+            setup_echo = echo["is_setup_echo"]
+        actor = signal.get("actor_label") if signal else _actor_label(item.record.role, _normalize(item.text))
+        evidence.append(
+            {
+                "evidence_id": f"o{len(evidence) + 1:03d}",
+                "actor_label": actor,
+                "categories": categories,
+                "setup_echo": setup_echo,
+                "substantive": not setup_echo,
+                "signal_id": signal.get("signal_id") if signal else None,
+                "signal_labels": signal.get("labels", []) if signal else [],
+                **row,
+            }
+        )
+    ranked = sorted(evidence, key=lambda item: (-_orchestration_priority(item), item.get("timestamp_utc") or "", item["source_ref"]["path"], item["source_ref"]["line"]))
+    returned = ranked[:ORCHESTRATION_EVIDENCE_LIMIT]
+    return {
+        "total_count": len(evidence),
+        "returned_count": len(returned),
+        "inline_limit": ORCHESTRATION_EVIDENCE_LIMIT,
+        "truncated": len(evidence) > len(returned),
+        "category_counts": _count_categories(evidence),
+        "actor_counts": _count_values(evidence, "actor_label"),
+        "setup_echo_count": len([item for item in evidence if item.get("setup_echo")]),
+        "substantive_count": len([item for item in evidence if item.get("substantive")]),
+        "items": returned,
+        "claim_boundary": (
+            "Orchestration evidence marks source-backed records that may explain task outcome; "
+            "setup_echo=true records are prompt/setup surfaces and are excluded from failure-mode grouping."
+        ),
+    }
+
+
+def _orchestration_categories(text: str, *, role: str | None, query: str, signal: dict | None) -> list[str]:
+    normalized = _normalize(text)
+    categories: list[str] = []
+    if signal and signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS:
+        categories.append("user_complaint_or_correction")
+    if _looks_like_semantic_wrapup_prompt(normalized, query):
+        categories.append("semantic_wrapup_prompt_echo")
+    elif setup_echo_classification(text, query=query)["is_setup_echo"]:
+        categories.append("setup_or_prompt_echo")
+    if any(term in normalized for term in ("automatic jsonl", "jsonl resolvability", "resolvable", "context pollution", "context hygiene", "low context")):
+        categories.append("context_hygiene_correction")
+    if any(term in normalized for term in ("fsm", "product loop", "current state + event", "current_state + event", "implement_as_one", "planner result", "commitment")):
+        categories.append("main_agent_fsm_or_product_loop_commitment")
+    if any(term in normalized for term in ("subagent", "worker", "implementer", "orchestrator worker", "worker output", "agent output")):
+        categories.append("worker_or_subagent_behavior")
+    if any(term in normalized for term in ("reviewer", "review artifact", "independent review", "independent reviewer", "claim boundary", "acceptance criteria", "partially_verified", "partially verified", "verified")):
+        categories.append("reviewer_proof_or_claim_boundary")
+    if any(term in normalized for term in ("same-task", "same task", "review_failed_fixable", "review failed fixable", "fix_review_findings", "fix review findings", "install refresh", "small setup fix", "small setup fixes")):
+        categories.append("same_task_repair_logic")
+    if any(term in normalized for term in ("product delta integration audit", "stale baseline", "dirty parent", "branch-only", "branch only", "reviewed not integrated", "baseline correction")):
+        categories.append("product_delta_integration_audit")
+    if any(term in normalized for term in ("product-moving", "product moving", "process/report drift", "report-only", "report only", "busywork", "small REDACTEDy tasks", "substantial product blocker", "substantial follow-up blocker")):
+        categories.append("product_moving_vs_process_drift")
+    return sorted(set(categories), key=categories.index)
+
+
+def _actor_label(role: str | None, normalized_text: str) -> str:
+    normalized_role = str(role or "").casefold()
+    if "tool" in normalized_role or "function" in normalized_role:
+        return "tool_output"
+    if "assistant" in normalized_role or "agent" in normalized_role:
+        if "reviewer" in normalized_text:
+            return "reviewer_or_review_summary"
+        if "subagent" in normalized_text or "worker" in normalized_text or "implementer" in normalized_text:
+            return "worker_or_subagent_summary"
+        return "main_agent"
+    if _is_user_like(role):
+        if setup_echo_classification(normalized_text)["is_setup_echo"]:
+            return "user_prompt_or_assignment"
+        return "user"
+    return normalized_role or "unknown"
+
+
+def _orchestration_priority(item: dict) -> int:
+    categories = set(item.get("categories") or [])
+    score = 0
+    for category, value in {
+        "user_complaint_or_correction": 100,
+        "context_hygiene_correction": 95,
+        "reviewer_proof_or_claim_boundary": 85,
+        "worker_or_subagent_behavior": 80,
+        "same_task_repair_logic": 78,
+        "product_delta_integration_audit": 76,
+        "product_moving_vs_process_drift": 74,
+        "main_agent_fsm_or_product_loop_commitment": 70,
+        "semantic_wrapup_prompt_echo": 10,
+        "setup_or_prompt_echo": 8,
+    }.items():
+        if category in categories:
+            score = max(score, value)
+    if item.get("setup_echo"):
+        score -= 20
+    return score
+
+
+def _count_categories(items: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        for category in item.get("categories") or []:
+            counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _count_values(items: list[dict], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _scope_signal_kind(normalized_text: str, query: str) -> str:
@@ -632,9 +823,10 @@ def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[d
     return suggestions
 
 
-def _semantic_next_reads(failure_modes: list[dict]) -> list[dict]:
+def _semantic_next_reads(failure_modes: list[dict], orchestration_evidence: dict | None = None) -> list[dict]:
     refs = []
-    for ref in next_read_refs(*[mode.get("evidence", []) for mode in failure_modes]):
+    orchestration_items = (orchestration_evidence or {}).get("items") or []
+    for ref in next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items):
         refs.append({"source_ref": ref, "reason": "Inspect complaint/correction evidence before applying suggested fix."})
     return refs
 

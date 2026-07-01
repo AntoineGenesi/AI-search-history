@@ -763,6 +763,8 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         (
             "Summary: "
             f"{summary.get('complaint_signal_count', 0)} complaint signals, "
+            f"{summary.get('substantive_signal_count', 0)} substantive, "
+            f"{summary.get('setup_echo_signal_count', 0)} setup/prompt echo, "
             f"{summary.get('failure_mode_returned_count', summary.get('failure_mode_count', 0))}/"
             f"{summary.get('failure_mode_total_count', summary.get('failure_mode_count', 0))} failure modes returned, "
             f"{summary.get('fix_suggestion_returned_count', summary.get('fix_suggestion_count', 0))}/"
@@ -777,6 +779,29 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
     if scope_resolution.get("first_action"):
         lines.append(f"First action: {scope_resolution.get('first_action')}")
+    signal_classification = report.get("signal_classification") or {}
+    if signal_classification:
+        lines.append(
+            "Signal classification: "
+            f"substantive={signal_classification.get('substantive_signal_count', 0)}, "
+            f"setup_echo={signal_classification.get('setup_echo_signal_count', 0)}, "
+            f"failure_modes_exclude_setup_echoes={signal_classification.get('failure_modes_exclude_setup_echoes')}"
+        )
+    orchestration = report.get("orchestration_evidence") or {}
+    if orchestration.get("items"):
+        lines.append(
+            "Orchestration evidence: "
+            f"{orchestration.get('returned_count', 0)}/{orchestration.get('total_count', 0)} returned; "
+            f"substantive={orchestration.get('substantive_count', 0)}, "
+            f"setup_echo={orchestration.get('setup_echo_count', 0)}"
+        )
+        for item in orchestration.get("items", [])[:8]:
+            ref = item.get("source_ref") or {}
+            categories = ", ".join(item.get("categories") or [])
+            lines.append(
+                f"- {item.get('actor_label')} {ref.get('path')}:{ref.get('line')} "
+                f"[{categories}] setup_echo={item.get('setup_echo')}: {item.get('snippet')}"
+            )
     if report.get("failure_modes"):
         lines.append("Failure modes:")
         for mode in report["failure_modes"][:8]:
@@ -850,6 +875,8 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         "",
         (
             f"**Summary:** {summary.get('complaint_signal_count', 0)} complaint signals, "
+            f"{summary.get('substantive_signal_count', 0)} substantive, "
+            f"{summary.get('setup_echo_signal_count', 0)} setup/prompt echo, "
             f"{summary.get('failure_mode_returned_count', summary.get('failure_mode_count', 0))}/"
             f"{summary.get('failure_mode_total_count', summary.get('failure_mode_count', 0))} failure modes returned, "
             f"{summary.get('fix_suggestion_returned_count', summary.get('fix_suggestion_count', 0))}/"
@@ -875,6 +902,34 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             f"**First action:** `{scope_resolution.get('first_action')}`",
             "",
         ])
+    signal_classification = report.get("signal_classification") or {}
+    if signal_classification:
+        lines.extend([
+            "## Signal Classification",
+            "",
+            f"- Substantive signals: `{signal_classification.get('substantive_signal_count', 0)}`",
+            f"- Setup/prompt echo signals: `{signal_classification.get('setup_echo_signal_count', 0)}`",
+            f"- Failure modes exclude setup echoes: `{signal_classification.get('failure_modes_exclude_setup_echoes')}`",
+            "",
+        ])
+    orchestration = report.get("orchestration_evidence") or {}
+    if orchestration.get("items"):
+        lines.extend([
+            "## Orchestration Evidence",
+            "",
+            f"- Returned: `{orchestration.get('returned_count', 0)}/{orchestration.get('total_count', 0)}`",
+            f"- Substantive: `{orchestration.get('substantive_count', 0)}`",
+            f"- Setup/prompt echo: `{orchestration.get('setup_echo_count', 0)}`",
+            f"- Claim boundary: {orchestration.get('claim_boundary')}",
+            "",
+        ])
+        for item in orchestration.get("items", [])[:10]:
+            ref = item.get("source_ref") or {}
+            categories = ", ".join(item.get("categories") or [])
+            lines.append(f"- `{item.get('actor_label')}` `{ref.get('path')}:{ref.get('line')}` `{categories}` setup_echo=`{item.get('setup_echo')}`")
+            if item.get("snippet"):
+                lines.append(f"  - {item.get('snippet')}")
+        lines.append("")
     if report.get("failure_modes"):
         lines.extend(["## Failure Modes", ""])
         for mode in report["failure_modes"][:10]:
