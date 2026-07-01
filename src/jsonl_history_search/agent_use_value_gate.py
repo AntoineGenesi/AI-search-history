@@ -7,8 +7,16 @@ from typing import Any
 
 
 DEFAULT_JSH1043_MANIFEST_PATH = Path("benchmarks/agent_use_value/jsh-1043-case-manifest.json")
+DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH = Path(
+    "reports/jsh-1043-reduced-warn-agent-use-value-gate-summary.json"
+)
 JSH1043_SCHEMA_VERSION = "jsh-1043-agent-use-value-case-manifest.v1"
+JSH1043_REDUCED_RUN_SCHEMA_VERSION = "jsh-1043-agent-use-value-reduced-run-summary.v1"
 REQUIRED_GLOBAL_LANES = ("manual_default_clean", "jsonl_current_default")
+ALLOWED_MANIFEST_STATUSES = (
+    "frozen_before_lane_execution",
+    "frozen_reduced_warn_lane_execution_started",
+)
 REQUIRED_LANE_ARTIFACTS = (
     "prompt",
     "event_or_transcript_log",
@@ -31,6 +39,7 @@ REQUIRED_DECISION_THRESHOLDS = (
 )
 MIN_CASES = 8
 MAX_CASES = 12
+MIN_REDUCED_RUN_CASES = 2
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,40 @@ class AgentUseValueManifestValidation:
                 "codex_exec_performed": False,
                 "private_payload_materialized": False,
                 "value_claim_created": False,
+                "errors": list(self.errors),
+                "warnings": list(self.warnings),
+            }
+        }
+
+
+@dataclass(frozen=True)
+class AgentUseValueReducedRunValidation:
+    summary_path: str
+    status: str
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    run_id: str
+    case_count: int
+    lane_count: int
+    raw_private_trace_root: str
+    host_guard_status: str
+    result_class: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "agent_use_value_reduced_run_validation": {
+                "schema_version": JSH1043_REDUCED_RUN_SCHEMA_VERSION,
+                "status": self.status,
+                "mode": "committed_safe_reduced_run_summary_validation",
+                "summary_path": self.summary_path,
+                "run_id": self.run_id,
+                "case_count": self.case_count,
+                "lane_count": self.lane_count,
+                "raw_private_trace_root": self.raw_private_trace_root,
+                "host_guard_status": self.host_guard_status,
+                "result_class": self.result_class,
+                "raw_private_text_committed": False,
+                "requires_parent_private_trace_root": True,
                 "errors": list(self.errors),
                 "warnings": list(self.warnings),
             }
@@ -104,7 +147,8 @@ def validate_agent_use_value_manifest(path: Path = DEFAULT_JSH1043_MANIFEST_PATH
         manifest = {}
 
     _expect_equal(manifest.get("schema_version"), JSH1043_SCHEMA_VERSION, "schema_version", errors)
-    _expect_equal(manifest.get("status"), "frozen_before_lane_execution", "status", errors)
+    if manifest.get("status") not in ALLOWED_MANIFEST_STATUSES:
+        errors.append(f"status must be one of {', '.join(ALLOWED_MANIFEST_STATUSES)}, found {manifest.get('status')!r}")
     _expect_equal(manifest.get("source_design"), "docs/jsh-1042-agent-use-value-gate-design.md", "source_design", errors)
     _expect_equal(
         manifest.get("task"),
@@ -173,6 +217,15 @@ def validate_agent_use_value_manifest(path: Path = DEFAULT_JSH1043_MANIFEST_PATH
             log_path = execution.get("host_guard_private_log")
             if not isinstance(log_path, str) or not log_path.startswith(".private/jsh-1043/"):
                 errors.append("host_guard_private_log must point to parent .private/jsh-1043/")
+        if lane_execution_started and not blocked_by_host_guard:
+            summary_path = execution.get("reduced_warn_run_summary")
+            if summary_path != str(DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH):
+                errors.append("reduced execution must point to the committed-safe reduced run summary")
+            trace_root = execution.get("reduced_warn_private_trace_root")
+            if not isinstance(trace_root, str) or not trace_root.startswith(".private/jsh-1043/"):
+                errors.append("reduced_warn_private_trace_root must point to parent .private/jsh-1043/")
+            if execution.get("current_guard_status") not in {"OK", "WARN"}:
+                errors.append("current_guard_status must be OK or WARN for reduced execution")
 
     status = "fail" if errors else "pass"
     return AgentUseValueManifestValidation(
@@ -187,8 +240,128 @@ def validate_agent_use_value_manifest(path: Path = DEFAULT_JSH1043_MANIFEST_PATH
     )
 
 
+def validate_agent_use_value_reduced_run_summary(
+    path: Path = DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
+) -> AgentUseValueReducedRunValidation:
+    errors: list[str] = []
+    warnings: list[str] = []
+    run_id = ""
+    raw_private_trace_root = ""
+    host_guard_status = ""
+    result_class = ""
+    case_count = 0
+    lane_count = 0
+
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return AgentUseValueReducedRunValidation(
+            str(path),
+            "fail",
+            (f"could not read summary: {exc}",),
+            (),
+            "",
+            0,
+            0,
+            "",
+            "",
+            "",
+        )
+    except json.JSONDecodeError as exc:
+        return AgentUseValueReducedRunValidation(
+            str(path),
+            "fail",
+            (f"invalid JSON: {exc}",),
+            (),
+            "",
+            0,
+            0,
+            "",
+            "",
+            "",
+        )
+
+    if not isinstance(summary, dict):
+        errors.append("summary must be a JSON object")
+        summary = {}
+
+    _expect_equal(summary.get("schema_version"), JSH1043_REDUCED_RUN_SCHEMA_VERSION, "schema_version", errors)
+    _expect_equal(summary.get("source_manifest"), str(DEFAULT_JSH1043_MANIFEST_PATH), "source_manifest", errors)
+    _expect_equal(summary.get("source_design"), "docs/jsh-1042-agent-use-value-gate-design.md", "source_design", errors)
+    _expect_equal(summary.get("task"), "tasks/jsh-1043-agent-use-value-gate-with-retrieval-performance-arms.md", "task", errors)
+
+    run_id_value = summary.get("run_id")
+    if isinstance(run_id_value, str):
+        run_id = run_id_value
+    if not run_id:
+        errors.append("run_id must be a non-empty string")
+
+    raw_private_trace_root_value = summary.get("raw_private_trace_root")
+    if isinstance(raw_private_trace_root_value, str):
+        raw_private_trace_root = raw_private_trace_root_value
+    if not raw_private_trace_root.startswith(".private/jsh-1043/"):
+        errors.append("raw_private_trace_root must point to parent .private/jsh-1043/")
+    if "worktrees/" in raw_private_trace_root:
+        errors.append("raw_private_trace_root must not point inside worktrees/")
+
+    host_guard = summary.get("host_guard")
+    if not isinstance(host_guard, dict):
+        errors.append("host_guard must be an object")
+    else:
+        status_value = host_guard.get("status")
+        if isinstance(status_value, str):
+            host_guard_status = status_value
+        if host_guard_status not in {"OK", "WARN"}:
+            errors.append("host_guard.status must be OK or WARN for reduced execution")
+        if host_guard_status == "WARN" and host_guard.get("user_explicitly_accepted_warn_progress") is not True:
+            errors.append("WARN reduced execution requires user_explicitly_accepted_warn_progress=true")
+        private_log = host_guard.get("private_log")
+        if not isinstance(private_log, str) or not private_log.startswith(".private/jsh-1043/"):
+            errors.append("host_guard.private_log must point to parent .private/jsh-1043/")
+
+    cases = summary.get("selected_cases")
+    if not isinstance(cases, list):
+        errors.append("selected_cases must be a list")
+        cases = []
+    case_count = len(cases)
+    if case_count < MIN_REDUCED_RUN_CASES:
+        errors.append(f"selected_cases must contain at least {MIN_REDUCED_RUN_CASES} cases")
+
+    for case_index, case in enumerate(cases):
+        lane_count += _validate_reduced_run_case(case, case_index, errors)
+
+    result_class_value = summary.get("result_class")
+    if isinstance(result_class_value, str):
+        result_class = result_class_value
+    if result_class not in REQUIRED_DECISION_THRESHOLDS:
+        errors.append("result_class must be one of the pre-registered decision thresholds")
+
+    if summary.get("raw_private_text_committed") is not False:
+        errors.append("raw_private_text_committed must be false")
+
+    status = "fail" if errors else "pass"
+    return AgentUseValueReducedRunValidation(
+        str(path),
+        status,
+        tuple(errors),
+        tuple(warnings),
+        run_id,
+        case_count,
+        lane_count,
+        raw_private_trace_root,
+        host_guard_status,
+        result_class,
+    )
+
+
 def build_agent_use_value_manifest_validation_payload(path: Path = DEFAULT_JSH1043_MANIFEST_PATH) -> dict[str, Any]:
     return validate_agent_use_value_manifest(path).to_payload()
+
+
+def build_agent_use_value_reduced_run_validation_payload(
+    path: Path = DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
+) -> dict[str, Any]:
+    return validate_agent_use_value_reduced_run_summary(path).to_payload()
 
 
 def _validate_case(case: Any, index: int, errors: list[str]) -> None:
@@ -214,6 +387,71 @@ def _validate_case(case: Any, index: int, errors: list[str]) -> None:
     case_id = case.get("case_id")
     if not isinstance(case_id, str) or not case_id.startswith("C"):
         errors.append(f"{label}.case_id must be a C-prefixed string")
+
+
+def _validate_reduced_run_case(case: Any, index: int, errors: list[str]) -> int:
+    label = f"selected_cases[{index}]"
+    if not isinstance(case, dict):
+        errors.append(f"{label} must be an object")
+        return 0
+    case_id = case.get("case_id")
+    if not isinstance(case_id, str) or not case_id.startswith("C"):
+        errors.append(f"{label}.case_id must be a C-prefixed string")
+    lanes = case.get("lanes")
+    if not isinstance(lanes, list):
+        errors.append(f"{label}.lanes must be a list")
+        return 0
+    lane_names = [lane.get("lane") for lane in lanes if isinstance(lane, dict)]
+    missing_global = [lane for lane in REQUIRED_GLOBAL_LANES if lane not in lane_names]
+    if missing_global:
+        errors.append(f"{label}.lanes missing required baseline lanes: {', '.join(missing_global)}")
+    arm_lanes = [lane for lane in lane_names if isinstance(lane, str) and lane not in REQUIRED_GLOBAL_LANES]
+    if not arm_lanes:
+        errors.append(f"{label}.lanes must include at least one arm lane")
+    for lane_index, lane in enumerate(lanes):
+        _validate_reduced_run_lane(lane, f"{label}.lanes[{lane_index}]", errors)
+    return len(lanes)
+
+
+def _validate_reduced_run_lane(lane: Any, label: str, errors: list[str]) -> None:
+    if not isinstance(lane, dict):
+        errors.append(f"{label} must be an object")
+        return
+    lane_name = lane.get("lane")
+    if not isinstance(lane_name, str) or not lane_name:
+        errors.append(f"{label}.lane must be a non-empty string")
+    for key in ("artifact_paths", "artifact_completeness", "opened_source_refs", "cost_buckets", "facet_audit"):
+        if key not in lane:
+            errors.append(f"{label}.{key} is required")
+    if lane.get("command_success") is not True:
+        errors.append(f"{label}.command_success must be true")
+    artifacts = lane.get("artifact_completeness")
+    if not isinstance(artifacts, dict):
+        errors.append(f"{label}.artifact_completeness must be an object")
+    else:
+        missing = [name for name in REQUIRED_LANE_ARTIFACTS if artifacts.get(name) is not True]
+        if missing:
+            errors.append(f"{label}.artifact_completeness missing true entries: {', '.join(missing)}")
+    artifact_paths = lane.get("artifact_paths")
+    if not isinstance(artifact_paths, dict):
+        errors.append(f"{label}.artifact_paths must be an object")
+    else:
+        for key in REQUIRED_LANE_ARTIFACTS:
+            path = artifact_paths.get(key)
+            if not isinstance(path, str) or not path.startswith(".private/jsh-1043/"):
+                errors.append(f"{label}.artifact_paths.{key} must point to parent .private/jsh-1043/")
+    cost_buckets = lane.get("cost_buckets")
+    if not isinstance(cost_buckets, dict):
+        errors.append(f"{label}.cost_buckets must be an object")
+    else:
+        for key in ("local_tool_work", "model_facing_handoff", "full_agent_loop_churn"):
+            if key not in cost_buckets:
+                errors.append(f"{label}.cost_buckets.{key} is required")
+    facet_audit = lane.get("facet_audit")
+    if not isinstance(facet_audit, dict):
+        errors.append(f"{label}.facet_audit must be an object")
+    elif "status" not in facet_audit:
+        errors.append(f"{label}.facet_audit.status is required")
 
 
 def _expect_equal(value: Any, expected: Any, field: str, errors: list[str]) -> None:

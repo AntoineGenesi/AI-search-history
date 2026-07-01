@@ -7,7 +7,9 @@ from pathlib import Path
 from .agent_contract import build_agent_find_payload
 from .agent_use_value_gate import (
     DEFAULT_JSH1043_MANIFEST_PATH,
+    DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
     build_agent_use_value_manifest_validation_payload,
+    build_agent_use_value_reduced_run_validation_payload,
 )
 from .agent_loop_cost import (
     DEFAULT_CASE_SELECTION_PATH as DEFAULT_AGENT_LOOP_CASE_SELECTION_PATH,
@@ -1345,6 +1347,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_JSH1043_MANIFEST_PATH),
         help="Committed-safe JSH-1043 agent-use value gate manifest to validate.",
     )
+    reduced_agent_use_value_gate = subparsers.add_parser("validate-agent-use-value-reduced-run")
+    reduced_agent_use_value_gate.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    reduced_agent_use_value_gate.add_argument(
+        "--summary",
+        default=str(DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH),
+        help="Committed-safe JSH-1043 reduced run summary to validate.",
+    )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
     embedding_experiment.add_argument(
@@ -2336,6 +2345,11 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         print(rendered)
         return 1 if payload["agent_use_value_gate_manifest_validation"]["status"] != "pass" else 0
+    if args.command == "validate-agent-use-value-reduced-run":
+        payload = build_agent_use_value_reduced_run_validation_payload(Path(args.summary).expanduser())
+        rendered = render(payload, args.format)
+        print(rendered)
+        return 1 if payload["agent_use_value_reduced_run_validation"]["status"] != "pass" else 0
     if args.command == "embedding-experiment":
         payload = build_embedding_experiment_payload(args)
         rendered = render(payload, args.format)
