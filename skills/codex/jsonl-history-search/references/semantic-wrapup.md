@@ -31,15 +31,19 @@ Rules:
 3. Separate evidence from inferred cause chains:
    `failure_modes[*].cause_chain.evidence_refs` are source-backed, while
    `failure_modes[*].cause_chain.inferred_steps` are hypotheses to inspect.
-4. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
+4. If the latest/current session is dominated by fresh receiving-agent prompts,
+   benchmark/lane setup text, or nearby task-orchestration echoes, fail closed
+   or rerun with the parent/session `--root`; do not turn setup echoes into the
+   remembered complaint set.
+5. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
    TODO/backlog docs, skills, learning indexes, tickets, or project-specific
    rules.
-5. Present user-selectable fix suggestions with `destination_source_refs`,
+6. Present user-selectable fix suggestions with `destination_source_refs`,
    `destination_rationale`, and `selection_options` of accept, reject, or
    defer.
-6. Do not auto-edit behavior rules, skills, task files, tickets, or memory
+7. Do not auto-edit behavior rules, skills, task files, tickets, or memory
    docs from this route.
-7. Do not assume everyone has contributor's `wrap-up` skill.
+8. Do not assume everyone has contributor's `wrap-up` skill.
 
 After running:
 

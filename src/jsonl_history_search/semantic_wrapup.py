@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .masking import MaskContext
+from .prompt_echo import setup_echo_classification
 from .skill_audit import context_row, next_read_refs, scan_records
 from .sources import SourcePlan
 
@@ -314,18 +315,34 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
         return None
     if not signals:
         return None
-    if not all(signal.get("scope_signal_kind") == "semantic_wrapup_prompt" for signal in signals):
+    setup_echo_signals = [
+        signal for signal in signals if signal.get("scope_signal_kind") in {"semantic_wrapup_prompt", "current_session_setup_echo"}
+    ]
+    if not setup_echo_signals:
         return None
+    substantive_signals = [signal for signal in signals if signal.get("scope_signal_kind") == "user_complaint"]
+    if substantive_signals and len(substantive_signals) > len(setup_echo_signals):
+        return None
+    prompt_only_count = len(
+        [signal for signal in setup_echo_signals if signal.get("scope_signal_kind") == "semantic_wrapup_prompt"]
+    )
+    strategy = (
+        "latest_known_session_prompt_only_fail_closed"
+        if prompt_only_count == len(signals)
+        else "latest_known_session_setup_echo_dominant_fail_closed"
+    )
     return {
         "status": "scope_ambiguous",
-        "strategy": "latest_known_session_prompt_only_fail_closed",
+        "strategy": strategy,
         "reason": (
-            "Current-session wording selected the latest known session, but every complaint/failure "
-            "signal in that session looks like the semantic-wrapup receiving-agent prompt itself, "
-            "not parent/user complaint evidence."
+            "Current-session wording selected the latest known session, but the complaint/failure "
+            "signals in that session are dominated by receiving-agent prompt, benchmark/setup, "
+            "or orchestration echoes rather than parent/user complaint evidence."
         ),
-        "selected_latest_session_status": "prompt_only_complaint_signals",
-        "prompt_only_signal_count": len(signals),
+        "selected_latest_session_status": "setup_echo_dominant_complaint_signals",
+        "prompt_only_signal_count": prompt_only_count,
+        "setup_echo_signal_count": len(setup_echo_signals),
+        "substantive_signal_count": len(substantive_signals),
         "first_action": (
             "Rerun with the parent/user session JSONL or another exact known Codex/Claude session JSONL, "
             f"for example: {_rerun_with_root_command(query)}"
@@ -517,6 +534,9 @@ def _complaint_signals(records, *, query: str) -> list[dict]:
 def _scope_signal_kind(normalized_text: str, query: str) -> str:
     if _looks_like_semantic_wrapup_prompt(normalized_text, query):
         return "semantic_wrapup_prompt"
+    echo = setup_echo_classification(normalized_text, query=query)
+    if echo["is_setup_echo"]:
+        return "current_session_setup_echo"
     return "user_complaint"
 
 
