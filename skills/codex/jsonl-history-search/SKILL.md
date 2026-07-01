@@ -58,7 +58,7 @@ JSONL directly before `ask` for these natural prompts.
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | `references/latest-status.md` | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
 | "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
-| "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `references/semantic-debugging.md` | `jsonl-history-search semantic-debug "why did this happen?" --cwd "$PWD" --format json` |
+| "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Can these old worktrees be removed?" "Are these branches/checkouts stale or safe to prune?" | Worktree cleanup/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -104,9 +104,10 @@ JSONL directly before `ask` for these natural prompts.
   parent `.private/worktree-cleanup-archive/<slug>/` before physical worktree
   pruning, and keep branch refs retained unless the user explicitly scopes
   branch ref pruning.
-- Use `semantic-debug` before lower-level helper scripts for quality-sensitive
-  remembered instructions, action proof, provenance, no-evidence, and
-  ambiguous semantic questions.
+- Use `ask` before `semantic-debug` for natural quality-sensitive remembered
+  instructions, action proof, provenance, no-evidence, and ambiguous semantic
+  questions. Use `semantic-debug --format text` before lower-level helper
+  scripts when `ask` selects semantic-debug.
 - Use `latest-user-messages` first for exact recent user-message wording.
 - Use helper scripts only for operational recovery: latest/today lookup,
   timestamp-window lookup, exact phrase search, or broad-term recovery where
