@@ -351,6 +351,12 @@ def build_semantic_wrapup_payload(
     scope_resolution = _scope_resolution(plan, source_plan, query)
     if ambiguous_prompt_only_scope:
         scope_resolution.update(ambiguous_prompt_only_scope)
+    next_reads = _semantic_next_reads(
+        failure_modes,
+        orchestration_evidence,
+        current_session_source_selection,
+    )
+    answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads)
     payload = {
         "semantic_wrapup": {
             "schema_version": SCHEMA_VERSION,
@@ -391,12 +397,9 @@ def build_semantic_wrapup_payload(
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
-            "agent_instruction": _agent_instruction(status, scope_resolution),
-            "next_reads": _semantic_next_reads(
-                failure_modes,
-                orchestration_evidence,
-                current_session_source_selection,
-            ),
+            "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract),
+            "answer_use_contract": answer_use_contract,
+            "next_reads": next_reads,
             "privacy": {
                 "raw_text_included": True,
                 "source_refs_included": True,
@@ -430,18 +433,80 @@ def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
     return "found" if failure_modes else "no_failure_modes_found"
 
 
-def _agent_instruction(status: str, scope_resolution: dict) -> dict:
+def _agent_instruction(
+    status: str,
+    scope_resolution: dict,
+    next_reads: list[dict] | None = None,
+    answer_use_contract: dict | None = None,
+) -> dict:
+    contract = answer_use_contract or {}
+    if contract.get("decision") == "answer_from_top_next_read_or_handoff_exact_source":
+        first_read = (next_reads or [{}])[0]
+        return {
+            "selection_required": False,
+            "do_not_auto_apply": True,
+            "source_use_required": True,
+            "decision": contract.get("decision"),
+            "required_next_action": contract.get("required_next_action"),
+            "required_source_ref": first_read.get("source_ref"),
+            "answer_scope": contract.get("answer_scope"),
+            "fallback_next_step": scope_resolution.get("first_action"),
+        }
     if status == "scope_ambiguous":
         return {
             "selection_required": False,
             "do_not_auto_apply": True,
+            "source_use_required": False,
             "next_step": scope_resolution.get("first_action")
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
         }
     return {
         "selection_required": True,
         "do_not_auto_apply": True,
+        "source_use_required": bool(next_reads),
         "next_step": "Ask the user which suggested fixes to apply, then implement selected fixes through normal task/FSM flow.",
+    }
+
+
+def _answer_use_contract(status: str, scope_resolution: dict, next_reads: list[dict]) -> dict:
+    first_read = next_reads[0] if next_reads else {}
+    first_ref = first_read.get("source_ref") or {}
+    requires_top_read = bool(first_ref) and first_read.get("answer_use_required") is True
+    if requires_top_read:
+        target = f"{first_ref.get('path')}:{first_ref.get('line')}"
+        return {
+            "source_use_required": True,
+            "decision": "answer_from_top_next_read_or_handoff_exact_source",
+            "answer_scope": (
+                "Answer the retained current-session complaint/fix question from the top next read; "
+                "do not answer from the fresh/setup/eval prompt that was classified as setup echo."
+            ),
+            "required_next_action": (
+                f"Open {target}; answer from that source if it contains the retained complaint/fix evidence, "
+                "or hand off that exact source ref and why it must be read."
+            ),
+            "required_source_ref": first_ref,
+            "setup_echo_boundary": (
+                "The latest/current session may still be setup-echo dominant; that only blocks mining the "
+                "fresh prompt as complaint evidence. It does not license dropping the retained top next read."
+            ),
+            "fallback_if_source_insufficient": scope_resolution.get("first_action"),
+        }
+    if status == "scope_ambiguous":
+        return {
+            "source_use_required": False,
+            "decision": "fail_closed_until_exact_session_root",
+            "required_next_action": scope_resolution.get("first_action")
+            or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
+        }
+    return {
+        "source_use_required": bool(next_reads),
+        "decision": "answer_after_inspecting_source_refs" if next_reads else "no_source_refs_available",
+        "required_next_action": (
+            "Inspect the listed source refs before summarizing failure modes or applying fixes."
+            if next_reads
+            else "Do not fabricate failure modes without source refs."
+        ),
     }
 
 
@@ -1175,17 +1240,37 @@ def _semantic_next_reads(
         refs.append(item)
         seen.add(key)
 
-    for source in (current_session_source_selection or {}).get("selected_sources") or []:
-        ref = source.get("source_ref") or {}
-        add(
-            ref,
-            "Inspect current-session semantic-wrapup smoke/hardening evidence before answering from active gate or front-door context.",
-            list(source.get("facets") or []),
-        )
-
     orchestration_items = (orchestration_evidence or {}).get("items") or []
-    for ref in next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items):
-        add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+    evidence_refs = next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items)
+
+    def add_current_session_sources() -> None:
+        for source in (current_session_source_selection or {}).get("selected_sources") or []:
+            ref = source.get("source_ref") or {}
+            if failure_modes:
+                add(
+                    ref,
+                    "Inspect current-session semantic-wrapup smoke/hardening evidence before answering from active gate or front-door context.",
+                    list(source.get("facets") or []),
+                )
+            else:
+                add(
+                    ref,
+                    (
+                        "Required for answer-use: inspect this retained current-session semantic-wrapup "
+                        "smoke/hardening source and answer from it, or hand off this exact source as required."
+                    ),
+                    list(source.get("facets") or []),
+                )
+                refs[-1]["answer_use_required"] = True
+
+    if failure_modes:
+        for ref in evidence_refs:
+            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+        add_current_session_sources()
+    else:
+        add_current_session_sources()
+        for ref in evidence_refs:
+            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
     return refs
 
 

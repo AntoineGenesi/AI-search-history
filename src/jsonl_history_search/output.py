@@ -780,6 +780,15 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             _append_text_read(lines, read)
     else:
         lines.append("- (no source refs surfaced)")
+    contract = report.get("answer_use_contract") or {}
+    if contract:
+        lines.append(
+            "Answer-use contract: "
+            f"{contract.get('decision')} "
+            f"source_use_required={contract.get('source_use_required')}"
+        )
+        if contract.get("required_next_action"):
+            lines.append(f"Required next action: {contract.get('required_next_action')}")
     lines.extend([
         "Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
         "Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
@@ -899,6 +908,19 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             _append_markdown_read(lines, read)
     else:
         lines.append("- No source refs surfaced.")
+    contract = report.get("answer_use_contract") or {}
+    if contract:
+        lines.extend([
+            "",
+            "## Answer-Use Contract",
+            "",
+            f"- Decision: `{contract.get('decision')}`",
+            f"- Source use required: `{contract.get('source_use_required')}`",
+        ])
+        if contract.get("required_next_action"):
+            lines.append(f"- Required next action: {contract.get('required_next_action')}")
+        if contract.get("setup_echo_boundary"):
+            lines.append(f"- Setup-echo boundary: {contract.get('setup_echo_boundary')}")
     lines.extend([
         "",
         "## Stop / Continue",

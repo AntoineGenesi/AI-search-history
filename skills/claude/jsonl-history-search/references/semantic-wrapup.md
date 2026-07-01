@@ -35,25 +35,33 @@ Rules:
    benchmark/lane setup text, or nearby task-orchestration echoes, fail closed
    or rerun with the parent/session `--root`; do not turn setup echoes into the
    remembered complaint set.
-5. If an explicit root or a substantive current session includes real
+5. If fail-closed output still exposes a top `next_reads` source with
+   `answer_use_required: true`, open that exact source before answering. Answer
+   the retained complaint/fix question from that top next read, or hand off the
+   exact source ref and why it must be read. Do not say there is nothing
+   substantive in the fresh/eval session while dropping the retained top read.
+6. If an explicit root or a substantive current session includes real
    orchestration, inspect `orchestration_evidence` as first-class causal
    evidence: user corrections, main-agent FSM/product-loop commitments,
    worker/subagent outputs, reviewer proof and claim boundaries, same-task
    repair logic, product-delta integration/currentness findings, and
    product-moving versus process/report drift.
-6. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
+7. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
    TODO/backlog docs, skills, learning indexes, tickets, or project-specific
    rules.
-7. Present user-selectable fix suggestions with `destination_source_refs`,
+8. Present user-selectable fix suggestions with `destination_source_refs`,
    `destination_rationale`, and `selection_options` of accept, reject, or
    defer.
-8. Do not auto-edit behavior rules, skills, task files, tickets, or memory
+9. Do not auto-edit behavior rules, skills, task files, tickets, or memory
    docs from this route.
-9. Do not assume everyone has contributor's `wrap-up` skill.
+10. Do not assume everyone has contributor's `wrap-up` skill.
 
 After running:
 
 - inspect `failure_modes[*].source_refs`;
+- obey `answer_use_contract` before finalizing; when it says
+  `answer_from_top_next_read_or_handoff_exact_source`, answer from the top
+  required read or explicitly hand off that source as the required next read;
 - inspect substantive `orchestration_evidence.items[*].source_ref` before
   deciding what worker/reviewer/subagent behavior mattered;
 - use `signal_classification` to separate substantive session evidence from
