@@ -30,6 +30,7 @@ from .agent_contract import (
 from .answer_source_discipline import answer_source_discipline_summary, build_answer_source_discipline
 from .claims import classify_claim_action, parse_review_verdict
 from .forensics import build_forensics_payload
+from .prompt_echo import clearly_intends_current_session, setup_echo_classification
 from .query import infer_query
 from .real_history_gold import validate_manifest_file
 from .retrieval_modes import RETRIEVAL_MODE_PACKAGE, run_retrieval_mode
@@ -858,32 +859,34 @@ def inferred_remembered_topic_next_reads(
         return []
     roots = semantic_debug_codex_session_roots(source_plan)
     files: list[Path] = []
+    max_files = 360
+    max_day_files = 96
     for root in roots:
         if root.is_dir():
+            days: list[Path] = []
             for year in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
                 for month in sorted((p for p in year.iterdir() if p.is_dir()), reverse=True):
-                    for day in sorted((p for p in month.iterdir() if p.is_dir()), reverse=True):
-                        files.extend(sorted(day.glob("*.jsonl"), key=lambda p: p.name, reverse=True))
-                        if len(files) >= 40:
-                            break
-                    if len(files) >= 40:
-                        break
-                if len(files) >= 40:
+                    days.extend(sorted((p for p in month.iterdir() if p.is_dir()), reverse=True))
+            for day in days[:14]:
+                files.extend(sorted(day.glob("*.jsonl"), key=lambda p: p.name, reverse=True)[:max_day_files])
+                if len(files) >= max_files:
                     break
     scored: list[dict[str, Any]] = []
-    for path in files[:40]:
+    for path in files[:max_files]:
         scored.extend(
             inferred_topic_records_for_path(
                 path,
                 topic_terms=topic_terms,
+                query=query,
             )
         )
     scored.sort(key=lambda item: (-float(item["score"]), str(item.get("timestamp_utc") or ""), int((item.get("source_ref") or {}).get("line") or 0)))
-    return [
-        inferred_anchor_read(
+    reads: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:2], 1):
+        read = inferred_anchor_read(
             source_ref=item["source_ref"],
             anchor_id=f"remembered-topic-{index:03d}",
-            reason="open recent user topic/provenance anchor before older same-term candidates",
+            reason="open substantive user topic/provenance anchor before setup or lane-prompt echoes",
             anchor_kind="remembered_topic",
             confidence="medium" if item["score"] < 80 else "high",
             selection_reason=item["selection_reason"],
@@ -891,8 +894,11 @@ def inferred_remembered_topic_next_reads(
             expansion_action_context=expansion_action_context,
             include_context_actions=include_context_actions,
         )
-        for index, item in enumerate(scored[:2], 1)
-    ]
+        echo = item.get("prompt_echo_classification")
+        if isinstance(echo, dict):
+            read["inferred_anchor"]["prompt_echo_resistance"] = echo
+        reads.append(read)
+    return reads
 
 
 def semantic_debug_codex_session_roots(source_plan: dict[str, Any]) -> list[Path]:
@@ -958,8 +964,9 @@ def inferred_anchor_records_for_path(
     return rows
 
 
-def inferred_topic_records_for_path(path: Path, *, topic_terms: set[str]) -> list[dict[str, Any]]:
+def inferred_topic_records_for_path(path: Path, *, topic_terms: set[str], query: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    current_session_intended = clearly_intends_current_session(query)
     try:
         for record in iter_records_for_file(path, "unknown_jsonl", timezone.utc):
             role_text = str(record.role or "").casefold()
@@ -971,13 +978,20 @@ def inferred_topic_records_for_path(path: Path, *, topic_terms: set[str]) -> lis
                 continue
             correction_bonus = 24.0 if any(term in lowered for term in ("context pollution", "resolvable", "i meant", "never said")) else 0.0
             score = 50.0 + len(matched) * 10.0 + correction_bonus
+            echo = setup_echo_classification(record.text, query=query)
+            if echo["is_setup_echo"] and not current_session_intended:
+                score -= 120.0
             rows.append(
                 {
                     "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
                     "role": record.role,
                     "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
                     "score": score,
-                    "selection_reason": f"remembered_topic:{'+'.join(sorted(matched)[:4])}",
+                    "selection_reason": (
+                        f"remembered_topic:{'+'.join(sorted(matched)[:4])}"
+                        + (":setup_echo_demoted" if echo["is_setup_echo"] and not current_session_intended else "")
+                    ),
+                    "prompt_echo_classification": echo,
                 }
             )
     except (AdapterReadError, OSError, ValueError):

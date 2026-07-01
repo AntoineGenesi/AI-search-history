@@ -31,6 +31,10 @@ conflict.
    sentence.
 5. Separate the user's actual point from the agent's later paraphrase.
 6. Preserve corrections where the user says the agent misunderstood the topic.
+7. Treat fresh receiving-agent prompts, benchmark/lane setup text, and nearby
+   task-orchestration echoes as weak diagnostic evidence unless the user
+   explicitly asks about the current session. Prefer the original substantive
+   user discussion over a later prompt that merely repeats the topic.
 
 ## Answer Shape
 
