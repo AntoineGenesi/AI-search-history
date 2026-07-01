@@ -2613,13 +2613,18 @@ def render_semantic_debug_text(payload: dict) -> str:
         or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
+    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
     lines = [
         "Semantic Debug",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
         "Open these source refs first:",
     ]
-    if required_reads:
+    if primary_command:
+        lines.append(f"- primary source window command: {primary_command}")
+        lines.append("- fallback individual refs are listed later only if this window leaves a named answer facet missing")
+    elif required_reads:
         for read in required_reads[:5]:
             _append_text_read(lines, read, command_by_target=command_by_target)
     elif report.get("next_reads"):
@@ -2766,6 +2771,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
+    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
     lines = [
         "# Semantic Debug",
         "",
@@ -2775,7 +2782,10 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "## Open These Source Refs First",
         "",
     ]
-    if required_reads:
+    if primary_command:
+        lines.append(f"- Primary source window command: `{primary_command}`")
+        lines.append("- Fallback individual refs are listed later only if this window leaves a named answer facet missing.")
+    elif required_reads:
         for read in required_reads[:5]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
     elif report.get("next_reads"):
