@@ -28,8 +28,95 @@ ORCHESTRATION_DIVERSITY_ACTORS = (
     "reviewer_or_review_summary",
 )
 ORCHESTRATION_PRIMARY_RANKED_LIMIT = 10
+CURRENT_SESSION_SOURCE_LIMIT = 5
+CURRENT_SESSION_SOURCE_SCAN_LIMIT = 160
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
+
+CURRENT_SESSION_SOURCE_PATTERNS = (
+    "tasks/side-thread-info*.md",
+    "reports/*semantic*wrap*.md",
+    "reports/*semantic-wrapup*.md",
+    "codex/state/pipeline-state.md",
+    "TODO.md",
+    "TASKS.md",
+)
+
+CURRENT_SESSION_SOURCE_FACETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "current_session_scope",
+        (
+            'broad "this session"',
+            "broad history sweep",
+            "too broad",
+            "mixed older sessions",
+            "this session scope",
+            "session scope",
+        ),
+    ),
+    (
+        "exact_session_root_handling",
+        (
+            "exact session",
+            "exact current-session",
+            "exact current session",
+            "exact known",
+            "arbitrary-root",
+            "arbitrary root",
+            "allow-arbitrary-root",
+        ),
+    ),
+    (
+        "root_rejection_ambiguity",
+        (
+            "root rejection",
+            "rejected root",
+            "no failures found",
+            "no_failure_modes_found",
+        ),
+    ),
+    (
+        "count_drift",
+        (
+            "count drift",
+            "summary counts",
+            "array length",
+            "returned array",
+            "returned/total",
+        ),
+    ),
+    (
+        "destination_ranking_noise",
+        (
+            "destination ranking",
+            "fix-destination",
+            "fix destination",
+            "stale task",
+            "private archived",
+            "archived private",
+        ),
+    ),
+    (
+        "receiving_agent_inspectability",
+        (
+            "receiving agent",
+            "receiving-agent",
+            "inspectability",
+            "inspect before",
+            "evidence summary",
+        ),
+    ),
+    (
+        "semantic_wrapup_hardening",
+        (
+            "semantic-wrapup hardening",
+            "semantic wrap-up hardening",
+            "semantic-wrapup evidence",
+            "semantic wrap-up needs",
+            "product requirements",
+        ),
+    ),
+)
 
 FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
     {
@@ -256,6 +343,7 @@ def build_semantic_wrapup_payload(
     all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
+    current_session_source_selection = _current_session_source_selection(cwd, query)
     behavior_system = detect_behavior_system(cwd)
     all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
     fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
@@ -286,6 +374,8 @@ def build_semantic_wrapup_payload(
                 "orchestration_evidence_count": orchestration_evidence["returned_count"],
                 "orchestration_evidence_total_count": orchestration_evidence["total_count"],
                 "orchestration_evidence_truncated": orchestration_evidence["truncated"],
+                "current_session_source_count": current_session_source_selection["returned_count"],
+                "current_session_source_total_count": current_session_source_selection["total_count"],
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             "failure_modes": failure_modes,
@@ -297,11 +387,16 @@ def build_semantic_wrapup_payload(
                 "failure_modes_exclude_setup_echoes": True,
             },
             "orchestration_evidence": orchestration_evidence,
+            "current_session_source_selection": current_session_source_selection,
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
             "agent_instruction": _agent_instruction(status, scope_resolution),
-            "next_reads": _semantic_next_reads(failure_modes, orchestration_evidence),
+            "next_reads": _semantic_next_reads(
+                failure_modes,
+                orchestration_evidence,
+                current_session_source_selection,
+            ),
             "privacy": {
                 "raw_text_included": True,
                 "source_refs_included": True,
@@ -423,6 +518,190 @@ def _rerun_with_root_command(query: str) -> str:
         f"jsonl-history-search semantic-wrapup {quoted_query} "
         '--root <path-to-session.jsonl> --cwd "$PWD" --format json'
     )
+
+
+def _current_session_source_selection(cwd: Path, query: str) -> dict:
+    if not _is_current_session_complaint_fix_query(query):
+        return _empty_current_session_source_selection("query_not_current_session_complaint_fix")
+
+    candidates = []
+    for rel in _current_session_source_paths(cwd):
+        path = cwd / rel
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        candidate = _score_current_session_source(rel, text)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda item: (-item["score"], -len(item["facets"]), item["source_ref"]["path"]))
+    selected = candidates[:CURRENT_SESSION_SOURCE_LIMIT]
+    status = "found" if selected else "not_found"
+    return {
+        "status": status,
+        "selection_policy": (
+            "rank cwd-local side-thread/task/report evidence by semantic-wrapup current-session "
+            "smoke/hardening facets before generic active-gate/front-door context"
+        ),
+        "returned_count": len(selected),
+        "total_count": len(candidates),
+        "truncated": len(candidates) > len(selected),
+        "selected_sources": selected,
+    }
+
+
+def _empty_current_session_source_selection(reason: str) -> dict:
+    return {
+        "status": "not_applicable",
+        "reason": reason,
+        "selection_policy": (
+            "rank cwd-local side-thread/task/report evidence by semantic-wrapup current-session "
+            "smoke/hardening facets before generic active-gate/front-door context"
+        ),
+        "returned_count": 0,
+        "total_count": 0,
+        "truncated": False,
+        "selected_sources": [],
+    }
+
+
+def _is_current_session_complaint_fix_query(query: str) -> bool:
+    normalized = _normalize(query)
+    has_current_session = any(term in normalized for term in ("this session", "current session", "current-session"))
+    has_complaint_or_fix = any(
+        term in normalized
+        for term in (
+            "complain",
+            "complaint",
+            "failure mode",
+            "failure modes",
+            "needs fixing",
+            "need fixing",
+            "should we fix",
+            "fix from",
+            "semantic wrap-up",
+            "semantic-wrapup",
+        )
+    )
+    return has_current_session and has_complaint_or_fix
+
+
+def _current_session_source_paths(cwd: Path) -> list[str]:
+    rels: list[str] = []
+    seen: set[str] = set()
+    for pattern in CURRENT_SESSION_SOURCE_PATTERNS:
+        for path in sorted(cwd.glob(pattern)):
+            if len(rels) >= CURRENT_SESSION_SOURCE_SCAN_LIMIT:
+                return rels
+            if not path.is_file() or ".scratch." in path.name or _skip_destination_path(path):
+                continue
+            try:
+                rel = path.relative_to(cwd).as_posix()
+            except ValueError:
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            rels.append(rel)
+    return rels
+
+
+def _score_current_session_source(rel: str, text: str) -> dict | None:
+    normalized_text = _normalize_for_source_selection(text)
+    normalized_path = _normalize_for_source_selection(rel)
+    if not normalized_text.strip():
+        return None
+
+    facets = _current_session_facets(normalized_text)
+    score = 0
+    if any(term in normalized_text for term in ("semantic-wrapup", "semantic wrap-up", "semantic_wrapup")):
+        score += 120
+    if any(term in normalized_text for term in ("current-session", "current session", "this session")):
+        score += 80
+    if any(term in normalized_text for term in ("smoke", "hardening", "product requirements", "quality judgment")):
+        score += 60
+    score += len(facets) * 55
+
+    if normalized_path.startswith("tasks/side-thread-info"):
+        score += 70
+    if "semantic" in normalized_path and "wrap" in normalized_path:
+        score += 35
+    if normalized_path in {"todo.md", "tasks.md", "codex/state/pipeline-state.md"}:
+        score -= 70
+    if "artifact-currentness" in normalized_text and len(facets) < 4:
+        score -= 90
+
+    if score < 240 or len(facets) < 2:
+        return None
+
+    lines = text.splitlines()
+    line_no = _best_current_session_source_line(lines)
+    return {
+        "source_ref": {"path": rel, "line": line_no},
+        "source_kind": _current_session_source_kind(rel),
+        "score": score,
+        "facets": facets,
+        "reason": (
+            "Substantive current-session semantic-wrapup smoke/hardening evidence; "
+            "inspect before answering from active task or front-door context."
+        ),
+        "snippet": _source_line_snippet(lines, line_no),
+    }
+
+
+def _normalize_for_source_selection(text: str) -> str:
+    normalized = _normalize(text)
+    return normalized.replace(" - ", " ").replace("_", "-")
+
+
+def _current_session_facets(normalized_text: str) -> list[str]:
+    facets = []
+    for label, terms in CURRENT_SESSION_SOURCE_FACETS:
+        if any(_normalize_for_source_selection(term) in normalized_text for term in terms):
+            facets.append(label)
+    return facets
+
+
+def _best_current_session_source_line(lines: list[str]) -> int:
+    if not lines:
+        return 1
+    best_line = 1
+    best_score = -1
+    flattened_terms = [
+        _normalize_for_source_selection(term)
+        for _label, terms in CURRENT_SESSION_SOURCE_FACETS
+        for term in terms
+    ]
+    for index, line in enumerate(lines, 1):
+        normalized = _normalize_for_source_selection(line)
+        score = sum(1 for term in flattened_terms if term in normalized)
+        if any(term in normalized for term in ("product requirements", "quality judgment", "bad:", "problem:")):
+            score += 3
+        if any(term in normalized for term in ("semantic-wrapup", "semantic wrap-up", "current-session", "current session")):
+            score += 2
+        if score > best_score:
+            best_score = score
+            best_line = index
+    return best_line
+
+
+def _source_line_snippet(lines: list[str], line_no: int) -> str:
+    if not lines:
+        return ""
+    start = max(0, line_no - 2)
+    end = min(len(lines), line_no + 1)
+    return re.sub(r"\s+", " ", " ".join(line.strip() for line in lines[start:end] if line.strip())).strip()[:260]
+
+
+def _current_session_source_kind(rel: str) -> str:
+    if rel.startswith("tasks/side-thread-info"):
+        return "side_thread_current_session_evidence"
+    if rel.startswith("tasks/"):
+        return "task_current_session_evidence"
+    if rel.startswith("reports/"):
+        return "report_current_session_evidence"
+    return "front_door_context"
 
 
 def detect_behavior_system(cwd: Path) -> dict:
@@ -878,11 +1157,35 @@ def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[d
     return suggestions
 
 
-def _semantic_next_reads(failure_modes: list[dict], orchestration_evidence: dict | None = None) -> list[dict]:
+def _semantic_next_reads(
+    failure_modes: list[dict],
+    orchestration_evidence: dict | None = None,
+    current_session_source_selection: dict | None = None,
+) -> list[dict]:
     refs = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(ref: dict, reason: str, facets: list[str] | None = None) -> None:
+        key = (str(ref.get("path") or ""), int(ref.get("line") or 0))
+        if not key[0] or key in seen:
+            return
+        item = {"source_ref": ref, "reason": reason}
+        if facets:
+            item["facets"] = facets
+        refs.append(item)
+        seen.add(key)
+
+    for source in (current_session_source_selection or {}).get("selected_sources") or []:
+        ref = source.get("source_ref") or {}
+        add(
+            ref,
+            "Inspect current-session semantic-wrapup smoke/hardening evidence before answering from active gate or front-door context.",
+            list(source.get("facets") or []),
+        )
+
     orchestration_items = (orchestration_evidence or {}).get("items") or []
     for ref in next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items):
-        refs.append({"source_ref": ref, "reason": "Inspect complaint/correction evidence before applying suggested fix."})
+        add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
     return refs
 
 

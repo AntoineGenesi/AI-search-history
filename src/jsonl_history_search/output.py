@@ -819,6 +819,19 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             f"setup_echo={signal_classification.get('setup_echo_signal_count', 0)}, "
             f"failure_modes_exclude_setup_echoes={signal_classification.get('failure_modes_exclude_setup_echoes')}"
         )
+    current_sources = report.get("current_session_source_selection") or {}
+    if current_sources.get("selected_sources"):
+        lines.append(
+            "Current-session source selection: "
+            f"{current_sources.get('returned_count', 0)}/{current_sources.get('total_count', 0)} returned"
+        )
+        for source in current_sources.get("selected_sources", [])[:5]:
+            ref = source.get("source_ref") or {}
+            facets = ", ".join(source.get("facets") or [])
+            lines.append(
+                f"- {ref.get('path')}:{ref.get('line')} "
+                f"[{source.get('source_kind')}; facets={facets}]: {source.get('snippet')}"
+            )
     orchestration = report.get("orchestration_evidence") or {}
     if orchestration.get("items"):
         lines.append(
@@ -934,6 +947,22 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             f"**First action:** `{scope_resolution.get('first_action')}`",
             "",
         ])
+    current_sources = report.get("current_session_source_selection") or {}
+    if current_sources.get("selected_sources"):
+        lines.extend([
+            "## Current-Session Source Selection",
+            "",
+            f"- Returned: `{current_sources.get('returned_count', 0)}/{current_sources.get('total_count', 0)}`",
+            f"- Policy: {current_sources.get('selection_policy')}",
+            "",
+        ])
+        for source in current_sources.get("selected_sources", [])[:5]:
+            ref = source.get("source_ref") or {}
+            facets = ", ".join(source.get("facets") or [])
+            lines.append(f"- `{ref.get('path')}:{ref.get('line')}` `{source.get('source_kind')}` facets=`{facets}`")
+            if source.get("snippet"):
+                lines.append(f"  - {source.get('snippet')}")
+        lines.append("")
     signal_classification = report.get("signal_classification") or {}
     if signal_classification:
         lines.extend([
