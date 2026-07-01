@@ -288,14 +288,30 @@ def _discover_artifacts(cwd: Path) -> list[Path]:
 
 def _explicit_path(query: str, cwd: Path) -> Path | None:
     cleaned = query.strip().strip("`'\"")
-    direct = (cwd / cleaned).resolve()
-    if cleaned and direct.is_file() and _inside(direct, cwd):
-        return direct
+    if _safe_direct_path_query(cleaned):
+        direct = (cwd / cleaned).resolve()
+        if _is_file_inside(direct, cwd):
+            return direct
     for match in PATHISH_RE.finditer(query):
         candidate = (cwd / match.group(2)).resolve()
-        if candidate.is_file() and _inside(candidate, cwd):
+        if _is_file_inside(candidate, cwd):
             return candidate
     return None
+
+
+def _safe_direct_path_query(cleaned: str) -> bool:
+    if not cleaned or len(cleaned) > 240 or "\n" in cleaned:
+        return False
+    if any(char.isspace() for char in cleaned) and not PATHISH_RE.fullmatch(cleaned):
+        return False
+    return any(marker in cleaned for marker in ("/", "\\")) or Path(cleaned).suffix.lower() in ARTIFACT_SUFFIXES
+
+
+def _is_file_inside(path: Path, cwd: Path) -> bool:
+    try:
+        return path.is_file() and _inside(path, cwd)
+    except OSError:
+        return False
 
 
 def _select_artifact_or_topic(query: str, cwd: Path, artifacts: list[Path], explicit_path: Path | None, front_door: dict) -> dict:
