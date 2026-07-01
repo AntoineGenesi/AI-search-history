@@ -40,6 +40,22 @@ STRONG_SETUP_ECHO_MARKERS = (
     "use live installed",
     "live installed jsonl",
     "installed skill/cli",
+    "<skill>",
+    "</skill>",
+    "read the attached reviewer skill",
+    "independent reviewer for",
+    "review against task acceptance criteria",
+    "write review artifact",
+    "review artifact format",
+    "allowed verdicts",
+    "if you find a fixable issue",
+    "same-task fix findings",
+    "orchestrator reviewer",
+    "orchestrator implementer",
+    "product fsm orchestration",
+    "current state + event + guard result -> next state",
+    "review failed fixable",
+    "fix review findings",
 )
 
 ORCHESTRATION_ECHO_MARKERS = (
