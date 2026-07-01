@@ -528,6 +528,8 @@ def render_artifact_currentness_text(payload: dict) -> str:
         lines.append(f"Selected: {selected_ref}")
         if selected.get("kind") or selected.get("artifact_type"):
             lines.append(f"Artifact type: {selected.get('artifact_type') or selected.get('kind')}")
+        if selected.get("role_label"):
+            lines.append(f"Selected role: {selected.get('role_label')}")
     worktree = report.get("worktree_currentness") or {}
     if worktree:
         lines.append("Worktree currentness:")
@@ -559,7 +561,21 @@ def render_artifact_currentness_text(payload: dict) -> str:
     if front.get("source_refs"):
         lines.append("Current front door:")
         for ref in front["source_refs"][:4]:
-            lines.append(f"- {ref.get('source_ref')}: {ref.get('snippet')}")
+            role = ref.get("role_label") or ref.get("currentness_role") or "front-door evidence"
+            lines.append(f"- {ref.get('source_ref')}: {role} - {ref.get('snippet')}")
+    if front.get("active_current") or front.get("supporting_context") or front.get("provenance"):
+        lines.append("Plan hierarchy:")
+        for label, key in (
+            ("active/current", "active_current"),
+            ("supporting/context", "supporting_context"),
+            ("provenance/historical", "provenance"),
+        ):
+            items = front.get(key) or []
+            if not items:
+                continue
+            lines.append(f"- {label}:")
+            for item in items[:4]:
+                lines.append(f"  - {item.get('source_ref')}: {item.get('snippet')}")
     chain = report.get("evidence_chain") or []
     if chain:
         lines.append("Evidence chain:")
@@ -630,6 +646,8 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
         lines.append(f"**Selected:** `{selected_ref}`")
     if selected.get("kind") or selected.get("artifact_type"):
         lines.append(f"**Artifact type:** `{selected.get('artifact_type') or selected.get('kind')}`")
+    if selected.get("role_label"):
+        lines.append(f"**Selected role:** {selected.get('role_label')}")
     worktree = report.get("worktree_currentness") or {}
     if worktree:
         lines.extend(["", "## Worktree Currentness", ""])
@@ -657,7 +675,21 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
     if front.get("source_refs"):
         lines.extend(["", "## Current Front Door", ""])
         for ref in front["source_refs"][:4]:
-            lines.append(f"- `{ref.get('source_ref')}`: {ref.get('snippet')}")
+            role = ref.get("role_label") or ref.get("currentness_role") or "front-door evidence"
+            lines.append(f"- `{ref.get('source_ref')}`: **{role}** - {ref.get('snippet')}")
+    if front.get("active_current") or front.get("supporting_context") or front.get("provenance"):
+        lines.extend(["", "## Plan Hierarchy", ""])
+        for label, key in (
+            ("Active/current", "active_current"),
+            ("Supporting/context", "supporting_context"),
+            ("Provenance/historical", "provenance"),
+        ):
+            items = front.get(key) or []
+            if not items:
+                continue
+            lines.append(f"### {label}")
+            for item in items[:4]:
+                lines.append(f"- `{item.get('source_ref')}`: {item.get('snippet')}")
     chain = report.get("evidence_chain") or []
     if chain:
         lines.extend(["", "## Evidence Chain", ""])

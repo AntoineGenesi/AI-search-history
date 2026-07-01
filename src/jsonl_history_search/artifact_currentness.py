@@ -308,13 +308,16 @@ def _select_artifact_or_topic(query: str, cwd: Path, artifacts: list[Path], expl
             item = dict(ranked[0])
             item["selection_reason"] = "highest-scoring topic artifact candidate"
             return item
-    if front_door.get("current_plan"):
+    controlling = front_door.get("controlling_artifact") or front_door.get("current_plan")
+    if controlling:
         return {
-            "kind": "topic",
+            "kind": _artifact_kind(cwd / controlling["path"], cwd) if controlling.get("path") else "topic",
             "topic": query,
-            "path": front_door["current_plan"].get("path"),
-            "source_ref": front_door["current_plan"].get("source_ref"),
-            "selection_reason": "current front-door plan pointer",
+            "path": controlling.get("path"),
+            "source_ref": controlling.get("source_ref"),
+            "selection_reason": controlling.get("relationship") or "active current front-door item",
+            "currentness_role": controlling.get("currentness_role"),
+            "role_label": controlling.get("role_label"),
         }
     if front_door.get("source_refs"):
         first = front_door["source_refs"][0]
@@ -415,7 +418,7 @@ def _candidate_item(path: Path, cwd: Path, reason: str, score: int = 0) -> dict:
 
 def _current_front_door(cwd: Path) -> dict:
     refs = []
-    current_plan = None
+    order = 0
     for rel in FRONT_DOOR_PATHS:
         path = cwd / rel
         if not path.is_file():
@@ -423,7 +426,11 @@ def _current_front_door(cwd: Path) -> dict:
         lines = _read_lines(path)
         for line_no, line in enumerate(lines[:200], 1):
             normalized = _normalize(line)
-            if not any(
+            next_line = _next_nonempty_line(lines, line_no)
+            has_path = bool(_extract_existing_paths(line, cwd) or _extract_existing_paths(next_line, cwd))
+            if not (
+                (line.strip().casefold().endswith("plan:") and has_path)
+                or any(
                 marker in normalized
                 for marker in (
                     "active_task",
@@ -447,50 +454,117 @@ def _current_front_door(cwd: Path) -> dict:
                     "superseded by",
                     "replaces",
                 )
+                )
             ):
                 continue
             context_line = line
-            next_line = _next_nonempty_line(lines, line_no)
             if next_line and not _extract_existing_path(context_line, cwd):
                 context_line = f"{line} {next_line}"
+            role, priority, label = _front_door_role(rel, context_line)
+            extracted_paths = _extract_existing_paths(context_line, cwd)
+            primary_path = extracted_paths[0] if extracted_paths else None
             item = {
                 "path": rel,
                 "source_ref": f"{rel}:{line_no}",
                 "snippet": _compact(context_line),
-                "relationship": "current_front_door",
+                "relationship": role,
+                "currentness_role": role,
+                "role_label": label,
+                "role_priority": priority,
+                "_source_order": order,
             }
+            if primary_path:
+                item["artifact_path"] = _rel(primary_path, cwd)
+                item["path"] = _rel(primary_path, cwd)
+                item["front_door_path"] = rel
+                primary_rel = _rel(primary_path, cwd)
+                if role == "active_current" and (
+                    primary_rel.startswith("codex/state/")
+                    or primary_rel.startswith("state/")
+                    or primary_rel in {"CURRENT.md", "current.md", "docs/current.md"}
+                ):
+                    role, priority, label = "active_current_state", 90, "Active current state"
+                    item["relationship"] = role
+                    item["currentness_role"] = role
+                    item["role_label"] = label
+                    item["role_priority"] = priority
+            elif role == "active_current":
+                role, priority, label = "current_front_door", 40, "Current front-door evidence"
+                item["relationship"] = role
+                item["currentness_role"] = role
+                item["role_label"] = label
+                item["role_priority"] = priority
             refs.append(item)
-            plan_path = _extract_existing_path(context_line, cwd)
-            if (
-                plan_path
-                and current_plan is None
-                and any(
-                    marker in _normalize(context_line)
-                    for marker in (
-                        "plan",
-                        "active_task",
-                        "active task",
-                        "current ticket",
-                        "active ticket",
-                        "current issue",
-                        "active issue",
-                        "current task",
-                        "current todo",
-                    )
-                )
-            ):
-                current_plan = {
-                    "path": _rel(plan_path, cwd),
-                    "source_ref": f"{rel}:{line_no}",
-                    "snippet": _compact(context_line),
-                }
-        if refs and rel == "codex/state/pipeline-state.md":
-            break
+            order += 1
+    refs.sort(key=lambda item: (-int(item.get("role_priority", 0)), int(item.get("_source_order", 0))))
+    for item in refs:
+        item.pop("_source_order", None)
+    controlling = next(
+        (item for item in refs if item.get("artifact_path") and item.get("currentness_role") == "active_current"),
+        None,
+    )
+    if controlling is None:
+        controlling = next((item for item in refs if item.get("path") and item.get("currentness_role") == "active_current_state"), None)
+    if controlling is None:
+        controlling = next(
+            (item for item in refs if item.get("artifact_path") and item.get("currentness_role") == "current_gate_plan"),
+            None,
+        )
+    if controlling is None:
+        controlling = next((item for item in refs if item.get("path") and item.get("currentness_role") == "current_plan_pointer"), None)
+    active = [
+        item
+        for item in refs
+        if item.get("currentness_role") in {"active_current", "active_current_state", "current_gate_plan"}
+        and (item.get("artifact_path") or item.get("currentness_role") == "active_current_state")
+    ]
+    supporting = [item for item in refs if item.get("currentness_role") in {"current_plan_pointer", "supporting_context"}]
+    provenance = [item for item in refs if item.get("currentness_role") == "historical_provenance"]
     return {
         "status": "found" if refs else "not_found",
         "source_refs": refs[:8],
-        "current_plan": current_plan,
+        "current_plan": controlling,
+        "controlling_artifact": controlling,
+        "active_current": active[:6],
+        "supporting_context": supporting[:6],
+        "provenance": provenance[:6],
     }
+
+
+def _front_door_role(front_door_path: str, context_line: str) -> tuple[str, int, str]:
+    normalized = _normalize(context_line)
+    if any(normalized.startswith(prefix) for prefix in ("attempt_learning_record:", "evidence_required_before_next_task:", "support_work_inside_task:")):
+        return "supporting_context", 35, "Supporting context"
+    if any(
+        marker in normalized
+        for marker in (
+            "active_task",
+            "current product task",
+            "active task",
+            "current task",
+            "current todo",
+            "current ticket",
+            "active ticket",
+            "current issue",
+            "active issue",
+        )
+    ):
+        return "active_current", 100, "Active current task/artifact"
+    if "current fsm" in normalized or "current state" in normalized:
+        return "active_current_state", 90, "Active current state"
+    if "gate plan" in normalized or re.search(r"\b[a-z0-9 -]*plan:\s+`?[./\w-]+", normalized):
+        return "current_gate_plan", 95, "Active current/gate plan"
+    if any(marker in normalized for marker in ("current next-loop plan", "current next loop plan", "current plan")):
+        return "current_plan_pointer", 70, "Supporting plan pointer"
+    if any(marker in normalized for marker in ("source of truth", "front door")):
+        return "active_current_state", 65, "Current front-door state"
+    if any(marker in normalized for marker in ("current coordination plan", "current handoff", "product direction", "mechanisms")):
+        return "supporting_context", 50, "Supporting context"
+    if any(marker in normalized for marker in ("historical/provenance", "historical provenance", "older ", "previous completed")):
+        return "historical_provenance", 10, "Historical/provenance"
+    if front_door_path in {"TODO.md", "TASKS.md"} and "plan" in normalized:
+        return "supporting_context", 45, "Supporting context"
+    return "current_front_door", 40, "Current front-door evidence"
 
 
 def _later_references(query: str, cwd: Path, artifacts: list[Path], selected: dict, front_door: dict) -> list[dict]:
@@ -693,6 +767,8 @@ def _evidence_chain(selected: dict, status: dict, git: dict, references: list[di
                 "source_ref": ref["source_ref"],
                 "relationship": ref["relationship"],
                 "snippet": ref["snippet"],
+                "currentness_role": ref.get("currentness_role"),
+                "role_label": ref.get("role_label"),
             }
         )
     for item in latest_evidence:
@@ -709,10 +785,42 @@ def _evidence_chain(selected: dict, status: dict, git: dict, references: list[di
 
 def _next_reads(selected: dict, front_door: dict, chain: list[dict]) -> list[dict]:
     reads = []
+    for ref in front_door.get("active_current", [])[:3]:
+        reads.append(
+            {
+                "source_ref": ref["source_ref"],
+                "reason": f"Inspect {ref.get('role_label', 'active current front-door evidence')} before broad plan pointers.",
+                "currentness_role": ref.get("currentness_role"),
+                "role_label": ref.get("role_label"),
+            }
+        )
     if selected.get("source_ref"):
-        reads.append({"source_ref": selected["source_ref"], "reason": "Inspect selected artifact/topic before trusting it."})
+        reads.append(
+            {
+                "source_ref": selected["source_ref"],
+                "reason": "Inspect selected artifact/topic before trusting it.",
+                "currentness_role": selected.get("currentness_role"),
+                "role_label": selected.get("role_label"),
+            }
+        )
+    for ref in front_door.get("supporting_context", [])[:3]:
+        reads.append(
+            {
+                "source_ref": ref["source_ref"],
+                "reason": f"Inspect {ref.get('role_label', 'supporting context')}; do not treat it as controlling if active current refs differ.",
+                "currentness_role": ref.get("currentness_role"),
+                "role_label": ref.get("role_label"),
+            }
+        )
     for ref in front_door.get("source_refs", [])[:3]:
-        reads.append({"source_ref": ref["source_ref"], "reason": "Inspect current front-door source of truth."})
+        reads.append(
+            {
+                "source_ref": ref["source_ref"],
+                "reason": "Inspect current front-door source of truth.",
+                "currentness_role": ref.get("currentness_role"),
+                "role_label": ref.get("role_label"),
+            }
+        )
     for item in chain:
         if item["evidence_type"] == "artifact_status_field":
             reads.append({"source_ref": item["source_ref"], "reason": "Inspect this status/ticket field as a claim, not truth."})
@@ -868,7 +976,11 @@ def _front_door_points_to_selected(front_door: dict, selected_path: str | None) 
         return False
     if (front_door.get("current_plan") or {}).get("path") == selected_path:
         return True
-    if any(ref.get("path") == selected_path for ref in front_door.get("source_refs", [])):
+    if any(
+        ref.get("path") == selected_path
+        and ref.get("currentness_role") in {"active_current", "active_current_state", "current_gate_plan", "current_plan_pointer"}
+        for ref in front_door.get("source_refs", [])
+    ):
         return True
     for ref in front_door.get("source_refs", []):
         snippet = _normalize(ref.get("snippet", ""))
@@ -1036,11 +1148,19 @@ def _next_nonempty_line(lines: list[str], current_line_no: int) -> str:
 
 
 def _extract_existing_path(line: str, cwd: Path) -> Path | None:
+    paths = _extract_existing_paths(line, cwd)
+    return paths[0] if paths else None
+
+
+def _extract_existing_paths(line: str, cwd: Path) -> list[Path]:
+    paths = []
+    seen = set()
     for match in PATHISH_RE.finditer(line):
         candidate = (cwd / match.group(2)).resolve()
-        if candidate.is_file() and _inside(candidate, cwd):
-            return candidate
-    return None
+        if candidate.is_file() and _inside(candidate, cwd) and candidate not in seen:
+            paths.append(candidate)
+            seen.add(candidate)
+    return paths
 
 
 def _query_terms(query: str) -> list[str]:
