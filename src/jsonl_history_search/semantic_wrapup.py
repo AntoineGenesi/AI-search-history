@@ -8,7 +8,8 @@ from typing import Any
 
 from .masking import MaskContext
 from .prompt_echo import setup_echo_classification
-from .skill_audit import context_row, next_read_refs, scan_records
+from .records import Record
+from .skill_audit import AuditRecord, context_row, next_read_refs, scan_records
 from .sources import SourcePlan
 
 
@@ -28,6 +29,7 @@ ORCHESTRATION_DIVERSITY_ACTORS = (
     "reviewer_or_review_summary",
 )
 ORCHESTRATION_PRIMARY_RANKED_LIMIT = 10
+SUPPLEMENTAL_SIDE_THREAD_LIMIT = 6
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
 
@@ -212,6 +214,42 @@ FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
             "Only distinct substantial product blockers should become follow-up work.",
         ),
     },
+    {
+        "label": "semantic_wrapup_current_session_scope",
+        "terms": ("this session scope", "scope is too broad", "searched too much history", "mixed older sessions", "too polluted for session wrap-up"),
+        "fix_type": "semantic-wrapup source selection update",
+        "preferred_path": "src/jsonl_history_search/semantic_wrapup.py",
+        "preferred_kinds": ("active_task", "pipeline_state", "skill_reference"),
+        "inferred_steps": (
+            "A natural current-session wrap-up asks for the active/latest session.",
+            "Broad history or active-gate context can crowd out the specific session complaint evidence.",
+            "The route should surface the richest current-session hardening source before suggesting fixes.",
+        ),
+    },
+    {
+        "label": "semantic_wrapup_exact_root_ergonomics",
+        "terms": ("exact session file", "exact current-session", "arbitrary-root", "allow-arbitrary-root", "root rejection", "rejected root"),
+        "fix_type": "semantic-wrapup source/root handling update",
+        "preferred_path": "src/jsonl_history_search/sources.py",
+        "preferred_kinds": ("active_task", "pipeline_state", "product_contract"),
+        "inferred_steps": (
+            "The user or receiving agent has an exact Codex/Claude session JSONL.",
+            "Requiring arbitrary-root ceremony or ambiguous rejection makes the result look like no failures were found.",
+            "Known transcript files should be accepted or rejected with unmistakable next-action guidance.",
+        ),
+    },
+    {
+        "label": "semantic_wrapup_count_and_destination_quality",
+        "terms": ("count drift", "array length", "destination ranking", "stale task files", "private archived", "receiving agent", "inspectability"),
+        "fix_type": "semantic-wrapup output/ranking update",
+        "preferred_path": "src/jsonl_history_search/semantic_wrapup.py",
+        "preferred_kinds": ("active_task", "pipeline_state", "product_contract"),
+        "inferred_steps": (
+            "The route finds useful failure modes but returns confusing counts or noisy fix destinations.",
+            "A receiving agent cannot confidently decide what to inspect or apply.",
+            "Summary counts, destination ranking, and next reads should make the source-backed fixes inspectable.",
+        ),
+    },
 )
 
 FRICTION_MARKERS = (
@@ -249,6 +287,12 @@ def build_semantic_wrapup_payload(
     started = time.monotonic()
     scan = scan_records(plan, default_tz=default_tz, mask_context=mask_context)
     records = scan["records"]
+    supplemental = _supplemental_current_session_sources(cwd, query=query)
+    if supplemental["records"]:
+        records = sorted([*records, *supplemental["records"]], key=lambda item: item.sort_key)
+        scan["searched_files"] += supplemental["searched_files"]
+        scan["searched_bytes"] += supplemental["searched_bytes"]
+        scan["warnings"] = sorted(set([*scan["warnings"], *supplemental["warnings"]]))
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
@@ -300,6 +344,7 @@ def build_semantic_wrapup_payload(
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
+            "supplemental_sources": supplemental["summary"],
             "agent_instruction": _agent_instruction(status, scope_resolution),
             "next_reads": _semantic_next_reads(failure_modes, orchestration_evidence),
             "privacy": {
@@ -323,6 +368,153 @@ def build_semantic_wrapup_payload(
     if "masking" in scan:
         payload["masking"] = scan["masking"]
     return payload
+
+
+def _supplemental_current_session_sources(cwd: Path, *, query: str) -> dict:
+    if not _current_session_wrapup_query(query):
+        return _empty_supplemental_sources("not_current_session_semantic_wrapup_query")
+
+    records: list[AuditRecord] = []
+    searched_files = 0
+    searched_bytes = 0
+    selected: list[dict] = []
+    for path in _candidate_side_thread_notes(cwd):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _is_current_session_semantic_wrapup_note(text):
+            continue
+        searched_files += 1
+        searched_bytes += len(text.encode("utf-8", errors="replace"))
+        rel = path.relative_to(cwd).as_posix()
+        selected.append({"path": rel, "reason": "tracked semantic-wrapup current-session side-thread evidence"})
+        records.extend(_side_thread_records(path, cwd=cwd, text=text))
+        if len(selected) >= SUPPLEMENTAL_SIDE_THREAD_LIMIT:
+            break
+
+    summary = {
+        "status": "found" if selected else "not_found",
+        "strategy": "tracked_current_session_semantic_wrapup_side_thread_notes",
+        "source_count": len(selected),
+        "sources": selected,
+        "records_added": len(records),
+    }
+    warnings = []
+    if selected:
+        warnings.append("Current-session semantic-wrapup side-thread evidence was included as supplemental tracked source context.")
+    return {
+        "records": records,
+        "searched_files": searched_files,
+        "searched_bytes": searched_bytes,
+        "warnings": warnings,
+        "summary": summary,
+    }
+
+
+def _empty_supplemental_sources(reason: str) -> dict:
+    return {
+        "records": [],
+        "searched_files": 0,
+        "searched_bytes": 0,
+        "warnings": [],
+        "summary": {
+            "status": "skipped",
+            "strategy": "tracked_current_session_semantic_wrapup_side_thread_notes",
+            "reason": reason,
+            "source_count": 0,
+            "sources": [],
+            "records_added": 0,
+        },
+    }
+
+
+def _current_session_wrapup_query(query: str) -> bool:
+    normalized = _normalize(query)
+    return (
+        any(term in normalized for term in ("this session", "current session", "from session"))
+        and any(term in normalized for term in ("complain", "failure mode", "needs fixing", "semantic wrap-up", "semantic-wrapup"))
+    )
+
+
+def _candidate_side_thread_notes(cwd: Path) -> list[Path]:
+    patterns = (
+        "tasks/side-thread-info*.md",
+    )
+    candidates: dict[str, Path] = {}
+    for pattern in patterns:
+        for path in sorted(cwd.glob(pattern)):
+            if path.is_file() and ".scratch." not in path.name and not _skip_destination_path(path):
+                candidates[path.as_posix()] = path
+    return list(candidates.values())
+
+
+def _is_current_session_semantic_wrapup_note(text: str) -> bool:
+    normalized = _normalize(text)
+    return (
+        "semantic-wrapup" in normalized or "semantic wrap-up" in normalized
+    ) and (
+        "current-session" in normalized or "current session" in normalized or "this session" in normalized
+    ) and any(
+        term in normalized
+        for term in (
+            "smoke",
+            "hardening",
+            "complaint clusters",
+            "product requirements",
+            "needs fixing",
+            "failure modes",
+        )
+    )
+
+
+def _side_thread_records(path: Path, *, cwd: Path, text: str) -> list[AuditRecord]:
+    rel = path.relative_to(cwd).as_posix()
+    records: list[AuditRecord] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        normalized = _normalize(stripped)
+        if not _side_thread_line_is_signal(normalized):
+            continue
+        record = Record(
+            path=rel,
+            line=line_number,
+            role="user",
+            text=stripped,
+            timestamp=None,
+            source_format="tracked_markdown_side_thread",
+        )
+        records.append(
+            AuditRecord(
+                record=record,
+                text=stripped,
+                timestamp_utc=None,
+                sort_key=("9999-12-31T23:59:59+00:00", rel, line_number),
+            )
+        )
+    return records
+
+
+def _side_thread_line_is_signal(normalized: str) -> bool:
+    return any(marker in normalized for marker in FRICTION_MARKERS) or any(
+        term in normalized
+        for term in (
+            "too broad",
+            "mixed older sessions",
+            "root rejection",
+            "arbitrary-root",
+            "count drift",
+            "destination ranking",
+            "stale task files",
+            "private archived",
+            "receiving agent",
+            "product requirements",
+            "fix suggestions",
+            "failure modes",
+        )
+    )
 
 
 def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
