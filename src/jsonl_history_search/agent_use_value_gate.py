@@ -10,8 +10,12 @@ DEFAULT_JSH1043_MANIFEST_PATH = Path("benchmarks/agent_use_value/jsh-1043-case-m
 DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH = Path(
     "reports/jsh-1043-reduced-warn-agent-use-value-gate-summary.json"
 )
+DEFAULT_JSH1045_EXPANSION_SUMMARY_PATH = Path(
+    "reports/jsh-1045-agent-use-value-gate-expansion-after-stop-contract-summary.json"
+)
 JSH1043_SCHEMA_VERSION = "jsh-1043-agent-use-value-case-manifest.v1"
 JSH1043_REDUCED_RUN_SCHEMA_VERSION = "jsh-1043-agent-use-value-reduced-run-summary.v1"
+JSH1045_EXPANSION_SCHEMA_VERSION = "jsh-1045-agent-use-value-expansion-summary.v1"
 REQUIRED_GLOBAL_LANES = ("manual_default_clean", "jsonl_current_default")
 ALLOWED_MANIFEST_STATUSES = (
     "frozen_before_lane_execution",
@@ -40,6 +44,7 @@ REQUIRED_DECISION_THRESHOLDS = (
 MIN_CASES = 8
 MAX_CASES = 12
 MIN_REDUCED_RUN_CASES = 2
+MIN_EXPANSION_CASES = 3
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,50 @@ class AgentUseValueReducedRunValidation:
                 "raw_private_trace_root": self.raw_private_trace_root,
                 "host_guard_status": self.host_guard_status,
                 "result_class": self.result_class,
+                "raw_file_check_enabled": self.raw_file_check_enabled,
+                "raw_file_count": self.raw_file_count,
+                "raw_private_text_committed": False,
+                "requires_parent_private_trace_root": True,
+                "errors": list(self.errors),
+                "warnings": list(self.warnings),
+            }
+        }
+
+
+@dataclass(frozen=True)
+class AgentUseValueExpansionValidation:
+    summary_path: str
+    status: str
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    run_id: str
+    case_count: int
+    lane_count: int
+    raw_private_trace_root: str
+    host_guard_status: str
+    result_class: str
+    c04_answer_ready: bool
+    c04_stop_broad_search: bool
+    c04_contract_passed: bool
+    raw_file_check_enabled: bool
+    raw_file_count: int
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "agent_use_value_expansion_validation": {
+                "schema_version": JSH1045_EXPANSION_SCHEMA_VERSION,
+                "status": self.status,
+                "mode": "committed_safe_expansion_summary_validation",
+                "summary_path": self.summary_path,
+                "run_id": self.run_id,
+                "case_count": self.case_count,
+                "lane_count": self.lane_count,
+                "raw_private_trace_root": self.raw_private_trace_root,
+                "host_guard_status": self.host_guard_status,
+                "result_class": self.result_class,
+                "c04_answer_ready": self.c04_answer_ready,
+                "c04_stop_broad_search": self.c04_stop_broad_search,
+                "c04_contract_passed": self.c04_contract_passed,
                 "raw_file_check_enabled": self.raw_file_check_enabled,
                 "raw_file_count": self.raw_file_count,
                 "raw_private_text_committed": False,
@@ -406,6 +455,214 @@ def build_agent_use_value_reduced_run_validation_payload(
     ).to_payload()
 
 
+def validate_agent_use_value_expansion_summary(
+    path: Path = DEFAULT_JSH1045_EXPANSION_SUMMARY_PATH,
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
+) -> AgentUseValueExpansionValidation:
+    errors: list[str] = []
+    warnings: list[str] = []
+    run_id = ""
+    raw_private_trace_root = ""
+    host_guard_status = ""
+    result_class = ""
+    case_count = 0
+    lane_count = 0
+    raw_file_count = 0
+    c04_answer_ready = False
+    c04_stop_broad_search = False
+    c04_contract_passed = False
+    resolved_private_root = private_root or Path(".")
+
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return AgentUseValueExpansionValidation(
+            str(path),
+            "fail",
+            (f"could not read summary: {exc}",),
+            (),
+            "",
+            0,
+            0,
+            "",
+            "",
+            "",
+            False,
+            False,
+            False,
+            require_raw_files,
+            0,
+        )
+    except json.JSONDecodeError as exc:
+        return AgentUseValueExpansionValidation(
+            str(path),
+            "fail",
+            (f"invalid JSON: {exc}",),
+            (),
+            "",
+            0,
+            0,
+            "",
+            "",
+            "",
+            False,
+            False,
+            False,
+            require_raw_files,
+            0,
+        )
+
+    if not isinstance(summary, dict):
+        errors.append("summary must be a JSON object")
+        summary = {}
+
+    _expect_equal(summary.get("schema_version"), JSH1045_EXPANSION_SCHEMA_VERSION, "schema_version", errors)
+    _expect_equal(summary.get("source_manifest"), str(DEFAULT_JSH1043_MANIFEST_PATH), "source_manifest", errors)
+    _expect_equal(summary.get("source_design"), "docs/jsh-1042-agent-use-value-gate-design.md", "source_design", errors)
+    _expect_equal(
+        summary.get("task"),
+        "tasks/jsh-1045-agent-use-value-gate-expansion-after-stop-contract.md",
+        "task",
+        errors,
+    )
+    if summary.get("raw_private_text_committed") is not False:
+        errors.append("raw_private_text_committed must be false")
+
+    run_id_value = summary.get("run_id")
+    if isinstance(run_id_value, str):
+        run_id = run_id_value
+    if not run_id:
+        errors.append("run_id must be a non-empty string")
+
+    raw_private_trace_root_value = summary.get("raw_private_trace_root")
+    if isinstance(raw_private_trace_root_value, str):
+        raw_private_trace_root = raw_private_trace_root_value
+    if not raw_private_trace_root.startswith(".private/jsh-1045/"):
+        errors.append("raw_private_trace_root must point to parent .private/jsh-1045/")
+    if "worktrees/" in raw_private_trace_root:
+        errors.append("raw_private_trace_root must not point inside worktrees/")
+
+    host_guard = summary.get("host_guard")
+    if not isinstance(host_guard, dict):
+        errors.append("host_guard must be an object")
+    else:
+        status_value = host_guard.get("status")
+        if isinstance(status_value, str):
+            host_guard_status = status_value
+        if host_guard_status not in {"OK", "WARN"}:
+            errors.append("host_guard.status must be OK or WARN for scoped expansion")
+        if host_guard_status == "WARN" and host_guard.get("user_explicitly_accepted_warn_progress") is not True:
+            errors.append("WARN scoped expansion requires user_explicitly_accepted_warn_progress=true")
+        private_log = host_guard.get("private_log")
+        if not isinstance(private_log, str) or not private_log.startswith(".private/jsh-1045/"):
+            errors.append("host_guard.private_log must point to parent .private/jsh-1045/")
+
+    cases = summary.get("selected_cases")
+    if not isinstance(cases, list):
+        errors.append("selected_cases must be a list")
+        cases = []
+    case_count = len(cases)
+    if case_count < MIN_EXPANSION_CASES:
+        errors.append(f"selected_cases must contain at least {MIN_EXPANSION_CASES} cases")
+    case_ids = {case.get("case_id") for case in cases if isinstance(case, dict)}
+    if "C04-semantic-wrapup-failure-modes" not in case_ids:
+        errors.append("selected_cases must include C04-semantic-wrapup-failure-modes")
+    if "C10-literal-provenance-exact-identifier" not in case_ids:
+        errors.append("selected_cases must include C10-literal-provenance-exact-identifier")
+    if not ({"C06-historical-meta-fsm-provenance", "C08-churn-read-more-over-search"} & case_ids):
+        errors.append("selected_cases must include at least one C06 historical/meta-FSM or C08 churn case")
+
+    for case_index, case in enumerate(cases):
+        lane_count += _validate_reduced_run_case(
+            case,
+            case_index,
+            errors,
+            require_raw_files=require_raw_files,
+            private_root=resolved_private_root,
+            private_prefix=".private/jsh-1045/",
+        )
+        if require_raw_files and isinstance(case, dict):
+            raw_file_count += _count_lane_artifact_paths(case)
+
+    if require_raw_files:
+        host_guard_log = summary.get("host_guard", {}).get("private_log") if isinstance(summary.get("host_guard"), dict) else None
+        if isinstance(host_guard_log, str):
+            raw_file_count += 1
+            _validate_raw_artifact_path(
+                host_guard_log,
+                "host_guard.private_log",
+                errors,
+                private_root=resolved_private_root,
+                parse_json=False,
+            )
+
+    checks = summary.get("post_stop_contract_checks")
+    if not isinstance(checks, dict):
+        errors.append("post_stop_contract_checks must be an object")
+    else:
+        c04_contract = checks.get("c04_answer_ready_contract")
+        if not isinstance(c04_contract, dict):
+            errors.append("post_stop_contract_checks.c04_answer_ready_contract must be an object")
+        else:
+            c04_answer_ready = c04_contract.get("answer_ready") is True
+            c04_stop_broad_search = c04_contract.get("stop_broad_search") is True
+            c04_contract_passed = c04_contract.get("all_required_checks_passed") is True
+            if not c04_answer_ready:
+                errors.append("C04 contract must have answer_ready=true")
+            if not c04_stop_broad_search:
+                errors.append("C04 contract must have stop_broad_search=true")
+            if c04_contract.get("decision") != "answer_ready_after_source_inspection":
+                errors.append("C04 contract decision must be answer_ready_after_source_inspection")
+            if c04_contract.get("required_next_action_mentions_no_broad_search") is not True:
+                errors.append("C04 contract must prove required_next_action says not to broad-search first")
+            if not c04_contract_passed:
+                errors.append("C04 contract all_required_checks_passed must be true")
+        if checks.get("full_gate_completion_claimed") is not False:
+            errors.append("full_gate_completion_claimed must be false")
+        if checks.get("broad_arm_promotion_claimed") is not False:
+            errors.append("broad_arm_promotion_claimed must be false")
+
+    result_class_value = summary.get("result_class")
+    if isinstance(result_class_value, str):
+        result_class = result_class_value
+    if result_class not in REQUIRED_DECISION_THRESHOLDS:
+        errors.append("result_class must be one of the pre-registered decision thresholds")
+
+    status = "fail" if errors else "pass"
+    return AgentUseValueExpansionValidation(
+        str(path),
+        status,
+        tuple(errors),
+        tuple(warnings),
+        run_id,
+        case_count,
+        lane_count,
+        raw_private_trace_root,
+        host_guard_status,
+        result_class,
+        c04_answer_ready,
+        c04_stop_broad_search,
+        c04_contract_passed,
+        require_raw_files,
+        raw_file_count,
+    )
+
+
+def build_agent_use_value_expansion_validation_payload(
+    path: Path = DEFAULT_JSH1045_EXPANSION_SUMMARY_PATH,
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
+) -> dict[str, Any]:
+    return validate_agent_use_value_expansion_summary(
+        path,
+        require_raw_files=require_raw_files,
+        private_root=private_root,
+    ).to_payload()
+
+
 def _validate_case(case: Any, index: int, errors: list[str]) -> None:
     label = f"cases[{index}]"
     if not isinstance(case, dict):
@@ -438,6 +695,7 @@ def _validate_reduced_run_case(
     *,
     require_raw_files: bool = False,
     private_root: Path | None = None,
+    private_prefix: str = ".private/jsh-1043/",
 ) -> int:
     label = f"selected_cases[{index}]"
     if not isinstance(case, dict):
@@ -464,6 +722,7 @@ def _validate_reduced_run_case(
             errors,
             require_raw_files=require_raw_files,
             private_root=private_root,
+            private_prefix=private_prefix,
         )
     return len(lanes)
 
@@ -475,6 +734,7 @@ def _validate_reduced_run_lane(
     *,
     require_raw_files: bool = False,
     private_root: Path | None = None,
+    private_prefix: str = ".private/jsh-1043/",
 ) -> None:
     if not isinstance(lane, dict):
         errors.append(f"{label} must be an object")
@@ -500,8 +760,8 @@ def _validate_reduced_run_lane(
     else:
         for key in REQUIRED_LANE_ARTIFACTS:
             path = artifact_paths.get(key)
-            if not isinstance(path, str) or not path.startswith(".private/jsh-1043/"):
-                errors.append(f"{label}.artifact_paths.{key} must point to parent .private/jsh-1043/")
+            if not isinstance(path, str) or not path.startswith(private_prefix):
+                errors.append(f"{label}.artifact_paths.{key} must point to parent {private_prefix}")
             elif require_raw_files:
                 _validate_raw_artifact_path(
                     path,
