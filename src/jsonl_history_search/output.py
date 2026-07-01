@@ -2077,6 +2077,13 @@ def render_status_anchor_text(payload: dict) -> str:
     ])
     if selected:
         lines.append(
+            "Anchor decision: "
+            f"context_boundary={selected.get('context_boundary')} "
+            f"anchor_scope={selected.get('anchor_scope')} "
+            f"anchor_reason={selected.get('anchor_reason')} "
+            f"anchor_ref={selected.get('anchor_ref')}"
+        )
+        lines.append(
             "Selected anchor: "
             f"{selected.get('timestamp_utc')} {selected.get('source_ref')}: "
             f"{selected.get('snippet')}"
@@ -2150,6 +2157,12 @@ def render_status_anchor_markdown(payload: dict) -> str:
             [
                 "## Selected Anchor",
                 "",
+                (
+                    f"- Decision: `context_boundary={selected.get('context_boundary')}` "
+                    f"`anchor_scope={selected.get('anchor_scope')}` "
+                    f"`anchor_reason={selected.get('anchor_reason')}` "
+                    f"`anchor_ref={selected.get('anchor_ref')}`"
+                ),
                 (
                     f"- `{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`: "
                     f"{selected.get('snippet')}"

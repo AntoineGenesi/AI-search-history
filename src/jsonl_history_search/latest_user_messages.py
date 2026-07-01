@@ -8,7 +8,16 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from .conversation_records import extract_human_ask
+from .conversation_records import (
+    ASSISTANT_OR_AGENT_MESSAGE,
+    COMPACTED_HISTORY_SUMMARY,
+    INJECTED_ENVIRONMENT_CONTEXT,
+    SUBAGENT_NOTIFICATION,
+    TOOL_ACTION_OUTPUT,
+    TURN_CONTROL_OR_STATUS,
+    classify_conversation_record,
+    extract_human_ask,
+)
 from .timeutil import parse_datetime
 
 
@@ -23,6 +32,7 @@ class LatestUserMessage:
     source_kind: str
     source_ref: str
     source_identifier: str
+    thread_key: str
     line: int
     openable_source_ref: dict[str, Any] | None = None
     openable_target: str | None = None
@@ -203,7 +213,7 @@ def _extract_user_message(
     if source.kind == "codex_history":
         text = _clean_text(data.get("text"))
         timestamp = parse_datetime(data.get("ts") or data.get("timestamp") or data.get("created_at"), default_tz)
-        if not text or timestamp is None:
+        if not text or timestamp is None or _history_text_is_non_human(data, text):
             return None
         identifier = _history_identifier(data)
         return LatestUserMessage(
@@ -212,7 +222,10 @@ def _extract_user_message(
             source_kind=source.kind,
             source_ref=f"codex_history:history.jsonl:{line_number}",
             source_identifier=identifier,
+            thread_key=identifier,
             line=line_number,
+            openable_source_ref=_openable_source_ref(source.path, line_number),
+            openable_target=_openable_target(source.path, line_number),
         )
 
     extracted = extract_human_ask(data)
@@ -227,6 +240,7 @@ def _extract_user_message(
         source_kind=source.kind,
         source_ref=_session_ref(source.path, codex_home, line=line_number),
         source_identifier=source.identifier,
+        thread_key=source.identifier,
         line=line_number,
         openable_source_ref=_openable_source_ref(source.path, line_number),
         openable_target=_openable_target(source.path, line_number),
@@ -270,6 +284,8 @@ def _message_to_dict(message: LatestUserMessage, local_tz, snippet_chars: int) -
         "source_kind": message.source_kind,
         "source_ref": message.source_ref,
         "source_identifier": message.source_identifier,
+        "thread_key": message.thread_key,
+        "thread_keys": _thread_keys(message),
         "mirror_sources": message.mirror_sources,
         "snippet": text.replace("\n", " "),
         "truncated": truncated,
@@ -286,12 +302,54 @@ def _mirror_source(message: LatestUserMessage) -> dict:
         "source_kind": message.source_kind,
         "source_ref": message.source_ref,
         "source_identifier": message.source_identifier,
+        "thread_key": message.thread_key,
     }
     if message.openable_source_ref:
         rendered["openable_source_ref"] = message.openable_source_ref
     if message.openable_target:
         rendered["openable_target"] = message.openable_target
     return rendered
+
+
+def _thread_keys(message: LatestUserMessage) -> list[str]:
+    keys = {message.thread_key}
+    for mirror in message.mirror_sources:
+        key = mirror.get("thread_key") or mirror.get("source_identifier")
+        if key:
+            keys.add(str(key))
+    return sorted(keys)
+
+
+def _history_text_is_non_human(data: Mapping[str, Any], text: str) -> bool:
+    classification = classify_conversation_record(data)
+    if classification.label in {
+        ASSISTANT_OR_AGENT_MESSAGE,
+        COMPACTED_HISTORY_SUMMARY,
+        INJECTED_ENVIRONMENT_CONTEXT,
+        SUBAGENT_NOTIFICATION,
+        TOOL_ACTION_OUTPUT,
+        TURN_CONTROL_OR_STATUS,
+    }:
+        return True
+    normalized = _normalized_text(text)
+    if normalized.startswith(("<subagent_notification", "<environment_context", "<tool_output", "<tool_result")):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "subagent_notification",
+            "subagent notification",
+            "tool output",
+            "tool_result",
+            "function_call_output",
+            "compacted history summary",
+            "inherited summary",
+            "inherited conversation summary",
+            "side-thread boundary",
+            "side conversation boundary",
+            "conversation boundary",
+        )
+    )
 
 
 def _openable_source_ref(path: Path, line: int) -> dict[str, Any]:

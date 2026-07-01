@@ -39,6 +39,25 @@ ADMIN_STATUS_MARKERS = (
     "last message",
 )
 
+NON_ANCHOR_CONTEXT_MARKERS = (
+    "subagent_notification",
+    "subagent notification",
+    "tool output",
+    "tool_result",
+    "tool result",
+    "function_call_output",
+    "function call output",
+    "compacted history summary",
+    "inherited summary",
+    "inherited conversation summary",
+    "boundary text",
+    "side-thread boundary",
+    "side conversation boundary",
+    "conversation boundary",
+    "<environment_context",
+    "</environment_context>",
+)
+
 WORKER_PROMPT_MARKERS = (
     "you are the jsh-",
     "you are the high-reasoning implementer",
@@ -155,8 +174,17 @@ def status_anchor_report(
     codex_home: Path | None = None,
     started: float | None = None,
 ) -> dict:
-    anchor_candidates = _rank_anchor_candidates(latest.get("messages", []))
-    selected_anchor = _with_read_more_command(_select_anchor(anchor_candidates), cwd=cwd, codex_home=codex_home)
+    latest_messages = latest.get("messages", [])
+    anchor_candidates = _rank_anchor_candidates(latest_messages)
+    anchor_decision = _select_anchor_with_boundary(query=query, messages=latest_messages, candidates=anchor_candidates)
+    selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
+    if selected_anchor:
+        selected_anchor.update(_anchor_decision_fields(anchor_decision, selected_anchor))
+    anchor_decision = {
+        **anchor_decision,
+        "selected_anchor": None,
+        "anchor_ref": selected_anchor.get("source_ref") if selected_anchor else None,
+    }
     artifacts = _collect_work_artifacts(cwd)
     behavior_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "behavior_delta"]
     non_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "non_delta"]
@@ -181,6 +209,10 @@ def status_anchor_report(
             "jsonl_first": True,
             "built_on": "latest_user_messages",
             "no_spawned_agents": True,
+            "context_boundary": anchor_decision["context_boundary"],
+            "anchor_scope": anchor_decision["anchor_scope"],
+            "anchor_reason": anchor_decision["anchor_reason"],
+            "anchor_ref": anchor_decision["anchor_ref"],
         },
         "source_scope": latest.get("source_scope"),
         "summary": {
@@ -191,9 +223,13 @@ def status_anchor_report(
             "non_delta_count": len(non_deltas),
             "unresolved_blocker_count": len(unresolved_blockers),
             "elapsed_seconds": elapsed,
+            "context_boundary": anchor_decision["context_boundary"],
+            "anchor_scope": anchor_decision["anchor_scope"],
+            "anchor_reason": anchor_decision["anchor_reason"],
         },
         "anchor_candidates": anchor_candidates,
         "selected_anchor": selected_anchor,
+        "anchor_decision": anchor_decision,
         "next_reads": next_reads,
         "agent_instruction": _agent_instruction(selected_anchor, next_reads),
         "work_products": {
@@ -245,6 +281,9 @@ def _rank_anchor_candidates(messages: list[dict]) -> list[dict]:
                 "openable_target": message.get("openable_target"),
                 "timestamp_utc": message.get("timestamp_utc"),
                 "local_timestamp": message.get("local_timestamp"),
+                "message_index": index,
+                "thread_key": message.get("thread_key"),
+                "thread_keys": _message_thread_keys(message),
                 "snippet": text,
                 "classification": classification,
                 "score": score,
@@ -271,6 +310,8 @@ def _score_anchor(text: str, index: int, *, timestamp_utc: str = "", status_cuto
     recency_penalty = min(index, 20)
     if not normalized:
         return -100, "empty", "rejected", "empty latest-message row"
+    if any(marker in normalized for marker in NON_ANCHOR_CONTEXT_MARKERS):
+        return -70 - recency_penalty, "non_human_boundary_or_tool_context", "rejected", "boundary/tool/subagent/inherited context is not a user anchor"
     if any(marker in normalized for marker in WORKER_PROMPT_MARKERS):
         return -55 - recency_penalty, "worker_or_reviewer_prompt", "rejected", "worker/reviewer prompt is not a human status anchor"
     if any(marker in normalized for marker in ADMIN_STATUS_MARKERS):
@@ -301,6 +342,158 @@ def _select_anchor(candidates: list[dict]) -> dict | None:
             selected["rationale"] = selected["rationale"] + "; selected as fallback because no stronger work anchor was found"
             return selected
     return None
+
+
+def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates: list[dict]) -> dict:
+    base = {
+        "context_boundary": "none",
+        "anchor_scope": "ranked_history",
+        "anchor_reason": "ranked_substantive_or_fallback_candidate",
+        "anchor_ref": None,
+        "status_ref": None,
+        "selected_anchor": None,
+        "excluded_as_anchor": [
+            "subagent_notification",
+            "tool_output",
+            "inherited_summary",
+            "boundary_text",
+            "worker_prompt",
+            "status_question",
+        ],
+    }
+    by_ref = {candidate.get("source_ref"): candidate for candidate in candidates}
+    if is_status_question(query):
+        status_message = _current_status_message(messages)
+        if status_message:
+            status_ref = status_message.get("source_ref")
+            status_index = int(status_message.get("message_index", 0))
+            status_thread_keys = set(status_message.get("thread_keys") or [])
+            older = sorted(
+                (
+                    candidate
+                    for candidate in candidates
+                    if int(candidate.get("message_index", 0)) > status_index
+                ),
+                key=lambda item: int(item.get("message_index", 0)),
+            )
+            same_thread_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=True)
+            if same_thread_anchor:
+                has_prior_same_thread_status = any(
+                    _thread_key_overlap(candidate, status_thread_keys) and candidate.get("classification") == "admin_or_status_turn"
+                    for candidate in older
+                )
+                reason = (
+                    "side_thread_follow_up_prior_same_thread_user_message"
+                    if has_prior_same_thread_status
+                    else "latest_prior_same_thread_user_message"
+                )
+                boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
+                return {
+                    **base,
+                    "context_boundary": boundary,
+                    "anchor_scope": "same_thread",
+                    "anchor_reason": reason,
+                    "anchor_ref": same_thread_anchor.get("source_ref"),
+                    "status_ref": status_ref,
+                    "selected_anchor": _selected_with_reason(
+                        same_thread_anchor,
+                        "; selected as the latest eligible prior user message in the same thread",
+                    ),
+                }
+            parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
+            if parent_anchor:
+                return {
+                    **base,
+                    "context_boundary": "side_thread",
+                    "anchor_scope": "parent_thread",
+                    "anchor_reason": "first_side_thread_user_message_after_boundary",
+                    "anchor_ref": parent_anchor.get("source_ref"),
+                    "status_ref": status_ref,
+                    "selected_anchor": _selected_with_reason(
+                        parent_anchor,
+                        "; selected as the last eligible parent/main-thread user message before the side-thread boundary",
+                    ),
+                }
+            base = {
+                **base,
+                "context_boundary": "status_question_no_prior_anchor",
+                "anchor_scope": "none",
+                "anchor_reason": "no_eligible_prior_user_message_found",
+                "status_ref": status_ref,
+            }
+    selected = _select_anchor(candidates)
+    if selected:
+        selected_ref = selected.get("source_ref")
+        selected = by_ref.get(selected_ref, selected)
+        return {
+            **base,
+            "anchor_ref": selected_ref,
+            "selected_anchor": selected,
+        }
+    return base
+
+
+def _current_status_message(messages: list[dict]) -> dict | None:
+    for index, message in enumerate(messages):
+        if is_status_question(str(message.get("snippet") or "")):
+            current = dict(message)
+            current["message_index"] = index
+            current["thread_keys"] = _message_thread_keys(message)
+            return current
+    return None
+
+
+def _first_eligible_thread_anchor(candidates: list[dict], thread_keys: set[str], *, same_thread: bool) -> dict | None:
+    for candidate in candidates:
+        overlaps = _thread_key_overlap(candidate, thread_keys)
+        if overlaps != same_thread:
+            continue
+        if _is_eligible_anchor(candidate):
+            return candidate
+    return None
+
+
+def _is_eligible_anchor(candidate: dict) -> bool:
+    return candidate.get("decision") in {"selected_candidate", "fallback_candidate"} and int(candidate.get("score") or 0) > 0
+
+
+def _thread_key_overlap(candidate: dict, thread_keys: set[str]) -> bool:
+    if not thread_keys:
+        return False
+    candidate_keys = set(candidate.get("thread_keys") or [])
+    return bool(candidate_keys & thread_keys)
+
+
+def _message_thread_keys(message: dict) -> list[str]:
+    keys = {str(key) for key in message.get("thread_keys", []) if key}
+    key = message.get("thread_key")
+    if key:
+        keys.add(str(key))
+    identifier = message.get("source_identifier")
+    if identifier:
+        keys.add(str(identifier))
+    for mirror in message.get("mirror_sources") or []:
+        if not isinstance(mirror, dict):
+            continue
+        mirror_key = mirror.get("thread_key") or mirror.get("source_identifier")
+        if mirror_key:
+            keys.add(str(mirror_key))
+    return sorted(keys)
+
+
+def _selected_with_reason(candidate: dict, reason_suffix: str) -> dict:
+    selected = dict(candidate)
+    selected["rationale"] = str(selected.get("rationale") or "").rstrip() + reason_suffix
+    return selected
+
+
+def _anchor_decision_fields(anchor_decision: dict, selected_anchor: dict) -> dict:
+    return {
+        "context_boundary": anchor_decision.get("context_boundary"),
+        "anchor_scope": anchor_decision.get("anchor_scope"),
+        "anchor_reason": anchor_decision.get("anchor_reason"),
+        "anchor_ref": anchor_decision.get("anchor_ref") or selected_anchor.get("source_ref"),
+    }
 
 
 def _collect_work_artifacts(cwd: Path) -> dict:
