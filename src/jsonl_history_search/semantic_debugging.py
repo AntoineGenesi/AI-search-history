@@ -828,6 +828,14 @@ def inferred_anchor_next_reads(
         )
     )
     reads.extend(
+        inferred_explicit_date_remembered_instruction_next_reads(
+            query=query,
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+    )
+    reads.extend(
         inferred_remembered_topic_next_reads(
             query=query,
             source_plan=source_plan,
@@ -1065,6 +1073,83 @@ def inferred_known_action_case_next_reads(
             "source_window_verification_required": True,
             "claim_boundary": "inferred_known_case_anchor_not_final_answer",
         }
+        reads.append(read)
+    return reads
+
+
+def inferred_explicit_date_remembered_instruction_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    text = str(query or "").casefold()
+    if not any(
+        phrase in text
+        for phrase in (
+            "what prior instruction",
+            "what instruction",
+            "prior instruction",
+            "what did i tell",
+            "what did the user give",
+            "what did the user say",
+        )
+    ):
+        return []
+    date_matches = EXPLICIT_DATE_RE.findall(str(query or ""))
+    if not date_matches:
+        return []
+    topic_terms = remembered_topic_terms(text)
+    topic_terms.discard("instruction")
+    if not topic_terms:
+        return []
+    roots = semantic_debug_codex_session_roots(source_plan)
+    files: list[Path] = []
+    for year, month, day in date_matches[:2]:
+        for root in roots:
+            date_dir = root / year / month / day
+            if date_dir.is_dir():
+                files.extend(sorted(date_dir.glob("*.jsonl"), key=lambda path: path.name))
+    scored: list[dict[str, Any]] = []
+    for path in files[:160]:
+        scored.extend(
+            inferred_topic_records_for_path(
+                path,
+                topic_terms=topic_terms,
+                query=query,
+            )
+        )
+    scored.sort(
+        key=lambda item: (
+            -float(item["score"]),
+            str(item.get("timestamp_utc") or ""),
+            str((item.get("source_ref") or {}).get("path") or ""),
+            int((item.get("source_ref") or {}).get("line") or 0),
+        )
+    )
+    reads: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:3], 1):
+        read = inferred_anchor_read(
+            source_ref=item["source_ref"],
+            anchor_id=f"explicit-date-remembered-instruction-{index:03d}",
+            reason=(
+                "open explicit-date remembered-instruction source window before "
+                "current-session prompt echoes or broad repo search"
+            ),
+            anchor_kind="explicit_date_remembered_instruction",
+            confidence="medium" if item["score"] < 80 else "high",
+            selection_reason=item["selection_reason"],
+            score=item["score"],
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+        read["inferred_anchor"]["bounded_to_explicit_date_window"] = True
+        read["inferred_anchor"]["broad_rg_after_required_reads_discouraged"] = True
+        read["inferred_anchor"]["current_session_echo_recovery_discouraged"] = True
+        echo = item.get("prompt_echo_classification")
+        if isinstance(echo, dict):
+            read["inferred_anchor"]["prompt_echo_resistance"] = echo
         reads.append(read)
     return reads
 
@@ -2824,7 +2909,11 @@ def primary_followthrough_reads(
     if not reads:
         for item in bounded_next_reads:
             inferred = item.get("inferred_anchor") if isinstance(item.get("inferred_anchor"), dict) else {}
-            if inferred.get("anchor_kind") in {"known_action_case", "remembered_topic"}:
+            if inferred.get("anchor_kind") in {
+                "known_action_case",
+                "remembered_topic",
+                "explicit_date_remembered_instruction",
+            }:
                 reads.append(item)
     return dedupe_primary_targets(reads)[:3]
 
@@ -2869,6 +2958,16 @@ def primary_followthrough_window(
             "after": 8,
             "max_records": 80,
             "reason": "action_proof_needs_preceding_tool_and_diff_context",
+        }
+    if anchor_kind == "explicit_date_remembered_instruction":
+        return {
+            "before": 2,
+            "after": 10,
+            "max_records": 40,
+            "projection": "compact",
+            "compact_text_limit": 500,
+            "format": "text",
+            "reason": "explicit_date_remembered_instruction_window_before_prompt_echo_recovery",
         }
     if anchor_kind == "remembered_topic" or "recent user topic/provenance" in str(read.get("reason") or ""):
         return {
