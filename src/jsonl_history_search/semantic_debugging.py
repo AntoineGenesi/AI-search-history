@@ -164,6 +164,7 @@ def build_semantic_debug_payload(
         )
         + next_reads
     )[:12]
+    next_reads = prefer_complete_explicit_correction_window_reads(next_reads)
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
         candidates=candidates,
@@ -219,7 +220,9 @@ def build_semantic_debug_payload(
         evidence_context_window=requested_evidence_context_window,
     )
     if source_locator_handoff.get("next_reads") != next_reads:
-        next_reads = list(source_locator_handoff.get("next_reads") or next_reads)
+        next_reads = prefer_complete_explicit_correction_window_reads(
+            list(source_locator_handoff.get("next_reads") or next_reads)
+        )
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
             candidates=candidates,
@@ -936,6 +939,39 @@ def select_explicit_correction_window_records(scored: list[dict[str, Any]]) -> l
     return selected[:4]
 
 
+EXPLICIT_CORRECTION_WINDOW_REQUIRED_ROLES = {
+    "followup_correction",
+    "source_inspection",
+    "first_distinction",
+    "user_challenge",
+}
+
+
+def explicit_correction_window_meta(read: dict[str, Any]) -> dict[str, Any]:
+    meta = read.get("correction_window_source_selection")
+    return meta if isinstance(meta, dict) else {}
+
+
+def is_explicit_date_correction_window_read(read: dict[str, Any]) -> bool:
+    meta = explicit_correction_window_meta(read)
+    return bool(meta.get("bounded_to_explicit_date_window") and meta.get("bundle_role"))
+
+
+def complete_explicit_correction_window_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    explicit_reads = [read for read in reads if is_explicit_date_correction_window_read(read)]
+    roles = {str(explicit_correction_window_meta(read).get("bundle_role") or "") for read in explicit_reads}
+    if not EXPLICIT_CORRECTION_WINDOW_REQUIRED_ROLES <= roles:
+        return []
+    return explicit_reads
+
+
+def prefer_complete_explicit_correction_window_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    explicit_reads = complete_explicit_correction_window_reads(reads)
+    if not explicit_reads:
+        return reads
+    return dedupe_dicts(explicit_reads)
+
+
 def explicit_correction_window_role_hint(selection_reason: str) -> dict[str, str]:
     if selection_reason == "source_inspection_for_correction_window":
         return {
@@ -1088,8 +1124,11 @@ def inferred_remembered_topic_next_reads(
 def semantic_debug_codex_session_roots(source_plan: dict[str, Any]) -> list[Path]:
     roots = []
     for root in ((source_plan.get("sources") or {}).get("roots") or source_plan.get("roots") or []):
-        if root.get("kind") == "codex_sessions" and root.get("path"):
-            roots.append(Path(str(root["path"])).expanduser())
+        if not root.get("path"):
+            continue
+        path = Path(str(root["path"])).expanduser()
+        if root.get("kind") == "codex_sessions" or path.name == "sessions":
+            roots.append(path)
     return roots
 
 
@@ -2006,6 +2045,9 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
             "inferred_anchor": read.get("inferred_anchor")
             if isinstance(read.get("inferred_anchor"), dict)
             else None,
+            "correction_window_source_selection": read.get("correction_window_source_selection")
+            if isinstance(read.get("correction_window_source_selection"), dict)
+            else None,
             "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
             "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
             "action": guidance,
@@ -2685,6 +2727,15 @@ def primary_followthrough_reads(
             if item.get("target"):
                 reads.append(item)
     if not reads:
+        explicit_reads = complete_explicit_correction_window_reads(bounded_next_reads)
+        if explicit_reads:
+            source_inspection_reads = [
+                read
+                for read in explicit_reads
+                if explicit_correction_window_meta(read).get("bundle_role") == "source_inspection"
+            ]
+            reads.extend(source_inspection_reads or explicit_reads[:1])
+    if not reads:
         for item in bounded_next_reads:
             inferred = item.get("inferred_anchor") if isinstance(item.get("inferred_anchor"), dict) else {}
             if inferred.get("anchor_kind") in {"known_action_case", "remembered_topic"}:
@@ -2711,6 +2762,14 @@ def primary_followthrough_window(
 ) -> dict[str, int | str]:
     inferred = read.get("inferred_anchor") if isinstance(read.get("inferred_anchor"), dict) else {}
     anchor_kind = inferred.get("anchor_kind")
+    correction_meta = explicit_correction_window_meta(read)
+    if correction_meta.get("bounded_to_explicit_date_window"):
+        return {
+            "before": 2,
+            "after": 115,
+            "max_records": 140,
+            "reason": "explicit_correction_source_window_covers_inspection_distinction_challenge_and_correction",
+        }
     if str(read.get("read_type") or "") == "required_primary_proof_read" or (
         action_proof_plan
         and action_proof_plan.get("applies")
@@ -4540,12 +4599,23 @@ def build_answer_readiness(
     deferred_ledger_count = int(surface_counts.get("final_surface_status:deferred_with_next_read", 0) or 0)
     no_evidence_ledger_count = int(surface_counts.get("final_surface_status:not_applicable", 0) or 0)
     recovery_available = omitted_window_recovery.get("status") == "available"
+    explicit_correction_window_ready = bool(complete_explicit_correction_window_reads(next_reads))
     audit_route_required = any(route_state["required"] for route_state in route_states if route_state["route"] in AUDIT_ROUTE_NAMES)
     if no_evidence.get("needed"):
         readiness_status = "scoped_no_evidence_ready"
         decision = "state_scoped_no_evidence"
         allowed_answer_scope = "searched_scope_no_evidence"
         required_before_answer = list(scope_ready_required_actions(no_evidence))
+    elif explicit_correction_window_ready and final_answer_contract.get("source_use_required"):
+        readiness_status = "answer_ready"
+        decision = "answer_now"
+        allowed_answer_scope = "explicit_date_source_window"
+        required_before_answer = [
+            (
+                "Open the primary explicit-date source window, answer only from that window, "
+                "and do not run repo rg/current-session recovery unless a named answer facet remains missing."
+            ),
+        ]
     elif recovery_available:
         readiness_status = "inspect_recovery_first"
         decision = "inspect_recovery_reads"
