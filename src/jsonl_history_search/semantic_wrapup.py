@@ -16,6 +16,18 @@ SCHEMA_VERSION = 1
 INLINE_FAILURE_MODE_LIMIT = 10
 DESTINATION_SCAN_LIMIT = 200
 ORCHESTRATION_EVIDENCE_LIMIT = 20
+ORCHESTRATION_DIVERSITY_CATEGORIES = (
+    "worker_or_subagent_behavior",
+    "reviewer_proof_or_claim_boundary",
+    "same_task_repair_logic",
+    "product_delta_integration_audit",
+    "product_moving_vs_process_drift",
+)
+ORCHESTRATION_DIVERSITY_ACTORS = (
+    "worker_or_subagent_summary",
+    "reviewer_or_review_summary",
+)
+ORCHESTRATION_PRIMARY_RANKED_LIMIT = 10
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
 
@@ -623,7 +635,7 @@ def _orchestration_evidence(records, *, signals: list[dict], query: str) -> dict
             }
         )
     ranked = sorted(evidence, key=lambda item: (-_orchestration_priority(item), item.get("timestamp_utc") or "", item["source_ref"]["path"], item["source_ref"]["line"]))
-    returned = ranked[:ORCHESTRATION_EVIDENCE_LIMIT]
+    returned = _select_orchestration_items(ranked, limit=ORCHESTRATION_EVIDENCE_LIMIT)
     return {
         "total_count": len(evidence),
         "returned_count": len(returned),
@@ -639,6 +651,49 @@ def _orchestration_evidence(records, *, signals: list[dict], query: str) -> dict
             "setup_echo=true records are prompt/setup surfaces and are excluded from failure-mode grouping."
         ),
     }
+
+
+def _select_orchestration_items(ranked: list[dict], *, limit: int) -> list[dict]:
+    if len(ranked) <= limit:
+        return ranked
+
+    selected: list[dict] = []
+    selected_keys: set[tuple[str, int]] = set()
+
+    def add(item: dict) -> bool:
+        ref = item.get("source_ref") or {}
+        key = (str(ref.get("path") or ""), int(ref.get("line") or 0))
+        if key in selected_keys or len(selected) >= limit:
+            return False
+        selected.append(item)
+        selected_keys.add(key)
+        return True
+
+    for item in ranked[: min(ORCHESTRATION_PRIMARY_RANKED_LIMIT, limit)]:
+        add(item)
+
+    for category in ORCHESTRATION_DIVERSITY_CATEGORIES:
+        for item in ranked:
+            if not item.get("substantive"):
+                continue
+            if item.get("actor_label") in {"user", "user_prompt_or_assignment"}:
+                continue
+            if category in (item.get("categories") or []):
+                add(item)
+                break
+
+    for actor in ORCHESTRATION_DIVERSITY_ACTORS:
+        for item in ranked:
+            if item.get("substantive") and item.get("actor_label") == actor:
+                add(item)
+                break
+
+    for item in ranked:
+        if len(selected) >= limit:
+            break
+        add(item)
+
+    return selected
 
 
 def _orchestration_categories(text: str, *, role: str | None, query: str, signal: dict | None) -> list[str]:
