@@ -49,6 +49,11 @@ After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
 JSONL directly before `ask` for these natural prompts.
 
+Do not combine reading this skill with `pwd`, `rg --files`, `find`, `ls -R`,
+TODO scans, broad repo `rg`, or direct JSONL spelunking for natural history
+prompts. If the command needs the current directory, pass `--cwd "$PWD"`; do
+not dump repo file lists or workspace inventories before `ask`.
+
 ## Route Table
 
 | User ask shape | Route | Read | First command |
