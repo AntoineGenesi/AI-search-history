@@ -1354,6 +1354,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH),
         help="Committed-safe JSH-1043 reduced run summary to validate.",
     )
+    reduced_agent_use_value_gate.add_argument(
+        "--require-raw-files",
+        action="store_true",
+        help="Also verify that private raw artifact paths exist and JSON artifacts parse.",
+    )
+    reduced_agent_use_value_gate.add_argument(
+        "--private-root",
+        default=".",
+        help="Root used to resolve .private/jsh-1043 paths when --require-raw-files is set.",
+    )
     embedding_experiment = subparsers.add_parser("embedding-experiment")
     add_common_args(embedding_experiment)
     embedding_experiment.add_argument(
@@ -2346,7 +2356,11 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         return 1 if payload["agent_use_value_gate_manifest_validation"]["status"] != "pass" else 0
     if args.command == "validate-agent-use-value-reduced-run":
-        payload = build_agent_use_value_reduced_run_validation_payload(Path(args.summary).expanduser())
+        payload = build_agent_use_value_reduced_run_validation_payload(
+            Path(args.summary).expanduser(),
+            require_raw_files=args.require_raw_files,
+            private_root=Path(args.private_root).expanduser(),
+        )
         rendered = render(payload, args.format)
         print(rendered)
         return 1 if payload["agent_use_value_reduced_run_validation"]["status"] != "pass" else 0

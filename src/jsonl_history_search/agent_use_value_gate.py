@@ -87,6 +87,8 @@ class AgentUseValueReducedRunValidation:
     raw_private_trace_root: str
     host_guard_status: str
     result_class: str
+    raw_file_check_enabled: bool
+    raw_file_count: int
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -101,6 +103,8 @@ class AgentUseValueReducedRunValidation:
                 "raw_private_trace_root": self.raw_private_trace_root,
                 "host_guard_status": self.host_guard_status,
                 "result_class": self.result_class,
+                "raw_file_check_enabled": self.raw_file_check_enabled,
+                "raw_file_count": self.raw_file_count,
                 "raw_private_text_committed": False,
                 "requires_parent_private_trace_root": True,
                 "errors": list(self.errors),
@@ -242,6 +246,9 @@ def validate_agent_use_value_manifest(path: Path = DEFAULT_JSH1043_MANIFEST_PATH
 
 def validate_agent_use_value_reduced_run_summary(
     path: Path = DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
 ) -> AgentUseValueReducedRunValidation:
     errors: list[str] = []
     warnings: list[str] = []
@@ -251,6 +258,8 @@ def validate_agent_use_value_reduced_run_summary(
     result_class = ""
     case_count = 0
     lane_count = 0
+    raw_file_count = 0
+    resolved_private_root = private_root or Path(".")
 
     try:
         summary = json.loads(path.read_text(encoding="utf-8"))
@@ -266,6 +275,8 @@ def validate_agent_use_value_reduced_run_summary(
             "",
             "",
             "",
+            require_raw_files,
+            0,
         )
     except json.JSONDecodeError as exc:
         return AgentUseValueReducedRunValidation(
@@ -279,6 +290,8 @@ def validate_agent_use_value_reduced_run_summary(
             "",
             "",
             "",
+            require_raw_files,
+            0,
         )
 
     if not isinstance(summary, dict):
@@ -328,7 +341,27 @@ def validate_agent_use_value_reduced_run_summary(
         errors.append(f"selected_cases must contain at least {MIN_REDUCED_RUN_CASES} cases")
 
     for case_index, case in enumerate(cases):
-        lane_count += _validate_reduced_run_case(case, case_index, errors)
+        lane_count += _validate_reduced_run_case(
+            case,
+            case_index,
+            errors,
+            require_raw_files=require_raw_files,
+            private_root=resolved_private_root,
+        )
+        if require_raw_files and isinstance(case, dict):
+            raw_file_count += _count_lane_artifact_paths(case)
+
+    if require_raw_files:
+        host_guard_log = summary.get("host_guard", {}).get("private_log") if isinstance(summary.get("host_guard"), dict) else None
+        if isinstance(host_guard_log, str):
+            raw_file_count += 1
+            _validate_raw_artifact_path(
+                host_guard_log,
+                "host_guard.private_log",
+                errors,
+                private_root=resolved_private_root,
+                parse_json=False,
+            )
 
     result_class_value = summary.get("result_class")
     if isinstance(result_class_value, str):
@@ -351,6 +384,8 @@ def validate_agent_use_value_reduced_run_summary(
         raw_private_trace_root,
         host_guard_status,
         result_class,
+        require_raw_files,
+        raw_file_count,
     )
 
 
@@ -360,8 +395,15 @@ def build_agent_use_value_manifest_validation_payload(path: Path = DEFAULT_JSH10
 
 def build_agent_use_value_reduced_run_validation_payload(
     path: Path = DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
 ) -> dict[str, Any]:
-    return validate_agent_use_value_reduced_run_summary(path).to_payload()
+    return validate_agent_use_value_reduced_run_summary(
+        path,
+        require_raw_files=require_raw_files,
+        private_root=private_root,
+    ).to_payload()
 
 
 def _validate_case(case: Any, index: int, errors: list[str]) -> None:
@@ -389,7 +431,14 @@ def _validate_case(case: Any, index: int, errors: list[str]) -> None:
         errors.append(f"{label}.case_id must be a C-prefixed string")
 
 
-def _validate_reduced_run_case(case: Any, index: int, errors: list[str]) -> int:
+def _validate_reduced_run_case(
+    case: Any,
+    index: int,
+    errors: list[str],
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
+) -> int:
     label = f"selected_cases[{index}]"
     if not isinstance(case, dict):
         errors.append(f"{label} must be an object")
@@ -409,11 +458,24 @@ def _validate_reduced_run_case(case: Any, index: int, errors: list[str]) -> int:
     if not arm_lanes:
         errors.append(f"{label}.lanes must include at least one arm lane")
     for lane_index, lane in enumerate(lanes):
-        _validate_reduced_run_lane(lane, f"{label}.lanes[{lane_index}]", errors)
+        _validate_reduced_run_lane(
+            lane,
+            f"{label}.lanes[{lane_index}]",
+            errors,
+            require_raw_files=require_raw_files,
+            private_root=private_root,
+        )
     return len(lanes)
 
 
-def _validate_reduced_run_lane(lane: Any, label: str, errors: list[str]) -> None:
+def _validate_reduced_run_lane(
+    lane: Any,
+    label: str,
+    errors: list[str],
+    *,
+    require_raw_files: bool = False,
+    private_root: Path | None = None,
+) -> None:
     if not isinstance(lane, dict):
         errors.append(f"{label} must be an object")
         return
@@ -440,6 +502,23 @@ def _validate_reduced_run_lane(lane: Any, label: str, errors: list[str]) -> None
             path = artifact_paths.get(key)
             if not isinstance(path, str) or not path.startswith(".private/jsh-1043/"):
                 errors.append(f"{label}.artifact_paths.{key} must point to parent .private/jsh-1043/")
+            elif require_raw_files:
+                _validate_raw_artifact_path(
+                    path,
+                    f"{label}.artifact_paths.{key}",
+                    errors,
+                    private_root=private_root or Path("."),
+                    parse_json=key
+                    in {
+                        "event_or_transcript_log",
+                        "timing",
+                        "metadata",
+                        "command_or_tool_trace",
+                        "opened_source_refs",
+                        "cost_buckets",
+                        "facet_audit",
+                    },
+                )
     cost_buckets = lane.get("cost_buckets")
     if not isinstance(cost_buckets, dict):
         errors.append(f"{label}.cost_buckets must be an object")
@@ -452,6 +531,41 @@ def _validate_reduced_run_lane(lane: Any, label: str, errors: list[str]) -> None
         errors.append(f"{label}.facet_audit must be an object")
     elif "status" not in facet_audit:
         errors.append(f"{label}.facet_audit.status is required")
+
+
+def _count_lane_artifact_paths(case: dict[str, Any]) -> int:
+    lanes = case.get("lanes")
+    if not isinstance(lanes, list):
+        return 0
+    count = 0
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        artifact_paths = lane.get("artifact_paths")
+        if isinstance(artifact_paths, dict):
+            count += sum(1 for value in artifact_paths.values() if isinstance(value, str))
+    return count
+
+
+def _validate_raw_artifact_path(
+    raw_path: str,
+    label: str,
+    errors: list[str],
+    *,
+    private_root: Path,
+    parse_json: bool,
+) -> None:
+    path = private_root / raw_path
+    if not path.is_file():
+        errors.append(f"{label} does not exist under private_root: {raw_path}")
+        return
+    if parse_json:
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            errors.append(f"{label} could not be read: {exc}")
+        except json.JSONDecodeError as exc:
+            errors.append(f"{label} is not valid JSON: {exc}")
 
 
 def _expect_equal(value: Any, expected: Any, field: str, errors: list[str]) -> None:
