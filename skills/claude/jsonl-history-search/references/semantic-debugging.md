@@ -7,7 +7,7 @@ explains an outcome.
 ## First Command
 
 ```bash
-jsonl-history-search semantic-debug "why did this happen?" --cwd "$PWD" --format json
+jsonl-history-search semantic-debug "why did this happen?" --cwd "$PWD" --format text
 ```
 
 Add handles when known:
@@ -19,8 +19,13 @@ jsonl-history-search semantic-debug "why did this happen?" \
   --commit <commit> \
   --around "<timestamp>" \
   --cwd "$PWD" \
-  --format json
+  --format text
 ```
+
+Use text first for receiving-agent answers. It prints the required source refs
+and copy-paste `read-more` commands without exposing the full structured packet
+to the model. Use `--format json --report-output <path>` only when you need to
+save the packet, inspect hidden fields, or debug the tool itself.
 
 ## Read Order
 
@@ -30,6 +35,11 @@ jsonl-history-search semantic-debug "why did this happen?" \
 4. `no_evidence`
 5. `uncertainty`
 6. relevant source refs
+
+If the route says `answer-after-required-reads`, open the required source refs
+first and answer once the named facets are covered. Do not run broad `rg` over a
+large raw JSONL transcript unless a required facet is still missing after those
+reads.
 
 Keep evidence separate from inference. Say `likely contributing assumption` or
 `candidate cause` unless linked evidence supports stronger language.
