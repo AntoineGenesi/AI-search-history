@@ -2666,8 +2666,15 @@ def build_primary_source_followthrough(
         "--max-records",
         str(window["max_records"]),
         "--format",
-        "json",
+        str(window.get("format", "json")),
     ]
+    if window.get("projection") == "compact":
+        argv.extend([
+            "--projection",
+            "compact",
+            "--compact-text-limit",
+            str(window.get("compact_text_limit", 500)),
+        ])
     command = {
         "command_family": "read_more",
         "command_id": "open_primary_source_window",
@@ -2768,6 +2775,9 @@ def primary_followthrough_window(
             "before": 2,
             "after": 115,
             "max_records": 140,
+            "projection": "compact",
+            "compact_text_limit": 500,
+            "format": "text",
             "reason": "explicit_correction_source_window_covers_inspection_distinction_challenge_and_correction",
         }
     if str(read.get("read_type") or "") == "required_primary_proof_read" or (

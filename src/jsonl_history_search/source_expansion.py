@@ -37,6 +37,8 @@ class ExpansionRequest:
     after: int = DEFAULT_WINDOW_AFTER
     next_count: int = DEFAULT_NEXT_COUNT
     max_records: int = DEFAULT_MAX_RECORDS
+    projection: str = "full"
+    compact_text_limit: int = 1200
 
 
 @dataclass(frozen=True)
@@ -612,7 +614,9 @@ def build_source_expansion_payload(
             "after": max(0, int(request.after)),
             "next_count": max(0, int(request.next_count)),
             "max_records": max(0, int(request.max_records)),
+            "compact_text_limit": max(0, int(request.compact_text_limit)),
         },
+        "projection": request.projection,
         "privacy_flags": {
             "raw_text_included": True,
             "raw_paths_included": True,
@@ -630,6 +634,8 @@ def build_source_expansion_payload(
         return {"source_expansion": {**base_payload, "status": "invalid_mode", "records": []}}
     if request.scope not in {"source", "session", "day"}:
         return {"source_expansion": {**base_payload, "status": "invalid_scope", "records": []}}
+    if request.projection not in {"full", "compact"}:
+        return {"source_expansion": {**base_payload, "status": "invalid_projection", "records": []}}
     if not parsed.path_text:
         return {"source_expansion": {**base_payload, "status": "missing_path", "records": []}}
     if parsed.line is None:
@@ -756,7 +762,19 @@ def build_source_expansion_payload(
             next_count=max(0, int(request.next_count)),
             max_records=max(0, int(request.max_records)),
         ),
-        "records": [expanded_record(record) for record in selected],
+        "projection_summary": source_expansion_projection_summary(
+            selected,
+            projection=request.projection,
+            compact_text_limit=max(0, int(request.compact_text_limit)),
+        ),
+        "records": [
+            expanded_record(
+                record,
+                projection=request.projection,
+                compact_text_limit=max(0, int(request.compact_text_limit)),
+            )
+            for record in selected
+        ],
         "scope": source_scope(plan),
     }
     return {"source_expansion": payload}
@@ -1555,8 +1573,95 @@ def build_expansion_continuation(
     }
 
 
-def expanded_record(record: Any) -> dict[str, Any]:
+COMPACT_SUPPRESSED_ROLES = {"token_count"}
+COMPACT_SUMMARY_ROLES = {"exec_command_end", "function_call_output", "tool_result", "tool_output"}
+
+
+def source_expansion_projection_summary(
+    records: list[Any],
+    *,
+    projection: str,
+    compact_text_limit: int,
+) -> dict[str, Any]:
+    raw_text_bytes = sum(len(str(getattr(record, "text", "") or "").encode("utf-8")) for record in records)
+    if projection != "compact":
+        return {
+            "schema_version": 1,
+            "projection": "full",
+            "raw_text_bytes": raw_text_bytes,
+            "projected_text_bytes": raw_text_bytes,
+            "suppressed_record_count": 0,
+            "truncated_record_count": 0,
+        }
+    projected = [compact_record_text(record, compact_text_limit=compact_text_limit) for record in records]
     return {
+        "schema_version": 1,
+        "projection": "compact",
+        "raw_text_bytes": raw_text_bytes,
+        "projected_text_bytes": sum(len(str(item["text"]).encode("utf-8")) for item in projected),
+        "suppressed_record_count": sum(1 for item in projected if item["suppressed"]),
+        "truncated_record_count": sum(1 for item in projected if item["truncated"]),
+        "compact_text_limit": compact_text_limit,
+        "suppressed_roles": sorted(COMPACT_SUPPRESSED_ROLES),
+        "summary_roles": sorted(COMPACT_SUMMARY_ROLES),
+        "claim_boundary": "compact projection preserves source refs and bounded text previews; it is not a full raw transcript dump",
+    }
+
+
+def compact_record_text(record: Any, *, compact_text_limit: int) -> dict[str, Any]:
+    role = str(getattr(record, "role", "") or "")
+    text = str(getattr(record, "text", "") or "")
+    raw_bytes = len(text.encode("utf-8"))
+    if role in COMPACT_SUPPRESSED_ROLES:
+        return {
+            "text": f"[suppressed {role} record; raw_text_bytes={raw_bytes}]",
+            "raw_text_bytes": raw_bytes,
+            "projected_text_bytes": 0,
+            "suppressed": True,
+            "truncated": False,
+            "projection_reason": "low_signal_runtime_metadata",
+        }
+    limit = max(0, int(compact_text_limit))
+    if role in COMPACT_SUMMARY_ROLES and raw_bytes > limit:
+        preview = text[:limit].rstrip()
+        omitted = max(0, raw_bytes - len(preview.encode("utf-8")))
+        return {
+            "text": f"{preview}\n[truncated {role} record; raw_text_bytes={raw_bytes}; omitted_bytes~={omitted}]",
+            "raw_text_bytes": raw_bytes,
+            "projected_text_bytes": len(preview.encode("utf-8")),
+            "suppressed": False,
+            "truncated": True,
+            "projection_reason": "large_tool_output_preview",
+        }
+    return {
+        "text": text,
+        "raw_text_bytes": raw_bytes,
+        "projected_text_bytes": raw_bytes,
+        "suppressed": False,
+        "truncated": False,
+        "projection_reason": "kept_full_text",
+    }
+
+
+def expanded_record(
+    record: Any,
+    *,
+    projection: str = "full",
+    compact_text_limit: int = 1200,
+) -> dict[str, Any]:
+    projected = (
+        compact_record_text(record, compact_text_limit=compact_text_limit)
+        if projection == "compact"
+        else {
+            "text": record.text,
+            "raw_text_bytes": len(str(record.text or "").encode("utf-8")),
+            "projected_text_bytes": len(str(record.text or "").encode("utf-8")),
+            "suppressed": False,
+            "truncated": False,
+            "projection_reason": "full_projection",
+        }
+    )
+    row = {
         "source_ref": {
             "path": str(record.path),
             "line": int(record.line),
@@ -1567,9 +1672,16 @@ def expanded_record(record: Any) -> dict[str, Any]:
         "timestamp": record.raw_timestamp,
         "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
         "cwd": record.cwd,
-        "text": record.text,
-        "text_included": True,
+        "text": projected["text"],
+        "text_included": not projected["suppressed"],
+        "projection": projection,
+        "projection_reason": projected["projection_reason"],
+        "raw_text_bytes": projected["raw_text_bytes"],
+        "projected_text_bytes": projected["projected_text_bytes"],
+        "text_truncated": projected["truncated"],
+        "text_suppressed": projected["suppressed"],
     }
+    return row
 
 
 def source_scope(plan: SourcePlan) -> dict[str, Any]:
