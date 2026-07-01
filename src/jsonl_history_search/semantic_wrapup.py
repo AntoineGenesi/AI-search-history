@@ -197,14 +197,17 @@ def build_semantic_wrapup_payload(
     started = time.monotonic()
     scan = scan_records(plan, default_tz=default_tz, mask_context=mask_context)
     records = scan["records"]
-    signals = _complaint_signals(records)
-    all_failure_modes = _failure_modes(signals)
+    signals = _complaint_signals(records, query=query)
+    ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
+    all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     behavior_system = detect_behavior_system(cwd)
     all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
     fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
-    status = _semantic_wrapup_status(plan, all_failure_modes)
+    status = "scope_ambiguous" if ambiguous_prompt_only_scope else _semantic_wrapup_status(plan, all_failure_modes)
     scope_resolution = _scope_resolution(plan, source_plan, query)
+    if ambiguous_prompt_only_scope:
+        scope_resolution.update(ambiguous_prompt_only_scope)
     payload = {
         "semantic_wrapup": {
             "schema_version": SCHEMA_VERSION,
@@ -229,11 +232,7 @@ def build_semantic_wrapup_payload(
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
-            "agent_instruction": {
-                "selection_required": True,
-                "do_not_auto_apply": True,
-                "next_step": "Ask the user which suggested fixes to apply, then implement selected fixes through normal task/FSM flow.",
-            },
+            "agent_instruction": _agent_instruction(status, scope_resolution),
             "next_reads": _semantic_next_reads(failure_modes),
             "privacy": {
                 "raw_text_included": True,
@@ -268,6 +267,21 @@ def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
     return "found" if failure_modes else "no_failure_modes_found"
 
 
+def _agent_instruction(status: str, scope_resolution: dict) -> dict:
+    if status == "scope_ambiguous":
+        return {
+            "selection_required": False,
+            "do_not_auto_apply": True,
+            "next_step": scope_resolution.get("first_action")
+            or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
+        }
+    return {
+        "selection_required": True,
+        "do_not_auto_apply": True,
+        "next_step": "Ask the user which suggested fixes to apply, then implement selected fixes through normal task/FSM flow.",
+    }
+
+
 def _scope_resolution(plan: SourcePlan, source_plan: dict, query: str) -> dict:
     resolution = dict(plan.scope_resolution)
     if not resolution:
@@ -286,13 +300,45 @@ def _scope_resolution(plan: SourcePlan, source_plan: dict, query: str) -> dict:
     if not plan.roots:
         resolution["first_action"] = (
             "Rerun with an exact known Codex/Claude session JSONL, for example: "
-            f"jsonl-history-search semantic-wrapup {shlex.quote(query)} --root <path-to-session.jsonl> --cwd \"$PWD\" --format json"
+            f"{_rerun_with_root_command(query)}"
         )
     elif plan.scope_resolution.get("status") == "scoped_to_latest_known_session":
         root = (source_plan.get("sources") or {}).get("roots", [{}])[0]
         resolution["selected_kind"] = root.get("kind")
         resolution["selected_root_known"] = root.get("known")
     return resolution
+
+
+def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list[dict], query: str) -> dict | None:
+    if plan.scope_resolution.get("status") != "scoped_to_latest_known_session":
+        return None
+    if not signals:
+        return None
+    if not all(signal.get("scope_signal_kind") == "semantic_wrapup_prompt" for signal in signals):
+        return None
+    return {
+        "status": "scope_ambiguous",
+        "strategy": "latest_known_session_prompt_only_fail_closed",
+        "reason": (
+            "Current-session wording selected the latest known session, but every complaint/failure "
+            "signal in that session looks like the semantic-wrapup receiving-agent prompt itself, "
+            "not parent/user complaint evidence."
+        ),
+        "selected_latest_session_status": "prompt_only_complaint_signals",
+        "prompt_only_signal_count": len(signals),
+        "first_action": (
+            "Rerun with the parent/user session JSONL or another exact known Codex/Claude session JSONL, "
+            f"for example: {_rerun_with_root_command(query)}"
+        ),
+    }
+
+
+def _rerun_with_root_command(query: str) -> str:
+    quoted_query = shlex.quote(query)
+    return (
+        f"jsonl-history-search semantic-wrapup {quoted_query} "
+        '--root <path-to-session.jsonl> --cwd "$PWD" --format json'
+    )
 
 
 def detect_behavior_system(cwd: Path) -> dict:
@@ -442,7 +488,7 @@ def _add_destination(destinations: list[dict], seen: set[str], cwd: Path, kind: 
     )
 
 
-def _complaint_signals(records) -> list[dict]:
+def _complaint_signals(records, *, query: str) -> list[dict]:
     signals: list[dict] = []
     for item in records:
         text = item.text
@@ -461,10 +507,53 @@ def _complaint_signals(records) -> list[dict]:
                 "signal_id": f"s{len(signals) + 1:03d}",
                 "labels": labels,
                 "friction_markers": friction_markers,
+                "scope_signal_kind": _scope_signal_kind(normalized, query),
                 **row,
             }
         )
     return signals
+
+
+def _scope_signal_kind(normalized_text: str, query: str) -> str:
+    if _looks_like_semantic_wrapup_prompt(normalized_text, query):
+        return "semantic_wrapup_prompt"
+    return "user_complaint"
+
+
+def _looks_like_semantic_wrapup_prompt(normalized_text: str, query: str) -> bool:
+    normalized_query = _normalize(query)
+    semantic_wrapup_marker = any(
+        marker in normalized_text
+        for marker in (
+            "semantic-wrapup",
+            "semantic wrap-up",
+            "semantic_wrapup",
+            "jsonl-history-search semantic-wrapup",
+        )
+    )
+    current_session_prompt = any(
+        marker in normalized_text
+        for marker in (
+            "what did i complain",
+            "complain about",
+            "needs fixing from this session",
+            "failure modes should we fix from this session",
+        )
+    )
+    lane_prompt_marker = any(
+        marker in normalized_text
+        for marker in (
+            "fresh receiving-agent",
+            "fresh receiving agent",
+            "receiving-agent",
+            "side-thread",
+            "lane prompt",
+            "worker lane",
+            "run jsonl-history-search",
+        )
+    )
+    query_embedded = normalized_query and normalized_query in normalized_text
+    return semantic_wrapup_marker and current_session_prompt and (lane_prompt_marker or query_embedded)
 
 
 def _failure_modes(signals: list[dict]) -> list[dict]:
