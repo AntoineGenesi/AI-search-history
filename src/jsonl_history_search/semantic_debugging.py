@@ -865,23 +865,27 @@ def inferred_explicit_correction_window_next_reads(
             int((item.get("source_ref") or {}).get("line") or 0),
         )
     )
+    selected = select_explicit_correction_window_records(scored)
     reads: list[dict[str, Any]] = []
-    for index, item in enumerate(scored[:2], 1):
+    for index, item in enumerate(selected, 1):
         source_ref = item["source_ref"]
         candidate_id = f"explicit-correction-window-{index:03d}"
+        role_hint = explicit_correction_window_role_hint(str(item.get("selection_reason") or ""))
         read = {
             "kind": "jsonl_source_ref",
             "target": source_ref_target(source_ref),
             "candidate_id": candidate_id,
             "source_ref": source_ref,
-            "reason": "inspect explicit date source window before current-session or prompt-echo matches",
+            "reason": role_hint["reason"],
             "correction_window_source_selection": {
                 "schema_version": 1,
                 "selection_reason": item["selection_reason"],
+                "bundle_role": role_hint["bundle_role"],
                 "role": item.get("role"),
                 "score": item["score"],
                 "raw_text_included": False,
                 "bounded_to_explicit_date_window": True,
+                "broad_rg_after_required_reads_discouraged": True,
                 "source_window_verification_required": True,
                 "claim_boundary": "explicit_date_window_anchor_not_final_answer",
             },
@@ -900,6 +904,70 @@ def inferred_explicit_correction_window_next_reads(
         if read["target"]:
             reads.append(read)
     return reads
+
+
+def select_explicit_correction_window_records(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    priority = (
+        "assistant_followup_correction",
+        "source_inspection_for_correction_window",
+        "assistant_persistent_vs_wait_distinction",
+        "user_followup_or_original_challenge",
+    )
+    selected: list[dict[str, Any]] = []
+    used_targets: set[str] = set()
+    for reason in priority:
+        for item in scored:
+            if item.get("selection_reason") != reason:
+                continue
+            target = source_ref_target(item.get("source_ref") or {})
+            if not target or target in used_targets:
+                continue
+            selected.append(item)
+            used_targets.add(target)
+            break
+    for item in scored:
+        if len(selected) >= 4:
+            break
+        target = source_ref_target(item.get("source_ref") or {})
+        if not target or target in used_targets:
+            continue
+        selected.append(item)
+        used_targets.add(target)
+    return selected[:4]
+
+
+def explicit_correction_window_role_hint(selection_reason: str) -> dict[str, str]:
+    if selection_reason == "source_inspection_for_correction_window":
+        return {
+            "bundle_role": "source_inspection",
+            "reason": (
+                "inspect explicit date source-inspection/tool-call window for local docs/scripts; "
+                "avoid broad rg unless this required read leaves a named facet missing"
+            ),
+        }
+    if selection_reason == "assistant_persistent_vs_wait_distinction":
+        return {
+            "bundle_role": "first_distinction",
+            "reason": (
+                "inspect explicit date first-distinction window before current-session or prompt-echo matches; "
+                "avoid broad rg unless this required read leaves a named facet missing"
+            ),
+        }
+    if selection_reason == "user_followup_or_original_challenge":
+        return {
+            "bundle_role": "user_challenge",
+            "reason": (
+                "inspect explicit date user challenge/follow-up window before current-session or prompt-echo matches; "
+                "avoid broad rg unless this required read leaves a named facet missing"
+            ),
+        }
+    return {
+        "bundle_role": "followup_correction",
+        "reason": (
+            "inspect explicit date correction window before current-session or prompt-echo matches; "
+            "avoid broad rg unless this required read leaves a named facet missing"
+        ),
+    }
 
 
 def inferred_known_action_case_next_reads(
