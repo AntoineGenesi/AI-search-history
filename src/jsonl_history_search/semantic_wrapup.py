@@ -548,7 +548,7 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
     if not setup_echo_signals:
         return None
     substantive_signals = [signal for signal in signals if signal.get("scope_signal_kind") == "user_complaint"]
-    if substantive_signals and len(substantive_signals) > len(setup_echo_signals):
+    if substantive_signals:
         return None
     prompt_only_count = len(
         [signal for signal in setup_echo_signals if signal.get("scope_signal_kind") == "semantic_wrapup_prompt"]
