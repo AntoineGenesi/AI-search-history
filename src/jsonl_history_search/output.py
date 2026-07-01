@@ -787,8 +787,14 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             f"{contract.get('decision')} "
             f"source_use_required={contract.get('source_use_required')}"
         )
+        if contract.get("answer_ready") is True:
+            lines.append("Answer-ready: yes after inspecting listed source refs.")
+        if contract.get("stop_broad_search") is True:
+            lines.append("Stop broad search: yes.")
         if contract.get("required_next_action"):
             lines.append(f"Required next action: {contract.get('required_next_action')}")
+        if contract.get("stop_condition"):
+            lines.append(f"Contract stop condition: {contract.get('stop_condition')}")
     lines.extend([
         "Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
         "Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
@@ -919,6 +925,14 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         ])
         if contract.get("required_next_action"):
             lines.append(f"- Required next action: {contract.get('required_next_action')}")
+        if contract.get("answer_ready") is True:
+            lines.append("- Answer-ready: `true` after inspecting listed source refs")
+        if contract.get("stop_broad_search") is True:
+            lines.append("- Stop broad search: `true`")
+        if contract.get("stop_condition"):
+            lines.append(f"- Stop condition: {contract.get('stop_condition')}")
+        for item in contract.get("continue_only_if") or []:
+            lines.append(f"- Continue only if: {item}")
         if contract.get("setup_echo_boundary"):
             lines.append(f"- Setup-echo boundary: {contract.get('setup_echo_boundary')}")
     lines.extend([

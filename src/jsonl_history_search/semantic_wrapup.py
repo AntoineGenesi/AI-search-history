@@ -356,7 +356,13 @@ def build_semantic_wrapup_payload(
         orchestration_evidence,
         current_session_source_selection,
     )
-    answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads)
+    answer_ready_contract = _answer_ready_contract(
+        status=status,
+        failure_modes=failure_modes,
+        fix_suggestions=fix_suggestions,
+        next_reads=next_reads,
+    )
+    answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads, answer_ready_contract)
     payload = {
         "semantic_wrapup": {
             "schema_version": SCHEMA_VERSION,
@@ -398,6 +404,7 @@ def build_semantic_wrapup_payload(
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
             "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract),
+            "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
             "next_reads": next_reads,
             "privacy": {
@@ -460,6 +467,19 @@ def _agent_instruction(
             "next_step": scope_resolution.get("first_action")
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
         }
+    if contract.get("decision") == "answer_ready_after_source_inspection":
+        return {
+            "selection_required": True,
+            "do_not_auto_apply": True,
+            "source_use_required": True,
+            "decision": contract.get("decision"),
+            "answer_ready": True,
+            "stop_broad_search": True,
+            "required_next_action": contract.get("required_next_action"),
+            "stop_condition": contract.get("stop_condition"),
+            "continue_only_if": list(contract.get("continue_only_if") or []),
+            "next_step": contract.get("required_next_action"),
+        }
     return {
         "selection_required": True,
         "do_not_auto_apply": True,
@@ -468,7 +488,56 @@ def _agent_instruction(
     }
 
 
-def _answer_use_contract(status: str, scope_resolution: dict, next_reads: list[dict]) -> dict:
+def _answer_ready_contract(
+    *,
+    status: str,
+    failure_modes: list[dict],
+    fix_suggestions: list[dict],
+    next_reads: list[dict],
+) -> dict:
+    if status != "found" or not failure_modes:
+        return {
+            "answer_ready": False,
+            "decision": "not_answer_ready",
+            "reason": "semantic-wrapup did not return source-backed failure modes.",
+        }
+    return {
+        "answer_ready": True,
+        "decision": "answer_ready_after_source_inspection",
+        "source_use_required": bool(next_reads),
+        "stop_broad_search": True,
+        "selection_required": True,
+        "auto_apply": False,
+        "failure_mode_count": len(failure_modes),
+        "fix_suggestion_count": len(fix_suggestions),
+        "required_next_action": (
+            "Inspect the listed source refs, then present the user-selectable fix suggestions "
+            "or ask which accepted fix to implement. Do not run broad additional searches first."
+        ),
+        "stop_condition": (
+            "Stop broad searching once the listed source refs support the returned failure modes "
+            "and fix suggestions."
+        ),
+        "continue_only_if": [
+            "a returned failure mode lacks source proof after inspecting listed refs",
+            "the proposed destination is ambiguous or contradicted by inspected refs",
+            "the user selects a fix and implementation needs the normal task/FSM workflow",
+        ],
+        "claim_boundary": (
+            "This is an answer-ready failure-mode/fix-suggestion handoff after source inspection; "
+            "it does not auto-apply changes or prove broad all-history completeness."
+        ),
+    }
+
+
+def _answer_use_contract(
+    status: str,
+    scope_resolution: dict,
+    next_reads: list[dict],
+    answer_ready_contract: dict | None = None,
+) -> dict:
+    if (answer_ready_contract or {}).get("answer_ready") is True:
+        return dict(answer_ready_contract or {})
     first_read = next_reads[0] if next_reads else {}
     first_ref = first_read.get("source_ref") or {}
     requires_top_read = bool(first_ref) and first_read.get("answer_use_required") is True

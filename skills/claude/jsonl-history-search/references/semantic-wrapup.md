@@ -40,21 +40,27 @@ Rules:
    the retained complaint/fix question from that top next read, or hand off the
    exact source ref and why it must be read. Do not say there is nothing
    substantive in the fresh/eval session while dropping the retained top read.
-6. If an explicit root or a substantive current session includes real
+6. If `answer_ready_contract.answer_ready` is true or
+   `answer_use_contract.decision` is `answer_ready_after_source_inspection`,
+   stop broad searching after inspecting the listed source refs. Present the
+   user-selectable fix suggestions or ask which accepted fix to implement; do
+   not run more broad retrieval first unless a returned failure mode lacks
+   source proof.
+7. If an explicit root or a substantive current session includes real
    orchestration, inspect `orchestration_evidence` as first-class causal
    evidence: user corrections, main-agent FSM/product-loop commitments,
    worker/subagent outputs, reviewer proof and claim boundaries, same-task
    repair logic, product-delta integration/currentness findings, and
    product-moving versus process/report drift.
-7. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
+8. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
    TODO/backlog docs, skills, learning indexes, tickets, or project-specific
    rules.
-8. Present user-selectable fix suggestions with `destination_source_refs`,
+9. Present user-selectable fix suggestions with `destination_source_refs`,
    `destination_rationale`, and `selection_options` of accept, reject, or
    defer.
-9. Do not auto-edit behavior rules, skills, task files, tickets, or memory
+10. Do not auto-edit behavior rules, skills, task files, tickets, or memory
    docs from this route.
-10. Do not assume everyone has contributor's `wrap-up` skill.
+11. Do not assume everyone has contributor's `wrap-up` skill.
 
 After running:
 
@@ -62,6 +68,9 @@ After running:
 - obey `answer_use_contract` before finalizing; when it says
   `answer_from_top_next_read_or_handoff_exact_source`, answer from the top
   required read or explicitly hand off that source as the required next read;
+- when it says `answer_ready_after_source_inspection`, inspect the listed
+  source refs, present/ask about the selectable fixes, and stop broad search
+  unless the inspected refs do not support a returned failure mode;
 - inspect substantive `orchestration_evidence.items[*].source_ref` before
   deciding what worker/reviewer/subagent behavior mattered;
 - use `signal_classification` to separate substantive session evidence from
