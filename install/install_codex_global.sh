@@ -6,6 +6,10 @@ SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/jsonl-history-search"
 
 mkdir -p "$SKILL_DIR/scripts"
 cp -a "$ROOT/skills/codex/jsonl-history-search/SKILL.md" "$SKILL_DIR/SKILL.md"
+if [ -d "$ROOT/skills/codex/jsonl-history-search/references" ]; then
+  rm -rf "$SKILL_DIR/references"
+  cp -a "$ROOT/skills/codex/jsonl-history-search/references" "$SKILL_DIR/references"
+fi
 cp -a "$ROOT/scripts/search_jsonl_history.py" "$SKILL_DIR/scripts/search_jsonl_history.py"
 chmod +x "$SKILL_DIR/scripts/search_jsonl_history.py"
 

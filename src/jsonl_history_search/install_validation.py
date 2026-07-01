@@ -498,9 +498,13 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
 
 
 def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_checkout: bool = True) -> list[ValidationCheck]:
-    skill = codex_home / "skills" / "jsonl-history-search" / "SKILL.md"
-    helper = codex_home / "skills" / "jsonl-history-search" / "scripts" / "search_jsonl_history.py"
-    package_skill = package_root / "skills" / "codex" / "jsonl-history-search" / "SKILL.md"
+    skill_root = codex_home / "skills" / "jsonl-history-search"
+    skill = skill_root / "SKILL.md"
+    references = skill_root / "references"
+    helper = skill_root / "scripts" / "search_jsonl_history.py"
+    package_skill_root = package_root / "skills" / "codex" / "jsonl-history-search"
+    package_skill = package_skill_root / "SKILL.md"
+    package_references = package_skill_root / "references"
     package_helper = package_root / "scripts" / "search_jsonl_history.py"
     checks: list[ValidationCheck] = []
     if skill.is_file():
@@ -514,6 +518,27 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 detail="Global Codex skill file is missing at the provided --codex-home.",
                 paths=[str(skill)],
                 recovery=["Run `bash install/install_codex_global.sh` from the package root, or copy the skill file manually."],
+            )
+        )
+    if references.is_dir():
+        checks.append(
+            _global_tree_check(
+                "global_references",
+                "Global Codex skill references",
+                references,
+                package_references,
+                source_checkout=source_checkout,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id="global_references",
+                name="Global Codex skill references",
+                status="fail",
+                detail="Global Codex skill references folder is missing at the provided --codex-home.",
+                paths=[str(references)],
+                recovery=["Run `bash install/install_codex_global.sh` from the package root to install the routed references folder."],
             )
         )
     if helper.is_file() and os.access(helper, os.X_OK):
@@ -579,12 +604,66 @@ def _global_copy_check(
     )
 
 
+def _global_tree_check(
+    check_id: str,
+    name: str,
+    installed: Path,
+    packaged: Path,
+    *,
+    source_checkout: bool,
+) -> ValidationCheck:
+    paths = [str(installed)]
+    if not source_checkout or not packaged.is_dir():
+        return ValidationCheck(
+            id=check_id,
+            name=name,
+            status="pass",
+            detail=f"{name} folder is present.",
+            paths=paths,
+            metadata={"source_checkout": source_checkout},
+        )
+
+    paths.append(str(packaged))
+    installed_hashes = _sha256_tree(installed)
+    packaged_hashes = _sha256_tree(packaged)
+    metadata = {
+        "installed_files": sorted(installed_hashes),
+        "package_files": sorted(packaged_hashes),
+        "matches_package": installed_hashes == packaged_hashes,
+    }
+    if installed_hashes == packaged_hashes:
+        return ValidationCheck(
+            id=check_id,
+            name=name,
+            status="pass",
+            detail=f"{name} folder matches the package checkout copy.",
+            paths=paths,
+            metadata=metadata,
+        )
+    return ValidationCheck(
+        id=check_id,
+        name=name,
+        status="fail",
+        detail=f"{name} folder is installed but stale relative to the package checkout copy.",
+        paths=paths,
+        recovery=["Run `bash install/install_codex_global.sh` from the package root to refresh the global Codex skill references."],
+        metadata=metadata,
+    )
+
+
 def _sha256_file(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _sha256_tree(path: Path) -> dict[str, str]:
+    return {
+        str(child.relative_to(path)): _sha256_file(child)
+        for child in sorted(item for item in path.rglob("*") if item.is_file())
+    }
 
 
 def _status_counts(checks: list[ValidationCheck]) -> dict[str, int]:

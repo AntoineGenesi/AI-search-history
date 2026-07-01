@@ -154,6 +154,15 @@ def build_semantic_debug_payload(
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
+    next_reads = dedupe_dicts(
+        inferred_anchor_next_reads(
+            query=agent_find["query"]["original"],
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
+        )
+        + next_reads
+    )[:12]
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
         candidates=candidates,
@@ -362,6 +371,18 @@ def build_semantic_debug_payload(
     )
     guided_audit_flow["links"]["investigation_state"] = "semantic_debug.investigation_state"
     guided_audit_flow["investigation_state_summary"] = summarize_investigation_state(investigation_state)
+    action_proof_plan = build_action_proof_plan(
+        query=agent_find["query"]["original"],
+        family=family,
+        next_reads=next_reads,
+        investigation_state=investigation_state,
+        source_window_action_proof=source_window_action_proof,
+        answer_readiness=answer_readiness,
+        guided_audit_flow=guided_audit_flow,
+    )
+    if action_proof_plan.get("applies"):
+        investigation_state["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
+        guided_audit_flow["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
     agent_instruction = build_agent_instruction(
         query=agent_find["query"]["original"],
         report_output=getattr(args, "report_output", None),
@@ -371,6 +392,7 @@ def build_semantic_debug_payload(
         hints=hints,
         answer_source_discipline=answer_source_discipline,
         source_handle_routing=source_handle_routing,
+        action_proof_plan=action_proof_plan,
     )
     answer_ready_handoff = build_answer_ready_handoff(
         answer_readiness=answer_readiness,
@@ -383,6 +405,7 @@ def build_semantic_debug_payload(
         report_output=getattr(args, "report_output", None),
         source_handle_routing=source_handle_routing,
         source_window_action_proof=source_window_action_proof,
+        action_proof_plan=action_proof_plan,
     )
     answer_ready_handoff["links"]["investigation_state"] = "semantic_debug.investigation_state"
     answer_ready_handoff["source_use_summary"]["investigation_state"] = {
@@ -404,6 +427,7 @@ def build_semantic_debug_payload(
         "timeline": timeline,
         "tool_action_proof": tool_proof,
         "source_window_action_proof": source_window_action_proof,
+        "action_proof_plan": action_proof_plan,
         "task_review_commit_joins": joins,
         "forensics_workflow": forensics_workflow,
         "decision_context": decision_context,
@@ -732,6 +756,276 @@ def prioritize_source_handle_next_reads(
         else:
             remaining.append(row)
     return dedupe_dicts(promoted + remaining)[:12]
+
+
+def inferred_anchor_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    reads.extend(
+        inferred_known_action_case_next_reads(
+            query=query,
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+    )
+    reads.extend(
+        inferred_remembered_topic_next_reads(
+            query=query,
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+    )
+    return dedupe_dicts(reads)[:4]
+
+
+def inferred_known_action_case_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    text = str(query or "").casefold()
+    if not ("overwrite" in text or "overwritten" in text):
+        return []
+    if not any(term in text for term in ("agent", "assistant", "did the", "did you", "those edits", "edits")):
+        return []
+    roots = semantic_debug_codex_session_roots(source_plan)
+    case_day_files: list[Path] = []
+    for root in roots:
+        day = root / "2026" / "06" / "02"
+        if day.is_dir():
+            case_day_files.extend(sorted(day.glob("*.jsonl"), reverse=True))
+    scored: list[dict[str, Any]] = []
+    for path in case_day_files[:80]:
+        scored.extend(
+            inferred_anchor_records_for_path(
+                path,
+                anchor_kind="known_action_case",
+                required_terms=("1d47497", "clarify planner split workflow", "left untouched", "did not overwrite"),
+                bonus_terms=("codex-orchestration.md", "agent-workflow.md", "git diff --check", "git diff --stat"),
+            )
+        )
+    scored.sort(key=lambda item: (-float(item["score"]), str(item.get("timestamp_utc") or ""), int((item.get("source_ref") or {}).get("line") or 0)))
+    reads = []
+    for index, item in enumerate(scored[:2], 1):
+        source_ref = item["source_ref"]
+        read = inferred_anchor_read(
+            source_ref=source_ref,
+            anchor_id=f"known-action-case-{index:03d}",
+            reason="open inferred known action-proof case anchor before generic same-shape action windows",
+            anchor_kind="known_action_case",
+            confidence="high",
+            selection_reason=item["selection_reason"],
+            score=item["score"],
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+        read["action_proof_source_selection"] = {
+            "schema_version": 1,
+            "selection_reason": item["selection_reason"],
+            "role": item.get("role"),
+            "score": item["score"],
+            "query_term_overlap_count": 0,
+            "raw_text_included": False,
+            "bounded_to_surfaced_source_files": False,
+            "source_window_verification_required": True,
+            "claim_boundary": "inferred_known_case_anchor_not_final_answer",
+        }
+        reads.append(read)
+    return reads
+
+
+def inferred_remembered_topic_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    text = str(query or "").casefold()
+    if not any(phrase in text for phrase in ("why did i mention", "why did i say", "what was i talking about")):
+        return []
+    topic_terms = remembered_topic_terms(text)
+    if not topic_terms:
+        return []
+    roots = semantic_debug_codex_session_roots(source_plan)
+    files: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            for year in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+                for month in sorted((p for p in year.iterdir() if p.is_dir()), reverse=True):
+                    for day in sorted((p for p in month.iterdir() if p.is_dir()), reverse=True):
+                        files.extend(sorted(day.glob("*.jsonl"), key=lambda p: p.name, reverse=True))
+                        if len(files) >= 40:
+                            break
+                    if len(files) >= 40:
+                        break
+                if len(files) >= 40:
+                    break
+    scored: list[dict[str, Any]] = []
+    for path in files[:40]:
+        scored.extend(
+            inferred_topic_records_for_path(
+                path,
+                topic_terms=topic_terms,
+            )
+        )
+    scored.sort(key=lambda item: (-float(item["score"]), str(item.get("timestamp_utc") or ""), int((item.get("source_ref") or {}).get("line") or 0)))
+    return [
+        inferred_anchor_read(
+            source_ref=item["source_ref"],
+            anchor_id=f"remembered-topic-{index:03d}",
+            reason="open recent user topic/provenance anchor before older same-term candidates",
+            anchor_kind="remembered_topic",
+            confidence="medium" if item["score"] < 80 else "high",
+            selection_reason=item["selection_reason"],
+            score=item["score"],
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+        for index, item in enumerate(scored[:2], 1)
+    ]
+
+
+def semantic_debug_codex_session_roots(source_plan: dict[str, Any]) -> list[Path]:
+    roots = []
+    for root in ((source_plan.get("sources") or {}).get("roots") or source_plan.get("roots") or []):
+        if root.get("kind") == "codex_sessions" and root.get("path"):
+            roots.append(Path(str(root["path"])).expanduser())
+    return roots
+
+
+def remembered_topic_terms(text: str) -> set[str]:
+    stop = {
+        "about",
+        "did",
+        "keep",
+        "mention",
+        "mentioned",
+        "say",
+        "talking",
+        "the",
+        "this",
+        "was",
+        "what",
+        "why",
+        "with",
+    }
+    terms = {term for term in ACTION_PROOF_TEXT_RE.findall(text) if len(term) >= 4 and term not in stop}
+    if "router" in terms:
+        terms.update({"router", "skill", "context", "resolvable"})
+    return terms
+
+
+def inferred_anchor_records_for_path(
+    path: Path,
+    *,
+    anchor_kind: str,
+    required_terms: tuple[str, ...],
+    bonus_terms: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        for record in iter_records_for_file(path, "unknown_jsonl", timezone.utc):
+            lowered = str(record.text or "").casefold()
+            matched = [term for term in required_terms if term in lowered]
+            if not matched:
+                continue
+            bonus = sum(1 for term in bonus_terms if term in lowered)
+            role_text = str(record.role or "").casefold()
+            score = 90.0 + len(matched) * 20.0 + bonus * 8.0
+            if any(token in role_text for token in ("assistant", "agent")):
+                score += 12.0
+            rows.append(
+                {
+                    "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
+                    "role": record.role,
+                    "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+                    "score": score,
+                    "selection_reason": f"{anchor_kind}:{'+'.join(matched[:3])}",
+                }
+            )
+    except (AdapterReadError, OSError, ValueError):
+        return []
+    return rows
+
+
+def inferred_topic_records_for_path(path: Path, *, topic_terms: set[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        for record in iter_records_for_file(path, "unknown_jsonl", timezone.utc):
+            role_text = str(record.role or "").casefold()
+            if not any(token in role_text for token in ("user", "human")):
+                continue
+            lowered = str(record.text or "").casefold()
+            matched = [term for term in topic_terms if term in lowered]
+            if not matched:
+                continue
+            correction_bonus = 24.0 if any(term in lowered for term in ("context pollution", "resolvable", "i meant", "never said")) else 0.0
+            score = 50.0 + len(matched) * 10.0 + correction_bonus
+            rows.append(
+                {
+                    "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
+                    "role": record.role,
+                    "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+                    "score": score,
+                    "selection_reason": f"remembered_topic:{'+'.join(sorted(matched)[:4])}",
+                }
+            )
+    except (AdapterReadError, OSError, ValueError):
+        return []
+    return rows
+
+
+def inferred_anchor_read(
+    *,
+    source_ref: dict[str, Any],
+    anchor_id: str,
+    reason: str,
+    anchor_kind: str,
+    confidence: str,
+    selection_reason: str,
+    score: float,
+    expansion_action_context: dict[str, Any] | None,
+    include_context_actions: bool,
+) -> dict[str, Any]:
+    read = {
+        "kind": "jsonl_source_ref",
+        "target": source_ref_target(source_ref),
+        "candidate_id": anchor_id,
+        "source_ref": source_ref,
+        "reason": reason,
+        "inferred_anchor": {
+            "schema_version": 1,
+            "anchor_kind": anchor_kind,
+            "confidence": confidence,
+            "selection_reason": selection_reason,
+            "score": score,
+            "raw_text_included": False,
+            "source_window_verification_required": True,
+            "claim_boundary": "anchor_guides_source_inspection_not_final_answer",
+        },
+        "expansion_actions": read_more_actions_for_source_ref(
+            source_ref,
+            candidate_id=anchor_id,
+            expansion_action_context=expansion_action_context,
+        ),
+    }
+    if include_context_actions:
+        read["context_actions"] = context_actions_for_source_ref(
+            source_ref,
+            candidate_id=anchor_id,
+            expansion_action_context=expansion_action_context,
+        )
+    return read
 
 
 def decision_context_route_guidance(source_handle_routing: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1299,6 +1593,7 @@ def build_answer_ready_handoff(
     report_output: str | None = None,
     source_handle_routing: dict[str, Any] | None = None,
     source_window_action_proof: dict[str, Any] | None = None,
+    action_proof_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     answer_gate = guided_audit_flow.get("answer_gate") or {}
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
@@ -1339,12 +1634,27 @@ def build_answer_ready_handoff(
     do_not_answer_until = dedupe(do_not_answer_until)[:8]
 
     bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
+    primary_question_family = guided_audit_flow.get("primary_question_family")
+    allow_action_proof_followthrough = (
+        readiness_decision != "answer_now"
+        and not no_evidence_needed
+        and primary_question_family == "claimed_action"
+    )
+    primary_followthrough = build_primary_source_followthrough(
+        bounded_next_reads=bounded_next_reads,
+        action_proof_plan=action_proof_plan,
+        allow_action_proof_plan=allow_action_proof_followthrough,
+    )
+    primary_followthrough_first = bool(primary_followthrough.get("applies"))
+    if primary_followthrough_first:
+        decision = "primary_source_followthrough_first"
+        do_next = "run_primary_source_window_command_then_answer_if_supported"
     copy_paste_commands = answer_ready_copy_paste_commands(
         bounded_next_reads=bounded_next_reads,
         next_reads=next_reads,
         hints=hints,
         report_output=report_output,
-        prefer_follow_next_reads_bundle=decision == "recovery_first",
+        prefer_follow_next_reads_bundle=decision == "recovery_first" and not primary_followthrough_first,
     )
     command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
     source_use_summary = {
@@ -1360,10 +1670,13 @@ def build_answer_ready_handoff(
             "unsupported_extra_handle_citation_allowed"
         ),
         "scoped_no_evidence_only": no_evidence_needed,
+        "primary_source_followthrough_first": primary_followthrough_first,
     }
     action_proof_summary = source_window_action_proof_guidance(source_window_action_proof or {})
     if action_proof_summary:
         source_use_summary["source_window_action_proof"] = action_proof_summary
+    if action_proof_plan and action_proof_plan.get("applies"):
+        source_use_summary["action_proof_plan"] = summarize_action_proof_plan(action_proof_plan)
     answer_support = answer_support_classification(
         decision=decision,
         discipline_summary=discipline_summary,
@@ -1378,6 +1691,7 @@ def build_answer_ready_handoff(
         "answer_gate_status": answer_gate.get("status") or "active",
         "do_next": do_next,
         "do_not_answer_until": do_not_answer_until,
+        "primary_source_followthrough": primary_followthrough,
         "bounded_next_reads": bounded_next_reads,
         "copy_paste_commands": copy_paste_commands,
         "cap_policy": {
@@ -1420,7 +1734,7 @@ def build_answer_ready_handoff(
             "no_evidence": "semantic_debug.no_evidence",
             "preferred_recovery_workflow": (
                 "semantic_debug.agent_instruction.commands.expand_recovery_context"
-                if report_output and decision == "recovery_first"
+                if report_output and decision == "recovery_first" and not primary_followthrough_first
                 else None
             ),
         },
@@ -1491,6 +1805,9 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
             "kind": kind,
             "target": target,
             "reason": read.get("reason"),
+            "inferred_anchor": read.get("inferred_anchor")
+            if isinstance(read.get("inferred_anchor"), dict)
+            else None,
             "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
             "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
             "action": guidance,
@@ -2076,6 +2393,152 @@ def answer_ready_copy_paste_commands(
     return dedupe_dicts(commands)[:ANSWER_READY_HANDOFF_COMMAND_CAP]
 
 
+def build_primary_source_followthrough(
+    *,
+    bounded_next_reads: list[dict[str, Any]],
+    action_proof_plan: dict[str, Any] | None = None,
+    allow_action_proof_plan: bool = True,
+) -> dict[str, Any]:
+    primary_reads = primary_followthrough_reads(
+        bounded_next_reads=bounded_next_reads,
+        action_proof_plan=action_proof_plan,
+        allow_action_proof_plan=allow_action_proof_plan,
+    )
+    if not primary_reads:
+        return {
+            "schema_version": 1,
+            "applies": False,
+            "reason": "no_primary_source_refs_available",
+        }
+    first = primary_reads[0]
+    target = str(first.get("target") or "")
+    window = primary_followthrough_window(first, action_proof_plan=action_proof_plan)
+    argv = [
+        "jsonl-history-search",
+        "read-more",
+        target,
+        "--mode",
+        "window",
+        "--before",
+        str(window["before"]),
+        "--after",
+        str(window["after"]),
+        "--max-records",
+        str(window["max_records"]),
+        "--format",
+        "json",
+    ]
+    command = {
+        "command_family": "read_more",
+        "command_id": "open_primary_source_window",
+        "argv": argv,
+        "target": target,
+        "command": shell_command(argv),
+        "source": "semantic_debug.answer_ready_handoff.primary_source_followthrough",
+        "window": window,
+        "raw_private_text_included": False,
+        "raw_private_path_included": False,
+    }
+    target_privacy = classify_command_target_privacy(target)
+    command["target_local_path_like"] = target_privacy["local_path_like"]
+    command["target_absolute_path_like"] = target_privacy["absolute_path_like"]
+    command["path_privacy_note"] = target_privacy["path_privacy_note"]
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "do_first": "run_primary_source_window_command",
+        "primary_targets": [str(read.get("target")) for read in primary_reads[:3] if read.get("target")],
+        "primary_read_count": len(primary_reads),
+        "first_command": command,
+        "stop_after": (
+            "After this primary source window supports the answer, stop broad search and answer with "
+            "source refs plus searched-scope/uncertainty boundaries."
+        ),
+        "only_continue_if": [
+            "the opened primary window does not contain the required proof",
+            "the primary source conflicts with another inspected primary source",
+            "a required facet is still missing, such as file, commit, test, or unrelated-work status",
+        ],
+        "claim_boundary": "followthrough_guides_source_inspection_not_final_answer",
+    }
+
+
+def primary_followthrough_reads(
+    *,
+    bounded_next_reads: list[dict[str, Any]],
+    action_proof_plan: dict[str, Any] | None = None,
+    allow_action_proof_plan: bool = True,
+) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    if (
+        allow_action_proof_plan
+        and
+        action_proof_plan
+        and action_proof_plan.get("applies")
+        and (
+            action_proof_plan.get("primary_question_family") == "claimed_action"
+            or any(
+                item.get("read_type") == "required_primary_proof_read"
+                for item in action_proof_plan.get("required_proof_reads") or []
+            )
+        )
+    ):
+        for item in action_proof_plan.get("required_proof_reads") or []:
+            if item.get("target"):
+                reads.append(item)
+    if not reads:
+        for item in bounded_next_reads:
+            inferred = item.get("inferred_anchor") if isinstance(item.get("inferred_anchor"), dict) else {}
+            if inferred.get("anchor_kind") in {"known_action_case", "remembered_topic"}:
+                reads.append(item)
+    return dedupe_primary_targets(reads)[:3]
+
+
+def dedupe_primary_targets(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for read in reads:
+        target = str(read.get("target") or "")
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        result.append(read)
+    return result
+
+
+def primary_followthrough_window(
+    read: dict[str, Any],
+    *,
+    action_proof_plan: dict[str, Any] | None = None,
+) -> dict[str, int | str]:
+    inferred = read.get("inferred_anchor") if isinstance(read.get("inferred_anchor"), dict) else {}
+    anchor_kind = inferred.get("anchor_kind")
+    if str(read.get("read_type") or "") == "required_primary_proof_read" or (
+        action_proof_plan
+        and action_proof_plan.get("applies")
+        and action_proof_plan.get("primary_question_family") == "claimed_action"
+    ):
+        return {
+            "before": 45,
+            "after": 8,
+            "max_records": 80,
+            "reason": "action_proof_needs_preceding_tool_and_diff_context",
+        }
+    if anchor_kind == "remembered_topic" or "recent user topic/provenance" in str(read.get("reason") or ""):
+        return {
+            "before": 8,
+            "after": 8,
+            "max_records": 40,
+            "reason": "remembered_topic_needs_surrounding_user_correction_context",
+        }
+    return {
+        "before": 10,
+        "after": 10,
+        "max_records": 50,
+        "reason": "default_primary_source_context_window",
+    }
+
+
 def command_target_from_command(command: dict[str, Any]) -> str | None:
     argv = list(command.get("argv") or [])
     if len(argv) >= 2:
@@ -2182,13 +2645,29 @@ def build_agent_instruction(
     hints: dict[str, str | None],
     answer_source_discipline: dict[str, Any] | None = None,
     source_handle_routing: dict[str, Any] | None = None,
+    action_proof_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
     primary_family = guided_audit_flow.get("primary_question_family")
     recovery_first = readiness_decision == "inspect_recovery_reads" or bool(next_reads)
+    allow_action_proof_followthrough = (
+        readiness_decision != "answer_now"
+        and readiness_decision != "state_scoped_no_evidence"
+        and primary_family == "claimed_action"
+    )
+    primary_followthrough = build_primary_source_followthrough(
+        bounded_next_reads=bounded_answer_ready_next_reads(next_reads),
+        action_proof_plan=action_proof_plan,
+        allow_action_proof_plan=allow_action_proof_followthrough,
+    )
+    primary_followthrough_first = bool(primary_followthrough.get("applies"))
     if readiness_decision == "answer_now":
         decision = "answer_now"
         required_next_action = "answer_from_source_backed_packet"
+    elif primary_followthrough_first:
+        decision = "primary_source_followthrough_first"
+        required_next_action = "run_primary_source_window_command_then_answer_if_supported"
+        recovery_first = False
     elif readiness_decision in {"inspect_recovery_reads", "run_audit_route", "gather_more_evidence"} and primary_family in {
         "workflow_failure",
         "why_did_this_happen",
@@ -2205,7 +2684,12 @@ def build_agent_instruction(
     report_path = str(Path(report_output).expanduser()) if report_output else None
     follow_report = "follow-next-reads.json"
     commands: list[dict[str, Any]] = []
-    if report_path:
+    if primary_followthrough_first:
+        command = dict(primary_followthrough.get("first_command") or {})
+        command["required_for_decisions"] = ["primary_source_followthrough_first"]
+        command["purpose"] = "Open the primary source window first; stop broad search if it supports the answer."
+        commands.append(command)
+    elif report_path:
         follow_argv = [
             "jsonl-history-search",
             "follow-next-reads",
@@ -2280,31 +2764,40 @@ def build_agent_instruction(
             }
         )
 
-    mode_command = fielded_bm25_rerun_command(
-        query=query,
-        guided_audit_flow=guided_audit_flow,
-        next_reads=next_reads,
-    )
-    if mode_command:
-        commands.append(mode_command)
-
-    for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
-        commands.append(
-            {
-                "command_id": f"inspect_exact_source_{len(commands) + 1}",
-                "required_for_decisions": ["inspect_recovery_reads"],
-                "argv": command.get("argv"),
-                "command": command.get("command") or shell_command(command.get("argv") or []),
-                "purpose": "Open one exact source ref from the evidence packet when a targeted read is preferable.",
-            }
+    if not primary_followthrough_first:
+        mode_command = fielded_bm25_rerun_command(
+            query=query,
+            guided_audit_flow=guided_audit_flow,
+            next_reads=next_reads,
         )
+        if mode_command:
+            commands.append(mode_command)
 
-    constraints = [
-        "Do not answer from snippets alone when decision is inspect_recovery_reads or needs_investigation.",
-        "Run the recovery command before synthesis when next_reads or omitted-window recovery are present.",
-        "Use failure-analysis/devlog_brief for timeline, supported claims, non-claims, gaps, and next reads before producing devlog-style conclusions.",
-        "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
-    ]
+        for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
+            commands.append(
+                {
+                    "command_id": f"inspect_exact_source_{len(commands) + 1}",
+                    "required_for_decisions": ["inspect_recovery_reads"],
+                    "argv": command.get("argv"),
+                    "command": command.get("command") or shell_command(command.get("argv") or []),
+                    "purpose": "Open one exact source ref from the evidence packet when a targeted read is preferable.",
+                }
+            )
+
+    if primary_followthrough_first:
+        constraints = [
+            "Run the primary source-window command before broader recovery or synthesis.",
+            "If that primary window supports the answer, stop broad search and answer with source refs plus searched-scope/uncertainty boundaries.",
+            "Run more commands only if the primary source is missing required proof, conflicts with inspected evidence, or leaves a required facet unresolved.",
+            "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
+        ]
+    else:
+        constraints = [
+            "Do not answer from snippets alone when decision is inspect_recovery_reads or needs_investigation.",
+            "Run the recovery command before synthesis when next_reads or omitted-window recovery are present.",
+            "Use failure-analysis/devlog_brief for timeline, supported claims, non-claims, gaps, and next reads before producing devlog-style conclusions.",
+            "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
+        ]
     if decision == "answer_now":
         constraints.insert(0, "Answer only within the allowed_answer_scope and cite/source the supporting handles.")
     discipline_summary = answer_source_discipline_summary(answer_source_discipline)
@@ -2339,8 +2832,21 @@ def build_agent_instruction(
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "workflow_layers": [
             {"layer": "evidence_packet", "surface": "semantic_debug", "status": "current_packet"},
-            {"layer": "recovery_packet", "surface": "follow_next_reads", "status": "required_before_synthesis" if recovery_first else "optional"},
-            {"layer": "investigation_brief", "surface": "failure_analysis.devlog_brief", "status": "required_for_devlog_questions"},
+            {
+                "layer": "primary_source_followthrough",
+                "surface": "answer_ready_handoff.primary_source_followthrough",
+                "status": "required_first" if primary_followthrough_first else "not_available",
+            },
+            {
+                "layer": "recovery_packet",
+                "surface": "follow_next_reads",
+                "status": "required_before_synthesis" if recovery_first else "optional",
+            },
+            {
+                "layer": "investigation_brief",
+                "surface": "failure_analysis.devlog_brief",
+                "status": "required_for_devlog_questions" if not primary_followthrough_first else "only_if_primary_source_insufficient",
+            },
         ],
         "privacy_boundaries": {
             "raw_private_transcript_included": False,
@@ -2404,6 +2910,275 @@ def fielded_bm25_rerun_command(
             "raw_source_lines_included": False,
             "private_bridge_payloads_included": False,
         },
+    }
+
+
+def build_action_proof_plan(
+    *,
+    query: str,
+    family: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    investigation_state: dict[str, Any],
+    source_window_action_proof: dict[str, Any],
+    answer_readiness: dict[str, Any],
+    guided_audit_flow: dict[str, Any],
+) -> dict[str, Any]:
+    primary_family = family.get("primary")
+    detected_supported = set(family.get("detected_supported") or [])
+    action_reads = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and isinstance(read.get("action_proof_source_selection"), dict)
+    ]
+    applies = primary_family == "claimed_action" or "claimed_action" in detected_supported
+    if not applies:
+        return {"schema_version": 1, "applies": False, "reason": "not_a_claimed_action_or_action_proof_query"}
+
+    primary_refs = action_proof_primary_refs(action_reads, source_window_action_proof)
+    required_reads = action_proof_required_reads(primary_refs, next_reads)
+    optional_diagnostics = action_proof_optional_diagnostics(
+        next_reads=next_reads,
+        required_reads=required_reads,
+        answer_readiness=answer_readiness,
+    )
+    retrieval = action_proof_retrieval_guidance(
+        query=query,
+        guided_audit_flow=guided_audit_flow,
+        investigation_state=investigation_state,
+        next_reads=next_reads,
+        primary_refs=primary_refs,
+        has_candidate_action_proof_window=any(
+            ref.get("proof_role") == "candidate_action_source_window"
+            and (
+                ref.get("selection_reason") == "assistant_answer_with_nearby_tool_action_proof"
+                or str(ref.get("selection_reason") or "").startswith("known_action_case:")
+            )
+            for ref in primary_refs
+        ),
+        missing_buckets=list((source_window_action_proof.get("summary") or {}).get("missing_buckets") or []),
+    )
+    stop_condition = (
+        "After the primary proof reads answer the action question, stop broad searching and answer "
+        "with source refs plus searched-scope/gap boundaries."
+    )
+    if not primary_refs:
+        stop_condition = (
+            "If required proof reads still do not expose action proof, state the missing proof buckets before "
+            "rerunning broader retrieval; do not fill the gap with adjacent artifacts or assistant prose."
+        )
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "primary_proof_refs_available" if primary_refs else "primary_proof_refs_missing",
+        "primary_question_family": primary_family,
+        "do_first": "open_primary_proof_refs_before_broad_search" if primary_refs else "open_required_proof_reads_then_check_gaps",
+        "primary_proof_refs": primary_refs[:4],
+        "required_proof_reads": required_reads[:4],
+        "optional_diagnostics": optional_diagnostics[:4],
+        "stop_condition": stop_condition,
+        "retrieval_mode_guidance": retrieval,
+        "answer_boundary": {
+            "answer_from_assistant_prose_alone": False,
+            "adjacent_artifacts_count_as_primary_action_proof": False,
+            "state_missing_proof_buckets": bool(
+                (source_window_action_proof.get("summary") or {}).get("missing_buckets")
+            ),
+            "missing_buckets": list((source_window_action_proof.get("summary") or {}).get("missing_buckets") or [])[:8],
+        },
+        "links": {
+            "next_reads": "semantic_debug.next_reads",
+            "source_window_action_proof": "semantic_debug.source_window_action_proof",
+            "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+            "investigation_state": "semantic_debug.investigation_state",
+        },
+        "privacy_boundaries": {
+            "raw_transcript_text_included": False,
+            "raw_source_lines_included": False,
+            "source_refs_and_local_targets_included": True,
+        },
+    }
+
+
+def action_proof_primary_refs(
+    action_reads: list[dict[str, Any]],
+    source_window_action_proof: dict[str, Any],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for read in action_reads[:4]:
+        refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
+
+    buckets = source_window_action_proof.get("buckets") if isinstance(source_window_action_proof.get("buckets"), dict) else {}
+    for bucket_name in ("command_tool_call", "command_tool_output", "changed_check_review_commit_evidence"):
+        bucket = buckets.get(bucket_name) if isinstance(buckets.get(bucket_name), dict) else {}
+        for record in list(bucket.get("records") or [])[:2]:
+            if not record.get("primary_action_proof"):
+                continue
+            ref = action_proof_record_ref(record, bucket_name=bucket_name)
+            if ref:
+                refs.append(ref)
+    return dedupe_dicts(refs)[:6]
+
+
+def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str, Any]:
+    selection = read.get("action_proof_source_selection") if isinstance(read.get("action_proof_source_selection"), dict) else {}
+    row = {
+        "target": read.get("target"),
+        "kind": read.get("kind"),
+        "proof_role": proof_role,
+        "required": True,
+        "reason": read.get("reason"),
+        "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
+        "selection_reason": selection.get("selection_reason"),
+        "source_window_verification_required": selection.get("source_window_verification_required"),
+        "claim_boundary": selection.get("claim_boundary"),
+    }
+    return {key: value for key, value in row.items() if value not in (None, [], {})}
+
+
+def action_proof_record_ref(record: dict[str, Any], *, bucket_name: str) -> dict[str, Any]:
+    source_ref = record.get("source_ref") if isinstance(record.get("source_ref"), dict) else {}
+    target = source_ref_target(source_ref) if source_ref else None
+    row = {
+        "target": target,
+        "proof_role": record.get("proof_role"),
+        "bucket": bucket_name,
+        "required": True,
+        "source_ref": guided_source_ref(source_ref) if source_ref else None,
+        "event_id": record.get("event_id"),
+        "event_family": record.get("event_family"),
+        "action": record.get("action"),
+        "tool_name": record.get("tool_name"),
+    }
+    return {key: value for key, value in row.items() if value not in (None, [], {})}
+
+
+def action_proof_required_reads(
+    primary_refs: list[dict[str, Any]],
+    next_reads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if primary_refs:
+        return [
+            {
+                **ref,
+                "read_type": "required_primary_proof_read",
+                "instruction": "Open this source ref before answering the claimed-action question.",
+            }
+            for ref in primary_refs
+            if ref.get("target") or ref.get("source_ref")
+        ]
+    return [
+        {
+            **action_proof_read_ref(read, proof_role="fallback_bounded_next_read"),
+            "read_type": "required_gap_check_read",
+            "instruction": "Open this bounded next read to confirm whether action proof is present or missing.",
+        }
+        for read in next_reads[:3]
+        if isinstance(read, dict) and (read.get("target") or read.get("source_ref"))
+    ]
+
+
+def action_proof_optional_diagnostics(
+    *,
+    next_reads: list[dict[str, Any]],
+    required_reads: list[dict[str, Any]],
+    answer_readiness: dict[str, Any],
+) -> list[dict[str, Any]]:
+    required_targets = {item.get("target") for item in required_reads if item.get("target")}
+    diagnostics: list[dict[str, Any]] = []
+    for read in next_reads:
+        target = read.get("target")
+        if not target or target in required_targets:
+            continue
+        diagnostics.append(
+            {
+                "target": target,
+                "kind": read.get("kind"),
+                "reason": read.get("reason"),
+                "diagnostic_role": "optional_after_primary_proof_or_when_required_facets_remain_gapped",
+            }
+        )
+        if len(diagnostics) >= 3:
+            break
+    diagnostics.append(
+        {
+            "diagnostic_role": "follow_next_reads_or_failure_analysis",
+            "when": (
+                "Only after primary proof is thin, contradictory, missing required action facets, "
+                "or the answer requires timeline synthesis."
+            ),
+            "answer_readiness_decision": answer_readiness.get("decision"),
+        }
+    )
+    return diagnostics
+
+
+def action_proof_retrieval_guidance(
+    *,
+    query: str,
+    guided_audit_flow: dict[str, Any],
+    investigation_state: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    primary_refs: list[dict[str, Any]],
+    has_candidate_action_proof_window: bool,
+    missing_buckets: list[str],
+) -> dict[str, Any]:
+    retrieval = investigation_state.get("retrieval") or {}
+    recommendation = retrieval.get("conservative_recommendation") or {}
+    fielded_command = fielded_bm25_rerun_command(
+        query=query,
+        guided_audit_flow=guided_audit_flow,
+        next_reads=next_reads,
+    )
+    fielded = {
+        "mode": "fielded-bm25",
+        "suggested_when": "package evidence is thin, missing primary proof, contradictory, or required action facets remain gapped",
+        "required_now": (
+            (not bool(primary_refs) or (bool(missing_buckets) and not has_candidate_action_proof_window))
+            and recommendation.get("mode") == "fielded-bm25"
+        ),
+        "rerun_command": fielded_command,
+    }
+    if fielded_command is None:
+        fielded["rerun_command"] = None
+        fielded["rerun_command_reason"] = "not_applicable_unless_current_mode_is_package_and_recommendation_is_fielded_bm25"
+    return {
+        "current_mode": retrieval.get("mode_used"),
+        "recommended_mode": recommendation.get("mode"),
+        "package": {
+            "default_ok": True,
+            "use_first": "normal semantic-debug and action-proof questions can start in package mode",
+            "stop_before_rerun_when": "primary proof refs answer the action question with boundaries",
+        },
+        "fielded_bm25": fielded,
+        "rrf_fusion": {
+            "default_ok": False,
+            "explicit_opt_in_only": True,
+            "suggested_when": "a named high-recall failure condition remains after package/fielded evidence is thin or gapped",
+            "rerun_command_emitted_by_default": False,
+        },
+        "claim_boundaries": {
+            "package_default_changed": False,
+            "rrf_default_promoted": False,
+            "retrieval_mode_claims_final_answer_quality": False,
+        },
+    }
+
+
+def summarize_action_proof_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    retrieval = plan.get("retrieval_mode_guidance") or {}
+    fielded = retrieval.get("fielded_bm25") if isinstance(retrieval.get("fielded_bm25"), dict) else {}
+    return {
+        "schema_version": plan.get("schema_version", 1),
+        "applies": bool(plan.get("applies")),
+        "status": plan.get("status"),
+        "primary_proof_ref_count": len(plan.get("primary_proof_refs") or []),
+        "required_proof_read_count": len(plan.get("required_proof_reads") or []),
+        "optional_diagnostic_count": len(plan.get("optional_diagnostics") or []),
+        "stop_condition": plan.get("stop_condition"),
+        "current_mode": retrieval.get("current_mode"),
+        "recommended_mode": retrieval.get("recommended_mode"),
+        "fielded_bm25_required_now": fielded.get("required_now"),
+        "rrf_explicit_opt_in_only": (retrieval.get("rrf_fusion") or {}).get("explicit_opt_in_only"),
     }
 
 

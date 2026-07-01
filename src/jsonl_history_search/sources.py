@@ -1104,7 +1104,7 @@ def iter_directory_jsonl_files(
         else:
             files.sort(key=lambda item: item.name, reverse=True)
         dirs.sort(key=lambda item: item.name)
-        pending.extend(reversed(dirs))
+        pending.extend(dirs)
         for path in files:
             if time.monotonic() - started > plan.limits.max_elapsed:
                 warnings.append("Stopped enumeration at max elapsed cap.")

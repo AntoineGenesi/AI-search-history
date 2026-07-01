@@ -15,6 +15,7 @@ from .agent_loop_cost import (
     write_retained_trace_counter_packet,
 )
 from .archive_snapshot import build_archive_snapshot_proof_payload
+from .ask_router import build_ask_router_payload
 from .capability_diagnostic import build_capability_diagnostic
 from .compact_handoff_usefulness import (
     DEFAULT_ANSWER_USE_FIXTURE as DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE,
@@ -125,11 +126,15 @@ from .semantic_debugging import (
 from .skill_audit import build_skill_audit_payload
 from .source_expansion import ExpansionRequest, build_follow_next_reads_payload, build_source_expansion_payload
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
+from .status_anchor import DEFAULT_STATUS_QUERY, build_status_anchor_payload
 from .structural_hybrid import search_structural_hybrid_budgeted
 from .timeutil import parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
 from .workflow_repeat import build_workflow_repeat_payload
 from .masking import MASK_MODES, MaskContext
+
+
+LOCAL_EVIDENCE_MODES = ("public", "internal")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,6 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    ask = subparsers.add_parser(
+        "ask",
+        description=(
+            "Natural-language first-command resolver for JSONL history/status/"
+            "action/currentness/wrap-up prompts. It does not produce final answers."
+        ),
+    )
+    ask.add_argument("query", help="User wording to classify into a JSONL first route.")
+    ask.add_argument("--cwd", default=".")
+    ask.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     for name in ("plan", "search"):
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
@@ -248,6 +263,58 @@ def build_parser() -> argparse.ArgumentParser:
         default=500,
         help="Maximum characters of each message snippet to include; 0 keeps the full text.",
     )
+    status_anchor = subparsers.add_parser(
+        "what-happened-since",
+        description=(
+            "JSONL-first status-anchor workflow for natural questions like "
+            "'what happened since my last message?' or 'what did you do while I was away?'."
+        ),
+    )
+    status_anchor.add_argument("query", nargs="?", default=DEFAULT_STATUS_QUERY)
+    add_common_args(status_anchor)
+    status_anchor.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum recent user messages to inspect for anchor candidates; defaults to --max-matches.",
+    )
+    status_anchor.add_argument(
+        "--snippet-chars",
+        type=int,
+        default=280,
+        help="Maximum characters of each message snippet to include; 0 keeps the full text.",
+    )
+    artifact_currentness = subparsers.add_parser(
+        "artifact-currentness",
+        description=(
+            "Resolve whether a plan, TODO, ticket, task, report, or topic should "
+            "be trusted as current or treated as stale/superseded provenance."
+        ),
+    )
+    artifact_currentness.add_argument("artifact_or_query", help="Artifact path, task/ticket id, or natural currentness query.")
+    add_common_args(artifact_currentness)
+    local_evidence = subparsers.add_parser(
+        "local-evidence-diagnostic",
+        description=(
+            "Render raw-run evidence in explicit public/export or internal/local "
+            "product-debugging mode."
+        ),
+    )
+    local_evidence.add_argument("--raw-run", required=True, help="Local raw-run JSON with rows/source refs/commands.")
+    local_evidence.add_argument("--evidence-mode", choices=LOCAL_EVIDENCE_MODES, default="public")
+    local_evidence.add_argument("--limit", type=int, default=20)
+    local_evidence.add_argument("--format", choices=("text", "json", "markdown"), default="json")
+    local_evidence.add_argument("--report-output", default=None)
+    semantic_wrapup = subparsers.add_parser(
+        "semantic-wrapup",
+        description=(
+            "Mine a session/window for complaints, corrections, workflow failures, "
+            "cause chains, and user-selectable fix suggestions."
+        ),
+    )
+    semantic_wrapup.add_argument("query", nargs="?", default="semantic wrap-up this run")
+    add_common_args(semantic_wrapup)
+    semantic_wrapup.add_argument("--report-output", default=None)
     read_more = subparsers.add_parser(
         "read-more",
         description=(
@@ -1614,6 +1681,11 @@ def discovery_payload_from_args(args: argparse.Namespace) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "ask":
+        cwd = str(Path(args.cwd).expanduser().resolve())
+        payload = build_ask_router_payload(args.query, cwd=cwd)
+        print(render(payload, args.format))
+        return 0
     if args.command == "validate-install":
         payload = validate_install(
             package_root=Path(args.package_root).expanduser() if args.package_root else None,
@@ -2253,6 +2325,45 @@ def main(argv: list[str] | None = None) -> int:
         payload = build_latest_user_messages_payload(args)
         print(render(payload, args.format))
         return 0
+    if args.command == "what-happened-since":
+        payload = build_status_anchor_payload(args)
+        print(render(payload, args.format))
+        return 0 if payload["status_anchor"]["status"] == "ok" else 1
+    if args.command == "artifact-currentness":
+        from .artifact_currentness import build_artifact_currentness_payload
+
+        payload = build_artifact_currentness_payload(args)
+        print(render(payload, args.format))
+        return 0 if payload["artifact_currentness"]["status"] == "ok" else 1
+    if args.command == "local-evidence-diagnostic":
+        from .local_evidence import build_local_evidence_diagnostic_payload
+
+        payload = build_local_evidence_diagnostic_payload(args)
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0 if payload["local_evidence_diagnostic"]["status"] == "ok" else 1
+    if args.command == "semantic-wrapup":
+        from .semantic_wrapup import build_semantic_wrapup_payload
+
+        source_plan, _intent, plan = payload_from_args(args)
+        mask_context = _mask_context_from_args(args)
+        payload = build_semantic_wrapup_payload(
+            query=args.query,
+            source_plan=source_plan,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=Path(args.cwd).expanduser().resolve(),
+            mask_context=mask_context,
+            output_format=args.format,
+            report_output=args.report_output,
+        )
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0 if payload["semantic_wrapup"]["status"] in {"found", "no_failure_modes_found"} else 1
     if args.command == "read-more":
         args.query = args.target
         _source_plan, _intent, plan = payload_from_args(args)

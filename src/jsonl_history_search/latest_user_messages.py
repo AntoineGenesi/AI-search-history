@@ -24,6 +24,8 @@ class LatestUserMessage:
     source_ref: str
     source_identifier: str
     line: int
+    openable_source_ref: dict[str, Any] | None = None
+    openable_target: str | None = None
     mirror_sources: list[dict] = field(default_factory=list)
 
 
@@ -111,6 +113,7 @@ def latest_user_messages(
 
     messages, deduped_mirror_count = _dedupe_and_sort(candidates)
     rendered = [_message_to_dict(item, default_tz, snippet_chars) for item in messages[:limit]]
+    raw_paths_included = any(message.get("openable_target") for message in rendered)
     return {
         "schema_version": 1,
         "status": "ok" if rendered else "no_user_messages_found",
@@ -134,8 +137,8 @@ def latest_user_messages(
         },
         "messages": rendered,
         "privacy": {
-            "raw_local_paths_included": False,
-            "raw_session_ids_included": False,
+            "raw_local_paths_included": raw_paths_included,
+            "raw_session_ids_included": raw_paths_included,
             "raw_text_included": True,
             "source_identifiers_are_hashed": True,
         },
@@ -225,6 +228,8 @@ def _extract_user_message(
         source_ref=_session_ref(source.path, codex_home, line=line_number),
         source_identifier=source.identifier,
         line=line_number,
+        openable_source_ref=_openable_source_ref(source.path, line_number),
+        openable_target=_openable_target(source.path, line_number),
     )
 
 
@@ -259,7 +264,7 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
 def _message_to_dict(message: LatestUserMessage, local_tz, snippet_chars: int) -> dict:
     text = message.text if snippet_chars == 0 else message.text[:snippet_chars]
     truncated = snippet_chars > 0 and len(message.text) > snippet_chars
-    return {
+    rendered = {
         "local_timestamp": message.timestamp_utc.astimezone(local_tz).isoformat(timespec="seconds"),
         "timestamp_utc": message.timestamp_utc.isoformat(timespec="seconds"),
         "source_kind": message.source_kind,
@@ -269,14 +274,39 @@ def _message_to_dict(message: LatestUserMessage, local_tz, snippet_chars: int) -
         "snippet": text.replace("\n", " "),
         "truncated": truncated,
     }
+    if message.openable_source_ref:
+        rendered["openable_source_ref"] = message.openable_source_ref
+    if message.openable_target:
+        rendered["openable_target"] = message.openable_target
+    return rendered
 
 
 def _mirror_source(message: LatestUserMessage) -> dict:
-    return {
+    rendered = {
         "source_kind": message.source_kind,
         "source_ref": message.source_ref,
         "source_identifier": message.source_identifier,
     }
+    if message.openable_source_ref:
+        rendered["openable_source_ref"] = message.openable_source_ref
+    if message.openable_target:
+        rendered["openable_target"] = message.openable_target
+    return rendered
+
+
+def _openable_source_ref(path: Path, line: int) -> dict[str, Any]:
+    return {"path": _resolved_path_text(path), "line": line}
+
+
+def _openable_target(path: Path, line: int) -> str:
+    return f"{_resolved_path_text(path)}:{line}"
+
+
+def _resolved_path_text(path: Path) -> str:
+    try:
+        return str(path.expanduser().resolve())
+    except OSError:
+        return str(path.expanduser())
 
 
 def _source_metadata(source: _Source, status: str) -> dict:

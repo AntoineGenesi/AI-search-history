@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+from pathlib import PurePosixPath
 
 from .agent_contract import source_ref_target
 from .metric_contract import TOKEN_FORMULA
@@ -22,10 +24,20 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "ask_router" in payload:
+        return render_ask_router_text(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_text(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_text(payload)
+    if "status_anchor" in payload:
+        return render_status_anchor_text(payload)
+    if "artifact_currentness" in payload:
+        return render_artifact_currentness_text(payload)
+    if "local_evidence_diagnostic" in payload:
+        return render_local_evidence_diagnostic_text(payload)
+    if "semantic_wrapup" in payload:
+        return render_semantic_wrapup_text(payload)
     if "source_expansion" in payload:
         return render_source_expansion_text(payload)
     if "follow_next_reads" in payload:
@@ -155,10 +167,20 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "ask_router" in payload:
+        return render_ask_router_markdown(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_markdown(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_markdown(payload)
+    if "status_anchor" in payload:
+        return render_status_anchor_markdown(payload)
+    if "artifact_currentness" in payload:
+        return render_artifact_currentness_markdown(payload)
+    if "local_evidence_diagnostic" in payload:
+        return render_local_evidence_diagnostic_markdown(payload)
+    if "semantic_wrapup" in payload:
+        return render_semantic_wrapup_markdown(payload)
     if "source_expansion" in payload:
         return render_source_expansion_markdown(payload)
     if "follow_next_reads" in payload:
@@ -263,6 +285,620 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_ask_router_text(payload: dict) -> str:
+    report = payload["ask_router"]
+    lines = [
+        "Ask Route",
+        "Answer status: not-ready/needs-more-proof",
+        "Open these source refs first: none yet; run the first command to produce source refs.",
+        f"First command: {report.get('first_command')}",
+        f"Stop condition: {report.get('stop_guidance')}",
+        f"Only continue if: {report.get('manual_search_guidance')}",
+        f"Chosen route: {report.get('chosen_route')}",
+        f"Why: {report.get('why_it_applies')}",
+        f"Read: {report.get('read_specialization')}",
+        "Inspect after:",
+    ]
+    for item in report.get("inspect_after", []):
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            f"Stop guidance: {report.get('stop_guidance')}",
+            f"Manual search guidance: {report.get('manual_search_guidance')}",
+            f"Boundary: {report.get('boundary')}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_ask_router_markdown(payload: dict) -> str:
+    report = payload["ask_router"]
+    lines = [
+        "# JSONL Ask Route",
+        "",
+        "- Answer status: `not-ready/needs-more-proof`",
+        "- Open these source refs first: none yet; run the first command to produce source refs.",
+        f"- First command: `{report.get('first_command')}`",
+        f"- Stop condition: {report.get('stop_guidance')}",
+        f"- Only continue if: {report.get('manual_search_guidance')}",
+        "",
+        f"- Chosen route: `{report.get('chosen_route')}`",
+        f"- Why: {report.get('why_it_applies')}",
+        f"- Read: `{report.get('read_specialization')}`",
+        "",
+        "## Inspect After",
+        "",
+    ]
+    for item in report.get("inspect_after", []):
+        lines.append(f"- `{item}`")
+    lines.extend(
+        [
+            "",
+            "## Search Boundary",
+            "",
+            f"- Stop: {report.get('stop_guidance')}",
+            f"- Manual search: {report.get('manual_search_guidance')}",
+            f"- Boundary: {report.get('boundary')}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _source_target(item: dict) -> str:
+    target = item.get("target") or item.get("openable_target")
+    if target:
+        return str(target)
+    source_ref = item.get("source_ref")
+    if isinstance(source_ref, dict):
+        return source_ref_target(source_ref) or ""
+    if source_ref:
+        return str(source_ref)
+    return ""
+
+
+def _command_from_argv(argv: list | tuple | None) -> str | None:
+    if not argv:
+        return None
+    parts = [str(part) for part in argv]
+    if parts[0] == "jsonl-history-search":
+        command = parts
+    elif parts[0] == "read-more":
+        command = ["jsonl-history-search", *parts]
+    else:
+        command = parts
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def _action_command(action: dict) -> str | None:
+    command = str(action.get("command") or "")
+    argv = action.get("argv")
+    if argv:
+        return _command_from_argv(argv)
+    if command.startswith("jsonl-history-search "):
+        return command
+    return None
+
+
+def _read_more_command(item: dict, command_by_target: dict[str, str] | None = None) -> str | None:
+    if item.get("read_more_command"):
+        return str(item["read_more_command"])
+    target = _source_target(item)
+    if target and command_by_target and target in command_by_target:
+        return command_by_target[target]
+    actions = list(item.get("expansion_actions") or [])
+    preferred = [action for action in actions if action.get("mode") == "window"] or actions
+    for action in preferred:
+        command = _action_command(action)
+        if command:
+            return command
+    command = item.get("command")
+    if isinstance(command, str) and command.startswith("jsonl-history-search read-more "):
+        return command
+    if _is_jsonl_read_target(target):
+        return _command_from_argv(["jsonl-history-search", "read-more", target, "--mode", "window", "--format", "json"])
+    return _repo_artifact_open_command(target)
+
+
+def _repo_artifact_open_command(target: str | None) -> str | None:
+    parsed = _parse_repo_artifact_target(target)
+    if not parsed:
+        return None
+    path, line = parsed
+    if line is None:
+        start, end = 1, 160
+    else:
+        start, end = max(1, line - 5), line + 20
+    return f"sed -n '{start},{end}p' {shlex.quote(path)}"
+
+
+def _parse_repo_artifact_target(target: str | None) -> tuple[str, int | None] | None:
+    if not target:
+        return None
+    if "\x00" in target or "\n" in target or "\r" in target:
+        return None
+    path = target
+    line = None
+    if ":" in target:
+        maybe_path, maybe_line = target.rsplit(":", 1)
+        if maybe_line.isdigit():
+            path = maybe_path
+            line = int(maybe_line)
+        else:
+            return None
+    if _is_jsonl_read_target(path):
+        return None
+    if path.startswith(("/", "~")) or "://" in path or ":" in path:
+        return None
+    parts = PurePosixPath(path).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    if "/" not in path and "." not in PurePosixPath(path).name:
+        return None
+    return path, line
+
+
+def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
+    commands: dict[str, str] = {}
+    for read in reads:
+        target = _source_target(read)
+        command = _read_more_command(read)
+        if target and command and target not in commands:
+            commands[target] = command
+    return commands
+
+
+def _is_jsonl_read_target(target: str | None) -> bool:
+    if not target:
+        return False
+    path = target.split(":", 1)[0]
+    return path.endswith(".jsonl") or path.endswith(".json")
+
+
+def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[str, str] | None = None) -> None:
+    target = _source_target(item) or "(no source ref)"
+    reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
+    lines.append(f"- {target}{f': {reason}' if reason else ''}")
+    command = _read_more_command(item, command_by_target)
+    if command:
+        lines.append(f"  command: {command}")
+
+
+def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: dict[str, str] | None = None) -> None:
+    target = _source_target(item) or "(no source ref)"
+    reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
+    lines.append(f"- `{target}`{f': {reason}' if reason else ''}")
+    command = _read_more_command(item, command_by_target)
+    if command:
+        lines.append(f"  - Command: `{command}`")
+
+
+def _source_use_answer_status(report_status: str | None, *, has_required_reads: bool, has_refs: bool) -> str:
+    if not has_refs:
+        return "not-ready/needs-more-proof"
+    if has_required_reads or report_status not in {None, "ok", "found", "candidates_found"}:
+        return "answer-after-required-reads"
+    return "answer-after-required-reads"
+
+
+def render_artifact_currentness_text(payload: dict) -> str:
+    report = payload["artifact_currentness"]
+    selected = report.get("selected_artifact_or_topic") or {}
+    trust = _artifact_trust_label(report.get("currentness_verdict"))
+    reads = report.get("next_reads") or []
+    answer_status = _source_use_answer_status(
+        report.get("status"),
+        has_required_reads=bool(reads),
+        has_refs=bool(reads or selected.get("source_ref") or (report.get("evidence_chain") or [])),
+    )
+    lines = [
+        f"Should the agent trust this artifact/topic? {trust}",
+        f"Answer status: {answer_status}",
+        "Open these source refs first:",
+    ]
+    if reads:
+        for read in reads[:5]:
+            _append_text_read(lines, read)
+    elif selected.get("source_ref"):
+        _append_text_read(lines, selected)
+    else:
+        lines.append("- (no source refs surfaced)")
+    lines.extend(
+        [
+            "Stop condition: stop after the selected artifact/topic and current front-door refs are inspected and the currentness verdict is source-backed.",
+            "Only continue if: the listed refs conflict, the front door is missing, or a required currentness source is absent.",
+            "Required proof reads:",
+        ]
+    )
+    if reads:
+        for read in reads[:8]:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- none listed")
+    lines.extend([
+        "Optional diagnostics/adjacent evidence: status fields, evidence chain, worktree classifications, blind spots, and warnings below.",
+        f"Verdict: {report.get('currentness_verdict')}",
+        f"Why: {report.get('why')}",
+        f"Query: {report.get('query')}",
+        f"Detected intent: {report.get('detected_intent')}",
+    ])
+    if selected:
+        selected_ref = selected.get("source_ref") or selected.get("path") or selected.get("topic")
+        lines.append(f"Selected: {selected_ref}")
+        if selected.get("kind") or selected.get("artifact_type"):
+            lines.append(f"Artifact type: {selected.get('artifact_type') or selected.get('kind')}")
+    worktree = report.get("worktree_currentness") or {}
+    if worktree:
+        lines.append("Worktree currentness:")
+        for item in worktree.get("classifications", [])[:12]:
+            lines.append(
+                f"- {item.get('identifier')}: {item.get('classification')} - {item.get('why')}"
+            )
+            if item.get("path"):
+                lines.append(f"  path: {item.get('path')}")
+            if item.get("branch"):
+                lines.append(f"  branch: {item.get('branch')}")
+            for ref in item.get("source_refs", [])[:3]:
+                lines.append(f"  evidence: {ref.get('source_ref')} - {ref.get('snippet')}")
+            for command in item.get("next_commands", [])[:5]:
+                lines.append(f"  command: {command.get('command')}")
+            if item.get("preservation_guidance"):
+                lines.append(f"  preservation: {item.get('preservation_guidance')}")
+        if worktree.get("preservation_policy"):
+            lines.append(f"Preservation policy: {worktree.get('preservation_policy')}")
+        if worktree.get("boundary"):
+            lines.append(f"Worktree boundary: {worktree.get('boundary')}")
+    status = report.get("status_field_assessment") or {}
+    lines.append(f"Status fields: {status.get('assessment')}")
+    if status.get("claim_source"):
+        lines.append(f"Claim source: {status.get('claim_source')}")
+    for field in status.get("status_fields", [])[:3]:
+        lines.append(f"- {field.get('source_ref')}: {field.get('raw')}")
+    front = report.get("current_front_door") or {}
+    if front.get("source_refs"):
+        lines.append("Current front door:")
+        for ref in front["source_refs"][:4]:
+            lines.append(f"- {ref.get('source_ref')}: {ref.get('snippet')}")
+    chain = report.get("evidence_chain") or []
+    if chain:
+        lines.append("Evidence chain:")
+        for item in chain[:10]:
+            lines.append(f"- {item.get('source_ref')}: {item.get('relationship')} - {item.get('snippet')}")
+    if reads:
+        lines.append("Next reads:")
+        for read in reads[:8]:
+            _append_text_read(lines, read)
+    for blind in report.get("blind_spots", []):
+        lines.append(f"Blind spot: {blind}")
+    return "\n".join(lines)
+
+
+def render_artifact_currentness_markdown(payload: dict) -> str:
+    report = payload["artifact_currentness"]
+    selected = report.get("selected_artifact_or_topic") or {}
+    trust = _artifact_trust_label(report.get("currentness_verdict"))
+    reads = report.get("next_reads") or []
+    answer_status = _source_use_answer_status(
+        report.get("status"),
+        has_required_reads=bool(reads),
+        has_refs=bool(reads or selected.get("source_ref") or (report.get("evidence_chain") or [])),
+    )
+    lines = [
+        "# Artifact Currentness",
+        "",
+        f"**Should the agent trust this artifact/topic?** {trust}",
+        "",
+        f"**Answer status:** `{answer_status}`",
+        "",
+        "## Open These Source Refs First",
+        "",
+    ]
+    if reads:
+        for read in reads[:5]:
+            _append_markdown_read(lines, read)
+    elif selected.get("source_ref"):
+        _append_markdown_read(lines, selected)
+    else:
+        lines.append("- No source refs surfaced.")
+    lines.extend([
+        "",
+        "## Stop / Continue",
+        "",
+        "- Stop condition: stop after the selected artifact/topic and current front-door refs are inspected and the currentness verdict is source-backed.",
+        "- Only continue if: the listed refs conflict, the front door is missing, or a required currentness source is absent.",
+        "",
+        "## Required Proof Reads",
+        "",
+    ])
+    if reads:
+        for read in reads[:8]:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- None listed.")
+    lines.extend([
+        "",
+        "## Optional Diagnostics / Adjacent Evidence",
+        "",
+        f"**Verdict:** `{report.get('currentness_verdict')}`",
+        f"**Why:** {report.get('why')}",
+        f"**Query:** {report.get('query')}",
+        f"**Detected intent:** `{report.get('detected_intent')}`",
+    ])
+    selected_ref = selected.get("source_ref") or selected.get("path") or selected.get("topic")
+    if selected_ref:
+        lines.append(f"**Selected:** `{selected_ref}`")
+    if selected.get("kind") or selected.get("artifact_type"):
+        lines.append(f"**Artifact type:** `{selected.get('artifact_type') or selected.get('kind')}`")
+    worktree = report.get("worktree_currentness") or {}
+    if worktree:
+        lines.extend(["", "## Worktree Currentness", ""])
+        for item in worktree.get("classifications", [])[:12]:
+            lines.append(f"- `{item.get('identifier')}`: `{item.get('classification')}` - {item.get('why')}")
+            if item.get("path"):
+                lines.append(f"  - Path: `{item.get('path')}`")
+            if item.get("branch"):
+                lines.append(f"  - Branch: `{item.get('branch')}`")
+            for ref in item.get("source_refs", [])[:3]:
+                lines.append(f"  - Evidence `{ref.get('source_ref')}`: {ref.get('snippet')}")
+            for command in item.get("next_commands", [])[:5]:
+                lines.append(f"  - Command: `{command.get('command')}`")
+            if item.get("preservation_guidance"):
+                lines.append(f"  - Preservation: {item.get('preservation_guidance')}")
+        lines.append(f"**Preservation policy:** {worktree.get('preservation_policy')}")
+        lines.append(f"**Boundary:** {worktree.get('boundary')}")
+    status = report.get("status_field_assessment") or {}
+    lines.extend(["", "## Status Field Assessment", "", f"`{status.get('assessment')}`"])
+    if status.get("claim_source"):
+        lines.append(f"- Claim source: `{status.get('claim_source')}`")
+    for field in status.get("status_fields", [])[:3]:
+        lines.append(f"- `{field.get('source_ref')}`: {field.get('raw')}")
+    front = report.get("current_front_door") or {}
+    if front.get("source_refs"):
+        lines.extend(["", "## Current Front Door", ""])
+        for ref in front["source_refs"][:4]:
+            lines.append(f"- `{ref.get('source_ref')}`: {ref.get('snippet')}")
+    chain = report.get("evidence_chain") or []
+    if chain:
+        lines.extend(["", "## Evidence Chain", ""])
+        for item in chain[:10]:
+            lines.append(f"- `{item.get('source_ref')}`: `{item.get('relationship')}` - {item.get('snippet')}")
+    if reads:
+        lines.extend(["", "## Next Reads", ""])
+        for read in reads[:8]:
+            _append_markdown_read(lines, read)
+    if report.get("blind_spots"):
+        lines.extend(["", "## Blind Spots", ""])
+        for blind in report["blind_spots"]:
+            lines.append(f"- {blind}")
+    return "\n".join(lines)
+
+
+def render_local_evidence_diagnostic_text(payload: dict) -> str:
+    report = payload["local_evidence_diagnostic"]
+    summary = report.get("summary") or {}
+    lines = [
+        f"Local evidence diagnostic: {report.get('evidence_mode')}",
+        f"Mode: {report.get('mode_label')}",
+        f"Rows: {summary.get('row_count', 0)}",
+        f"Rows with source refs: {summary.get('rows_with_source_refs', 0)}",
+        f"Rows with commands: {summary.get('rows_with_commands', 0)}",
+    ]
+    contract = report.get("privacy_contract") or {}
+    lines.append(
+        "Raw detail included: "
+        f"paths={contract.get('raw_private_paths_included')} "
+        f"lines={contract.get('exact_line_numbers_included')} "
+        f"commands={contract.get('raw_command_text_included')} "
+        f"answers={contract.get('final_answer_text_included')}"
+    )
+    for row in report.get("rows", [])[:5]:
+        lines.append(f"- {row.get('case_id')}: refs={row.get('diagnosis_inputs', {}).get('source_ref_count', 0)}")
+        for ref in row.get("source_refs", [])[:3]:
+            lines.append(f"  source: {ref.get('target')}")
+        for command in row.get("command_family_trace", [])[:3]:
+            lines.append(f"  command family: {command.get('family')}")
+    return "\n".join(lines)
+
+
+def render_local_evidence_diagnostic_markdown(payload: dict) -> str:
+    report = payload["local_evidence_diagnostic"]
+    summary = report.get("summary") or {}
+    lines = [
+        "# Local Evidence Diagnostic",
+        "",
+        f"- Evidence mode: `{report.get('evidence_mode')}`",
+        f"- Mode label: {report.get('mode_label')}",
+        f"- Rows: {summary.get('row_count', 0)}",
+        f"- Rows with source refs: {summary.get('rows_with_source_refs', 0)}",
+        f"- Rows with commands: {summary.get('rows_with_commands', 0)}",
+        "",
+        "## Boundary",
+        "",
+        f"- Internal mode: {report.get('boundary', {}).get('internal_mode')}",
+        f"- Public mode: {report.get('boundary', {}).get('public_mode')}",
+        "",
+        "## Rows",
+        "",
+    ]
+    for row in report.get("rows", [])[:10]:
+        lines.append(f"### {row.get('case_id')}")
+        lines.append("")
+        for ref in row.get("source_refs", [])[:5]:
+            lines.append(f"- Source: `{ref.get('target')}`")
+        for command in row.get("command_family_trace", [])[:5]:
+            lines.append(f"- Command family: `{command.get('family')}`")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def render_semantic_wrapup_text(payload: dict) -> str:
+    report = payload["semantic_wrapup"]
+    summary = report.get("summary") or {}
+    reads = report.get("next_reads") or []
+    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads))
+    lines = [
+        "Semantic wrap-up",
+        f"Status: {report.get('status')}",
+        f"Answer status: {answer_status}",
+        "Open these source refs first:",
+    ]
+    if reads:
+        for read in reads[:5]:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- (no source refs surfaced)")
+    lines.extend([
+        "Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
+        "Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
+        "Required proof reads:",
+    ])
+    if reads:
+        for read in reads[:8]:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- none listed")
+    lines.extend([
+        "Optional diagnostics/adjacent evidence: behavior-system destinations and fix suggestions below.",
+        (
+            "Summary: "
+            f"{summary.get('complaint_signal_count', 0)} complaint signals, "
+            f"{summary.get('failure_mode_count', 0)} failure modes, "
+            f"{summary.get('fix_suggestion_count', 0)} fix suggestions"
+        ),
+        "Selection required: yes; no fixes were auto-applied.",
+    ])
+    if report.get("failure_modes"):
+        lines.append("Failure modes:")
+        for mode in report["failure_modes"][:8]:
+            lines.append(f"- {mode.get('failure_mode')}: {mode.get('title')} evidence={mode.get('evidence_count')}")
+            for ref in mode.get("source_refs", [])[:3]:
+                lines.append(f"  ref: {ref.get('path')}:{ref.get('line')}")
+            cause_chain = mode.get("cause_chain") or {}
+            inferred_steps = cause_chain.get("inferred_steps") or []
+            if inferred_steps:
+                lines.append(f"  inferred: {inferred_steps[0]}")
+    if report.get("fix_suggestions"):
+        lines.append("Fix suggestions:")
+        for suggestion in report["fix_suggestions"][:8]:
+            dest = suggestion.get("proposed_destination") or {}
+            lines.append(
+                f"- {suggestion.get('suggestion_id')} {suggestion.get('fix_type')} -> "
+                f"{dest.get('path')}: {suggestion.get('proposed_action')}"
+            )
+            lines.append(f"  destination rationale: {suggestion.get('destination_rationale')}")
+            decisions = [
+                option.get("decision")
+                for option in (suggestion.get("selection_shape") or {}).get("options", [])
+                if option.get("decision")
+            ] or list(suggestion.get("selection_options") or [])
+            if decisions:
+                lines.append(f"  options: {', '.join(decisions)}")
+    if reads:
+        lines.append("Next reads:")
+        for read in reads[:8]:
+            _append_text_read(lines, read)
+    return "\n".join(lines)
+
+
+def render_semantic_wrapup_markdown(payload: dict) -> str:
+    report = payload["semantic_wrapup"]
+    summary = report.get("summary") or {}
+    reads = report.get("next_reads") or []
+    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads))
+    lines = [
+        "# Semantic Wrap-Up",
+        "",
+        f"**Status:** `{report.get('status')}`",
+        f"**Answer status:** `{answer_status}`",
+        "",
+        "## Open These Source Refs First",
+        "",
+    ]
+    if reads:
+        for read in reads[:5]:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- No source refs surfaced.")
+    lines.extend([
+        "",
+        "## Stop / Continue",
+        "",
+        "- Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
+        "- Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
+        "",
+        "## Required Proof Reads",
+        "",
+    ])
+    if reads:
+        for read in reads[:8]:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- None listed.")
+    lines.extend([
+        "",
+        "## Optional Diagnostics / Adjacent Evidence",
+        "",
+        (
+            f"**Summary:** {summary.get('complaint_signal_count', 0)} complaint signals, "
+            f"{summary.get('failure_mode_count', 0)} failure modes, "
+            f"{summary.get('fix_suggestion_count', 0)} fix suggestions"
+        ),
+        "",
+        "> Selection required: no fixes were auto-applied.",
+        "",
+    ])
+    if report.get("failure_modes"):
+        lines.extend(["## Failure Modes", ""])
+        for mode in report["failure_modes"][:10]:
+            lines.append(f"### {mode.get('title')}")
+            lines.append("")
+            lines.append(f"- Label: `{mode.get('failure_mode')}`")
+            lines.append(f"- Evidence count: `{mode.get('evidence_count')}`")
+            lines.append(f"- Confidence: `{mode.get('confidence')}`")
+            lines.append("- Source refs:")
+            for ref in mode.get("source_refs", [])[:5]:
+                lines.append(f"  - `{ref.get('path')}:{ref.get('line')}`")
+            cause_chain = mode.get("cause_chain") or {}
+            lines.append("- Cause-chain evidence refs:")
+            for ref in cause_chain.get("evidence_refs", [])[:5]:
+                lines.append(f"  - `{ref.get('path')}:{ref.get('line')}`")
+            lines.append("- Inferred steps:")
+            for step in cause_chain.get("inferred_steps", []):
+                lines.append(f"  - {step}")
+            if cause_chain.get("claim_boundary"):
+                lines.append(f"- Claim boundary: {cause_chain.get('claim_boundary')}")
+            lines.append("")
+    if report.get("fix_suggestions"):
+        lines.extend(["## User-Selectable Fix Suggestions", ""])
+        for suggestion in report["fix_suggestions"][:10]:
+            dest = suggestion.get("proposed_destination") or {}
+            lines.append(f"- `{suggestion.get('suggestion_id')}` `{suggestion.get('fix_type')}` -> `{dest.get('path')}`")
+            lines.append(f"  - {suggestion.get('proposed_action')}")
+            lines.append(f"  - Destination rationale: {suggestion.get('destination_rationale')}")
+            for ref in (suggestion.get("destination_source_refs") or suggestion.get("destination_refs") or [])[:3]:
+                lines.append(f"  - Destination ref: `{ref.get('path')}:{ref.get('line')}`")
+            lines.append(f"  - Auto-apply: `{suggestion.get('auto_apply')}`")
+            decisions = [
+                option.get("decision")
+                for option in (suggestion.get("selection_shape") or {}).get("options", [])
+                if option.get("decision")
+            ] or list(suggestion.get("selection_options") or [])
+            if decisions:
+                lines.append(f"  - Selection options: `{', '.join(decisions)}`")
+    if reads:
+        lines.extend(["", "## Next Reads", ""])
+        for read in reads[:8]:
+            _append_markdown_read(lines, read)
+    return "\n".join(lines).rstrip()
+
+
+def _artifact_trust_label(verdict: str | None) -> str:
+    if verdict == "current":
+        return "Yes, but only after checking the cited front-door source."
+    if verdict in {"stale", "superseded", "contradicted", "historical_provenance"}:
+        return "No, not as the current source of truth."
+    return "Unknown from the inspected local evidence."
 
 
 def render_follow_next_reads_text(payload: dict) -> str:
@@ -1377,6 +2013,141 @@ def render_latest_user_messages_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_status_anchor_text(payload: dict) -> str:
+    report = payload["status_anchor"]
+    summary = report["summary"]
+    reads = report.get("next_reads") or []
+    selected = report.get("selected_anchor")
+    instruction = report.get("agent_instruction") or {}
+    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
+    lines = [
+        "Status Anchor",
+        f"Status: {report['status']}",
+        f"Answer status: {answer_status}",
+        "Open these source refs first:",
+    ]
+    if selected:
+        _append_text_read(lines, selected)
+    for read in reads[:4]:
+        if not selected or read.get("source_ref") != selected.get("source_ref"):
+            _append_text_read(lines, read)
+    if not selected and not reads:
+        lines.append("- (no source refs surfaced)")
+    if instruction.get("stop_condition"):
+        lines.append(f"Stop condition: {instruction.get('stop_condition')}")
+    lines.append("Only continue if: direct anchor/artifact reads fail, conflict, or leave a named status gap.")
+    lines.append("Optional diagnostics/adjacent evidence: rejected anchors, broad work products, blind spots, and warnings below.")
+    lines.extend([
+        f"Route: {report['routing']['route']}",
+        f"JSONL-first: {report['routing']['jsonl_first']}",
+        (
+            "Summary: "
+            f"{summary['anchor_candidate_count']} anchors, "
+            f"{summary['behavior_delta_count']} behavior deltas, "
+            f"{summary['non_delta_count']} non-deltas, "
+            f"{summary['unresolved_blocker_count']} blockers"
+        ),
+    ])
+    if selected:
+        lines.append(
+            "Selected anchor: "
+            f"{selected.get('timestamp_utc')} {selected.get('source_ref')}: "
+            f"{selected.get('snippet')}"
+        )
+        if selected.get("openable_target"):
+            lines.append(f"Selected anchor openable target: {selected.get('openable_target')}")
+        if selected.get("read_more_command"):
+            lines.append(f"Selected anchor read-more: {selected.get('read_more_command')}")
+        lines.append(f"Anchor rationale: {selected.get('rationale')}")
+    lines.append("Answer brief:")
+    for item in report.get("answer_brief", []):
+        lines.append(f"- {item}")
+    if report.get("unresolved_blockers"):
+        lines.append("Unresolved blockers:")
+        for blocker in report["unresolved_blockers"]:
+            lines.append(f"- {blocker['blocker']}: {blocker['summary']}")
+    if reads:
+        lines.append("Next reads:")
+        for read in reads[:10]:
+            _append_text_read(lines, read)
+    for blind in report.get("blind_spots", []):
+        lines.append(f"Blind spot: {blind}")
+    for warning in report.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def render_status_anchor_markdown(payload: dict) -> str:
+    report = payload["status_anchor"]
+    summary = report["summary"]
+    reads = report.get("next_reads") or []
+    selected = report.get("selected_anchor")
+    instruction = report.get("agent_instruction") or {}
+    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
+    lines = [
+        "# Status Anchor",
+        "",
+        f"**Status:** {report['status']}",
+        f"**Answer status:** `{answer_status}`",
+        "",
+        "## Open These Source Refs First",
+        "",
+    ]
+    if selected:
+        _append_markdown_read(lines, selected)
+    for read in reads[:4]:
+        if not selected or read.get("source_ref") != selected.get("source_ref"):
+            _append_markdown_read(lines, read)
+    if not selected and not reads:
+        lines.append("- No source refs surfaced.")
+    lines.extend(["", "## Stop / Continue", ""])
+    if instruction.get("stop_condition"):
+        lines.append(f"- Stop condition: {instruction.get('stop_condition')}")
+    lines.extend([
+        "- Only continue if: direct anchor/artifact reads fail, conflict, or leave a named status gap.",
+        "",
+        "## Optional Diagnostics / Adjacent Evidence",
+        "",
+        f"**Route:** `{report['routing']['route']}`",
+        f"**JSONL-first:** `{report['routing']['jsonl_first']}`",
+        (
+            f"**Summary:** {summary['anchor_candidate_count']} anchors, "
+            f"{summary['behavior_delta_count']} behavior deltas, "
+            f"{summary['non_delta_count']} non-deltas, "
+            f"{summary['unresolved_blocker_count']} blockers"
+        ),
+        "",
+    ])
+    if selected:
+        lines.extend(
+            [
+                "## Selected Anchor",
+                "",
+                (
+                    f"- `{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`: "
+                    f"{selected.get('snippet')}"
+                ),
+            ]
+        )
+        if selected.get("openable_target"):
+            lines.append(f"- Openable target: `{selected.get('openable_target')}`")
+        if selected.get("read_more_command"):
+            lines.append(f"- Read more: `{selected.get('read_more_command')}`")
+        lines.extend([f"- Rationale: {selected.get('rationale')}", ""])
+    lines.extend(["## Answer Brief", ""])
+    lines.extend(f"- {item}" for item in report.get("answer_brief", []))
+    lines.append("")
+    if reads:
+        lines.extend(["## Next Reads", ""])
+        for read in reads[:10]:
+            _append_markdown_read(lines, read)
+        lines.append("")
+    if report.get("blind_spots"):
+        lines.extend(["## Blind Spots", ""])
+        lines.extend(f"- {blind}" for blind in report["blind_spots"])
+    return "\n".join(lines)
+
+
 def render_generated_metadata_discovery_text(payload: dict) -> str:
     report = payload["generated_metadata_discovery"]
     summary = report["summary"]
@@ -1591,16 +2362,53 @@ def render_semantic_debug_text(payload: dict) -> str:
     report = payload["semantic_debug"]
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
+    action_proof_plan = report.get("action_proof_plan") or {}
+    command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
+    required_reads = action_proof_plan.get("required_proof_reads") or []
+    readiness = report.get("answer_readiness") or {}
+    answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
+    stop_condition = (
+        action_proof_plan.get("stop_condition")
+        or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
+        or "Stop when inspected source refs support the answer within the searched-scope boundaries."
+    )
     lines = [
         "Semantic Debug",
         f"Status: {report.get('status')}",
+        f"Answer status: {answer_status}",
+        "Open these source refs first:",
+    ]
+    if required_reads:
+        for read in required_reads[:5]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
+    elif report.get("next_reads"):
+        for read in report.get("next_reads", [])[:5]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
+    else:
+        lines.append("- (no source refs surfaced)")
+    lines.append(f"Stop condition: {stop_condition}")
+    only_continue = (
+        ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
+        or readiness.get("required_before_answer")
+        or []
+    )
+    for item in only_continue[:4]:
+        lines.append(f"Only continue if: {item}")
+    lines.append("Required proof reads:")
+    if required_reads:
+        for read in required_reads[:8]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
+    else:
+        lines.append("- none listed")
+    lines.extend([
+        "Optional diagnostics/adjacent evidence: source locator handoff, strongest candidates, uncertainty, and retrieval mode diagnostics below.",
         f"Query: {report.get('query')}",
         f"Primary family: {family.get('primary')}",
         f"Candidates: {len(report.get('strongest_candidates', []))}",
         f"Structured events: {report.get('tool_action_proof', {}).get('event_count', 0)}",
         f"Packet bytes/tokens: {tradeoffs.get('packet_basis_bytes', 0)} / {tradeoffs.get('packet_basis_estimated_tokens', 0)}",
         "Root cause: not claimed",
-    ]
+    ])
     workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
     if workflow_summary:
         basis_counts = workflow_summary.get("join_basis_counts") or {}
@@ -1632,6 +2440,8 @@ def render_semantic_debug_text(payload: dict) -> str:
     investigation_state = report.get("investigation_state")
     if investigation_state:
         lines.extend(render_investigation_state_text(investigation_state))
+    if action_proof_plan and action_proof_plan.get("applies"):
+        lines.extend(render_action_proof_plan_text(action_proof_plan, command_by_target=command_by_target))
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
@@ -1645,6 +2455,23 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"gate={handoff.get('answer_gate_status')} "
             f"next={handoff.get('do_next')}"
         )
+        followthrough = handoff.get("primary_source_followthrough") or {}
+        if followthrough.get("applies"):
+            command = followthrough.get("first_command") or {}
+            lines.append(
+                "Primary source followthrough: "
+                f"do_first={followthrough.get('do_first')} "
+                f"primary_reads={followthrough.get('primary_read_count')} "
+                f"command_id={command.get('command_id')} "
+                f"target={command.get('target')}"
+            )
+            if command.get("target_absolute_path_like") or not command.get("target_local_path_like"):
+                lines.append(f"- command: {command.get('command')}")
+            else:
+                lines.append("- command: omitted from text output for relative/local target; use JSON field first_command.command")
+            lines.append(f"- stop_after: {followthrough.get('stop_after')}")
+            for item in (followthrough.get("only_continue_if") or [])[:3]:
+                lines.append(f"- only_continue_if: {item}")
     contract = report.get("final_answer_source_use_contract")
     if contract:
         lines.append("Final Answer Contract:")
@@ -1652,25 +2479,33 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"- source_use_required: {contract.get('source_use_required')}")
         for action in contract.get("required_actions", [])[:5]:
             lines.append(f"- {action}")
-    readiness = report.get("answer_readiness")
     if readiness:
         lines.append("Answer Readiness:")
         lines.append(f"- status: {readiness.get('status')}")
         lines.append(f"- decision: {readiness.get('decision')}")
         lines.append(f"- allowed_answer_scope: {readiness.get('allowed_answer_scope')}")
-        for action in readiness.get("required_before_answer", [])[:4]:
-            lines.append(f"- {action}")
+        followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+        if followthrough.get("applies"):
+            lines.append("- effective_next_action: run_primary_source_window_command_then_answer_if_supported")
+            lines.append("- older recovery-readiness actions are secondary unless the primary source window is insufficient")
+        else:
+            for action in readiness.get("required_before_answer", [])[:4]:
+                lines.append(f"- {action}")
     instruction = report.get("agent_instruction")
     if instruction:
         lines.append("Agent Instruction:")
         lines.append(f"- decision: {instruction.get('decision')}")
         lines.append(f"- required_next_action: {instruction.get('required_next_action')}")
-        lines.append(f"- command_count: {len(instruction.get('commands', []))}")
-        lines.append("- commands: omitted from text output; use JSON for executable read-more commands")
+        commands = instruction.get("commands", [])
+        lines.append(f"- command_count: {len(commands)}")
+        for command in commands[:5]:
+            rendered = _action_command(command)
+            if rendered:
+                lines.append(f"- command: {rendered}")
     if report.get("next_reads"):
         lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
-            lines.append(f"- {item.get('kind')}: {item.get('target')} ({item.get('reason')})")
+            _append_text_read(lines, item, command_by_target=command_by_target)
     for item in report.get("uncertainty", [])[:8]:
         lines.append(f"Uncertainty: {item.get('label')} - {item.get('meaning')}")
     return "\n".join(lines)
@@ -1680,10 +2515,51 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     report = payload["semantic_debug"]
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
+    action_proof_plan = report.get("action_proof_plan") or {}
+    command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
+    required_reads = action_proof_plan.get("required_proof_reads") or []
+    readiness = report.get("answer_readiness") or {}
+    answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
+    stop_condition = (
+        action_proof_plan.get("stop_condition")
+        or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
+        or "Stop when inspected source refs support the answer within the searched-scope boundaries."
+    )
     lines = [
         "# Semantic Debug",
         "",
         f"**Status:** {report.get('status')}",
+        f"**Answer status:** `{answer_status}`",
+        "",
+        "## Open These Source Refs First",
+        "",
+    ]
+    if required_reads:
+        for read in required_reads[:5]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
+    elif report.get("next_reads"):
+        for read in report.get("next_reads", [])[:5]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
+    else:
+        lines.append("- No source refs surfaced.")
+    lines.extend(["", "## Stop / Continue", "", f"- Stop condition: {stop_condition}"])
+    only_continue = (
+        ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
+        or readiness.get("required_before_answer")
+        or []
+    )
+    for item in only_continue[:4]:
+        lines.append(f"- Only continue if: {item}")
+    lines.extend(["", "## Required Proof Reads", ""])
+    if required_reads:
+        for read in required_reads[:8]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
+    else:
+        lines.append("- None listed.")
+    lines.extend([
+        "",
+        "## Optional Diagnostics / Adjacent Evidence",
+        "",
         f"**Query:** {report.get('query')}",
         f"**Primary family:** `{family.get('primary')}`",
         f"**Root cause:** not claimed",
@@ -1691,7 +2567,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "",
         "## Source Locator Handoff",
         "",
-    ]
+    ])
     workflow_summary = report.get("forensics_workflow_summary") or (report.get("forensics_workflow") or {}).get("summary")
     if workflow_summary:
         basis_counts = workflow_summary.get("join_basis_counts") or {}
@@ -1738,6 +2614,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     investigation_state = report.get("investigation_state")
     if investigation_state:
         lines.extend(render_investigation_state_markdown(investigation_state))
+    if action_proof_plan and action_proof_plan.get("applies"):
+        lines.extend(render_action_proof_plan_markdown(action_proof_plan, command_by_target=command_by_target))
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     handoff = report.get("answer_ready_handoff")
@@ -1751,6 +2629,27 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"- `answer_gate_status`: `{handoff.get('answer_gate_status')}`",
             f"- `do_next`: `{handoff.get('do_next')}`",
         ])
+        followthrough = handoff.get("primary_source_followthrough") or {}
+        if followthrough.get("applies"):
+            command = followthrough.get("first_command") or {}
+            lines.extend(
+                [
+                    "",
+                    "### Primary Source Followthrough",
+                    "",
+                    f"- `do_first`: `{followthrough.get('do_first')}`",
+                    f"- `primary_read_count`: `{followthrough.get('primary_read_count')}`",
+                    f"- `command_id`: `{command.get('command_id')}`",
+                    f"- `target`: `{command.get('target')}`",
+                    f"- `stop_after`: {followthrough.get('stop_after')}",
+                ]
+            )
+            if command.get("target_absolute_path_like") or not command.get("target_local_path_like"):
+                lines.append(f"- `command`: `{command.get('command')}`")
+            else:
+                lines.append("- `command`: omitted from Markdown output for relative/local target; use JSON field `first_command.command`")
+            for item in (followthrough.get("only_continue_if") or [])[:3]:
+                lines.append(f"- `only_continue_if`: {item}")
     contract = report.get("final_answer_source_use_contract")
     if contract:
         lines.extend([
@@ -1762,7 +2661,6 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         ])
         for action in contract.get("required_actions", [])[:6]:
             lines.append(f"- {action}")
-    readiness = report.get("answer_readiness")
     if readiness:
         lines.extend([
             "",
@@ -1783,8 +2681,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"- `decision`: `{instruction.get('decision')}`",
             f"- `required_next_action`: `{instruction.get('required_next_action')}`",
             f"- `command_count`: `{len(instruction.get('commands', []))}`",
-            "- `commands`: omitted from Markdown output; use JSON for executable read-more commands",
         ])
+        for command in instruction.get("commands", [])[:5]:
+            rendered = _action_command(command)
+            if rendered:
+                lines.append(f"- `command`: `{rendered}`")
     lines.extend([
         "",
         "## Strongest Candidates",
@@ -1798,7 +2699,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     lines.append("")
     lines.append("## Next Reads")
     for item in report.get("next_reads", [])[:8]:
-        lines.append(f"- `{item.get('kind')}` {item.get('target')} - {item.get('reason')}")
+        _append_markdown_read(lines, item, command_by_target=command_by_target)
     lines.append("")
     lines.append("## Uncertainty")
     for item in report.get("uncertainty", [])[:8]:
@@ -1887,6 +2788,93 @@ def render_investigation_state_markdown(investigation_state: dict) -> list[str]:
         ]
     )
     return lines
+
+
+def render_action_proof_plan_text(plan: dict, *, command_by_target: dict[str, str] | None = None) -> list[str]:
+    retrieval = plan.get("retrieval_mode_guidance") or {}
+    package = retrieval.get("package") or {}
+    fielded = retrieval.get("fielded_bm25") or {}
+    rrf = retrieval.get("rrf_fusion") or {}
+    primary_refs = plan.get("primary_proof_refs") or []
+    required_reads = plan.get("required_proof_reads") or []
+    optional = plan.get("optional_diagnostics") or []
+    lines = [
+        "Action-proof plan: "
+        f"status={plan.get('status')} "
+        f"primary_refs={len(primary_refs)} "
+        f"required_reads={len(required_reads)} "
+        f"optional_diagnostics={len(optional)} "
+        f"current_mode={retrieval.get('current_mode')} "
+        f"recommended_mode={retrieval.get('recommended_mode')}",
+        f"- do_first: {plan.get('do_first')}",
+    ]
+    for ref in primary_refs[:3]:
+        lines.append(
+            "- primary proof ref: "
+            f"{ref.get('target') or source_ref_target(ref.get('source_ref') or {})} "
+            f"role={ref.get('proof_role')} required={ref.get('required')}"
+        )
+    for read in required_reads[:3]:
+        lines.append(
+            "- required proof read: "
+            f"{read.get('target') or source_ref_target(read.get('source_ref') or {})} "
+            f"type={read.get('read_type')}"
+        )
+        command = _read_more_command(read, command_by_target)
+        if command:
+            lines.append(f"  command: {command}")
+    if optional:
+        lines.append(f"- optional diagnostics: {len(optional)} after primary proof is thin/gapped or timeline synthesis is required")
+    lines.append(f"- stop broad search: {plan.get('stop_condition')}")
+    lines.append(
+        "- retrieval modes: "
+        f"package_default_ok={package.get('default_ok')} "
+        f"fielded_bm25_required_now={fielded.get('required_now')} "
+        f"fielded_command_available={bool(fielded.get('rerun_command'))} "
+        f"rrf_explicit_opt_in_only={rrf.get('explicit_opt_in_only')}"
+    )
+    return lines
+
+
+def render_action_proof_plan_markdown(plan: dict, *, command_by_target: dict[str, str] | None = None) -> list[str]:
+    retrieval = plan.get("retrieval_mode_guidance") or {}
+    package = retrieval.get("package") or {}
+    fielded = retrieval.get("fielded_bm25") or {}
+    rrf = retrieval.get("rrf_fusion") or {}
+    primary_refs = plan.get("primary_proof_refs") or []
+    required_reads = plan.get("required_proof_reads") or []
+    optional = plan.get("optional_diagnostics") or []
+    lines = [
+        "## Action-Proof Plan",
+        "",
+        f"- `status`: `{plan.get('status')}`",
+        f"- `do_first`: `{plan.get('do_first')}`",
+        f"- `primary_proof_ref_count`: `{len(primary_refs)}`",
+        f"- `required_proof_read_count`: `{len(required_reads)}`",
+        f"- `optional_diagnostic_count`: `{len(optional)}`",
+        f"- `stop_broad_search`: {plan.get('stop_condition')}",
+        (
+            "- `retrieval_modes`: "
+            f"package_default_ok=`{package.get('default_ok')}`; "
+            f"fielded_bm25_required_now=`{fielded.get('required_now')}`; "
+            f"fielded_command_available=`{bool(fielded.get('rerun_command'))}`; "
+            f"rrf_explicit_opt_in_only=`{rrf.get('explicit_opt_in_only')}`"
+        ),
+    ]
+    if primary_refs:
+        lines.append("- `primary_proof_refs`:")
+        for ref in primary_refs[:3]:
+            target = ref.get("target") or source_ref_target(ref.get("source_ref") or {})
+            lines.append(f"  - `{target}` proof_role=`{ref.get('proof_role')}` required=`{ref.get('required')}`")
+    if required_reads:
+        lines.append("- `required_proof_reads`:")
+        for read in required_reads[:3]:
+            target = read.get("target") or source_ref_target(read.get("source_ref") or {})
+            lines.append(f"  - `{target}` read_type=`{read.get('read_type')}`")
+            command = _read_more_command(read, command_by_target)
+            if command:
+                lines.append(f"    - Command: `{command}`")
+    return lines + [""]
 
 
 def _investigation_gap_labels(unresolved_gaps: dict) -> list[str]:
