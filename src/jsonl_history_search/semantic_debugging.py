@@ -507,7 +507,17 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
         detected.append("why_did_this_happen")
     if any(hints.values()) or any(word in text for word in ("commit", "branch", "task", "review", "provenance", "path")):
         detected.append("provenance")
-    if any(word in text for word in ("actually", "claimed", "claim", "ran", "edited", "tested", "reviewed", "did the agent")):
+    claimed_action_cues = ("actually", "claimed", "claim", "ran", "edited", "tested", "did the agent")
+    review_action_cue = "reviewed" in text and not any(
+        phrase in text
+        for phrase in (
+            "reviewed source case",
+            "using reviewed source case",
+            "reviewed real-history",
+            "reviewed source window",
+        )
+    )
+    if any(word in text for word in claimed_action_cues) or review_action_cue:
         detected.append("claimed_action")
     if any(phrase in text for phrase in ("told you", "tell you before", "remember", "instruction", "preference", "said before", "what did i say")):
         detected.append("remembered_instruction")
@@ -642,7 +652,33 @@ def source_handle_match_texts(item: dict[str, Any]) -> list[str]:
     return texts
 
 
-def source_handle_item_matches(handle: dict[str, Any], item: dict[str, Any]) -> bool:
+def source_handle_prompt_echo_match(handle: dict[str, Any], item: dict[str, Any], *, query: str) -> bool:
+    snippet = str(item.get("snippet") or "")
+    if not snippet:
+        return False
+    normalized_snippet = " ".join(snippet.casefold().split())
+    normalized_query = " ".join(str(query or "").casefold().split())
+    handle_text = str(handle.get("handle") or "").casefold()
+    if not handle_text or handle_text not in normalized_snippet:
+        return False
+    if setup_echo_classification(snippet, query=query).get("is_setup_echo"):
+        return True
+    investigation_prompt_cues = (
+        "using the reviewed source case",
+        "answer this stable-history",
+        "answer from that source window only",
+        "jsonl-history-search semantic-debug",
+    )
+    if any(cue in normalized_snippet for cue in investigation_prompt_cues):
+        return True
+    if normalized_query and normalized_query in normalized_snippet:
+        return True
+    return False
+
+
+def source_handle_item_matches(handle: dict[str, Any], item: dict[str, Any], *, query: str = "") -> bool:
+    if source_handle_prompt_echo_match(handle, item, query=query):
+        return False
     needle = handle.get("normalized")
     if not needle:
         return False
@@ -665,7 +701,7 @@ def build_source_handle_routing(
     for handle in handles:
         handle_read_count = 0
         for index, read in enumerate(next_reads):
-            if not source_handle_item_matches(handle, read):
+            if not source_handle_item_matches(handle, read, query=query):
                 continue
             resolved.add(handle["normalized"])
             handle_read_count += 1
@@ -680,7 +716,7 @@ def build_source_handle_routing(
                 }
             )
         for candidate in candidates[:INLINE_CANDIDATE_LIMIT]:
-            if not source_handle_item_matches(handle, candidate):
+            if not source_handle_item_matches(handle, candidate, query=query):
                 continue
             resolved.add(handle["normalized"])
             ref = candidate.get("source_ref") or {}
@@ -768,6 +804,14 @@ def inferred_anchor_next_reads(
 ) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
     reads.extend(
+        inferred_explicit_correction_window_next_reads(
+            query=query,
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+    )
+    reads.extend(
         inferred_known_action_case_next_reads(
             query=query,
             source_plan=source_plan,
@@ -784,6 +828,78 @@ def inferred_anchor_next_reads(
         )
     )
     return dedupe_dicts(reads)[:4]
+
+
+EXPLICIT_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+
+
+def inferred_explicit_correction_window_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    if not correction_window_source_selection_wanted(query):
+        return []
+    date_matches = EXPLICIT_DATE_RE.findall(str(query or ""))
+    if not date_matches:
+        return []
+    roots = semantic_debug_codex_session_roots(source_plan)
+    files: list[Path] = []
+    for year, month, day in date_matches[:2]:
+        for root in roots:
+            date_dir = root / year / month / day
+            if date_dir.is_dir():
+                files.extend(sorted(date_dir.glob("*.jsonl"), key=lambda path: path.name))
+    if not files:
+        return []
+    scored: list[dict[str, Any]] = []
+    for path in files[:160]:
+        scored.extend(correction_window_records_for_path(path))
+    scored.sort(
+        key=lambda item: (
+            -float(item["score"]),
+            str(item.get("timestamp_utc") or ""),
+            str((item.get("source_ref") or {}).get("path") or ""),
+            int((item.get("source_ref") or {}).get("line") or 0),
+        )
+    )
+    reads: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:2], 1):
+        source_ref = item["source_ref"]
+        candidate_id = f"explicit-correction-window-{index:03d}"
+        read = {
+            "kind": "jsonl_source_ref",
+            "target": source_ref_target(source_ref),
+            "candidate_id": candidate_id,
+            "source_ref": source_ref,
+            "reason": "inspect explicit date source window before current-session or prompt-echo matches",
+            "correction_window_source_selection": {
+                "schema_version": 1,
+                "selection_reason": item["selection_reason"],
+                "role": item.get("role"),
+                "score": item["score"],
+                "raw_text_included": False,
+                "bounded_to_explicit_date_window": True,
+                "source_window_verification_required": True,
+                "claim_boundary": "explicit_date_window_anchor_not_final_answer",
+            },
+            "expansion_actions": read_more_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            ),
+        }
+        if include_context_actions:
+            read["context_actions"] = context_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        if read["target"]:
+            reads.append(read)
+    return reads
 
 
 def inferred_known_action_case_next_reads(
