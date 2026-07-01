@@ -54,11 +54,18 @@ TODO scans, broad repo `rg`, or direct JSONL spelunking for natural history
 prompts. If the command needs the current directory, pass `--cwd "$PWD"`; do
 not dump repo file lists or workspace inventories before `ask`.
 
+For prompts that name a reviewed source case, a `real-jsh...` source case ID,
+an explicit date/source window, or "answer from that source scope only", do not
+bypass the front door with `semantic-debug --format json`. Run `ask` first, or
+run `semantic-debug ... --format text` only when the route has already selected
+semantic-debug. Use compact/text `read-more` follow-through before any broad
+repo/private `rg`, `rg --files`, or current-session echo recovery.
+
 ## Route Table
 
 | User ask shape | Route | Read | First command |
 | --- | --- | --- | --- |
-| "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction/preference | `references/remembered-instruction.md` | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format json` |
+| "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction/preference | `references/remembered-instruction.md` | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format text` |
 | "Why did I say X?" "Why did I mention X?" "What was I talking about with X?" | Remembered topic/provenance | `ask` then `references/remembered-topic.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | `references/latest-status.md` | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
 | "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |

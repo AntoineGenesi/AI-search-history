@@ -171,6 +171,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
     )
     next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+    next_reads = compact_text_semantic_read_more_actions(next_reads)
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
         candidates=candidates,
@@ -229,12 +230,14 @@ def build_semantic_debug_payload(
             next_reads=next_reads,
         )
         next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+        next_reads = compact_text_semantic_read_more_actions(next_reads)
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
             candidates=candidates,
             next_reads=next_reads,
         )
         source_locator_handoff["next_reads"] = next_reads
+        source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
         decision_context["next_reads"] = next_reads[:12]
         decision_context["next_commands"] = build_next_commands(
             next_reads,
@@ -255,6 +258,8 @@ def build_semantic_debug_payload(
             audit_plan.get("checkpoint_plan", []),
             source_handle_routing,
         )
+    else:
+        source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
     source_locator_handoff["source_handle_routing"] = source_handle_routing
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
@@ -1769,10 +1774,8 @@ def build_next_commands(
             commands.append(
                 {
                     "command_family": "read_more",
-                    "argv": ["jsonl-history-search", "read-more", read["target"], "--format", "json"],
-                    "command": shell_command(
-                        ["jsonl-history-search", "read-more", read["target"], "--format", "json"]
-                    ),
+                    "argv": compact_text_read_more_window_argv(str(read["target"])),
+                    "command": shell_command(compact_text_read_more_window_argv(str(read["target"]))),
                     "source": "next_reads.target",
                     "raw_private_text_included": False,
                 }
@@ -1810,6 +1813,82 @@ def shell_command(argv: list[Any]) -> str:
     }:
         normalized.insert(0, "jsonl-history-search")
     return " ".join(shlex.quote(part) for part in normalized)
+
+
+def compact_text_read_more_window_argv(target: str) -> list[str]:
+    return [
+        "jsonl-history-search",
+        "read-more",
+        target,
+        "--mode",
+        "window",
+        "--format",
+        "text",
+        "--projection",
+        "compact",
+        "--compact-text-limit",
+        "500",
+    ]
+
+
+def compact_text_read_more_argv(argv: list[Any]) -> list[str]:
+    parts = [str(part) for part in argv]
+    if not parts:
+        return parts
+    if parts[0] == "jsonl-history-search":
+        command_index = 1
+    else:
+        command_index = 0
+    if len(parts) <= command_index or parts[command_index] != "read-more":
+        return parts
+    if "--format" in parts:
+        index = parts.index("--format")
+        if index + 1 < len(parts):
+            parts[index + 1] = "text"
+        else:
+            parts.append("text")
+    else:
+        parts.extend(["--format", "text"])
+    if "--projection" not in parts:
+        parts.extend(["--projection", "compact"])
+    if "--compact-text-limit" not in parts:
+        parts.extend(["--compact-text-limit", "500"])
+    return parts
+
+
+def compact_text_semantic_read_more_actions(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for read in reads:
+        row = dict(read)
+        for action_key in ("expansion_actions", "context_actions"):
+            actions = []
+            changed = False
+            for action in list(row.get(action_key) or []):
+                if not isinstance(action, dict):
+                    actions.append(action)
+                    continue
+                action_row = dict(action)
+                argv = action_row.get("argv")
+                if isinstance(argv, list):
+                    new_argv = compact_text_read_more_argv(argv)
+                    if new_argv != [str(part) for part in argv]:
+                        changed = True
+                    action_row["argv"] = new_argv
+                    action_row["command"] = shell_command(new_argv)
+                actions.append(action_row)
+            if actions or changed:
+                row[action_key] = actions
+        compacted.append(row)
+    return compacted
+
+
+def compact_text_semantic_handoff_actions(handoff: dict[str, Any]) -> dict[str, Any]:
+    row = dict(handoff)
+    for key in ("next_reads", "source_windows", "evidence_packets"):
+        values = row.get(key)
+        if isinstance(values, list):
+            row[key] = compact_text_semantic_read_more_actions([value for value in values if isinstance(value, dict)])
+    return row
 
 
 ANSWER_READY_HANDOFF_READ_CAP = 5
@@ -2593,7 +2672,7 @@ def answer_ready_copy_paste_commands(
         target = read.get("target")
         if target not in command_targets:
             continue
-        argv = ["jsonl-history-search", "read-more", str(target), "--mode", "window", "--format", "json"]
+        argv = compact_text_read_more_window_argv(str(target))
         target_privacy = classify_command_target_privacy(target)
         commands.append(
             {

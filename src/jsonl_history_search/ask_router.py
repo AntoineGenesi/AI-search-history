@@ -36,16 +36,20 @@ ROUTES: tuple[AskRoute, ...] = (
         inspect_after=(
             "semantic_debug.answer_ready_handoff.primary_source_followthrough",
             "semantic_debug.source_locator_handoff / top source refs",
-            "next_reads for bounded source-window follow-through",
+            "compact text read-more follow-through; avoid JSON source-window output",
         ),
         stop_guidance=(
             "Run text-first semantic-debug before artifact currentness or broad "
             "rg, then open the promoted source-window reads. Stop broad searching "
-            "once the reviewed source window answers the prompt."
+            "once the reviewed source window answers the prompt. Do not switch to "
+            "JSON output, `rg --files`, broad repo/private `rg`, or current-session "
+            "echo recovery unless a named required facet is still missing after the "
+            "compact source-window read."
         ),
         manual_search_guidance=(
             "Manual rg is a follow-up only for a named missing facet after "
-            "semantic-debug source-window follow-through, not before it."
+            "semantic-debug compact text source-window follow-through, not before it. "
+            "Do not run `rg --files` as reviewed-source recovery."
         ),
     ),
     AskRoute(
@@ -262,7 +266,8 @@ def classify_ask_route(query: str) -> AskRoute:
         ),
         manual_search_guidance=(
             "Manual rg is a targeted follow-up after route output, not the first "
-            "move for a natural history question."
+            "move for a natural history question. Prefer compact text read-more "
+            "commands over raw JSON source-window output."
         ),
     )
 
