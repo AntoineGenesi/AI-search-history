@@ -317,8 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_wrapup = subparsers.add_parser(
         "semantic-wrapup",
         description=(
-            "Mine a session/window for complaints, corrections, workflow failures, "
-            "cause chains, and user-selectable fix suggestions."
+            "Mine the selected/current session for complaints, corrections, workflow failures, "
+            "assistant/tool/runtime errors, whole-session coverage, cause chains, and "
+            "user-selectable fix suggestions. Use skill-audit for deep skill workflow audits."
         ),
     )
     semantic_wrapup.add_argument("query", nargs="?", default="semantic wrap-up this run")
@@ -457,7 +458,13 @@ def build_parser() -> argparse.ArgumentParser:
     lineage.add_argument("--max-projects", type=int, default=12)
     lineage.add_argument("--timeline-limit", type=int, default=20)
     lineage.add_argument("--report-output", default=None)
-    skill_audit = subparsers.add_parser("skill-audit")
+    skill_audit = subparsers.add_parser(
+        "skill-audit",
+        description=(
+            "Deep skill workflow audit: distinguish proper skill use, missed triggers, "
+            "misapplication, and missing referenced-file follow-through from mere mentions."
+        ),
+    )
     skill_audit.add_argument("skill")
     add_common_args(skill_audit)
     skill_audit.add_argument("--pre-window", type=int, default=3)

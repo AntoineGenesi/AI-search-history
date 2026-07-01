@@ -809,6 +809,8 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         "Optional diagnostics/adjacent evidence: behavior-system destinations and fix suggestions below.",
         (
             "Summary: "
+            f"{summary.get('session_message_count', 0)} session messages, "
+            f"{summary.get('user_message_count', 0)} user messages, "
             f"{summary.get('complaint_signal_count', 0)} complaint signals, "
             f"{summary.get('substantive_signal_count', 0)} substantive, "
             f"{summary.get('setup_echo_signal_count', 0)} setup/prompt echo, "
@@ -821,6 +823,21 @@ def render_semantic_wrapup_text(payload: dict) -> str:
     ])
     if summary.get("failure_mode_truncated") or summary.get("fix_suggestion_truncated"):
         lines.append(f"Truncation: inline arrays are limited to {summary.get('inline_limit')} items; totals are shown above.")
+    coverage = report.get("rolling_window_coverage") or {}
+    window_accounting = coverage.get("window_accounting") or {}
+    cap_accounting = coverage.get("cap_accounting") or {}
+    if coverage:
+        lines.append(
+            "Whole-session coverage: "
+            f"windows_inspected={window_accounting.get('windows_inspected', 0)}, "
+            f"windows_omitted={window_accounting.get('windows_omitted', 0)}, "
+            f"assistant_tool_runtime_errors={coverage.get('assistant_tool_runtime_error_count', 0)}, "
+            f"cap_changed_conclusion={cap_accounting.get('cap_changed_conclusion')}"
+        )
+        if coverage.get("omitted_or_uncertain_next_reads"):
+            lines.append("Omitted/uncertain rolling-window next reads:")
+            for read in coverage.get("omitted_or_uncertain_next_reads", [])[:5]:
+                _append_text_read(lines, read)
     scope_resolution = report.get("scope_resolution") or {}
     if scope_resolution.get("status"):
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
@@ -955,7 +972,9 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         "## Optional Diagnostics / Adjacent Evidence",
         "",
         (
-            f"**Summary:** {summary.get('complaint_signal_count', 0)} complaint signals, "
+            f"**Summary:** {summary.get('session_message_count', 0)} session messages, "
+            f"{summary.get('user_message_count', 0)} user messages, "
+            f"{summary.get('complaint_signal_count', 0)} complaint signals, "
             f"{summary.get('substantive_signal_count', 0)} substantive, "
             f"{summary.get('setup_echo_signal_count', 0)} setup/prompt echo, "
             f"{summary.get('failure_mode_returned_count', summary.get('failure_mode_count', 0))}/"
@@ -972,6 +991,36 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             f"**Truncation:** inline arrays are limited to `{summary.get('inline_limit')}` items; totals are shown above.",
             "",
         ])
+    coverage = report.get("rolling_window_coverage") or {}
+    if coverage:
+        session_accounting = coverage.get("session_accounting") or {}
+        window_accounting = coverage.get("window_accounting") or {}
+        cap_accounting = coverage.get("cap_accounting") or {}
+        lines.extend([
+            "## Whole-Session Rolling Coverage",
+            "",
+            f"- Session messages: `{session_accounting.get('session_message_count', 0)}`",
+            f"- User messages: `{session_accounting.get('user_message_count', 0)}`",
+            f"- User complaint/correction candidates: `{session_accounting.get('user_complaint_candidate_count', 0)}`",
+            f"- Windows inspected: `{window_accounting.get('windows_inspected', 0)}`",
+            f"- Windows omitted from inline output: `{window_accounting.get('windows_omitted', 0)}`",
+            f"- Assistant/tool/runtime errors found around windows: `{coverage.get('assistant_tool_runtime_error_count', 0)}`",
+            f"- Cap changed conclusion: `{cap_accounting.get('cap_changed_conclusion')}`",
+            f"- Boundary: {cap_accounting.get('cap_boundary')}",
+            "",
+        ])
+        if coverage.get("omitted_or_uncertain_next_reads"):
+            lines.extend(["### Omitted Or Uncertain Window Reads", ""])
+            for read in coverage.get("omitted_or_uncertain_next_reads", [])[:8]:
+                _append_markdown_read(lines, read)
+            lines.append("")
+        if coverage.get("assistant_tool_runtime_errors"):
+            lines.extend(["### Assistant / Tool / Runtime Errors", ""])
+            for item in coverage.get("assistant_tool_runtime_errors", [])[:10]:
+                ref = item.get("source_ref") or {}
+                labels = ", ".join(item.get("labels") or [])
+                lines.append(f"- `{ref.get('path')}:{ref.get('line')}` `{labels}`: {item.get('snippet')}")
+            lines.append("")
     scope_resolution = report.get("scope_resolution") or {}
     if scope_resolution.get("status"):
         lines.extend([
@@ -3742,6 +3791,13 @@ def render_skill_audit_text(payload: dict) -> str:
             f"{efficiency.get('non_use_mention_count', 0)} non-use mentions"
         ),
     ]
+    workflow_summary = report.get("workflow_classification_summary") or {}
+    if workflow_summary.get("classification_counts"):
+        counts = ", ".join(
+            f"{key}={value}"
+            for key, value in sorted((workflow_summary.get("classification_counts") or {}).items())
+        )
+        lines.append(f"Workflow classifications: {counts}")
     if report.get("report_written"):
         lines.append(f"Report written: {report['report_written']}")
     for instance in report.get("usage_instances", [])[:8]:
@@ -3750,13 +3806,14 @@ def render_skill_audit_text(payload: dict) -> str:
         lines.append(
             "- "
             f"{instance.get('usage_id')} {instance.get('confidence')} "
+            f"{instance.get('workflow_classification')} "
             f"{','.join(instance.get('signal_types', []))} "
             f"{ref.get('path')}:{ref.get('line')} "
             f"labels={','.join(instance.get('outcome_labels', []))}"
         )
     for mention in report.get("non_use_mentions", [])[:5]:
         ref = mention.get("source_ref", {})
-        lines.append(f"Non-use: {ref.get('path')}:{ref.get('line')} {mention.get('snippet')}")
+        lines.append(f"{mention.get('classification')}: {ref.get('path')}:{ref.get('line')} {mention.get('snippet')}")
     for warning in payload.get("warnings", []) + report.get("warnings", []):
         lines.append(f"Warning: {warning}")
     return "\n".join(lines)
@@ -3779,11 +3836,25 @@ def render_skill_audit_markdown(payload: dict) -> str:
             f"{efficiency.get('non_use_mention_count', 0)} non-use mentions"
         ),
         "",
+        "## Workflow Classification",
+        "",
+    ]
+    workflow_summary = report.get("workflow_classification_summary") or {}
+    counts = workflow_summary.get("classification_counts") or {}
+    if counts:
+        for key, value in sorted(counts.items()):
+            lines.append(f"- `{key}`: `{value}`")
+    else:
+        lines.append("- No workflow classifications found.")
+    if workflow_summary.get("classification_contract"):
+        lines.append(f"- Contract: {workflow_summary.get('classification_contract')}")
+    lines.extend([
+        "",
         "## Usage Instances",
         "",
-        "| ID | Confidence | Signals | Source | Labels |",
-        "| --- | --- | --- | --- | --- |",
-    ]
+        "| ID | Classification | Confidence | Signals | Source | Labels |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ])
     for instance in report.get("usage_instances", []):
         evidence = instance.get("skill_evidence", [{}])[0]
         ref = evidence.get("source_ref", {})
@@ -3791,6 +3862,7 @@ def render_skill_audit_markdown(payload: dict) -> str:
         lines.append(
             "| "
             f"{_escape_markdown_table(str(instance.get('usage_id', '')))} | "
+            f"{_escape_markdown_table(str(instance.get('workflow_classification', '')))} | "
             f"{_escape_markdown_table(str(instance.get('confidence', '')))} | "
             f"{_escape_markdown_table(', '.join(instance.get('signal_types', [])))} | "
             f"{_escape_markdown_table(source)} | "
@@ -3800,7 +3872,10 @@ def render_skill_audit_markdown(payload: dict) -> str:
         lines.extend(["", "## Non-Use Mentions", ""])
         for mention in report["non_use_mentions"][:12]:
             ref = mention.get("source_ref", {})
-            lines.append(f"- `{ref.get('path')}:{ref.get('line')}` {mention.get('snippet')}")
+            lines.append(
+                f"- `{mention.get('classification')}` `{ref.get('path')}:{ref.get('line')}` "
+                f"{mention.get('snippet')}"
+            )
     return "\n".join(lines)
 
 

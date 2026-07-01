@@ -77,6 +77,7 @@ def build_skill_audit_payload(
         correction_window=max(0, correction_window),
     )
     non_use_mentions = build_non_use_mentions(skill, records, used_indices, used_refs_for(usage_instances))
+    workflow_summary = workflow_classification_summary(usage_instances, non_use_mentions)
     status = "found" if usage_instances else "mentions_only" if non_use_mentions else "no_evidence"
     instance_dicts = [instance for instance in usage_instances]
     inline_context_bytes = len(str(instance_dicts[:INLINE_INSTANCE_LIMIT] + non_use_mentions[:INLINE_MENTION_LIMIT]).encode("utf-8"))
@@ -92,6 +93,7 @@ def build_skill_audit_payload(
             "signal_definitions": signal_definitions(),
             "usage_instances": instance_dicts[:INLINE_INSTANCE_LIMIT],
             "non_use_mentions": non_use_mentions[:INLINE_MENTION_LIMIT],
+            "workflow_classification_summary": workflow_summary,
             "ai_handoff_packet": compact_ai_handoff(skill, instance_dicts, non_use_mentions),
             "context_budget": {
                 "payload_bytes": inline_context_bytes,
@@ -105,6 +107,7 @@ def build_skill_audit_payload(
             "token_efficiency": {
                 "usage_instance_count": len(instance_dicts),
                 "non_use_mention_count": len(non_use_mentions),
+                "workflow_classification_counts": workflow_summary["classification_counts"],
                 "inline_instance_limit": INLINE_INSTANCE_LIMIT,
                 "inline_context_bytes": inline_context_bytes,
                 "searched_files": scan["searched_files"],
@@ -116,6 +119,14 @@ def build_skill_audit_payload(
                 "post_window_records": max(0, post_window),
                 "correction_window_records": max(0, correction_window),
                 "actual_use_rule": "keyword mentions alone are never actual use; actual use requires a skill-file/helper signal or an explicit agent use statement adjacent to workflow behavior",
+                "deep_audit_classifications": [
+                    "properly_applied",
+                    "partially_applied",
+                    "missed_trigger",
+                    "misapplied",
+                    "skill_read_without_required_reference_followthrough",
+                    "not_enough_evidence",
+                ],
             },
             "warnings": sorted(set(scan["warnings"] + source_plan.get("sources", {}).get("warnings", []))),
         },
@@ -219,6 +230,7 @@ def build_usage_instances(
             "uncertainty": uncertainty_for(signals, corrections),
             "next_read_refs": next_read_refs(pre, signals, post, corrections),
         }
+        instance["workflow_classification"] = classify_usage_workflow(instance)
         instances.append(instance)
         used_indices.add(index)
         last_instance_at = index
@@ -235,7 +247,7 @@ def build_non_use_mentions(skill: str, records: list[AuditRecord], used_indices:
         mentions.append(
             {
                 "mention_id": f"m{len(mentions) + 1:03d}",
-                "classification": "non_use_mention",
+                "classification": classify_non_use_mention(skill, item),
                 "reason": "mention_or_suggestion_without_actual_use_signal",
                 "signal_types": signals,
                 **context_row(item),
@@ -279,6 +291,71 @@ def actual_use_signals(skill: str, item: AuditRecord, following: list[AuditRecor
     ):
         signals.append(signal(item, "explicit_agent_use_statement", "agent stated skill use with adjacent workflow behavior"))
     return dedupe_signals(signals)
+
+
+def classify_usage_workflow(instance: dict) -> str:
+    signal_types = set(instance.get("signal_types") or [])
+    outcome_labels_set = set(instance.get("outcome_labels") or [])
+    if "needed_correction" in outcome_labels_set or "over_applied_skill" in outcome_labels_set:
+        return "misapplied"
+    if "skill_file_read" in signal_types and _missing_required_reference_followthrough(instance):
+        return "skill_read_without_required_reference_followthrough"
+    if "skill_file_read" in signal_types or "skill_helper_invocation" in signal_types:
+        if "completed_smoothly" in outcome_labels_set or "produced_useful_durable_artifact" in outcome_labels_set:
+            return "properly_applied"
+        return "partially_applied"
+    if "explicit_agent_use_statement" in signal_types:
+        return "partially_applied"
+    return "not_enough_evidence"
+
+
+def _missing_required_reference_followthrough(instance: dict) -> bool:
+    evidence_text = " ".join(str(row.get("snippet") or "") for row in instance.get("skill_evidence", [])).lower()
+    if not any(marker in evidence_text for marker in ("references/", "reference file", "referenced file")):
+        return False
+    followthrough_text = " ".join(
+        str(row.get("snippet") or "")
+        for group in (instance.get("skill_evidence", []), instance.get("post_window", []))
+        for row in group
+    ).lower()
+    followthrough_markers = (
+        "opened references/",
+        "read references/",
+        "reading references/",
+        "loaded references/",
+        "sed -n",
+        "cat references/",
+    )
+    return not any(marker in followthrough_text for marker in followthrough_markers)
+
+
+def classify_non_use_mention(skill: str, item: AuditRecord) -> str:
+    lower = item.text.lower()
+    if any(marker in lower for marker in ("maybe", "later", "should use")):
+        return "non_use_mention"
+    if item.record.role.lower() in {"user", "user_message"} and (
+        re.search(rf"\${re.escape(skill_slug(skill))}\b", lower)
+        or re.search(r"\b(use|invoke|trigger|run)\b.{0,80}\b(skill|audit)\b", lower)
+    ):
+        return "missed_trigger"
+    return "non_use_mention"
+
+
+def workflow_classification_summary(usage_instances: list[dict], non_use_mentions: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for instance in usage_instances:
+        label = str(instance.get("workflow_classification") or "not_enough_evidence")
+        counts[label] = counts.get(label, 0) + 1
+    for mention in non_use_mentions:
+        label = str(mention.get("classification") or "non_use_mention")
+        counts[label] = counts.get(label, 0) + 1
+    return {
+        "classification_counts": dict(sorted(counts.items())),
+        "classification_contract": (
+            "Skill audit distinguishes actual SKILL.md/helper use from mentions, missed triggers, "
+            "misapplication, and missing required referenced-file follow-through."
+        ),
+    }
 
 
 def is_agent_action_record(item: AuditRecord) -> bool:
@@ -500,16 +577,23 @@ def compact_ai_handoff(skill: str, instances: list[dict], non_use_mentions: list
                 "evidence_refs": [signal["source_ref"] for signal in item.get("skill_evidence", [])[:4]],
                 "correction_refs": [row["source_ref"] for row in item.get("user_corrections", [])[:4]],
                 "outcome_labels": item["outcome_labels"],
+                "workflow_classification": item.get("workflow_classification"),
                 "improvement_labels": [opp["label"] for opp in item.get("improvement_opportunities", [])],
                 "uncertainty": item["uncertainty"],
             }
             for item in instances[:INLINE_INSTANCE_LIMIT]
         ],
         "non_use_mention_refs": [item["source_ref"] for item in non_use_mentions[:INLINE_MENTION_LIMIT]],
+        "missed_trigger_refs": [
+            item["source_ref"]
+            for item in non_use_mentions[:INLINE_MENTION_LIMIT]
+            if item.get("classification") == "missed_trigger"
+        ],
         "recommended_next_read": [
             "Open high-confidence skill evidence rows first.",
             "Inspect correction refs before suggesting skill changes.",
             "Treat non-use mentions as exclusion evidence, not proof of skill execution.",
+            "Treat missed_trigger and missing-reference-follow-through classifications as workflow failures to inspect.",
         ],
     }
 

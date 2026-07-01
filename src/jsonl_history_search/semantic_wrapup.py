@@ -30,8 +30,20 @@ ORCHESTRATION_DIVERSITY_ACTORS = (
 ORCHESTRATION_PRIMARY_RANKED_LIMIT = 10
 CURRENT_SESSION_SOURCE_LIMIT = 5
 CURRENT_SESSION_SOURCE_SCAN_LIMIT = 160
+ROLLING_WINDOW_PRE_RECORDS = 3
+ROLLING_WINDOW_POST_RECORDS = 6
+ROLLING_WINDOW_INLINE_LIMIT = 20
+ROLLING_WINDOW_ERROR_INLINE_LIMIT = 30
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
+
+ASSISTANT_TOOL_ERROR_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("tool_error", ("tool error", "tool failed", "function error", "exception", "traceback")),
+    ("command_failed", ("exit code", "non-zero", "command failed", "returned error", "no such file")),
+    ("runtime_abort", ("aborted", "timed out", "timeout", "killed", "stalled", "stuck")),
+    ("review_failure", ("review failed", "partially_verified", "partially verified", "failed verification")),
+    ("contradicted_user_intent", ("wrong direction", "not what the user asked", "silently running", "process drift")),
+)
 
 CURRENT_SESSION_SOURCE_PATTERNS = (
     "tasks/side-thread-info*.md",
@@ -339,6 +351,13 @@ def build_semantic_wrapup_payload(
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
+    rolling_window_coverage = _rolling_window_coverage(
+        records,
+        signals,
+        substantive_signals,
+        setup_echo_signals,
+        scan_warnings=scan["warnings"],
+    )
     ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
     all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
@@ -355,6 +374,7 @@ def build_semantic_wrapup_payload(
         failure_modes,
         orchestration_evidence,
         current_session_source_selection,
+        rolling_window_coverage,
     )
     answer_ready_contract = _answer_ready_contract(
         status=status,
@@ -371,6 +391,13 @@ def build_semantic_wrapup_payload(
             "route": "semantic_wrapup_frustration_mining",
             "summary": {
                 "complaint_signal_count": len(signals),
+                "session_message_count": len(records),
+                "user_message_count": rolling_window_coverage["session_accounting"]["user_message_count"],
+                "user_complaint_candidate_count": len(signals),
+                "user_complaint_windows_inspected": rolling_window_coverage["window_accounting"]["windows_inspected"],
+                "user_complaint_windows_omitted": rolling_window_coverage["window_accounting"]["windows_omitted"],
+                "assistant_tool_runtime_error_count": rolling_window_coverage["assistant_tool_runtime_error_count"],
+                "cap_changed_conclusion": rolling_window_coverage["cap_accounting"]["cap_changed_conclusion"],
                 "substantive_signal_count": len(substantive_signals),
                 "setup_echo_signal_count": len(setup_echo_signals),
                 "failure_mode_count": len(failure_modes),
@@ -398,6 +425,7 @@ def build_semantic_wrapup_payload(
                 "setup_echo_source_refs": [signal["source_ref"] for signal in setup_echo_signals[:8]],
                 "failure_modes_exclude_setup_echoes": True,
             },
+            "rolling_window_coverage": rolling_window_coverage,
             "orchestration_evidence": orchestration_evidence,
             "current_session_source_selection": current_session_source_selection,
             "fix_suggestions": fix_suggestions,
@@ -438,6 +466,128 @@ def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
             return "root_rejected"
         return "no_roots"
     return "found" if failure_modes else "no_failure_modes_found"
+
+
+def _rolling_window_coverage(
+    records,
+    signals: list[dict],
+    substantive_signals: list[dict],
+    setup_echo_signals: list[dict],
+    *,
+    scan_warnings: list[str],
+) -> dict:
+    ref_to_index = {
+        (item.record.path, int(item.record.line)): index
+        for index, item in enumerate(records)
+    }
+    user_records = [item for item in records if _is_user_like(item.record.role)]
+    windows: list[dict] = []
+    error_items: list[dict] = []
+    omitted_next_reads: list[dict] = []
+    for ordinal, signal in enumerate(substantive_signals, 1):
+        source_ref = signal.get("source_ref") or {}
+        key = (str(source_ref.get("path") or ""), int(source_ref.get("line") or 0))
+        center = ref_to_index.get(key)
+        if center is None:
+            continue
+        start = max(0, center - ROLLING_WINDOW_PRE_RECORDS)
+        end = min(len(records) - 1, center + ROLLING_WINDOW_POST_RECORDS)
+        window_records = records[start : end + 1]
+        errors = _assistant_tool_errors(window_records)
+        error_items.extend(errors)
+        window = {
+            "window_id": f"w{ordinal:03d}",
+            "signal_id": signal.get("signal_id"),
+            "signal_source_ref": source_ref,
+            "start_source_ref": {"path": records[start].record.path, "line": records[start].record.line},
+            "end_source_ref": {"path": records[end].record.path, "line": records[end].record.line},
+            "record_count": len(window_records),
+            "user_message_count": len([item for item in window_records if _is_user_like(item.record.role)]),
+            "assistant_tool_runtime_error_count": len(errors),
+            "assistant_tool_runtime_error_refs": [item["source_ref"] for item in errors[:5]],
+        }
+        if len(windows) < ROLLING_WINDOW_INLINE_LIMIT:
+            windows.append(window)
+        else:
+            omitted_next_reads.append(
+                {
+                    "source_ref": source_ref,
+                    "reason": (
+                        "Rolling complaint window was inspected for coverage but omitted from inline output; "
+                        "open this signal if the returned failure modes do not cover the later correction."
+                    ),
+                }
+            )
+
+    total_windows = len(substantive_signals)
+    inline_omitted = max(0, total_windows - len(windows))
+    scan_cap_warnings = [warning for warning in scan_warnings if "cap" in warning.lower() or "elapsed" in warning.lower()]
+    cap_changed_conclusion = bool(scan_cap_warnings)
+    if inline_omitted:
+        cap_changed_conclusion = True
+    return {
+        "policy": (
+            "Default semantic-wrapup enumerates all user records in the selected session, "
+            "builds bounded rolling windows around every substantive user complaint/correction, "
+            "and mines assistant/tool/runtime errors in those windows."
+        ),
+        "window_radius": {
+            "pre_records": ROLLING_WINDOW_PRE_RECORDS,
+            "post_records": ROLLING_WINDOW_POST_RECORDS,
+        },
+        "session_accounting": {
+            "session_message_count": len(records),
+            "user_message_count": len(user_records),
+            "user_complaint_candidate_count": len(signals),
+            "substantive_user_complaint_candidate_count": len(substantive_signals),
+            "setup_echo_candidate_count": len(setup_echo_signals),
+        },
+        "window_accounting": {
+            "windows_considered": total_windows,
+            "windows_inspected": total_windows,
+            "windows_returned_inline": len(windows),
+            "windows_omitted": inline_omitted,
+            "inline_window_limit": ROLLING_WINDOW_INLINE_LIMIT,
+        },
+        "cap_accounting": {
+            "scan_cap_warnings": scan_cap_warnings,
+            "inline_window_omitted_count": inline_omitted,
+            "error_item_omitted_count": max(0, len(error_items) - ROLLING_WINDOW_ERROR_INLINE_LIMIT),
+            "cap_changed_conclusion": cap_changed_conclusion,
+            "cap_boundary": (
+                "cap_changed_conclusion is true when scan caps or inline omission mean a reader should "
+                "inspect omitted windows before treating the returned summary as complete."
+            ),
+        },
+        "assistant_tool_runtime_error_count": len(error_items),
+        "assistant_tool_runtime_errors": error_items[:ROLLING_WINDOW_ERROR_INLINE_LIMIT],
+        "windows": windows,
+        "omitted_or_uncertain_next_reads": omitted_next_reads[:8],
+    }
+
+
+def _assistant_tool_errors(window_records) -> list[dict]:
+    errors = []
+    for item in window_records:
+        if _is_user_like(item.record.role):
+            continue
+        normalized = _normalize(item.text)
+        labels = [
+            label
+            for label, terms in ASSISTANT_TOOL_ERROR_TERMS
+            if any(term in normalized for term in terms)
+        ]
+        if not labels:
+            continue
+        row = context_row(item)
+        errors.append(
+            {
+                "error_id": f"e{len(errors) + 1:03d}",
+                "labels": labels,
+                **row,
+            }
+        )
+    return errors
 
 
 def _agent_instruction(
@@ -1295,6 +1445,7 @@ def _semantic_next_reads(
     failure_modes: list[dict],
     orchestration_evidence: dict | None = None,
     current_session_source_selection: dict | None = None,
+    rolling_window_coverage: dict | None = None,
 ) -> list[dict]:
     refs = []
     seen: set[tuple[str, int]] = set()
@@ -1340,6 +1491,8 @@ def _semantic_next_reads(
         add_current_session_sources()
         for ref in evidence_refs:
             add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+    for read in (rolling_window_coverage or {}).get("omitted_or_uncertain_next_reads") or []:
+        add(read.get("source_ref") or {}, str(read.get("reason") or "Inspect omitted rolling-window signal."))
     return refs
 
 
