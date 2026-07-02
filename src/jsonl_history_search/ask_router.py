@@ -343,25 +343,42 @@ def _looks_like_ticket_currentness(normalized: str) -> bool:
 
 
 def _looks_like_process_actual_use_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
     actual_use_phrases = (
         "actually being used",
+        "actually consulted",
         "actually used",
         "actual use",
         "being used",
         "consulted before planning",
         "consulted before work",
+        "consulted before",
+        "used to change agent behavior",
+        "used to change behavior",
         "used before planning",
         "read before planning",
         "process for its own sake",
         "performative",
+        "merely exist",
+        "get cited",
+        "merely cited",
         "write-only ritual",
         "only updated after the fact",
         "updated after the fact",
+        "get updated after the fact",
         "changed behavior",
+        "change agent behavior",
         "changed scope",
+        "changed task selection",
         "claim boundaries",
         "reviewer enforced",
         "review enforced",
+        "artifact exists",
+        "artifact is cited",
+        "consulted before planning",
+        "changed task selection scope or claim boundaries",
+        "only updated after the fact",
+        "stale performative or no evidence gap",
     )
     process_targets = (
         "process",
@@ -375,6 +392,7 @@ def _looks_like_process_actual_use_query(normalized: str) -> bool:
         "fsm",
         "learning",
         "learnings",
+        "learning entry",
         "ledger",
         "memory",
         "workflow",
@@ -382,6 +400,7 @@ def _looks_like_process_actual_use_query(normalized: str) -> bool:
         "rubric",
     )
     use_audit_verbs = (
+        "is ",
         "is this",
         "is the",
         "are the",
@@ -392,6 +411,8 @@ def _looks_like_process_actual_use_query(normalized: str) -> bool:
         "prove",
         "verify",
         "audit",
+        "distinguish",
+        "does it",
     )
     has_actual_use_phrase = _has_any(normalized, actual_use_phrases)
     has_target = _has_any(normalized, process_targets)
