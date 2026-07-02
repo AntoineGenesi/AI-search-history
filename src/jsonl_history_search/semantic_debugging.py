@@ -139,6 +139,7 @@ def build_semantic_debug_payload(
     forensics_payload = build_forensics_payload(args) if any(hints.values()) else None
 
     family = classify_question_family(agent_find["query"]["original"], hints=hints, status=agent_find["status"])
+    process_actual_use = process_actual_use_detected(family)
     source_scope = build_source_scope_summary(source_plan, result)
     candidates = compact_candidates(agent_find.get("find_candidates", []))
     timeline = compact_timeline(agent_find.get("timeline", []))
@@ -156,6 +157,7 @@ def build_semantic_debug_payload(
         query=agent_find["query"]["original"],
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
+        suppress_action_proof=process_actual_use,
     )
     next_reads = dedupe_dicts(
         inferred_anchor_next_reads(
@@ -321,16 +323,20 @@ def build_semantic_debug_payload(
         (answer_source_discipline.get("answer_gate") or {}).get("blocked_facets") or []
     )[:8]
     answer_readiness["source_use_contract"]["answer_source_discipline"] = discipline_summary
-    source_window_action_proof = build_source_window_action_proof(
-        query=agent_find["query"]["original"],
-        family=family,
-        candidates=candidates,
-        timeline=timeline,
-        source_locator_handoff=source_locator_handoff,
-        next_reads=next_reads,
-        tool_proof=tool_proof,
-        joins=joins,
-        answer_source_discipline=answer_source_discipline,
+    source_window_action_proof = (
+        source_window_action_proof_not_applicable(family, reason="process_actual_use_uses_raw_timing_buckets")
+        if process_actual_use
+        else build_source_window_action_proof(
+            query=agent_find["query"]["original"],
+            family=family,
+            candidates=candidates,
+            timeline=timeline,
+            source_locator_handoff=source_locator_handoff,
+            next_reads=next_reads,
+            tool_proof=tool_proof,
+            joins=joins,
+            answer_source_discipline=answer_source_discipline,
+        )
     )
     action_proof_guidance = source_window_action_proof_guidance(source_window_action_proof)
     final_answer_contract["evidence_inputs"]["source_window_action_proof"] = action_proof_guidance
@@ -529,7 +535,8 @@ def build_semantic_debug_payload(
 def classify_question_family(query: str, *, hints: dict[str, str | None], status: str) -> dict[str, Any]:
     text = query.lower()
     detected: list[str] = []
-    if looks_like_process_actual_use_query(text):
+    is_process_actual_use = looks_like_process_actual_use_query(text)
+    if is_process_actual_use:
         detected.append("process_actual_use")
     if any(word in text for word in ("why", "cause", "caused", "happen", "regression", "bug", "symptom", "assumption")):
         detected.append("why_did_this_happen")
@@ -545,7 +552,7 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
             "reviewed source window",
         )
     )
-    if any(word in text for word in claimed_action_cues) or review_action_cue:
+    if not is_process_actual_use and (any(word in text for word in claimed_action_cues) or review_action_cue):
         detected.append("claimed_action")
     if any(phrase in text for phrase in ("told you", "tell you before", "remember", "instruction", "preference", "said before", "what did i say")):
         detected.append("remembered_instruction")
@@ -570,6 +577,12 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
             {"label": label, "meaning": meaning} for label, meaning in sorted(UNSUPPORTED_QUESTION_FAMILIES.items())
         ],
     }
+
+
+def process_actual_use_detected(family: dict[str, Any]) -> bool:
+    return family.get("primary") == "process_actual_use" or "process_actual_use" in set(
+        family.get("detected_supported") or []
+    )
 
 
 def looks_like_process_actual_use_query(text: str) -> bool:
@@ -1923,7 +1936,7 @@ def select_decision_routes(
         or joins.get("status") == "joined"
     ):
         selected.append("task_review_join")
-    if tool_proof.get("event_count", 0) or "claimed_action" in detected:
+    if not process_actual_use and (tool_proof.get("event_count", 0) or "claimed_action" in detected):
         selected.append("tool_action_proof")
     if candidates:
         selected.append("source_ref_followup")
@@ -2763,15 +2776,59 @@ def build_source_window_action_proof(
     }
 
 
+def source_window_action_proof_not_applicable(family: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "not_applicable",
+        "reason": reason,
+        "question_family": {
+            "primary": family.get("primary"),
+            "claimed_action_detected": False,
+        },
+        "source_windows": [],
+        "buckets": {},
+        "summary": {
+            "primary_record_count": 0,
+            "adjacent_record_count": 0,
+            "missing_buckets": [],
+            "missing_labels": [],
+            "source_window_verification_required": False,
+            "verification_required_next_read_count": 0,
+        },
+        "guidance": {
+            "use_for_claimed_action_questions": False,
+            "use_for_process_actual_use_questions": False,
+            "process_actual_use_policy": (
+                "Use raw conversation/session timing windows and actual-use buckets; "
+                "do not promote claimed-action/action-proof reads for process actual-use prompts."
+            ),
+        },
+        "privacy_boundaries": {
+            "raw_transcript_dump_included": False,
+            "raw_tool_payload_dump_included": False,
+            "raw_artifact_content_included": False,
+            "text_excerpts_bounded": False,
+            "private_payloads_committed": False,
+        },
+        "claim_boundaries": {
+            "assistant_prose_satisfies_action_proof": False,
+            "adjacent_artifact_satisfies_primary_action_proof": False,
+            "candidate_next_read_proves_original_source_window": False,
+        },
+    }
+
+
 def source_window_action_proof_guidance(bundle: dict[str, Any]) -> dict[str, Any]:
     if not bundle:
         return {}
     summary = bundle.get("summary") or {}
     buckets = bundle.get("buckets") or {}
+    guidance = bundle.get("guidance") or {}
     return {
         "status": bundle.get("status"),
         "link": "semantic_debug.source_window_action_proof",
-        "use_for_claimed_action_questions": True,
+        "use_for_claimed_action_questions": bool(guidance.get("use_for_claimed_action_questions", True)),
+        "use_for_process_actual_use_questions": bool(guidance.get("use_for_process_actual_use_questions", False)),
         "primary_record_count": summary.get("primary_record_count", 0),
         "adjacent_record_count": summary.get("adjacent_record_count", 0),
         "missing_buckets": list(summary.get("missing_buckets") or [])[:8],
@@ -3875,6 +3932,12 @@ def build_action_proof_plan(
     guided_audit_flow: dict[str, Any],
 ) -> dict[str, Any]:
     primary_family = family.get("primary")
+    if primary_family == "process_actual_use":
+        return {
+            "schema_version": 1,
+            "applies": False,
+            "reason": "process_actual_use_uses_raw_timing_bucket_audit_not_claimed_action_proof",
+        }
     detected_supported = set(family.get("detected_supported") or [])
     action_reads = [
         read
@@ -4635,6 +4698,7 @@ def build_next_reads(
     query: str = "",
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    suppress_action_proof: bool = False,
 ) -> list[dict[str, str]]:
     reads: list[dict[str, Any]] = []
     for candidate in candidates[:5]:
@@ -4657,29 +4721,40 @@ def build_next_reads(
                     expansion_action_context=expansion_action_context,
                 )
             reads.append(read)
-    for event in tool_proof.get("events", [])[:4]:
-        ref = event.get("source_ref") or {}
-        target = source_ref_target(ref)
-        if target:
-            read = {
-                "kind": "tool_event_source_ref",
-                "target": target,
-                "source_ref": dict(ref),
-                "reason": "confirm structured action proof",
-                "expansion_actions": read_more_actions_for_source_ref(
-                    ref,
-                    expansion_action_context=expansion_action_context,
-                ),
-            }
-            if include_context_actions:
-                read["context_actions"] = context_actions_for_source_ref(
-                    ref,
-                    expansion_action_context=expansion_action_context,
-                )
-            reads.append(read)
+    if not suppress_action_proof:
+        for event in tool_proof.get("events", [])[:4]:
+            ref = event.get("source_ref") or {}
+            target = source_ref_target(ref)
+            if target:
+                read = {
+                    "kind": "tool_event_source_ref",
+                    "target": target,
+                    "source_ref": dict(ref),
+                    "reason": "confirm structured action proof",
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        ref,
+                        expansion_action_context=expansion_action_context,
+                    ),
+                }
+                if include_context_actions:
+                    read["context_actions"] = context_actions_for_source_ref(
+                        ref,
+                        expansion_action_context=expansion_action_context,
+                    )
+                reads.append(read)
     for item in joins.get("review_evidence", [])[:4]:
         if item.get("path"):
-            reads.append({"kind": "task_or_review_artifact", "target": item["path"], "reason": "confirm task/review verdict and claim-action classification"})
+            reads.append(
+                {
+                    "kind": "task_or_review_artifact",
+                    "target": item["path"],
+                    "reason": (
+                        "confirm secondary task/review context for actual-use buckets"
+                        if suppress_action_proof
+                        else "confirm task/review verdict and claim-action classification"
+                    ),
+                }
+            )
     hint_path = hints.get("path")
     for item in joins.get("artifact_checks", [])[:4]:
         if item.get("path") and (not hint_path or item.get("path") == hint_path):
@@ -4693,12 +4768,16 @@ def build_next_reads(
         expansion_action_context=expansion_action_context,
         include_context_actions=include_context_actions,
     )
-    promoted_reads = action_proof_source_next_reads(
-        query=query,
-        candidates=candidates,
-        tool_proof=tool_proof,
-        expansion_action_context=expansion_action_context,
-        include_context_actions=include_context_actions,
+    promoted_reads = (
+        []
+        if suppress_action_proof
+        else action_proof_source_next_reads(
+            query=query,
+            candidates=candidates,
+            tool_proof=tool_proof,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
     )
     return dedupe_dicts(correction_reads + promoted_reads + reads)[:12]
 
