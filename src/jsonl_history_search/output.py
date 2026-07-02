@@ -382,6 +382,8 @@ def _action_command(action: dict) -> str | None:
 
 
 def _read_more_command(item: dict, command_by_target: dict[str, str] | None = None) -> str | None:
+    if item.get("read_more_actionable") is False or item.get("diagnostic_only") is True:
+        return None
     if item.get("read_more_command"):
         return str(item["read_more_command"])
     target = _source_target(item)
@@ -442,6 +444,8 @@ def _parse_repo_artifact_target(target: str | None) -> tuple[str, int | None] | 
 def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
     commands: dict[str, str] = {}
     for read in reads:
+        if read.get("read_more_actionable") is False:
+            continue
         target = _source_target(read)
         command = _read_more_command(read)
         if target and command and target not in commands:
@@ -460,6 +464,10 @@ def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[s
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- {target}{f': {reason}' if reason else ''}")
+    if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
+        policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
+        lines.append(f"  diagnostic-only: {policy}")
+        return
     command = _read_more_command(item, command_by_target)
     if command:
         lines.append(f"  command: {command}")
@@ -469,6 +477,10 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- `{target}`{f': {reason}' if reason else ''}")
+    if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
+        policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
+        lines.append(f"  - Diagnostic-only: {policy}")
+        return
     command = _read_more_command(item, command_by_target)
     if command:
         lines.append(f"  - Command: `{command}`")
@@ -486,6 +498,9 @@ def _append_process_actual_use_read_plan_text(
     lines.append("Process actual-use final-support read plan:")
     lines.append(
         "- guidance: open required primary raw reads first; secondary leads and post-hoc answer-key candidates are not final support"
+    )
+    lines.append(
+        "- excluded candidate policy: post-hoc answer-key candidates are diagnostic-only; open only for contamination audit or explicit prior-answer/report recovery"
     )
     lines.append(
         "- prior final prose support: "
@@ -508,6 +523,7 @@ def _append_process_actual_use_read_plan_text(
     answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
     if answer_key:
         lines.append("- post_hoc_answer_key_candidates_excluded_from_required_reads:")
+        lines.append("  diagnostic-only: do not open these as answer evidence or normal follow-through")
         for item in answer_key[:3]:
             _append_text_read(lines, item, command_by_target=command_by_target)
     _append_process_actual_use_bucket_bundle_text(
@@ -532,6 +548,7 @@ def _append_process_actual_use_read_plan_markdown(
             "## Process Actual-Use Final-Support Read Plan",
             "",
             "- Open required primary raw reads first; secondary leads and post-hoc answer-key candidates are not final support.",
+            "- Excluded candidate policy: post-hoc answer-key candidates are diagnostic-only; open only for contamination audit or explicit prior-answer/report recovery.",
             (
                 "- Prior final prose support: allowed only because the prompt explicitly asks for a prior answer/report."
                 if guidance.get("prior_final_prose_counts_as_support")
@@ -552,7 +569,10 @@ def _append_process_actual_use_read_plan_markdown(
     answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
     if answer_key:
         lines.extend(["", "### Post-Hoc Answer-Key Candidates", ""])
-        lines.append("- Excluded from required final-support reads unless the prompt asks for that prior answer/report.")
+        lines.append(
+            "- Excluded from required final-support reads and normal read-more follow-through unless the prompt asks for that prior answer/report."
+        )
+        lines.append("- Diagnostic-only: open only for contamination audit or explicit prior-answer/report recovery.")
         for item in answer_key[:3]:
             _append_markdown_read(lines, item, command_by_target=command_by_target)
     _append_process_actual_use_bucket_bundle_markdown(
@@ -4434,7 +4454,9 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
         ]
         lines.append(f"- top candidate: {' '.join(bits)}")
     for item in handoff.get("next_reads", [])[:5]:
-        lines.append(f"- next read: {item.get('kind')} {item.get('target')}")
+        actionability = "diagnostic-only" if item.get("diagnostic_only") or item.get("read_more_actionable") is False else "actionable"
+        reason = f" reason={item.get('reason')}" if item.get("reason") else ""
+        lines.append(f"- next read ({actionability}): {item.get('kind')} {item.get('target')}{reason}")
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_text(
             lines,
@@ -4475,12 +4497,18 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
             )
     next_reads = handoff.get("next_reads", [])[:5]
     if next_reads:
-        lines.extend(["", "| Kind | Target | Reason |", "| --- | --- | --- |"])
+        lines.extend(["", "| Kind | Target | Actionability | Reason |", "| --- | --- | --- | --- |"])
         for item in next_reads:
+            actionability = (
+                "diagnostic-only"
+                if item.get("diagnostic_only") or item.get("read_more_actionable") is False
+                else "actionable"
+            )
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(item.get('kind', '')))} | "
                 f"{_escape_markdown_table(str(item.get('target', '')))} | "
+                f"{_escape_markdown_table(actionability)} | "
                 f"{_escape_markdown_table(str(item.get('reason', '')))} |"
             )
     if handoff.get("process_actual_use_bucket_evidence_bundle"):

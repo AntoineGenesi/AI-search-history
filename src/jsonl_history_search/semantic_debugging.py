@@ -1023,7 +1023,18 @@ def annotate_process_actual_use_next_read(
             "post-hoc answer-key or prior final-answer prose candidate; do not count as final "
             "support for process actual-use unless the prompt asks for that prior answer/report"
         )
+    diagnostic_only = process_actual_use_diagnostic_only_chronology(chronology)
     row["actual_use_source_tier"] = tier
+    row["read_more_actionable"] = not diagnostic_only
+    row["followthrough_actionable"] = not diagnostic_only
+    row["diagnostic_only"] = diagnostic_only
+    if diagnostic_only:
+        row["diagnostic_open_policy"] = (
+            "Open only for contamination/chronology audit, or when the user explicitly asks "
+            "to recover a prior answer/report; do not use as answer evidence."
+        )
+        row["expansion_actions"] = []
+        row["context_actions"] = []
     row["process_actual_use_selection"] = {
         "schema_version": 1,
         "source_tier": tier,
@@ -1036,6 +1047,14 @@ def annotate_process_actual_use_next_read(
         "final_support_allowed": chronology["final_support_allowed"],
         "required_final_support_read": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
         and chronology["final_support_allowed"],
+        "read_more_actionable": not diagnostic_only,
+        "followthrough_actionable": not diagnostic_only,
+        "diagnostic_only": diagnostic_only,
+        "diagnostic_open_policy": (
+            "contamination_audit_or_explicit_prior_answer_request_only"
+            if diagnostic_only
+            else "normal_process_actual_use_followthrough"
+        ),
         "post_hoc_answer_key_candidate": chronology["source_chronology_role"] == "post_hoc_answer_key_artifact",
         "prior_final_prose_candidate": chronology["prior_final_prose_candidate"],
         "explicit_prior_answer_or_report_requested": chronology["explicit_prior_answer_or_report_requested"],
@@ -1044,6 +1063,13 @@ def annotate_process_actual_use_next_read(
     }
     row["_process_actual_use_sort_key"] = process_actual_use_read_sort_key(row, index)
     return row
+
+
+def process_actual_use_diagnostic_only_chronology(chronology: dict[str, Any]) -> bool:
+    return (
+        chronology.get("source_chronology_role") == "post_hoc_answer_key_artifact"
+        and not chronology.get("explicit_prior_answer_or_report_requested")
+    )
 
 
 def process_actual_use_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
@@ -1234,6 +1260,12 @@ def build_process_actual_use_final_support_read_plan(
         "required_primary_raw_final_support_read_count": len(required),
         "secondary_lead_count": len(secondary),
         "post_hoc_answer_key_candidate_count": len(answer_key),
+        "diagnostic_only_excluded_candidate_count": sum(
+            1 for row in answer_key if row.get("diagnostic_only")
+        ),
+        "actionable_followthrough_read_count": sum(
+            1 for row in required + secondary + answer_key if row.get("followthrough_actionable")
+        ),
         "excluded_from_required_final_support_read_count": len(secondary) + (0 if explicit_request else len(answer_key)),
         "compact_read_order": [row.get("target") for row in required if row.get("target")],
         "guidance": {
@@ -1243,6 +1275,10 @@ def build_process_actual_use_final_support_read_plan(
                 "prior final-answer prose, reports, tasks, reviews, and adjudication artifacts are not final support "
                 "for process actual-use unless the prompt explicitly asks for that prior answer/report"
             ),
+            "post_hoc_answer_key_followthrough_policy": (
+                "diagnostic-only for normal process actual-use prompts: keep visible for chronology/contamination "
+                "audit, but do not open as required/top/read-more follow-through or answer evidence"
+            ),
             "prior_final_prose_counts_as_support": bool(explicit_request),
             "chronology_required": True,
             "raw_text_included": False,
@@ -1251,6 +1287,7 @@ def build_process_actual_use_final_support_read_plan(
             "primary_raw_timing_evidence_required_for_behavior_claims": True,
             "secondary_leads_count_as_final_support": False,
             "post_hoc_answer_key_candidates_count_as_final_support": bool(explicit_request),
+            "post_hoc_answer_key_candidates_count_as_actionable_followthrough": bool(explicit_request),
             "release_or_token_savings_claim_supported": False,
         },
         "cap_policy": {
@@ -1343,7 +1380,10 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             "primary_raw_evidence_policy": "primary raw session/tool-event reads remain preferred for timing and behavior claims",
             "secondary_lead_policy": "secondary leads may explain context or route follow-up reads but do not displace primary behavior proof",
             "missing_bucket_policy": "missing buckets are explicit gaps; do not smooth them into a yes/no conclusion",
-            "post_hoc_answer_key_policy": "excluded from final support unless explicitly requested",
+            "post_hoc_answer_key_policy": (
+                "excluded from final support and normal follow-through unless explicitly requested; "
+                "open only for contamination/chronology audit"
+            ),
             "raw_text_included": False,
         },
         "claim_boundaries": {
@@ -1351,6 +1391,9 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             "read_more_reduction_proven": False,
             "primary_raw_timing_evidence_required_for_behavior_claims": True,
             "secondary_leads_count_as_behavior_proof": False,
+            "excluded_post_hoc_answer_key_candidates_are_actionable_followthrough": bool(
+                plan.get("explicit_prior_answer_or_report_requested")
+            ),
         },
     }
 
@@ -1364,6 +1407,10 @@ def process_actual_use_bucket_evidence_row(item: dict[str, Any], *, evidence_rol
         "source_chronology_role": item.get("source_chronology_role"),
         "evidence_role": evidence_role,
         "final_support_allowed": bool(item.get("final_support_allowed")),
+        "read_more_actionable": bool(item.get("read_more_actionable", True)),
+        "followthrough_actionable": bool(item.get("followthrough_actionable", True)),
+        "diagnostic_only": bool(item.get("diagnostic_only", False)),
+        "diagnostic_open_policy": item.get("diagnostic_open_policy"),
         "final_support_rule": item.get("final_support_rule"),
         "source_ref": item.get("source_ref"),
         "raw_text_included": False,
@@ -1382,6 +1429,17 @@ def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: 
     final_support_allowed = bool(selection.get("final_support_allowed", False))
     if role == "post_hoc_answer_key_artifact" and not explicit_request:
         final_support_allowed = False
+    diagnostic_only = bool(
+        selection.get("diagnostic_only")
+        or (role == "post_hoc_answer_key_artifact" and not explicit_request)
+    )
+    read_more_actionable = bool(selection.get("read_more_actionable", read.get("read_more_actionable", True)))
+    followthrough_actionable = bool(
+        selection.get("followthrough_actionable", read.get("followthrough_actionable", True))
+    )
+    if diagnostic_only:
+        read_more_actionable = False
+        followthrough_actionable = False
     return {
         "kind": read.get("kind"),
         "target": read.get("target"),
@@ -1390,6 +1448,14 @@ def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: 
         "source_chronology_role": role,
         "selected_buckets": list(selection.get("selected_buckets") or [])[:6],
         "final_support_allowed": final_support_allowed,
+        "read_more_actionable": read_more_actionable,
+        "followthrough_actionable": followthrough_actionable,
+        "diagnostic_only": diagnostic_only,
+        "diagnostic_open_policy": (
+            "contamination_audit_or_explicit_prior_answer_request_only"
+            if diagnostic_only
+            else "normal_process_actual_use_followthrough"
+        ),
         "final_support_rule": (
             "may_support_behavior_claims_after_inspection"
             if final_support_allowed
@@ -1511,15 +1577,25 @@ def annotate_process_actual_use_source_locator_handoff(
             1
             for item in result.get("next_reads") or []
             if item.get("actual_use_source_tier") == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+            and item.get("followthrough_actionable", True) is not False
         ),
         "secondary_lead_next_read_count": sum(
             1
             for item in result.get("next_reads") or []
             if item.get("actual_use_source_tier") == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
+            and item.get("followthrough_actionable", True) is not False
+        ),
+        "diagnostic_only_excluded_next_read_count": sum(
+            1
+            for item in result.get("next_reads") or []
+            if item.get("diagnostic_only")
         ),
         "raw_timing_windows_promoted_before_secondary_artifacts": True,
         "secondary_artifact_rule": "task/review/report/doc artifacts are leads/context unless they locate raw timing or reviewer enforcement",
         "anti_contamination_gate": "do_not_answer_from_post_hoc_task_review_report_summary_artifacts_when_raw_timing_evidence_is_available",
+        "excluded_candidate_followthrough_policy": (
+            "post-hoc answer-key candidates remain visible as diagnostics but are not normal actionable reads"
+        ),
         "raw_text_included": False,
     }
     return result
@@ -3017,6 +3093,8 @@ def build_next_commands(
     _ = include_semantic_debug_replay
     commands: list[dict[str, Any]] = []
     for read in next_reads[:8]:
+        if read.get("read_more_actionable") is False:
+            continue
         actions = read.get("expansion_actions") or []
         for action in actions[:1]:
             argv = action.get("argv")
@@ -3240,6 +3318,7 @@ def build_answer_ready_handoff(
         "required_action_count": len(final_answer_contract.get("required_actions") or []),
         "bounded_next_read_count": len(bounded_next_reads),
         "copy_paste_command_count": len(copy_paste_commands),
+        "diagnostic_only_excluded_next_read_count": sum(1 for item in next_reads if item.get("diagnostic_only")),
         "blocked_facets": blocked_facets,
         "missing_proof_buckets": list(discipline_summary.get("missing_proof_buckets") or [])[:8],
         "candidate_only_citation_allowed": discipline_summary.get("candidate_only_citation_allowed"),
@@ -3370,7 +3449,9 @@ def answer_support_classification(
 
 def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for read in next_reads[:ANSWER_READY_HANDOFF_READ_CAP]:
+    for read in (item for item in next_reads if item.get("followthrough_actionable", True) is not False):
+        if len(rows) >= ANSWER_READY_HANDOFF_READ_CAP:
+            break
         target = read.get("target")
         kind = read.get("kind")
         guidance = (
@@ -3393,6 +3474,8 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
             else None,
             "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
             "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
+            "read_more_actionable": read.get("read_more_actionable", True),
+            "followthrough_actionable": read.get("followthrough_actionable", True),
             "action": guidance,
         }
         rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
@@ -3973,10 +4056,16 @@ def answer_ready_copy_paste_commands(
             }
         )
         return commands
-    command_targets = {read.get("target") for read in bounded_next_reads if is_jsonl_read_target(read.get("target"))}
+    command_targets = {
+        read.get("target")
+        for read in bounded_next_reads
+        if is_jsonl_read_target(read.get("target")) and read.get("read_more_actionable", True) is not False
+    }
     for read in next_reads:
         if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
             break
+        if read.get("read_more_actionable") is False:
+            continue
         target = read.get("target")
         if target not in command_targets:
             continue
@@ -4130,7 +4219,7 @@ def primary_followthrough_reads(
     reviewed_pointer_reads = [
         item
         for item in bounded_next_reads
-        if reviewed_source_packet_pointer_read(item)
+        if reviewed_source_packet_pointer_read(item) and item.get("followthrough_actionable", True) is not False
     ]
     if reviewed_pointer_reads and not reads:
         reads.extend(reviewed_pointer_reads)
@@ -4152,6 +4241,8 @@ def primary_followthrough_reads(
                 reads.append(item)
     if not reads:
         for item in bounded_next_reads:
+            if item.get("followthrough_actionable", True) is False:
+                continue
             inferred = item.get("inferred_anchor") if isinstance(item.get("inferred_anchor"), dict) else {}
             if inferred.get("anchor_kind") in {
                 "known_action_case",
@@ -6541,6 +6632,10 @@ def build_investigation_state(
         "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:6],
         "link": "semantic_debug.answer_readiness",
     }
+    actionable_next_reads = [
+        item for item in next_reads if item.get("followthrough_actionable", True) is not False
+    ]
+    diagnostic_next_reads = [item for item in next_reads if item.get("diagnostic_only")]
     return {
         "schema_version": 1,
         "status": investigation_status(answer_state, gaps),
@@ -6570,8 +6665,9 @@ def build_investigation_state(
             },
         },
         "actionable_next": {
-            "read_next_refs": investigation_read_next_refs(next_reads),
-            "read_next_count": len(next_reads),
+            "read_next_refs": investigation_read_next_refs(actionable_next_reads),
+            "read_next_count": len(actionable_next_reads),
+            "diagnostic_only_excluded_read_count": len(diagnostic_next_reads),
             "preferred_recovery_workflow": (
                 "semantic_debug.agent_instruction.commands.expand_recovery_context"
                 if answer_readiness.get("decision") == "inspect_recovery_reads"
