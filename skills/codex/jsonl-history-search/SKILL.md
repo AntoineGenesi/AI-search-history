@@ -31,8 +31,14 @@ specialization, broad `rg`, repo recovery, TODO scans, or direct JSONL
 spelunking:
 
 ```bash
+python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
+
+The installed `jsonl_ask_first.py` launcher is the neutral ask-first helper. It
+wraps the canonical `jsonl-history-search ask` command, adds `--cwd "$PWD"` and
+`--format text` when omitted, and exists so the first command can be the
+front-door resolver rather than a repo inventory/setup probe.
 
 Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
@@ -103,6 +109,8 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - Trigger this skill even when the user does not say "use JSONL" if the answer
   depends on prior AI conversation logs or agent actions.
 - For natural history/status/action/currentness/wrap-up prompts, run
+  `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
+  or its canonical wrapped command,
   `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` before
   broad `rg`, repo recovery, TODO scans, direct JSONL inspection, or loading a
   specialization. Then follow the printed first command and read only the named

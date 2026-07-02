@@ -53,6 +53,7 @@ def validate_install(
         _check_package_skill(root, source_checkout=source_checkout),
         _check_package_helpers(root, source_checkout=source_checkout),
         _check_package_helper_behavior(root, source_checkout=source_checkout),
+        _check_package_ask_first_launcher_behavior(root, source_checkout=source_checkout),
         _check_safe_root_rejection(root),
     ]
     checks.extend(_check_redaction_and_fixture_search())
@@ -190,6 +191,7 @@ def _check_package_skill(package_root: Path, *, source_checkout: bool = True) ->
 def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
     helpers = [
         package_root / "scripts" / "search_jsonl_history.py",
+        package_root / "scripts" / "jsonl_ask_first.py",
         package_root / "scripts" / "git_jsonl_forensics.py",
     ]
     missing = [path for path in helpers if not path.is_file()]
@@ -219,7 +221,7 @@ def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) 
     if missing:
         recovery.append("Restore missing helper scripts from the package checkout.")
     if not_executable:
-        recovery.append("Run `chmod +x scripts/search_jsonl_history.py scripts/git_jsonl_forensics.py`.")
+        recovery.append("Run `chmod +x scripts/search_jsonl_history.py scripts/jsonl_ask_first.py scripts/git_jsonl_forensics.py`.")
     return ValidationCheck(
         id="package_helpers",
         name="Package helper executability",
@@ -319,6 +321,68 @@ def _run_helper_json(helper: Path, query: str, root: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
     return {"returncode": result.returncode, "payload": payload}
+
+
+def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+    launcher = package_root / "scripts" / "jsonl_ask_first.py"
+    if not source_checkout:
+        return ValidationCheck(
+            id="package_ask_first_launcher_smoke",
+            name="Package ask-first launcher smoke",
+            status="skip",
+            detail="Package ask-first launcher smoke is skipped outside a source checkout.",
+            paths=[str(launcher)],
+            metadata={"source_checkout": False},
+        )
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        return ValidationCheck(
+            id="package_ask_first_launcher_smoke",
+            name="Package ask-first launcher smoke",
+            status="skip",
+            detail="Package ask-first launcher smoke is skipped because the launcher is missing or not executable.",
+            paths=[str(launcher)],
+            recovery=["Restore executable `scripts/jsonl_ask_first.py` before running the behavior smoke."],
+        )
+
+    env = os.environ.copy()
+    src_path = str(package_root / "src")
+    env["PYTHONPATH"] = src_path if not env.get("PYTHONPATH") else f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+    result = run_subprocess(
+        [sys.executable, str(launcher), "why", "did", "I", "mention", "the", "router?"],
+        text=True,
+        stdout=PIPE,
+        stderr=PIPE,
+        check=False,
+        cwd=str(package_root),
+        env=env,
+    )
+    stdout = result.stdout
+    ok = (
+        result.returncode == 0
+        and "Ask Route" in stdout
+        and "First command: jsonl-history-search semantic-debug" in stdout
+        and "--cwd \"$PWD\"" in stdout
+        and "--format text" in stdout
+        and "Read: references/remembered-topic.md" in stdout
+    )
+    return ValidationCheck(
+        id="package_ask_first_launcher_smoke",
+        name="Package ask-first launcher smoke",
+        status="pass" if ok else "fail",
+        detail=(
+            "Package ask-first launcher delegates natural prompts to `jsonl-history-search ask` with text output."
+            if ok
+            else "Package ask-first launcher did not return the expected ask router text output."
+        ),
+        paths=[str(launcher)],
+        recovery=[] if ok else ["Run `python3 scripts/jsonl_ask_first.py \"why did I mention the router?\"` from the package checkout."],
+        metadata={
+            "returncode": result.returncode,
+            "stdout_contains_ask_route": "Ask Route" in stdout,
+            "stdout_contains_first_command": "First command: jsonl-history-search semantic-debug" in stdout,
+            "stderr": result.stderr.strip()[:500],
+        },
+    )
 
 
 def _check_safe_root_rejection(package_root: Path) -> ValidationCheck:
@@ -502,10 +566,12 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
     skill = skill_root / "SKILL.md"
     references = skill_root / "references"
     helper = skill_root / "scripts" / "search_jsonl_history.py"
+    ask_first_launcher = skill_root / "scripts" / "jsonl_ask_first.py"
     package_skill_root = package_root / "skills" / "codex" / "jsonl-history-search"
     package_skill = package_skill_root / "SKILL.md"
     package_references = package_skill_root / "references"
     package_helper = package_root / "scripts" / "search_jsonl_history.py"
+    package_ask_first_launcher = package_root / "scripts" / "jsonl_ask_first.py"
     checks: list[ValidationCheck] = []
     if skill.is_file():
         checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, source_checkout=source_checkout))
@@ -552,6 +618,27 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 detail="Global Codex helper is missing or not executable at the provided --codex-home.",
                 paths=[str(helper)],
                 recovery=["Copy `scripts/search_jsonl_history.py` into the skill scripts folder and run `chmod +x` on it."],
+            )
+        )
+    if ask_first_launcher.is_file() and os.access(ask_first_launcher, os.X_OK):
+        checks.append(
+            _global_copy_check(
+                "global_ask_first_launcher",
+                "Global Codex ask-first launcher",
+                ask_first_launcher,
+                package_ask_first_launcher,
+                source_checkout=source_checkout,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id="global_ask_first_launcher",
+                name="Global Codex ask-first launcher executability",
+                status="fail",
+                detail="Global Codex ask-first launcher is missing or not executable at the provided --codex-home.",
+                paths=[str(ask_first_launcher)],
+                recovery=["Copy `scripts/jsonl_ask_first.py` into the skill scripts folder and run `chmod +x` on it."],
             )
         )
     return checks
