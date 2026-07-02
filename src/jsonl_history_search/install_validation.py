@@ -636,6 +636,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
     package_helper = package_root / "scripts" / "search_jsonl_history.py"
     package_ask_first_launcher = package_root / "scripts" / "jsonl_ask_first.py"
     checks: list[ValidationCheck] = []
+    checks.append(_check_global_backup_skill_dirs(codex_home))
     if skill.is_file():
         checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, source_checkout=source_checkout))
     else:
@@ -705,6 +706,56 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
             )
         )
     return checks
+
+
+def _check_global_backup_skill_dirs(codex_home: Path) -> ValidationCheck:
+    skills_dir = codex_home / "skills"
+    if not skills_dir.is_dir():
+        return ValidationCheck(
+            id="global_backup_skill_dirs",
+            name="Global Codex backup skill directories",
+            status="pass",
+            detail="No Codex skills directory exists at the provided --codex-home.",
+            paths=[str(skills_dir)],
+        )
+
+    backup_dirs = sorted(
+        path
+        for path in skills_dir.iterdir()
+        if path.is_dir()
+        and path.name != "jsonl-history-search"
+        and path.name.startswith("jsonl-history-search")
+    )
+    if not backup_dirs:
+        return ValidationCheck(
+            id="global_backup_skill_dirs",
+            name="Global Codex backup skill directories",
+            status="pass",
+            detail="No duplicate or backup jsonl-history-search skill directories are discoverable.",
+            paths=[str(skills_dir)],
+        )
+
+    return ValidationCheck(
+        id="global_backup_skill_dirs",
+        name="Global Codex backup skill directories",
+        status="fail",
+        detail=(
+            "Duplicate or backup jsonl-history-search skill directories are discoverable "
+            "beside the active global skill; receiving agents may read stale guidance first."
+        ),
+        paths=[str(path) for path in backup_dirs],
+        recovery=[
+            (
+                "Move backup directories out of the immediate Codex skills directory, "
+                "for example into `$CODEX_HOME/skills/.disabled-backups/`, then rerun "
+                "`jsonl-history-search validate-install --codex-home ~/.codex --format text`."
+            )
+        ],
+        metadata={
+            "backup_dir_names": [path.name for path in backup_dirs],
+            "active_skill_dir": str(skills_dir / "jsonl-history-search"),
+        },
+    )
 
 
 def _global_copy_check(
