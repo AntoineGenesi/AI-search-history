@@ -1878,6 +1878,11 @@ def source_handle_match_texts(item: dict[str, Any]) -> list[str]:
         target = source_ref_target(source_ref)
         if target:
             texts.append(target)
+    reviewed_pointer = item.get("reviewed_source_packet_pointer")
+    if isinstance(reviewed_pointer, dict):
+        for key in ("handle", "source_ref_id", "packet_handle"):
+            if reviewed_pointer.get(key):
+                texts.append(str(reviewed_pointer.get(key)))
     for key in ("artifacts", "tasks", "reason_codes", "stages"):
         values = item.get(key) or []
         if isinstance(values, list):
@@ -2087,13 +2092,6 @@ def inferred_reviewed_source_packet_next_reads(
     include_context_actions: bool = False,
 ) -> list[dict[str, Any]]:
     text = str(query or "").casefold()
-    reviewed_source_case_mentioned = (
-        "reviewed source case" in text
-        or "using reviewed source case" in text
-        or "source case" in text
-    )
-    if not reviewed_source_case_mentioned:
-        return []
     handles = [
         handle
         for handle in detect_source_handles(query)

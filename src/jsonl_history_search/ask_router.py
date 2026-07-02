@@ -283,11 +283,11 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 def classify_ask_route(query: str) -> AskRoute:
     normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
 
-    if _looks_like_local_artifact_verification_query(normalized):
-        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
-
     if _looks_like_reviewed_source_window_prompt(normalized):
         return ROUTES[0]
+
+    if _looks_like_local_artifact_verification_query(normalized):
+        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
     if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
         normalized, ("agent", "edits", "edit", "changed", "action")
@@ -443,11 +443,12 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
 
 
 def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
-    reviewed_source = "reviewed source case" in normalized or re.search(r"\breal-jsh[0-9a-z-]*\b", normalized)
+    real_jsh_handle = bool(re.search(r"\breal-jsh[0-9a-z-]*\b", normalized))
+    reviewed_source = "reviewed source case" in normalized or real_jsh_handle
     source_window = "source window" in normalized or "source refs" in normalized or "source case" in normalized
     dated_session = bool(re.search(r"\b20\d\d-\d\d-\d\d\b", normalized)) or "session dated" in normalized
     boundary = _has_any(normalized, ("only", "not from current docs", "not current docs", "answer from"))
-    return bool(reviewed_source and source_window and (dated_session or boundary))
+    return bool(reviewed_source and (real_jsh_handle or (source_window and (dated_session or boundary))))
 
 
 def _looks_like_ticket_currentness(normalized: str) -> bool:
