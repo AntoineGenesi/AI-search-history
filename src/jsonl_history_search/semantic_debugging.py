@@ -3060,6 +3060,7 @@ def build_primary_source_followthrough(
             "--compact-text-limit",
             str(window.get("compact_text_limit", 500)),
         ])
+    required_answer_facets = primary_followthrough_required_answer_facets(first)
     command = {
         "command_family": "read_more",
         "command_id": "open_primary_source_window",
@@ -3086,6 +3087,7 @@ def build_primary_source_followthrough(
         "required_final_source_ref_ids": required_final_source_ref_ids,
         "reviewed_source_case_handle": reviewed_pointer.get("handle"),
         "primary_read_count": len(primary_reads),
+        "required_answer_facets": required_answer_facets,
         "first_command": command,
         "stop_after": (
             "After this primary source window supports the answer, stop broad search and answer with "
@@ -3098,6 +3100,7 @@ def build_primary_source_followthrough(
         "only_continue_if": [
             "the opened primary window does not contain the required proof",
             "the primary source conflicts with another inspected primary source",
+            "a required answer facet from required_answer_facets is absent or only implicit",
             "a required facet is still missing, such as file, commit, test, or unrelated-work status",
         ],
         "claim_boundary": "followthrough_guides_source_inspection_not_final_answer",
@@ -3186,6 +3189,33 @@ def explicit_correction_primary_bundle_read(explicit_reads: list[dict[str, Any]]
         "claim_boundary": "bundle_guides_one_compact_source_window_not_final_answer",
     }
     return row
+
+
+def primary_followthrough_required_answer_facets(read: dict[str, Any]) -> list[str]:
+    correction_meta = explicit_correction_window_meta(read)
+    if not correction_meta.get("bounded_to_explicit_date_window"):
+        return []
+    bundle = read.get("explicit_correction_window_bundle")
+    if not isinstance(bundle, dict) or not bundle.get("same_source_window"):
+        return []
+    roles = {
+        str(item.get("bundle_role") or "")
+        for item in bundle.get("roles") or []
+        if isinstance(item, dict)
+    }
+    if not EXPLICIT_CORRECTION_WINDOW_REQUIRED_ROLES <= roles:
+        return []
+    return [
+        "original user challenge about persistent coordinator versus wait/poll loops",
+        "local docs/scripts or tool calls inspected before the distinction",
+        "first distinction between outer tmux/injector coordination and foreground current-session waiting",
+        "follow-up correction after the user challenged the first distinction",
+        (
+            "explicitly state whether wait/poll was for keeping/checking active foreground work; "
+            "if the opened window lacks that nuance, say it is not shown there"
+        ),
+        "persistent coordinator can safely go idle or stop between cycles only because an external injector can wake it later",
+    ]
 
 
 def reviewed_source_packet_pointer_read(read: dict[str, Any]) -> bool:
