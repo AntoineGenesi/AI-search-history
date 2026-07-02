@@ -651,12 +651,16 @@ def looks_like_process_actual_use_query(text: str) -> bool:
         "are these",
         "was this",
         "were these",
+        "which ",
         "whether",
         "prove",
         "verify",
         "audit",
+        "classify",
         "distinguish",
         "does it",
+        "did it",
+        "did they",
     )
     return (
         any(phrase in normalized for phrase in actual_use_phrases)

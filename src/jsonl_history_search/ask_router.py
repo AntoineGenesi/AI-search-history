@@ -407,12 +407,16 @@ def _looks_like_process_actual_use_query(normalized: str) -> bool:
         "are these",
         "was this",
         "were these",
+        "which ",
         "whether",
         "prove",
         "verify",
         "audit",
+        "classify",
         "distinguish",
         "does it",
+        "did it",
+        "did they",
     )
     has_actual_use_phrase = _has_any(normalized, actual_use_phrases)
     has_target = _has_any(normalized, process_targets)
