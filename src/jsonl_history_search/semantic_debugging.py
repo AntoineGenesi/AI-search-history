@@ -862,7 +862,12 @@ def inferred_reviewed_source_packet_next_reads(
     include_context_actions: bool = False,
 ) -> list[dict[str, Any]]:
     text = str(query or "").casefold()
-    if "reviewed source case" not in text and "source case" not in text:
+    reviewed_source_case_mentioned = (
+        "reviewed source case" in text
+        or "using reviewed source case" in text
+        or "source case" in text
+    )
+    if not reviewed_source_case_mentioned:
         return []
     handles = [
         handle
@@ -3024,6 +3029,13 @@ def primary_followthrough_reads(
     allow_action_proof_plan: bool = True,
 ) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
+    reviewed_pointer_reads = [
+        item
+        for item in bounded_next_reads
+        if reviewed_source_packet_pointer_read(item)
+    ]
+    if reviewed_pointer_reads:
+        reads.extend(reviewed_pointer_reads)
     if (
         allow_action_proof_plan
         and
@@ -3062,6 +3074,13 @@ def primary_followthrough_reads(
     return dedupe_primary_targets(reads)[:3]
 
 
+def reviewed_source_packet_pointer_read(read: dict[str, Any]) -> bool:
+    inferred = read.get("inferred_anchor") if isinstance(read.get("inferred_anchor"), dict) else {}
+    return inferred.get("anchor_kind") == "reviewed_source_packet_pointer" or isinstance(
+        read.get("reviewed_source_packet_pointer"), dict
+    )
+
+
 def dedupe_primary_targets(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -3092,6 +3111,16 @@ def primary_followthrough_window(
             "format": "text",
             "reason": "explicit_correction_source_window_covers_inspection_distinction_challenge_and_correction",
         }
+    if anchor_kind == "reviewed_source_packet_pointer" or reviewed_source_packet_pointer_read(read):
+        return {
+            "before": 0,
+            "after": 35,
+            "max_records": 60,
+            "projection": "compact",
+            "compact_text_limit": 1200,
+            "format": "text",
+            "reason": "reviewed_source_packet_pointer_window_before_current_session_echo_recovery",
+        }
     if str(read.get("read_type") or "") == "required_primary_proof_read" or (
         action_proof_plan
         and action_proof_plan.get("applies")
@@ -3112,16 +3141,6 @@ def primary_followthrough_window(
             "compact_text_limit": 500,
             "format": "text",
             "reason": "explicit_date_remembered_instruction_window_before_prompt_echo_recovery",
-        }
-    if anchor_kind == "reviewed_source_packet_pointer":
-        return {
-            "before": 0,
-            "after": 35,
-            "max_records": 60,
-            "projection": "compact",
-            "compact_text_limit": 1200,
-            "format": "text",
-            "reason": "reviewed_source_packet_pointer_window_before_current_session_echo_recovery",
         }
     if anchor_kind == "remembered_topic" or "recent user topic/provenance" in str(read.get("reason") or ""):
         return {
@@ -3533,7 +3552,7 @@ def build_action_proof_plan(
     if not applies:
         return {"schema_version": 1, "applies": False, "reason": "not_a_claimed_action_or_action_proof_query"}
 
-    primary_refs = action_proof_primary_refs(action_reads, source_window_action_proof)
+    primary_refs = action_proof_primary_refs(action_reads, source_window_action_proof, next_reads=next_reads)
     required_reads = action_proof_required_reads(primary_refs, next_reads)
     optional_diagnostics = action_proof_optional_diagnostics(
         next_reads=next_reads,
@@ -3601,8 +3620,13 @@ def build_action_proof_plan(
 def action_proof_primary_refs(
     action_reads: list[dict[str, Any]],
     source_window_action_proof: dict[str, Any],
+    *,
+    next_reads: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
+    for read in list(next_reads or []):
+        if reviewed_source_packet_pointer_read(read):
+            refs.append(action_proof_read_ref(read, proof_role="reviewed_source_packet_pointer"))
     for read in action_reads[:4]:
         refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
 
