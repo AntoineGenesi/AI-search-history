@@ -393,22 +393,26 @@ def build_semantic_wrapup_payload(
         scan_warnings=scan["warnings"],
     )
     ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
-    all_failure_modes = [] if ambiguous_prompt_only_scope else _failure_modes(substantive_signals)
+    explicit_root_setup_echo_scope = _explicit_root_setup_echo_only_scope(plan, signals, query)
+    fail_closed_scope = ambiguous_prompt_only_scope or explicit_root_setup_echo_scope
+    all_failure_modes = [] if fail_closed_scope else _failure_modes(substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
     current_session_source_selection = _current_session_source_selection(cwd, query)
     behavior_system = detect_behavior_system(cwd)
     all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
     fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
-    status = "scope_ambiguous" if ambiguous_prompt_only_scope else _semantic_wrapup_status(plan, all_failure_modes)
+    status = "scope_ambiguous" if fail_closed_scope else _semantic_wrapup_status(plan, all_failure_modes)
     scope_resolution = _scope_resolution(plan, source_plan, query)
-    if ambiguous_prompt_only_scope:
-        scope_resolution.update(ambiguous_prompt_only_scope)
+    if fail_closed_scope:
+        scope_resolution.update(fail_closed_scope)
     next_reads = _semantic_next_reads(
         failure_modes,
         orchestration_evidence,
         current_session_source_selection,
         rolling_window_coverage,
+        setup_echo_signals=setup_echo_signals,
+        prefer_setup_signal_refs=bool(explicit_root_setup_echo_scope),
     )
     answer_ready_contract = _answer_ready_contract(
         status=status,
@@ -826,6 +830,34 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
         "first_action": (
             "Rerun with the parent/user session JSONL or another exact known Codex/Claude session JSONL, "
             f"for example: {_rerun_with_root_command(query)}"
+        ),
+    }
+
+
+def _explicit_root_setup_echo_only_scope(plan: SourcePlan, signals: list[dict], query: str) -> dict | None:
+    if plan.scope_resolution.get("status") == "scoped_to_latest_known_session":
+        return None
+    if not plan.roots or not signals or not _is_current_session_complaint_fix_query(query):
+        return None
+    setup_echo_signals = [
+        signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS
+    ]
+    if len(setup_echo_signals) != len(signals):
+        return None
+    return {
+        "status": "scope_ambiguous",
+        "strategy": "explicit_root_setup_echo_only_fail_closed",
+        "reason": (
+            "The explicit root contains complaint/failure-looking signals, but they are setup, "
+            "reviewer, worker, or semantic-wrapup prompt echoes rather than source-backed "
+            "current-session user corrections."
+        ),
+        "selected_explicit_root_status": "setup_echo_only_complaint_signals",
+        "setup_echo_signal_count": len(setup_echo_signals),
+        "substantive_signal_count": 0,
+        "first_action": (
+            "Inspect the listed selected-session signal refs to confirm they are only setup/reviewer "
+            "echoes, or rerun semantic-wrapup with the parent/user session JSONL."
         ),
     }
 
@@ -1480,6 +1512,9 @@ def _semantic_next_reads(
     orchestration_evidence: dict | None = None,
     current_session_source_selection: dict | None = None,
     rolling_window_coverage: dict | None = None,
+    *,
+    setup_echo_signals: list[dict] | None = None,
+    prefer_setup_signal_refs: bool = False,
 ) -> list[dict]:
     refs = []
     seen: set[tuple[str, int]] = set()
@@ -1521,6 +1556,15 @@ def _semantic_next_reads(
         for ref in evidence_refs:
             add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
         add_current_session_sources()
+    elif prefer_setup_signal_refs:
+        for signal in setup_echo_signals or []:
+            add(
+                signal.get("source_ref") or {},
+                "Inspect selected-session setup/reviewer prompt signal before using old retained semantic-wrapup artifacts.",
+            )
+        add_current_session_sources()
+        for ref in evidence_refs:
+            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
     else:
         add_current_session_sources()
         for ref in evidence_refs:
