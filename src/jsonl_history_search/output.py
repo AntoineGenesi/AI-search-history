@@ -2247,11 +2247,13 @@ def render_status_anchor_text(payload: dict) -> str:
     reads = report.get("next_reads") or []
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
+    session_activity = report.get("session_activity") or {}
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
         "Status Anchor",
         f"Status: {report['status']}",
         f"Answer status: {answer_status}",
+        "Evidence contract: raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
         "Open these source refs first:",
     ]
     if selected:
@@ -2268,6 +2270,8 @@ def render_status_anchor_text(payload: dict) -> str:
     lines.extend([
         f"Route: {report['routing']['route']}",
         f"JSONL-first: {report['routing']['jsonl_first']}",
+        f"Raw session trace: {session_activity.get('status')}",
+        f"Commit-only answers allowed: {report.get('evidence_contract', {}).get('commit_only_answers_allowed')}",
         (
             "Summary: "
             f"{summary['anchor_candidate_count']} anchors, "
@@ -2294,6 +2298,20 @@ def render_status_anchor_text(payload: dict) -> str:
         if selected.get("read_more_command"):
             lines.append(f"Selected anchor read-more: {selected.get('read_more_command')}")
         lines.append(f"Anchor rationale: {selected.get('rationale')}")
+    if session_activity:
+        activity = session_activity.get("activity_after_anchor") or {}
+        lines.append(
+            "Raw session activity after anchor: "
+            f"records={activity.get('records_after_anchor')} "
+            f"conversation_actions={activity.get('conversation_actions')} "
+            f"tool_calls={activity.get('tool_calls')} "
+            f"tool_outputs={activity.get('tool_outputs')} "
+            f"spawned_sessions={activity.get('spawned_session_calls')} "
+            f"compactions={activity.get('compacted_summaries')}"
+        )
+        lines.append(
+            "Secondary evidence boundary: commits/merges and current repo state can support the answer only after raw JSONL source refs are inspected."
+        )
     lines.append("Answer brief:")
     for item in report.get("answer_brief", []):
         lines.append(f"- {item}")
@@ -2318,12 +2336,14 @@ def render_status_anchor_markdown(payload: dict) -> str:
     reads = report.get("next_reads") or []
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
+    session_activity = report.get("session_activity") or {}
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
         "# Status Anchor",
         "",
         f"**Status:** {report['status']}",
         f"**Answer status:** `{answer_status}`",
+        "**Evidence contract:** raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
         "",
         "## Open These Source Refs First",
         "",
@@ -2345,6 +2365,8 @@ def render_status_anchor_markdown(payload: dict) -> str:
         "",
         f"**Route:** `{report['routing']['route']}`",
         f"**JSONL-first:** `{report['routing']['jsonl_first']}`",
+        f"**Raw session trace:** `{session_activity.get('status')}`",
+        f"**Commit-only answers allowed:** `{report.get('evidence_contract', {}).get('commit_only_answers_allowed')}`",
         (
             f"**Summary:** {summary['anchor_candidate_count']} anchors, "
             f"{summary['behavior_delta_count']} behavior deltas, "
@@ -2375,6 +2397,24 @@ def render_status_anchor_markdown(payload: dict) -> str:
         if selected.get("read_more_command"):
             lines.append(f"- Read more: `{selected.get('read_more_command')}`")
         lines.extend([f"- Rationale: {selected.get('rationale')}", ""])
+    if session_activity:
+        activity = session_activity.get("activity_after_anchor") or {}
+        lines.extend(
+            [
+                "## Raw Session Activity After Anchor",
+                "",
+                (
+                    f"- Records: `{activity.get('records_after_anchor')}`; "
+                    f"conversation actions: `{activity.get('conversation_actions')}`; "
+                    f"tool calls: `{activity.get('tool_calls')}`; "
+                    f"tool outputs: `{activity.get('tool_outputs')}`; "
+                    f"spawned sessions: `{activity.get('spawned_session_calls')}`; "
+                    f"compactions: `{activity.get('compacted_summaries')}`"
+                ),
+                "- Secondary evidence boundary: commits/merges and current repo state can support the answer only after raw JSONL source refs are inspected.",
+                "",
+            ]
+        )
     lines.extend(["## Answer Brief", ""])
     lines.extend(f"- {item}" for item in report.get("answer_brief", []))
     lines.append("")

@@ -86,16 +86,18 @@ ROUTES: tuple[AskRoute, ...] = (
         read_specialization="references/latest-status.md",
         inspect_after=(
             "status_anchor.anchor_candidates and selected_anchor",
-            "status_anchor.value_summary / work_after_anchor",
-            "next_reads for source refs that justify the status summary",
+            "status_anchor.session_activity raw sessions/**/*.jsonl trace after the anchor",
+            "next_reads for raw JSONL/source refs before commits, task artifacts, or repo state",
         ),
         stop_guidance=(
-            "Run the status route before task/repo recovery scans. Stop once the "
-            "status route and inspected refs explain the current work since the anchor."
+            "Run the status route before task/repo recovery scans. Inspect the selected "
+            "anchor and raw session JSONL source refs first. Do not answer from commits, "
+            "current repo state, compacted summaries, or process state alone."
         ),
         manual_search_guidance=(
             "Repo or task scans are follow-up only after the JSONL route "
-            "identifies the anchor/window or reports that it cannot find one."
+            "identifies the anchor/window and raw session trace, or reports that it cannot find one. "
+            "Treat commits and repo state as secondary support, never as the status anchor."
         ),
     ),
     AskRoute(

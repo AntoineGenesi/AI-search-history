@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
+import subprocess
 import time
+from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from .conversation_records import (
+    ASSISTANT_OR_AGENT_MESSAGE,
+    COMPACTED_HISTORY_SUMMARY,
+    HUMAN_AUTHORED_USER_MESSAGE,
+    TOOL_ACTION_OUTPUT,
+    classify_conversation_record,
+)
 from .latest_user_messages import latest_user_messages
+from .timeutil import parse_datetime
 
 
 DEFAULT_STATUS_QUERY = "what happened since my last message?"
@@ -185,19 +197,27 @@ def status_anchor_report(
         "selected_anchor": None,
         "anchor_ref": selected_anchor.get("source_ref") if selected_anchor else None,
     }
-    artifacts = _collect_work_artifacts(cwd)
+    session_activity = _session_activity_trace(
+        selected_anchor,
+        anchor_decision,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
+    artifacts = _collect_work_artifacts(cwd, anchor_timestamp_utc=session_activity.get("anchor_timestamp_utc"))
     behavior_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "behavior_delta"]
     non_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "non_delta"]
     unresolved_blockers = _unresolved_blockers(artifacts)
     answer_brief = _answer_brief(behavior_deltas, non_deltas, unresolved_blockers)
-    next_reads = _next_reads(selected_anchor, artifacts, cwd=cwd, codex_home=codex_home)
+    next_reads = _next_reads(selected_anchor, session_activity, artifacts, cwd=cwd, codex_home=codex_home)
     blind_spots = []
     if not selected_anchor:
         blind_spots.append("No substantive anchor selected from the searched latest-message scope.")
+    if session_activity["status"] != "raw_session_trace_found":
+        blind_spots.append("Raw session activity trace was not found; do not answer from commits/repo state alone.")
     if not artifacts["value_items"]:
         blind_spots.append("No known JSH-998 through JSH-1002 task/report/review artifacts were found under --cwd.")
     if not artifacts["commits"]:
-        blind_spots.append("Commit join was not run; work_products are based on task/report/review artifacts.")
+        blind_spots.append("No secondary git commits were found; do not substitute git history for the raw JSONL trace.")
     elapsed = None if started is None else round(time.monotonic() - started, 6)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -209,6 +229,9 @@ def status_anchor_report(
             "jsonl_first": True,
             "built_on": "latest_user_messages",
             "no_spawned_agents": True,
+            "raw_jsonl_session_trace": session_activity["status"],
+            "commits_and_repo_state_are_secondary": True,
+            "commit_only_answers_allowed": False,
             "context_boundary": anchor_decision["context_boundary"],
             "anchor_scope": anchor_decision["anchor_scope"],
             "anchor_reason": anchor_decision["anchor_reason"],
@@ -222,6 +245,9 @@ def status_anchor_report(
             "behavior_delta_count": len(behavior_deltas),
             "non_delta_count": len(non_deltas),
             "unresolved_blocker_count": len(unresolved_blockers),
+            "raw_session_file_count": session_activity["summary"]["session_file_count"],
+            "raw_session_record_count": session_activity["summary"]["records_after_anchor"],
+            "spawned_session_call_count": session_activity["summary"]["spawned_session_call_count"],
             "elapsed_seconds": elapsed,
             "context_boundary": anchor_decision["context_boundary"],
             "anchor_scope": anchor_decision["anchor_scope"],
@@ -230,8 +256,10 @@ def status_anchor_report(
         "anchor_candidates": anchor_candidates,
         "selected_anchor": selected_anchor,
         "anchor_decision": anchor_decision,
+        "session_activity": session_activity,
+        "evidence_contract": _evidence_contract(),
         "next_reads": next_reads,
-        "agent_instruction": _agent_instruction(selected_anchor, next_reads),
+        "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
             "reports": artifacts["reports"],
@@ -246,6 +274,7 @@ def status_anchor_report(
         "privacy": {
             "raw_transcript_dump_included": False,
             "raw_text_included": True,
+            "raw_session_activity_snippets_included": False,
             "snippets_are_compact": True,
             "source_refs_included": True,
         },
@@ -496,7 +525,379 @@ def _anchor_decision_fields(anchor_decision: dict, selected_anchor: dict) -> dic
     }
 
 
-def _collect_work_artifacts(cwd: Path) -> dict:
+def _session_activity_trace(
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    *,
+    cwd: Path,
+    codex_home: Path | None,
+) -> dict:
+    base = {
+        "status": "no_selected_anchor",
+        "anchor_timestamp_utc": None,
+        "session_followups": [],
+        "activity_after_anchor": _empty_activity_counts(),
+        "next_reads": [],
+        "evidence_boundary": {
+            "primary": "raw Codex history/session JSONL after the selected user anchor",
+            "secondary_only": ["commits/merges", "current repo state", "task/report/review artifacts"],
+            "commit_only_answers_allowed": False,
+        },
+        "missing_logs": [],
+        "summary": {
+            "session_file_count": 0,
+            "records_after_anchor": 0,
+            "spawned_session_call_count": 0,
+        },
+    }
+    if not selected_anchor:
+        return base
+    if codex_home is None:
+        return {**base, "status": "missing_codex_home", "missing_logs": ["codex_home was not provided"]}
+
+    anchor_timestamp = parse_datetime(str(selected_anchor.get("timestamp_utc") or ""), timezone.utc)
+    if anchor_timestamp is None:
+        return {
+            **base,
+            "status": "missing_anchor_timestamp",
+            "missing_logs": ["selected anchor did not include a parseable timestamp"],
+        }
+    anchor_timestamp = anchor_timestamp.astimezone(timezone.utc)
+    contexts = _session_contexts_for_anchor(selected_anchor, codex_home, role="selected_anchor")
+    status_ref = anchor_decision.get("status_ref")
+    if status_ref:
+        contexts.extend(_session_contexts_for_history_ref(str(status_ref), codex_home, role="status_question"))
+
+    unique_contexts = _dedupe_session_contexts(contexts)
+    if not unique_contexts:
+        return {
+            **base,
+            "status": "no_session_context_found",
+            "anchor_timestamp_utc": anchor_timestamp.isoformat(timespec="seconds"),
+            "missing_logs": ["no raw session file could be derived from the selected/history source refs"],
+        }
+
+    activity = _empty_activity_counts()
+    followups = []
+    next_reads = []
+    missing = []
+    for context in unique_contexts:
+        session_files = list(context.get("session_files") or [])
+        if not session_files:
+            missing.append(f"{context['role']} session file not found from {context.get('history_source_ref') or context.get('source_ref')}")
+        for path in session_files:
+            scan = _scan_session_file_after_anchor(path, anchor_timestamp, codex_home=codex_home, cwd=cwd)
+            _merge_activity_counts(activity, scan["activity_after_anchor"])
+            followups.append(
+                {
+                    **{key: value for key, value in context.items() if key != "session_files"},
+                    "session_file": str(path),
+                    "session_source_ref": _source_ref_for_path_line(path, None, codex_home),
+                    "records_after_anchor": scan["records_after_anchor"],
+                    "first_after_anchor_ref": scan["first_after_anchor_ref"],
+                    "last_after_anchor_ref": scan["last_after_anchor_ref"],
+                    "spawned_session_call_refs": scan["spawned_session_call_refs"],
+                    "raw_jsonl_primary_evidence": True,
+                }
+            )
+            next_reads.extend(scan["next_reads"])
+
+    summary = {
+        "session_file_count": len({item["session_file"] for item in followups}),
+        "records_after_anchor": activity["records_after_anchor"],
+        "spawned_session_call_count": activity["spawned_session_calls"],
+    }
+    status = "raw_session_trace_found" if summary["session_file_count"] and summary["records_after_anchor"] else "raw_session_trace_empty"
+    if missing and status == "raw_session_trace_found":
+        status = "partial_raw_session_trace_found"
+    return {
+        **base,
+        "status": status,
+        "anchor_timestamp_utc": anchor_timestamp.isoformat(timespec="seconds"),
+        "session_followups": followups,
+        "activity_after_anchor": activity,
+        "next_reads": _dedupe_reads(next_reads),
+        "missing_logs": missing,
+        "summary": summary,
+    }
+
+
+def _empty_activity_counts() -> dict:
+    return {
+        "records_after_anchor": 0,
+        "conversation_actions": 0,
+        "human_user_messages": 0,
+        "assistant_or_agent_messages": 0,
+        "tool_calls": 0,
+        "tool_outputs": 0,
+        "spawned_session_calls": 0,
+        "compacted_summaries": 0,
+        "unknown_records": 0,
+        "commits_merges": "secondary_evidence_only_not_anchor_source",
+        "current_repo_state": "secondary_evidence_only_after_raw_jsonl_trace",
+    }
+
+
+def _merge_activity_counts(target: dict, source: dict) -> None:
+    for key, value in source.items():
+        if isinstance(value, int):
+            target[key] = int(target.get(key, 0)) + value
+
+
+def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -> list[dict]:
+    contexts = []
+    source_ref = str(anchor.get("source_ref") or "")
+    if source_ref.startswith("codex_history:"):
+        contexts.extend(_session_contexts_for_history_ref(source_ref, codex_home, role=role))
+    if anchor.get("source_kind") == "codex_sessions":
+        context = _session_context_from_openable(anchor, role=role)
+        if context:
+            contexts.append(context)
+    for mirror in anchor.get("mirror_sources") or []:
+        if not isinstance(mirror, dict):
+            continue
+        if mirror.get("source_kind") == "codex_sessions":
+            context = _session_context_from_openable(mirror, role=f"{role}_mirror")
+            if context:
+                contexts.append(context)
+    return contexts
+
+
+def _session_contexts_for_history_ref(source_ref: str, codex_home: Path, *, role: str) -> list[dict]:
+    path = codex_home / "history.jsonl"
+    line_number = _line_from_source_ref(source_ref)
+    if line_number is None:
+        return []
+    record = _read_jsonl_line(path, line_number)
+    if not isinstance(record, Mapping):
+        return []
+    session_id = record.get("session_id")
+    timestamp = parse_datetime(record.get("ts") or record.get("timestamp") or record.get("created_at"), timezone.utc)
+    return [
+        {
+            "role": role,
+            "history_source_ref": source_ref,
+            "history_openable_target": f"{path}:{line_number}",
+            "session_id_hash": _hash_value(session_id),
+            "history_timestamp_utc": timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if timestamp else None,
+            "session_files": _session_files_for_id(codex_home, session_id),
+        }
+    ]
+
+
+def _session_context_from_openable(source: dict, *, role: str) -> dict | None:
+    openable = source.get("openable_source_ref") or {}
+    path_text = openable.get("path")
+    if not path_text:
+        target = str(source.get("openable_target") or "")
+        path_text = target.rsplit(":", 1)[0] if target else ""
+    if not path_text:
+        return None
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        return None
+    return {
+        "role": role,
+        "source_ref": source.get("source_ref"),
+        "session_id_hash": _hash_value(_session_id_from_filename(path)),
+        "session_files": [path],
+    }
+
+
+def _scan_session_file_after_anchor(path: Path, anchor_timestamp, *, codex_home: Path, cwd: Path) -> dict:
+    activity = _empty_activity_counts()
+    first_ref = None
+    last_ref = None
+    spawned_refs = []
+    next_reads = []
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return {
+            "records_after_anchor": 0,
+            "activity_after_anchor": activity,
+            "first_after_anchor_ref": None,
+            "last_after_anchor_ref": None,
+            "spawned_session_call_refs": [],
+            "next_reads": [],
+        }
+    with handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            timestamp = parse_datetime(
+                record.get("timestamp") or record.get("ts") or record.get("created_at") or record.get("time"),
+                timezone.utc,
+            )
+            if timestamp is not None and timestamp.astimezone(timezone.utc) < anchor_timestamp:
+                continue
+            source_ref = _source_ref_for_path_line(path, line_number, codex_home)
+            if first_ref is None:
+                first_ref = source_ref
+                target = f"{path}:{line_number}"
+                next_reads.append(
+                    {
+                        "reason": "Inspect raw session JSONL activity after the selected anchor before using commits or repo state.",
+                        "source_ref": source_ref,
+                        "openable_source_ref": {"path": str(path), "line": line_number},
+                        "openable_target": target,
+                        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
+                    }
+                )
+            last_ref = source_ref
+            _count_session_record(record, activity)
+            if _is_spawned_session_call(record):
+                spawned_refs.append(source_ref)
+                if len(next_reads) < 4:
+                    target = f"{path}:{line_number}"
+                    next_reads.append(
+                        {
+                            "reason": "Inspect spawned worker/reviewer session launch as part of the long-absence trace.",
+                            "source_ref": source_ref,
+                            "openable_source_ref": {"path": str(path), "line": line_number},
+                            "openable_target": target,
+                            "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
+                        }
+                    )
+    return {
+        "records_after_anchor": activity["records_after_anchor"],
+        "activity_after_anchor": activity,
+        "first_after_anchor_ref": first_ref,
+        "last_after_anchor_ref": last_ref,
+        "spawned_session_call_refs": spawned_refs[:10],
+        "next_reads": next_reads,
+    }
+
+
+def _count_session_record(record: Mapping[str, Any], activity: dict) -> None:
+    activity["records_after_anchor"] += 1
+    classification = classify_conversation_record(record)
+    if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+        activity["human_user_messages"] += 1
+        activity["conversation_actions"] += 1
+    elif classification.label == ASSISTANT_OR_AGENT_MESSAGE:
+        activity["assistant_or_agent_messages"] += 1
+        activity["conversation_actions"] += 1
+    elif classification.label == TOOL_ACTION_OUTPUT:
+        activity["tool_outputs"] += 1
+    elif classification.label == COMPACTED_HISTORY_SUMMARY:
+        activity["compacted_summaries"] += 1
+    else:
+        activity["unknown_records"] += 1
+
+    payload = record.get("payload")
+    payload_map = payload if isinstance(payload, Mapping) else {}
+    payload_type = str(payload_map.get("type") or record.get("type") or "").casefold()
+    if payload_type in {"function_call", "custom_tool_call", "tool_call", "tool_search_call"}:
+        activity["tool_calls"] += 1
+    if payload_type in {"function_call_output", "custom_tool_call_output", "tool_call_output", "tool_search_output"}:
+        activity["tool_outputs"] += 1
+    if _is_spawned_session_call(record):
+        activity["spawned_session_calls"] += 1
+
+
+def _is_spawned_session_call(record: Mapping[str, Any]) -> bool:
+    payload = record.get("payload")
+    payload_map = payload if isinstance(payload, Mapping) else {}
+    name = str(payload_map.get("name") or record.get("name") or "")
+    return name == "spawn_agent"
+
+
+def _session_files_for_id(codex_home: Path, session_id: Any) -> list[Path]:
+    if not session_id:
+        return []
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    needle = str(session_id)
+    return sorted(path for path in sessions_root.rglob("*.jsonl") if needle in path.name)
+
+
+def _dedupe_session_contexts(contexts: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for context in contexts:
+        files = tuple(str(path) for path in context.get("session_files") or [])
+        key = (context.get("role"), context.get("history_source_ref"), context.get("source_ref"), files)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+    return deduped
+
+
+def _read_jsonl_line(path: Path, line_number: int) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for current, line in enumerate(handle, 1):
+                if current == line_number:
+                    return json.loads(line)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _line_from_source_ref(source_ref: str) -> int | None:
+    try:
+        return int(source_ref.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _source_ref_for_path_line(path: Path, line: int | None, codex_home: Path) -> str:
+    try:
+        rel = path.resolve().relative_to((codex_home / "sessions").resolve())
+        parts = rel.parts
+        date_label = "/".join(parts[:3]) if len(parts) >= 4 else "unknown-date"
+        base = f"codex_sessions:{date_label}/session-{hashlib.sha256(str(rel).encode()).hexdigest()[:12]}"
+    except (OSError, ValueError):
+        base = str(path)
+    return f"{base}:{line}" if line is not None else base
+
+
+def _session_id_from_filename(path: Path) -> str:
+    stem = path.stem
+    if "-" not in stem:
+        return stem
+    return stem.rsplit("-", 1)[-1]
+
+
+def _hash_value(value: Any) -> str | None:
+    if not value:
+        return None
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _evidence_contract() -> dict:
+    return {
+        "primary_evidence_order": [
+            "selected user anchor from Codex history/session JSONL",
+            "raw sessions/**/*.jsonl activity after that anchor",
+            "source refs/read-more windows opened from the raw JSONL trace",
+        ],
+        "secondary_evidence_only": [
+            "commits/merges",
+            "task/report/review artifacts",
+            "current repo/worktree state",
+            "compacted or inherited summaries",
+        ],
+        "summary_categories_required": [
+            "conversation actions",
+            "tool calls",
+            "spawned worker/reviewer/free-agent sessions",
+            "commits/merges as secondary evidence",
+            "current repo state as secondary evidence",
+            "uncertainty or missing logs",
+        ],
+        "commit_only_answers_allowed": False,
+    }
+
+
+def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = None) -> dict:
     tasks: list[dict] = []
     reports: list[dict] = []
     reviews: list[dict] = []
@@ -530,7 +931,41 @@ def _collect_work_artifacts(cwd: Path) -> dict:
                     "evidence_snippets": [source["snippet"] for source in sources[:2] if source.get("snippet")],
                 }
             )
-    return {"tasks": tasks, "reports": reports, "reviews": reviews, "commits": [], "value_items": value_items}
+    return {
+        "tasks": tasks,
+        "reports": reports,
+        "reviews": reviews,
+        "commits": _collect_secondary_commits(cwd, anchor_timestamp_utc),
+        "value_items": value_items,
+    }
+
+
+def _collect_secondary_commits(cwd: Path, anchor_timestamp_utc: str | None) -> list[dict]:
+    if not anchor_timestamp_utc:
+        return []
+    command = ["git", "-C", str(cwd), "log", "--max-count=8", "--format=%H%x09%cI%x09%s"]
+    command.extend(["--since", anchor_timestamp_utc])
+    try:
+        result = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    commits = []
+    for line in result.stdout.splitlines():
+        commit_hash, committed_at, subject = (line.split("\t", 2) + ["", "", ""])[:3]
+        if not commit_hash:
+            continue
+        commits.append(
+            {
+                "kind": "git_commit_secondary",
+                "commit": commit_hash[:12],
+                "committed_at": committed_at,
+                "subject": _compact(subject, 160),
+                "evidence_role": "secondary_only_after_raw_jsonl_trace",
+            }
+        )
+    return commits
 
 
 def _artifact_item(path: Path, cwd: Path, category: str, terms: tuple[str, ...]) -> dict:
@@ -595,7 +1030,14 @@ def _answer_brief(behavior_deltas: list[dict], non_deltas: list[dict], blockers:
     return lines
 
 
-def _next_reads(selected_anchor: dict | None, artifacts: dict, *, cwd: Path, codex_home: Path | None) -> list[dict]:
+def _next_reads(
+    selected_anchor: dict | None,
+    session_activity: dict,
+    artifacts: dict,
+    *,
+    cwd: Path,
+    codex_home: Path | None,
+) -> list[dict]:
     reads = []
     if selected_anchor:
         read = {
@@ -607,9 +1049,15 @@ def _next_reads(selected_anchor: dict | None, artifacts: dict, *, cwd: Path, cod
         if read.get("openable_target") and not read.get("read_more_command"):
             read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
         reads.append(read)
+    reads.extend(session_activity.get("next_reads") or [])
     for item in artifacts["value_items"]:
         for ref in item["source_refs"][:2]:
-            reads.append({"reason": f"Inspect {item['work_id']} {item['value_kind']} evidence.", "source_ref": ref})
+            reads.append(
+                {
+                    "reason": f"Inspect {item['work_id']} {item['value_kind']} evidence after raw JSONL trace.",
+                    "source_ref": ref,
+                }
+            )
     for blocker in _unresolved_blockers(artifacts):
         for ref in blocker.get("source_refs", [])[:2]:
             reads.append({"reason": "Inspect unresolved blocker evidence.", "source_ref": ref})
@@ -634,17 +1082,20 @@ def _copy_openable_fields(read: dict, source: dict) -> None:
             read[key] = value
 
 
-def _agent_instruction(selected_anchor: dict | None, next_reads: list[dict]) -> dict:
+def _agent_instruction(selected_anchor: dict | None, session_activity: dict, next_reads: list[dict]) -> dict:
     first_read = next_reads[0] if next_reads else {}
     return {
         "first_read_target": first_read.get("openable_target") or first_read.get("source_ref"),
         "first_read_command": first_read.get("read_more_command"),
         "stop_condition": (
-            "Start with the selected anchor read-more command when present, then inspect the listed "
-            "artifact evidence only until the status answer is source-backed; do not run broad directory "
-            "lookup unless the direct reads fail or contradict each other."
+            "Start with the selected anchor read-more command, then inspect raw sessions/**/*.jsonl "
+            "activity after the anchor before task/report/review artifacts. Commits, merges, and current "
+            "repo state are secondary evidence only; do not give a commit-only or repo-status-only answer, "
+            "and do not run broad directory lookup unless the direct raw JSONL reads fail or contradict each other."
         ),
         "direct_anchor_openable": bool(selected_anchor and selected_anchor.get("openable_target")),
+        "raw_session_trace_status": session_activity.get("status"),
+        "commit_only_answer_allowed": False,
     }
 
 
