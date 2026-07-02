@@ -47,7 +47,10 @@ refs to inspect after, and gives the stop condition for manual search.
 
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
-JSONL directly before `ask` for these natural prompts.
+JSONL directly before `ask` for these natural prompts. If you have just read
+this skill for a natural prompt, the next shell command should be `ask` itself;
+do not insert `pwd`, `rg --files`, `find`, `ls`, repo inventories, or setup
+probes between the skill read and `ask`.
 
 Do not combine reading this skill with `pwd`, `rg --files`, `find`, `ls -R`,
 TODO scans, broad repo `rg`, or direct JSONL spelunking for natural history

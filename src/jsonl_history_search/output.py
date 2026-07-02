@@ -2752,7 +2752,11 @@ def render_semantic_debug_text(payload: dict) -> str:
             if rendered:
                 lines.append(f"- command: {rendered}")
     if report.get("next_reads"):
-        lines.append("Next reads:")
+        followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+        if followthrough.get("applies"):
+            lines.append("Fallback next reads (only if the primary source window leaves a named facet missing):")
+        else:
+            lines.append("Next reads:")
         for item in report.get("next_reads", [])[:8]:
             _append_text_read(lines, item, command_by_target=command_by_target)
     for item in report.get("uncertainty", [])[:8]:
