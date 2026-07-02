@@ -2772,6 +2772,16 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append(f"- source_use_required: {contract.get('source_use_required')}")
         for action in contract.get("required_actions", [])[:5]:
             lines.append(f"- {action}")
+        process_contract = contract.get("process_actual_use_contract") or {}
+        if process_contract:
+            lines.append("- process_actual_use: primary raw evidence is required for behavior claims")
+            hierarchy = process_contract.get("source_hierarchy") or {}
+            if hierarchy.get("secondary_artifact_rule"):
+                lines.append(f"- {hierarchy.get('secondary_artifact_rule')}")
+            for bucket in list(process_contract.get("bucket_requirements") or [])[:6]:
+                lines.append(
+                    f"- actual_use_bucket: {bucket.get('bucket')} ({bucket.get('evidence_status')})"
+                )
     if readiness:
         lines.append("Answer Readiness:")
         lines.append(f"- status: {readiness.get('status')}")
@@ -2965,6 +2975,16 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         ])
         for action in contract.get("required_actions", [])[:6]:
             lines.append(f"- {action}")
+        process_contract = contract.get("process_actual_use_contract") or {}
+        if process_contract:
+            lines.append("- `process_actual_use`: primary raw evidence is required for behavior claims.")
+            hierarchy = process_contract.get("source_hierarchy") or {}
+            if hierarchy.get("secondary_artifact_rule"):
+                lines.append(f"- {hierarchy.get('secondary_artifact_rule')}")
+            for bucket in list(process_contract.get("bucket_requirements") or [])[:6]:
+                lines.append(
+                    f"- `actual_use_bucket`: `{bucket.get('bucket')}` (`{bucket.get('evidence_status')}`)"
+                )
     if readiness:
         lines.extend([
             "",
