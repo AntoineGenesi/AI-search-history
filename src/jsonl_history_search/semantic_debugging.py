@@ -1231,8 +1231,6 @@ def classify_process_actual_use_read_chronology(
 
 def process_actual_use_current_run_or_tool_behavior_requested(text: str) -> bool:
     lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
-    if clearly_intends_current_session(lowered):
-        return True
     explicit_patterns = (
         r"\bcurrent\s+(?:lane|tool|jsonl\s+lane|semantic-debug|semantic\s+debug|run|route|workflow)\b",
         r"\bthis\s+(?:lane|tool|jsonl\s+lane|semantic-debug|semantic\s+debug|route|workflow)\b",
