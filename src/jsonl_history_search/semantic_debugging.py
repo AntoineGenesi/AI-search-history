@@ -304,8 +304,17 @@ def build_semantic_debug_payload(
         if process_actual_use
         else {}
     )
+    process_actual_use_bucket_evidence_bundle = (
+        process_actual_use_read_plan.get("process_actual_use_bucket_evidence_bundle")
+        if process_actual_use_read_plan
+        else {}
+    )
     if process_actual_use_read_plan:
         source_locator_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
+    if process_actual_use_bucket_evidence_bundle:
+        source_locator_handoff["process_actual_use_bucket_evidence_bundle"] = (
+            process_actual_use_bucket_evidence_bundle
+        )
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
         Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
@@ -468,6 +477,10 @@ def build_semantic_debug_payload(
     )
     if process_actual_use_read_plan:
         answer_ready_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
+        if process_actual_use_bucket_evidence_bundle:
+            answer_ready_handoff["process_actual_use_bucket_evidence_bundle"] = (
+                process_actual_use_bucket_evidence_bundle
+            )
         answer_ready_handoff["source_use_summary"]["process_actual_use_final_support_read_plan"] = {
             "link": "semantic_debug.process_actual_use_final_support_read_plan",
             "required_primary_raw_final_support_read_count": process_actual_use_read_plan.get(
@@ -481,6 +494,18 @@ def build_semantic_debug_payload(
                 process_actual_use_read_plan.get("guidance") or {}
             ).get("prior_final_prose_counts_as_support"),
         }
+        if process_actual_use_bucket_evidence_bundle:
+            bundle_summary = process_actual_use_bucket_evidence_bundle.get("summary") or {}
+            answer_ready_handoff["source_use_summary"]["process_actual_use_bucket_evidence_bundle"] = {
+                "link": "semantic_debug.process_actual_use_bucket_evidence_bundle",
+                "primary_supported_bucket_count": bundle_summary.get("primary_supported_bucket_count", 0),
+                "secondary_only_bucket_count": bundle_summary.get("secondary_only_bucket_count", 0),
+                "missing_or_excluded_bucket_count": bundle_summary.get("missing_or_excluded_bucket_count", 0),
+                "post_hoc_answer_key_candidate_count": bundle_summary.get(
+                    "post_hoc_answer_key_candidate_count", 0
+                ),
+                "read_more_reduction_proven": False,
+            }
     followthrough = answer_ready_handoff.get("primary_source_followthrough") or {}
     if followthrough.get("applies"):
         final_answer_contract["required_actions"] = [
@@ -531,6 +556,7 @@ def build_semantic_debug_payload(
         "answer_ready_handoff": answer_ready_handoff,
         "answer_source_discipline": answer_source_discipline,
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
+        "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
@@ -797,6 +823,7 @@ PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING = "supporting_context"
 PROCESS_ACTUAL_USE_REQUIRED_READ_CAP = 4
 PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP = 4
 PROCESS_ACTUAL_USE_ANSWER_KEY_CAP = 4
+PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP = 3
 PROCESS_ACTUAL_USE_BUCKET_TERMS = {
     "consulted_before_planning": (
         "consulted before planning",
@@ -1197,7 +1224,7 @@ def build_process_actual_use_final_support_read_plan(
     required = required[:PROCESS_ACTUAL_USE_REQUIRED_READ_CAP]
     secondary = secondary[:PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP]
     answer_key = answer_key[:PROCESS_ACTUAL_USE_ANSWER_KEY_CAP]
-    return {
+    plan = {
         "schema_version": 1,
         "status": "active",
         "explicit_prior_answer_or_report_requested": explicit_request,
@@ -1232,6 +1259,114 @@ def build_process_actual_use_final_support_read_plan(
             "post_hoc_answer_key_candidates": PROCESS_ACTUAL_USE_ANSWER_KEY_CAP,
             "deterministic_order": "required primary raw final-support reads first; secondary leads and answer-key candidates are separated",
         },
+    }
+    plan["process_actual_use_bucket_evidence_bundle"] = build_process_actual_use_bucket_evidence_bundle(plan)
+    return plan
+
+
+def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dict[str, Any]:
+    required = list(plan.get("required_primary_raw_final_support_reads") or [])
+    secondary = list(plan.get("secondary_leads") or [])
+    answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
+    buckets: dict[str, dict[str, Any]] = {}
+    for bucket in process_actual_use_bucket_contract():
+        bucket_name = str(bucket.get("bucket") or "")
+        primary_support = [
+            process_actual_use_bucket_evidence_row(item, evidence_role="primary_raw_evidence")
+            for item in required
+            if bucket_name in set(item.get("selected_buckets") or [])
+        ][:PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP]
+        secondary_leads = [
+            process_actual_use_bucket_evidence_row(item, evidence_role="secondary_lead_context")
+            for item in secondary
+            if bucket_name in set(item.get("selected_buckets") or [])
+        ][:PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP]
+        excluded_answer_keys = [
+            process_actual_use_bucket_evidence_row(item, evidence_role="excluded_post_hoc_answer_key")
+            for item in answer_key
+            if bucket_name in set(item.get("selected_buckets") or [])
+        ][:PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP]
+        if primary_support:
+            status = "primary_raw_support_available"
+            answer_use = "use_primary_raw_reads_for_behavior_or_timing_claims"
+        elif secondary_leads:
+            status = "secondary_leads_only"
+            answer_use = "lead_or_context_only_do_not_count_as_behavior_proof"
+        elif excluded_answer_keys:
+            status = "excluded_post_hoc_answer_key_only"
+            answer_use = "excluded_unless_prompt_explicitly_asks_for_prior_answer_or_report"
+        else:
+            status = "no_evidence_in_selected_reads"
+            answer_use = "state_gap_or_run_targeted_follow_up_before_claiming_bucket"
+        buckets[bucket_name] = {
+            "bucket": bucket_name,
+            "status": status,
+            "requirement": bucket.get("requirement"),
+            "expected_evidence_status": bucket.get("evidence_status"),
+            "answer_use": answer_use,
+            "primary_raw_evidence": primary_support,
+            "secondary_leads": secondary_leads,
+            "excluded_post_hoc_answer_key_candidates": excluded_answer_keys,
+            "primary_raw_evidence_count": len(primary_support),
+            "secondary_lead_count": len(secondary_leads),
+            "excluded_post_hoc_answer_key_candidate_count": len(excluded_answer_keys),
+            "raw_text_included": False,
+        }
+    missing_buckets = [
+        bucket
+        for bucket, item in buckets.items()
+        if item["status"] in {"no_evidence_in_selected_reads", "excluded_post_hoc_answer_key_only"}
+    ]
+    secondary_only_buckets = [
+        bucket for bucket, item in buckets.items() if item["status"] == "secondary_leads_only"
+    ]
+    primary_supported_buckets = [
+        bucket for bucket, item in buckets.items() if item["status"] == "primary_raw_support_available"
+    ]
+    return {
+        "schema_version": 1,
+        "status": "active",
+        "source": "process_actual_use_final_support_read_plan",
+        "bucket_order": [bucket.get("bucket") for bucket in process_actual_use_bucket_contract()],
+        "buckets": buckets,
+        "summary": {
+            "primary_supported_buckets": primary_supported_buckets,
+            "secondary_only_buckets": secondary_only_buckets,
+            "missing_or_excluded_buckets": missing_buckets,
+            "primary_supported_bucket_count": len(primary_supported_buckets),
+            "secondary_only_bucket_count": len(secondary_only_buckets),
+            "missing_or_excluded_bucket_count": len(missing_buckets),
+            "post_hoc_answer_key_candidate_count": len(answer_key),
+        },
+        "guidance": {
+            "do_first": "answer_from_bucket_primary_raw_evidence_when_available",
+            "primary_raw_evidence_policy": "primary raw session/tool-event reads remain preferred for timing and behavior claims",
+            "secondary_lead_policy": "secondary leads may explain context or route follow-up reads but do not displace primary behavior proof",
+            "missing_bucket_policy": "missing buckets are explicit gaps; do not smooth them into a yes/no conclusion",
+            "post_hoc_answer_key_policy": "excluded from final support unless explicitly requested",
+            "raw_text_included": False,
+        },
+        "claim_boundaries": {
+            "release_or_token_savings_claim_supported": False,
+            "read_more_reduction_proven": False,
+            "primary_raw_timing_evidence_required_for_behavior_claims": True,
+            "secondary_leads_count_as_behavior_proof": False,
+        },
+    }
+
+
+def process_actual_use_bucket_evidence_row(item: dict[str, Any], *, evidence_role: str) -> dict[str, Any]:
+    return {
+        "kind": item.get("kind"),
+        "target": item.get("target"),
+        "reason": item.get("reason"),
+        "actual_use_source_tier": item.get("actual_use_source_tier"),
+        "source_chronology_role": item.get("source_chronology_role"),
+        "evidence_role": evidence_role,
+        "final_support_allowed": bool(item.get("final_support_allowed")),
+        "final_support_rule": item.get("final_support_rule"),
+        "source_ref": item.get("source_ref"),
+        "raw_text_included": False,
     }
 
 

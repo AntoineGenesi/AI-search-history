@@ -510,6 +510,11 @@ def _append_process_actual_use_read_plan_text(
         lines.append("- post_hoc_answer_key_candidates_excluded_from_required_reads:")
         for item in answer_key[:3]:
             _append_text_read(lines, item, command_by_target=command_by_target)
+    _append_process_actual_use_bucket_bundle_text(
+        lines,
+        plan.get("process_actual_use_bucket_evidence_bundle") or {},
+        command_by_target=command_by_target,
+    )
 
 
 def _append_process_actual_use_read_plan_markdown(
@@ -550,6 +555,90 @@ def _append_process_actual_use_read_plan_markdown(
         lines.append("- Excluded from required final-support reads unless the prompt asks for that prior answer/report.")
         for item in answer_key[:3]:
             _append_markdown_read(lines, item, command_by_target=command_by_target)
+    _append_process_actual_use_bucket_bundle_markdown(
+        lines,
+        plan.get("process_actual_use_bucket_evidence_bundle") or {},
+        command_by_target=command_by_target,
+    )
+
+
+def _append_process_actual_use_bucket_bundle_text(
+    lines: list[str],
+    bundle: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> None:
+    if not bundle:
+        return
+    summary = bundle.get("summary") or {}
+    lines.append("Process actual-use bucket evidence bundle:")
+    lines.append(
+        "- summary: "
+        f"primary_supported={summary.get('primary_supported_bucket_count', 0)} "
+        f"secondary_only={summary.get('secondary_only_bucket_count', 0)} "
+        f"missing_or_excluded={summary.get('missing_or_excluded_bucket_count', 0)}"
+    )
+    buckets = bundle.get("buckets") or {}
+    for bucket_name in bundle.get("bucket_order") or list(buckets):
+        bucket = buckets.get(bucket_name) or {}
+        if not bucket:
+            continue
+        lines.append(f"- bucket {bucket_name}: {bucket.get('status')} - {bucket.get('answer_use')}")
+        primary = list(bucket.get("primary_raw_evidence") or [])
+        secondary = list(bucket.get("secondary_leads") or [])
+        excluded = list(bucket.get("excluded_post_hoc_answer_key_candidates") or [])
+        if primary:
+            _append_text_read(lines, primary[0], command_by_target=command_by_target)
+        elif secondary:
+            _append_text_read(lines, secondary[0], command_by_target=command_by_target)
+        elif excluded:
+            _append_text_read(lines, excluded[0], command_by_target=command_by_target)
+
+
+def _append_process_actual_use_bucket_bundle_markdown(
+    lines: list[str],
+    bundle: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> None:
+    if not bundle:
+        return
+    summary = bundle.get("summary") or {}
+    lines.extend(
+        [
+            "",
+            "## Process Actual-Use Bucket Evidence Bundle",
+            "",
+            (
+                f"- Primary-supported buckets: `{summary.get('primary_supported_bucket_count', 0)}`; "
+                f"secondary-only buckets: `{summary.get('secondary_only_bucket_count', 0)}`; "
+                f"missing/excluded buckets: `{summary.get('missing_or_excluded_bucket_count', 0)}`."
+            ),
+            "- Primary raw evidence remains preferred for timing and behavior claims; secondary leads do not displace it.",
+            "",
+            "| Bucket | Status | Answer use | First evidence/lead |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    buckets = bundle.get("buckets") or {}
+    for bucket_name in bundle.get("bucket_order") or list(buckets):
+        bucket = buckets.get(bucket_name) or {}
+        if not bucket:
+            continue
+        primary = list(bucket.get("primary_raw_evidence") or [])
+        secondary = list(bucket.get("secondary_leads") or [])
+        excluded = list(bucket.get("excluded_post_hoc_answer_key_candidates") or [])
+        first = (primary or secondary or excluded or [{}])[0]
+        lines.append(
+            "| "
+            f"`{_escape_markdown_table(str(bucket_name))}` | "
+            f"`{_escape_markdown_table(str(bucket.get('status') or ''))}` | "
+            f"{_escape_markdown_table(str(bucket.get('answer_use') or ''))} | "
+            f"`{_escape_markdown_table(str(_source_target(first) or 'gap'))}` |"
+        )
+        command = _read_more_command(first, command_by_target)
+        if command:
+            lines.append(f"- `{bucket_name}` command: `{command}`")
 
 
 def _source_use_answer_status(report_status: str | None, *, has_required_reads: bool, has_refs: bool) -> str:
@@ -4346,6 +4435,11 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
         lines.append(f"- top candidate: {' '.join(bits)}")
     for item in handoff.get("next_reads", [])[:5]:
         lines.append(f"- next read: {item.get('kind')} {item.get('target')}")
+    if handoff.get("process_actual_use_bucket_evidence_bundle"):
+        _append_process_actual_use_bucket_bundle_text(
+            lines,
+            handoff.get("process_actual_use_bucket_evidence_bundle") or {},
+        )
     return lines
 
 
@@ -4389,6 +4483,11 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(str(item.get('target', '')))} | "
                 f"{_escape_markdown_table(str(item.get('reason', '')))} |"
             )
+    if handoff.get("process_actual_use_bucket_evidence_bundle"):
+        _append_process_actual_use_bucket_bundle_markdown(
+            lines,
+            handoff.get("process_actual_use_bucket_evidence_bundle") or {},
+        )
     return lines
 
 
