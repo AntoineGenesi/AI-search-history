@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes; then use ask as the first resolver.
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
@@ -29,12 +29,13 @@ implementation surfaces, not the product itself.
 
 ## Natural Prompt First Move
 
-For natural history/status/action/currentness/wrap-up prompts, run the
-lightweight front door as the first resolver before loading a route
-specialization, broad `rg`, repo recovery, TODO scans, or direct JSONL
-spelunking:
+For natural history/status/action/currentness/wrap-up prompts, first make sure
+the installed global skill is fresh when this workflow relies on it, then run
+the lightweight front door before loading a route specialization, broad `rg`,
+repo recovery, TODO scans, or direct JSONL spelunking:
 
 ```bash
+jsonl-history-search validate-install --codex-home ~/.codex --format text
 python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
@@ -77,7 +78,7 @@ package checkout before relying on the route instructions:
 bash install/install_codex_global.sh
 ```
 
-Command-shape contract for the first two shell commands:
+Command-shape contract for the first commands:
 
 - The command that reads this `SKILL.md` must be a single-purpose skill read
   only. It must not use shell chaining (`&&`, `;`, `|`) to run `pwd`,
@@ -86,8 +87,11 @@ Command-shape contract for the first two shell commands:
 - Invalid first commands include `sed -n '1,220p' .../SKILL.md && pwd`,
   `sed -n '1,220p' .../SKILL.md && rg --files`, and
   `cat .../SKILL.md && rg --files`.
-- After the skill-read command completes for a natural prompt, the next shell
-  command should be
+- After the skill-read command completes for an installed global-skill
+  workflow, the next shell command should be
+  `jsonl-history-search validate-install --codex-home ~/.codex --format text`.
+  If it fails, refresh the skill before relying on this route guidance.
+- After the freshness preflight passes, the next shell command should be
   `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
   or `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`.
 - Repo inventory belongs only after `ask` selects a route or a source
@@ -111,9 +115,10 @@ refs to inspect after, and gives the stop condition for manual search.
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
 JSONL directly before `ask` for these natural prompts. If you have just read
-this skill for a natural prompt, the next shell command should be `ask` itself;
-do not insert `pwd`, `rg --files`, `find`, `ls`, repo inventories, or setup
-probes between the skill read and `ask`.
+this skill for an installed global-skill natural prompt, the next shell command
+should be `validate-install`; after it passes, run `ask`. Do not insert `pwd`,
+`rg --files`, `find`, `ls`, repo inventories, or setup probes between the skill
+read, freshness preflight, and `ask`.
 
 Do not combine reading this skill with `pwd`, `rg --files`, `find`, `ls -R`,
 TODO scans, broad repo `rg`, or direct JSONL spelunking for natural history
@@ -172,7 +177,13 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   evidence, TODO, report, or doc files include the requested material, inspect
   local artifacts first; use targeted JSONL only if source-window coverage is
   missing or disputed.
-- For natural history/status/action/currentness/wrap-up prompts, run
+- For natural history/status/action/currentness/wrap-up prompts that rely on
+  the installed global skill, run
+  `jsonl-history-search validate-install --codex-home ~/.codex --format text`
+  after reading this skill and before ask-first routing. If it fails, refresh
+  with `bash install/install_codex_global.sh` before relying on this route
+  guidance.
+- Then run
   `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
   or its canonical wrapped command,
   `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` before
@@ -199,7 +210,8 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   questions. Use `semantic-debug --format text` before lower-level helper
   scripts when `ask` selects semantic-debug.
 - When the user prompt includes a reviewed source case or `real-jsh...` handle,
-  the next command after reading this skill should be `jsonl-history-search ask`
+  installed global-skill workflows still run `validate-install` after reading
+  this skill. After freshness preflight passes, run `jsonl-history-search ask`
   or the already-selected `semantic-debug --format text`, not repo `rg`.
 - Use `latest-user-messages` first for exact recent user-message wording.
 - Use helper scripts only for operational recovery: latest/today lookup,
