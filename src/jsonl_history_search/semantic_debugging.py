@@ -186,6 +186,7 @@ def build_semantic_debug_payload(
             candidates=source_selection_candidates,
             tool_proof=tool_proof,
             joins=joins,
+            query=agent_find["query"]["original"],
         )
     next_reads = compact_text_semantic_read_more_actions(next_reads)
     source_handle_routing = build_source_handle_routing(
@@ -252,6 +253,7 @@ def build_semantic_debug_payload(
                 candidates=source_selection_candidates,
                 tool_proof=tool_proof,
                 joins=joins,
+                query=agent_find["query"]["original"],
             )
         next_reads = compact_text_semantic_read_more_actions(next_reads)
         source_handle_routing = build_source_handle_routing(
@@ -261,7 +263,10 @@ def build_semantic_debug_payload(
         )
         source_locator_handoff["next_reads"] = next_reads
         if process_actual_use:
-            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(source_locator_handoff)
+            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(
+                source_locator_handoff,
+                query=agent_find["query"]["original"],
+            )
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
         decision_context["next_reads"] = next_reads[:12]
         decision_context["next_commands"] = build_next_commands(
@@ -285,9 +290,22 @@ def build_semantic_debug_payload(
         )
     else:
         if process_actual_use:
-            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(source_locator_handoff)
+            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(
+                source_locator_handoff,
+                query=agent_find["query"]["original"],
+            )
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
     source_locator_handoff["source_handle_routing"] = source_handle_routing
+    process_actual_use_read_plan = (
+        build_process_actual_use_final_support_read_plan(
+            list(source_locator_handoff.get("next_reads") or next_reads),
+            query=agent_find["query"]["original"],
+        )
+        if process_actual_use
+        else {}
+    )
+    if process_actual_use_read_plan:
+        source_locator_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
     benchmark_gate = build_manifest_evaluation(
         Path(getattr(args, "gold_manifest", DEFAULT_GOLD_MANIFEST)),
@@ -448,6 +466,21 @@ def build_semantic_debug_payload(
         source_window_action_proof=source_window_action_proof,
         action_proof_plan=action_proof_plan,
     )
+    if process_actual_use_read_plan:
+        answer_ready_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
+        answer_ready_handoff["source_use_summary"]["process_actual_use_final_support_read_plan"] = {
+            "link": "semantic_debug.process_actual_use_final_support_read_plan",
+            "required_primary_raw_final_support_read_count": process_actual_use_read_plan.get(
+                "required_primary_raw_final_support_read_count", 0
+            ),
+            "secondary_lead_count": process_actual_use_read_plan.get("secondary_lead_count", 0),
+            "post_hoc_answer_key_candidate_count": process_actual_use_read_plan.get(
+                "post_hoc_answer_key_candidate_count", 0
+            ),
+            "prior_final_prose_counts_as_support": (
+                process_actual_use_read_plan.get("guidance") or {}
+            ).get("prior_final_prose_counts_as_support"),
+        }
     followthrough = answer_ready_handoff.get("primary_source_followthrough") or {}
     if followthrough.get("applies"):
         final_answer_contract["required_actions"] = [
@@ -497,6 +530,7 @@ def build_semantic_debug_payload(
         "next_reads": next_reads,
         "answer_ready_handoff": answer_ready_handoff,
         "answer_source_discipline": answer_source_discipline,
+        "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
@@ -760,6 +794,9 @@ def process_actual_use_forbidden_claims() -> list[str]:
 PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY = "primary_raw_timing_evidence"
 PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY = "secondary_lead_context"
 PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING = "supporting_context"
+PROCESS_ACTUAL_USE_REQUIRED_READ_CAP = 4
+PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP = 4
+PROCESS_ACTUAL_USE_ANSWER_KEY_CAP = 4
 PROCESS_ACTUAL_USE_BUCKET_TERMS = {
     "consulted_before_planning": (
         "consulted before planning",
@@ -860,6 +897,7 @@ def prioritize_process_actual_use_next_reads(
     candidates: list[dict[str, Any]],
     tool_proof: dict[str, Any],
     joins: dict[str, Any],
+    query: str | None = None,
 ) -> list[dict[str, Any]]:
     candidate_by_id = {
         str(candidate.get("candidate_id") or ""): candidate
@@ -886,6 +924,7 @@ def prioritize_process_actual_use_next_reads(
             target_to_candidate=target_to_candidate,
             tool_event_targets=tool_event_targets,
             review_paths=review_paths,
+            query=query,
         )
         annotated.append(row)
     annotated.sort(key=lambda item: item.pop("_process_actual_use_sort_key"))
@@ -900,6 +939,7 @@ def annotate_process_actual_use_next_read(
     target_to_candidate: dict[str, dict[str, Any]],
     tool_event_targets: set[str],
     review_paths: set[str],
+    query: str | None = None,
 ) -> dict[str, Any]:
     row = dict(read)
     target = str(row.get("target") or "")
@@ -939,22 +979,39 @@ def annotate_process_actual_use_next_read(
     if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY and not buckets:
         buckets = ["raw_session_timing_context"]
     original_reason = existing_selection.get("original_reason") or row.get("reason")
+    chronology = classify_process_actual_use_read_chronology(
+        row,
+        candidate=candidate,
+        query=query,
+        source_tier=tier,
+    )
     if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY:
         row["reason"] = "primary raw session/tool-event timing window for process actual-use bucket audit"
     elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY:
         row["reason"] = "secondary lead/context only; use to locate raw timing or reviewer enforcement evidence"
+    if chronology["source_chronology_role"] == "post_hoc_answer_key_artifact" and not chronology[
+        "explicit_prior_answer_or_report_requested"
+    ]:
+        row["reason"] = (
+            "post-hoc answer-key or prior final-answer prose candidate; do not count as final "
+            "support for process actual-use unless the prompt asks for that prior answer/report"
+        )
     row["actual_use_source_tier"] = tier
     row["process_actual_use_selection"] = {
         "schema_version": 1,
         "source_tier": tier,
         "selected_buckets": buckets,
-        "primary_for_behavior_claims": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
+        "primary_for_behavior_claims": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+        and chronology["final_support_allowed"],
         "secondary_artifacts_are_final_proof": False,
-        "anti_contamination_role": (
-            "primary_raw_evidence"
-            if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
-            else "legitimate_secondary_lead_or_context_not_final_behavior_proof"
-        ),
+        "anti_contamination_role": chronology["source_chronology_role"],
+        "source_chronology_role": chronology["source_chronology_role"],
+        "final_support_allowed": chronology["final_support_allowed"],
+        "required_final_support_read": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+        and chronology["final_support_allowed"],
+        "post_hoc_answer_key_candidate": chronology["source_chronology_role"] == "post_hoc_answer_key_artifact",
+        "prior_final_prose_candidate": chronology["prior_final_prose_candidate"],
+        "explicit_prior_answer_or_report_requested": chronology["explicit_prior_answer_or_report_requested"],
         "raw_text_included": False,
         "original_reason": original_reason,
     }
@@ -964,12 +1021,20 @@ def annotate_process_actual_use_next_read(
 
 def process_actual_use_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
     tier = read.get("actual_use_source_tier")
-    tier_rank = {
-        PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
-        PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
-        PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
-    }.get(str(tier), 3)
-    buckets = set((read.get("process_actual_use_selection") or {}).get("selected_buckets") or [])
+    selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
+    if selection.get("post_hoc_answer_key_candidate") and not selection.get(
+        "explicit_prior_answer_or_report_requested"
+    ):
+        tier_rank = 3
+    else:
+        tier_rank = {
+            PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
+            PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
+            PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
+        }.get(str(tier), 3)
+    if not selection.get("final_support_allowed", tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY):
+        tier_rank = max(tier_rank, 2)
+    buckets = set(selection.get("selected_buckets") or [])
     decisive_bucket_rank = 0 if buckets & {"consulted_before_planning", "changed_behavior_scope_or_claim_boundaries"} else 1
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     timestamp_rank = 0 if source_ref.get("timestamp_utc") else 1
@@ -989,6 +1054,223 @@ def process_actual_use_source_tier(*, kind: str, target: str | None, source_ref:
     if process_actual_use_secondary_artifact_path(path):
         return PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
     return PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING
+
+
+def classify_process_actual_use_read_chronology(
+    read: dict[str, Any],
+    *,
+    candidate: dict[str, Any] | None = None,
+    query: str | None = None,
+    source_tier: str | None = None,
+) -> dict[str, Any]:
+    candidate = candidate or {}
+    target = str(read.get("target") or "")
+    kind = str(read.get("kind") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    text = " ".join(
+        str(part or "")
+        for part in (
+            kind,
+            target,
+            path,
+            read.get("reason"),
+            candidate.get("snippet"),
+            " ".join(str(item) for item in candidate.get("reason_codes") or []),
+        )
+    )
+    explicit_request = process_actual_use_prior_answer_or_report_requested(query or "")
+    prior_final_prose = process_actual_use_prior_final_prose_candidate(text)
+    post_hoc_artifact = process_actual_use_post_hoc_artifact_candidate(kind=kind, path=path, text=text)
+    tier = source_tier or process_actual_use_source_tier(kind=kind, target=target, source_ref=source_ref)
+    if (prior_final_prose or post_hoc_artifact) and not explicit_request:
+        role = "post_hoc_answer_key_artifact"
+        final_support_allowed = False
+    elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY:
+        role = "primary_raw_evidence"
+        final_support_allowed = True
+    else:
+        role = "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+        final_support_allowed = False
+    return {
+        "schema_version": 1,
+        "source_chronology_role": role,
+        "final_support_allowed": final_support_allowed,
+        "prior_final_prose_candidate": prior_final_prose,
+        "post_hoc_artifact_candidate": post_hoc_artifact,
+        "explicit_prior_answer_or_report_requested": explicit_request,
+    }
+
+
+def process_actual_use_prior_answer_or_report_requested(text: str) -> bool:
+    lowered = str(text or "").lower()
+    request_cues = (
+        "prior answer",
+        "previous answer",
+        "earlier answer",
+        "past answer",
+        "prior final",
+        "previous final",
+        "final answer",
+        "answer text",
+        "answer prose",
+        "saved report",
+        "prior report",
+        "previous report",
+        "review report",
+        "find the report",
+        "locate the report",
+    )
+    intent_cues = ("find", "locate", "recover", "quote", "summarize", "show", "what did")
+    return any(cue in lowered for cue in request_cues) and any(cue in lowered for cue in intent_cues)
+
+
+def process_actual_use_prior_final_prose_candidate(text: str) -> bool:
+    lowered = str(text or "").lower().replace("_", "-")
+    return any(
+        cue in lowered
+        for cue in (
+            "final-answer",
+            "final answer",
+            "prior answer",
+            "previous answer",
+            "earlier answer",
+            "answer-key",
+            "answer key",
+            "final prose",
+            "answer prose",
+        )
+    )
+
+
+def process_actual_use_post_hoc_artifact_candidate(*, kind: str, path: str, text: str) -> bool:
+    normalized_path = str(path or "").lower().replace("\\", "/").replace("_", "-")
+    lowered = str(text or "").lower().replace("_", "-")
+    artifact_kind = str(kind or "").lower() in {"task_or_review_artifact", "artifact", "hint_path"}
+    post_hoc_path = any(
+        marker in f"/{normalized_path.strip('/')}"
+        for marker in (
+            "/reports/",
+            "/codex/state/reviews/",
+            "/reviews/",
+            "/tasks/",
+            "/learnings/",
+        )
+    )
+    answer_key_name = any(
+        cue in normalized_path
+        for cue in (
+            "final-answer",
+            "answer-key",
+            "raw-trace-audit",
+            "adjudication",
+            "benefit-classification",
+            "pressure-eval",
+            "free-pressure",
+        )
+    )
+    answer_key_text = any(
+        cue in lowered
+        for cue in (
+            "post-hoc answer-key",
+            "answer-key artifact",
+            "prior final",
+            "previous final",
+            "final-answer prose",
+            "final answer prose",
+        )
+    )
+    return bool(answer_key_text or answer_key_name or (artifact_kind and post_hoc_path and process_actual_use_prior_final_prose_candidate(lowered)))
+
+
+def build_process_actual_use_final_support_read_plan(
+    next_reads: list[dict[str, Any]],
+    *,
+    query: str | None = None,
+) -> dict[str, Any]:
+    explicit_request = process_actual_use_prior_answer_or_report_requested(query or "")
+    required: list[dict[str, Any]] = []
+    secondary: list[dict[str, Any]] = []
+    answer_key: list[dict[str, Any]] = []
+    for read in next_reads:
+        row = process_actual_use_read_plan_row(read, explicit_request=explicit_request)
+        selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
+        role = row.get("source_chronology_role")
+        if selection.get("required_final_support_read") or row.get("final_support_allowed"):
+            required.append(row)
+        elif role == "post_hoc_answer_key_artifact":
+            answer_key.append(row)
+        else:
+            secondary.append(row)
+    required = required[:PROCESS_ACTUAL_USE_REQUIRED_READ_CAP]
+    secondary = secondary[:PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP]
+    answer_key = answer_key[:PROCESS_ACTUAL_USE_ANSWER_KEY_CAP]
+    return {
+        "schema_version": 1,
+        "status": "active",
+        "explicit_prior_answer_or_report_requested": explicit_request,
+        "required_primary_raw_final_support_reads": required,
+        "secondary_leads": secondary,
+        "post_hoc_answer_key_candidates": answer_key,
+        "required_primary_raw_final_support_read_count": len(required),
+        "secondary_lead_count": len(secondary),
+        "post_hoc_answer_key_candidate_count": len(answer_key),
+        "excluded_from_required_final_support_read_count": len(secondary) + (0 if explicit_request else len(answer_key)),
+        "compact_read_order": [row.get("target") for row in required if row.get("target")],
+        "guidance": {
+            "do_first": "open_required_primary_raw_final_support_reads",
+            "secondary_leads_policy": "use_secondary_leads_only_to_locate_or_explain raw timing/reviewer enforcement gaps",
+            "post_hoc_answer_key_policy": (
+                "prior final-answer prose, reports, tasks, reviews, and adjudication artifacts are not final support "
+                "for process actual-use unless the prompt explicitly asks for that prior answer/report"
+            ),
+            "prior_final_prose_counts_as_support": bool(explicit_request),
+            "chronology_required": True,
+            "raw_text_included": False,
+        },
+        "claim_boundaries": {
+            "primary_raw_timing_evidence_required_for_behavior_claims": True,
+            "secondary_leads_count_as_final_support": False,
+            "post_hoc_answer_key_candidates_count_as_final_support": bool(explicit_request),
+            "release_or_token_savings_claim_supported": False,
+        },
+        "cap_policy": {
+            "required_primary_raw_final_support_reads": PROCESS_ACTUAL_USE_REQUIRED_READ_CAP,
+            "secondary_leads": PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP,
+            "post_hoc_answer_key_candidates": PROCESS_ACTUAL_USE_ANSWER_KEY_CAP,
+            "deterministic_order": "required primary raw final-support reads first; secondary leads and answer-key candidates are separated",
+        },
+    }
+
+
+def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: bool) -> dict[str, Any]:
+    selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
+    role = selection.get("source_chronology_role") or selection.get("anti_contamination_role")
+    if role is None:
+        role = (
+            "primary_raw_evidence"
+            if read.get("actual_use_source_tier") == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+            else "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+        )
+    final_support_allowed = bool(selection.get("final_support_allowed", False))
+    if role == "post_hoc_answer_key_artifact" and not explicit_request:
+        final_support_allowed = False
+    return {
+        "kind": read.get("kind"),
+        "target": read.get("target"),
+        "reason": read.get("reason"),
+        "actual_use_source_tier": read.get("actual_use_source_tier"),
+        "source_chronology_role": role,
+        "selected_buckets": list(selection.get("selected_buckets") or [])[:6],
+        "final_support_allowed": final_support_allowed,
+        "final_support_rule": (
+            "may_support_behavior_claims_after_inspection"
+            if final_support_allowed
+            else "lead_or_context_only_do_not_count_as_final_support"
+        ),
+        "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
+        "raw_text_included": False,
+    }
 
 
 def process_actual_use_secondary_artifact_path(path: str) -> bool:
@@ -1036,7 +1318,11 @@ def dedupe_process_actual_use_reads(reads: list[dict[str, Any]]) -> list[dict[st
     return result
 
 
-def annotate_process_actual_use_source_locator_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
+def annotate_process_actual_use_source_locator_handoff(
+    handoff: dict[str, Any],
+    *,
+    query: str | None = None,
+) -> dict[str, Any]:
     result = dict(handoff)
     raw_count = 0
     secondary_count = 0
@@ -1060,6 +1346,13 @@ def annotate_process_actual_use_source_locator_handoff(handoff: dict[str, Any]) 
             "source_tier": tier,
             "primary_for_behavior_claims": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
             "secondary_artifacts_are_final_proof": False,
+            "source_chronology_role": (
+                "primary_raw_evidence"
+                if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+                else "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+            ),
+            "final_support_allowed": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
+            "post_hoc_answer_key_candidate": False,
             "raw_text_included": False,
         }
         row["_process_actual_use_sort_key"] = process_actual_use_read_sort_key(row, index)
@@ -1071,6 +1364,7 @@ def annotate_process_actual_use_source_locator_handoff(handoff: dict[str, Any]) 
         candidates=[],
         tool_proof={"events": []},
         joins={"review_evidence": []},
+        query=query,
     )
     packaging = dict(result.get("source_window_packaging") or {})
     selection_policy = dict(packaging.get("selection_policy") or {})

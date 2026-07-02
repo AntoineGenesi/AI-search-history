@@ -474,6 +474,84 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
         lines.append(f"  - Command: `{command}`")
 
 
+def _append_process_actual_use_read_plan_text(
+    lines: list[str],
+    plan: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> None:
+    if not plan:
+        return
+    guidance = plan.get("guidance") or {}
+    lines.append("Process actual-use final-support read plan:")
+    lines.append(
+        "- guidance: open required primary raw reads first; secondary leads and post-hoc answer-key candidates are not final support"
+    )
+    lines.append(
+        "- prior final prose support: "
+        + (
+            "allowed only because the prompt explicitly asks for a prior answer/report"
+            if guidance.get("prior_final_prose_counts_as_support")
+            else "do not count prior final prose as support"
+        )
+    )
+    required = list(plan.get("required_primary_raw_final_support_reads") or [])
+    if required:
+        lines.append("- required_primary_raw_final_support_reads:")
+        for item in required[:4]:
+            _append_text_read(lines, item, command_by_target=command_by_target)
+    secondary = list(plan.get("secondary_leads") or [])
+    if secondary:
+        lines.append("- secondary_leads_not_final_support:")
+        for item in secondary[:3]:
+            _append_text_read(lines, item, command_by_target=command_by_target)
+    answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
+    if answer_key:
+        lines.append("- post_hoc_answer_key_candidates_excluded_from_required_reads:")
+        for item in answer_key[:3]:
+            _append_text_read(lines, item, command_by_target=command_by_target)
+
+
+def _append_process_actual_use_read_plan_markdown(
+    lines: list[str],
+    plan: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> None:
+    if not plan:
+        return
+    guidance = plan.get("guidance") or {}
+    lines.extend(
+        [
+            "",
+            "## Process Actual-Use Final-Support Read Plan",
+            "",
+            "- Open required primary raw reads first; secondary leads and post-hoc answer-key candidates are not final support.",
+            (
+                "- Prior final prose support: allowed only because the prompt explicitly asks for a prior answer/report."
+                if guidance.get("prior_final_prose_counts_as_support")
+                else "- Prior final prose support: do not count prior final prose as support."
+            ),
+        ]
+    )
+    required = list(plan.get("required_primary_raw_final_support_reads") or [])
+    if required:
+        lines.extend(["", "### Required Primary Raw Reads", ""])
+        for item in required[:4]:
+            _append_markdown_read(lines, item, command_by_target=command_by_target)
+    secondary = list(plan.get("secondary_leads") or [])
+    if secondary:
+        lines.extend(["", "### Secondary Leads", ""])
+        for item in secondary[:3]:
+            _append_markdown_read(lines, item, command_by_target=command_by_target)
+    answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
+    if answer_key:
+        lines.extend(["", "### Post-Hoc Answer-Key Candidates", ""])
+        lines.append("- Excluded from required final-support reads unless the prompt asks for that prior answer/report.")
+        for item in answer_key[:3]:
+            _append_markdown_read(lines, item, command_by_target=command_by_target)
+
+
 def _source_use_answer_status(report_status: str | None, *, has_required_reads: bool, has_refs: bool) -> str:
     if not has_refs:
         return "not-ready/needs-more-proof"
@@ -2647,6 +2725,11 @@ def render_semantic_debug_text(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
     required_reads = action_proof_plan.get("required_proof_reads") or []
     readiness = report.get("answer_readiness") or {}
+    process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
+        report.get("answer_ready_handoff") or {}
+    ).get("process_actual_use_final_support_read_plan") or (
+        report.get("source_locator_handoff") or {}
+    ).get("process_actual_use_final_support_read_plan")
     answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
     stop_condition = (
         action_proof_plan.get("stop_condition")
@@ -2765,6 +2848,12 @@ def render_semantic_debug_text(payload: dict) -> str:
                 lines.append(f"- required_answer_facet: {facet}")
             for item in (followthrough.get("only_continue_if") or [])[:3]:
                 lines.append(f"- only_continue_if: {item}")
+    if process_read_plan:
+        _append_process_actual_use_read_plan_text(
+            lines,
+            process_read_plan,
+            command_by_target=command_by_target,
+        )
     contract = report.get("final_answer_source_use_contract")
     if contract:
         lines.append("Final Answer Contract:")
@@ -2826,6 +2915,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
     required_reads = action_proof_plan.get("required_proof_reads") or []
     readiness = report.get("answer_readiness") or {}
+    process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
+        report.get("answer_ready_handoff") or {}
+    ).get("process_actual_use_final_support_read_plan") or (
+        report.get("source_locator_handoff") or {}
+    ).get("process_actual_use_final_support_read_plan")
     answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
     stop_condition = (
         action_proof_plan.get("stop_condition")
@@ -2843,7 +2937,10 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "## Open These Source Refs First",
         "",
     ]
-    if primary_command:
+    if process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
+        for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
+    elif primary_command:
         lines.append(f"- Primary source window command: `{primary_command}`")
         lines.append("- Fallback individual refs are listed later only if this window leaves a named answer facet missing.")
     elif required_reads:
@@ -2930,6 +3027,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.extend(render_action_proof_plan_markdown(action_proof_plan, command_by_target=command_by_target))
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
+    if process_read_plan:
+        _append_process_actual_use_read_plan_markdown(
+            lines,
+            process_read_plan,
+            command_by_target=command_by_target,
+        )
     handoff = report.get("answer_ready_handoff")
     if handoff:
         lines.extend([
