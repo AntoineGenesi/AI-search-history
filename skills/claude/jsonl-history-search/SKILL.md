@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, do not run pwd, rg --files, find, ls, repo inventories, or setup probes first; read this skill, then use ask as the first resolver.
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes; then use ask as the first resolver.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
@@ -39,6 +39,22 @@ The installed `jsonl_ask_first.py` launcher is the neutral ask-first helper. It
 wraps the canonical `jsonl-history-search ask` command, adds `--cwd "$PWD"` and
 `--format text` when omitted, and exists so the first command can be the
 front-door resolver rather than a repo inventory/setup probe.
+
+Command-shape contract for the first two shell commands:
+
+- The command that reads this `SKILL.md` must be a single-purpose skill read
+  only. It must not use shell chaining (`&&`, `;`, `|`) to run `pwd`,
+  `rg --files`, `find`, `ls`, TODO scans, broad repo `rg`, or any other
+  inventory/setup command in the same shell invocation.
+- Invalid first commands include `sed -n '1,220p' .../SKILL.md && pwd`,
+  `sed -n '1,220p' .../SKILL.md && rg --files`, and
+  `cat .../SKILL.md && rg --files`.
+- After the skill-read command completes for a natural prompt, the next shell
+  command should be
+  `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
+  or `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`.
+- Repo inventory belongs only after `ask` selects a route or a source
+  follow-through genuinely needs it.
 
 Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
