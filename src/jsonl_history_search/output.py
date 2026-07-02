@@ -2626,6 +2626,8 @@ def render_semantic_debug_text(payload: dict) -> str:
         required_final_source_ref_ids = list(followthrough.get("required_final_source_ref_ids") or [])
         for source_ref_id in required_final_source_ref_ids[:3]:
             lines.append(f"- required final source ref: {source_ref_id}")
+        for facet in list(followthrough.get("required_answer_facets") or [])[:6]:
+            lines.append(f"- required answer facet: {facet}")
         lines.append("- fallback individual refs are listed later only if this window leaves a named answer facet missing")
     elif required_reads:
         for read in required_reads[:5]:
@@ -2719,6 +2721,8 @@ def render_semantic_debug_text(payload: dict) -> str:
             else:
                 lines.append("- command: omitted from text output for relative/local target; use JSON field first_command.command")
             lines.append(f"- stop_after: {followthrough.get('stop_after')}")
+            for facet in list(followthrough.get("required_answer_facets") or [])[:6]:
+                lines.append(f"- required_answer_facet: {facet}")
             for item in (followthrough.get("only_continue_if") or [])[:3]:
                 lines.append(f"- only_continue_if: {item}")
     contract = report.get("final_answer_source_use_contract")
@@ -2906,6 +2910,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
                 lines.append(f"- `command`: `{command.get('command')}`")
             else:
                 lines.append("- `command`: omitted from Markdown output for relative/local target; use JSON field `first_command.command`")
+            for facet in list(followthrough.get("required_answer_facets") or [])[:6]:
+                lines.append(f"- `required_answer_facet`: {facet}")
             for item in (followthrough.get("only_continue_if") or [])[:3]:
                 lines.append(f"- `only_continue_if`: {item}")
     contract = report.get("final_answer_source_use_contract")
