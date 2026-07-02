@@ -1092,18 +1092,65 @@ def select_explicit_correction_window_records(scored: list[dict[str, Any]]) -> l
         "assistant_persistent_vs_wait_distinction",
         "user_followup_or_original_challenge",
     )
-    selected: list[dict[str, Any]] = []
+    selected_by_reason: dict[str, dict[str, Any]] = {}
     used_targets: set[str] = set()
-    for reason in priority:
+
+    def add_item(reason: str, item: dict[str, Any] | None) -> None:
+        if not item:
+            return
+        target = source_ref_target(item.get("source_ref") or {})
+        if not target or target in used_targets:
+            return
+        selected_by_reason[reason] = item
+        used_targets.add(target)
+
+    def first_for_reason(reason: str) -> dict[str, Any] | None:
         for item in scored:
             if item.get("selection_reason") != reason:
                 continue
             target = source_ref_target(item.get("source_ref") or {})
             if not target or target in used_targets:
                 continue
-            selected.append(item)
-            used_targets.add(target)
-            break
+            return item
+        return None
+
+    add_item("assistant_followup_correction", first_for_reason("assistant_followup_correction"))
+    add_item("assistant_persistent_vs_wait_distinction", first_for_reason("assistant_persistent_vs_wait_distinction"))
+    add_item("user_followup_or_original_challenge", first_for_reason("user_followup_or_original_challenge"))
+
+    focus_refs = [
+        item.get("source_ref") or {}
+        for key, item in selected_by_reason.items()
+        if key in {"assistant_followup_correction", "assistant_persistent_vs_wait_distinction"}
+    ]
+    focus_paths = {str(ref.get("path") or "") for ref in focus_refs if ref.get("path")}
+    focus_lines = [int(ref.get("line") or 0) for ref in focus_refs if int(ref.get("line") or 0) > 0]
+    focus_line = min(focus_lines) if focus_lines else None
+    source_candidates = [
+        item
+        for item in scored
+        if item.get("selection_reason") == "source_inspection_for_correction_window"
+        and source_ref_target(item.get("source_ref") or {}) not in used_targets
+    ]
+    if source_candidates and focus_line is not None:
+        source_candidates.sort(
+            key=lambda item: (
+                0 if str((item.get("source_ref") or {}).get("path") or "") in focus_paths else 1,
+                0 if int((item.get("source_ref") or {}).get("line") or 0) <= focus_line else 1,
+                abs(int((item.get("source_ref") or {}).get("line") or 0) - focus_line),
+                -float(item.get("score") or 0),
+            )
+        )
+    add_item(
+        "source_inspection_for_correction_window",
+        source_candidates[0] if source_candidates else first_for_reason("source_inspection_for_correction_window"),
+    )
+
+    selected = [
+        selected_by_reason[reason]
+        for reason in priority
+        if reason in selected_by_reason
+    ]
     for item in scored:
         if len(selected) >= 4:
             break
@@ -3064,12 +3111,15 @@ def primary_followthrough_reads(
     allow_action_proof_plan: bool = True,
 ) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
+    explicit_reads = complete_explicit_correction_window_reads(bounded_next_reads)
+    if explicit_reads:
+        reads.append(explicit_correction_primary_bundle_read(explicit_reads))
     reviewed_pointer_reads = [
         item
         for item in bounded_next_reads
         if reviewed_source_packet_pointer_read(item)
     ]
-    if reviewed_pointer_reads:
+    if reviewed_pointer_reads and not reads:
         reads.extend(reviewed_pointer_reads)
     if (
         allow_action_proof_plan
@@ -3088,15 +3138,6 @@ def primary_followthrough_reads(
             if item.get("target"):
                 reads.append(item)
     if not reads:
-        explicit_reads = complete_explicit_correction_window_reads(bounded_next_reads)
-        if explicit_reads:
-            source_inspection_reads = [
-                read
-                for read in explicit_reads
-                if explicit_correction_window_meta(read).get("bundle_role") == "source_inspection"
-            ]
-            reads.extend(source_inspection_reads or explicit_reads[:1])
-    if not reads:
         for item in bounded_next_reads:
             inferred = item.get("inferred_anchor") if isinstance(item.get("inferred_anchor"), dict) else {}
             if inferred.get("anchor_kind") in {
@@ -3107,6 +3148,44 @@ def primary_followthrough_reads(
             }:
                 reads.append(item)
     return dedupe_primary_targets(reads)[:3]
+
+
+def explicit_correction_primary_bundle_read(explicit_reads: list[dict[str, Any]]) -> dict[str, Any]:
+    source_inspection_reads = [
+        read
+        for read in explicit_reads
+        if explicit_correction_window_meta(read).get("bundle_role") == "source_inspection"
+    ]
+    anchor = source_inspection_reads[0] if source_inspection_reads else explicit_reads[0]
+    row = dict(anchor)
+    refs = [
+        read.get("source_ref")
+        for read in explicit_reads
+        if isinstance(read.get("source_ref"), dict) and read.get("source_ref", {}).get("path")
+    ]
+    paths = {str(ref.get("path") or "") for ref in refs}
+    lines = [int(ref.get("line") or 0) for ref in refs if int(ref.get("line") or 0) > 0]
+    anchor_ref = row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {}
+    anchor_line = int(anchor_ref.get("line") or 0)
+    row["explicit_correction_window_bundle"] = {
+        "schema_version": 1,
+        "same_source_window": len(paths) == 1 and bool(lines) and anchor_line > 0,
+        "roles": [
+            {
+                "target": read.get("target"),
+                "bundle_role": explicit_correction_window_meta(read).get("bundle_role"),
+                "selection_reason": explicit_correction_window_meta(read).get("selection_reason"),
+            }
+            for read in explicit_reads
+        ],
+        "role_count": len(explicit_reads),
+        "start_line": min(lines) if lines else None,
+        "end_line": max(lines) if lines else None,
+        "anchor_line": anchor_line or None,
+        "anchor_role": explicit_correction_window_meta(row).get("bundle_role"),
+        "claim_boundary": "bundle_guides_one_compact_source_window_not_final_answer",
+    }
+    return row
 
 
 def reviewed_source_packet_pointer_read(read: dict[str, Any]) -> bool:
@@ -3137,12 +3216,28 @@ def primary_followthrough_window(
     anchor_kind = inferred.get("anchor_kind")
     correction_meta = explicit_correction_window_meta(read)
     if correction_meta.get("bounded_to_explicit_date_window"):
+        bundle = read.get("explicit_correction_window_bundle")
+        if isinstance(bundle, dict) and bundle.get("same_source_window"):
+            start_line = int(bundle.get("start_line") or 0)
+            end_line = int(bundle.get("end_line") or 0)
+            anchor_line = int(bundle.get("anchor_line") or 0)
+            before = min(20, max(0, anchor_line - start_line))
+            after = min(60, max(8, end_line - anchor_line + 2))
+            return {
+                "before": before,
+                "after": after,
+                "max_records": max(30, before + after + 1),
+                "projection": "compact",
+                "compact_text_limit": 1400,
+                "format": "text",
+                "reason": "explicit_correction_compact_bundle_covers_inspection_distinction_challenge_and_correction",
+            }
         return {
             "before": 2,
-            "after": 115,
-            "max_records": 140,
+            "after": 35,
+            "max_records": 60,
             "projection": "compact",
-            "compact_text_limit": 500,
+            "compact_text_limit": 1200,
             "format": "text",
             "reason": "explicit_correction_source_window_covers_inspection_distinction_challenge_and_correction",
         }
@@ -4599,9 +4694,13 @@ def score_correction_window_record(records: list[Any], index: int) -> tuple[floa
     record = records[index]
     role_text = str(record.role or "").lower()
     lowered = str(record.text or "").lower()
-    if "persistent coordinator" not in lowered:
+    context_start = max(0, index - 6)
+    context_end = min(len(records), index + 7)
+    local_context = " ".join(str(records[item].text or "").lower() for item in range(context_start, context_end))
+    topic_context = f"{lowered} {local_context}"
+    if "persistent coordinator" not in topic_context and "persistent-coordinator" not in topic_context:
         return 0.0, "no_correction_window_topic"
-    wait_cue = "wait" in lowered or "poll" in lowered
+    wait_cue = "wait" in topic_context or "poll" in topic_context
     if not wait_cue:
         return 0.0, "no_wait_or_poll_cue"
     score = 0.0
@@ -4622,7 +4721,7 @@ def score_correction_window_record(records: list[Any], index: int) -> tuple[floa
         if correction:
             score = max(score, 116.0)
             reason = "assistant_followup_correction"
-    if "function_call" in role_text and any(
+    if role_text == "function_call" and any(
         term in lowered
         for term in (
             "persistent-coordinator-pattern",
