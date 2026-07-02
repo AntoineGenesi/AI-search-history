@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history.
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, do not run pwd, rg --files, find, ls, repo inventories, or setup probes first; read this skill, then use ask as the first resolver.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
