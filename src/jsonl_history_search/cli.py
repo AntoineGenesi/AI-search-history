@@ -1681,7 +1681,12 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
 def current_session_wording(query: str) -> bool:
     normalized = " ".join(str(query or "").casefold().split())
     return bool(
-        re.search(r"\b(this|current|active|latest)\s+(session|chat|thread|conversation|run)\b", normalized)
+        re.search(
+            r"\b(this|current|active|latest)\s+"
+            r"(?:(?:work|working|chat|conversation|agent|codex|claude|current)\s+)?"
+            r"(session|chat|thread|conversation|run)\b",
+            normalized,
+        )
         or re.search(r"\b(this|current)\s+conversation\b", normalized)
     )
 
