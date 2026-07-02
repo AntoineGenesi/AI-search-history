@@ -76,6 +76,37 @@ ROUTES: tuple[AskRoute, ...] = (
         ),
     ),
     AskRoute(
+        route_family="process_actual_use",
+        chosen_route="process-actual-use / semantic-debug",
+        why_it_applies=(
+            "The wording asks whether a process, artifact, checklist, learning, "
+            "or front-door is actually used in work, not merely current or cited. "
+            "Route to semantic-debug so raw session timing and behavior-change "
+            "evidence are primary."
+        ),
+        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        read_specialization="references/semantic-debugging.md",
+        inspect_after=(
+            "semantic_debug.question_family.primary == process_actual_use",
+            "semantic_debug.guided_audit_flow.answer_gate.process_actual_use_buckets",
+            "primary raw conversation/session windows for before-planning consultation, behavior/scope/claim-boundary changes, and reviewer enforcement timing",
+            "repo task/review artifacts only as secondary context unless linked to raw timing or reviewer enforcement evidence",
+        ),
+        stop_guidance=(
+            "Run semantic-debug text-first before artifact-currentness, TODO scans, "
+            "or repo-only grep. Answer behavior claims from inspected raw session "
+            "windows and actual-use buckets: exists, cited, consulted before "
+            "planning, changed behavior/scope/claim boundaries, only updated "
+            "after the fact, stale/performative/no-evidence gap."
+        ),
+        manual_search_guidance=(
+            "Manual rg is a targeted follow-up only after semantic-debug names a "
+            "missing bucket or source window. File existence, task status, or "
+            "mentions are not actual-use proof without raw timing or reviewer "
+            "enforcement evidence."
+        ),
+    ),
+    AskRoute(
         route_family="latest_status",
         chosen_route="latest-status / what-happened-since",
         why_it_applies=(
@@ -230,23 +261,26 @@ def classify_ask_route(query: str) -> AskRoute:
     ):
         return ROUTES[1]
 
-    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
+    if _looks_like_process_actual_use_query(normalized):
         return ROUTES[2]
 
-    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
+    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
         return ROUTES[3]
 
-    if is_worktree_cleanup_currentness_query(query):
+    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[4]
 
-    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+    if is_worktree_cleanup_currentness_query(query):
         return ROUTES[5]
+
+    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+        return ROUTES[6]
 
     if _looks_like_ticket_currentness(normalized):
-        return ROUTES[5]
+        return ROUTES[6]
 
     if _has_any(normalized, ("keep yelling", "yelling about", "complain", "complained", "semantic wrap-up", "wrap up")):
-        return ROUTES[6]
+        return ROUTES[7]
 
     return AskRoute(
         route_family="semantic_debug",
@@ -306,3 +340,60 @@ def _looks_like_ticket_currentness(normalized: str) -> bool:
         ),
     )
     return ticketish and currentish
+
+
+def _looks_like_process_actual_use_query(normalized: str) -> bool:
+    actual_use_phrases = (
+        "actually being used",
+        "actually used",
+        "actual use",
+        "being used",
+        "consulted before planning",
+        "consulted before work",
+        "used before planning",
+        "read before planning",
+        "process for its own sake",
+        "performative",
+        "write-only ritual",
+        "only updated after the fact",
+        "updated after the fact",
+        "changed behavior",
+        "changed scope",
+        "claim boundaries",
+        "reviewer enforced",
+        "review enforced",
+    )
+    process_targets = (
+        "process",
+        "artifact",
+        "document",
+        "doc",
+        "rule",
+        "checklist",
+        "front-door",
+        "front door",
+        "fsm",
+        "learning",
+        "learnings",
+        "ledger",
+        "memory",
+        "workflow",
+        "procedure",
+        "rubric",
+    )
+    use_audit_verbs = (
+        "is this",
+        "is the",
+        "are the",
+        "are these",
+        "was this",
+        "were these",
+        "whether",
+        "prove",
+        "verify",
+        "audit",
+    )
+    has_actual_use_phrase = _has_any(normalized, actual_use_phrases)
+    has_target = _has_any(normalized, process_targets)
+    has_audit_shape = _has_any(normalized, use_audit_verbs)
+    return has_target and has_actual_use_phrase and has_audit_shape

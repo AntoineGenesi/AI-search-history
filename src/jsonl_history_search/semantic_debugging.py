@@ -53,6 +53,7 @@ LABELED_HANDLE_RE = re.compile(
 DECISION_CONTEXT_ROUTES = {
     "conversation_reconstruction",
     "git_history_reconstruction",
+    "process_actual_use_audit",
     "task_review_join",
     "tool_action_proof",
     "source_ref_followup",
@@ -63,6 +64,7 @@ SUPPORTED_QUESTION_FAMILIES = {
     "why_did_this_happen": "Vague bug, incident, regression, symptom, or assumption questions.",
     "provenance": "Task, path, branch, commit, review, or artifact provenance questions.",
     "claimed_action": "Whether an agent actually ran, edited, tested, reviewed, or claimed a concrete action.",
+    "process_actual_use": "Whether a process, artifact, checklist, learning, or front-door was actually used before/during work and changed behavior.",
     "remembered_instruction": "Prior user instruction, preference, feedback, or remembered wording recovery.",
     "no_evidence": "Bounded not-found reporting for the searched source scope.",
 }
@@ -276,6 +278,7 @@ def build_semantic_debug_payload(
     routes = build_routes(agent_find, source_scope, tool_report, forensics_payload, hints, benchmark_gate)
     final_answer_contract = build_final_answer_source_use_contract(
         status=agent_find["status"],
+        family=family,
         candidates=candidates,
         source_locator_handoff=source_locator_handoff,
         tool_proof=tool_proof,
@@ -526,6 +529,8 @@ def build_semantic_debug_payload(
 def classify_question_family(query: str, *, hints: dict[str, str | None], status: str) -> dict[str, Any]:
     text = query.lower()
     detected: list[str] = []
+    if looks_like_process_actual_use_query(text):
+        detected.append("process_actual_use")
     if any(word in text for word in ("why", "cause", "caused", "happen", "regression", "bug", "symptom", "assumption")):
         detected.append("why_did_this_happen")
     if any(hints.values()) or any(word in text for word in ("commit", "branch", "task", "review", "provenance", "path")):
@@ -565,6 +570,130 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
             {"label": label, "meaning": meaning} for label, meaning in sorted(UNSUPPORTED_QUESTION_FAMILIES.items())
         ],
     }
+
+
+def looks_like_process_actual_use_query(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().replace("?", " ").replace("!", " ").split())
+    actual_use_phrases = (
+        "actually being used",
+        "actually used",
+        "actual use",
+        "being used",
+        "consulted before planning",
+        "consulted before work",
+        "used before planning",
+        "read before planning",
+        "process for its own sake",
+        "performative",
+        "write-only ritual",
+        "only updated after the fact",
+        "updated after the fact",
+        "changed behavior",
+        "changed scope",
+        "claim boundaries",
+        "reviewer enforced",
+        "review enforced",
+    )
+    process_targets = (
+        "process",
+        "artifact",
+        "document",
+        "doc",
+        "rule",
+        "checklist",
+        "front-door",
+        "front door",
+        "fsm",
+        "learning",
+        "learnings",
+        "ledger",
+        "memory",
+        "workflow",
+        "procedure",
+        "rubric",
+    )
+    audit_shape = (
+        "is this",
+        "is the",
+        "are the",
+        "are these",
+        "was this",
+        "were these",
+        "whether",
+        "prove",
+        "verify",
+        "audit",
+    )
+    return (
+        any(phrase in normalized for phrase in actual_use_phrases)
+        and any(target in normalized for target in process_targets)
+        and any(shape in normalized for shape in audit_shape)
+    )
+
+
+def process_actual_use_bucket_contract() -> list[dict[str, str]]:
+    return [
+        {
+            "bucket": "artifact_exists",
+            "requirement": "Show the artifact/process exists or was available.",
+            "evidence_status": "secondary_context_only",
+        },
+        {
+            "bucket": "artifact_cited",
+            "requirement": "Show the artifact/process was cited or mentioned by agents, tasks, or reviews.",
+            "evidence_status": "weak_actual_use_signal",
+        },
+        {
+            "bucket": "consulted_before_planning",
+            "requirement": "Use raw conversation/session timing to show it was opened, read, or explicitly consulted before planning or task selection.",
+            "evidence_status": "primary_actual_use_evidence",
+        },
+        {
+            "bucket": "changed_behavior_scope_or_claim_boundaries",
+            "requirement": "Show the process changed task selection, implementation scope, review pressure, claim wording, or stop conditions.",
+            "evidence_status": "primary_actual_use_evidence",
+        },
+        {
+            "bucket": "only_updated_after_the_fact",
+            "requirement": "Separate post-hoc updates from evidence that the process guided the work before or during execution.",
+            "evidence_status": "counterevidence_or_limit",
+        },
+        {
+            "bucket": "stale_performative_no_evidence_gap",
+            "requirement": "Name stale, ignored, performative, or not-found-in-searched-scope gaps instead of smoothing them into a yes.",
+            "evidence_status": "required_gap_bucket",
+        },
+    ]
+
+
+def process_actual_use_source_hierarchy() -> dict[str, Any]:
+    return {
+        "primary_for_behavior_claims": [
+            "raw conversation/session windows showing pre-planning consultation timing",
+            "raw agent traces showing behavior, scope, or claim-boundary changes",
+            "reviewer enforcement evidence tied to raw timing or explicit review findings",
+        ],
+        "secondary_context_only": [
+            "repo task files",
+            "review artifacts",
+            "learning ledger or process-document updates",
+            "commits and current repo state",
+        ],
+        "secondary_artifact_rule": (
+            "Repo task/review artifacts are secondary context and are not primary actual-use proof "
+            "unless linked to raw timing or reviewer enforcement evidence."
+        ),
+    }
+
+
+def process_actual_use_forbidden_claims() -> list[str]:
+    return [
+        "artifact_exists_means_actual_use",
+        "artifact_cited_means_consulted_before_planning",
+        "post_hoc_update_means_behavior_changed",
+        "repo_task_or_review_artifact_as_primary_behavior_proof_without_raw_timing",
+        "yes_the_process_is_used_without_stating_missing_buckets",
+    ]
 
 
 def empty_source_handle_routing() -> dict[str, Any]:
@@ -1761,10 +1890,16 @@ def select_decision_routes(
 ) -> list[str]:
     selected = ["conversation_reconstruction"]
     detected = set(family.get("detected_supported", []))
-    if project_time_needed:
+    process_actual_use = "process_actual_use" in detected
+    if "process_actual_use" in detected:
+        selected.append("process_actual_use_audit")
+    if project_time_needed and not process_actual_use:
         selected.append("git_history_reconstruction")
     if joins.get("status") in {"joined", "no_join_evidence", "not_run"} and (
-        project_time_needed or "provenance" in detected or joins.get("review_evidence")
+        (project_time_needed and not process_actual_use)
+        or "provenance" in detected
+        or joins.get("review_evidence")
+        or joins.get("status") == "joined"
     ):
         selected.append("task_review_join")
     if tool_proof.get("event_count", 0) or "claimed_action" in detected:
@@ -1923,6 +2058,7 @@ def parse_watchlist(query: str, watchlist_inputs: list[str]) -> list[dict[str, A
 def order_decision_routes(routes: list[str]) -> list[str]:
     preferred = [
         "conversation_reconstruction",
+        "process_actual_use_audit",
         "git_history_reconstruction",
         "task_review_join",
         "tool_action_proof",
@@ -1947,6 +2083,7 @@ def checkpoint_plan(route_order: list[str]) -> list[dict[str, Any]]:
 def checkpoint_completion(route: str) -> str:
     return {
         "conversation_reconstruction": "candidate source refs have been opened with read-more and evidence vs inference is separated",
+        "process_actual_use_audit": "actual-use buckets separate artifact exists/cited from before-planning consultation, behavior change, post-hoc updates, and stale/performative gaps",
         "git_history_reconstruction": "git commit/branch/path/time commands have been checked without treating git state as user intent alone",
         "task_review_join": "task and review artifacts have been read for verdicts, blockers, and handoff claims",
         "tool_action_proof": "structured tool events have been confirmed from source refs before action claims",
@@ -5025,6 +5162,7 @@ def score_action_proof_record(
 def build_final_answer_source_use_contract(
     *,
     status: str,
+    family: dict[str, Any],
     candidates: list[dict[str, Any]],
     source_locator_handoff: dict[str, Any],
     tool_proof: dict[str, Any],
@@ -5052,10 +5190,22 @@ def build_final_answer_source_use_contract(
         "Preserve uncertainty labels instead of smoothing them into a stronger claim.",
         "Do not claim root cause, exhaustive all-history absence, JSONL superiority, speed, value, or token-efficiency unless separate reviewed evidence supports it.",
     ]
+    process_actual_use = family.get("primary") == "process_actual_use" or "process_actual_use" in set(
+        family.get("detected_supported") or []
+    )
     if (source_handle_routing or {}).get("detected_handles"):
         required_actions.insert(
             0,
             "Resolve/open matching source refs for detected reviewed/source/case handles before broad answer claims, or state no matching source ref was found in searched scope.",
+        )
+    if process_actual_use:
+        required_actions.insert(
+            0,
+            "For process/artifact actual-use claims, fill the actual-use buckets and cite primary raw conversation/session windows for behavior claims.",
+        )
+        required_actions.insert(
+            1,
+            "Treat repo task/review artifacts as secondary unless linked to raw timing or reviewer enforcement evidence.",
         )
     evidence_inputs = {
         "strongest_candidate_source_refs": candidate_refs,
@@ -5079,7 +5229,7 @@ def build_final_answer_source_use_contract(
             required_actions.append("Use task/review/commit joins for provenance claims before relying on transcript snippets alone.")
         answer_scope = "source_backed_answer_required"
         source_use_required = bool(candidate_refs or next_reads or tool_proof.get("events") or joins.get("status") == "joined")
-    return {
+    contract = {
         "status": "active",
         "answer_scope": answer_scope,
         "source_use_required": source_use_required,
@@ -5100,6 +5250,24 @@ def build_final_answer_source_use_contract(
             "support_precision_claim": "counts_only_not_artifact_content_correctness",
         },
     }
+    if process_actual_use:
+        contract["process_actual_use_contract"] = {
+            "status": "active",
+            "bucket_requirements": process_actual_use_bucket_contract(),
+            "source_hierarchy": process_actual_use_source_hierarchy(),
+            "primary_raw_evidence_required_for_behavior_claims": True,
+            "repo_task_review_artifacts_secondary_unless_linked": True,
+            "answer_shape": [
+                "separate exists/cited from consulted-before-planning",
+                "separate behavior/scope/claim-boundary changes from post-hoc updates",
+                "state stale/performative/no-evidence gaps explicitly",
+            ],
+            "forbidden_claims": process_actual_use_forbidden_claims(),
+        }
+        contract["claim_boundaries"]["process_actual_use_behavior_claim"] = (
+            "requires primary raw timing or reviewer enforcement evidence"
+        )
+    return contract
 
 
 def build_answer_readiness(
@@ -5203,6 +5371,16 @@ def build_answer_readiness(
         required_before_answer.append(
             "Resolve/open matching source refs for detected source handles first, or state no matching source ref was found in searched scope."
         )
+    process_actual_use_contract = final_answer_contract.get("process_actual_use_contract") or {}
+    if process_actual_use_contract:
+        required_before_answer.insert(
+            0,
+            "For process actual-use, inspect raw conversation/session windows for before-planning consultation and behavior/scope/claim-boundary changes before answering yes/no.",
+        )
+        required_before_answer.insert(
+            1,
+            "Do not count repo task/review artifacts as primary actual-use proof unless they are linked to raw timing or reviewer enforcement evidence.",
+        )
 
     ready_ledger_ids = [
         entry.get("ledger_id")
@@ -5248,6 +5426,7 @@ def build_answer_readiness(
             "forensics_join_count": int((forensics_workflow.get("summary") or {}).get("join_count", 0) or 0),
             "source_handle_count": len((source_handle_routing or {}).get("detected_handles") or []),
             "source_handle_matching_next_read_count": len((source_handle_routing or {}).get("matched_next_reads") or []),
+            "process_actual_use_bucket_count": len(process_actual_use_contract.get("bucket_requirements") or []),
         },
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "ledger_summary": {
@@ -5297,6 +5476,7 @@ def build_answer_readiness(
             "source_use_required": final_answer_contract.get("source_use_required"),
             "required_actions": list(final_answer_contract.get("required_actions") or [])[:8],
             "no_evidence_scope": final_answer_contract.get("no_evidence_scope"),
+            "process_actual_use_contract": process_actual_use_contract,
         },
         "answer_gate_link": "semantic_debug.guided_audit_flow.answer_gate",
         "answer_readiness_link": "semantic_debug.answer_readiness",
@@ -5396,6 +5576,7 @@ def summarize_answer_readiness(answer_readiness: dict[str, Any]) -> dict[str, An
             "task_review_join_status": basis.get("task_review_join_status"),
             "next_read_count": basis.get("next_read_count", 0),
             "omitted_window_recovery_count": basis.get("omitted_window_recovery_count", 0),
+            "process_actual_use_bucket_count": basis.get("process_actual_use_bucket_count", 0),
         },
         "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:4],
         "ledger_summary": {
@@ -5856,10 +6037,10 @@ def guided_primary_question_family(
     if primary_intent == "workflow_failure":
         return "workflow_failure"
     primary = family.get("primary")
-    if primary in {"why_did_this_happen", "claimed_action", "remembered_instruction"}:
+    if primary in {"why_did_this_happen", "claimed_action", "process_actual_use", "remembered_instruction"}:
         return str(primary)
     detected = set(family.get("detected_supported") or [])
-    for label in ("claimed_action", "remembered_instruction", "why_did_this_happen"):
+    for label in ("process_actual_use", "claimed_action", "remembered_instruction", "why_did_this_happen"):
         if label in detected:
             return label
     return str(primary or "why_did_this_happen")
@@ -5873,6 +6054,16 @@ def guided_route_order(*, primary_family: str, primary_intent: str, routes: list
         preferred = ["conversation_reconstruction", "tool_action_proof", "task_review_join", "source_ref_followup", "no_evidence_scoped_report"]
     elif primary_family == "claimed_action":
         preferred = ["tool_action_proof", "task_review_join", "conversation_reconstruction", "source_ref_followup", "no_evidence_scoped_report"]
+    elif primary_family == "process_actual_use":
+        preferred = [
+            "conversation_reconstruction",
+            "process_actual_use_audit",
+            "source_ref_followup",
+            "task_review_join",
+            "tool_action_proof",
+            "git_history_reconstruction",
+            "no_evidence_scoped_report",
+        ]
     elif primary_family == "remembered_instruction":
         preferred = ["conversation_reconstruction", "source_ref_followup", "no_evidence_scoped_report"]
     else:
@@ -6046,6 +6237,14 @@ def guided_stage_status(
         return "available" if workflow_summary.get("join_count", 0) else "not_run_or_no_join"
     if route == "tool_action_proof":
         return "available" if any(handle.get("kind") == "tool_event_source_ref" for handle in decision_context.get("evidence_handles", [])) else "needs_structured_event_source"
+    if route == "process_actual_use_audit":
+        has_raw_candidates = any(handle.get("kind") == "candidate_source_ref" for handle in decision_context.get("evidence_handles", []))
+        has_review_context = any(handle.get("kind") == "task_review_artifact" for handle in decision_context.get("evidence_handles", []))
+        if has_raw_candidates and has_review_context:
+            return "ready_with_raw_and_secondary_context"
+        if has_raw_candidates:
+            return "ready_needs_bucket_classification"
+        return "needs_primary_raw_timing_evidence"
     if route == "source_ref_followup":
         if recovery.get("status") == "available":
             return "recovery_reads_available"
@@ -6059,6 +6258,12 @@ def guided_stage_inputs(route: str) -> list[str]:
     return {
         "conversation_reconstruction": ["strongest_candidates", "source_locator_handoff.source_windows", "next_reads"],
         "git_history_reconstruction": ["task_review_commit_joins", "forensics_workflow"],
+        "process_actual_use_audit": [
+            "strongest_candidates",
+            "source_locator_handoff.next_reads",
+            "raw conversation/session windows",
+            "task_review_commit_joins as secondary context",
+        ],
         "task_review_join": ["task_review_commit_joins", "forensics_workflow.review_gate"],
         "tool_action_proof": ["tool_action_proof", "structured_tool_events"],
         "source_ref_followup": ["source_locator_handoff.next_reads", "source_locator_handoff.omitted_window_recovery"],
@@ -6070,6 +6275,11 @@ def guided_stage_outputs(route: str) -> list[str]:
     return {
         "conversation_reconstruction": ["evidence_vs_inference_notes", "candidate_timeline"],
         "git_history_reconstruction": ["project_time_context", "artifact_state_context"],
+        "process_actual_use_audit": [
+            "actual_use_bucket_findings",
+            "primary_raw_evidence_for_behavior_claims",
+            "secondary_artifact_context_or_gap",
+        ],
         "task_review_join": ["review_verdict_context", "task_handoff_context"],
         "tool_action_proof": ["action_claim_support_or_gap"],
         "source_ref_followup": ["confirmed_context_or_recovery_gap"],
@@ -6092,6 +6302,7 @@ def guided_answer_gate(
         "why_did_this_happen": "Separate source-backed observations from candidate-cause inference before saying why.",
         "workflow_failure": "Use failure-timeline/process evidence from the query-plan route before naming where the workflow went wrong.",
         "claimed_action": "Confirm structured tool/action proof before saying an agent ran, edited, tested, reviewed, or claimed an action.",
+        "process_actual_use": "Fill actual-use buckets and cite primary raw session timing before claiming a process/artifact changed behavior.",
         "remembered_instruction": "Open source refs for the prior user wording before restating remembered instructions.",
         "no_evidence": "State not_found_in_searched_scope and list unsearched, missing, or cap-limited scope.",
     }.get(primary_family, "Use source refs before making factual or provenance claims.")
@@ -6114,6 +6325,24 @@ def guided_answer_gate(
         completion_criteria.append("Candidate-only and unsupported-extra handles are not used as final support.")
         if (discipline_summary.get("missing_proof_buckets") or []):
             completion_criteria.append("Missing proof/action buckets are stated as gaps before synthesis.")
+    process_contract = final_answer_contract.get("process_actual_use_contract") or {}
+    if process_contract:
+        completion_criteria.extend(
+            [
+                "Artifact exists/cited buckets are not treated as behavior-changing actual-use proof.",
+                "Consulted-before-planning and behavior/scope/claim-boundary buckets use primary raw evidence or are stated as gaps.",
+                "Post-hoc update and stale/performative/no-evidence buckets are explicitly considered.",
+            ]
+        )
+    forbidden_claims = [
+        "root_cause_without_linked_reviewed_evidence",
+        "global_absence_or_all_history_completeness",
+        "jsonl_value_speed_token_or_final_answer_quality_without_separate_reviewed_evidence",
+        "candidate_only_or_unsupported_extra_handle_as_final_support",
+        "unstated_missing_proof_action_facet",
+    ]
+    if process_contract:
+        forbidden_claims.extend(process_contract.get("forbidden_claims") or [])
     return {
         "status": "active",
         "primary_question_family": primary_family,
@@ -6132,14 +6361,16 @@ def guided_answer_gate(
             "task_review_join_support_summary",
             empty_support_summary(),
         ),
+        "process_actual_use_buckets": list(process_contract.get("bucket_requirements") or []),
+        "process_actual_use_source_hierarchy": process_contract.get("source_hierarchy") or {},
+        "primary_raw_evidence_required_for_behavior_claims": bool(
+            process_contract.get("primary_raw_evidence_required_for_behavior_claims", False)
+        ),
+        "repo_task_review_artifacts_secondary_unless_linked": bool(
+            process_contract.get("repo_task_review_artifacts_secondary_unless_linked", False)
+        ),
         "answer_source_discipline": discipline_summary,
-        "forbidden_claims": [
-            "root_cause_without_linked_reviewed_evidence",
-            "global_absence_or_all_history_completeness",
-            "jsonl_value_speed_token_or_final_answer_quality_without_separate_reviewed_evidence",
-            "candidate_only_or_unsupported_extra_handle_as_final_support",
-            "unstated_missing_proof_action_facet",
-        ],
+        "forbidden_claims": forbidden_claims,
         "claim_boundaries": final_answer_contract.get("claim_boundaries", {}),
     }
 
@@ -6207,6 +6438,13 @@ def summarize_guided_audit_flow(guide: dict[str, Any]) -> dict[str, Any]:
             "answer_readiness_scope": answer_gate.get("answer_readiness_scope"),
             "required_before_answer": list(answer_gate.get("required_before_answer") or [])[:4],
             "forbidden_claims": list(answer_gate.get("forbidden_claims") or [])[:3],
+            "process_actual_use_bucket_count": len(answer_gate.get("process_actual_use_buckets") or []),
+            "primary_raw_evidence_required_for_behavior_claims": answer_gate.get(
+                "primary_raw_evidence_required_for_behavior_claims"
+            ),
+            "repo_task_review_artifacts_secondary_unless_linked": answer_gate.get(
+                "repo_task_review_artifacts_secondary_unless_linked"
+            ),
             "answer_readiness_summary": answer_gate.get("answer_readiness_summary"),
             "answer_source_discipline": answer_gate.get("answer_source_discipline"),
         },
