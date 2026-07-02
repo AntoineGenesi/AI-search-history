@@ -812,6 +812,14 @@ def inferred_anchor_next_reads(
 ) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
     reads.extend(
+        inferred_reviewed_source_packet_next_reads(
+            query=query,
+            source_plan=source_plan,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+    )
+    reads.extend(
         inferred_explicit_correction_window_next_reads(
             query=query,
             source_plan=source_plan,
@@ -844,6 +852,141 @@ def inferred_anchor_next_reads(
         )
     )
     return dedupe_dicts(reads)[:4]
+
+
+def inferred_reviewed_source_packet_next_reads(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    text = str(query or "").casefold()
+    if "reviewed source case" not in text and "source case" not in text:
+        return []
+    handles = [
+        handle
+        for handle in detect_source_handles(query)
+        if str(handle.get("normalized") or "").startswith("real-jsh")
+    ]
+    if not handles:
+        return []
+    cwd = Path(str(source_plan.get("cwd") or ".")).expanduser()
+    packet_roots = reviewed_packet_roots(cwd)
+    if not packet_roots:
+        return []
+    reads: list[dict[str, Any]] = []
+    for handle in handles[:3]:
+        pointer = find_reviewed_source_packet_pointer(handle, packet_roots)
+        if not pointer:
+            continue
+        source_ref = {
+            "path": pointer["private_path"],
+            "line": pointer["primary_line"],
+            "session": Path(pointer["private_path"]).stem,
+        }
+        read = inferred_anchor_read(
+            source_ref=source_ref,
+            anchor_id=f"reviewed-source-packet-{len(reads) + 1:03d}",
+            reason=(
+                "open retained reviewed source pointer before current-session "
+                "prompt echoes, packet-gate artifacts, or broad private search"
+            ),
+            anchor_kind="reviewed_source_packet_pointer",
+            confidence="high",
+            selection_reason=pointer["selection_reason"],
+            score=150.0,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+        read["reviewed_source_packet_pointer"] = {
+            "schema_version": 1,
+            "handle": handle["handle"],
+            "source_ref_id": pointer["source_ref_id"],
+            "packet_handle": pointer["packet_handle"],
+            "raw_private_text_included": False,
+            "source_window_verification_required": True,
+            "current_session_echo_recovery_discouraged": True,
+            "broad_private_artifact_search_discouraged": True,
+            "claim_boundary": "retained_packet_pointer_guides_source_inspection_not_final_answer",
+        }
+        reads.append(read)
+    return reads
+
+
+def reviewed_packet_roots(cwd: Path) -> list[Path]:
+    candidates = [cwd / ".private" / "jsh-935"]
+    parts = list(cwd.parts)
+    if "worktrees" in parts:
+        worktrees_index = parts.index("worktrees")
+        if worktrees_index > 0:
+            parent_repo = Path(*parts[:worktrees_index])
+            candidates.append(parent_repo / ".private" / "jsh-935")
+    for parent in cwd.parents:
+        candidates.append(parent / ".private" / "jsh-935")
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen or not candidate.is_dir():
+            continue
+        seen.add(key)
+        roots.append(candidate)
+    return roots[:4]
+
+
+def find_reviewed_source_packet_pointer(
+    handle: dict[str, Any],
+    packet_roots: list[Path],
+) -> dict[str, Any] | None:
+    normalized = str(handle.get("normalized") or "")
+    if not normalized:
+        return None
+    for root in packet_roots:
+        for packet in sorted(root.glob("*/case-packet.md"))[:80]:
+            try:
+                text = packet.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if normalized not in normalize_source_handle(text):
+                continue
+            pointer = parse_reviewed_source_pointer(text, handle_normalized=normalized)
+            if not pointer:
+                continue
+            pointer["packet_handle"] = f"private:jsh-935/{packet.parent.name}/case-packet.md"
+            pointer["selection_reason"] = "reviewed_source_packet_pointer"
+            return pointer
+    return None
+
+
+def parse_reviewed_source_pointer(text: str, *, handle_normalized: str) -> dict[str, Any] | None:
+    sections = re.split(r"\n###\s+", "\n" + text)
+    for section in sections:
+        first_line, _, body = section.partition("\n")
+        heading = first_line.strip()
+        if not heading or handle_normalized not in normalize_source_handle(heading):
+            continue
+        private_path_match = re.search(r"(?m)^-\s+private_path:\s*(.+?)\s*$", body)
+        primary_line_match = re.search(r"(?m)^-\s+primary_line:\s*(\d+)\s*$", body)
+        if not private_path_match or not primary_line_match:
+            continue
+        private_path = private_path_match.group(1).strip()
+        try:
+            primary_line = int(primary_line_match.group(1))
+        except ValueError:
+            continue
+        if not private_path or primary_line < 1:
+            continue
+        return {
+            "source_ref_id": heading,
+            "private_path": private_path,
+            "primary_line": primary_line,
+        }
+    return None
 
 
 EXPLICIT_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
@@ -2913,6 +3056,7 @@ def primary_followthrough_reads(
                 "known_action_case",
                 "remembered_topic",
                 "explicit_date_remembered_instruction",
+                "reviewed_source_packet_pointer",
             }:
                 reads.append(item)
     return dedupe_primary_targets(reads)[:3]
@@ -2968,6 +3112,16 @@ def primary_followthrough_window(
             "compact_text_limit": 500,
             "format": "text",
             "reason": "explicit_date_remembered_instruction_window_before_prompt_echo_recovery",
+        }
+    if anchor_kind == "reviewed_source_packet_pointer":
+        return {
+            "before": 0,
+            "after": 35,
+            "max_records": 60,
+            "projection": "compact",
+            "compact_text_limit": 1200,
+            "format": "text",
+            "reason": "reviewed_source_packet_pointer_window_before_current_session_echo_recovery",
         }
     if anchor_kind == "remembered_topic" or "recent user topic/provenance" in str(read.get("reason") or ""):
         return {
