@@ -44,6 +44,39 @@ wraps the canonical `jsonl-history-search ask` command, adds `--cwd "$PWD"` and
 `--format text` when omitted, and exists so the first command can be the
 front-door resolver rather than a repo inventory/setup probe.
 
+## Proven Route Demos
+
+JSH-1098 free-agent traces showed sampled lower-burden source-window routing
+for these workflows. This is not a release-readiness, provider-token-savings,
+all-history, or universal-superiority claim.
+
+- Date/timeline exact-ref recovery: ask first for prompts like "In the session
+  dated <date>, what happened with <event>?", then open the promoted compact
+  source window before broad repo search.
+- Vague remembered-history retrieval: ask first for prompts like "What did I
+  say before about making this clearly valuable upfront?", then use
+  semantic-debug/source-window follow-through before artifact recovery.
+- Agent action/proof verification: ask first for prompts like "Did the agent
+  overwrite those workflow/planner edits?", then inspect tool/action proof,
+  command output, diffs, commits, or review metadata.
+- Decision-rationale/source-window provenance: ask first for prompts like "Why
+  did we distinguish persistent coordinator from wait loops?", then answer from
+  the reviewed source window and preserve corrections/uncertainty.
+
+Before free-agent or user-facing workflows that rely on the installed global
+Codex skill, run:
+
+```bash
+jsonl-history-search validate-install --codex-home ~/.codex --format text
+```
+
+If the agent preflight says the global skill is stale, refresh it from the
+package checkout before relying on the route instructions:
+
+```bash
+bash install/install_codex_global.sh
+```
+
 Command-shape contract for the first two shell commands:
 
 - The command that reads this `SKILL.md` must be a single-purpose skill read
