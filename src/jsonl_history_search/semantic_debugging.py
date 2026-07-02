@@ -416,6 +416,21 @@ def build_semantic_debug_payload(
         source_window_action_proof=source_window_action_proof,
         action_proof_plan=action_proof_plan,
     )
+    followthrough = answer_ready_handoff.get("primary_source_followthrough") or {}
+    if followthrough.get("applies"):
+        final_answer_contract["required_actions"] = [
+            (
+                "Run answer_ready_handoff.primary_source_followthrough.first_command first; "
+                "treat source_locator_handoff.next_reads as fallback only if the primary "
+                "window leaves a named required facet missing."
+            )
+            if action == "Use source refs from strongest_candidates and source_locator_handoff.next_reads before answering when they exist."
+            else action
+            for action in final_answer_contract.get("required_actions", [])
+        ]
+        final_answer_contract["evidence_inputs"]["source_locator_next_reads_policy"] = (
+            "fallback_after_primary_source_followthrough_only"
+        )
     answer_ready_handoff["links"]["investigation_state"] = "semantic_debug.investigation_state"
     answer_ready_handoff["source_use_summary"]["investigation_state"] = {
         "link": "semantic_debug.investigation_state",
@@ -3141,15 +3156,22 @@ def primary_followthrough_window(
             "format": "text",
             "reason": "reviewed_source_packet_pointer_window_before_current_session_echo_recovery",
         }
-    if str(read.get("read_type") or "") == "required_primary_proof_read" or (
-        action_proof_plan
-        and action_proof_plan.get("applies")
-        and action_proof_plan.get("primary_question_family") == "claimed_action"
+    if (
+        anchor_kind == "known_action_case"
+        or str(read.get("read_type") or "") == "required_primary_proof_read"
+        or (
+            action_proof_plan
+            and action_proof_plan.get("applies")
+            and action_proof_plan.get("primary_question_family") == "claimed_action"
+        )
     ):
         return {
             "before": 45,
             "after": 8,
             "max_records": 80,
+            "projection": "compact",
+            "compact_text_limit": 1200,
+            "format": "text",
             "reason": "action_proof_needs_preceding_tool_and_diff_context",
         }
     if anchor_kind == "explicit_date_remembered_instruction":
