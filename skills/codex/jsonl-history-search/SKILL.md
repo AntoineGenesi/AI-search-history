@@ -14,6 +14,10 @@ learn from a session, run `ask` as the
 first resolver before choosing a route yourself. For explicit operational
 lookups that are not natural route-choice questions, choose the narrowest route
 and read only the referenced specialization needed for the user's question.
+Exception: when the user is asking whether the files/tasks/evidence packet you
+just created or edited include everything, verify local artifacts first with
+`git status`, `git diff`, `git show`, and targeted `sed`/`rg`; use JSONL only
+as a targeted backstop for disputed source-window coverage.
 
 The product contract is agent-assist retrieval: find useful information in
 large, messy JSONL histories, show where it was found, and give the receiving
@@ -60,6 +64,10 @@ Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
 actually matters?", "is ticket ABC-42 still current?", "can these old worktrees be removed?", and "what did I
 keep yelling about in this session?".
+For immediate artifact-completeness prompts like "are you sure you got
+everything?", "did the task file include X?", "did you save this whole thread as
+evidence?", or "what changed in the files you just created?", do local artifact
+verification first instead of running `ask` or `semantic-debug`.
 
 The `ask` output is not a final answer and is not evidence retrieval by itself:
 it does not inspect source refs, raw JSONL, tasks, reports, or repo files. It
@@ -99,6 +107,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Can these old worktrees be removed?" "Are these branches/checkouts stale or safe to prune?" | Worktree cleanup/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -111,6 +120,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "what did I tell you before about release readiness?" -> `references/remembered-instruction.md`
 - "why did I mention the router?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/remembered-topic.md`
 - "what happened since my last message?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/latest-status.md`
+- "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
@@ -124,6 +134,11 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 
 - Trigger this skill even when the user does not say "use JSONL" if the answer
   depends on prior AI conversation logs or agent actions.
+- Do not trigger a full JSONL workflow for immediate local artifact
+  completeness questions. If the user asks whether recently edited task,
+  evidence, TODO, report, or doc files include the requested material, inspect
+  local artifacts first; use targeted JSONL only if source-window coverage is
+  missing or disputed.
 - For natural history/status/action/currentness/wrap-up prompts, run
   `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
   or its canonical wrapped command,

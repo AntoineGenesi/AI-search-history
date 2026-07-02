@@ -22,6 +22,36 @@ class AskRoute:
         return self.first_command_template.format(query=escaped)
 
 
+LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
+    route_family="local_artifact_verification",
+    chosen_route="local-artifact-verification",
+    why_it_applies=(
+        "The wording asks whether recently edited local artifacts include or "
+        "saved the requested material, so verify the worktree and named files "
+        "before invoking JSONL history search."
+    ),
+    first_command_template="git status --short",
+    read_specialization="local-artifact-verification",
+    inspect_after=(
+        "git status --short for changed/untracked files",
+        "git diff or git show for just-created/edited artifacts",
+        "targeted sed/rg against named task, evidence, TODO, report, or docs files",
+        "targeted raw JSONL/source-window reads only if artifact source coverage is missing or disputed",
+    ),
+    stop_guidance=(
+        "Start with local artifact verification. Answer from the inspected task/"
+        "evidence/TODO/report files when they resolve completeness. Do not run "
+        "broad ask/semantic-debug unless the user explicitly asks about prior "
+        "conversation history or a cited source window is missing/disputed."
+    ),
+    manual_search_guidance=(
+        "Use bounded local commands first: git status, git diff, git show, and "
+        "sed/rg against named files. JSONL is a targeted backstop only for "
+        "conversation/source-window coverage gaps."
+    ),
+)
+
+
 ROUTES: tuple[AskRoute, ...] = (
     AskRoute(
         route_family="source_window_semantic_debug",
@@ -253,6 +283,9 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 def classify_ask_route(query: str) -> AskRoute:
     normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
 
+    if _looks_like_local_artifact_verification_query(normalized):
+        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
+
     if _looks_like_reviewed_source_window_prompt(normalized):
         return ROUTES[0]
 
@@ -310,6 +343,103 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    local_verification = _has_any(
+        normalized,
+        (
+            "are you sure",
+            "got everything",
+            "save",
+            "saved",
+            "include",
+            "included",
+            "did you get",
+            "did you add",
+            "did you write",
+            "did you save",
+            "what changed",
+            "files you just",
+            "just created",
+            "just made",
+            "just edited",
+            "whole thread as evidence",
+            "thread as evidence",
+            "evidence packet complete",
+            "task file include",
+        ),
+    )
+    artifact_context = _has_any(
+        normalized,
+        (
+            "task file",
+            "task",
+            "evidence packet",
+            "evidence file",
+            "todo",
+            "report",
+            "review",
+            "doc",
+            "docs",
+            "file",
+            "files",
+            "artifact",
+            "artifacts",
+            "diff",
+            "commit",
+            "anti contamination",
+            "source refs",
+            "source windows",
+            "thread",
+        ),
+    )
+    asks_history = _has_any(
+        normalized,
+        (
+            "what happened",
+            "what did i say",
+            "what did i tell",
+            "why did i mention",
+            "why did i say",
+            "prior conversation",
+            "conversation history",
+            "before in the chat",
+            "last message",
+            "while i was away",
+        ),
+    )
+    explicitly_artifact_first = _has_any(
+        normalized,
+        (
+            "task file include",
+            "evidence packet",
+            "whole thread as evidence",
+            "thread as evidence",
+            "files you just",
+            "just created",
+            "just edited",
+            "what changed in the files",
+            "anti contamination rule",
+        ),
+    )
+    ambiguous_recent_work_followup = _has_any(
+        normalized,
+        (
+            "are you sure",
+            "got everything",
+            "did you get everything",
+            "did you get it all",
+            "did you include everything",
+            "did you save everything",
+        ),
+    )
+    return (
+        local_verification
+        and not asks_history
+        and (artifact_context or explicitly_artifact_first or ambiguous_recent_work_followup)
+    )
 
 
 def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
