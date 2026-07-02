@@ -60,6 +60,9 @@ bypass the front door with `semantic-debug --format json`. Run `ask` first, or
 run `semantic-debug ... --format text` only when the route has already selected
 semantic-debug. Use compact/text `read-more` follow-through before any broad
 repo/private `rg`, `rg --files`, or current-session echo recovery.
+Do not run a preliminary `rg -n` for the `real-jsh...` handle, packet terms,
+JSH-935, "reviewed source", or "read-more" before `ask`; that recreates the
+broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 
 ## Route Table
 
@@ -120,6 +123,9 @@ repo/private `rg`, `rg --files`, or current-session echo recovery.
   instructions, action proof, provenance, no-evidence, and ambiguous semantic
   questions. Use `semantic-debug --format text` before lower-level helper
   scripts when `ask` selects semantic-debug.
+- When the user prompt includes a reviewed source case or `real-jsh...` handle,
+  the next command after reading this skill should be `jsonl-history-search ask`
+  or the already-selected `semantic-debug --format text`, not repo `rg`.
 - Use `latest-user-messages` first for exact recent user-message wording.
 - Use helper scripts only for operational recovery: latest/today lookup,
   timestamp-window lookup, exact phrase search, or broad-term recovery where
