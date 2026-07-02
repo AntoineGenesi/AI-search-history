@@ -142,6 +142,11 @@ def build_semantic_debug_payload(
     process_actual_use = process_actual_use_detected(family)
     source_scope = build_source_scope_summary(source_plan, result)
     candidates = compact_candidates(agent_find.get("find_candidates", []))
+    source_selection_candidates = (
+        prioritize_process_actual_use_candidates(candidates)
+        if process_actual_use
+        else candidates
+    )
     timeline = compact_timeline(agent_find.get("timeline", []))
     tool_proof = compact_tool_proof(tool_report)
     joins = compact_joins(forensics_payload, hints)
@@ -150,7 +155,7 @@ def build_semantic_debug_payload(
     no_evidence = build_no_evidence_section(agent_find, source_scope, tool_report, forensics_payload)
     uncertainty = build_uncertainty(agent_find, source_scope, tool_report, forensics_payload, family)
     next_reads = build_next_reads(
-        candidates,
+        source_selection_candidates,
         tool_proof,
         joins,
         hints,
@@ -171,14 +176,21 @@ def build_semantic_debug_payload(
     next_reads = prefer_complete_explicit_correction_window_reads(next_reads)
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
-        candidates=candidates,
+        candidates=source_selection_candidates,
         next_reads=next_reads,
     )
     next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+    if process_actual_use:
+        next_reads = prioritize_process_actual_use_next_reads(
+            next_reads,
+            candidates=source_selection_candidates,
+            tool_proof=tool_proof,
+            joins=joins,
+        )
     next_reads = compact_text_semantic_read_more_actions(next_reads)
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
-        candidates=candidates,
+        candidates=source_selection_candidates,
         next_reads=next_reads,
     )
     decision_context = build_decision_context(
@@ -213,7 +225,7 @@ def build_semantic_debug_payload(
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=result,
-        candidates=candidates,
+        candidates=source_selection_candidates,
         next_reads=next_reads,
         source_family="local_ai_conversation_jsonl",
         question_family=compact_handoff_question_family(family),
@@ -230,17 +242,26 @@ def build_semantic_debug_payload(
         )
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
-            candidates=candidates,
+            candidates=source_selection_candidates,
             next_reads=next_reads,
         )
         next_reads = prioritize_source_handle_next_reads(next_reads, source_handle_routing)
+        if process_actual_use:
+            next_reads = prioritize_process_actual_use_next_reads(
+                next_reads,
+                candidates=source_selection_candidates,
+                tool_proof=tool_proof,
+                joins=joins,
+            )
         next_reads = compact_text_semantic_read_more_actions(next_reads)
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
-            candidates=candidates,
+            candidates=source_selection_candidates,
             next_reads=next_reads,
         )
         source_locator_handoff["next_reads"] = next_reads
+        if process_actual_use:
+            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(source_locator_handoff)
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
         decision_context["next_reads"] = next_reads[:12]
         decision_context["next_commands"] = build_next_commands(
@@ -263,6 +284,8 @@ def build_semantic_debug_payload(
             source_handle_routing,
         )
     else:
+        if process_actual_use:
+            source_locator_handoff = annotate_process_actual_use_source_locator_handoff(source_locator_handoff)
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
     source_locator_handoff["source_handle_routing"] = source_handle_routing
     tradeoffs = build_tradeoff_counters(agent_find, tool_report, candidates, timeline, tool_proof)
@@ -732,6 +755,353 @@ def process_actual_use_forbidden_claims() -> list[str]:
         "repo_task_or_review_artifact_as_primary_behavior_proof_without_raw_timing",
         "yes_the_process_is_used_without_stating_missing_buckets",
     ]
+
+
+PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY = "primary_raw_timing_evidence"
+PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY = "secondary_lead_context"
+PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING = "supporting_context"
+PROCESS_ACTUAL_USE_BUCKET_TERMS = {
+    "consulted_before_planning": (
+        "consulted before planning",
+        "consulted before work",
+        "used before planning",
+        "read before planning",
+        "opened before planning",
+        "before planning",
+        "before task selection",
+    ),
+    "changed_behavior_scope_or_claim_boundaries": (
+        "changed behavior",
+        "change agent behavior",
+        "changed task selection",
+        "changed scope",
+        "changed implementation scope",
+        "changed claim boundaries",
+        "claim boundaries",
+        "changed stop condition",
+        "review pressure",
+    ),
+    "only_updated_after_the_fact": (
+        "after the fact",
+        "post hoc",
+        "post-hoc",
+        "only updated",
+        "updated after",
+    ),
+    "artifact_cited": (
+        "cited",
+        "mentioned",
+        "referenced",
+    ),
+    "artifact_exists": (
+        "exists",
+        "available",
+    ),
+    "stale_performative_no_evidence_gap": (
+        "stale",
+        "performative",
+        "no evidence",
+        "not found",
+        "write-only",
+    ),
+}
+
+
+def prioritize_process_actual_use_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+    for index, candidate in enumerate(candidates):
+        row = dict(candidate)
+        source_ref = row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {}
+        target = source_ref_target(source_ref)
+        tier = process_actual_use_source_tier(
+            kind="jsonl_source_ref",
+            target=target or "",
+            source_ref=source_ref,
+        )
+        buckets = process_actual_use_bucket_matches(
+            " ".join(
+                str(part or "")
+                for part in (
+                    row.get("snippet"),
+                    row.get("role"),
+                    row.get("timestamp_utc"),
+                    " ".join(str(item) for item in row.get("reason_codes") or []),
+                )
+            )
+        )
+        row["process_actual_use_source_tier"] = tier
+        row["process_actual_use_bucket_matches"] = buckets
+        reason_codes = list(row.get("reason_codes") or [])
+        if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY and "process_actual_use_primary_raw_timing" not in reason_codes:
+            reason_codes.append("process_actual_use_primary_raw_timing")
+        elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY and "process_actual_use_secondary_lead" not in reason_codes:
+            reason_codes.append("process_actual_use_secondary_lead")
+        row["reason_codes"] = reason_codes
+        ranked.append((process_actual_use_candidate_sort_key(row, index), row))
+    return [row for _, row in sorted(ranked, key=lambda item: item[0])]
+
+
+def process_actual_use_candidate_sort_key(candidate: dict[str, Any], index: int) -> tuple[int, int, int]:
+    tier = candidate.get("process_actual_use_source_tier")
+    tier_rank = {
+        PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
+    }.get(str(tier), 3)
+    buckets = set(candidate.get("process_actual_use_bucket_matches") or [])
+    decisive_bucket_rank = 0 if buckets & {"consulted_before_planning", "changed_behavior_scope_or_claim_boundaries"} else 1
+    timestamp_rank = 0 if candidate.get("timestamp_utc") else 1
+    return (tier_rank, decisive_bucket_rank + timestamp_rank, index)
+
+
+def prioritize_process_actual_use_next_reads(
+    next_reads: list[dict[str, Any]],
+    *,
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    joins: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id") is not None
+    }
+    target_to_candidate = {
+        source_ref_target(candidate.get("source_ref") or {}): candidate
+        for candidate in candidates
+        if source_ref_target(candidate.get("source_ref") or {})
+    }
+    tool_event_targets = {
+        source_ref_target(event.get("source_ref") or {})
+        for event in tool_proof.get("events", [])
+        if source_ref_target(event.get("source_ref") or {})
+    }
+    review_paths = {str(item.get("path") or "") for item in joins.get("review_evidence", []) if item.get("path")}
+    annotated = []
+    for index, read in enumerate(next_reads):
+        row = annotate_process_actual_use_next_read(
+            read,
+            index=index,
+            candidate_by_id=candidate_by_id,
+            target_to_candidate=target_to_candidate,
+            tool_event_targets=tool_event_targets,
+            review_paths=review_paths,
+        )
+        annotated.append(row)
+    annotated.sort(key=lambda item: item.pop("_process_actual_use_sort_key"))
+    return dedupe_process_actual_use_reads(annotated)[:12]
+
+
+def annotate_process_actual_use_next_read(
+    read: dict[str, Any],
+    *,
+    index: int,
+    candidate_by_id: dict[str, dict[str, Any]],
+    target_to_candidate: dict[str, dict[str, Any]],
+    tool_event_targets: set[str],
+    review_paths: set[str],
+) -> dict[str, Any]:
+    row = dict(read)
+    target = str(row.get("target") or "")
+    kind = str(row.get("kind") or "")
+    source_ref = row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {}
+    existing_selection = (
+        row.get("process_actual_use_selection")
+        if isinstance(row.get("process_actual_use_selection"), dict)
+        else {}
+    )
+    candidate = candidate_by_id.get(str(row.get("candidate_id") or "")) or target_to_candidate.get(target) or {}
+    existing_tier = row.get("actual_use_source_tier") or existing_selection.get("source_tier")
+    if existing_tier in {
+        PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING,
+    }:
+        tier = str(existing_tier)
+    else:
+        tier = process_actual_use_source_tier(kind=kind, target=target, source_ref=source_ref)
+    if target in review_paths or kind in {"task_or_review_artifact", "artifact", "hint_path"}:
+        tier = PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
+    if target in tool_event_targets or kind == "tool_event_source_ref":
+        tier = PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+    bucket_text = " ".join(
+        str(part or "")
+        for part in (
+            row.get("reason"),
+            target,
+            candidate.get("snippet"),
+            candidate.get("role"),
+            candidate.get("timestamp_utc"),
+            " ".join(str(item) for item in candidate.get("reason_codes") or []),
+        )
+    )
+    buckets = list(existing_selection.get("selected_buckets") or process_actual_use_bucket_matches(bucket_text))
+    if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY and not buckets:
+        buckets = ["raw_session_timing_context"]
+    original_reason = existing_selection.get("original_reason") or row.get("reason")
+    if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY:
+        row["reason"] = "primary raw session/tool-event timing window for process actual-use bucket audit"
+    elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY:
+        row["reason"] = "secondary lead/context only; use to locate raw timing or reviewer enforcement evidence"
+    row["actual_use_source_tier"] = tier
+    row["process_actual_use_selection"] = {
+        "schema_version": 1,
+        "source_tier": tier,
+        "selected_buckets": buckets,
+        "primary_for_behavior_claims": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
+        "secondary_artifacts_are_final_proof": False,
+        "anti_contamination_role": (
+            "primary_raw_evidence"
+            if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+            else "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+        ),
+        "raw_text_included": False,
+        "original_reason": original_reason,
+    }
+    row["_process_actual_use_sort_key"] = process_actual_use_read_sort_key(row, index)
+    return row
+
+
+def process_actual_use_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
+    tier = read.get("actual_use_source_tier")
+    tier_rank = {
+        PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
+        PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
+    }.get(str(tier), 3)
+    buckets = set((read.get("process_actual_use_selection") or {}).get("selected_buckets") or [])
+    decisive_bucket_rank = 0 if buckets & {"consulted_before_planning", "changed_behavior_scope_or_claim_boundaries"} else 1
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    timestamp_rank = 0 if source_ref.get("timestamp_utc") else 1
+    return (tier_rank, decisive_bucket_rank + timestamp_rank, index)
+
+
+def process_actual_use_source_tier(*, kind: str, target: str | None, source_ref: dict[str, Any]) -> str:
+    target_text = str(target or "")
+    path = str(source_ref.get("path") or target_text.split(":", 1)[0] or "").lower().replace("\\", "/")
+    kind_text = str(kind or "").lower()
+    if "tool_event" in kind_text:
+        return PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+    if kind_text in {"task_or_review_artifact", "artifact", "hint_path"}:
+        return PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
+    if path.endswith(".jsonl") or ".jsonl:" in target_text.lower() or path.endswith(".jsonl.gz"):
+        return PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+    if process_actual_use_secondary_artifact_path(path):
+        return PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
+    return PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING
+
+
+def process_actual_use_secondary_artifact_path(path: str) -> bool:
+    normalized = f"/{path.strip('/')}"
+    return any(
+        marker in normalized
+        for marker in (
+            "/tasks/",
+            "/reviews/",
+            "/reports/",
+            "/docs/",
+            "/learnings/",
+            "/codex/state/reviews/",
+        )
+    )
+
+
+def process_actual_use_bucket_matches(text: str) -> list[str]:
+    lowered = str(text or "").lower()
+    matches: list[str] = []
+    for bucket, terms in PROCESS_ACTUAL_USE_BUCKET_TERMS.items():
+        if any(term in lowered for term in terms):
+            matches.append(bucket)
+    return matches
+
+
+def dedupe_process_actual_use_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for read in reads:
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        key = json.dumps(
+            {
+                "kind": read.get("kind"),
+                "target": read.get("target"),
+                "path": source_ref.get("path"),
+                "line": source_ref.get("line"),
+            },
+            sort_keys=True,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(read)
+    return result
+
+
+def annotate_process_actual_use_source_locator_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
+    result = dict(handoff)
+    raw_count = 0
+    secondary_count = 0
+    windows = []
+    for index, window in enumerate(list(result.get("source_windows") or [])):
+        row = dict(window)
+        tier = process_actual_use_source_tier(
+            kind="jsonl_source_ref",
+            target=str(row.get("target") or ""),
+            source_ref=row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {},
+        )
+        if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY:
+            raw_count += 1
+            row["window_kind"] = "actual_use_raw_timing"
+        elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY:
+            secondary_count += 1
+            row["window_kind"] = "actual_use_secondary_lead"
+        row["actual_use_source_tier"] = tier
+        row["process_actual_use_selection"] = {
+            "schema_version": 1,
+            "source_tier": tier,
+            "primary_for_behavior_claims": tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY,
+            "secondary_artifacts_are_final_proof": False,
+            "raw_text_included": False,
+        }
+        row["_process_actual_use_sort_key"] = process_actual_use_read_sort_key(row, index)
+        windows.append(row)
+    windows.sort(key=lambda item: item.pop("_process_actual_use_sort_key"))
+    result["source_windows"] = windows
+    result["next_reads"] = prioritize_process_actual_use_next_reads(
+        list(result.get("next_reads") or []),
+        candidates=[],
+        tool_proof={"events": []},
+        joins={"review_evidence": []},
+    )
+    packaging = dict(result.get("source_window_packaging") or {})
+    selection_policy = dict(packaging.get("selection_policy") or {})
+    selection_policy["process_actual_use_primary_raw_selection"] = {
+        "schema_version": 1,
+        "primary_raw_window_count": raw_count,
+        "secondary_lead_window_count": secondary_count,
+        "raw_windows_preferred_before_secondary_artifacts": True,
+        "secondary_artifacts_final_behavior_proof": False,
+        "raw_text_included": False,
+    }
+    packaging["selection_policy"] = selection_policy
+    result["source_window_packaging"] = packaging
+    result["process_actual_use_source_selection"] = {
+        "schema_version": 1,
+        "primary_raw_next_read_count": sum(
+            1
+            for item in result.get("next_reads") or []
+            if item.get("actual_use_source_tier") == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+        ),
+        "secondary_lead_next_read_count": sum(
+            1
+            for item in result.get("next_reads") or []
+            if item.get("actual_use_source_tier") == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
+        ),
+        "raw_timing_windows_promoted_before_secondary_artifacts": True,
+        "secondary_artifact_rule": "task/review/report/doc artifacts are leads/context unless they locate raw timing or reviewer enforcement",
+        "anti_contamination_gate": "do_not_answer_from_post_hoc_task_review_report_summary_artifacts_when_raw_timing_evidence_is_available",
+        "raw_text_included": False,
+    }
+    return result
 
 
 def empty_source_handle_routing() -> dict[str, Any]:
@@ -4712,16 +5082,19 @@ def build_next_reads(
             read = {
                 "kind": "jsonl_source_ref",
                 "target": target,
+                "candidate_id": str(candidate.get("candidate_id") or ""),
                 "source_ref": dict(ref),
                 "reason": "confirm candidate snippet in source context",
                 "expansion_actions": read_more_actions_for_source_ref(
                     ref,
+                    candidate_id=str(candidate.get("candidate_id") or ""),
                     expansion_action_context=expansion_action_context,
                 ),
             }
             if include_context_actions:
                 read["context_actions"] = context_actions_for_source_ref(
                     ref,
+                    candidate_id=str(candidate.get("candidate_id") or ""),
                     expansion_action_context=expansion_action_context,
                 )
             reads.append(read)
