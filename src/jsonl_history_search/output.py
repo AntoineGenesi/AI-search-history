@@ -503,6 +503,9 @@ def _append_process_actual_use_read_plan_text(
         "- excluded candidate policy: post-hoc answer-key candidates are diagnostic-only; open only for contamination audit or explicit prior-answer/report recovery"
     )
     lines.append(
+        "- current-run self-echo policy: current prompt/tool-output/same-lane evidence is diagnostic-only for historical actual-use prompts unless the prompt asks about the current lane/tool/run"
+    )
+    lines.append(
         "- prior final prose support: "
         + (
             "allowed only because the prompt explicitly asks for a prior answer/report"
@@ -525,6 +528,14 @@ def _append_process_actual_use_read_plan_text(
         lines.append("- post_hoc_answer_key_candidates_excluded_from_required_reads:")
         lines.append("  diagnostic-only: do not open these as answer evidence or normal follow-through")
         for item in answer_key[:3]:
+            _append_text_read(lines, item, command_by_target=command_by_target)
+    diagnostic = list(plan.get("diagnostic_only_candidates") or [])
+    if diagnostic:
+        lines.append("- diagnostic_only_current_run_self_echo_candidates_excluded_from_required_reads:")
+        lines.append(
+            "  diagnostic-only: current-run prompt echoes/tool output are not historical final support or normal follow-through"
+        )
+        for item in diagnostic[:3]:
             _append_text_read(lines, item, command_by_target=command_by_target)
     _append_process_actual_use_bucket_bundle_text(
         lines,
@@ -549,6 +560,7 @@ def _append_process_actual_use_read_plan_markdown(
             "",
             "- Open required primary raw reads first; secondary leads and post-hoc answer-key candidates are not final support.",
             "- Excluded candidate policy: post-hoc answer-key candidates are diagnostic-only; open only for contamination audit or explicit prior-answer/report recovery.",
+            "- Current-run self-echo policy: current prompt/tool-output/same-lane evidence is diagnostic-only for historical actual-use prompts unless the prompt asks about the current lane/tool/run.",
             (
                 "- Prior final prose support: allowed only because the prompt explicitly asks for a prior answer/report."
                 if guidance.get("prior_final_prose_counts_as_support")
@@ -574,6 +586,15 @@ def _append_process_actual_use_read_plan_markdown(
         )
         lines.append("- Diagnostic-only: open only for contamination audit or explicit prior-answer/report recovery.")
         for item in answer_key[:3]:
+            _append_markdown_read(lines, item, command_by_target=command_by_target)
+    diagnostic = list(plan.get("diagnostic_only_candidates") or [])
+    if diagnostic:
+        lines.extend(["", "### Diagnostic-Only Current-Run Self-Echo Candidates", ""])
+        lines.append(
+            "- Excluded from required final-support reads and normal read-more follow-through for historical actual-use prompts."
+        )
+        lines.append("- Diagnostic-only: open only for current lane/tool/run behavior audit.")
+        for item in diagnostic[:3]:
             _append_markdown_read(lines, item, command_by_target=command_by_target)
     _append_process_actual_use_bucket_bundle_markdown(
         lines,

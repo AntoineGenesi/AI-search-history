@@ -143,7 +143,10 @@ def build_semantic_debug_payload(
     source_scope = build_source_scope_summary(source_plan, result)
     candidates = compact_candidates(agent_find.get("find_candidates", []))
     source_selection_candidates = (
-        prioritize_process_actual_use_candidates(candidates)
+        prioritize_process_actual_use_candidates(
+            candidates,
+            query=agent_find["query"]["original"],
+        )
         if process_actual_use
         else candidates
     )
@@ -871,7 +874,17 @@ PROCESS_ACTUAL_USE_BUCKET_TERMS = {
 }
 
 
-def prioritize_process_actual_use_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+PROCESS_ACTUAL_USE_CHRONOLOGY_PRIMARY_RAW = "primary_raw_evidence"
+PROCESS_ACTUAL_USE_CHRONOLOGY_SECONDARY = "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC = "post_hoc_answer_key_artifact"
+PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO = "current_run_self_echo_diagnostic"
+
+
+def prioritize_process_actual_use_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
     ranked: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
     for index, candidate in enumerate(candidates):
         row = dict(candidate)
@@ -895,9 +908,33 @@ def prioritize_process_actual_use_candidates(candidates: list[dict[str, Any]]) -
         )
         row["process_actual_use_source_tier"] = tier
         row["process_actual_use_bucket_matches"] = buckets
+        candidate_text = " ".join(
+            str(part or "")
+            for part in (
+                target,
+                row.get("snippet"),
+                row.get("role"),
+                row.get("timestamp_utc"),
+                " ".join(str(item) for item in row.get("reason_codes") or []),
+            )
+        )
+        current_run_self_echo = process_actual_use_current_run_or_self_echo_candidate(
+            candidate_text,
+            query=query,
+        )
+        explicit_current_run = process_actual_use_current_run_or_tool_behavior_requested(query or "")
+        if current_run_self_echo:
+            row["process_actual_use_current_run_self_echo_candidate"] = True
+            row["process_actual_use_source_chronology_role"] = (
+                PROCESS_ACTUAL_USE_CHRONOLOGY_PRIMARY_RAW
+                if explicit_current_run
+                else PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+            )
         reason_codes = list(row.get("reason_codes") or [])
         if tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY and "process_actual_use_primary_raw_timing" not in reason_codes:
             reason_codes.append("process_actual_use_primary_raw_timing")
+        if current_run_self_echo and not explicit_current_run and "process_actual_use_current_run_self_echo_diagnostic" not in reason_codes:
+            reason_codes.append("process_actual_use_current_run_self_echo_diagnostic")
         elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY and "process_actual_use_secondary_lead" not in reason_codes:
             reason_codes.append("process_actual_use_secondary_lead")
         row["reason_codes"] = reason_codes
@@ -907,11 +944,14 @@ def prioritize_process_actual_use_candidates(candidates: list[dict[str, Any]]) -
 
 def process_actual_use_candidate_sort_key(candidate: dict[str, Any], index: int) -> tuple[int, int, int]:
     tier = candidate.get("process_actual_use_source_tier")
-    tier_rank = {
-        PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
-        PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
-        PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
-    }.get(str(tier), 3)
+    if candidate.get("process_actual_use_source_chronology_role") == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO:
+        tier_rank = 3
+    else:
+        tier_rank = {
+            PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY: 0,
+            PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING: 1,
+            PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY: 2,
+        }.get(str(tier), 3)
     buckets = set(candidate.get("process_actual_use_bucket_matches") or [])
     decisive_bucket_rank = 0 if buckets & {"consulted_before_planning", "changed_behavior_scope_or_claim_boundaries"} else 1
     timestamp_rank = 0 if candidate.get("timestamp_utc") else 1
@@ -1016,12 +1056,17 @@ def annotate_process_actual_use_next_read(
         row["reason"] = "primary raw session/tool-event timing window for process actual-use bucket audit"
     elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY:
         row["reason"] = "secondary lead/context only; use to locate raw timing or reviewer enforcement evidence"
-    if chronology["source_chronology_role"] == "post_hoc_answer_key_artifact" and not chronology[
+    if chronology["source_chronology_role"] == PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC and not chronology[
         "explicit_prior_answer_or_report_requested"
     ]:
         row["reason"] = (
             "post-hoc answer-key or prior final-answer prose candidate; do not count as final "
             "support for process actual-use unless the prompt asks for that prior answer/report"
+        )
+    if chronology["source_chronology_role"] == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO:
+        row["reason"] = (
+            "current-run prompt/tool-output/self-echo diagnostic; do not count as final support "
+            "for historical process actual-use unless the prompt asks about the current run/tool/lane"
         )
     diagnostic_only = process_actual_use_diagnostic_only_chronology(chronology)
     row["actual_use_source_tier"] = tier
@@ -1029,10 +1074,16 @@ def annotate_process_actual_use_next_read(
     row["followthrough_actionable"] = not diagnostic_only
     row["diagnostic_only"] = diagnostic_only
     if diagnostic_only:
-        row["diagnostic_open_policy"] = (
-            "Open only for contamination/chronology audit, or when the user explicitly asks "
-            "to recover a prior answer/report; do not use as answer evidence."
-        )
+        if chronology["source_chronology_role"] == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO:
+            row["diagnostic_open_policy"] = (
+                "Open only for current-lane/tool/run behavior audit; do not use as answer evidence "
+                "for a historical process actual-use claim."
+            )
+        else:
+            row["diagnostic_open_policy"] = (
+                "Open only for contamination/chronology audit, or when the user explicitly asks "
+                "to recover a prior answer/report; do not use as answer evidence."
+            )
         row["expansion_actions"] = []
         row["context_actions"] = []
     row["process_actual_use_selection"] = {
@@ -1051,13 +1102,22 @@ def annotate_process_actual_use_next_read(
         "followthrough_actionable": not diagnostic_only,
         "diagnostic_only": diagnostic_only,
         "diagnostic_open_policy": (
-            "contamination_audit_or_explicit_prior_answer_request_only"
+            "current_lane_tool_run_audit_only"
+            if diagnostic_only
+            and chronology["source_chronology_role"] == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+            else "contamination_audit_or_explicit_prior_answer_request_only"
             if diagnostic_only
             else "normal_process_actual_use_followthrough"
         ),
         "post_hoc_answer_key_candidate": chronology["source_chronology_role"] == "post_hoc_answer_key_artifact",
+        "current_run_self_echo_candidate": chronology["source_chronology_role"]
+        == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+        or chronology["current_run_self_echo_candidate"],
         "prior_final_prose_candidate": chronology["prior_final_prose_candidate"],
         "explicit_prior_answer_or_report_requested": chronology["explicit_prior_answer_or_report_requested"],
+        "explicit_current_run_or_tool_behavior_requested": chronology[
+            "explicit_current_run_or_tool_behavior_requested"
+        ],
         "raw_text_included": False,
         "original_reason": original_reason,
     }
@@ -1069,14 +1129,21 @@ def process_actual_use_diagnostic_only_chronology(chronology: dict[str, Any]) ->
     return (
         chronology.get("source_chronology_role") == "post_hoc_answer_key_artifact"
         and not chronology.get("explicit_prior_answer_or_report_requested")
+    ) or (
+        chronology.get("source_chronology_role") == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+        and not chronology.get("explicit_current_run_or_tool_behavior_requested")
     )
 
 
 def process_actual_use_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
     tier = read.get("actual_use_source_tier")
     selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
-    if selection.get("post_hoc_answer_key_candidate") and not selection.get(
-        "explicit_prior_answer_or_report_requested"
+    if (
+        selection.get("post_hoc_answer_key_candidate")
+        and not selection.get("explicit_prior_answer_or_report_requested")
+    ) or (
+        selection.get("current_run_self_echo_candidate")
+        and not selection.get("explicit_current_run_or_tool_behavior_requested")
     ):
         tier_rank = 3
     else:
@@ -1133,17 +1200,22 @@ def classify_process_actual_use_read_chronology(
         )
     )
     explicit_request = process_actual_use_prior_answer_or_report_requested(query or "")
+    explicit_current_run = process_actual_use_current_run_or_tool_behavior_requested(query or "")
     prior_final_prose = process_actual_use_prior_final_prose_candidate(text)
     post_hoc_artifact = process_actual_use_post_hoc_artifact_candidate(kind=kind, path=path, text=text)
+    current_run_self_echo = process_actual_use_current_run_or_self_echo_candidate(text, query=query)
     tier = source_tier or process_actual_use_source_tier(kind=kind, target=target, source_ref=source_ref)
-    if (prior_final_prose or post_hoc_artifact) and not explicit_request:
-        role = "post_hoc_answer_key_artifact"
+    if current_run_self_echo and not explicit_current_run:
+        role = PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+        final_support_allowed = False
+    elif (prior_final_prose or post_hoc_artifact) and not explicit_request:
+        role = PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC
         final_support_allowed = False
     elif tier == PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY:
-        role = "primary_raw_evidence"
+        role = PROCESS_ACTUAL_USE_CHRONOLOGY_PRIMARY_RAW
         final_support_allowed = True
     else:
-        role = "legitimate_secondary_lead_or_context_not_final_behavior_proof"
+        role = PROCESS_ACTUAL_USE_CHRONOLOGY_SECONDARY
         final_support_allowed = False
     return {
         "schema_version": 1,
@@ -1152,7 +1224,55 @@ def classify_process_actual_use_read_chronology(
         "prior_final_prose_candidate": prior_final_prose,
         "post_hoc_artifact_candidate": post_hoc_artifact,
         "explicit_prior_answer_or_report_requested": explicit_request,
+        "current_run_self_echo_candidate": current_run_self_echo,
+        "explicit_current_run_or_tool_behavior_requested": explicit_current_run,
     }
+
+
+def process_actual_use_current_run_or_tool_behavior_requested(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    if clearly_intends_current_session(lowered):
+        return True
+    explicit_patterns = (
+        r"\bcurrent\s+(?:lane|tool|jsonl\s+lane|semantic-debug|semantic\s+debug|run|route|workflow)\b",
+        r"\bthis\s+(?:lane|tool|jsonl\s+lane|semantic-debug|semantic\s+debug|route|workflow)\b",
+        r"\bsame\s+(?:lane|run|eval|tool)\b",
+        r"\blive\s+(?:lane|tool|semantic-debug|semantic\s+debug|jsonl\s+route)\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in explicit_patterns)
+
+
+def process_actual_use_current_run_or_self_echo_candidate(text: str, *, query: str | None = None) -> bool:
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    echo = setup_echo_classification(text, query=query or "")
+    if echo.get("is_setup_echo"):
+        return True
+    current_tool_markers = (
+        "jsonl-history-search semantic-debug",
+        "semantic-debug command",
+        "semantic debug command",
+        "semantic-debug output",
+        "semantic debug output",
+        "process actual use final support read plan",
+        "process_actual_use_final_support_read_plan",
+        "source locator handoff",
+        "source_locator_handoff",
+        "answer ready handoff",
+        "answer_ready_handoff",
+        "follow-next-reads",
+        "follow next reads",
+        "raw-lane-tool-reports",
+        "raw lane tool reports",
+        "lane prompt",
+        "worker lane",
+        "jsonl lane",
+        "same lane eval",
+        "same-lane eval",
+        "current benchmark",
+        "current-run prompt",
+        "current run prompt",
+    )
+    return any(marker in lowered for marker in current_tool_markers)
 
 
 def process_actual_use_prior_answer_or_report_requested(text: str) -> bool:
@@ -1234,39 +1354,53 @@ def build_process_actual_use_final_support_read_plan(
     query: str | None = None,
 ) -> dict[str, Any]:
     explicit_request = process_actual_use_prior_answer_or_report_requested(query or "")
+    explicit_current_run = process_actual_use_current_run_or_tool_behavior_requested(query or "")
     required: list[dict[str, Any]] = []
     secondary: list[dict[str, Any]] = []
     answer_key: list[dict[str, Any]] = []
+    diagnostic: list[dict[str, Any]] = []
     for read in next_reads:
-        row = process_actual_use_read_plan_row(read, explicit_request=explicit_request)
+        row = process_actual_use_read_plan_row(
+            read,
+            explicit_request=explicit_request,
+            explicit_current_run_request=explicit_current_run,
+        )
         selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
         role = row.get("source_chronology_role")
         if selection.get("required_final_support_read") or row.get("final_support_allowed"):
             required.append(row)
-        elif role == "post_hoc_answer_key_artifact":
+        elif role == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO:
+            diagnostic.append(row)
+        elif role == PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC:
             answer_key.append(row)
         else:
             secondary.append(row)
     required = required[:PROCESS_ACTUAL_USE_REQUIRED_READ_CAP]
     secondary = secondary[:PROCESS_ACTUAL_USE_SECONDARY_LEAD_CAP]
     answer_key = answer_key[:PROCESS_ACTUAL_USE_ANSWER_KEY_CAP]
+    diagnostic = diagnostic[:PROCESS_ACTUAL_USE_ANSWER_KEY_CAP]
     plan = {
         "schema_version": 1,
         "status": "active",
         "explicit_prior_answer_or_report_requested": explicit_request,
+        "explicit_current_run_or_tool_behavior_requested": explicit_current_run,
         "required_primary_raw_final_support_reads": required,
         "secondary_leads": secondary,
         "post_hoc_answer_key_candidates": answer_key,
+        "diagnostic_only_candidates": diagnostic,
         "required_primary_raw_final_support_read_count": len(required),
         "secondary_lead_count": len(secondary),
         "post_hoc_answer_key_candidate_count": len(answer_key),
+        "diagnostic_only_candidate_count": len(diagnostic),
         "diagnostic_only_excluded_candidate_count": sum(
-            1 for row in answer_key if row.get("diagnostic_only")
+            1 for row in answer_key + diagnostic if row.get("diagnostic_only")
         ),
         "actionable_followthrough_read_count": sum(
-            1 for row in required + secondary + answer_key if row.get("followthrough_actionable")
+            1 for row in required + secondary + answer_key + diagnostic if row.get("followthrough_actionable")
         ),
-        "excluded_from_required_final_support_read_count": len(secondary) + (0 if explicit_request else len(answer_key)),
+        "excluded_from_required_final_support_read_count": (
+            len(secondary) + (0 if explicit_request else len(answer_key)) + len(diagnostic)
+        ),
         "compact_read_order": [row.get("target") for row in required if row.get("target")],
         "guidance": {
             "do_first": "open_required_primary_raw_final_support_reads",
@@ -1279,7 +1413,13 @@ def build_process_actual_use_final_support_read_plan(
                 "diagnostic-only for normal process actual-use prompts: keep visible for chronology/contamination "
                 "audit, but do not open as required/top/read-more follow-through or answer evidence"
             ),
+            "current_run_self_echo_policy": (
+                "current-run prompt echoes, current semantic-debug command/output, and same-lane eval mechanics "
+                "are diagnostic-only for historical actual-use prompts; they count as support only when the prompt "
+                "explicitly asks about the current lane/tool/run behavior"
+            ),
             "prior_final_prose_counts_as_support": bool(explicit_request),
+            "current_run_self_echo_counts_as_support": bool(explicit_current_run),
             "chronology_required": True,
             "raw_text_included": False,
         },
@@ -1288,6 +1428,8 @@ def build_process_actual_use_final_support_read_plan(
             "secondary_leads_count_as_final_support": False,
             "post_hoc_answer_key_candidates_count_as_final_support": bool(explicit_request),
             "post_hoc_answer_key_candidates_count_as_actionable_followthrough": bool(explicit_request),
+            "current_run_self_echo_candidates_count_as_final_support": bool(explicit_current_run),
+            "current_run_self_echo_candidates_count_as_actionable_followthrough": bool(explicit_current_run),
             "release_or_token_savings_claim_supported": False,
         },
         "cap_policy": {
@@ -1305,6 +1447,7 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
     required = list(plan.get("required_primary_raw_final_support_reads") or [])
     secondary = list(plan.get("secondary_leads") or [])
     answer_key = list(plan.get("post_hoc_answer_key_candidates") or [])
+    diagnostic = list(plan.get("diagnostic_only_candidates") or [])
     buckets: dict[str, dict[str, Any]] = {}
     for bucket in process_actual_use_bucket_contract():
         bucket_name = str(bucket.get("bucket") or "")
@@ -1323,6 +1466,11 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             for item in answer_key
             if bucket_name in set(item.get("selected_buckets") or [])
         ][:PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP]
+        excluded_current_run_self_echoes = [
+            process_actual_use_bucket_evidence_row(item, evidence_role="excluded_current_run_self_echo_diagnostic")
+            for item in diagnostic
+            if bucket_name in set(item.get("selected_buckets") or [])
+        ][:PROCESS_ACTUAL_USE_BUCKET_EVIDENCE_CAP]
         if primary_support:
             status = "primary_raw_support_available"
             answer_use = "use_primary_raw_reads_for_behavior_or_timing_claims"
@@ -1332,6 +1480,9 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
         elif excluded_answer_keys:
             status = "excluded_post_hoc_answer_key_only"
             answer_use = "excluded_unless_prompt_explicitly_asks_for_prior_answer_or_report"
+        elif excluded_current_run_self_echoes:
+            status = "excluded_current_run_self_echo_only"
+            answer_use = "diagnostic_only_unless_prompt_explicitly_asks_about_current_lane_tool_or_run"
         else:
             status = "no_evidence_in_selected_reads"
             answer_use = "state_gap_or_run_targeted_follow_up_before_claiming_bucket"
@@ -1344,15 +1495,21 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             "primary_raw_evidence": primary_support,
             "secondary_leads": secondary_leads,
             "excluded_post_hoc_answer_key_candidates": excluded_answer_keys,
+            "excluded_current_run_self_echo_candidates": excluded_current_run_self_echoes,
             "primary_raw_evidence_count": len(primary_support),
             "secondary_lead_count": len(secondary_leads),
             "excluded_post_hoc_answer_key_candidate_count": len(excluded_answer_keys),
+            "excluded_current_run_self_echo_candidate_count": len(excluded_current_run_self_echoes),
             "raw_text_included": False,
         }
     missing_buckets = [
         bucket
         for bucket, item in buckets.items()
-        if item["status"] in {"no_evidence_in_selected_reads", "excluded_post_hoc_answer_key_only"}
+        if item["status"] in {
+            "no_evidence_in_selected_reads",
+            "excluded_post_hoc_answer_key_only",
+            "excluded_current_run_self_echo_only",
+        }
     ]
     secondary_only_buckets = [
         bucket for bucket, item in buckets.items() if item["status"] == "secondary_leads_only"
@@ -1374,6 +1531,7 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             "secondary_only_bucket_count": len(secondary_only_buckets),
             "missing_or_excluded_bucket_count": len(missing_buckets),
             "post_hoc_answer_key_candidate_count": len(answer_key),
+            "current_run_self_echo_candidate_count": len(diagnostic),
         },
         "guidance": {
             "do_first": "answer_from_bucket_primary_raw_evidence_when_available",
@@ -1384,6 +1542,10 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
                 "excluded from final support and normal follow-through unless explicitly requested; "
                 "open only for contamination/chronology audit"
             ),
+            "current_run_self_echo_policy": (
+                "excluded from historical final support and normal follow-through unless the prompt explicitly "
+                "asks about current lane/tool/run behavior"
+            ),
             "raw_text_included": False,
         },
         "claim_boundaries": {
@@ -1393,6 +1555,9 @@ def build_process_actual_use_bucket_evidence_bundle(plan: dict[str, Any]) -> dic
             "secondary_leads_count_as_behavior_proof": False,
             "excluded_post_hoc_answer_key_candidates_are_actionable_followthrough": bool(
                 plan.get("explicit_prior_answer_or_report_requested")
+            ),
+            "excluded_current_run_self_echo_candidates_are_actionable_followthrough": bool(
+                plan.get("explicit_current_run_or_tool_behavior_requested")
             ),
         },
     }
@@ -1417,7 +1582,12 @@ def process_actual_use_bucket_evidence_row(item: dict[str, Any], *, evidence_rol
     }
 
 
-def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: bool) -> dict[str, Any]:
+def process_actual_use_read_plan_row(
+    read: dict[str, Any],
+    *,
+    explicit_request: bool,
+    explicit_current_run_request: bool = False,
+) -> dict[str, Any]:
     selection = read.get("process_actual_use_selection") if isinstance(read.get("process_actual_use_selection"), dict) else {}
     role = selection.get("source_chronology_role") or selection.get("anti_contamination_role")
     if role is None:
@@ -1427,11 +1597,14 @@ def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: 
             else "legitimate_secondary_lead_or_context_not_final_behavior_proof"
         )
     final_support_allowed = bool(selection.get("final_support_allowed", False))
-    if role == "post_hoc_answer_key_artifact" and not explicit_request:
+    if role == PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC and not explicit_request:
+        final_support_allowed = False
+    if role == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO and not explicit_current_run_request:
         final_support_allowed = False
     diagnostic_only = bool(
         selection.get("diagnostic_only")
-        or (role == "post_hoc_answer_key_artifact" and not explicit_request)
+        or (role == PROCESS_ACTUAL_USE_CHRONOLOGY_POST_HOC and not explicit_request)
+        or (role == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO and not explicit_current_run_request)
     )
     read_more_actionable = bool(selection.get("read_more_actionable", read.get("read_more_actionable", True)))
     followthrough_actionable = bool(
@@ -1452,6 +1625,9 @@ def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: 
         "followthrough_actionable": followthrough_actionable,
         "diagnostic_only": diagnostic_only,
         "diagnostic_open_policy": (
+            "current_lane_tool_run_audit_only"
+            if diagnostic_only and role == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
+            else
             "contamination_audit_or_explicit_prior_answer_request_only"
             if diagnostic_only
             else "normal_process_actual_use_followthrough"
@@ -1459,6 +1635,8 @@ def process_actual_use_read_plan_row(read: dict[str, Any], *, explicit_request: 
         "final_support_rule": (
             "may_support_behavior_claims_after_inspection"
             if final_support_allowed
+            else "current_run_self_echo_diagnostic_only_do_not_count_as_historical_process_support"
+            if role == PROCESS_ACTUAL_USE_CHRONOLOGY_CURRENT_RUN_SELF_ECHO
             else "lead_or_context_only_do_not_count_as_final_support"
         ),
         "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
