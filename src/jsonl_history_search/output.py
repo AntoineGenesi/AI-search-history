@@ -4395,6 +4395,22 @@ def render_install_validation_text(payload: dict) -> str:
     ]
     if validation.get("codex_home"):
         lines.append(f"Codex home: {validation['codex_home']}")
+    preflight = validation.get("agent_preflight") or {}
+    if preflight:
+        lines.append("Agent preflight:")
+        lines.append(f"- Global skill freshness: {preflight.get('global_skill_freshness', 'unknown')}")
+        lines.append(f"- Must refresh global skill: {preflight.get('must_refresh_global_skill')}")
+        if preflight.get("stale_or_missing_global_checks"):
+            lines.append(
+                "- Stale/missing global checks: "
+                + ", ".join(str(item) for item in preflight.get("stale_or_missing_global_checks", []))
+            )
+            lines.append(f"- Refresh command: {preflight.get('refresh_command')}")
+        lines.append(f"- Validate global command: {preflight.get('validate_global_command')}")
+        lines.append("- JSH-1098 proven route demos:")
+        for demo in preflight.get("jsh1098_route_demos", []):
+            lines.append(f"  - {demo.get('label')}: {demo.get('first_move')}")
+        lines.append(f"- Claim boundary: {preflight.get('claim_boundary')}")
     lines.append("Details:")
     for check in validation.get("checks", []):
         lines.append(f"- {str(check.get('status', '')).upper()} {check.get('name')}: {check.get('detail')}")
@@ -4431,6 +4447,29 @@ def render_install_validation_markdown(payload: dict) -> str:
     if suggestions:
         lines.extend(["", "## Recovery Suggestions", ""])
         lines.extend(f"- {item}" for item in suggestions)
+    preflight = validation.get("agent_preflight") or {}
+    if preflight:
+        lines.extend(
+            [
+                "",
+                "## Agent Preflight",
+                "",
+                f"- Global skill freshness: `{preflight.get('global_skill_freshness', 'unknown')}`",
+                f"- Must refresh global skill: `{preflight.get('must_refresh_global_skill')}`",
+                f"- Validate global command: `{preflight.get('validate_global_command')}`",
+            ]
+        )
+        stale = preflight.get("stale_or_missing_global_checks") or []
+        if stale:
+            lines.append(f"- Stale/missing global checks: `{', '.join(str(item) for item in stale)}`")
+            lines.append(f"- Refresh command: `{preflight.get('refresh_command')}`")
+        lines.extend(["", "### JSH-1098 Proven Route Demos", ""])
+        for demo in preflight.get("jsh1098_route_demos", []):
+            lines.append(
+                f"- **{demo.get('label')}**: `{demo.get('first_move')}` "
+                f"for {demo.get('prompt_shape')}"
+            )
+        lines.extend(["", f"Claim boundary: {preflight.get('claim_boundary')}"])
     return "\n".join(lines)
 
 

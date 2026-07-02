@@ -69,6 +69,7 @@ def validate_install(
             "user_home_mutated": False,
             "package_root": str(root),
             "codex_home": str(codex_home.expanduser()) if codex_home is not None else None,
+            "agent_preflight": _agent_preflight(checks, codex_home=codex_home),
             "summary": counts,
             "checks": [check.to_dict() for check in checks],
             "warnings": [check.detail for check in checks if check.status == "warn"],
@@ -76,6 +77,68 @@ def validate_install(
         }
     }
     return payload
+
+
+def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) -> dict[str, Any]:
+    global_checks = [check for check in checks if check.id.startswith("global_")]
+    if codex_home is None:
+        freshness_status = "not_checked"
+        stale_or_missing: list[str] = []
+    else:
+        stale_or_missing = [check.id for check in global_checks if check.status == "fail"]
+        freshness_status = "pass" if not stale_or_missing else "fail"
+    return {
+        "purpose": (
+            "Run before free-agent or user-facing JSONL workflows that rely on "
+            "the installed global Codex skill."
+        ),
+        "global_skill_freshness": freshness_status,
+        "must_refresh_global_skill": freshness_status == "fail",
+        "stale_or_missing_global_checks": stale_or_missing,
+        "refresh_command": "bash install/install_codex_global.sh",
+        "validate_global_command": (
+            "jsonl-history-search validate-install --codex-home ~/.codex --format text"
+        ),
+        "jsh1098_route_demos": _jsh1098_route_demos(),
+        "claim_boundary": (
+            "JSH-1098 showed sampled lower-burden source-window routing, not "
+            "broad release readiness, provider-token savings, all-history "
+            "completeness, or universal superiority."
+        ),
+    }
+
+
+def _jsh1098_route_demos() -> list[dict[str, str]]:
+    return [
+        {
+            "id": "date_timeline_exact_ref",
+            "label": "Date/timeline exact-ref recovery",
+            "prompt_shape": "In the session dated <date>, what happened with <event>?",
+            "first_move": 'jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text',
+            "followthrough": "Open the promoted source window with compact read-more before broad repo search.",
+        },
+        {
+            "id": "heldout_vague_paraphrase",
+            "label": "Vague remembered-history retrieval",
+            "prompt_shape": "What did I say before about making this clearly valuable upfront?",
+            "first_move": 'jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text',
+            "followthrough": "Use semantic-debug/source-window follow-through before artifact recovery.",
+        },
+        {
+            "id": "agent_action_overwrite_proof",
+            "label": "Agent action/proof verification",
+            "prompt_shape": "Did the agent overwrite those workflow/planner edits?",
+            "first_move": 'jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text',
+            "followthrough": "Inspect tool/action proof, command output, diffs, commits, or review metadata.",
+        },
+        {
+            "id": "decision_rationale_source_window",
+            "label": "Decision-rationale/source-window provenance",
+            "prompt_shape": "Why did we distinguish persistent coordinator from wait loops?",
+            "first_move": 'jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text',
+            "followthrough": "Answer from the reviewed source window and preserve corrections/uncertainty.",
+        },
+    ]
 
 
 def default_package_root() -> Path:
