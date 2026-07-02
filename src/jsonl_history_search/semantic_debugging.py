@@ -2360,6 +2360,9 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
             "correction_window_source_selection": read.get("correction_window_source_selection")
             if isinstance(read.get("correction_window_source_selection"), dict)
             else None,
+            "reviewed_source_packet_pointer": read.get("reviewed_source_packet_pointer")
+            if isinstance(read.get("reviewed_source_packet_pointer"), dict)
+            else None,
             "omitted_window_recovery": bool(read.get("omitted_window_recovery")),
             "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
             "action": guidance,
@@ -2964,6 +2967,14 @@ def build_primary_source_followthrough(
         }
     first = primary_reads[0]
     target = str(first.get("target") or "")
+    reviewed_pointer = (
+        first.get("reviewed_source_packet_pointer")
+        if isinstance(first.get("reviewed_source_packet_pointer"), dict)
+        else {}
+    )
+    required_final_source_ref_ids = [
+        str(reviewed_pointer.get("source_ref_id"))
+    ] if reviewed_pointer.get("source_ref_id") else []
     window = primary_followthrough_window(first, action_proof_plan=action_proof_plan)
     argv = [
         "jsonl-history-search",
@@ -2998,6 +3009,9 @@ def build_primary_source_followthrough(
         "raw_private_text_included": False,
         "raw_private_path_included": False,
     }
+    if required_final_source_ref_ids:
+        command["required_final_source_ref_ids"] = required_final_source_ref_ids
+        command["reviewed_source_case_handle"] = reviewed_pointer.get("handle")
     target_privacy = classify_command_target_privacy(target)
     command["target_local_path_like"] = target_privacy["local_path_like"]
     command["target_absolute_path_like"] = target_privacy["absolute_path_like"]
@@ -3007,11 +3021,17 @@ def build_primary_source_followthrough(
         "applies": True,
         "do_first": "run_primary_source_window_command",
         "primary_targets": [str(read.get("target")) for read in primary_reads[:3] if read.get("target")],
+        "required_final_source_ref_ids": required_final_source_ref_ids,
+        "reviewed_source_case_handle": reviewed_pointer.get("handle"),
         "primary_read_count": len(primary_reads),
         "first_command": command,
         "stop_after": (
             "After this primary source window supports the answer, stop broad search and answer with "
-            "source refs plus searched-scope/uncertainty boundaries."
+            "source refs plus searched-scope/uncertainty boundaries"
+            + (
+                f", including exact reviewed source ref {required_final_source_ref_ids[0]} as final support."
+                if required_final_source_ref_ids else "."
+            )
         ),
         "only_continue_if": [
             "the opened primary window does not contain the required proof",
@@ -3403,12 +3423,20 @@ def build_agent_instruction(
             )
 
     if primary_followthrough_first:
+        required_final_source_ref_ids = list(primary_followthrough.get("required_final_source_ref_ids") or [])
         constraints = [
             "Run the primary source-window command before broader recovery or synthesis.",
             "If that primary window supports the answer, stop broad search and answer with source refs plus searched-scope/uncertainty boundaries.",
             "Run more commands only if the primary source is missing required proof, conflicts with inspected evidence, or leaves a required facet unresolved.",
             "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
         ]
+        if required_final_source_ref_ids:
+            constraints.insert(
+                1,
+                "When answering, cite the exact reviewed source ref as final support: "
+                + ", ".join(required_final_source_ref_ids)
+                + ".",
+            )
     else:
         constraints = [
             "Do not answer from snippets alone when decision is inspect_recovery_reads or needs_investigation.",

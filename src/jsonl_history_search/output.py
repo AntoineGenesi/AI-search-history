@@ -2623,6 +2623,9 @@ def render_semantic_debug_text(payload: dict) -> str:
     ]
     if primary_command:
         lines.append(f"- primary source window command: {primary_command}")
+        required_final_source_ref_ids = list(followthrough.get("required_final_source_ref_ids") or [])
+        for source_ref_id in required_final_source_ref_ids[:3]:
+            lines.append(f"- required final source ref: {source_ref_id}")
         lines.append("- fallback individual refs are listed later only if this window leaves a named answer facet missing")
     elif required_reads:
         for read in required_reads[:5]:
