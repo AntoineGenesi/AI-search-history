@@ -982,9 +982,11 @@ def process_actual_use_source_tier(*, kind: str, target: str | None, source_ref:
     kind_text = str(kind or "").lower()
     if "tool_event" in kind_text:
         return PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
+    if kind_text in {"task_or_review_artifact", "artifact", "hint_path"}:
+        return PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
     if path.endswith(".jsonl") or ".jsonl:" in target_text.lower() or path.endswith(".jsonl.gz"):
         return PROCESS_ACTUAL_USE_SOURCE_TIER_PRIMARY
-    if process_actual_use_secondary_artifact_path(path) or kind_text in {"task_or_review_artifact", "artifact", "hint_path"}:
+    if process_actual_use_secondary_artifact_path(path):
         return PROCESS_ACTUAL_USE_SOURCE_TIER_SECONDARY
     return PROCESS_ACTUAL_USE_SOURCE_TIER_SUPPORTING
 
