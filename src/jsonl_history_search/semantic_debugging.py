@@ -1103,26 +1103,18 @@ def classify_process_actual_use_read_chronology(
 
 
 def process_actual_use_prior_answer_or_report_requested(text: str) -> bool:
-    lowered = str(text or "").lower()
-    request_cues = (
-        "prior answer",
-        "previous answer",
-        "earlier answer",
-        "past answer",
-        "prior final",
-        "previous final",
-        "final answer",
-        "answer text",
-        "answer prose",
-        "saved report",
-        "prior report",
-        "previous report",
-        "review report",
-        "find the report",
-        "locate the report",
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    historical_answer_or_report = (
+        r"(?:prior|previous|earlier|past|saved|old)\s+"
+        r"(?:(?:final\s+)?answer|answer\s+(?:text|prose)|final\s+prose|report|review\s+report)"
     )
-    intent_cues = ("find", "locate", "recover", "quote", "summarize", "show", "what did")
-    return any(cue in lowered for cue in request_cues) and any(cue in lowered for cue in intent_cues)
+    explicit_request_patterns = (
+        rf"\b(?:find|locate|recover|quote|show|summarize)\s+(?:me\s+)?(?:the\s+)?{historical_answer_or_report}\b",
+        rf"\bwhat\s+did\s+(?:the\s+)?{historical_answer_or_report}\s+(?:say|state|claim|answer)\b",
+        rf"\b(?:what|which)\s+(?:was|is)\s+(?:the\s+)?{historical_answer_or_report}\b",
+        rf"\b(?:find|locate|recover|quote|show|summarize)\s+(?:me\s+)?(?:the\s+)?(?:answer-key|answer\s+key)\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in explicit_request_patterns)
 
 
 def process_actual_use_prior_final_prose_candidate(text: str) -> bool:

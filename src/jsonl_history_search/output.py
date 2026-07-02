@@ -2744,7 +2744,10 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
         "Open these source refs first:",
     ]
-    if primary_command:
+    if process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
+        for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
+    elif primary_command:
         lines.append(f"- primary source window command: {primary_command}")
         required_final_source_ref_ids = list(followthrough.get("required_final_source_ref_ids") or [])
         for source_ref_id in required_final_source_ref_ids[:3]:
