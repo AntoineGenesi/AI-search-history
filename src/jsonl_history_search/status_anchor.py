@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import subprocess
 import time
@@ -30,6 +31,9 @@ STATUS_QUERY_PATTERNS = (
     "while i was away",
     "status since",
     "since last time",
+    "before the last time",
+    "before hte last time",
+    "time before that",
     "what changed after",
     "what happened in the main thread",
 )
@@ -49,6 +53,19 @@ ADMIN_STATUS_MARKERS = (
     "side thread",
     "latest admin",
     "last message",
+    "last actual message",
+    "not the status question",
+    "too narrow",
+    "made no sense",
+    "wrong anchor",
+    "use the updated skill",
+    "updated skill",
+    "before the last answer",
+    "time before the last answer",
+    "before the last time",
+    "before hte last time",
+    "time before that",
+    "previous relevant time window",
 )
 
 NON_ANCHOR_CONTEXT_MARKERS = (
@@ -73,19 +90,36 @@ NON_ANCHOR_CONTEXT_MARKERS = (
 WORKER_PROMPT_MARKERS = (
     "you are the jsh-",
     "you are the high-reasoning implementer",
+    "you are the implementer/runner",
     "you are the independent reviewer",
+    "you are the jsonl_current_free lane",
+    "you are the manual_default lane",
     "you are implementing jsh-",
+    "implement jsh-",
     "you are reviewing branch",
+    "you are not alone in the codebase",
     "implementation worker",
+    "you are the implementer worker",
     "implementer for jsh-",
     "isolated implementer",
     "independent reviewer for jsh-",
     "independent review for jsh-",
     "jsonl_layered_current lane",
     "reviewer worker",
+    "reviewer update:",
+    "review-blocking fix",
+    "review artifact fix needed",
     "orchestrator reviewer",
     "read-only review",
+    "independent review task",
     "coordinator evidence for jsh-",
+    "coordinator found a concrete",
+    "focused fix required",
+    "please re-review jsh-",
+    "review fix needed",
+    "repo merge gate",
+    "value_verdict",
+    "your review currently",
     "scope: verify",
     "inspect changed files",
     "use implementer discipline",
@@ -353,7 +387,7 @@ def _score_anchor(text: str, index: int, *, timestamp_utc: str = "", status_cuto
         return score, "substantive_work_anchor", "selected_candidate", f"substantive work wording matched: {', '.join(work_hits[:3])}"
     if len(normalized.split()) >= 12:
         return 20 - recency_penalty, "ordinary_human_turn", "fallback_candidate", "ordinary human turn; usable only if no stronger work anchor exists"
-    return 0 - recency_penalty, "short_human_turn", "fallback_candidate", "short human turn; weak status anchor"
+    return 10 - recency_penalty, "short_human_turn", "fallback_candidate", "short human turn; weak status anchor"
 
 
 def _select_anchor(candidates: list[dict]) -> dict | None:
@@ -381,6 +415,7 @@ def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates
         "anchor_ref": None,
         "status_ref": None,
         "selected_anchor": None,
+        "rejected_anchor_alternatives": [],
         "excluded_as_anchor": [
             "subagent_notification",
             "tool_output",
@@ -391,6 +426,22 @@ def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates
         ],
     }
     by_ref = {candidate.get("source_ref"): candidate for candidate in candidates}
+    explicit_anchor = _explicit_anchor_candidate(query, candidates)
+    if explicit_anchor:
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "explicit_anchor",
+                "anchor_scope": "explicit_user_anchor",
+                "anchor_reason": explicit_anchor.get("explicit_anchor_reason") or "explicit_timestamp_or_quoted_message_anchor",
+                "anchor_ref": explicit_anchor.get("source_ref"),
+                "selected_anchor": _selected_with_reason(
+                    explicit_anchor,
+                    "; selected because the query explicitly named this timestamp/message anchor",
+                ),
+            },
+            candidates,
+        )
     if is_status_question(query):
         status_message = _current_status_message(messages)
         if status_message:
@@ -406,43 +457,60 @@ def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates
                 key=lambda item: int(item.get("message_index", 0)),
             )
             same_thread_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=True)
-            if same_thread_anchor:
+            prefer_parent = _prefers_parent_main_anchor(query)
+            explicit_side_thread_local = _explicit_side_thread_local_status(query)
+            parent_anchor = None
+            if prefer_parent:
+                parent_anchor = _first_history_parent_anchor(older, status_thread_keys)
+            if same_thread_anchor and (explicit_side_thread_local or not prefer_parent):
                 has_prior_same_thread_status = any(
                     _thread_key_overlap(candidate, status_thread_keys) and candidate.get("classification") == "admin_or_status_turn"
                     for candidate in older
                 )
-                reason = (
-                    "side_thread_follow_up_prior_same_thread_user_message"
-                    if has_prior_same_thread_status
-                    else "latest_prior_same_thread_user_message"
-                )
-                boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
-                return {
-                    **base,
-                    "context_boundary": boundary,
-                    "anchor_scope": "same_thread",
-                    "anchor_reason": reason,
-                    "anchor_ref": same_thread_anchor.get("source_ref"),
-                    "status_ref": status_ref,
-                    "selected_anchor": _selected_with_reason(
-                        same_thread_anchor,
-                        "; selected as the latest eligible prior user message in the same thread",
-                    ),
-                }
-            parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
+                same_thread_is_substantive = same_thread_anchor.get("classification") == "substantive_work_anchor"
+                if explicit_side_thread_local or same_thread_is_substantive or not has_prior_same_thread_status:
+                    reason = (
+                        "side_thread_follow_up_prior_same_thread_user_message"
+                        if has_prior_same_thread_status
+                        else "latest_prior_same_thread_user_message"
+                    )
+                    boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
+                    return _with_rejected_alternatives(
+                        {
+                            **base,
+                            "context_boundary": boundary,
+                            "anchor_scope": "same_thread",
+                            "anchor_reason": reason,
+                            "anchor_ref": same_thread_anchor.get("source_ref"),
+                            "status_ref": status_ref,
+                            "selected_anchor": _selected_with_reason(
+                                same_thread_anchor,
+                                "; selected as the latest eligible prior user message in the same thread",
+                            ),
+                        },
+                        candidates,
+                    )
+            if parent_anchor is None:
+                parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
             if parent_anchor:
-                return {
-                    **base,
-                    "context_boundary": "side_thread",
-                    "anchor_scope": "parent_thread",
-                    "anchor_reason": "first_side_thread_user_message_after_boundary",
-                    "anchor_ref": parent_anchor.get("source_ref"),
-                    "status_ref": status_ref,
-                    "selected_anchor": _selected_with_reason(
-                        parent_anchor,
-                        "; selected as the last eligible parent/main-thread user message before the side-thread boundary",
-                    ),
-                }
+                reason = "parent_main_last_actual_work_handoff"
+                if not prefer_parent:
+                    reason = "first_side_thread_user_message_after_boundary"
+                return _with_rejected_alternatives(
+                    {
+                        **base,
+                        "context_boundary": "side_thread",
+                        "anchor_scope": "parent_thread",
+                        "anchor_reason": reason,
+                        "anchor_ref": parent_anchor.get("source_ref"),
+                        "status_ref": status_ref,
+                        "selected_anchor": _selected_with_reason(
+                            parent_anchor,
+                            "; selected as the last eligible parent/main-thread user message before the side-thread boundary",
+                        ),
+                    },
+                    candidates,
+                )
             base = {
                 **base,
                 "context_boundary": "status_question_no_prior_anchor",
@@ -454,12 +522,143 @@ def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates
     if selected:
         selected_ref = selected.get("source_ref")
         selected = by_ref.get(selected_ref, selected)
-        return {
-            **base,
-            "anchor_ref": selected_ref,
-            "selected_anchor": selected,
-        }
-    return base
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "anchor_ref": selected_ref,
+                "selected_anchor": selected,
+            },
+            candidates,
+        )
+    return _with_rejected_alternatives(base, candidates)
+
+
+_TIMESTAMP_ANCHOR_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?:Z|[+-][0-9]{2}:?[0-9]{2})?\b"
+)
+_QUOTED_ANCHOR_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")
+
+
+def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
+    normalized_query = _normalize(query)
+    parsed_times = [
+        parsed.astimezone(timezone.utc)
+        for parsed in (parse_datetime(match.group(0).replace(" ", "T"), timezone.utc) for match in _TIMESTAMP_ANCHOR_RE.finditer(query))
+        if parsed is not None
+    ]
+    quoted_fragments = [
+        _normalize(match.group(1))
+        for match in _QUOTED_ANCHOR_RE.finditer(query)
+        if len(_normalize(match.group(1)).split()) >= 3
+    ]
+    if not parsed_times and not quoted_fragments:
+        return None
+    matches = []
+    for candidate in candidates:
+        if _is_never_anchor(candidate):
+            continue
+        timestamp = parse_datetime(str(candidate.get("timestamp_utc") or ""), timezone.utc)
+        timestamp_match = False
+        if timestamp is not None:
+            timestamp_utc = timestamp.astimezone(timezone.utc)
+            timestamp_match = any(abs((timestamp_utc - target).total_seconds()) <= 1 for target in parsed_times)
+        snippet = _normalize(str(candidate.get("snippet") or ""))
+        quote_match = any(fragment and (fragment in snippet or snippet in normalized_query) for fragment in quoted_fragments)
+        if not timestamp_match and not quote_match:
+            continue
+        selected = dict(candidate)
+        if timestamp_match and quote_match:
+            selected["explicit_anchor_reason"] = "explicit_timestamp_and_quoted_message_anchor"
+            selected["score"] = max(int(selected.get("score") or 0), 120)
+        elif timestamp_match:
+            selected["explicit_anchor_reason"] = "explicit_timestamp_anchor"
+            selected["score"] = max(int(selected.get("score") or 0), 110)
+        else:
+            selected["explicit_anchor_reason"] = "explicit_quoted_message_anchor"
+            selected["score"] = max(int(selected.get("score") or 0), 100)
+        matches.append(selected)
+    matches.sort(key=lambda item: (int(item.get("score") or 0), item.get("timestamp_utc") or ""), reverse=True)
+    return matches[0] if matches else None
+
+
+def _prefers_parent_main_anchor(query: str) -> bool:
+    normalized = _normalize(query)
+    return any(
+        marker in normalized
+        for marker in (
+            "parent/main",
+            "parent thread",
+            "main thread",
+            "before this side conversation",
+            "before the side conversation",
+            "last actual message",
+            "last actual substantive",
+            "work-handoff",
+            "work handoff",
+            "not the status question",
+            "not the side thread",
+            "not this side thread",
+            "previous relevant time window",
+            "before the last answer",
+            "time before the last answer",
+            "before the last time",
+            "before hte last time",
+            "time before that",
+        )
+    )
+
+
+def _explicit_side_thread_local_status(query: str) -> bool:
+    normalized = _normalize(query)
+    return any(
+        marker in normalized
+        for marker in (
+            "side-thread-local",
+            "side thread local",
+            "this side thread",
+            "this side conversation",
+            "in the side thread",
+            "in this side",
+        )
+    )
+
+
+def _is_never_anchor(candidate: dict) -> bool:
+    return candidate.get("classification") in {
+        "empty",
+        "non_human_boundary_or_tool_context",
+        "worker_or_reviewer_prompt",
+        "admin_or_status_turn",
+        "post_status_context",
+    }
+
+
+def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
+    selected_ref = decision.get("anchor_ref")
+    alternatives = []
+    for candidate in candidates:
+        if candidate.get("source_ref") == selected_ref:
+            continue
+        classification = candidate.get("classification")
+        if candidate.get("decision") == "rejected" or classification in {
+            "admin_or_status_turn",
+            "worker_or_reviewer_prompt",
+            "non_human_boundary_or_tool_context",
+            "post_status_context",
+        }:
+            alternatives.append(
+                {
+                    "source_ref": candidate.get("source_ref"),
+                    "timestamp_utc": candidate.get("timestamp_utc"),
+                    "classification": classification,
+                    "decision": candidate.get("decision"),
+                    "rationale": candidate.get("rationale"),
+                    "snippet": candidate.get("snippet"),
+                }
+            )
+        if len(alternatives) >= 8:
+            break
+    return {**decision, "rejected_anchor_alternatives": alternatives}
 
 
 def _current_status_message(messages: list[dict]) -> dict | None:
@@ -479,6 +678,20 @@ def _first_eligible_thread_anchor(candidates: list[dict], thread_keys: set[str],
             continue
         if _is_eligible_anchor(candidate):
             return candidate
+    return None
+
+
+def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) -> dict | None:
+    for candidate in candidates:
+        if _thread_key_overlap(candidate, thread_keys):
+            continue
+        if candidate.get("source_kind") != "codex_history":
+            continue
+        if _is_never_anchor(candidate):
+            continue
+        if candidate.get("decision") not in {"selected_candidate", "fallback_candidate"}:
+            continue
+        return candidate
     return None
 
 

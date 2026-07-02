@@ -2506,6 +2506,17 @@ def render_status_anchor_text(payload: dict) -> str:
         if selected.get("read_more_command"):
             lines.append(f"Selected anchor read-more: {selected.get('read_more_command')}")
         lines.append(f"Anchor rationale: {selected.get('rationale')}")
+    rejected = (report.get("anchor_decision") or {}).get("rejected_anchor_alternatives") or []
+    if rejected:
+        lines.append("Rejected anchor alternatives:")
+        for item in rejected[:5]:
+            lines.append(
+                "- "
+                f"{item.get('source_ref')} "
+                f"classification={item.get('classification')} "
+                f"reason={item.get('rationale')}: "
+                f"{item.get('snippet')}"
+            )
     if session_activity:
         activity = session_activity.get("activity_after_anchor") or {}
         lines.append(
@@ -2605,6 +2616,15 @@ def render_status_anchor_markdown(payload: dict) -> str:
         if selected.get("read_more_command"):
             lines.append(f"- Read more: `{selected.get('read_more_command')}`")
         lines.extend([f"- Rationale: {selected.get('rationale')}", ""])
+    rejected = (report.get("anchor_decision") or {}).get("rejected_anchor_alternatives") or []
+    if rejected:
+        lines.extend(["## Rejected Anchor Alternatives", ""])
+        for item in rejected[:5]:
+            lines.append(
+                f"- `{item.get('source_ref')}` `{item.get('classification')}`: "
+                f"{item.get('rationale')} - {item.get('snippet')}"
+            )
+        lines.append("")
     if session_activity:
         activity = session_activity.get("activity_after_anchor") or {}
         lines.extend(
