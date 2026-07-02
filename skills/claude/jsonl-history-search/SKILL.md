@@ -210,7 +210,8 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   questions. Use `semantic-debug --format text` before lower-level helper
   scripts when `ask` selects semantic-debug.
 - When the user prompt includes a reviewed source case or `real-jsh...` handle,
-  the next command after reading this skill should be `jsonl-history-search ask`
+  installed global-skill workflows still run `validate-install` after reading
+  this skill. After freshness preflight passes, run `jsonl-history-search ask`
   or the already-selected `semantic-debug --format text`, not repo `rg`.
 - Use `latest-user-messages` first for exact recent user-message wording.
 - Use helper scripts only for operational recovery: latest/today lookup,
