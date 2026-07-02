@@ -424,7 +424,22 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
             "anti contamination rule",
         ),
     )
-    return local_verification and artifact_context and (explicitly_artifact_first or not asks_history)
+    ambiguous_recent_work_followup = _has_any(
+        normalized,
+        (
+            "are you sure",
+            "got everything",
+            "did you get everything",
+            "did you get it all",
+            "did you include everything",
+            "did you save everything",
+        ),
+    )
+    return (
+        local_verification
+        and not asks_history
+        and (artifact_context or explicitly_artifact_first or ambiguous_recent_work_followup)
+    )
 
 
 def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
