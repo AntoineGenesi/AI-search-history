@@ -88,7 +88,8 @@ def build_skill_audit_payload(
             "status": status,
             "skill": skill,
             "command_surface": {
-                "skill-audit": "Returns deterministic source-referenced skill usage evidence, pre/post windows, correction/outcome labels, non-use mentions, and a compact AI handoff packet."
+                "skill-check": "Alias for skill-audit; use this clearer name for named-skill compliance questions.",
+                "skill-audit": "Returns deterministic source-referenced skill usage evidence, pre/post windows, correction/outcome labels, non-use mentions, and a compact AI handoff packet.",
             },
             "signal_definitions": signal_definitions(),
             "usage_instances": instance_dicts[:INLINE_INSTANCE_LIMIT],

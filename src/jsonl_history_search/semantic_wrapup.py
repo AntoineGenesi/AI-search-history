@@ -385,6 +385,7 @@ def build_semantic_wrapup_payload(
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
+    skill_check_recommendation = _skill_check_recommendation(query, signals)
     rolling_window_coverage = _rolling_window_coverage(
         records,
         signals,
@@ -453,6 +454,7 @@ def build_semantic_wrapup_payload(
                 "orchestration_evidence_truncated": orchestration_evidence["truncated"],
                 "current_session_source_count": current_session_source_selection["returned_count"],
                 "current_session_source_total_count": current_session_source_selection["total_count"],
+                "skill_check_recommendation_present": bool(skill_check_recommendation),
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             "failure_modes": failure_modes,
@@ -469,7 +471,8 @@ def build_semantic_wrapup_payload(
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
-            "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract),
+            "skill_check_recommendation": skill_check_recommendation,
+            "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract, skill_check_recommendation),
             "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
             "next_reads": next_reads,
@@ -633,6 +636,7 @@ def _agent_instruction(
     scope_resolution: dict,
     next_reads: list[dict] | None = None,
     answer_use_contract: dict | None = None,
+    skill_check_recommendation: dict | None = None,
 ) -> dict:
     contract = answer_use_contract or {}
     if contract.get("decision") == "answer_from_top_next_read_or_handoff_exact_source":
@@ -648,15 +652,18 @@ def _agent_instruction(
             "fallback_next_step": scope_resolution.get("first_action"),
         }
     if status == "scope_ambiguous":
-        return {
+        instruction = {
             "selection_required": False,
             "do_not_auto_apply": True,
             "source_use_required": False,
             "next_step": scope_resolution.get("first_action")
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
         }
+        if skill_check_recommendation:
+            instruction["focused_follow_up"] = skill_check_recommendation
+        return instruction
     if contract.get("decision") == "answer_ready_after_source_inspection":
-        return {
+        instruction = {
             "selection_required": True,
             "do_not_auto_apply": True,
             "source_use_required": True,
@@ -668,12 +675,92 @@ def _agent_instruction(
             "continue_only_if": list(contract.get("continue_only_if") or []),
             "next_step": contract.get("required_next_action"),
         }
-    return {
+        if skill_check_recommendation:
+            instruction["focused_follow_up"] = skill_check_recommendation
+        return instruction
+    instruction = {
         "selection_required": True,
         "do_not_auto_apply": True,
         "source_use_required": bool(next_reads),
         "next_step": "Ask the user which suggested fixes to apply, then implement selected fixes through normal task/FSM flow.",
     }
+    if skill_check_recommendation:
+        instruction["focused_follow_up"] = skill_check_recommendation
+    return instruction
+
+
+def _skill_check_recommendation(query: str, signals: list[dict]) -> dict | None:
+    text = " ".join([query] + [str(signal.get("snippet") or "") for signal in signals]).lower()
+    if not _looks_like_skill_use_compliance_signal(text):
+        return None
+    skill = _extract_named_skill(text)
+    return {
+        "route": "skill_check_named_skill_compliance",
+        "reason": (
+            "Semantic-wrapup is for frustration/failure/improvement mining. "
+            "This prompt also asks whether a named skill was used, read, or followed, "
+            "which requires the focused skill-check/skill-audit path."
+        ),
+        "skill": skill,
+        "first_command": f'jsonl-history-search skill-check "{skill}" --cwd "$PWD" --format text',
+        "alias_of": "skill-audit",
+        "semantic_wrapup_boundary": (
+            "Do not treat this semantic-wrapup payload as a deep skill compliance audit; "
+            "run skill-check/skill-audit for proper-use, missed-trigger, misapplication, "
+            "and referenced-file follow-through classifications."
+        ),
+    }
+
+
+def _looks_like_skill_use_compliance_signal(text: str) -> bool:
+    has_skill_term = any(
+        term in text
+        for term in (
+            "skill",
+            "skill.md",
+            "reviewer",
+            "product-fsm",
+            "product fsm",
+            "implementer",
+            "planner",
+            "wrap-up",
+            "wrap up",
+        )
+    )
+    has_compliance_term = bool(
+        re.search(
+            r"\b(use|used|using|trigger|triggered|read|follow|followed|compliance|missed|misapplied)\b",
+            text,
+        )
+        or re.search(r"\breferenced files?\b", text)
+    )
+    return has_skill_term and has_compliance_term
+
+
+def _extract_named_skill(text: str) -> str:
+    match = re.search(r"<name>([^<]+)</name>", text)
+    if match:
+        return _normalize_skill_name(match.group(1))
+    match = re.search(r"\$([a-z0-9][a-z0-9_-]+)", text)
+    if match:
+        return _normalize_skill_name(match.group(1))
+    match = re.search(r"\b([a-z0-9][a-z0-9_-]+)\s+skill\b", text)
+    if match and match.group(1) not in {"the", "a", "named", "that", "this"}:
+        return _normalize_skill_name(match.group(1))
+    for candidate in (
+        "product-fsm-orchestration",
+        "reviewer",
+        "implementer",
+        "planner",
+        "wrap-up",
+    ):
+        if candidate in text or candidate.replace("-", " ") in text:
+            return candidate
+    return "<skill-name>"
+
+
+def _normalize_skill_name(value: str) -> str:
+    return value.strip().lower().replace("_", "-").replace(" ", "-")
 
 
 def _answer_ready_contract(

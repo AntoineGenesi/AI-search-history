@@ -31,7 +31,8 @@ implementation surfaces, not the product itself.
 
 For natural history/status/action/currentness/wrap-up prompts, first make sure
 the installed global skill is fresh when this workflow relies on it, then run
-the lightweight front door before loading a route specialization, broad `rg`,
+the lightweight front door as the first resolver before loading a route
+specialization, broad `rg`,
 repo recovery, TODO scans, or direct JSONL spelunking:
 
 ```bash
@@ -78,7 +79,7 @@ package checkout before relying on the route instructions:
 bash install/install_codex_global.sh
 ```
 
-Command-shape contract for the first commands:
+Command-shape contract for the first two shell commands:
 
 - The command that reads this `SKILL.md` must be a single-purpose skill read
   only. It must not use shell chaining (`&&`, `;`, `|`) to run `pwd`,
@@ -87,6 +88,9 @@ Command-shape contract for the first commands:
 - Invalid first commands include `sed -n '1,220p' .../SKILL.md && pwd`,
   `sed -n '1,220p' .../SKILL.md && rg --files`, and
   `cat .../SKILL.md && rg --files`.
+- After the skill-read command completes for a natural prompt, the next shell
+  command should be the freshness preflight for installed global-skill
+  workflows, then ask-first routing.
 - After the skill-read command completes for an installed global-skill
   workflow, the next shell command should be
   `jsonl-history-search validate-install --codex-home ~/.codex --format text`.
@@ -99,7 +103,8 @@ Command-shape contract for the first commands:
 
 Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
-actually matters?", "is ticket ABC-42 still current?", "can these old worktrees be removed?", and "what did I
+actually matters?", "is ticket ABC-42 still current?", "can these old worktrees
+be removed?", "did the agent read/follow the reviewer skill?", and "what did I
 keep yelling about in this session?".
 For immediate artifact-completeness prompts like "are you sure you got
 everything?", "did the task file include X?", "did you save this whole thread as
@@ -144,6 +149,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | `references/latest-status.md` | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
 | "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
@@ -160,6 +166,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "what happened since my last message?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/latest-status.md`
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
+- "did the agent read/follow the reviewer skill?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/skill-audit.md`
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "is ticket ABC-42 still current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`

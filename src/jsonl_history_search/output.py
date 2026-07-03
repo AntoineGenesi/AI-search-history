@@ -1092,6 +1092,15 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
     if scope_resolution.get("first_action"):
         lines.append(f"First action: {scope_resolution.get('first_action')}")
+    skill_check = report.get("skill_check_recommendation") or {}
+    if skill_check:
+        lines.extend([
+            "Skill-check recommendation:",
+            f"- Route: {skill_check.get('route')}",
+            f"- Skill: {skill_check.get('skill')}",
+            f"- First command: {skill_check.get('first_command')}",
+            f"- Boundary: {skill_check.get('semantic_wrapup_boundary')}",
+        ])
     signal_classification = report.get("signal_classification") or {}
     if signal_classification:
         lines.append(
@@ -1201,6 +1210,17 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             lines.append(f"- Continue only if: {item}")
         if contract.get("setup_echo_boundary"):
             lines.append(f"- Setup-echo boundary: {contract.get('setup_echo_boundary')}")
+    skill_check = report.get("skill_check_recommendation") or {}
+    if skill_check:
+        lines.extend([
+            "",
+            "## Skill-Check Recommendation",
+            "",
+            f"- Route: `{skill_check.get('route')}`",
+            f"- Skill: `{skill_check.get('skill')}`",
+            f"- First command: `{skill_check.get('first_command')}`",
+            f"- Boundary: {skill_check.get('semantic_wrapup_boundary')}",
+        ])
     lines.extend([
         "",
         "## Stop / Continue",
