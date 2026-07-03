@@ -242,6 +242,7 @@ def status_anchor_report(
         anchor_decision,
         cwd=cwd,
         codex_home=codex_home,
+        target_window=target_window,
     )
     artifacts = _collect_work_artifacts(
         cwd,
@@ -262,6 +263,7 @@ def status_anchor_report(
     )
     next_reads = _next_reads(
         selected_anchor,
+        anchor_decision,
         session_activity,
         artifacts,
         cwd=cwd,
@@ -405,6 +407,7 @@ def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None 
                 "decision": decision,
                 "rationale": rationale,
                 "target_window_hits": _target_window_hits(text, target_window),
+                "outside_target_task_ids": _outside_target_task_ids(text, target_window),
             }
         )
     candidates.sort(key=lambda item: (item["score"], item.get("timestamp_utc") or ""), reverse=True)
@@ -696,11 +699,27 @@ def _target_window_hits(text: str, target_window: dict | None) -> list[str]:
     return [task_id for task_id in target_window.get("ids") or [] if task_id in normalized]
 
 
+def _task_ids_in_text(text: str) -> set[str]:
+    return {
+        f"{match.group(1).upper()}-{int(match.group(2))}"
+        for match in _TASK_ID_RE.finditer(text)
+        if match.group(2).isdigit()
+    }
+
+
+def _outside_target_task_ids(text: str, target_window: dict | None) -> list[str]:
+    if not target_window:
+        return []
+    target_ids = set(target_window.get("ids") or [])
+    if not target_ids:
+        return []
+    return sorted(_task_ids_in_text(_normalize_task_ids(text)) - target_ids)
+
+
 def _target_window_anchor_candidate(candidates: list[dict], target_window: dict | None) -> dict | None:
     if not target_window:
         return None
     matches = []
-    target_ids = set(target_window.get("ids") or [])
     for candidate in candidates:
         if _is_never_anchor(candidate):
             continue
@@ -708,16 +727,13 @@ def _target_window_anchor_candidate(candidates: list[dict], target_window: dict 
         if not hits:
             continue
         text = _normalize_task_ids(f"{candidate.get('source_ref', '')} {candidate.get('snippet', '')}")
-        mentioned = set(_TASK_ID_RE.findall(text))
+        outside_task_ids = set(candidate.get("outside_target_task_ids") or _outside_target_task_ids(text, target_window))
         outside_task_penalty = 0
-        if mentioned:
-            normalized_mentions = {
-                f"{prefix.upper()}-{int(number)}"
-                for prefix, number in mentioned
-                if number.isdigit()
-            }
-            outside_task_penalty = len(normalized_mentions - target_ids) * 8
+        if not target_window.get("audit_run_requested"):
+            outside_task_penalty = len(outside_task_ids) * 28
         score = 130 + len(hits) * 12 + int(candidate.get("score") or 0) - outside_task_penalty
+        if not outside_task_ids and not target_window.get("audit_run_requested"):
+            score += 30
         if target_window.get("start_id") in hits:
             score += 10
         if target_window.get("end_id") in hits:
@@ -725,6 +741,7 @@ def _target_window_anchor_candidate(candidates: list[dict], target_window: dict 
         selected = dict(candidate)
         selected["score"] = max(score, int(selected.get("score") or 0))
         selected["target_window_hits"] = sorted(hits)
+        selected["outside_target_task_ids"] = sorted(outside_task_ids)
         selected["explicit_anchor_reason"] = target_window.get("anchor_reason")
         matches.append(selected)
     matches.sort(key=lambda item: (int(item.get("score") or 0), item.get("timestamp_utc") or ""), reverse=True)
@@ -832,7 +849,8 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
         if candidate.get("source_ref") == selected_ref:
             continue
         classification = candidate.get("classification")
-        if candidate.get("decision") == "rejected" or classification in {
+        target_window_outside_candidate = bool(candidate.get("target_window_hits") and candidate.get("outside_target_task_ids"))
+        if target_window_outside_candidate or candidate.get("decision") == "rejected" or classification in {
             "admin_or_status_turn",
             "worker_or_reviewer_prompt",
             "non_human_boundary_or_tool_context",
@@ -846,6 +864,11 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
                     "decision": candidate.get("decision"),
                     "rationale": candidate.get("rationale"),
                     "snippet": candidate.get("snippet"),
+                    "source_kind": candidate.get("source_kind"),
+                    "openable_source_ref": candidate.get("openable_source_ref"),
+                    "openable_target": candidate.get("openable_target"),
+                    "target_window_hits": candidate.get("target_window_hits") or [],
+                    "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
                 }
             )
         if len(alternatives) >= 8:
@@ -936,6 +959,7 @@ def _session_activity_trace(
     *,
     cwd: Path,
     codex_home: Path | None,
+    target_window: dict | None = None,
 ) -> dict:
     base = {
         "status": "no_selected_anchor",
@@ -991,7 +1015,13 @@ def _session_activity_trace(
         if not session_files:
             missing.append(f"{context['role']} session file not found from {context.get('history_source_ref') or context.get('source_ref')}")
         for path in session_files:
-            scan = _scan_session_file_after_anchor(path, anchor_timestamp, codex_home=codex_home, cwd=cwd)
+            scan = _scan_session_file_after_anchor(
+                path,
+                anchor_timestamp,
+                codex_home=codex_home,
+                cwd=cwd,
+                target_window=target_window,
+            )
             _merge_activity_counts(activity, scan["activity_after_anchor"])
             followups.append(
                 {
@@ -1109,7 +1139,14 @@ def _session_context_from_openable(source: dict, *, role: str) -> dict | None:
     }
 
 
-def _scan_session_file_after_anchor(path: Path, anchor_timestamp, *, codex_home: Path, cwd: Path) -> dict:
+def _scan_session_file_after_anchor(
+    path: Path,
+    anchor_timestamp,
+    *,
+    codex_home: Path,
+    cwd: Path,
+    target_window: dict | None = None,
+) -> dict:
     activity = _empty_activity_counts()
     first_ref = None
     last_ref = None
@@ -1145,13 +1182,17 @@ def _scan_session_file_after_anchor(path: Path, anchor_timestamp, *, codex_home:
                 first_ref = source_ref
                 target = f"{path}:{line_number}"
                 next_reads.append(
-                    {
-                        "reason": "Inspect raw session JSONL activity after the selected anchor before using commits or repo state.",
-                        "source_ref": source_ref,
-                        "openable_source_ref": {"path": str(path), "line": line_number},
-                        "openable_target": target,
-                        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
-                    }
+                    _raw_session_next_read(
+                        record,
+                        source_ref,
+                        target,
+                        line_number,
+                        path=path,
+                        cwd=cwd,
+                        codex_home=codex_home,
+                        target_window=target_window,
+                        reason="Inspect raw session JSONL activity after the selected anchor before using commits or repo state.",
+                    )
                 )
             last_ref = source_ref
             _count_session_record(record, activity)
@@ -1160,13 +1201,17 @@ def _scan_session_file_after_anchor(path: Path, anchor_timestamp, *, codex_home:
                 if len(next_reads) < 4:
                     target = f"{path}:{line_number}"
                     next_reads.append(
-                        {
-                            "reason": "Inspect spawned worker/reviewer session launch as part of the long-absence trace.",
-                            "source_ref": source_ref,
-                            "openable_source_ref": {"path": str(path), "line": line_number},
-                            "openable_target": target,
-                            "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
-                        }
+                        _raw_session_next_read(
+                            record,
+                            source_ref,
+                            target,
+                            line_number,
+                            path=path,
+                            cwd=cwd,
+                            codex_home=codex_home,
+                            target_window=target_window,
+                            reason="Inspect spawned worker/reviewer session launch as part of the long-absence trace.",
+                        )
                     )
     return {
         "records_after_anchor": activity["records_after_anchor"],
@@ -1176,6 +1221,39 @@ def _scan_session_file_after_anchor(path: Path, anchor_timestamp, *, codex_home:
         "spawned_session_call_refs": spawned_refs[:10],
         "next_reads": next_reads,
     }
+
+
+def _raw_session_next_read(
+    record: Mapping[str, Any],
+    source_ref: str,
+    target: str,
+    line_number: int,
+    *,
+    path: Path,
+    cwd: Path,
+    codex_home: Path,
+    target_window: dict | None,
+    reason: str,
+) -> dict:
+    record_text = _record_task_text(record)
+    read = {
+        "reason": reason,
+        "source_ref": source_ref,
+        "openable_source_ref": {"path": str(path), "line": line_number},
+        "openable_target": target,
+        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
+    }
+    if target_window:
+        read["target_window_hits"] = _target_window_hits(record_text, target_window)
+        read["outside_target_task_ids"] = _outside_target_task_ids(record_text, target_window)
+    return read
+
+
+def _record_task_text(record: Mapping[str, Any]) -> str:
+    try:
+        return json.dumps(record, sort_keys=True, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return str(record)
 
 
 def _count_session_record(record: Mapping[str, Any], activity: dict) -> None:
@@ -1578,6 +1656,7 @@ def _answer_brief(
 
 def _next_reads(
     selected_anchor: dict | None,
+    anchor_decision: dict,
     session_activity: dict,
     artifacts: dict,
     *,
@@ -1594,6 +1673,15 @@ def _next_reads(
             "source_tier": "required_primary",
             "answer_use_required": True,
         }
+        if target_window:
+            read["target_window_hits"] = selected_anchor.get("target_window_hits") or _target_window_hits(
+                str(selected_anchor.get("snippet") or ""),
+                target_window,
+            )
+            read["outside_target_task_ids"] = selected_anchor.get("outside_target_task_ids") or _outside_target_task_ids(
+                str(selected_anchor.get("snippet") or ""),
+                target_window,
+            )
         _copy_openable_fields(read, selected_anchor)
         if read.get("openable_target") and not read.get("read_more_command"):
             read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
@@ -1606,6 +1694,14 @@ def _next_reads(
                 "answer_use_required": True,
             }
         )
+    reads.extend(
+        _target_window_follow_on_reads(
+            anchor_decision,
+            cwd=cwd,
+            codex_home=codex_home,
+            target_window=target_window,
+        )
+    )
     for item in artifacts["value_items"]:
         for ref in item["source_refs"][:2]:
             tier = item.get("source_tier") or "diagnostic_optional"
@@ -1650,8 +1746,59 @@ def _next_reads(
                 "committed_at": commit.get("committed_at"),
             }
         )
+    reads = _apply_target_window_primary_dominance(reads, target_window=target_window)
     reads = _apply_answer_facing_suppression(reads, target_window=target_window)
     return _dedupe_reads(reads)
+
+
+def _target_window_follow_on_reads(
+    anchor_decision: dict,
+    *,
+    cwd: Path,
+    codex_home: Path | None,
+    target_window: dict | None,
+) -> list[dict]:
+    if not target_window:
+        return []
+    reads = []
+    audit_run_requested = bool(target_window.get("audit_run_requested"))
+    for candidate in anchor_decision.get("rejected_anchor_alternatives") or []:
+        if not _is_target_window_outside_task_ref(candidate, target_window=target_window):
+            continue
+        tier = "required_primary" if audit_run_requested else "diagnostic_optional"
+        read = {
+            "reason": (
+                "Inspect later raw conversation ref because the query explicitly asks to audit that run."
+                if audit_run_requested
+                else (
+                    "Later raw conversation ref mentions target-window IDs plus outside-window tasks; "
+                    "keep as follow-on context, not required primary support for the target window."
+                )
+            ),
+            "source_ref": candidate.get("source_ref"),
+            "snippet": candidate.get("snippet"),
+            "source_tier": tier,
+            "answer_use_required": audit_run_requested,
+            "target_window_hits": candidate.get("target_window_hits") or [],
+            "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+            "target_window_follow_on_context": not audit_run_requested,
+        }
+        _copy_openable_fields(read, candidate)
+        if read.get("openable_target") and not read.get("read_more_command"):
+            read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+        if not audit_run_requested:
+            read.update(
+                {
+                    "diagnostic_only": True,
+                    "read_more_actionable": False,
+                    "diagnostic_open_policy": (
+                        "post-window recovery/current-run ref; open only after target-window primary and secondary refs "
+                        "leave a named follow-on gap"
+                    ),
+                }
+            )
+        reads.append(read)
+    return reads
 
 
 def _source_tiers(reads: list[dict]) -> dict:
@@ -1676,6 +1823,70 @@ def _source_tiers(reads: list[dict]) -> dict:
             "diagnostic_optional stale/demo/example and same-run/private pressure refs are not answer-facing summary support"
         ),
     }
+
+
+def _apply_target_window_primary_dominance(reads: list[dict], *, target_window: dict | None) -> list[dict]:
+    if not target_window or target_window.get("audit_run_requested"):
+        return reads
+    demoted_reads = []
+    for read in reads:
+        if not _is_target_window_outside_task_ref(read, target_window=target_window):
+            demoted_reads.append(read)
+            continue
+        demoted = dict(read)
+        demoted.update(
+            {
+                "source_tier": "diagnostic_optional",
+                "answer_use_required": False,
+                "diagnostic_only": True,
+                "read_more_actionable": False,
+                "target_window_follow_on_context": True,
+                "demoted_from_required_primary": read.get("source_tier") == "required_primary",
+                "diagnostic_open_policy": (
+                    "post-window recovery/current-run raw ref mentions target-window and outside-window tasks; "
+                    "open only as follow-on context unless explicitly auditing that later run"
+                ),
+            }
+        )
+        demoted_reads.append(demoted)
+    return demoted_reads
+
+
+def _is_target_window_outside_task_ref(read: dict, *, target_window: dict | None) -> bool:
+    if not target_window:
+        return False
+    target_hits = set(read.get("target_window_hits") or [])
+    outside_task_ids = set(read.get("outside_target_task_ids") or [])
+    has_task_metadata = "target_window_hits" in read or "outside_target_task_ids" in read
+    if not has_task_metadata:
+        text = _target_window_read_text(read)
+        target_hits = set(_target_window_hits(text, target_window))
+        outside_task_ids = set(_outside_target_task_ids(text, target_window))
+    return bool(target_hits and outside_task_ids and _is_raw_conversation_ref(read))
+
+
+def _target_window_read_text(read: dict) -> str:
+    return " ".join(
+        str(read.get(key) or "")
+        for key in (
+            "source_ref",
+            "openable_target",
+            "reason",
+            "snippet",
+        )
+    )
+
+
+def _is_raw_conversation_ref(read: dict) -> bool:
+    source_ref = str(read.get("source_ref") or "")
+    openable_target = _normalize_pathish(str(read.get("openable_target") or ""))
+    return (
+        source_ref.startswith("codex_history:")
+        or source_ref.startswith("codex_sessions:")
+        or "/sessions/" in openable_target
+        or openable_target.endswith("history.jsonl")
+        or "history.jsonl:" in openable_target
+    )
 
 
 def _apply_answer_facing_suppression(reads: list[dict], *, target_window: dict | None) -> list[dict]:
