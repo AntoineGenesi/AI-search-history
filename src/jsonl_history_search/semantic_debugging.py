@@ -3630,7 +3630,7 @@ def build_next_commands(
     _ = include_semantic_debug_replay
     commands: list[dict[str, Any]] = []
     for read in next_reads[:8]:
-        if read.get("read_more_actionable") is False:
+        if not read_is_required_surface_actionable(read):
             continue
         actions = read.get("expansion_actions") or []
         for action in actions[:1]:
@@ -3986,9 +3986,21 @@ def answer_support_classification(
     }
 
 
+def read_is_required_surface_actionable(read: dict[str, Any]) -> bool:
+    selection = read.get("historical_provenance_selection") if isinstance(read.get("historical_provenance_selection"), dict) else {}
+    return not (
+        read.get("diagnostic_only") is True
+        or read.get("read_more_actionable") is False
+        or read.get("followthrough_actionable") is False
+        or selection.get("diagnostic_only") is True
+        or selection.get("read_more_actionable") is False
+        or selection.get("final_support_allowed") is False
+    )
+
+
 def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for read in (item for item in next_reads if item.get("followthrough_actionable", True) is not False):
+    for read in (item for item in next_reads if read_is_required_surface_actionable(item)):
         if len(rows) >= ANSWER_READY_HANDOFF_READ_CAP:
             break
         target = read.get("target")
@@ -4598,7 +4610,7 @@ def answer_ready_copy_paste_commands(
     command_targets = {
         read.get("target")
         for read in bounded_next_reads
-        if is_jsonl_read_target(read.get("target")) and read.get("read_more_actionable", True) is not False
+        if is_jsonl_read_target(read.get("target")) and read_is_required_surface_actionable(read)
     }
     for read in next_reads:
         if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
@@ -5494,9 +5506,9 @@ def action_proof_primary_refs(
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     for read in list(next_reads or []):
-        if reviewed_source_packet_pointer_read(read):
+        if read_is_required_surface_actionable(read) and reviewed_source_packet_pointer_read(read):
             refs.append(action_proof_read_ref(read, proof_role="reviewed_source_packet_pointer"))
-    for read in action_reads[:4]:
+    for read in [item for item in action_reads if read_is_required_surface_actionable(item)][:4]:
         refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
 
     buckets = source_window_action_proof.get("buckets") if isinstance(source_window_action_proof.get("buckets"), dict) else {}
@@ -5523,6 +5535,12 @@ def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str,
         "selection_reason": selection.get("selection_reason"),
         "source_window_verification_required": selection.get("source_window_verification_required"),
         "claim_boundary": selection.get("claim_boundary"),
+        "diagnostic_only": read.get("diagnostic_only"),
+        "read_more_actionable": read.get("read_more_actionable"),
+        "followthrough_actionable": read.get("followthrough_actionable"),
+        "historical_provenance_selection": read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else None,
     }
     return {key: value for key, value in row.items() if value not in (None, [], {})}
 
@@ -5564,8 +5582,8 @@ def action_proof_required_reads(
             "read_type": "required_gap_check_read",
             "instruction": "Open this bounded next read to confirm whether action proof is present or missing.",
         }
-        for read in next_reads[:3]
-        if isinstance(read, dict) and (read.get("target") or read.get("source_ref"))
+        for read in [item for item in next_reads if isinstance(item, dict) and read_is_required_surface_actionable(item)][:3]
+        if read.get("target") or read.get("source_ref")
     ]
 
 
