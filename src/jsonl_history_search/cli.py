@@ -1908,54 +1908,57 @@ def main(argv: list[str] | None = None) -> int:
         if args.report_output:
             Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
             packet = payload["semantic_debug"]
-            payload = {
-                "semantic_debug": {
-                    "schema_version": packet["schema_version"],
-                    "status": packet["status"],
-                    "query": packet["query"],
-                    "question_family": packet["question_family"],
-                    "report_written": str(Path(args.report_output).expanduser()),
-                    "candidate_count": len(packet["strongest_candidates"]),
-                    "event_count": packet["tool_action_proof"]["event_count"],
-                    "source_locator_handoff": packet["source_locator_handoff"],
-                    "investigation_state": packet["investigation_state"],
-                    "answer_ready_handoff": packet["answer_ready_handoff"],
-                    "agent_instruction": packet["agent_instruction"],
-                    "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
-                    "answer_source_discipline_summary": (
-                        packet["final_answer_source_use_contract"].get("answer_source_discipline")
-                    ),
-                    "claim_boundaries": packet["claim_boundaries"],
-                    "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
-                    "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
-                    "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
-                    "support_precision_summary": (
-                        packet.get("forensics_workflow", {}).get("summary", {}).get("support_summary")
-                    ),
-                    "decision_context_summary": {
-                        "primary_question_family": packet["decision_context"].get("primary_question_family"),
-                        "project_time_reconstruction_needed": packet["decision_context"].get(
-                            "project_time_reconstruction_needed"
+            if _semantic_debug_is_scoped_no_evidence(packet):
+                payload = _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
+            else:
+                payload = {
+                    "semantic_debug": {
+                        "schema_version": packet["schema_version"],
+                        "status": packet["status"],
+                        "query": packet["query"],
+                        "question_family": packet["question_family"],
+                        "report_written": str(Path(args.report_output).expanduser()),
+                        "candidate_count": len(packet["strongest_candidates"]),
+                        "event_count": packet["tool_action_proof"]["event_count"],
+                        "source_locator_handoff": packet["source_locator_handoff"],
+                        "investigation_state": packet["investigation_state"],
+                        "answer_ready_handoff": packet["answer_ready_handoff"],
+                        "agent_instruction": packet["agent_instruction"],
+                        "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
+                        "answer_source_discipline_summary": (
+                            packet["final_answer_source_use_contract"].get("answer_source_discipline")
                         ),
-                        "selected_routes": packet["decision_context"].get("selected_routes", []),
-                        "confidence": packet["decision_context"].get("confidence"),
-                    },
-                    "audit_plan_summary": {
-                        "watchlist": packet["audit_plan"].get("watchlist", [])[:8],
-                        "route_order": packet["audit_plan"].get("route_order", []),
-                        "resume_from": packet["audit_plan"].get("resume_from"),
-                        "cap_pressure_notes": packet["audit_plan"].get("cap_pressure_notes", []),
-                    },
-                    "next_reads": packet["next_reads"][:5],
-                    "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
+                        "claim_boundaries": packet["claim_boundaries"],
+                        "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
+                        "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
+                        "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
+                        "support_precision_summary": (
+                            packet.get("forensics_workflow", {}).get("summary", {}).get("support_summary")
+                        ),
+                        "decision_context_summary": {
+                            "primary_question_family": packet["decision_context"].get("primary_question_family"),
+                            "project_time_reconstruction_needed": packet["decision_context"].get(
+                                "project_time_reconstruction_needed"
+                            ),
+                            "selected_routes": packet["decision_context"].get("selected_routes", []),
+                            "confidence": packet["decision_context"].get("confidence"),
+                        },
+                        "audit_plan_summary": {
+                            "watchlist": packet["audit_plan"].get("watchlist", [])[:8],
+                            "route_order": packet["audit_plan"].get("route_order", []),
+                            "resume_from": packet["audit_plan"].get("resume_from"),
+                            "cap_pressure_notes": packet["audit_plan"].get("cap_pressure_notes", []),
+                        },
+                        "next_reads": packet["next_reads"][:5],
+                        "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
+                    }
                 }
-            }
-            if "compact_provenance_handoff" in packet:
-                payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
-            if "retrieval_diagnostics" in packet:
-                payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
-            if "retrieval_pressure" in packet:
-                payload["semantic_debug"]["retrieval_pressure"] = packet["retrieval_pressure"]
+                if "compact_provenance_handoff" in packet:
+                    payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
+                if "retrieval_diagnostics" in packet:
+                    payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
+                if "retrieval_pressure" in packet:
+                    payload["semantic_debug"]["retrieval_pressure"] = packet["retrieval_pressure"]
             rendered = render(payload, args.format)
         print(rendered)
         return 0
@@ -2624,10 +2627,216 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "report_output", None):
         Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
         if "agent_find" in payload:
-            payload = _short_report_written_payload(payload, args.report_output)
+            if _agent_find_is_no_evidence_report(payload["agent_find"]):
+                payload = _short_no_evidence_report_written_payload(payload, args.report_output)
+            else:
+                payload = _short_report_written_payload(payload, args.report_output)
             rendered = render(payload, args.format)
     print(rendered)
     return 0
+
+
+def _agent_find_is_no_evidence_report(report: dict) -> bool:
+    no_evidence = report.get("no_evidence_report") if isinstance(report.get("no_evidence_report"), dict) else {}
+    return report.get("status") == "no_evidence" or bool(no_evidence.get("needed"))
+
+
+def _semantic_debug_is_scoped_no_evidence(packet: dict) -> bool:
+    answer_ready = packet.get("answer_ready_handoff") if isinstance(packet.get("answer_ready_handoff"), dict) else {}
+    agent_instruction = packet.get("agent_instruction") if isinstance(packet.get("agent_instruction"), dict) else {}
+    source_action = (
+        packet.get("source_action_guidance")
+        if isinstance(packet.get("source_action_guidance"), dict)
+        else answer_ready.get("source_action_guidance")
+        if isinstance(answer_ready.get("source_action_guidance"), dict)
+        else agent_instruction.get("source_action_guidance")
+        if isinstance(agent_instruction.get("source_action_guidance"), dict)
+        else {}
+    )
+    return (
+        answer_ready.get("decision") == "scoped_no_evidence"
+        or source_action.get("decision") == "answer_scoped_no_evidence_now"
+    )
+
+
+def _short_no_evidence_report_written_payload(payload: dict, report_output: str) -> dict:
+    report = payload["agent_find"]
+    no_evidence = report.get("no_evidence_report") if isinstance(report.get("no_evidence_report"), dict) else {}
+    return {
+        "agent_find": {
+            "schema_version": report["schema_version"],
+            "status": report["status"],
+            "query": report["query"],
+            "report_written": str(Path(report_output).expanduser()),
+            "searched_scope": _no_evidence_searched_scope_summary(
+                no_evidence,
+                searched_files=report["token_efficiency"]["searched_files"],
+                searched_bytes=report["token_efficiency"]["searched_bytes"],
+            ),
+            "scope_counts": _no_evidence_scope_counts(no_evidence),
+            "cap_hit": _no_evidence_cap_hit(no_evidence),
+            "no_evidence": _no_evidence_boundary_summary(no_evidence),
+            "message": "Full no-evidence find report written to report_output; stdout is a scoped summary.",
+        }
+    }
+
+
+def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, report_output: str) -> dict:
+    no_evidence = packet.get("no_evidence") if isinstance(packet.get("no_evidence"), dict) else {}
+    answer_ready = packet.get("answer_ready_handoff") if isinstance(packet.get("answer_ready_handoff"), dict) else {}
+    agent_instruction = packet.get("agent_instruction") if isinstance(packet.get("agent_instruction"), dict) else {}
+    source_action = (
+        packet.get("source_action_guidance")
+        if isinstance(packet.get("source_action_guidance"), dict)
+        else answer_ready.get("source_action_guidance")
+        if isinstance(answer_ready.get("source_action_guidance"), dict)
+        else agent_instruction.get("source_action_guidance")
+        if isinstance(agent_instruction.get("source_action_guidance"), dict)
+        else {}
+    )
+    boundary = _no_evidence_boundary_summary(
+        no_evidence,
+        locator_meaning=(packet.get("source_locator_handoff") or {}).get("no_evidence_meaning", {}),
+    )
+    boundary["source_action_guidance_decision"] = source_action.get("decision")
+    boundary["read_more_policy"] = _semantic_debug_scoped_no_evidence_read_more_policy(
+        answer_ready=answer_ready,
+        source_action=source_action,
+    )
+    return {
+        "semantic_debug": {
+            "schema_version": packet["schema_version"],
+            "status": packet["status"],
+            "query": packet["query"],
+            "report_written": str(Path(report_output).expanduser()),
+            "answer_ready_decision": answer_ready.get("decision"),
+            "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
+            "scope_counts": _no_evidence_scope_counts(no_evidence),
+            "cap_hit": _no_evidence_cap_hit(no_evidence),
+            "no_evidence": boundary,
+            "message": "Full semantic-debug scoped no-evidence report written to report_output; stdout is a scoped summary.",
+        }
+    }
+
+
+def _no_evidence_searched_scope_summary(
+    no_evidence: dict,
+    *,
+    searched_files: int | None = None,
+    searched_bytes: int | None = None,
+) -> dict:
+    searched = no_evidence.get("searched_scope") if isinstance(no_evidence.get("searched_scope"), dict) else {}
+    files = searched.get("searched_files") if searched_files is None else searched_files
+    bytes_ = searched.get("searched_bytes") if searched_bytes is None else searched_bytes
+    return {
+        "searched_files": int(files or 0),
+        "searched_bytes": int(bytes_ or 0),
+        "result_meaning": searched.get("result_meaning"),
+    }
+
+
+def _no_evidence_scope_counts(no_evidence: dict) -> dict:
+    searched = no_evidence.get("searched_scope") if isinstance(no_evidence.get("searched_scope"), dict) else {}
+    selected_roots = no_evidence.get("selected_roots")
+    if isinstance(selected_roots, list):
+        selected_count = len(selected_roots)
+    else:
+        selected_count = len(searched.get("roots") or [])
+
+    excluded_summary = (
+        no_evidence.get("excluded_scope_summary")
+        if isinstance(no_evidence.get("excluded_scope_summary"), dict)
+        else no_evidence.get("excluded_scope")
+        if isinstance(no_evidence.get("excluded_scope"), dict)
+        else {}
+    )
+    excluded_roots = no_evidence.get("excluded_scope")
+    excluded_count = int(excluded_summary.get("rejected_root_count") or 0)
+    if not excluded_count and isinstance(excluded_roots, list):
+        excluded_count = len(excluded_roots)
+
+    not_searched = no_evidence.get("not_searched_scope") if isinstance(no_evidence.get("not_searched_scope"), dict) else {}
+    missing_roots = no_evidence.get("missing_scope") if isinstance(no_evidence.get("missing_scope"), list) else None
+    missing_count = int(not_searched.get("missing_root_count") or 0)
+    if not missing_count:
+        missing_count = len(missing_roots or not_searched.get("missing_roots") or [])
+
+    return {
+        "selected_root_count": selected_count,
+        "excluded_root_count": excluded_count,
+        "missing_root_count": missing_count,
+    }
+
+
+def _no_evidence_cap_hit(no_evidence: dict) -> dict:
+    cap_hit = no_evidence.get("cap_hit") if isinstance(no_evidence.get("cap_hit"), dict) else {}
+    if cap_hit:
+        return {
+            "hit": bool(cap_hit.get("hit")),
+            "caps_hit": list(cap_hit.get("caps_hit") or []),
+            "normalized_warnings": list(cap_hit.get("normalized_warnings") or []),
+        }
+    not_searched = no_evidence.get("not_searched_scope") if isinstance(no_evidence.get("not_searched_scope"), dict) else {}
+    cap_limited = not_searched.get("cap_limited") if isinstance(not_searched.get("cap_limited"), dict) else {}
+    return {
+        "hit": bool(cap_limited.get("hit")),
+        "caps_hit": list(cap_limited.get("caps_hit") or []),
+        "normalized_warnings": list(cap_limited.get("normalized_warnings") or []),
+    }
+
+
+def _no_evidence_boundary_summary(no_evidence: dict, *, locator_meaning: dict | None = None) -> dict:
+    locator_meaning = locator_meaning or {}
+    summary = {
+        "needed": bool(no_evidence.get("needed")),
+        "answer_scope": no_evidence.get("answer_scope")
+        or locator_meaning.get("answer_scope")
+        or "not_found_in_searched_scope",
+        "not_all_history_absence": bool(
+            no_evidence.get("not_all_history_absence", locator_meaning.get("not_all_history_absence", True))
+        ),
+        "read_more_policy": _no_evidence_read_more_policy(no_evidence),
+    }
+    if no_evidence.get("candidate_interpretation"):
+        summary["candidate_interpretation"] = no_evidence.get("candidate_interpretation")
+    coverage = no_evidence.get("query_term_coverage") if isinstance(no_evidence.get("query_term_coverage"), dict) else {}
+    missing_terms = list(coverage.get("missing_terms_any_candidate") or [])
+    if missing_terms:
+        summary["missing_query_terms"] = missing_terms
+    if no_evidence.get("weak_candidate_count") is not None:
+        summary["weak_candidate_count"] = no_evidence.get("weak_candidate_count")
+    elif no_evidence.get("candidate_rows_found") is not None:
+        summary["candidate_rows_found"] = no_evidence.get("candidate_rows_found")
+    return summary
+
+
+def _no_evidence_read_more_policy(no_evidence: dict) -> dict:
+    guidance = no_evidence.get("read_more_guidance") if isinstance(no_evidence.get("read_more_guidance"), dict) else {}
+    required = bool(guidance.get("required_before_scoped_no_evidence_answer", False))
+    policy = {
+        "required_before_scoped_no_evidence_answer": required,
+        "actionability": guidance.get("actionability")
+        or ("required_before_answer" if required else "optional_diagnostic_context"),
+    }
+    if guidance.get("diagnostic_next_read_count_suppressed") is not None:
+        policy["diagnostic_next_read_count_suppressed"] = guidance.get("diagnostic_next_read_count_suppressed")
+    if guidance.get("source_refs_available_in"):
+        policy["source_refs_available_in"] = guidance.get("source_refs_available_in")
+    if guidance.get("reason"):
+        policy["reason"] = guidance.get("reason")
+    return policy
+
+
+def _semantic_debug_scoped_no_evidence_read_more_policy(*, answer_ready: dict, source_action: dict) -> dict:
+    source_use = answer_ready.get("source_use_summary") if isinstance(answer_ready.get("source_use_summary"), dict) else {}
+    optional_reads = source_action.get("optional_diagnostic_reads") if isinstance(source_action, dict) else []
+    return {
+        "required_before_scoped_no_evidence_answer": False,
+        "actionability": "optional_diagnostic_context",
+        "diagnostic_policy": "Diagnostic reads may be inspected for audit/context, but are not required before the scoped no-evidence answer.",
+        "optional_diagnostic_read_count": len(optional_reads or []),
+        "diagnostic_only_excluded_next_read_count": int(source_use.get("diagnostic_only_excluded_next_read_count") or 0),
+    }
 
 
 def _short_report_written_payload(payload: dict, report_output: str) -> dict:
