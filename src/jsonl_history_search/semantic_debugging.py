@@ -194,6 +194,7 @@ def build_semantic_debug_payload(
             query=agent_find["query"]["original"],
         )
     next_reads = compact_text_semantic_read_more_actions(next_reads)
+    next_reads = mark_scoped_no_evidence_diagnostic_reads(next_reads, no_evidence)
     source_handle_routing = build_source_handle_routing(
         agent_find["query"]["original"],
         candidates=source_selection_candidates,
@@ -261,12 +262,19 @@ def build_semantic_debug_payload(
                 query=agent_find["query"]["original"],
             )
         next_reads = compact_text_semantic_read_more_actions(next_reads)
+        next_reads = mark_scoped_no_evidence_diagnostic_reads(next_reads, no_evidence)
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
             candidates=source_selection_candidates,
             next_reads=next_reads,
         )
         source_locator_handoff["next_reads"] = next_reads
+        if no_evidence.get("needed"):
+            source_locator_handoff["next_reads"] = mark_scoped_no_evidence_diagnostic_reads(
+                list(source_locator_handoff.get("next_reads") or []),
+                no_evidence,
+            )
+            next_reads = list(source_locator_handoff.get("next_reads") or [])
         if process_actual_use:
             source_locator_handoff = annotate_process_actual_use_source_locator_handoff(
                 source_locator_handoff,
@@ -314,7 +322,8 @@ def build_semantic_debug_payload(
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
     )
     if historical_provenance_self_echo_policy:
-        source_locator_handoff["next_reads"] = next_reads
+        source_locator_handoff["next_reads"] = mark_scoped_no_evidence_diagnostic_reads(next_reads, no_evidence)
+        next_reads = list(source_locator_handoff.get("next_reads") or [])
         source_locator_handoff["historical_provenance_self_echo_policy"] = (
             historical_provenance_self_echo_policy
         )
@@ -570,6 +579,19 @@ def build_semantic_debug_payload(
         ]
         final_answer_contract["evidence_inputs"]["source_locator_next_reads_policy"] = (
             "fallback_after_primary_source_followthrough_only"
+        )
+    elif answer_ready_handoff.get("decision") == "scoped_no_evidence":
+        final_answer_contract["required_actions"] = [
+            (
+                "Treat source_locator_handoff.next_reads as optional diagnostics; answer scoped no-evidence first "
+                "unless the user needs stronger recall or broader scope."
+            )
+            if action == "Use source refs from strongest_candidates and source_locator_handoff.next_reads before answering when they exist."
+            else action
+            for action in final_answer_contract.get("required_actions", [])
+        ]
+        final_answer_contract["evidence_inputs"]["source_locator_next_reads_policy"] = (
+            "optional_diagnostics_after_scoped_no_evidence"
         )
     answer_ready_handoff["links"]["investigation_state"] = "semantic_debug.investigation_state"
     answer_ready_handoff["source_use_summary"]["investigation_state"] = {
@@ -3826,11 +3848,20 @@ def build_answer_ready_handoff(
         )
     do_not_answer_until = dedupe(do_not_answer_until)[:8]
 
-    bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
+    candidate_bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
+    has_primary_followthrough_source = bool(
+        primary_followthrough_reads(
+            bounded_next_reads=candidate_bounded_next_reads,
+            action_proof_plan=action_proof_plan,
+            allow_action_proof_plan=True,
+        )
+    )
+    scoped_no_evidence_answer = no_evidence_needed and not has_primary_followthrough_source
+    bounded_next_reads = [] if scoped_no_evidence_answer else candidate_bounded_next_reads
     primary_question_family = guided_audit_flow.get("primary_question_family")
     allow_action_proof_followthrough = (
         readiness_decision != "answer_now"
-        and not no_evidence_needed
+        and not scoped_no_evidence_answer
         and primary_question_family == "claimed_action"
     )
     primary_followthrough = build_primary_source_followthrough(
@@ -3843,12 +3874,31 @@ def build_answer_ready_handoff(
     if primary_followthrough_first:
         decision = "primary_source_followthrough_first"
         do_next = "run_primary_source_window_command_then_answer_if_supported"
-    copy_paste_commands = answer_ready_copy_paste_commands(
-        bounded_next_reads=bounded_next_reads,
+    copy_paste_commands = (
+        []
+        if scoped_no_evidence_answer
+        else answer_ready_copy_paste_commands(
+            bounded_next_reads=bounded_next_reads,
+            next_reads=next_reads,
+            hints=hints,
+            report_output=report_output,
+            prefer_follow_next_reads_bundle=decision == "recovery_first" and not primary_followthrough_first,
+        )
+    )
+    optional_fielded_bm25_command = (
+        fielded_bm25_rerun_command(
+            query=query,
+            guided_audit_flow=guided_audit_flow,
+            next_reads=next_reads,
+        )
+        if scoped_no_evidence_answer
+        else None
+    )
+    source_action_guidance = build_source_action_guidance(
+        answer_readiness=answer_readiness,
+        no_evidence={**no_evidence, "needed": scoped_no_evidence_answer},
         next_reads=next_reads,
-        hints=hints,
-        report_output=report_output,
-        prefer_follow_next_reads_bundle=decision == "recovery_first" and not primary_followthrough_first,
+        fielded_bm25_command=optional_fielded_bm25_command,
     )
     command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
     source_use_summary = {
@@ -3896,10 +3946,13 @@ def build_answer_ready_handoff(
                 "saved follow-next-reads bundle first when recovery reads are present; "
                 "individual jsonl read-more commands are fallback in semantic_debug.next_reads order"
                 if report_output and decision == "recovery_first"
+                else "scoped no-evidence answer first; diagnostic next_reads and retrieval reruns are optional"
+                if scoped_no_evidence_answer
                 else "semantic_debug.next_reads order; jsonl read-more commands first"
             ),
         },
         "source_use_summary": source_use_summary,
+        "source_action_guidance": source_action_guidance,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
         "privacy_boundaries": {
@@ -3962,8 +4015,8 @@ def answer_support_classification(
         current = "read_more_required"
         reason = "missing_primary_proof_or_blocked_facets"
     elif decision == "scoped_no_evidence":
-        current = "read_more_required"
-        reason = "scoped_no_evidence_not_primary_source_answer"
+        current = "scoped_no_evidence_answer"
+        reason = "scoped_no_evidence_ready_without_required_source_reads"
     else:
         current = "primary_source_answer"
         reason = "primary_source_surfaces_available_for_answer_scope"
@@ -3972,7 +4025,7 @@ def answer_support_classification(
         "schema_version": 1,
         "current": current,
         "reason": reason,
-        "states": ["primary_source_answer", "answer_with_caveat", "read_more_required"],
+        "states": ["primary_source_answer", "answer_with_caveat", "read_more_required", "scoped_no_evidence_answer"],
         "adjacent_artifact_present": adjacent_present,
         "adjacent_artifact_counts_as_primary_source": False,
         "action_proof_status": action_status or "not_applicable",
@@ -3982,6 +4035,7 @@ def answer_support_classification(
             "primary_source_grounding_claim_allowed": current == "primary_source_answer",
             "adjacent_artifact_success_requires_caveat": current == "answer_with_caveat",
             "read_more_required_before_clean_answer": current == "read_more_required",
+            "scoped_no_evidence_answer_allowed": current == "scoped_no_evidence_answer",
         },
     }
 
@@ -5133,14 +5187,23 @@ def build_agent_instruction(
 ) -> dict[str, Any]:
     readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
     primary_family = guided_audit_flow.get("primary_question_family")
-    recovery_first = readiness_decision == "inspect_recovery_reads" or bool(next_reads)
+    candidate_bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
+    has_primary_followthrough_source = bool(
+        primary_followthrough_reads(
+            bounded_next_reads=candidate_bounded_next_reads,
+            action_proof_plan=action_proof_plan,
+            allow_action_proof_plan=True,
+        )
+    )
+    scoped_no_evidence = readiness_decision == "state_scoped_no_evidence" and not has_primary_followthrough_source
+    recovery_first = (readiness_decision == "inspect_recovery_reads" or bool(next_reads)) and not scoped_no_evidence
     allow_action_proof_followthrough = (
         readiness_decision != "answer_now"
-        and readiness_decision != "state_scoped_no_evidence"
+        and not scoped_no_evidence
         and primary_family == "claimed_action"
     )
     primary_followthrough = build_primary_source_followthrough(
-        bounded_next_reads=bounded_answer_ready_next_reads(next_reads),
+        bounded_next_reads=candidate_bounded_next_reads,
         action_proof_plan=action_proof_plan,
         allow_action_proof_plan=allow_action_proof_followthrough,
         query=query,
@@ -5174,7 +5237,7 @@ def build_agent_instruction(
         command["required_for_decisions"] = ["primary_source_followthrough_first"]
         command["purpose"] = "Open the primary source window first; stop broad search if it supports the answer."
         commands.append(command)
-    elif report_path:
+    elif report_path and not scoped_no_evidence:
         follow_argv = [
             "jsonl-history-search",
             "follow-next-reads",
@@ -5220,7 +5283,7 @@ def build_agent_instruction(
                 "purpose": "Synthesize a deterministic devlog_brief from saved semantic-debug and recovery packets.",
             }
         )
-    else:
+    elif not scoped_no_evidence:
         commands.append(
             {
                 "command_id": "save_semantic_debug_report_first",
@@ -5249,25 +5312,36 @@ def build_agent_instruction(
             }
         )
 
+    optional_fielded_bm25_command = None
     if not primary_followthrough_first:
         mode_command = fielded_bm25_rerun_command(
             query=query,
             guided_audit_flow=guided_audit_flow,
             next_reads=next_reads,
         )
-        if mode_command:
+        if scoped_no_evidence:
+            optional_fielded_bm25_command = mode_command
+        elif mode_command:
             commands.append(mode_command)
 
-        for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
-            commands.append(
-                {
-                    "command_id": f"inspect_exact_source_{len(commands) + 1}",
-                    "required_for_decisions": ["inspect_recovery_reads"],
-                    "argv": command.get("argv"),
-                    "command": command.get("command") or shell_command(command.get("argv") or []),
-                    "purpose": "Open one exact source ref from the evidence packet when a targeted read is preferable.",
-                }
-            )
+        if not scoped_no_evidence:
+            for command in build_next_commands(next_reads, hints=hints, include_semantic_debug_replay=False)[:3]:
+                commands.append(
+                    {
+                        "command_id": f"inspect_exact_source_{len(commands) + 1}",
+                        "required_for_decisions": ["inspect_recovery_reads"],
+                        "argv": command.get("argv"),
+                        "command": command.get("command") or shell_command(command.get("argv") or []),
+                        "purpose": "Open one exact source ref from the evidence packet when a targeted read is preferable.",
+                    }
+                )
+
+    source_action_guidance = build_source_action_guidance(
+        answer_readiness=answer_readiness,
+        no_evidence={"needed": scoped_no_evidence},
+        next_reads=next_reads,
+        fielded_bm25_command=optional_fielded_bm25_command,
+    )
 
     if primary_followthrough_first:
         required_final_source_ref_ids = list(primary_followthrough.get("required_final_source_ref_ids") or [])
@@ -5291,7 +5365,14 @@ def build_agent_instruction(
             "Use failure-analysis/devlog_brief for timeline, supported claims, non-claims, gaps, and next reads before producing devlog-style conclusions.",
             "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
         ]
-    if decision == "answer_now":
+    if scoped_no_evidence:
+        constraints = [
+            "Answer now with `not_found_in_searched_scope`; do not open diagnostic next_reads first.",
+            "Name searched scope, not-searched/missing scope, and cap limits before concluding no evidence.",
+            "Escalate retrieval mode only if the user needs stronger recall or a broader claim than searched-scope no-evidence allows.",
+            "Do not claim root cause, all-history completeness, token savings, speed, final-answer quality, or product value unless separately proven.",
+        ]
+    elif decision == "answer_now":
         constraints.insert(0, "Answer only within the allowed_answer_scope and cite/source the supporting handles.")
     discipline_summary = answer_source_discipline_summary(answer_source_discipline)
     discipline_gate = (
@@ -5321,6 +5402,7 @@ def build_agent_instruction(
             "answer_source_discipline": discipline_summary,
         },
         "commands": commands[:8],
+        "source_action_guidance": source_action_guidance,
         "do_not_answer_until": constraints,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "workflow_layers": [
@@ -5333,12 +5415,12 @@ def build_agent_instruction(
             {
                 "layer": "recovery_packet",
                 "surface": "follow_next_reads",
-                "status": "required_before_synthesis" if recovery_first else "optional",
+                "status": "optional_diagnostic" if scoped_no_evidence else "required_before_synthesis" if recovery_first else "optional",
             },
             {
                 "layer": "investigation_brief",
                 "surface": "failure_analysis.devlog_brief",
-                "status": "required_for_devlog_questions" if not primary_followthrough_first else "only_if_primary_source_insufficient",
+                "status": "optional_after_scoped_no_evidence" if scoped_no_evidence else "required_for_devlog_questions" if not primary_followthrough_first else "only_if_primary_source_insufficient",
             },
         ],
         "privacy_boundaries": {
@@ -5348,6 +5430,112 @@ def build_agent_instruction(
             "commands_may_include_local_report_paths": bool(report_path),
         },
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
+    }
+
+
+def diagnostic_next_read_summaries(next_reads: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for read in next_reads:
+        if len(rows) >= limit:
+            break
+        rows.append(
+            {
+                key: value
+                for key, value in {
+                    "kind": read.get("kind"),
+                    "target": read.get("target"),
+                    "reason": read.get("reason"),
+                    "diagnostic_only": bool(read.get("diagnostic_only")),
+                    "read_more_actionable": read.get("read_more_actionable", True),
+                    "followthrough_actionable": read.get("followthrough_actionable", True),
+                }.items()
+                if value not in (None, [], {})
+            }
+        )
+    return rows
+
+
+def scoped_no_evidence_without_primary_source(next_reads: list[dict[str, Any]], no_evidence: dict[str, Any]) -> bool:
+    if not no_evidence.get("needed"):
+        return False
+    return not bool(
+        primary_followthrough_reads(
+            bounded_next_reads=bounded_answer_ready_next_reads(next_reads),
+            action_proof_plan=None,
+            allow_action_proof_plan=True,
+        )
+    )
+
+
+def mark_scoped_no_evidence_diagnostic_reads(next_reads: list[dict[str, Any]], no_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    if not scoped_no_evidence_without_primary_source(next_reads, no_evidence):
+        return next_reads
+    rows: list[dict[str, Any]] = []
+    for read in next_reads:
+        row = dict(read)
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        row["no_evidence_action_role"] = "optional_diagnostic_after_scoped_answer"
+        row["required_before_scoped_no_evidence_answer"] = False
+        reason = str(row.get("reason") or "inspect adjacent diagnostic source context")
+        if not reason.startswith("optional diagnostic after scoped no-evidence answer"):
+            row["reason"] = f"optional diagnostic after scoped no-evidence answer: {reason}"
+        rows.append(row)
+    return rows
+
+
+def build_source_action_guidance(
+    *,
+    answer_readiness: dict[str, Any],
+    no_evidence: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    fielded_bm25_command: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scoped_no_evidence = bool(no_evidence.get("needed")) and answer_readiness.get("decision") == "state_scoped_no_evidence"
+    if scoped_no_evidence:
+        optional_commands = []
+        if fielded_bm25_command:
+            command = dict(fielded_bm25_command)
+            command["required_for_decisions"] = []
+            command["optional_after_decision"] = True
+            command["purpose"] = (
+                "Optional retrieval escalation only if the user needs stronger recall or a broader scope than "
+                "the current searched-scope no-evidence answer allows."
+            )
+            optional_commands.append(command)
+        return {
+            "schema_version": 1,
+            "decision": "answer_scoped_no_evidence_now",
+            "required_primary_source_actions": [],
+            "optional_diagnostic_reads": diagnostic_next_read_summaries(next_reads),
+            "stop_condition": (
+                "Stop broad search and answer `not_found_in_searched_scope` once searched, not-searched, "
+                "missing, and cap-limited scope are named."
+            ),
+            "retrieval_escalation_condition": (
+                "Escalate to `--retrieval-mode fielded-bm25` only if the user asks for stronger recall, "
+                "the searched scope/caps are too weak for the requested claim, or the answer must go beyond "
+                "searched-scope no-evidence."
+            ),
+            "optional_retrieval_escalation_commands": optional_commands,
+            "diagnostic_policy": (
+                "Diagnostic next_reads may be inspected for audit/context, but they are not required before "
+                "the scoped no-evidence answer."
+            ),
+        }
+    return {
+        "schema_version": 1,
+        "decision": str(answer_readiness.get("decision") or "gather_more_evidence"),
+        "required_primary_source_actions": bounded_answer_ready_next_reads(next_reads),
+        "optional_diagnostic_reads": [
+            row for row in diagnostic_next_read_summaries(next_reads) if row.get("diagnostic_only")
+        ],
+        "stop_condition": "Stop when inspected source refs support the answer within the searched-scope boundaries.",
+        "retrieval_escalation_condition": (
+            "Escalate retrieval mode only when package-mode evidence is weak, required facets remain missing, "
+            "or bounded source reads do not support the requested answer."
+        ),
     }
 
 

@@ -2913,10 +2913,18 @@ def render_semantic_debug_text(payload: dict) -> str:
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
-    next_reads_for_required_surfaces = _required_surface_reads(report.get("next_reads", []) or [])
+    handoff = report.get("answer_ready_handoff") or {}
+    source_action_guidance = handoff.get("source_action_guidance") or {}
+    scoped_no_evidence = (
+        handoff.get("decision") == "scoped_no_evidence"
+        or source_action_guidance.get("decision") == "answer_scoped_no_evidence_now"
+    )
+    next_reads_for_required_surfaces = (
+        [] if scoped_no_evidence else _required_surface_reads(report.get("next_reads", []) or [])
+    )
     command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
-    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    followthrough = handoff.get("primary_source_followthrough") or {}
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = (
         []
@@ -2928,9 +2936,17 @@ def render_semantic_debug_text(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
-    answer_status = "answer-after-required-reads" if required_reads or next_reads_for_required_surfaces else "not-ready/needs-more-proof"
+    answer_status = (
+        "answer-scoped-no-evidence-now"
+        if scoped_no_evidence
+        else "answer-after-required-reads"
+        if required_reads or next_reads_for_required_surfaces
+        else "not-ready/needs-more-proof"
+    )
     stop_condition = (
-        followthrough.get("stop_after")
+        source_action_guidance.get("stop_condition")
+        if scoped_no_evidence
+        else followthrough.get("stop_after")
         if suppress_action_required_reads
         else action_proof_plan.get("stop_condition")
         or followthrough.get("stop_after")
@@ -2943,7 +2959,11 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
         "Open these source refs first:",
     ]
-    if process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
+    if scoped_no_evidence:
+        lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
+        if source_action_guidance.get("diagnostic_policy"):
+            lines.append(f"- diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
+    elif process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
         for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
             _append_text_read(lines, read, command_by_target=command_by_target)
     elif primary_command:
@@ -3035,6 +3055,16 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"gate={handoff.get('answer_gate_status')} "
             f"next={handoff.get('do_next')}"
         )
+        source_action = handoff.get("source_action_guidance") or {}
+        if source_action:
+            lines.append(
+                "Source action guidance: "
+                f"decision={source_action.get('decision')} "
+                f"required_primary={len(source_action.get('required_primary_source_actions') or [])} "
+                f"optional_diagnostics={len(source_action.get('optional_diagnostic_reads') or [])}"
+            )
+            if source_action.get("retrieval_escalation_condition"):
+                lines.append(f"- retrieval_escalation_condition: {source_action.get('retrieval_escalation_condition')}")
         followthrough = handoff.get("primary_source_followthrough") or {}
         if followthrough.get("applies"):
             command = followthrough.get("first_command") or {}
@@ -3102,7 +3132,11 @@ def render_semantic_debug_text(payload: dict) -> str:
                 lines.append(f"- command: {rendered}")
     if report.get("next_reads"):
         followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
-        if followthrough.get("applies"):
+        if scoped_no_evidence:
+            lines.append("Optional diagnostic next reads (not required before scoped no-evidence answer):")
+            for item in report.get("next_reads", [])[:8]:
+                _append_text_read_summary(lines, item)
+        elif followthrough.get("applies"):
             lines.append("Fallback next reads (only if the primary source window leaves a named facet missing):")
             lines.append("- executable fallback commands suppressed in text output; use JSON next_reads only after a named facet gap")
             for item in report.get("next_reads", [])[:8]:
@@ -3121,10 +3155,18 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
-    next_reads_for_required_surfaces = _required_surface_reads(report.get("next_reads", []) or [])
+    handoff = report.get("answer_ready_handoff") or {}
+    source_action_guidance = handoff.get("source_action_guidance") or {}
+    scoped_no_evidence = (
+        handoff.get("decision") == "scoped_no_evidence"
+        or source_action_guidance.get("decision") == "answer_scoped_no_evidence_now"
+    )
+    next_reads_for_required_surfaces = (
+        [] if scoped_no_evidence else _required_surface_reads(report.get("next_reads", []) or [])
+    )
     command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
-    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    followthrough = handoff.get("primary_source_followthrough") or {}
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = (
         []
@@ -3136,9 +3178,17 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
-    answer_status = "answer-after-required-reads" if required_reads or next_reads_for_required_surfaces else "not-ready/needs-more-proof"
+    answer_status = (
+        "answer-scoped-no-evidence-now"
+        if scoped_no_evidence
+        else "answer-after-required-reads"
+        if required_reads or next_reads_for_required_surfaces
+        else "not-ready/needs-more-proof"
+    )
     stop_condition = (
-        followthrough.get("stop_after")
+        source_action_guidance.get("stop_condition")
+        if scoped_no_evidence
+        else followthrough.get("stop_after")
         if suppress_action_required_reads
         else action_proof_plan.get("stop_condition")
         or followthrough.get("stop_after")
@@ -3154,7 +3204,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "## Open These Source Refs First",
         "",
     ]
-    if process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
+    if scoped_no_evidence:
+        lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
+        if source_action_guidance.get("diagnostic_policy"):
+            lines.append(f"- Diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
+    elif process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
         for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
     elif primary_command:
@@ -3176,6 +3230,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     )
     for item in only_continue[:4]:
         lines.append(f"- Only continue if: {item}")
+    if scoped_no_evidence and source_action_guidance.get("retrieval_escalation_condition"):
+        lines.append(f"- Retrieval escalation condition: {source_action_guidance.get('retrieval_escalation_condition')}")
     lines.extend(["", "## Required Proof Reads", ""])
     if required_reads:
         for read in required_reads[:8]:
@@ -3270,6 +3326,20 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"- `answer_gate_status`: `{handoff.get('answer_gate_status')}`",
             f"- `do_next`: `{handoff.get('do_next')}`",
         ])
+        source_action = handoff.get("source_action_guidance") or {}
+        if source_action:
+            lines.extend(
+                [
+                    "",
+                    "### Source Action Guidance",
+                    "",
+                    f"- `decision`: `{source_action.get('decision')}`",
+                    f"- `required_primary_source_actions`: `{len(source_action.get('required_primary_source_actions') or [])}`",
+                    f"- `optional_diagnostic_reads`: `{len(source_action.get('optional_diagnostic_reads') or [])}`",
+                ]
+            )
+            if source_action.get("retrieval_escalation_condition"):
+                lines.append(f"- `retrieval_escalation_condition`: {source_action.get('retrieval_escalation_condition')}")
         followthrough = handoff.get("primary_source_followthrough") or {}
         if followthrough.get("applies"):
             command = followthrough.get("first_command") or {}
@@ -3352,7 +3422,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     lines.append("")
     lines.append("## Next Reads")
     followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
-    if followthrough.get("applies"):
+    if scoped_no_evidence:
+        lines.append("These are optional diagnostics, not required before the scoped no-evidence answer.")
+        for item in report.get("next_reads", [])[:8]:
+            _append_markdown_read_summary(lines, item)
+    elif followthrough.get("applies"):
         lines.append(
             "- Executable fallback commands suppressed in Markdown output; use JSON `next_reads` only after a named facet gap."
         )
