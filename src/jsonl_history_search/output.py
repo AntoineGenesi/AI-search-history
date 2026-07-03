@@ -381,8 +381,24 @@ def _action_command(action: dict) -> str | None:
     return None
 
 
+def _read_marked_diagnostic_or_nonactionable(item: dict) -> bool:
+    selection = item.get("historical_provenance_selection") if isinstance(item.get("historical_provenance_selection"), dict) else {}
+    return (
+        item.get("diagnostic_only") is True
+        or item.get("read_more_actionable") is False
+        or item.get("followthrough_actionable") is False
+        or selection.get("diagnostic_only") is True
+        or selection.get("read_more_actionable") is False
+        or selection.get("final_support_allowed") is False
+    )
+
+
+def _required_surface_reads(reads: list[dict] | tuple[dict, ...] | None) -> list[dict]:
+    return [read for read in list(reads or []) if isinstance(read, dict) and not _read_marked_diagnostic_or_nonactionable(read)]
+
+
 def _read_more_command(item: dict, command_by_target: dict[str, str] | None = None) -> str | None:
-    if item.get("read_more_actionable") is False or item.get("diagnostic_only") is True:
+    if _read_marked_diagnostic_or_nonactionable(item):
         return None
     if item.get("read_more_command"):
         return str(item["read_more_command"])
@@ -444,7 +460,7 @@ def _parse_repo_artifact_target(target: str | None) -> tuple[str, int | None] | 
 def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
     commands: dict[str, str] = {}
     for read in reads:
-        if read.get("read_more_actionable") is False:
+        if _read_marked_diagnostic_or_nonactionable(read):
             continue
         target = _source_target(read)
         command = _read_more_command(read)
@@ -2897,17 +2913,22 @@ def render_semantic_debug_text(payload: dict) -> str:
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
-    command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
+    next_reads_for_required_surfaces = _required_surface_reads(report.get("next_reads", []) or [])
+    command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
     followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
-    required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
+    required_reads = (
+        []
+        if suppress_action_required_reads
+        else _required_surface_reads(action_proof_plan.get("required_proof_reads") or [])
+    )
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
-    answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
+    answer_status = "answer-after-required-reads" if required_reads or next_reads_for_required_surfaces else "not-ready/needs-more-proof"
     stop_condition = (
         followthrough.get("stop_after")
         if suppress_action_required_reads
@@ -2936,8 +2957,8 @@ def render_semantic_debug_text(payload: dict) -> str:
     elif required_reads:
         for read in required_reads[:5]:
             _append_text_read(lines, read, command_by_target=command_by_target)
-    elif report.get("next_reads"):
-        for read in report.get("next_reads", [])[:5]:
+    elif next_reads_for_required_surfaces:
+        for read in next_reads_for_required_surfaces[:5]:
             _append_text_read(lines, read, command_by_target=command_by_target)
     else:
         lines.append("- (no source refs surfaced)")
@@ -3100,17 +3121,22 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
-    command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
+    next_reads_for_required_surfaces = _required_surface_reads(report.get("next_reads", []) or [])
+    command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
     followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
-    required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
+    required_reads = (
+        []
+        if suppress_action_required_reads
+        else _required_surface_reads(action_proof_plan.get("required_proof_reads") or [])
+    )
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
-    answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
+    answer_status = "answer-after-required-reads" if required_reads or next_reads_for_required_surfaces else "not-ready/needs-more-proof"
     stop_condition = (
         followthrough.get("stop_after")
         if suppress_action_required_reads
@@ -3137,8 +3163,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     elif required_reads:
         for read in required_reads[:5]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
-    elif report.get("next_reads"):
-        for read in report.get("next_reads", [])[:5]:
+    elif next_reads_for_required_surfaces:
+        for read in next_reads_for_required_surfaces[:5]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
     else:
         lines.append("- No source refs surfaced.")
@@ -3430,8 +3456,8 @@ def render_action_proof_plan_text(plan: dict, *, command_by_target: dict[str, st
     package = retrieval.get("package") or {}
     fielded = retrieval.get("fielded_bm25") or {}
     rrf = retrieval.get("rrf_fusion") or {}
-    primary_refs = plan.get("primary_proof_refs") or []
-    required_reads = plan.get("required_proof_reads") or []
+    primary_refs = _required_surface_reads(plan.get("primary_proof_refs") or [])
+    required_reads = _required_surface_reads(plan.get("required_proof_reads") or [])
     optional = plan.get("optional_diagnostics") or []
     lines = [
         "Action-proof plan: "
@@ -3476,8 +3502,8 @@ def render_action_proof_plan_markdown(plan: dict, *, command_by_target: dict[str
     package = retrieval.get("package") or {}
     fielded = retrieval.get("fielded_bm25") or {}
     rrf = retrieval.get("rrf_fusion") or {}
-    primary_refs = plan.get("primary_proof_refs") or []
-    required_reads = plan.get("required_proof_reads") or []
+    primary_refs = _required_surface_reads(plan.get("primary_proof_refs") or [])
+    required_reads = _required_surface_reads(plan.get("required_proof_reads") or [])
     optional = plan.get("optional_diagnostics") or []
     lines = [
         "## Action-Proof Plan",
@@ -4579,6 +4605,13 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
         lines.append(f"- caps hit: {', '.join(caps.get('caps_hit', []))}")
     if no_evidence.get("candidate_interpretation") == "weak_context_only":
         lines.append("- no-evidence candidate interpretation: weak/context-only candidates; read-more is optional diagnostic context")
+    provenance_policy = handoff.get("historical_provenance_self_echo_policy") or {}
+    if provenance_policy:
+        lines.append(
+            "- historical provenance self-echo policy: "
+            f"embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)} "
+            f"diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}"
+        )
     top_candidates = candidate_ordering.get("top_candidates") or []
     for candidate in top_candidates[:5]:
         bits = [
@@ -4621,6 +4654,13 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
         lines.append(f"- Caps hit: `{', '.join(caps.get('caps_hit', []))}`")
     if no_evidence.get("candidate_interpretation") == "weak_context_only":
         lines.append("- No-evidence candidate interpretation: `weak_context_only`; read-more is optional diagnostic context.")
+    provenance_policy = handoff.get("historical_provenance_self_echo_policy") or {}
+    if provenance_policy:
+        lines.append(
+            "- Historical provenance self-echo policy: "
+            f"`embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)}`; "
+            f"`diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}`."
+        )
     top_candidates = candidate_ordering.get("top_candidates") or []
     if top_candidates:
         lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])

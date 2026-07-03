@@ -44,11 +44,13 @@ INLINE_TIMELINE_LIMIT = 12
 INLINE_EVENT_LIMIT = 12
 DEFAULT_GOLD_MANIFEST = Path("benchmarks/real_history_gold/sanitized_cases.json")
 HANDLE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+){2,})(?![A-Za-z0-9_.-])")
+TASKISH_HANDLE_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z]{2,}[-_]\d{2,}[A-Za-z0-9_-]*)(?![A-Za-z0-9_.-])")
 BACKTICK_HANDLE_RE = re.compile(r"`([^`\n]{3,120})`")
 LABELED_HANDLE_RE = re.compile(
     r"\b(?:reviewed\s+source\s+case|source\s+case|source\s+handle|case\s+handle|case\s+id|task\s+handle|task\s+case|source\s+ref)\s*:?\s*`?([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+)`?",
     re.IGNORECASE,
 )
+EMBEDDED_JSONL_SOURCE_REF_RE = re.compile(r"(?P<path>/(?:(?!\.jsonl)[^`\"'\n\r])+?\.jsonl):(?P<line>\d+)(?!\d)")
 
 DECISION_CONTEXT_ROUTES = {
     "conversation_reconstruction",
@@ -299,6 +301,50 @@ def build_semantic_debug_payload(
             )
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
     source_locator_handoff["source_handle_routing"] = source_handle_routing
+    historical_provenance_self_echo_policy: dict[str, Any] = {}
+    (
+        next_reads,
+        historical_provenance_self_echo_policy,
+    ) = apply_historical_provenance_self_echo_policy(
+        list(source_locator_handoff.get("next_reads") or next_reads),
+        candidates=source_selection_candidates,
+        query=agent_find["query"]["original"],
+        family=family,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
+    )
+    if historical_provenance_self_echo_policy:
+        source_locator_handoff["next_reads"] = next_reads
+        source_locator_handoff["historical_provenance_self_echo_policy"] = (
+            historical_provenance_self_echo_policy
+        )
+        source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
+        source_handle_routing = build_source_handle_routing(
+            agent_find["query"]["original"],
+            candidates=source_selection_candidates,
+            next_reads=next_reads,
+        )
+        source_locator_handoff["source_handle_routing"] = source_handle_routing
+        decision_context["next_reads"] = next_reads[:12]
+        decision_context["next_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=False,
+        )
+        decision_context["source_handle_routing"] = source_handle_routing
+        decision_context["route_guidance"] = decision_context_route_guidance(source_handle_routing)
+        audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
+        audit_plan["replay_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=True,
+        )
+        audit_plan["next_commands"] = decision_context["next_commands"]
+        audit_plan["source_handle_routing"] = audit_source_handle_guidance(source_handle_routing)
+        audit_plan["checkpoint_plan"] = source_handle_checkpoint_plan(
+            audit_plan.get("checkpoint_plan", []),
+            source_handle_routing,
+        )
     process_actual_use_read_plan = (
         build_process_actual_use_final_support_read_plan(
             list(source_locator_handoff.get("next_reads") or next_reads),
@@ -561,6 +607,7 @@ def build_semantic_debug_payload(
         "answer_source_discipline": answer_source_discipline,
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
+        "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
@@ -1160,6 +1207,321 @@ def process_actual_use_read_sort_key(read: dict[str, Any], index: int) -> tuple[
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     timestamp_rank = 0 if source_ref.get("timestamp_utc") else 1
     return (tier_rank, decisive_bucket_rank + timestamp_rank, index)
+
+
+def apply_historical_provenance_self_echo_policy(
+    next_reads: list[dict[str, Any]],
+    *,
+    candidates: list[dict[str, Any]],
+    query: str,
+    family: dict[str, Any],
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    handles = historical_provenance_handles(query)
+    if not historical_provenance_self_echo_policy_wanted(query, family=family, handles=handles):
+        if handles and historical_provenance_current_scope_requested(query):
+            return ensure_read_more_actionability_defaults(next_reads), {}
+        return next_reads, {}
+
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id") is not None
+    }
+    target_to_candidate = {
+        source_ref_target(candidate.get("source_ref") or {}): candidate
+        for candidate in candidates
+        if source_ref_target(candidate.get("source_ref") or {})
+    }
+    unwrapped = embedded_source_ref_next_reads(
+        candidates,
+        query=query,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=include_context_actions,
+    )
+    annotated: list[dict[str, Any]] = []
+    diagnostic_count = 0
+    for index, read in enumerate(next_reads):
+        row = dict(read)
+        target = str(row.get("target") or "")
+        candidate = candidate_by_id.get(str(row.get("candidate_id") or "")) or target_to_candidate.get(target) or {}
+        text = historical_provenance_read_text(row, candidate)
+        if historical_provenance_current_run_or_self_echo_candidate(text, query=query):
+            diagnostic_count += 1
+            row["diagnostic_only"] = True
+            row["read_more_actionable"] = False
+            row["followthrough_actionable"] = False
+            row["expansion_actions"] = []
+            row["context_actions"] = []
+            row["reason"] = (
+                "current-run/tool-output/self-echo diagnostic; prefer original pre-existing "
+                "source refs for historical provenance unless the prompt asks about the current run/tool/lane"
+            )
+            row["historical_provenance_selection"] = {
+                "schema_version": 1,
+                "source_chronology_role": "current_run_self_echo_diagnostic",
+                "final_support_allowed": False,
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "diagnostic_only": True,
+                "detected_handles": handles[:8],
+                "raw_text_included": False,
+            }
+        else:
+            row.setdefault("historical_provenance_selection", {
+                "schema_version": 1,
+                "source_chronology_role": "candidate_or_original_source_ref",
+                "final_support_allowed": True,
+                "read_more_actionable": row.get("read_more_actionable", True) is not False,
+                "followthrough_actionable": row.get("followthrough_actionable", True) is not False,
+                "diagnostic_only": bool(row.get("diagnostic_only", False)),
+                "detected_handles": handles[:8],
+                "raw_text_included": False,
+            })
+        row["_historical_provenance_sort_key"] = historical_provenance_read_sort_key(row, index)
+        annotated.append(row)
+
+    combined = dedupe_dicts(unwrapped + annotated)
+    combined.sort(key=lambda item: item.pop("_historical_provenance_sort_key", (1, 0, 0)))
+    result = combined[:12]
+    summary = {
+        "schema_version": 1,
+        "status": "active",
+        "detected_handles": handles[:8],
+        "applies_to_question_family": family.get("primary"),
+        "embedded_source_ref_promoted_count": len(unwrapped),
+        "diagnostic_only_next_read_count": sum(1 for item in result if item.get("diagnostic_only")),
+        "diagnostic_only_candidate_count": diagnostic_count,
+        "policy": (
+            "For explicit historical provenance handles, current-run command outputs, "
+            "lane prompts, and same-run tool echoes are diagnostics. When they quote "
+            "older JSONL source refs, promote the quoted original refs as actionable reads."
+        ),
+        "current_run_evidence_counts_as_final_support": False,
+        "raw_text_included": False,
+    }
+    return result, summary
+
+
+def historical_provenance_handles(query: str) -> list[str]:
+    handles: list[str] = []
+    for pattern in (LABELED_HANDLE_RE, BACKTICK_HANDLE_RE, HANDLE_TOKEN_RE, TASKISH_HANDLE_RE):
+        for match in pattern.finditer(query or ""):
+            value = match.group(1).strip()
+            normalized = value.strip("`'\".,:;()[]{}")
+            if not normalized:
+                continue
+            lowered = normalized.lower()
+            if lowered in {
+                "jsonl-history-search",
+                "semantic-debug",
+                "source-locator-handoff",
+                "answer-ready-handoff",
+            }:
+                continue
+            if normalized not in handles:
+                handles.append(normalized)
+    return handles
+
+
+def historical_provenance_self_echo_policy_wanted(
+    query: str,
+    *,
+    family: dict[str, Any],
+    handles: list[str],
+) -> bool:
+    if not handles:
+        return False
+    if historical_provenance_current_scope_requested(query):
+        return False
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    primary = str((family or {}).get("primary") or "")
+    if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"}:
+        return False
+    return any(
+        term in lowered
+        for term in (
+            "coordinator",
+            "worker",
+            "reviewer",
+            "rereviewer",
+            "subagent",
+            "spawned",
+            "launched",
+            "parent",
+            "orchestration",
+            "provenance",
+            "what changed",
+            "verified",
+        )
+    )
+
+
+def historical_provenance_current_scope_requested(query: str) -> bool:
+    if clearly_intends_current_session(query) or process_actual_use_current_run_or_tool_behavior_requested(query):
+        return True
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    return bool(
+        re.search(
+            r"\b(?:current|this|live)\s+(?:task|worktree|branch|slice|lane|run|session|tool|route)\b",
+            lowered,
+        )
+    )
+
+
+def ensure_read_more_actionability_defaults(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for read in next_reads:
+        row = dict(read)
+        if "read_more_actionable" not in row and row.get("expansion_actions"):
+            row["read_more_actionable"] = True
+        if "followthrough_actionable" not in row and row.get("expansion_actions"):
+            row["followthrough_actionable"] = True
+        result.append(row)
+    return result
+
+
+def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query: str | None = None) -> bool:
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    echo = setup_echo_classification(text, query=query or "")
+    if echo.get("is_setup_echo"):
+        return True
+    normalized_query = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    if normalized_query and normalized_query in lowered:
+        return True
+    current_tool_markers = (
+        "jsonl-history-search semantic-debug",
+        "semantic-debug command",
+        "semantic debug command",
+        "semantic-debug output",
+        "semantic debug output",
+        "source locator handoff",
+        "source_locator_handoff",
+        "answer ready handoff",
+        "answer_ready_handoff",
+        "command_trace",
+        "raw-trace-audit",
+        "raw_trace_audit",
+        "adjudication/raw-trace-audit",
+        "same-lane",
+        "same lane",
+        "lane prompt",
+        "jsonl lane",
+        "manual lane",
+        "current-run prompt",
+        "current run prompt",
+        "original token count",
+        "process exited with code",
+    )
+    return any(marker in lowered for marker in current_tool_markers)
+
+
+def historical_provenance_read_text(read: dict[str, Any], candidate: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return " ".join(
+        str(part or "")
+        for part in (
+            read.get("kind"),
+            read.get("target"),
+            read.get("reason"),
+            source_ref.get("path"),
+            candidate.get("snippet"),
+            candidate.get("role"),
+            candidate.get("timestamp_utc"),
+            " ".join(str(item) for item in candidate.get("reason_codes") or []),
+        )
+    )
+
+
+def embedded_source_ref_next_reads(
+    candidates: list[dict[str, Any]],
+    *,
+    query: str,
+    expansion_action_context: dict[str, Any] | None = None,
+    include_context_actions: bool = False,
+) -> list[dict[str, Any]]:
+    reads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        source_ref = candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+        candidate_target = source_ref_target(source_ref)
+        text = historical_provenance_read_text(
+            {"kind": "jsonl_source_ref", "target": candidate_target, "source_ref": source_ref},
+            candidate,
+        )
+        if not historical_provenance_current_run_or_self_echo_candidate(text, query=query):
+            continue
+        for embedded_ref in embedded_jsonl_source_refs(text):
+            target = source_ref_target(embedded_ref)
+            if not target or target == candidate_target or target in seen:
+                continue
+            seen.add(target)
+            candidate_id = f"embedded-source-ref-{len(reads) + 1:03d}"
+            read = {
+                "kind": "jsonl_source_ref",
+                "target": target,
+                "candidate_id": candidate_id,
+                "source_ref": embedded_ref,
+                "reason": "inspect original JSONL source ref quoted by diagnostic current-run/tool output",
+                "embedded_source_ref_unwrapped": {
+                    "schema_version": 1,
+                    "from_candidate_id": candidate.get("candidate_id"),
+                    "from_candidate_target": candidate_target,
+                    "source_chronology_role": "pre_existing_source_ref_quoted_by_current_run_echo",
+                    "raw_text_included": False,
+                },
+                "historical_provenance_selection": {
+                    "schema_version": 1,
+                    "source_chronology_role": "pre_existing_source_ref_quoted_by_current_run_echo",
+                    "final_support_allowed": True,
+                    "read_more_actionable": True,
+                    "followthrough_actionable": True,
+                    "diagnostic_only": False,
+                    "raw_text_included": False,
+                },
+                "expansion_actions": read_more_actions_for_source_ref(
+                    embedded_ref,
+                    candidate_id=candidate_id,
+                    expansion_action_context=expansion_action_context,
+                ),
+                "_historical_provenance_sort_key": (0, len(reads), 0),
+            }
+            if include_context_actions:
+                read["context_actions"] = context_actions_for_source_ref(
+                    embedded_ref,
+                    candidate_id=candidate_id,
+                    expansion_action_context=expansion_action_context,
+                )
+            reads.append(read)
+    return reads
+
+
+def embedded_jsonl_source_refs(text: str) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in EMBEDDED_JSONL_SOURCE_REF_RE.finditer(text or ""):
+        path = " ".join(match.group("path").split())
+        if not path.startswith("/"):
+            continue
+        line = int(match.group("line"))
+        key = f"{path}:{line}"
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append({"path": path, "line": line})
+    return refs[:8]
+
+
+def historical_provenance_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
+    if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
+        return (3, 0, index)
+    if read.get("embedded_source_ref_unwrapped"):
+        return (0, 0, index)
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    original_jsonl = 0 if target.endswith(".jsonl") or str(source_ref.get("path") or "").endswith(".jsonl") else 1
+    return (1, original_jsonl, index)
 
 
 def process_actual_use_source_tier(*, kind: str, target: str | None, source_ref: dict[str, Any]) -> str:
@@ -3268,7 +3630,7 @@ def build_next_commands(
     _ = include_semantic_debug_replay
     commands: list[dict[str, Any]] = []
     for read in next_reads[:8]:
-        if read.get("read_more_actionable") is False:
+        if not read_is_required_surface_actionable(read):
             continue
         actions = read.get("expansion_actions") or []
         for action in actions[:1]:
@@ -3624,9 +3986,21 @@ def answer_support_classification(
     }
 
 
+def read_is_required_surface_actionable(read: dict[str, Any]) -> bool:
+    selection = read.get("historical_provenance_selection") if isinstance(read.get("historical_provenance_selection"), dict) else {}
+    return not (
+        read.get("diagnostic_only") is True
+        or read.get("read_more_actionable") is False
+        or read.get("followthrough_actionable") is False
+        or selection.get("diagnostic_only") is True
+        or selection.get("read_more_actionable") is False
+        or selection.get("final_support_allowed") is False
+    )
+
+
 def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for read in (item for item in next_reads if item.get("followthrough_actionable", True) is not False):
+    for read in (item for item in next_reads if read_is_required_surface_actionable(item)):
         if len(rows) >= ANSWER_READY_HANDOFF_READ_CAP:
             break
         target = read.get("target")
@@ -4236,7 +4610,7 @@ def answer_ready_copy_paste_commands(
     command_targets = {
         read.get("target")
         for read in bounded_next_reads
-        if is_jsonl_read_target(read.get("target")) and read.get("read_more_actionable", True) is not False
+        if is_jsonl_read_target(read.get("target")) and read_is_required_surface_actionable(read)
     }
     for read in next_reads:
         if len(commands) >= ANSWER_READY_HANDOFF_COMMAND_CAP:
@@ -5132,9 +5506,9 @@ def action_proof_primary_refs(
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     for read in list(next_reads or []):
-        if reviewed_source_packet_pointer_read(read):
+        if read_is_required_surface_actionable(read) and reviewed_source_packet_pointer_read(read):
             refs.append(action_proof_read_ref(read, proof_role="reviewed_source_packet_pointer"))
-    for read in action_reads[:4]:
+    for read in [item for item in action_reads if read_is_required_surface_actionable(item)][:4]:
         refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
 
     buckets = source_window_action_proof.get("buckets") if isinstance(source_window_action_proof.get("buckets"), dict) else {}
@@ -5161,6 +5535,12 @@ def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str,
         "selection_reason": selection.get("selection_reason"),
         "source_window_verification_required": selection.get("source_window_verification_required"),
         "claim_boundary": selection.get("claim_boundary"),
+        "diagnostic_only": read.get("diagnostic_only"),
+        "read_more_actionable": read.get("read_more_actionable"),
+        "followthrough_actionable": read.get("followthrough_actionable"),
+        "historical_provenance_selection": read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else None,
     }
     return {key: value for key, value in row.items() if value not in (None, [], {})}
 
@@ -5202,8 +5582,8 @@ def action_proof_required_reads(
             "read_type": "required_gap_check_read",
             "instruction": "Open this bounded next read to confirm whether action proof is present or missing.",
         }
-        for read in next_reads[:3]
-        if isinstance(read, dict) and (read.get("target") or read.get("source_ref"))
+        for read in [item for item in next_reads if isinstance(item, dict) and read_is_required_surface_actionable(item)][:3]
+        if read.get("target") or read.get("source_ref")
     ]
 
 

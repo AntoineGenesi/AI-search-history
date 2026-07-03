@@ -137,6 +137,34 @@ ROUTES: tuple[AskRoute, ...] = (
         ),
     ),
     AskRoute(
+        route_family="orchestration_provenance",
+        chosen_route="orchestration-provenance / semantic-debug",
+        why_it_applies=(
+            "The wording names a historical task/source handle and asks about "
+            "coordinator, worker, reviewer, subagent, or launched-run provenance. "
+            "Use semantic-debug source refs rather than status anchoring to the "
+            "current run."
+        ),
+        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        read_specialization="references/semantic-debugging.md",
+        inspect_after=(
+            "semantic_debug.source_locator_handoff.next_reads",
+            "historical provenance self-echo diagnostics",
+            "pre-existing parent/worker/reviewer raw source refs before current-run tool-output echoes",
+        ),
+        stop_guidance=(
+            "Run semantic-debug before what-happened-since or broad repo recovery. "
+            "Open promoted pre-existing raw parent/worker/reviewer source refs first. "
+            "Treat current-run command outputs, lane prompts, and same-run tool echoes "
+            "as diagnostics unless the user explicitly asks about the current run/tool/lane."
+        ),
+        manual_search_guidance=(
+            "Manual rg is a targeted follow-up only after semantic-debug source refs "
+            "leave a named provenance facet missing. Prefer original raw session refs "
+            "over current-run outputs that merely quote those refs."
+        ),
+    ),
+    AskRoute(
         route_family="latest_status",
         chosen_route="latest-status / what-happened-since",
         why_it_applies=(
@@ -297,23 +325,26 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_process_actual_use_query(normalized):
         return ROUTES[2]
 
-    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
+    if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[3]
 
-    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
+    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
         return ROUTES[4]
 
-    if is_worktree_cleanup_currentness_query(query):
+    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[5]
 
-    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+    if is_worktree_cleanup_currentness_query(query):
         return ROUTES[6]
+
+    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+        return ROUTES[7]
 
     if _looks_like_ticket_currentness(normalized):
-        return ROUTES[6]
+        return ROUTES[7]
 
     if _has_any(normalized, ("keep yelling", "yelling about", "complain", "complained", "semantic wrap-up", "wrap up")):
-        return ROUTES[7]
+        return ROUTES[8]
 
     return AskRoute(
         route_family="semantic_debug",
@@ -343,6 +374,56 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
+    has_explicit_handle = bool(
+        re.search(r"\b[a-z]+[-_][a-z0-9]+[-_][a-z0-9_-]*\b", normalized)
+        or re.search(r"\b[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*\b", normalized)
+    )
+    if not has_explicit_handle:
+        return False
+    if _has_any(
+        normalized,
+        (
+            "current run",
+            "this run",
+            "current lane",
+            "this lane",
+            "current tool",
+            "this tool",
+            "current route",
+            "this route",
+        ),
+    ):
+        return False
+    return _has_any(
+        normalized,
+        (
+            "coordinator",
+            "worker",
+            "reviewer",
+            "rereviewer",
+            "subagent",
+            "spawned",
+            "launched",
+            "implementation worker",
+            "parent",
+            "orchestration",
+        ),
+    ) and _has_any(
+        normalized,
+        (
+            "what happened",
+            "what changed",
+            "actually did",
+            "verified",
+            "proven",
+            "unresolved",
+            "caveat",
+            "provenance",
+        ),
+    )
 
 
 def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
