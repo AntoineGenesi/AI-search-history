@@ -3327,7 +3327,7 @@ def source_locator_no_evidence_meaning(no_evidence_report: dict[str, Any] | None
             ),
             "candidate_interpretation": report.get("candidate_interpretation"),
             "read_more_required_before_scoped_no_evidence_answer": bool(
-                (report.get("read_more_guidance") or {}).get("required_before_scoped_no_evidence_answer", True)
+                (report.get("read_more_guidance") or {}).get("required_before_scoped_no_evidence_answer", False)
             ),
         }
     return {
