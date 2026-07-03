@@ -453,6 +453,19 @@ def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
     return commands
 
 
+COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON = (
+    "reviewed_source_multifacet_provenance_window_covers_task_review_branch_commit_and_notes"
+)
+
+
+def _is_compact_multifacet_provenance_followthrough(followthrough: dict) -> bool:
+    if not followthrough.get("applies"):
+        return False
+    command = followthrough.get("first_command") if isinstance(followthrough.get("first_command"), dict) else {}
+    window = command.get("window") if isinstance(command.get("window"), dict) else {}
+    return window.get("reason") == COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON
+
+
 def _is_jsonl_read_target(target: str | None) -> bool:
     if not target:
         return False
@@ -2887,7 +2900,7 @@ def render_semantic_debug_text(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
     readiness = report.get("answer_readiness") or {}
     followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
-    suppress_action_required_reads = bool(followthrough.get("applies")) and family.get("primary") != "claimed_action"
+    suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
@@ -3090,7 +3103,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
     readiness = report.get("answer_readiness") or {}
     followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
-    suppress_action_required_reads = bool(followthrough.get("applies")) and family.get("primary") != "claimed_action"
+    suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
