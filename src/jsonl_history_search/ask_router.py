@@ -19,7 +19,8 @@ class AskRoute:
 
     def first_command(self, query: str) -> str:
         escaped = query.replace('"', '\\"')
-        return self.first_command_template.format(query=escaped)
+        skill = _skill_name_from_query(query)
+        return self.first_command_template.format(query=escaped, skill=skill)
 
 
 LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
@@ -53,6 +54,34 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
 
 
 ROUTES: tuple[AskRoute, ...] = (
+    AskRoute(
+        route_family="skill_check",
+        chosen_route="skill-check / skill-audit",
+        why_it_applies=(
+            "The wording asks whether a named skill was used, read, triggered, "
+            "followed, skipped, or misapplied, so route to the focused skill "
+            "audit/check surface instead of semantic-wrapup frustration mining."
+        ),
+        first_command_template='jsonl-history-search skill-check "{skill}" --cwd "$PWD" --format text',
+        read_specialization="references/skill-audit.md",
+        inspect_after=(
+            "skill_audit.usage_instances",
+            "skill_audit.non_use_mentions",
+            "skill_audit.workflow_classification_summary",
+            "ai_handoff_packet evidence refs before making compliance claims",
+        ),
+        stop_guidance=(
+            "Run skill-check/skill-audit before semantic-wrapup for named-skill "
+            "compliance questions. Stop when the audit classifies proper use, "
+            "missed trigger, misapplication, or missing referenced-file follow-through "
+            "from inspected source refs."
+        ),
+        manual_search_guidance=(
+            "Manual rg is a targeted follow-up only after the skill audit names "
+            "a missing skill-use facet or source ref. Keyword mentions alone are "
+            "not proof of actual skill use."
+        ),
+    ),
     AskRoute(
         route_family="source_window_semantic_debug",
         chosen_route="source-window / semantic-debug",
@@ -311,8 +340,11 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 def classify_ask_route(query: str) -> AskRoute:
     normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
 
-    if _looks_like_reviewed_source_window_prompt(normalized):
+    if _looks_like_skill_compliance_query(normalized):
         return ROUTES[0]
+
+    if _looks_like_reviewed_source_window_prompt(normalized):
+        return ROUTES[1]
 
     if _looks_like_local_artifact_verification_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
@@ -320,31 +352,31 @@ def classify_ask_route(query: str) -> AskRoute:
     if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
         normalized, ("agent", "edits", "edit", "changed", "action")
     ):
-        return ROUTES[1]
-
-    if _looks_like_process_actual_use_query(normalized):
         return ROUTES[2]
 
-    if _looks_like_orchestration_provenance_query(normalized):
+    if _looks_like_process_actual_use_query(normalized):
         return ROUTES[3]
 
-    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
+    if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
 
-    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
+    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
         return ROUTES[5]
 
-    if is_worktree_cleanup_currentness_query(query):
+    if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[6]
 
-    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+    if is_worktree_cleanup_currentness_query(query):
         return ROUTES[7]
+
+    if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
+        return ROUTES[8]
 
     if _looks_like_ticket_currentness(normalized):
-        return ROUTES[7]
+        return ROUTES[8]
 
     if _has_any(normalized, ("keep yelling", "yelling about", "complain", "complained", "semantic wrap-up", "wrap up")):
-        return ROUTES[8]
+        return ROUTES[9]
 
     return AskRoute(
         route_family="semantic_debug",
@@ -374,6 +406,87 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_skill_compliance_query(normalized: str) -> bool:
+    if not _has_any(
+        normalized,
+        (
+            "skill",
+            "$",
+            "skill.md",
+            "reviewer",
+            "product-fsm",
+            "product fsm",
+            "implementer",
+            "planner",
+            "wrap-up",
+            "wrap up",
+        ),
+    ):
+        return False
+    compliance_terms = (
+        r"\buse\b",
+        r"\bused\b",
+        r"\busing\b",
+        r"\btrigger\b",
+        r"\btriggered\b",
+        r"\bread\b",
+        r"\bfollow\b",
+        r"\bfollowed\b",
+        r"\bcomply\b",
+        r"\bcompliance\b",
+        r"\bskip\b",
+        r"\bskipped\b",
+        r"\bmissed\b",
+        r"\bmisapplied\b",
+        r"\bproperly applied\b",
+        r"\breferenced files?\b",
+        r"\bskill\.md\b",
+    )
+    question_terms = (
+        "did the agent",
+        "did it",
+        "did they",
+        "whether",
+        "was the",
+        "was ",
+        "were the",
+        "were ",
+        "was it",
+        "check",
+        "audit",
+        "prove",
+        "actually",
+    )
+    return any(re.search(term, normalized) for term in compliance_terms) and _has_any(normalized, question_terms)
+
+
+def _skill_name_from_query(query: str) -> str:
+    normalized = query.lower()
+    match = re.search(r"<name>([^<]+)</name>", normalized)
+    if match:
+        return _normalize_skill_name(match.group(1))
+    match = re.search(r"\$([a-z0-9][a-z0-9_-]+)", normalized)
+    if match:
+        return _normalize_skill_name(match.group(1))
+    match = re.search(r"\b([a-z0-9][a-z0-9_-]+)\s+skill\b", normalized)
+    if match and match.group(1) not in {"a", "the", "this", "that", "named"}:
+        return _normalize_skill_name(match.group(1))
+    for candidate in (
+        "product-fsm-orchestration",
+        "reviewer",
+        "implementer",
+        "planner",
+        "wrap-up",
+    ):
+        if candidate in normalized or candidate.replace("-", " ") in normalized:
+            return candidate
+    return "<skill-name>"
+
+
+def _normalize_skill_name(value: str) -> str:
+    return value.strip().lower().replace("_", "-").replace(" ", "-")
 
 
 def _looks_like_orchestration_provenance_query(normalized: str) -> bool:

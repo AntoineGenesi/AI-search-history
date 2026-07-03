@@ -462,11 +462,13 @@ def build_parser() -> argparse.ArgumentParser:
     lineage.add_argument("--report-output", default=None)
     skill_audit = subparsers.add_parser(
         "skill-audit",
+        aliases=("skill-check",),
         description=(
             "Deep skill workflow audit: distinguish proper skill use, missed triggers, "
             "misapplication, and missing referenced-file follow-through from mere mentions."
         ),
     )
+    skill_audit.set_defaults(command="skill-audit")
     skill_audit.add_argument("skill")
     add_common_args(skill_audit)
     skill_audit.add_argument("--pre-window", type=int, default=3)
