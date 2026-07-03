@@ -466,6 +466,7 @@ def build_semantic_debug_payload(
         action_proof_plan=action_proof_plan,
     )
     answer_ready_handoff = build_answer_ready_handoff(
+        query=agent_find["query"]["original"],
         answer_readiness=answer_readiness,
         guided_audit_flow=guided_audit_flow,
         answer_source_discipline=answer_source_discipline,
@@ -3412,6 +3413,7 @@ ACTION_PROOF_TEXT_LIMIT = 220
 
 def build_answer_ready_handoff(
     *,
+    query: str,
     answer_readiness: dict[str, Any],
     guided_audit_flow: dict[str, Any],
     answer_source_discipline: dict[str, Any],
@@ -3473,6 +3475,7 @@ def build_answer_ready_handoff(
         bounded_next_reads=bounded_next_reads,
         action_proof_plan=action_proof_plan,
         allow_action_proof_plan=allow_action_proof_followthrough,
+        query=query,
     )
     primary_followthrough_first = bool(primary_followthrough.get("applies"))
     if primary_followthrough_first:
@@ -4288,6 +4291,7 @@ def build_primary_source_followthrough(
     bounded_next_reads: list[dict[str, Any]],
     action_proof_plan: dict[str, Any] | None = None,
     allow_action_proof_plan: bool = True,
+    query: str = "",
 ) -> dict[str, Any]:
     primary_reads = primary_followthrough_reads(
         bounded_next_reads=bounded_next_reads,
@@ -4310,7 +4314,7 @@ def build_primary_source_followthrough(
     required_final_source_ref_ids = [
         str(reviewed_pointer.get("source_ref_id"))
     ] if reviewed_pointer.get("source_ref_id") else []
-    window = primary_followthrough_window(first, action_proof_plan=action_proof_plan)
+    window = primary_followthrough_window(first, action_proof_plan=action_proof_plan, query=query)
     argv = [
         "jsonl-history-search",
         "read-more",
@@ -4333,7 +4337,7 @@ def build_primary_source_followthrough(
             "--compact-text-limit",
             str(window.get("compact_text_limit", 500)),
         ])
-    required_answer_facets = primary_followthrough_required_answer_facets(first)
+    required_answer_facets = primary_followthrough_required_answer_facets(first, query=query)
     command = {
         "command_family": "read_more",
         "command_id": "open_primary_source_window",
@@ -4466,7 +4470,42 @@ def explicit_correction_primary_bundle_read(explicit_reads: list[dict[str, Any]]
     return row
 
 
-def primary_followthrough_required_answer_facets(read: dict[str, Any]) -> list[str]:
+PROVENANCE_FACET_TERMS = {
+    "task": ("task", "task file", "ticket"),
+    "review": ("review", "reviewer", "verified", "verdict"),
+    "branch": ("branch", "worktree"),
+    "commit": ("commit", "merge", "sha"),
+    "implementation_note": ("implementation note", "implementation-note", "notes", "scratch", "progress log"),
+}
+
+
+def requested_provenance_facets(query: str) -> list[str]:
+    text = str(query or "").lower()
+    if "provenance" not in text and not any(term in text for term in ("source case", "source handle", "reviewed source")):
+        return []
+    facets = [
+        facet
+        for facet, terms in PROVENANCE_FACET_TERMS.items()
+        if any(term in text for term in terms)
+    ]
+    return facets if len(facets) >= 3 else []
+
+
+def reviewed_source_multifacet_provenance(read: dict[str, Any], query: str) -> bool:
+    return reviewed_source_packet_pointer_read(read) and bool(requested_provenance_facets(query))
+
+
+def primary_followthrough_required_answer_facets(read: dict[str, Any], *, query: str = "") -> list[str]:
+    provenance_facets = requested_provenance_facets(query)
+    if reviewed_source_packet_pointer_read(read) and provenance_facets:
+        labels = {
+            "task": "task evidence: what task or work item the source supports",
+            "review": "review evidence: what reviewer/verifier artifact or verdict is distinct from implementation notes",
+            "branch": "branch/worktree evidence: what branch or isolated worktree provenance is supported",
+            "commit": "commit/merge evidence: what commit, merge, or SHA evidence is supported",
+            "implementation_note": "implementation-note evidence: what scratch/progress/notes say, and whether they are only implementation context",
+        }
+        return [labels[facet] for facet in provenance_facets if facet in labels]
     correction_meta = explicit_correction_window_meta(read)
     if not correction_meta.get("bounded_to_explicit_date_window"):
         return []
@@ -4516,6 +4555,7 @@ def primary_followthrough_window(
     read: dict[str, Any],
     *,
     action_proof_plan: dict[str, Any] | None = None,
+    query: str = "",
 ) -> dict[str, int | str]:
     inferred = read.get("inferred_anchor") if isinstance(read.get("inferred_anchor"), dict) else {}
     anchor_kind = inferred.get("anchor_kind")
@@ -4545,6 +4585,16 @@ def primary_followthrough_window(
             "compact_text_limit": 1200,
             "format": "text",
             "reason": "explicit_correction_source_window_covers_inspection_distinction_challenge_and_correction",
+        }
+    if reviewed_source_multifacet_provenance(read, query):
+        return {
+            "before": 0,
+            "after": 180,
+            "max_records": 220,
+            "projection": "compact",
+            "compact_text_limit": 900,
+            "format": "text",
+            "reason": "reviewed_source_multifacet_provenance_window_covers_task_review_branch_commit_and_notes",
         }
     if anchor_kind == "reviewed_source_packet_pointer" or reviewed_source_packet_pointer_read(read):
         return {
@@ -4719,6 +4769,7 @@ def build_agent_instruction(
         bounded_next_reads=bounded_answer_ready_next_reads(next_reads),
         action_proof_plan=action_proof_plan,
         allow_action_proof_plan=allow_action_proof_followthrough,
+        query=query,
     )
     primary_followthrough_first = bool(primary_followthrough.get("applies"))
     if readiness_decision == "answer_now":
