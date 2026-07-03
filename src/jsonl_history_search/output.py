@@ -4577,6 +4577,8 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
     ]
     if caps.get("hit"):
         lines.append(f"- caps hit: {', '.join(caps.get('caps_hit', []))}")
+    if no_evidence.get("candidate_interpretation") == "weak_context_only":
+        lines.append("- no-evidence candidate interpretation: weak/context-only candidates; read-more is optional diagnostic context")
     top_candidates = candidate_ordering.get("top_candidates") or []
     for candidate in top_candidates[:5]:
         bits = [
@@ -4617,6 +4619,8 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
     ]
     if caps.get("hit"):
         lines.append(f"- Caps hit: `{', '.join(caps.get('caps_hit', []))}`")
+    if no_evidence.get("candidate_interpretation") == "weak_context_only":
+        lines.append("- No-evidence candidate interpretation: `weak_context_only`; read-more is optional diagnostic context.")
     top_candidates = candidate_ordering.get("top_candidates") or []
     if top_candidates:
         lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
@@ -4695,7 +4699,7 @@ def render_agent_find_text(payload: dict) -> str:
             f"{candidate.get('timestamp') or '(no timestamp)'} "
             f"{candidate.get('role') or ''}: {candidate.get('snippet')}"
         )
-    if report.get("status") == "no_evidence":
+    if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):
         no_evidence = report.get("no_evidence_report", {})
         not_searched = no_evidence.get("not_searched_scope", {})
         searched = no_evidence.get("searched_scope", {})
@@ -4705,6 +4709,17 @@ def render_agent_find_text(payload: dict) -> str:
             f"{not_searched.get('missing_root_count', 0)} missing selected roots; "
             f"{len(no_evidence.get('excluded_scope', []))} excluded roots"
         )
+        interpretation = no_evidence.get("candidate_interpretation")
+        if interpretation:
+            lines.append(f"No-evidence candidate interpretation: {interpretation}")
+        coverage = no_evidence.get("query_term_coverage") or {}
+        missing_terms = coverage.get("missing_terms_any_candidate") or []
+        if missing_terms:
+            lines.append(f"Missing query terms in surfaced candidates: {', '.join(str(term) for term in missing_terms)}")
+        guidance = no_evidence.get("read_more_guidance") or {}
+        if guidance:
+            required = "required" if guidance.get("required_before_scoped_no_evidence_answer") else "optional diagnostic"
+            lines.append(f"Read-more before scoped no-evidence answer: {required}")
         lines.append("No-evidence boundary: do not treat this as all-history, global, or permanent absence without more search.")
         lines.append(f"No evidence: {no_evidence.get('why_not_confident')}")
     suggestions = report.get("next_search_suggestions") or []
@@ -4763,10 +4778,13 @@ def render_agent_find_markdown(payload: dict) -> str:
             f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
             f"{_escape_markdown_table(str(candidate.get('snippet') or ''))} |"
         )
-    if report.get("status") == "no_evidence":
+    if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):
         no_evidence = report.get("no_evidence_report", {})
         not_searched = no_evidence.get("not_searched_scope", {})
         searched = no_evidence.get("searched_scope", {})
+        coverage = no_evidence.get("query_term_coverage") or {}
+        missing_terms = coverage.get("missing_terms_any_candidate") or []
+        guidance = no_evidence.get("read_more_guidance") or {}
         lines.extend(
             [
                 "",
@@ -4782,6 +4800,15 @@ def render_agent_find_markdown(payload: dict) -> str:
                 no_evidence.get("why_not_confident", ""),
             ]
         )
+        if missing_terms:
+            lines.append("")
+            lines.append("Missing query terms in surfaced candidates: `" + "`, `".join(str(term) for term in missing_terms) + "`.")
+        interpretation = no_evidence.get("candidate_interpretation")
+        if interpretation:
+            lines.append(f"Candidate interpretation: `{interpretation}`.")
+        if guidance:
+            required = "required" if guidance.get("required_before_scoped_no_evidence_answer") else "optional diagnostic"
+            lines.append(f"Read-more before scoped no-evidence answer: `{required}`.")
     suggestions = report.get("next_search_suggestions") or []
     if suggestions:
         lines.extend(["", "## Next Searches", ""])

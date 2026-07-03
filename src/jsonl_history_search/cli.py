@@ -2595,6 +2595,7 @@ def main(argv: list[str] | None = None) -> int:
             report_output=args.report_output,
             compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
             evidence_context_window=getattr(args, "evidence_context_window", 0),
+            no_evidence_mode=args.command == "no-evidence-report",
         )
     elif args.command == "plan":
         payload = {
