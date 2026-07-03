@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -238,11 +238,20 @@ def status_anchor_report(
         codex_home=codex_home,
     )
     artifacts = _collect_work_artifacts(cwd, anchor_timestamp_utc=session_activity.get("anchor_timestamp_utc"))
-    behavior_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "behavior_delta"]
-    non_deltas = [item for item in artifacts["value_items"] if item["value_kind"] == "non_delta"]
-    unresolved_blockers = _unresolved_blockers(artifacts)
-    answer_brief = _answer_brief(behavior_deltas, non_deltas, unresolved_blockers)
+    current_value_items = [item for item in artifacts["value_items"] if item.get("current_window_evidence")]
+    behavior_deltas = [item for item in current_value_items if item["value_kind"] == "behavior_delta"]
+    non_deltas = [item for item in current_value_items if item["value_kind"] == "non_delta"]
+    diagnostic_value_items = [item for item in artifacts["value_items"] if not item.get("current_window_evidence")]
+    unresolved_blockers = _unresolved_blockers(artifacts, current_window_only=True)
+    answer_brief = _answer_brief(
+        selected_anchor=selected_anchor,
+        session_activity=session_activity,
+        behavior_deltas=behavior_deltas,
+        non_deltas=non_deltas,
+        blockers=unresolved_blockers,
+    )
     next_reads = _next_reads(selected_anchor, session_activity, artifacts, cwd=cwd, codex_home=codex_home)
+    source_tiers = _source_tiers(next_reads)
     blind_spots = []
     if not selected_anchor:
         blind_spots.append("No substantive anchor selected from the searched latest-message scope.")
@@ -276,8 +285,21 @@ def status_anchor_report(
             "anchor_candidate_count": len(anchor_candidates),
             "selected_anchor_available": selected_anchor is not None,
             "work_product_count": len(artifacts["tasks"]) + len(artifacts["reports"]) + len(artifacts["reviews"]),
+            "current_window_work_product_count": sum(
+                1
+                for collection in (artifacts["tasks"], artifacts["reports"], artifacts["reviews"])
+                for item in collection
+                if item.get("current_window_evidence")
+            ),
+            "diagnostic_optional_work_product_count": sum(
+                1
+                for collection in (artifacts["tasks"], artifacts["reports"], artifacts["reviews"])
+                for item in collection
+                if item.get("source_tier") == "diagnostic_optional"
+            ),
             "behavior_delta_count": len(behavior_deltas),
             "non_delta_count": len(non_deltas),
+            "diagnostic_value_item_count": len(diagnostic_value_items),
             "unresolved_blocker_count": len(unresolved_blockers),
             "raw_session_file_count": session_activity["summary"]["session_file_count"],
             "raw_session_record_count": session_activity["summary"]["records_after_anchor"],
@@ -293,6 +315,7 @@ def status_anchor_report(
         "session_activity": session_activity,
         "evidence_contract": _evidence_contract(),
         "next_reads": next_reads,
+        "source_tiers": source_tiers,
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
@@ -302,6 +325,7 @@ def status_anchor_report(
         },
         "behavior_deltas": behavior_deltas,
         "non_deltas": non_deltas,
+        "diagnostic_optional_work_products": diagnostic_value_items,
         "unresolved_blockers": unresolved_blockers,
         "answer_brief": answer_brief,
         "blind_spots": blind_spots,
@@ -1087,6 +1111,11 @@ def _hash_value(value: Any) -> str | None:
 
 def _evidence_contract() -> dict:
     return {
+        "source_tiers": {
+            "required_primary": "Selected anchor plus raw current-window Codex history/session JSONL refs.",
+            "required_secondary": "Current-window commits and task/report/review artifacts, only after required primary reads.",
+            "diagnostic_optional": "Stale/demo/example artifacts, rejected anchors, broad work products, and other non-answer refs.",
+        },
         "primary_evidence_order": [
             "selected user anchor from Codex history/session JSONL",
             "raw sessions/**/*.jsonl activity after that anchor",
@@ -1111,6 +1140,9 @@ def _evidence_contract() -> dict:
 
 
 def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = None) -> dict:
+    anchor_timestamp = parse_datetime(anchor_timestamp_utc or "", timezone.utc)
+    if anchor_timestamp is not None:
+        anchor_timestamp = anchor_timestamp.astimezone(timezone.utc)
     tasks: list[dict] = []
     reports: list[dict] = []
     reviews: list[dict] = []
@@ -1126,7 +1158,7 @@ def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = Non
                 if not root.is_dir():
                     continue
                 for path in sorted(root.glob(f"{work['slug']}*.md")):
-                    item = _artifact_item(path, cwd, category, work["artifact_terms"])
+                    item = _artifact_item(path, cwd, category, work["artifact_terms"], anchor_timestamp=anchor_timestamp)
                     sources.append(item)
                     if category == "task":
                         tasks.append(item)
@@ -1135,13 +1167,18 @@ def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = Non
                     else:
                         reviews.append(item)
         if sources:
+            current_sources = [source for source in sources if source.get("current_window_evidence")]
+            selected_sources = current_sources or sources
+            source_tier = "required_secondary" if current_sources else "diagnostic_optional"
             value_items.append(
                 {
                     "work_id": work["id"],
                     "value_kind": work["value_kind"],
                     "summary": work["summary"],
-                    "source_refs": [source["source_ref"] for source in sources[:4]],
-                    "evidence_snippets": [source["snippet"] for source in sources[:2] if source.get("snippet")],
+                    "source_tier": source_tier,
+                    "current_window_evidence": bool(current_sources),
+                    "source_refs": [source["source_ref"] for source in selected_sources[:4]],
+                    "evidence_snippets": [source["snippet"] for source in selected_sources[:2] if source.get("snippet")],
                 }
             )
     return {
@@ -1176,20 +1213,57 @@ def _collect_secondary_commits(cwd: Path, anchor_timestamp_utc: str | None) -> l
                 "committed_at": committed_at,
                 "subject": _compact(subject, 160),
                 "evidence_role": "secondary_only_after_raw_jsonl_trace",
+                "source_tier": "required_secondary",
             }
         )
     return commits
 
 
-def _artifact_item(path: Path, cwd: Path, category: str, terms: tuple[str, ...]) -> dict:
+def _artifact_item(path: Path, cwd: Path, category: str, terms: tuple[str, ...], *, anchor_timestamp) -> dict:
     rel = _rel(path, cwd)
     line_no, snippet = _first_matching_line(path, terms)
+    evidence_timestamp = _artifact_evidence_timestamp(path, cwd)
+    current_window = bool(
+        anchor_timestamp is not None
+        and evidence_timestamp is not None
+        and evidence_timestamp.astimezone(timezone.utc) >= anchor_timestamp
+    )
+    source_tier = "required_secondary" if current_window else "diagnostic_optional"
     return {
         "kind": category,
         "path": rel,
         "source_ref": f"{rel}:{line_no}" if line_no else rel,
         "snippet": snippet,
+        "source_tier": source_tier,
+        "current_window_evidence": current_window,
+        "evidence_timestamp_utc": (
+            evidence_timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if evidence_timestamp else None
+        ),
+        "diagnostic_only": not current_window,
     }
+
+
+def _artifact_evidence_timestamp(path: Path, cwd: Path):
+    rel = _rel(path, cwd)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "log", "-1", "--format=%cI", "--", rel],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0:
+        timestamp = parse_datetime(result.stdout.strip(), timezone.utc)
+        if timestamp is not None:
+            return timestamp.astimezone(timezone.utc)
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
 
 
 def _first_matching_line(path: Path, terms: tuple[str, ...]) -> tuple[int | None, str]:
@@ -1208,10 +1282,13 @@ def _first_matching_line(path: Path, terms: tuple[str, ...]) -> tuple[int | None
     return None, ""
 
 
-def _unresolved_blockers(artifacts: dict) -> list[dict]:
+def _unresolved_blockers(artifacts: dict, *, current_window_only: bool = False) -> list[dict]:
+    collections = (artifacts["tasks"], artifacts["reports"], artifacts["reviews"])
+    if current_window_only:
+        collections = tuple([item for item in collection if item.get("current_window_evidence")] for collection in collections)
     joined = " ".join(
         item.get("snippet", "")
-        for collection in (artifacts["tasks"], artifacts["reports"], artifacts["reviews"])
+        for collection in collections
         for item in collection
     ).lower()
     if "case-002" in joined or "case 002" in joined or "read-more" in joined or "workflow churn" in joined:
@@ -1220,24 +1297,54 @@ def _unresolved_blockers(artifacts: dict) -> list[dict]:
                 "blocker": "case-002 over-search/read-more churn",
                 "status": "unresolved",
                 "summary": "The remaining serious blocker is case-002 over-search/read-more churn after source-grounded answers are possible.",
-                "source_refs": _source_refs_containing(artifacts, ("case-002", "case 002", "read-more", "workflow churn"))[:4],
+                "source_tier": "required_secondary",
+                "source_refs": _source_refs_containing(
+                    artifacts,
+                    ("case-002", "case 002", "read-more", "workflow churn"),
+                    current_window_only=current_window_only,
+                )[:4],
             }
         ]
     return []
 
 
-def _source_refs_containing(artifacts: dict, terms: tuple[str, ...]) -> list[str]:
+def _source_refs_containing(artifacts: dict, terms: tuple[str, ...], *, current_window_only: bool = False) -> list[str]:
     refs = []
     for collection in (artifacts["tasks"], artifacts["reports"], artifacts["reviews"]):
         for item in collection:
+            if current_window_only and not item.get("current_window_evidence"):
+                continue
             text = f"{item.get('path', '')} {item.get('snippet', '')}".lower()
             if any(term in text for term in terms):
                 refs.append(item["source_ref"])
     return refs
 
 
-def _answer_brief(behavior_deltas: list[dict], non_deltas: list[dict], blockers: list[dict]) -> list[str]:
-    lines = [item["summary"] for item in behavior_deltas]
+def _answer_brief(
+    *,
+    selected_anchor: dict | None,
+    session_activity: dict,
+    behavior_deltas: list[dict],
+    non_deltas: list[dict],
+    blockers: list[dict],
+) -> list[str]:
+    lines = []
+    activity = session_activity.get("activity_after_anchor") or {}
+    if selected_anchor:
+        lines.append(
+            "Current window starts at "
+            f"{selected_anchor.get('timestamp_utc')} from {selected_anchor.get('source_ref')}; "
+            "answer from required primary raw JSONL refs before secondary artifacts."
+        )
+    if session_activity.get("status") == "raw_session_trace_found" or activity.get("records_after_anchor"):
+        lines.append(
+            "Current-window raw trace: "
+            f"{activity.get('records_after_anchor', 0)} records, "
+            f"{activity.get('conversation_actions', 0)} conversation actions, "
+            f"{activity.get('tool_calls', 0)} tool calls, "
+            f"{activity.get('spawned_session_calls', 0)} spawned worker/reviewer session launches."
+        )
+    lines.extend(item["summary"] for item in behavior_deltas)
     lines.extend(item["summary"] for item in non_deltas)
     lines.extend(item["summary"] for item in blockers)
     return lines
@@ -1257,24 +1364,90 @@ def _next_reads(
             "reason": "Inspect selected conversation anchor before answering.",
             "source_ref": selected_anchor["source_ref"],
             "snippet": selected_anchor["snippet"],
+            "source_tier": "required_primary",
+            "answer_use_required": True,
         }
         _copy_openable_fields(read, selected_anchor)
         if read.get("openable_target") and not read.get("read_more_command"):
             read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
         reads.append(read)
-    reads.extend(session_activity.get("next_reads") or [])
+    for read in session_activity.get("next_reads") or []:
+        reads.append(
+            {
+                **read,
+                "source_tier": "required_primary",
+                "answer_use_required": True,
+            }
+        )
     for item in artifacts["value_items"]:
         for ref in item["source_refs"][:2]:
+            tier = item.get("source_tier") or "diagnostic_optional"
+            read = {
+                "reason": f"Inspect {item['work_id']} {item['value_kind']} evidence after raw JSONL trace.",
+                "source_ref": ref,
+                "source_tier": tier,
+                "answer_use_required": tier != "diagnostic_optional",
+            }
+            if tier == "diagnostic_optional":
+                read.update(
+                    {
+                        "diagnostic_only": True,
+                        "read_more_actionable": False,
+                        "diagnostic_open_policy": (
+                            "stale/demo/example work product; open only if the current-window primary and secondary refs leave "
+                            "a named diagnostic gap"
+                        ),
+                    }
+                )
+            reads.append(read)
+    for blocker in _unresolved_blockers(artifacts, current_window_only=True):
+        for ref in blocker.get("source_refs", [])[:2]:
             reads.append(
                 {
-                    "reason": f"Inspect {item['work_id']} {item['value_kind']} evidence after raw JSONL trace.",
+                    "reason": "Inspect unresolved blocker evidence.",
                     "source_ref": ref,
+                    "source_tier": blocker.get("source_tier") or "required_secondary",
+                    "answer_use_required": True,
                 }
             )
-    for blocker in _unresolved_blockers(artifacts):
-        for ref in blocker.get("source_refs", [])[:2]:
-            reads.append({"reason": "Inspect unresolved blocker evidence.", "source_ref": ref})
+    for commit in artifacts.get("commits") or []:
+        commit_ref = f"git_commit:{commit.get('commit')}"
+        reads.append(
+            {
+                "reason": "Use commit as required secondary support after required primary raw JSONL refs.",
+                "source_ref": commit_ref,
+                "snippet": commit.get("subject"),
+                "source_tier": commit.get("source_tier") or "required_secondary",
+                "answer_use_required": True,
+                "commit": commit.get("commit"),
+                "committed_at": commit.get("committed_at"),
+            }
+        )
     return _dedupe_reads(reads)
+
+
+def _source_tiers(reads: list[dict]) -> dict:
+    tiers = {
+        "required_primary": [],
+        "required_secondary": [],
+        "diagnostic_optional": [],
+    }
+    for read in reads:
+        tier = read.get("source_tier") or "diagnostic_optional"
+        if tier not in tiers:
+            tier = "diagnostic_optional"
+        tiers[tier].append(read)
+    return {
+        "tier_order": ["required_primary", "required_secondary", "diagnostic_optional"],
+        "required_primary": tiers["required_primary"],
+        "required_secondary": tiers["required_secondary"],
+        "diagnostic_optional": tiers["diagnostic_optional"],
+        "counts": {tier: len(items) for tier, items in tiers.items()},
+        "answer_brief_source_policy": (
+            "answer_brief is derived from the selected current anchor/window plus current-window secondary evidence; "
+            "diagnostic_optional stale/demo/example refs are not answer-facing summary support"
+        ),
+    }
 
 
 def _with_read_more_command(anchor: dict | None, *, cwd: Path, codex_home: Path | None) -> dict | None:
@@ -1335,6 +1508,8 @@ def _dedupe_reads(reads: list[dict]) -> list[dict]:
             continue
         seen.add(ref)
         deduped.append(read)
+    tier_order = {"required_primary": 0, "required_secondary": 1, "diagnostic_optional": 2}
+    deduped.sort(key=lambda item: tier_order.get(item.get("source_tier"), 2))
     return deduped
 
 

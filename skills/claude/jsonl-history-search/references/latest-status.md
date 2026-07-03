@@ -34,22 +34,33 @@ status packet if the selected anchor needs manual inspection.
    - side-thread/main-thread boundary.
 2. State the anchor used.
 3. Follow `history.jsonl` session IDs into `sessions/**/*.jsonl`, then inspect
-   the raw source refs/read-more commands before answering.
+   the raw source refs/read-more commands before answering. Treat
+   `source_tiers.required_primary` as the must-open first set.
 4. Reconstruct the long window from raw JSONL first:
    - conversation actions;
    - tool calls;
    - spawned worker/reviewer/free-agent sessions;
    - compactions or missing logs.
-5. Use durable artifacts only after the raw trace:
+5. Use durable artifacts only after the raw trace. Treat
+   `source_tiers.required_secondary` as current-window support, not the anchor:
    - commits and merges as secondary evidence;
    - tasks, reviews, reports, and current repo state as secondary evidence.
-6. Say explicitly when commits/repo state are only supporting evidence.
-7. Answer value-first:
+6. Treat `source_tiers.diagnostic_optional` as optional diagnostics only.
+   Stale demo/example work products, rejected anchors, broad work products, or
+   older route examples must not drive the answer-facing summary unless they
+   are explicitly selected current-window evidence.
+7. Say explicitly when commits/repo state are only supporting evidence.
+8. Answer value-first:
    - behavior changes;
    - measurement/results;
    - docs/claim-only changes;
    - unresolved blockers;
    - next real work.
+
+Stop once required primary refs plus any needed required secondary support are
+sufficient for the answer. Do not blanket-crawl worker/reviewer side threads;
+open spawned worker/reviewer refs only when the status question asks for
+delegated work or the selected current window includes those spawned refs.
 
 Avoid commit-only, repo-status-only, summary-only, or process-event-only
 answers. If the raw JSONL session trace is missing or partial, say that as an

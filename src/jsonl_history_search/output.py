@@ -2514,9 +2514,11 @@ def render_status_anchor_text(payload: dict) -> str:
     report = payload["status_anchor"]
     summary = report["summary"]
     reads = report.get("next_reads") or []
+    source_tiers = report.get("source_tiers") or {}
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
+    open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
         "Status Anchor",
@@ -2527,10 +2529,10 @@ def render_status_anchor_text(payload: dict) -> str:
     ]
     if selected:
         _append_text_read(lines, selected)
-    for read in reads[:4]:
+    for read in open_first_reads[:4]:
         if not selected or read.get("source_ref") != selected.get("source_ref"):
             _append_text_read(lines, read)
-    if not selected and not reads:
+    if not selected and not open_first_reads:
         lines.append("- (no source refs surfaced)")
     if instruction.get("stop_condition"):
         lines.append(f"Stop condition: {instruction.get('stop_condition')}")
@@ -2544,6 +2546,8 @@ def render_status_anchor_text(payload: dict) -> str:
         (
             "Summary: "
             f"{summary['anchor_candidate_count']} anchors, "
+            f"{summary.get('current_window_work_product_count', 0)} current-window work products, "
+            f"{summary.get('diagnostic_optional_work_product_count', 0)} diagnostic optional work products, "
             f"{summary['behavior_delta_count']} behavior deltas, "
             f"{summary['non_delta_count']} non-deltas, "
             f"{summary['unresolved_blocker_count']} blockers"
@@ -2595,6 +2599,13 @@ def render_status_anchor_text(payload: dict) -> str:
     lines.append("Answer brief:")
     for item in report.get("answer_brief", []):
         lines.append(f"- {item}")
+    if source_tiers:
+        lines.append("Source tiers:")
+        for tier in source_tiers.get("tier_order") or ["required_primary", "required_secondary", "diagnostic_optional"]:
+            tier_reads = source_tiers.get(tier) or []
+            lines.append(f"{tier}: {len(tier_reads)}")
+            for read in tier_reads[:5]:
+                _append_text_read(lines, read)
     if report.get("unresolved_blockers"):
         lines.append("Unresolved blockers:")
         for blocker in report["unresolved_blockers"]:
@@ -2614,9 +2625,11 @@ def render_status_anchor_markdown(payload: dict) -> str:
     report = payload["status_anchor"]
     summary = report["summary"]
     reads = report.get("next_reads") or []
+    source_tiers = report.get("source_tiers") or {}
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
+    open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
         "# Status Anchor",
@@ -2630,10 +2643,10 @@ def render_status_anchor_markdown(payload: dict) -> str:
     ]
     if selected:
         _append_markdown_read(lines, selected)
-    for read in reads[:4]:
+    for read in open_first_reads[:4]:
         if not selected or read.get("source_ref") != selected.get("source_ref"):
             _append_markdown_read(lines, read)
-    if not selected and not reads:
+    if not selected and not open_first_reads:
         lines.append("- No source refs surfaced.")
     lines.extend(["", "## Stop / Continue", ""])
     if instruction.get("stop_condition"):
@@ -2649,6 +2662,8 @@ def render_status_anchor_markdown(payload: dict) -> str:
         f"**Commit-only answers allowed:** `{report.get('evidence_contract', {}).get('commit_only_answers_allowed')}`",
         (
             f"**Summary:** {summary['anchor_candidate_count']} anchors, "
+            f"{summary.get('current_window_work_product_count', 0)} current-window work products, "
+            f"{summary.get('diagnostic_optional_work_product_count', 0)} diagnostic optional work products, "
             f"{summary['behavior_delta_count']} behavior deltas, "
             f"{summary['non_delta_count']} non-deltas, "
             f"{summary['unresolved_blocker_count']} blockers"
@@ -2707,6 +2722,16 @@ def render_status_anchor_markdown(payload: dict) -> str:
     lines.extend(["## Answer Brief", ""])
     lines.extend(f"- {item}" for item in report.get("answer_brief", []))
     lines.append("")
+    if source_tiers:
+        lines.extend(["## Source Tiers", ""])
+        for tier in source_tiers.get("tier_order") or ["required_primary", "required_secondary", "diagnostic_optional"]:
+            tier_reads = source_tiers.get(tier) or []
+            lines.extend([f"### `{tier}`", ""])
+            if not tier_reads:
+                lines.append("- No refs surfaced.")
+            for read in tier_reads[:5]:
+                _append_markdown_read(lines, read)
+            lines.append("")
     if reads:
         lines.extend(["## Next Reads", ""])
         for read in reads[:10]:
