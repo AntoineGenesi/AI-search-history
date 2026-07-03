@@ -221,8 +221,14 @@ def status_anchor_report(
     started: float | None = None,
 ) -> dict:
     latest_messages = latest.get("messages", [])
-    anchor_candidates = _rank_anchor_candidates(latest_messages)
-    anchor_decision = _select_anchor_with_boundary(query=query, messages=latest_messages, candidates=anchor_candidates)
+    target_window = _target_window_from_query(query)
+    anchor_candidates = _rank_anchor_candidates(latest_messages, target_window=target_window)
+    anchor_decision = _select_anchor_with_boundary(
+        query=query,
+        messages=latest_messages,
+        candidates=anchor_candidates,
+        target_window=target_window,
+    )
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
         selected_anchor.update(_anchor_decision_fields(anchor_decision, selected_anchor))
@@ -237,7 +243,11 @@ def status_anchor_report(
         cwd=cwd,
         codex_home=codex_home,
     )
-    artifacts = _collect_work_artifacts(cwd, anchor_timestamp_utc=session_activity.get("anchor_timestamp_utc"))
+    artifacts = _collect_work_artifacts(
+        cwd,
+        anchor_timestamp_utc=session_activity.get("anchor_timestamp_utc"),
+        target_window=target_window,
+    )
     current_value_items = [item for item in artifacts["value_items"] if item.get("current_window_evidence")]
     behavior_deltas = [item for item in current_value_items if item["value_kind"] == "behavior_delta"]
     non_deltas = [item for item in current_value_items if item["value_kind"] == "non_delta"]
@@ -250,8 +260,16 @@ def status_anchor_report(
         non_deltas=non_deltas,
         blockers=unresolved_blockers,
     )
-    next_reads = _next_reads(selected_anchor, session_activity, artifacts, cwd=cwd, codex_home=codex_home)
+    next_reads = _next_reads(
+        selected_anchor,
+        session_activity,
+        artifacts,
+        cwd=cwd,
+        codex_home=codex_home,
+        target_window=target_window,
+    )
     source_tiers = _source_tiers(next_reads)
+    suppressed_support = _suppressed_answer_facing_support(cwd, target_window=target_window)
     blind_spots = []
     if not selected_anchor:
         blind_spots.append("No substantive anchor selected from the searched latest-message scope.")
@@ -279,6 +297,7 @@ def status_anchor_report(
             "anchor_scope": anchor_decision["anchor_scope"],
             "anchor_reason": anchor_decision["anchor_reason"],
             "anchor_ref": anchor_decision["anchor_ref"],
+            "target_window": target_window,
         },
         "source_scope": latest.get("source_scope"),
         "summary": {
@@ -300,6 +319,13 @@ def status_anchor_report(
             "behavior_delta_count": len(behavior_deltas),
             "non_delta_count": len(non_deltas),
             "diagnostic_value_item_count": len(diagnostic_value_items),
+            "target_window_work_product_count": sum(
+                1
+                for collection in (artifacts["tasks"], artifacts["reports"], artifacts["reviews"])
+                for item in collection
+                if item.get("target_window_evidence")
+            ),
+            "suppressed_answer_facing_artifact_count": suppressed_support.get("count", 0),
             "unresolved_blocker_count": len(unresolved_blockers),
             "raw_session_file_count": session_activity["summary"]["session_file_count"],
             "raw_session_record_count": session_activity["summary"]["records_after_anchor"],
@@ -316,6 +342,8 @@ def status_anchor_report(
         "evidence_contract": _evidence_contract(),
         "next_reads": next_reads,
         "source_tiers": source_tiers,
+        "target_window": target_window,
+        "suppressed_support": suppressed_support,
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
@@ -346,7 +374,7 @@ def is_status_question(query: str) -> bool:
     return any(pattern in normalized for pattern in STATUS_QUERY_PATTERNS)
 
 
-def _rank_anchor_candidates(messages: list[dict]) -> list[dict]:
+def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None = None) -> list[dict]:
     candidates = []
     status_cutoff = _status_query_cutoff(messages)
     for index, message in enumerate(messages):
@@ -376,6 +404,7 @@ def _rank_anchor_candidates(messages: list[dict]) -> list[dict]:
                 "score": score,
                 "decision": decision,
                 "rationale": rationale,
+                "target_window_hits": _target_window_hits(text, target_window),
             }
         )
     candidates.sort(key=lambda item: (item["score"], item.get("timestamp_utc") or ""), reverse=True)
@@ -431,7 +460,13 @@ def _select_anchor(candidates: list[dict]) -> dict | None:
     return None
 
 
-def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates: list[dict]) -> dict:
+def _select_anchor_with_boundary(
+    *,
+    query: str,
+    messages: list[dict],
+    candidates: list[dict],
+    target_window: dict | None = None,
+) -> dict:
     base = {
         "context_boundary": "none",
         "anchor_scope": "ranked_history",
@@ -462,6 +497,22 @@ def _select_anchor_with_boundary(*, query: str, messages: list[dict], candidates
                 "selected_anchor": _selected_with_reason(
                     explicit_anchor,
                     "; selected because the query explicitly named this timestamp/message anchor",
+                ),
+            },
+            candidates,
+        )
+    target_anchor = _target_window_anchor_candidate(candidates, target_window)
+    if target_anchor:
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "explicit_task_window",
+                "anchor_scope": "target_window",
+                "anchor_reason": target_window.get("anchor_reason") if target_window else "explicit_task_window_anchor",
+                "anchor_ref": target_anchor.get("source_ref"),
+                "selected_anchor": _selected_with_reason(
+                    target_anchor,
+                    "; selected because the query explicitly named this task/window range",
                 ),
             },
             candidates,
@@ -561,6 +612,123 @@ _TIMESTAMP_ANCHOR_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?:Z|[+-][0-9]{2}:?[0-9]{2})?\b"
 )
 _QUOTED_ANCHOR_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")
+_TASK_ID_RE = re.compile(r"\b([A-Z]{2,12})[- ]?(\d{1,6})\b", re.IGNORECASE)
+_TASK_RANGE_MARKERS = (
+    "->",
+    " through ",
+    " thru ",
+    " to ",
+    " until ",
+    " between ",
+    " from ",
+    " range ",
+)
+_RUN_AUDIT_MARKERS = (
+    "audit this run",
+    "audit that run",
+    "audit the run",
+    "audit same-run",
+    "audit same run",
+    "pressure run",
+    "manual lane",
+    "manual-lane",
+    "private run",
+    ".private",
+)
+
+
+def _target_window_from_query(query: str) -> dict | None:
+    normalized = _normalize(query)
+    matches = list(_TASK_ID_RE.finditer(query))
+    if not matches:
+        return None
+    ids = []
+    seen = set()
+    for match in matches:
+        prefix = match.group(1).upper()
+        number = int(match.group(2))
+        task_id = f"{prefix}-{number}"
+        if task_id in seen:
+            continue
+        ids.append({"prefix": prefix, "number": number, "id": task_id})
+        seen.add(task_id)
+    if not ids:
+        return None
+    same_prefix_ids = [item for item in ids if item["prefix"] == ids[0]["prefix"]]
+    range_cued = len(same_prefix_ids) >= 2 and any(marker in normalized for marker in _TASK_RANGE_MARKERS)
+    audit_run_requested = any(marker in normalized for marker in _RUN_AUDIT_MARKERS)
+    if range_cued:
+        start = min(item["number"] for item in same_prefix_ids)
+        end = max(item["number"] for item in same_prefix_ids)
+        if end - start > 50:
+            return {
+                "kind": "task_id_mentions",
+                "ids": [item["id"] for item in ids],
+                "start_id": same_prefix_ids[0]["id"],
+                "end_id": same_prefix_ids[-1]["id"],
+                "audit_run_requested": audit_run_requested,
+                "anchor_reason": "explicit_task_id_mentions_anchor",
+            }
+        prefix = same_prefix_ids[0]["prefix"]
+        window_ids = [f"{prefix}-{number}" for number in range(start, end + 1)]
+        return {
+            "kind": "task_id_range",
+            "ids": window_ids,
+            "start_id": f"{prefix}-{start}",
+            "end_id": f"{prefix}-{end}",
+            "audit_run_requested": audit_run_requested,
+            "anchor_reason": "explicit_task_id_range_anchor",
+        }
+    return {
+        "kind": "task_id_mentions",
+        "ids": [item["id"] for item in ids],
+        "start_id": ids[0]["id"],
+        "end_id": ids[-1]["id"],
+        "audit_run_requested": audit_run_requested,
+        "anchor_reason": "explicit_task_id_mentions_anchor",
+    }
+
+
+def _target_window_hits(text: str, target_window: dict | None) -> list[str]:
+    if not target_window:
+        return []
+    normalized = _normalize_task_ids(text)
+    return [task_id for task_id in target_window.get("ids") or [] if task_id in normalized]
+
+
+def _target_window_anchor_candidate(candidates: list[dict], target_window: dict | None) -> dict | None:
+    if not target_window:
+        return None
+    matches = []
+    target_ids = set(target_window.get("ids") or [])
+    for candidate in candidates:
+        if _is_never_anchor(candidate):
+            continue
+        hits = set(candidate.get("target_window_hits") or [])
+        if not hits:
+            continue
+        text = _normalize_task_ids(f"{candidate.get('source_ref', '')} {candidate.get('snippet', '')}")
+        mentioned = set(_TASK_ID_RE.findall(text))
+        outside_task_penalty = 0
+        if mentioned:
+            normalized_mentions = {
+                f"{prefix.upper()}-{int(number)}"
+                for prefix, number in mentioned
+                if number.isdigit()
+            }
+            outside_task_penalty = len(normalized_mentions - target_ids) * 8
+        score = 130 + len(hits) * 12 + int(candidate.get("score") or 0) - outside_task_penalty
+        if target_window.get("start_id") in hits:
+            score += 10
+        if target_window.get("end_id") in hits:
+            score += 10
+        selected = dict(candidate)
+        selected["score"] = max(score, int(selected.get("score") or 0))
+        selected["target_window_hits"] = sorted(hits)
+        selected["explicit_anchor_reason"] = target_window.get("anchor_reason")
+        matches.append(selected)
+    matches.sort(key=lambda item: (int(item.get("score") or 0), item.get("timestamp_utc") or ""), reverse=True)
+    return matches[0] if matches else None
 
 
 def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
@@ -1139,7 +1307,12 @@ def _evidence_contract() -> dict:
     }
 
 
-def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = None) -> dict:
+def _collect_work_artifacts(
+    cwd: Path,
+    *,
+    anchor_timestamp_utc: str | None = None,
+    target_window: dict | None = None,
+) -> dict:
     anchor_timestamp = parse_datetime(anchor_timestamp_utc or "", timezone.utc)
     if anchor_timestamp is not None:
         anchor_timestamp = anchor_timestamp.astimezone(timezone.utc)
@@ -1147,8 +1320,9 @@ def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = Non
     reports: list[dict] = []
     reviews: list[dict] = []
     value_items: list[dict] = []
-    for work in KNOWN_WORK:
+    for work in _work_specs(target_window):
         sources: list[dict] = []
+        target_window_match = _work_id_in_target_window(work["id"], target_window)
         for category, roots in (
             ("task", (cwd / "tasks",)),
             ("report", (cwd / "reports",)),
@@ -1158,7 +1332,15 @@ def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = Non
                 if not root.is_dir():
                     continue
                 for path in sorted(root.glob(f"{work['slug']}*.md")):
-                    item = _artifact_item(path, cwd, category, work["artifact_terms"], anchor_timestamp=anchor_timestamp)
+                    item = _artifact_item(
+                        path,
+                        cwd,
+                        category,
+                        work["artifact_terms"],
+                        anchor_timestamp=anchor_timestamp,
+                        force_current=target_window_match,
+                        target_window_evidence=target_window_match,
+                    )
                     sources.append(item)
                     if category == "task":
                         tasks.append(item)
@@ -1190,6 +1372,37 @@ def _collect_work_artifacts(cwd: Path, *, anchor_timestamp_utc: str | None = Non
     }
 
 
+def _work_specs(target_window: dict | None) -> list[dict]:
+    specs = {work["id"]: dict(work) for work in KNOWN_WORK}
+    for task_id in (target_window or {}).get("ids") or []:
+        specs.setdefault(
+            task_id,
+            {
+                "id": task_id,
+                "slug": task_id.casefold(),
+                "value_kind": "target_window_work",
+                "summary": (
+                    f"{task_id} is part of the explicit target window; inspect its task/report/review "
+                    "artifact as secondary support after raw JSONL primary refs."
+                ),
+                "artifact_terms": (
+                    task_id.casefold(),
+                    "status:",
+                    "verdict",
+                    "result classification",
+                    "validation",
+                    "merged",
+                    "closeout",
+                ),
+            },
+        )
+    return list(specs.values())
+
+
+def _work_id_in_target_window(work_id: str, target_window: dict | None) -> bool:
+    return bool(target_window and work_id in set(target_window.get("ids") or []))
+
+
 def _collect_secondary_commits(cwd: Path, anchor_timestamp_utc: str | None) -> list[dict]:
     if not anchor_timestamp_utc:
         return []
@@ -1219,14 +1432,26 @@ def _collect_secondary_commits(cwd: Path, anchor_timestamp_utc: str | None) -> l
     return commits
 
 
-def _artifact_item(path: Path, cwd: Path, category: str, terms: tuple[str, ...], *, anchor_timestamp) -> dict:
+def _artifact_item(
+    path: Path,
+    cwd: Path,
+    category: str,
+    terms: tuple[str, ...],
+    *,
+    anchor_timestamp,
+    force_current: bool = False,
+    target_window_evidence: bool = False,
+) -> dict:
     rel = _rel(path, cwd)
     line_no, snippet = _first_matching_line(path, terms)
     evidence_timestamp = _artifact_evidence_timestamp(path, cwd)
     current_window = bool(
-        anchor_timestamp is not None
-        and evidence_timestamp is not None
-        and evidence_timestamp.astimezone(timezone.utc) >= anchor_timestamp
+        force_current
+        or (
+            anchor_timestamp is not None
+            and evidence_timestamp is not None
+            and evidence_timestamp.astimezone(timezone.utc) >= anchor_timestamp
+        )
     )
     source_tier = "required_secondary" if current_window else "diagnostic_optional"
     return {
@@ -1236,6 +1461,7 @@ def _artifact_item(path: Path, cwd: Path, category: str, terms: tuple[str, ...],
         "snippet": snippet,
         "source_tier": source_tier,
         "current_window_evidence": current_window,
+        "target_window_evidence": target_window_evidence,
         "evidence_timestamp_utc": (
             evidence_timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if evidence_timestamp else None
         ),
@@ -1357,6 +1583,7 @@ def _next_reads(
     *,
     cwd: Path,
     codex_home: Path | None,
+    target_window: dict | None = None,
 ) -> list[dict]:
     reads = []
     if selected_anchor:
@@ -1423,6 +1650,7 @@ def _next_reads(
                 "committed_at": commit.get("committed_at"),
             }
         )
+    reads = _apply_answer_facing_suppression(reads, target_window=target_window)
     return _dedupe_reads(reads)
 
 
@@ -1445,9 +1673,116 @@ def _source_tiers(reads: list[dict]) -> dict:
         "counts": {tier: len(items) for tier, items in tiers.items()},
         "answer_brief_source_policy": (
             "answer_brief is derived from the selected current anchor/window plus current-window secondary evidence; "
-            "diagnostic_optional stale/demo/example refs are not answer-facing summary support"
+            "diagnostic_optional stale/demo/example and same-run/private pressure refs are not answer-facing summary support"
         ),
     }
+
+
+def _apply_answer_facing_suppression(reads: list[dict], *, target_window: dict | None) -> list[dict]:
+    if target_window and target_window.get("audit_run_requested"):
+        return reads
+    suppressed = []
+    for read in reads:
+        if not _is_suppressed_answer_facing_ref(read):
+            suppressed.append(read)
+            continue
+        demoted = dict(read)
+        demoted.update(
+            {
+                "source_tier": "diagnostic_optional",
+                "answer_use_required": False,
+                "diagnostic_only": True,
+                "read_more_actionable": False,
+                "suppressed_from_answer_facing": True,
+                "diagnostic_open_policy": (
+                    "same-run/private pressure artifact or manual-lane output; open only when explicitly auditing that run"
+                ),
+            }
+        )
+        suppressed.append(demoted)
+    return suppressed
+
+
+def _is_suppressed_answer_facing_ref(read: dict) -> bool:
+    text = _normalize_pathish(
+        " ".join(
+            str(read.get(key) or "")
+            for key in (
+                "source_ref",
+                "openable_target",
+                "reason",
+                "snippet",
+            )
+        )
+    )
+    if not text:
+        return False
+    private_or_run = (
+        ".private/" in text
+        or text.startswith("private:")
+        or "/run-" in text
+        or "pressure-run" in text
+        or "pressure_run" in text
+    )
+    manual_lane = (
+        "/manual_default/" in text
+        or "/manual-lane/" in text
+        or "/manual_lane/" in text
+        or "manual_default" in text
+        or "manual-lane" in text
+        or "manual lane" in text
+    )
+    final_output = (
+        "final_answer.txt" in text
+        or "final-answer.txt" in text
+        or "final_answer" in text
+    )
+    return private_or_run or (manual_lane and final_output)
+
+
+def _suppressed_answer_facing_support(cwd: Path, *, target_window: dict | None = None) -> dict:
+    audit_run_requested = bool(target_window and target_window.get("audit_run_requested"))
+    if audit_run_requested:
+        return {
+            "policy": "same-run/private pressure artifacts may be answer-facing because the query explicitly asks to audit the run",
+            "audit_run_requested": True,
+            "count": 0,
+            "class_counts": {},
+            "paths_included": False,
+        }
+    private_root = cwd / ".private"
+    class_counts: dict[str, int] = {}
+    truncated = False
+    if private_root.is_dir():
+        for path in private_root.glob("*/run-*/*/final_answer.txt"):
+            _increment_class(class_counts, _suppressed_artifact_class(path))
+            if sum(class_counts.values()) >= 20:
+                truncated = True
+                break
+    return {
+        "policy": (
+            "same-run pressure artifacts, private run directories, and manual-lane outputs are omitted from "
+            "required/open-first support unless the query explicitly asks to audit that run"
+        ),
+        "audit_run_requested": False,
+        "count": sum(class_counts.values()),
+        "class_counts": class_counts,
+        "truncated": truncated,
+        "paths_included": False,
+    }
+
+
+def _suppressed_artifact_class(path: Path) -> str:
+    text = _normalize_pathish(str(path))
+    if "/manual_default/" in text or "/manual-lane/" in text or "/manual_lane/" in text:
+        return "manual_lane_final_output"
+    if ".private/" in text:
+        return "private_pressure_artifact"
+    return "same_run_pressure_artifact"
+
+
+def _increment_class(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
 
 
 def _with_read_more_command(anchor: dict | None, *, cwd: Path, codex_home: Path | None) -> dict | None:
@@ -1529,6 +1864,14 @@ def _compact(text: str, limit: int = 240) -> str:
 
 def _normalize(text: str) -> str:
     return " ".join(text.casefold().split())
+
+
+def _normalize_task_ids(text: str) -> str:
+    return _TASK_ID_RE.sub(lambda match: f"{match.group(1).upper()}-{int(match.group(2))}", text)
+
+
+def _normalize_pathish(text: str) -> str:
+    return _normalize(text).replace("\\", "/")
 
 
 def _timezone_from_args(args: Any):
