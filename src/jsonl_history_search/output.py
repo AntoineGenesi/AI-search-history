@@ -2908,6 +2908,87 @@ def render_generated_metadata_discovery_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_scope_boundary_summary_text(summary: dict) -> list[str]:
+    if not summary:
+        return []
+    searched = summary.get("searched_scope") or {}
+    not_searched = summary.get("not_searched_scope") or {}
+    excluded = summary.get("excluded_scope") or {}
+    caps = summary.get("caps") or {}
+    duplicate = summary.get("duplicate_mirror_risk") or {}
+    lines = [
+        "Scope boundary summary:",
+        (
+            "- searched: "
+            f"roots={searched.get('searched_root_count', 0)}/{searched.get('selected_root_count', 0)} "
+            f"files={searched.get('searched_files', 0)} bytes={searched.get('searched_bytes', 0)} "
+            f"meaning={searched.get('result_meaning')}"
+        ),
+        (
+            "- not searched/excluded: "
+            f"outside_selected_roots={not_searched.get('outside_selected_roots')} "
+            f"missing_roots={not_searched.get('missing_root_count', 0)} "
+            f"deferred_files={not_searched.get('source_plan_deferred_files', 0)} "
+            f"pruned_files={not_searched.get('source_plan_pruned_files', 0)} "
+            f"rejected_roots={excluded.get('rejected_root_count', 0)}"
+        ),
+        (
+            "- caps: "
+            f"{caps.get('status')} hit={caps.get('hit', False)} "
+            f"caps_hit={', '.join(caps.get('caps_hit') or []) or 'none'}"
+        ),
+        (
+            "- duplicate/mirror risk: "
+            f"{duplicate.get('status')} "
+            f"collapsed_candidates={duplicate.get('collapsed_candidate_count', 0)} "
+            f"duplicate_or_collapsed_rows={duplicate.get('duplicate_or_collapsed_row_count', 0)} "
+            f"duplicate_file_overlap={duplicate.get('duplicate_file_overlap_count', 0)}"
+        ),
+        f"- not-all-history boundary: {summary.get('claim_boundary')}",
+        f"- escalation condition: {summary.get('escalation_condition')}",
+    ]
+    return lines
+
+
+def render_scope_boundary_summary_markdown(summary: dict) -> list[str]:
+    if not summary:
+        return []
+    searched = summary.get("searched_scope") or {}
+    not_searched = summary.get("not_searched_scope") or {}
+    excluded = summary.get("excluded_scope") or {}
+    caps = summary.get("caps") or {}
+    duplicate = summary.get("duplicate_mirror_risk") or {}
+    return [
+        "",
+        "## Scope Boundary Summary",
+        "",
+        (
+            f"- `searched`: roots `{searched.get('searched_root_count', 0)}/{searched.get('selected_root_count', 0)}`, "
+            f"files `{searched.get('searched_files', 0)}`, bytes `{searched.get('searched_bytes', 0)}`, "
+            f"meaning `{searched.get('result_meaning')}`"
+        ),
+        (
+            f"- `not_searched_or_excluded`: outside selected roots `{not_searched.get('outside_selected_roots')}`, "
+            f"missing roots `{not_searched.get('missing_root_count', 0)}`, "
+            f"deferred files `{not_searched.get('source_plan_deferred_files', 0)}`, "
+            f"pruned files `{not_searched.get('source_plan_pruned_files', 0)}`, "
+            f"rejected roots `{excluded.get('rejected_root_count', 0)}`"
+        ),
+        (
+            f"- `caps`: `{caps.get('status')}`, hit `{caps.get('hit', False)}`, "
+            f"caps hit `{', '.join(caps.get('caps_hit') or []) or 'none'}`"
+        ),
+        (
+            f"- `duplicate_mirror_risk`: `{duplicate.get('status')}`, "
+            f"collapsed candidates `{duplicate.get('collapsed_candidate_count', 0)}`, "
+            f"duplicate/collapsed rows `{duplicate.get('duplicate_or_collapsed_row_count', 0)}`, "
+            f"duplicate file overlap `{duplicate.get('duplicate_file_overlap_count', 0)}`"
+        ),
+        f"- `not_all_history_boundary`: {summary.get('claim_boundary')}",
+        f"- `escalation_condition`: {summary.get('escalation_condition')}",
+    ]
+
+
 def render_semantic_debug_text(payload: dict) -> str:
     report = payload["semantic_debug"]
     family = report.get("question_family", {})
@@ -2957,8 +3038,9 @@ def render_semantic_debug_text(payload: dict) -> str:
         "Semantic Debug",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
-        "Open these source refs first:",
     ]
+    lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    lines.append("Open these source refs first:")
     if scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
         if source_action_guidance.get("diagnostic_policy"):
@@ -3200,10 +3282,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "",
         f"**Status:** {report.get('status')}",
         f"**Answer status:** `{answer_status}`",
-        "",
-        "## Open These Source Refs First",
-        "",
     ]
+    lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    lines.extend(["", "## Open These Source Refs First", ""])
     if scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
         if source_action_guidance.get("diagnostic_policy"):
@@ -3255,7 +3336,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         basis_counts = workflow_summary.get("join_basis_counts") or {}
         provenance = workflow_summary.get("provenance") or {}
         support_summary = workflow_summary.get("support_summary") or workflow_summary
-        lines[7:7] = [
+        lines[4:4] = [
             f"**Forensics workflow:** phases={workflow_summary.get('phase_count', 0)} "
             f"joins={workflow_summary.get('join_count', 0)} "
             f"review_gate={workflow_summary.get('review_gate_status') or 'unknown'} "

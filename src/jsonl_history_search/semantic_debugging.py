@@ -478,6 +478,13 @@ def build_semantic_debug_payload(
         source_handle_routing=source_handle_routing,
         source_window_action_proof=source_window_action_proof,
     )
+    scope_boundary_summary = build_scope_boundary_summary(
+        source_scope=source_scope,
+        no_evidence=no_evidence,
+        source_locator_handoff=source_locator_handoff,
+    )
+    source_locator_handoff["scope_boundary_summary"] = scope_boundary_summary
+    answer_readiness["scope_boundary_summary"] = scope_boundary_summary
     answer_readiness["investigation_state_link"] = "semantic_debug.investigation_state"
     guided_audit_flow = build_guided_audit_flow(
         status=agent_find["status"],
@@ -519,6 +526,7 @@ def build_semantic_debug_payload(
         answer_source_discipline=answer_source_discipline,
         source_handle_routing=source_handle_routing,
         action_proof_plan=action_proof_plan,
+        scope_boundary_summary=scope_boundary_summary,
     )
     answer_ready_handoff = build_answer_ready_handoff(
         query=agent_find["query"]["original"],
@@ -533,6 +541,7 @@ def build_semantic_debug_payload(
         source_handle_routing=source_handle_routing,
         source_window_action_proof=source_window_action_proof,
         action_proof_plan=action_proof_plan,
+        scope_boundary_summary=scope_boundary_summary,
     )
     if process_actual_use_read_plan:
         answer_ready_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
@@ -609,6 +618,7 @@ def build_semantic_debug_payload(
         "routes": routes,
         "source_handle_routing": source_handle_routing,
         "source_locator_handoff": source_locator_handoff,
+        "scope_boundary_summary": scope_boundary_summary,
         "strongest_candidates": candidates,
         "timeline": timeline,
         "tool_action_proof": tool_proof,
@@ -3643,6 +3653,124 @@ def cap_pressure_notes(source_scope: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def build_scope_boundary_summary(
+    *,
+    source_scope: dict[str, Any],
+    no_evidence: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+) -> dict[str, Any]:
+    searched = source_scope.get("searched_scope") or {}
+    not_searched = source_scope.get("not_searched_scope") or {}
+    excluded = source_scope.get("excluded_scope") or {}
+    cap_hit = source_scope.get("cap_hit") or {}
+    source_plan = not_searched.get("source_plan") or {}
+    duplicate_risk = scope_duplicate_mirror_risk(source_locator_handoff)
+    cap_pressure_status = "cap_pressure_reported" if cap_hit.get("hit") else "no_cap_pressure_reported"
+    missing_root_count = safe_count(not_searched.get("missing_root_count"))
+    rejected_root_count = safe_count(excluded.get("rejected_root_count"))
+    deferred_count = safe_count(source_plan.get("sources_deferred_budget"))
+    pruned_count = safe_count(source_plan.get("sources_pruned_hard"))
+    searched_file_count = safe_count(searched.get("searched_files"))
+    scope_too_weak = bool(
+        cap_hit.get("hit")
+        or missing_root_count
+        or rejected_root_count
+        or deferred_count
+        or searched_file_count == 0
+    )
+    return {
+        "schema_version": 1,
+        "searched_scope": {
+            "selected_root_count": len(source_scope.get("selected_roots") or []),
+            "searched_root_count": len(searched.get("roots") or []),
+            "searched_files": searched_file_count,
+            "searched_bytes": safe_count(searched.get("searched_bytes")),
+            "result_meaning": searched.get("result_meaning"),
+            "source_plan_selected_files": safe_count(searched.get("source_plan_selected_files")),
+        },
+        "not_searched_scope": {
+            "outside_selected_roots": not_searched.get("outside_selected_roots"),
+            "missing_root_count": missing_root_count,
+            "source_plan_deferred_files": deferred_count,
+            "source_plan_pruned_files": pruned_count,
+            "notes": list(not_searched.get("notes") or [])[:4],
+        },
+        "excluded_scope": {
+            "rejected_root_count": rejected_root_count,
+            "meaning": excluded.get("meaning"),
+        },
+        "caps": {
+            "status": cap_pressure_status,
+            "hit": bool(cap_hit.get("hit")),
+            "caps_hit": list(cap_hit.get("caps_hit") or []),
+            "normalized_warnings": list(cap_hit.get("normalized_warnings") or [])[:6],
+        },
+        "duplicate_mirror_risk": duplicate_risk,
+        "not_all_history_boundary": True,
+        "answer_scope_boundary": (
+            no_evidence.get("answer_scope")
+            if no_evidence.get("needed")
+            else searched.get("result_meaning") or "searched_scope_candidate_boundary"
+        ),
+        "scope_strength": "weak_escalate_before_broad_claim" if scope_too_weak else "bounded_selected_scope",
+        "escalation_condition": (
+            "Escalate or narrow/rerun before any broader-than-searched-scope claim when caps hit, selected roots "
+            "are missing/rejected/deferred, no files were searched, or duplicate/mirror collapse could hide distinct "
+            "source context."
+        ),
+        "claim_boundary": (
+            "This is not an all-history completeness claim; answer only for the selected searched scope unless "
+            "the user explicitly asks for broader recall and the run is rerun with adequate roots/caps."
+        ),
+        "links": {
+            "scope": "semantic_debug.scope",
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+            "no_evidence": "semantic_debug.no_evidence",
+        },
+    }
+
+
+def scope_duplicate_mirror_risk(source_locator_handoff: dict[str, Any]) -> dict[str, Any]:
+    source_window_packaging = source_locator_handoff.get("source_window_packaging") or {}
+    selection_policy = source_window_packaging.get("selection_policy") or {}
+    collapse = selection_policy.get("collapse") or {}
+    omission_counts = selection_policy.get("omission_reason_counts") or {}
+    evidence_packaging = source_locator_handoff.get("evidence_packet_packaging") or {}
+    stage_diagnostics = source_locator_handoff.get("stage_diagnostics") or {}
+    duplicate_local_work = (
+        (stage_diagnostics.get("retrieval_diagnostics_summary") or {}).get("duplicate_local_work")
+        or stage_diagnostics.get("duplicate_local_work")
+        or {}
+    )
+    counts = {
+        "collapsed_candidate_count": safe_count(collapse.get("collapsed_candidate_count")),
+        "duplicate_or_collapsed_row_count": safe_count(omission_counts.get("duplicate_or_collapsed_row_count")),
+        "deduplicated_child_count": safe_count(evidence_packaging.get("deduplicated_child_count")),
+        "duplicate_file_overlap_count": safe_count(duplicate_local_work.get("duplicate_file_overlap_count")),
+        "duplicate_file_visit_count": safe_count(duplicate_local_work.get("duplicate_file_visit_count")),
+    }
+    detected = any(value > 0 for value in counts.values())
+    return {
+        "status": "risk_summarized_from_existing_diagnostics" if detected else "not_detected_in_emitted_diagnostics",
+        **counts,
+        "mirror_boundary": (
+            "Duplicate/mirror counters are diagnostics from emitted retrieval/source-window packaging; they do "
+            "not prove every duplicate or mirror source was found."
+        ),
+        "agent_guidance": (
+            "If the answer depends on distinct copies, mirrored histories, or omitted duplicate windows, inspect "
+            "source_locator_handoff/source_window_packaging before claiming uniqueness or completeness."
+        ),
+    }
+
+
+def safe_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_next_commands(
     next_reads: list[dict[str, Any]],
     *,
@@ -3809,6 +3937,7 @@ def build_answer_ready_handoff(
     source_handle_routing: dict[str, Any] | None = None,
     source_window_action_proof: dict[str, Any] | None = None,
     action_proof_plan: dict[str, Any] | None = None,
+    scope_boundary_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     answer_gate = guided_audit_flow.get("answer_gate") or {}
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
@@ -3899,6 +4028,7 @@ def build_answer_ready_handoff(
         no_evidence={**no_evidence, "needed": scoped_no_evidence_answer},
         next_reads=next_reads,
         fielded_bm25_command=optional_fielded_bm25_command,
+        scope_boundary_summary=scope_boundary_summary,
     )
     command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
     source_use_summary = {
@@ -3951,6 +4081,7 @@ def build_answer_ready_handoff(
                 else "semantic_debug.next_reads order; jsonl read-more commands first"
             ),
         },
+        "scope_boundary_summary": scope_boundary_summary or {},
         "source_use_summary": source_use_summary,
         "source_action_guidance": source_action_guidance,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
@@ -5184,6 +5315,7 @@ def build_agent_instruction(
     answer_source_discipline: dict[str, Any] | None = None,
     source_handle_routing: dict[str, Any] | None = None,
     action_proof_plan: dict[str, Any] | None = None,
+    scope_boundary_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness_decision = str(answer_readiness.get("decision") or "gather_more_evidence")
     primary_family = guided_audit_flow.get("primary_question_family")
@@ -5341,6 +5473,7 @@ def build_agent_instruction(
         no_evidence={"needed": scoped_no_evidence},
         next_reads=next_reads,
         fielded_bm25_command=optional_fielded_bm25_command,
+        scope_boundary_summary=scope_boundary_summary,
     )
 
     if primary_followthrough_first:
@@ -5402,6 +5535,7 @@ def build_agent_instruction(
             "answer_source_discipline": discipline_summary,
         },
         "commands": commands[:8],
+        "scope_boundary_summary": scope_boundary_summary or {},
         "source_action_guidance": source_action_guidance,
         "do_not_answer_until": constraints,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
@@ -5491,6 +5625,7 @@ def build_source_action_guidance(
     no_evidence: dict[str, Any],
     next_reads: list[dict[str, Any]],
     fielded_bm25_command: dict[str, Any] | None = None,
+    scope_boundary_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scoped_no_evidence = bool(no_evidence.get("needed")) and answer_readiness.get("decision") == "state_scoped_no_evidence"
     if scoped_no_evidence:
@@ -5507,6 +5642,7 @@ def build_source_action_guidance(
         return {
             "schema_version": 1,
             "decision": "answer_scoped_no_evidence_now",
+            "scope_boundary_summary": scope_boundary_summary or {},
             "required_primary_source_actions": [],
             "optional_diagnostic_reads": diagnostic_next_read_summaries(next_reads),
             "stop_condition": (
@@ -5527,6 +5663,7 @@ def build_source_action_guidance(
     return {
         "schema_version": 1,
         "decision": str(answer_readiness.get("decision") or "gather_more_evidence"),
+        "scope_boundary_summary": scope_boundary_summary or {},
         "required_primary_source_actions": bounded_answer_ready_next_reads(next_reads),
         "optional_diagnostic_reads": [
             row for row in diagnostic_next_read_summaries(next_reads) if row.get("diagnostic_only")
