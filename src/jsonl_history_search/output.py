@@ -473,6 +473,12 @@ def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[s
         lines.append(f"  command: {command}")
 
 
+def _append_text_read_summary(lines: list[str], item: dict) -> None:
+    target = _source_target(item) or "(no source ref)"
+    reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
+    lines.append(f"- {target}{f': {reason}' if reason else ''}")
+
+
 def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: dict[str, str] | None = None) -> None:
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
@@ -484,6 +490,12 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
     command = _read_more_command(item, command_by_target)
     if command:
         lines.append(f"  - Command: `{command}`")
+
+
+def _append_markdown_read_summary(lines: list[str], item: dict) -> None:
+    target = _source_target(item) or "(no source ref)"
+    reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
+    lines.append(f"- `{target}`{f': {reason}' if reason else ''}")
 
 
 def _append_process_actual_use_read_plan_text(
@@ -3051,10 +3063,13 @@ def render_semantic_debug_text(payload: dict) -> str:
         followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
         if followthrough.get("applies"):
             lines.append("Fallback next reads (only if the primary source window leaves a named facet missing):")
+            lines.append("- executable fallback commands suppressed in text output; use JSON next_reads only after a named facet gap")
+            for item in report.get("next_reads", [])[:8]:
+                _append_text_read_summary(lines, item)
         else:
             lines.append("Next reads:")
-        for item in report.get("next_reads", [])[:8]:
-            _append_text_read(lines, item, command_by_target=command_by_target)
+            for item in report.get("next_reads", [])[:8]:
+                _append_text_read(lines, item, command_by_target=command_by_target)
     for item in report.get("uncertainty", [])[:8]:
         lines.append(f"Uncertainty: {item.get('label')} - {item.get('meaning')}")
     return "\n".join(lines)
@@ -3278,8 +3293,16 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         )
     lines.append("")
     lines.append("## Next Reads")
-    for item in report.get("next_reads", [])[:8]:
-        _append_markdown_read(lines, item, command_by_target=command_by_target)
+    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    if followthrough.get("applies"):
+        lines.append(
+            "- Executable fallback commands suppressed in Markdown output; use JSON `next_reads` only after a named facet gap."
+        )
+        for item in report.get("next_reads", [])[:8]:
+            _append_markdown_read_summary(lines, item)
+    else:
+        for item in report.get("next_reads", [])[:8]:
+            _append_markdown_read(lines, item, command_by_target=command_by_target)
     lines.append("")
     lines.append("## Uncertainty")
     for item in report.get("uncertainty", [])[:8]:
