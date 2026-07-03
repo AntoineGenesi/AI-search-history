@@ -49,10 +49,19 @@ Treat no-evidence as searched-scope evidence, not all-history absence.
 ## No-Evidence Stop Rule
 
 For explicit no-evidence questions with a known bounded root or source scope,
-prefer `jsonl-history-search no-evidence-report "<target terms>" ...` after
-ask-first routing. If the report says
+prefer the bounded no-evidence route after ask-first routing:
+
+```bash
+jsonl-history-search no-evidence-report "<user wording>" --cwd "$PWD" --report-output .private/jsonl/no-evidence-report.json --format json
+```
+
+This keeps stdout compact and saves the full report for review/debugging. After
+the command, read `references/no-evidence.md` and inspect searched scope,
+answer scope, weak/context interpretation, and read-more stop fields. If the
+report says
 `candidate_interpretation: weak_context_only`, the surfaced candidates matched
 context or partial query terms only. If no `next_reads` are listed, that is an
-intentional stop signal; do not manufacture `read-more` commands from source
-refs before a searched-scope no-evidence answer. Preserve `answer_scope:
-not_found_in_searched_scope` and do not claim all-history absence.
+intentional stop signal; do not manufacture or run `read-more` commands from
+source refs before a searched-scope no-evidence answer. Preserve
+`answer_scope: not_found_in_searched_scope` and do not claim all-history
+absence.

@@ -104,7 +104,8 @@ Command-shape contract for the first two shell commands:
 Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
 actually matters?", "is ticket ABC-42 still current?", "can these old worktrees
-be removed?", "did the agent read/follow the reviewer skill?", and "what did I
+be removed?", "did the agent read/follow the reviewer skill?", "is there
+evidence that X was discussed in this bounded source scope?", and "what did I
 keep yelling about in this session?".
 For immediate artifact-completeness prompts like "are you sure you got
 everything?", "did the task file include X?", "did you save this whole thread as
@@ -151,6 +152,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | `ask` then `references/no-evidence.md` | `jsonl-history-search no-evidence-report "<user wording>" --cwd "$PWD" --report-output .private/jsonl/no-evidence-report.json --format json` |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -167,6 +169,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
 - "did the agent read/follow the reviewer skill?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/skill-audit.md`
+- "is there evidence that X was discussed in this bounded source scope?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/no-evidence.md` and `no-evidence-report --report-output .private/jsonl/no-evidence-report.json --format json`
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "is ticket ABC-42 still current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
@@ -216,6 +219,11 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   instructions, action proof, provenance, no-evidence, and ambiguous semantic
   questions. Use `semantic-debug --format text` before lower-level helper
   scripts when `ask` selects semantic-debug.
+- When `ask` selects bounded no-evidence/searched-scope absence, read
+  `references/no-evidence.md` and use the printed `no-evidence-report ... --report-output .private/jsonl/no-evidence-report.json --format json` shape. The
+  saved report keeps the full evidence packet while stdout stays compact.
+  Inspect searched scope, answer scope, weak/context interpretation, and
+  read-more stop fields before deciding whether any diagnostics are needed.
 - When the user prompt includes a reviewed source case or `real-jsh...` handle,
   installed global-skill workflows still run `validate-install` after reading
   this skill. After freshness preflight passes, run `jsonl-history-search ask`

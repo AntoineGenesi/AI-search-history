@@ -52,6 +52,40 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
     ),
 )
 
+BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
+    route_family="bounded_no_evidence",
+    chosen_route="bounded-no-evidence / no-evidence-report",
+    why_it_applies=(
+        "The wording asks whether evidence exists inside an explicit bounded "
+        "or searched source scope. Use the no-evidence report surface so the "
+        "answer is scoped to searched roots and weak/context-only candidates "
+        "instead of becoming a generic semantic-debug question."
+    ),
+    first_command_template=(
+        'jsonl-history-search no-evidence-report "{query}" --cwd "$PWD" '
+        "--report-output .private/jsonl/no-evidence-report.json --format json"
+    ),
+    read_specialization="references/no-evidence.md",
+    inspect_after=(
+        "no_evidence_report.searched_scope / searched roots, file caps, byte caps, and date windows",
+        "no_evidence_report.answer_scope == not_found_in_searched_scope",
+        "candidate_interpretation and weak/context-only candidate boundary",
+        "sufficient_to_stop_for_searched_scope_only and read_more_guidance.required_before_scoped_no_evidence_answer",
+    ),
+    stop_guidance=(
+        "Read references/no-evidence.md, then inspect the report's searched "
+        "scope, answer_scope, candidate_interpretation, and read_more_guidance "
+        "stop fields. Do not run `read-more` when the searched-scope stop rule "
+        "is sufficient; weak/context source reads are optional diagnostics only."
+    ),
+    manual_search_guidance=(
+        "Manual rg or read-more is follow-up only when the searched scope is "
+        "wrong, capped, missing a required root, or the user asks for weak "
+        "context records to be summarized. Preserve the boundary: this proves "
+        "not_found_in_searched_scope, not all-history absence."
+    ),
+)
+
 
 ROUTES: tuple[AskRoute, ...] = (
     AskRoute(
@@ -349,6 +383,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_local_artifact_verification_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
+    if _looks_like_bounded_no_evidence_query(normalized):
+        return BOUNDED_NO_EVIDENCE_ROUTE
+
     if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
         normalized, ("agent", "edits", "edit", "changed", "action")
     ):
@@ -643,6 +680,96 @@ def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
     dated_session = bool(re.search(r"\b20\d\d-\d\d-\d\d\b", normalized)) or "session dated" in normalized
     boundary = _has_any(normalized, ("only", "not from current docs", "not current docs", "answer from"))
     return bool(reviewed_source and (real_jsh_handle or (source_window and (dated_session or boundary))))
+
+
+def _looks_like_bounded_no_evidence_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    scoped_terms = (
+        "bounded scope",
+        "bounded source scope",
+        "bounded source",
+        "bounded root",
+        "bounded search",
+        "bounded fixture",
+        "searched scope",
+        "searched source",
+        "searched root",
+        "selected scope",
+        "selected source",
+        "selected root",
+        "source scope",
+        "source-scoped",
+        "scoped search",
+        "scoped no evidence",
+        "searched-scope",
+        "within the searched",
+        "within this root",
+        "within this source",
+        "within this scope",
+        "in this root",
+        "in this source scope",
+        "in the selected root",
+        "in the selected source",
+        "in the searched scope",
+    )
+    if not _has_any(normalized, scoped_terms):
+        return False
+
+    explicit_absence_terms = (
+        "no evidence",
+        "no direct evidence",
+        "not found",
+        "nothing found",
+        "absent",
+        "absence",
+        "was not discussed",
+        "wasn't discussed",
+        "were not discussed",
+        "weren't discussed",
+        "not discussed",
+        "not mentioned",
+        "missing evidence",
+    )
+    evidence_question_terms = (
+        "is there evidence",
+        "any evidence",
+        "evidence that",
+        "prove there is no",
+        "prove no evidence",
+        "did the searched scope contain",
+        "did the selected scope contain",
+        "did the searched root contain",
+        "did the selected root contain",
+        "does the searched scope contain",
+        "does the selected root contain",
+    )
+    scoped_discussion_terms = (
+        "discussed",
+        "mentioned",
+        "contain",
+        "contains",
+        "contained",
+        "covered",
+        "appear",
+        "appears",
+        "appeared",
+        "show",
+        "shows",
+    )
+    weak_terms = (
+        "weak evidence",
+        "weak/no evidence",
+        "weak candidates",
+        "weak context",
+        "context only",
+        "context-only",
+    )
+    return (
+        _has_any(normalized, explicit_absence_terms)
+        or _has_any(normalized, evidence_question_terms)
+        or (_has_any(normalized, scoped_discussion_terms) and _has_any(normalized, ("was ", "were ", "did ", "does ", "is ")))
+        or _has_any(normalized, weak_terms)
+    )
 
 
 def _looks_like_ticket_currentness(normalized: str) -> bool:
