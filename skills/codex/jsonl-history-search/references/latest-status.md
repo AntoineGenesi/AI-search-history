@@ -33,6 +33,10 @@ status packet if the selected anchor needs manual inspection.
    - unattended-work boundary;
    - side-thread/main-thread boundary.
 2. State the anchor used.
+   - If the user names an explicit task/window range such as
+     `JSH-1141 -> JSH-1143` or `JSH-1141 through JSH-1143`, treat that as the
+     target window and prefer its source refs/work products over newer
+     current-run recovery or eval artifacts.
 3. Follow `history.jsonl` session IDs into `sessions/**/*.jsonl`, then inspect
    the raw source refs/read-more commands before answering. Treat
    `source_tiers.required_primary` as the must-open first set.
@@ -49,6 +53,9 @@ status packet if the selected anchor needs manual inspection.
    Stale demo/example work products, rejected anchors, broad work products, or
    older route examples must not drive the answer-facing summary unless they
    are explicitly selected current-window evidence.
+   Same-run pressure artifacts, private run directories, and manual-lane final
+   outputs are not required/open-first support unless the user explicitly asks
+   to audit that run.
 7. Say explicitly when commits/repo state are only supporting evidence.
 8. Answer value-first:
    - behavior changes;
