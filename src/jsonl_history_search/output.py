@@ -453,6 +453,19 @@ def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
     return commands
 
 
+COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON = (
+    "reviewed_source_multifacet_provenance_window_covers_task_review_branch_commit_and_notes"
+)
+
+
+def _is_compact_multifacet_provenance_followthrough(followthrough: dict) -> bool:
+    if not followthrough.get("applies"):
+        return False
+    command = followthrough.get("first_command") if isinstance(followthrough.get("first_command"), dict) else {}
+    window = command.get("window") if isinstance(command.get("window"), dict) else {}
+    return window.get("reason") == COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON
+
+
 def _is_jsonl_read_target(target: str | None) -> bool:
     if not target:
         return False
@@ -2885,8 +2898,10 @@ def render_semantic_debug_text(payload: dict) -> str:
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
-    required_reads = action_proof_plan.get("required_proof_reads") or []
     readiness = report.get("answer_readiness") or {}
+    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
+    required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
     ).get("process_actual_use_final_support_read_plan") or (
@@ -2894,11 +2909,12 @@ def render_semantic_debug_text(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan")
     answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
     stop_condition = (
-        action_proof_plan.get("stop_condition")
-        or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
+        followthrough.get("stop_after")
+        if suppress_action_required_reads
+        else action_proof_plan.get("stop_condition")
+        or followthrough.get("stop_after")
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
-    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
     lines = [
         "Semantic Debug",
@@ -2979,8 +2995,12 @@ def render_semantic_debug_text(payload: dict) -> str:
     investigation_state = report.get("investigation_state")
     if investigation_state:
         lines.extend(render_investigation_state_text(investigation_state))
-    if action_proof_plan and action_proof_plan.get("applies"):
+    if action_proof_plan and action_proof_plan.get("applies") and not suppress_action_required_reads:
         lines.extend(render_action_proof_plan_text(action_proof_plan, command_by_target=command_by_target))
+    elif action_proof_plan and action_proof_plan.get("applies") and suppress_action_required_reads:
+        lines.append(
+            "Action-proof plan: fallback diagnostics suppressed because primary source followthrough is active for this provenance prompt."
+        )
     if report.get("report_written"):
         lines.append(f"Report written: {report.get('report_written')}")
     if report.get("source_locator_handoff"):
@@ -3081,8 +3101,10 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
     command_by_target = _read_more_commands_by_target(report.get("next_reads", []) or [])
-    required_reads = action_proof_plan.get("required_proof_reads") or []
     readiness = report.get("answer_readiness") or {}
+    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
+    suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
+    required_reads = [] if suppress_action_required_reads else action_proof_plan.get("required_proof_reads") or []
     process_read_plan = report.get("process_actual_use_final_support_read_plan") or (
         report.get("answer_ready_handoff") or {}
     ).get("process_actual_use_final_support_read_plan") or (
@@ -3090,11 +3112,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan")
     answer_status = "answer-after-required-reads" if required_reads or report.get("next_reads") else "not-ready/needs-more-proof"
     stop_condition = (
-        action_proof_plan.get("stop_condition")
-        or (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough", {}).get("stop_after")
+        followthrough.get("stop_after")
+        if suppress_action_required_reads
+        else action_proof_plan.get("stop_condition")
+        or followthrough.get("stop_after")
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
-    followthrough = (report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
     lines = [
         "# Semantic Debug",
@@ -3191,8 +3214,17 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     investigation_state = report.get("investigation_state")
     if investigation_state:
         lines.extend(render_investigation_state_markdown(investigation_state))
-    if action_proof_plan and action_proof_plan.get("applies"):
+    if action_proof_plan and action_proof_plan.get("applies") and not suppress_action_required_reads:
         lines.extend(render_action_proof_plan_markdown(action_proof_plan, command_by_target=command_by_target))
+    elif action_proof_plan and action_proof_plan.get("applies") and suppress_action_required_reads:
+        lines.extend(
+            [
+                "## Action-Proof Plan",
+                "",
+                "- Fallback diagnostics suppressed because primary source followthrough is active for this provenance prompt.",
+                "",
+            ]
+        )
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
     if process_read_plan:
