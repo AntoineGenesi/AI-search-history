@@ -11,6 +11,11 @@ No evidence means `not_found_in_searched_scope`, not "does not exist anywhere".
 
 1. Inspect searched roots, file caps, byte caps, date windows, and source
    family selection.
+   If an explicit `no-evidence-report` returns
+   `candidate_interpretation: weak_context_only`,
+   `sufficient_to_stop_for_searched_scope_only: true`, and no `next_reads`,
+   stop and answer from the report. Do not run `read-more` from weak candidate
+   source refs unless the user needs those context records summarized.
 2. Check whether the query is too literal, too broad, or using the wrong route.
 3. Use targeted alternatives before broad scanning:
    - remembered instruction -> original user wording variants;
@@ -24,5 +29,6 @@ No evidence means `not_found_in_searched_scope`, not "does not exist anywhere".
 
 - searched scope;
 - what was and was not found;
-- likely next command;
+- likely next command, or state no next read is required when the weak-context
+  stop rule applies;
 - whether absence is meaningful or the search needs another route/mode.

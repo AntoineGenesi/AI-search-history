@@ -99,6 +99,7 @@ def build_agent_find_payload(
     report_output: str | None = None,
     compact_provenance_handoff: bool = False,
     evidence_context_window: int = 0,
+    no_evidence_mode: bool = False,
 ) -> dict[str, Any]:
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     candidates = build_candidate_rows(search_result)
@@ -113,7 +114,19 @@ def build_agent_find_payload(
         source_plan=source_plan,
         search_result=search_result,
         manifest_report=manifest_report,
+        candidates=candidates,
+        no_evidence_mode=no_evidence_mode,
     )
+    next_read_rows = next_reads_from_candidates(
+        candidates,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=compact_provenance_handoff,
+    )
+    if no_evidence_report.get("candidate_interpretation") == "weak_context_only":
+        next_read_rows = suppress_weak_context_next_reads(
+            next_read_rows,
+            no_evidence_report=no_evidence_report,
+        )
     agent_find = {
         "schema_version": 1,
         "status": status,
@@ -123,7 +136,7 @@ def build_agent_find_payload(
             source_plan,
             search_result,
             manifest_report,
-            include_source_scope=status == "no_evidence",
+            include_source_scope=status == "no_evidence" or bool(no_evidence_report.get("needed")),
         ),
         "broaden_query": build_broaden_query(source_plan["query"]),
         "find_candidates": candidate_dicts[:INLINE_CANDIDATE_LIMIT],
@@ -170,11 +183,7 @@ def build_agent_find_payload(
         source_plan=source_plan,
         search_result=search_result,
         candidates=candidate_dicts,
-        next_reads=next_reads_from_candidates(
-            candidates,
-            expansion_action_context=expansion_action_context,
-            include_context_actions=compact_provenance_handoff,
-        ),
+        next_reads=next_read_rows,
         source_family="local_ai_conversation_jsonl",
         question_family={
             "primary": "agent_find",
@@ -3127,8 +3136,12 @@ def build_source_locator_handoff(
     cap_hit = compact_handoff_caps(source_scope["cap_hit"])
     candidate_rows = list(candidates or [])
     candidate_count = len(candidate_rows) or sum(len(group.get("matches", [])) for group in search_result.get("groups", []))
-    next_read_rows = list(next_reads or [])
-    if not next_read_rows:
+    weak_context_no_evidence = (
+        isinstance(no_evidence_report, dict)
+        and no_evidence_report.get("candidate_interpretation") == "weak_context_only"
+    )
+    next_read_rows = list(next_reads) if next_reads is not None else []
+    if next_reads is None:
         next_read_rows = next_reads_from_candidates(
             candidate_rows,
             expansion_action_context=expansion_action_context,
@@ -3150,11 +3163,14 @@ def build_source_locator_handoff(
         expansion_action_context=expansion_action_context,
         include_context_actions=include_context_actions,
     )
-    next_read_rows, promoted_recovery_count = promote_omitted_window_recovery_next_reads(
-        next_read_rows,
-        omitted_window_recovery.get("items", []),
-        include_context_actions=include_context_actions,
-    )
+    if weak_context_no_evidence:
+        promoted_recovery_count = 0
+    else:
+        next_read_rows, promoted_recovery_count = promote_omitted_window_recovery_next_reads(
+            next_read_rows,
+            omitted_window_recovery.get("items", []),
+            include_context_actions=include_context_actions,
+        )
     if omitted_window_recovery:
         omitted_window_recovery = {
             **omitted_window_recovery,
@@ -3258,11 +3274,7 @@ def build_source_locator_handoff(
         "omitted_window_recovery": omitted_window_recovery,
         "final_evidence_contract": final_evidence_contract,
         "next_reads": next_read_rows[:COMPACT_PROVENANCE_NEXT_READ_LIMIT],
-        "no_evidence_meaning": {
-            "answer_scope": "not_found_in_searched_scope",
-            "not_all_history_absence": True,
-            "meaning": "No match survived selected roots, caps, filters, and parser scope.",
-        },
+        "no_evidence_meaning": source_locator_no_evidence_meaning(no_evidence_report),
         "privacy_boundaries": {
             "root_metadata_raw_paths_included": False,
             "raw_private_text_or_bridge_payload_included": False,
@@ -3299,6 +3311,30 @@ def build_source_locator_handoff(
     if stage_diagnostics:
         payload["stage_diagnostics"] = stage_diagnostics
     return payload
+
+
+def source_locator_no_evidence_meaning(no_evidence_report: dict[str, Any] | None) -> dict[str, Any]:
+    report = no_evidence_report if isinstance(no_evidence_report, dict) else {}
+    if report.get("needed"):
+        return {
+            "answer_scope": report.get("answer_scope") or "not_found_in_searched_scope",
+            "not_all_history_absence": True,
+            "meaning": (
+                "Weak/context candidates may exist, but the no-evidence report says the target evidence "
+                "was not found in the searched scope."
+                if report.get("candidate_interpretation") == "weak_context_only"
+                else "No match survived selected roots, caps, filters, and parser scope."
+            ),
+            "candidate_interpretation": report.get("candidate_interpretation"),
+            "read_more_required_before_scoped_no_evidence_answer": bool(
+                (report.get("read_more_guidance") or {}).get("required_before_scoped_no_evidence_answer", True)
+            ),
+        }
+    return {
+        "answer_scope": "not_found_in_searched_scope",
+        "not_all_history_absence": True,
+        "meaning": "No match survived selected roots, caps, filters, and parser scope.",
+    }
 
 
 def build_final_evidence_contract(
@@ -6239,13 +6275,24 @@ def build_no_evidence_report(
     source_plan: dict,
     search_result: dict,
     manifest_report: dict | None,
+    candidates: list[CandidateRow] | None = None,
+    no_evidence_mode: bool = False,
 ) -> dict:
+    source_scope = build_source_scope_summary(source_plan, search_result)
+    if status != "no_evidence" and no_evidence_mode:
+        weak_context_report = build_weak_context_no_evidence_report(
+            source_plan=source_plan,
+            source_scope=source_scope,
+            search_result=search_result,
+            candidates=list(candidates or []),
+        )
+        if weak_context_report:
+            return weak_context_report
     if status != "no_evidence":
         return {
             "needed": False,
             "reason": "Candidates were found; inspect find_candidates, timeline, and cluster_candidates.",
         }
-    source_scope = build_source_scope_summary(source_plan, search_result)
     weak_candidates = []
     if manifest_report:
         selected = manifest_report.get("manifest_report", {}).get("shortlist", {}).get("selected_entries", [])
@@ -6280,6 +6327,165 @@ def build_no_evidence_report(
             "budget-deferred sources, or scope beyond any hit caps."
         ),
     }
+
+
+def build_weak_context_no_evidence_report(
+    *,
+    source_plan: dict,
+    source_scope: dict,
+    search_result: dict,
+    candidates: list[CandidateRow],
+) -> dict[str, Any] | None:
+    coverage = no_evidence_query_term_coverage(source_plan, candidates)
+    if coverage["classification"] != "weak_context_only":
+        return None
+    scope_clean = searched_scope_clean_for_scoped_no_evidence(source_scope)
+    return {
+        "needed": True,
+        "answer": "target_terms_not_found_yet",
+        "answer_scope": "not_found_in_searched_scope",
+        "candidate_interpretation": "weak_context_only",
+        "searched_scope": source_scope["searched_scope"],
+        "excluded_scope": source_scope["excluded_scope"]["rejected_roots"],
+        "excluded_scope_summary": source_scope["excluded_scope"],
+        "not_searched_scope": source_scope["not_searched_scope"],
+        "selected_roots": source_scope["selected_roots"],
+        "private_roots": source_scope["private_roots"],
+        "cap_hit": source_scope["cap_hit"],
+        "deferred_source_count": source_scope["not_searched_scope"]["source_plan"]["sources_deferred_budget"],
+        "retry_guidance": source_scope["not_searched_scope"]["source_plan"]["retry_guidance"],
+        "not_all_history_absence": True,
+        "candidate_rows_found": len(candidates),
+        "weak_candidate_count": len(candidates),
+        "weak_candidates": weak_context_candidates(candidates),
+        "query_term_coverage": coverage,
+        "sufficient_to_stop_for_searched_scope_only": scope_clean,
+        "read_more_guidance": {
+            "required_before_scoped_no_evidence_answer": False,
+            "actionability": "optional_diagnostic_context",
+            "reason": (
+                "Surfaced candidates matched only contextual query terms; no surfaced candidate matched "
+                "the missing query terms. Open them only if the context itself must be summarized."
+            ),
+        },
+        "warnings": search_result.get("warnings", []),
+        "blind_spots": search_result.get("blind_spots", []),
+        "why_not_confident": (
+            "Candidate rows were found, but they matched only contextual or partial query terms. "
+            "The missing query terms did not appear in surfaced candidates within the searched scope. "
+            "This supports only a searched-scope no-evidence answer for those missing terms; it does "
+            "not prove all-history absence or absence from unsearched, excluded, missing, or "
+            "budget-deferred locations."
+        ),
+    }
+
+
+def no_evidence_query_term_coverage(source_plan: dict, candidates: list[CandidateRow]) -> dict[str, Any]:
+    query = source_plan.get("query", {}) if isinstance(source_plan.get("query"), dict) else {}
+    base_terms = [normalize_term_for_coverage(term) for term in query.get("base_terms") or []]
+    base_terms = [term for term in base_terms if term]
+    matched_terms = sorted(
+        {
+            normalize_term_for_coverage(term)
+            for candidate in candidates
+            for term in candidate.matched_terms
+            if normalize_term_for_coverage(term)
+        }
+    )
+    base_set = set(base_terms)
+    matched_set = set(matched_terms)
+    missing_terms = [term for term in base_terms if term not in matched_set]
+    full_coverage_found = any(candidate_covers_all_base_terms(candidate, base_set) for candidate in candidates)
+    classification = "not_applicable"
+    if candidates and base_set and matched_set and missing_terms and not full_coverage_found:
+        classification = "weak_context_only"
+    elif candidates:
+        classification = "candidates_cover_query_terms"
+    return {
+        "classification": classification,
+        "base_terms": base_terms,
+        "matched_terms_any_candidate": matched_terms,
+        "missing_terms_any_candidate": missing_terms,
+        "candidate_count": len(candidates),
+        "full_base_term_coverage_found": full_coverage_found,
+        "best_coverage": best_candidate_coverage(candidates, base_set),
+        "privacy": {
+            "raw_query_text_included": False,
+            "raw_source_text_included": False,
+        },
+    }
+
+
+def candidate_covers_all_base_terms(candidate: CandidateRow, base_terms: set[str]) -> bool:
+    if not base_terms:
+        return False
+    matched = {normalize_term_for_coverage(term) for term in candidate.matched_terms}
+    if base_terms <= matched:
+        return True
+    expected_coverage = f"coverage:base_terms:{len(base_terms)}/{len(base_terms)}"
+    return any(reason.startswith(expected_coverage) for reason in candidate.reasons)
+
+
+def best_candidate_coverage(candidates: list[CandidateRow], base_terms: set[str]) -> dict[str, Any]:
+    total = len(base_terms)
+    if not candidates or total == 0:
+        return {"matched_count": 0, "base_term_count": total, "ratio": 0.0}
+    best = max(
+        len({normalize_term_for_coverage(term) for term in candidate.matched_terms} & base_terms)
+        for candidate in candidates
+    )
+    return {
+        "matched_count": best,
+        "base_term_count": total,
+        "ratio": round(best / total, 3) if total else 0.0,
+    }
+
+
+def normalize_term_for_coverage(term: Any) -> str:
+    return str(term or "").strip().lower()
+
+
+def searched_scope_clean_for_scoped_no_evidence(source_scope: dict[str, Any]) -> bool:
+    not_searched = source_scope.get("not_searched_scope", {})
+    source_plan = not_searched.get("source_plan", {})
+    return not (
+        source_scope.get("cap_hit", {}).get("hit")
+        or not_searched.get("missing_root_count", 0)
+        or source_scope.get("excluded_scope", {}).get("rejected_root_count", 0)
+        or source_plan.get("sources_deferred_budget", 0)
+    )
+
+
+def weak_context_candidates(candidates: list[CandidateRow]) -> list[dict[str, Any]]:
+    rows = []
+    for candidate in candidates[:INLINE_CANDIDATE_LIMIT]:
+        rows.append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "source_ref": candidate.source_ref,
+                "score": candidate.score,
+                "confidence": candidate.confidence,
+                "matched_terms": candidate.matched_terms,
+                "reason_codes": candidate.reason_codes,
+            }
+        )
+    return rows
+
+
+def suppress_weak_context_next_reads(
+    next_reads: list[dict[str, Any]],
+    *,
+    no_evidence_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    guidance = (
+        no_evidence_report.get("read_more_guidance")
+        if isinstance(no_evidence_report.get("read_more_guidance"), dict)
+        else {}
+    )
+    guidance["diagnostic_next_read_count_suppressed"] = len(next_reads)
+    guidance["source_refs_available_in"] = "no_evidence_report.weak_candidates"
+    no_evidence_report["read_more_guidance"] = guidance
+    return []
 
 
 def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
