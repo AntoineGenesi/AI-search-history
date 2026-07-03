@@ -4579,6 +4579,13 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
         lines.append(f"- caps hit: {', '.join(caps.get('caps_hit', []))}")
     if no_evidence.get("candidate_interpretation") == "weak_context_only":
         lines.append("- no-evidence candidate interpretation: weak/context-only candidates; read-more is optional diagnostic context")
+    provenance_policy = handoff.get("historical_provenance_self_echo_policy") or {}
+    if provenance_policy:
+        lines.append(
+            "- historical provenance self-echo policy: "
+            f"embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)} "
+            f"diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}"
+        )
     top_candidates = candidate_ordering.get("top_candidates") or []
     for candidate in top_candidates[:5]:
         bits = [
@@ -4621,6 +4628,13 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
         lines.append(f"- Caps hit: `{', '.join(caps.get('caps_hit', []))}`")
     if no_evidence.get("candidate_interpretation") == "weak_context_only":
         lines.append("- No-evidence candidate interpretation: `weak_context_only`; read-more is optional diagnostic context.")
+    provenance_policy = handoff.get("historical_provenance_self_echo_policy") or {}
+    if provenance_policy:
+        lines.append(
+            "- Historical provenance self-echo policy: "
+            f"`embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)}`; "
+            f"`diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}`."
+        )
     top_candidates = candidate_ordering.get("top_candidates") or []
     if top_candidates:
         lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
