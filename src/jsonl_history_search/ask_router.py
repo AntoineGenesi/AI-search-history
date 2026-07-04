@@ -334,14 +334,15 @@ ROUTES: tuple[AskRoute, ...] = (
         route_family="semantic_wrapup",
         chosen_route="semantic-wrapup",
         why_it_applies=(
-            "The wording asks for repeated complaints, yelling, or session-level "
-            "lessons, so use the semantic wrap-up failure-mining route."
+            "The wording asks for repeated complaints, recurring failure modes, "
+            "or user corrections, so use the semantic wrap-up failure-mining route."
         ),
         first_command_template='jsonl-history-search semantic-wrapup "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-wrapup.md",
         inspect_after=(
             "semantic_wrapup.failure_modes",
             "semantic_wrapup.fix_suggestions",
+            "complaint/correction source refs before proposing any fix",
             "next_reads source refs before proposing any fix",
         ),
         stop_guidance=(
@@ -408,7 +409,7 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
 
-    if _has_any(normalized, ("while i was away", "what happened", "since my last", "after i told", "keep working")):
+    if _looks_like_latest_status_anchor_query(normalized):
         return ROUTES[5]
 
     if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
@@ -423,7 +424,7 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_ticket_currentness(normalized):
         return ROUTES[8]
 
-    if _has_any(normalized, ("keep yelling", "yelling about", "complain", "complained", "semantic wrap-up", "wrap up")):
+    if _looks_like_repeated_complaint_or_failure_query(normalized):
         return ROUTES[9]
 
     return AskRoute(
@@ -631,6 +632,100 @@ def _looks_like_task_window_status_handoff_query(normalized: str) -> bool:
             "next serious action",
         ),
     )
+
+
+def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
+    if _has_any(
+        normalized,
+        (
+            "what happened since",
+            "what has happened since",
+            "what changed since",
+            "what changed while i was away",
+            "what did you do while i was away",
+            "while i was away",
+            "since my last",
+            "since my latest",
+            "status since",
+            "latest status",
+            "status update",
+            "after i told",
+            "keep working",
+        ),
+    ):
+        return True
+    anchor_terms = (
+        "last message",
+        "latest message",
+        "last actual message",
+        "latest actual message",
+        "main thread",
+        "parent thread",
+        "parent/main",
+        "before this worker",
+        "before the worker",
+        "before this reviewer",
+        "before the reviewer",
+        "before this side conversation",
+        "before the side conversation",
+        "before this side thread",
+        "before the side thread",
+    )
+    status_verbs = (
+        "what happened",
+        "what changed",
+        "what did i ask",
+        "what did i tell",
+        "what was my ask",
+        "what was the ask",
+        "what did you do",
+        "status",
+        "catch me up",
+    )
+    return _has_any(normalized, anchor_terms) and _has_any(normalized, status_verbs)
+
+
+def _looks_like_repeated_complaint_or_failure_query(normalized: str) -> bool:
+    if _has_any(normalized, ("semantic wrap-up", "semantic wrapup", "wrap up", "keep yelling", "yelling about")):
+        return True
+    complaint_terms = (
+        "complain",
+        "complained",
+        "complaining",
+        "complaints",
+        "failure mode",
+        "failure modes",
+        "failure-mode",
+        "failure-modes",
+        "kept correcting",
+        "keep correcting",
+        "kept correcting you",
+        "keep correcting you",
+        "user corrections",
+        "same correction",
+        "same failure",
+        "recurring failure",
+        "repeated failure",
+        "keeps happening",
+        "keep happening",
+        "keep doing",
+        "kept doing",
+    )
+    repeated_terms = (
+        "keep",
+        "kept",
+        "repeated",
+        "recurring",
+        "again",
+        "same",
+        "correcting",
+        "correction",
+        "failure modes",
+        "complaining",
+    )
+    if _has_any(normalized, complaint_terms) and _has_any(normalized, repeated_terms):
+        return True
+    return _has_any(normalized, ("why does this keep happening", "why do you keep doing this", "why did this keep happening"))
 
 
 def _looks_like_local_artifact_verification_query(normalized: str) -> bool:

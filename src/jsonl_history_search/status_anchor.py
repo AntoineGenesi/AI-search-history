@@ -352,6 +352,11 @@ def status_anchor_report(
         "follow_through_plan": follow_through_plan,
         "target_window": target_window,
         "suppressed_support": suppressed_support,
+        "fail_closed_guidance": _fail_closed_guidance(
+            selected_anchor=selected_anchor,
+            anchor_decision=anchor_decision,
+            session_activity=session_activity,
+        ),
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
@@ -2208,6 +2213,42 @@ def _agent_instruction(selected_anchor: dict | None, session_activity: dict, nex
         "direct_anchor_openable": bool(selected_anchor and selected_anchor.get("openable_target")),
         "raw_session_trace_status": session_activity.get("status"),
         "commit_only_answer_allowed": False,
+    }
+
+
+def _fail_closed_guidance(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    session_activity: dict,
+) -> dict:
+    if not selected_anchor:
+        return {
+            "mode": "candidate_anchors_required_before_answer",
+            "answer_allowed": False,
+            "guidance": (
+                "Fail closed: no human-authored anchor was selected. Do not answer from visible context, "
+                "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
+                "and rejected alternatives first, then rerun with an explicit timestamp/quoted-message anchor if needed."
+            ),
+            "candidate_fields": [
+                "anchor_candidates",
+                "anchor_decision.rejected_anchor_alternatives",
+            ],
+        }
+    raw_status = session_activity.get("status")
+    answer_allowed = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
+    return {
+        "mode": "selected_anchor_requires_primary_read_followthrough",
+        "answer_allowed": answer_allowed,
+        "guidance": (
+            "Use the selected human history/session anchor and required primary raw JSONL reads before answering. "
+            "Do not answer from inherited context, current-session worker/reviewer prompts, rejected false anchors, "
+            "or secondary repo artifacts unless the primary reads have been inspected."
+        ),
+        "selected_anchor_ref": selected_anchor.get("source_ref"),
+        "anchor_scope": selected_anchor.get("anchor_scope") or anchor_decision.get("anchor_scope"),
+        "raw_session_trace_status": raw_status,
     }
 
 
