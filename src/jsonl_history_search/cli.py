@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
@@ -146,15 +147,49 @@ from .masking import MASK_MODES, MaskContext
 LOCAL_EVIDENCE_MODES = ("public", "internal")
 
 
-def build_parser() -> argparse.ArgumentParser:
+PUBLIC_HELP_EPILOG = """\
+Launch-facing commands:
+  validate-install        Check that the package/console script can run.
+  diagnose-capabilities  Report installed core and optional capabilities.
+  ask                    Route a natural-language prompt to the first JSONL command.
+  semantic-debug         Main evidence workflow for memory, action proof, provenance, and no-evidence questions.
+  read-more              Open bounded context for an exact source ref.
+  follow-next-reads      Expand saved next_reads from a JSON report without rerunning search.
+  find                   Focused candidate recovery when the full semantic-debug packet is unnecessary.
+
+Developer/internal commands:
+  benchmark/eval, private mining, harness/proof, real-history diagnostic,
+  embedding/archive experiment, and validation-gate families are maintained for
+  local product work. They are not public first-run guidance or release/readiness proof.
+
+Use `jsonl-history-search <command> --help` for a launch command.
+Use `jsonl-history-search --help-internal` to list the full developer command inventory.
+"""
+
+
+INTERNAL_HELP_EPILOG = """\
+Developer note: this full inventory includes benchmark, harness, eval,
+diagnostic, and proof commands for local product work. Do not treat their
+presence here as a public first-run path or as evidence of release readiness,
+token savings, all-history coverage, or broad superiority.
+"""
+
+
+def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jsonl-history-search",
         description=(
             "JSONL: AI conversation parsing/mining for semantic debugging and "
             "agent memory/debug workflows."
         ),
+        epilog=PUBLIC_HELP_EPILOG if public_help else INTERNAL_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="COMMAND" if public_help else None,
+    )
     ask = subparsers.add_parser(
         "ask",
         description=(
@@ -1760,7 +1795,12 @@ def discovery_payload_from_args(args: argparse.Namespace) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv == ["--help-internal"]:
+        print(build_parser(public_help=False).format_help())
+        return 0
+
+    args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
         cwd = str(Path(args.cwd).expanduser().resolve())
         payload = build_ask_router_payload(args.query, cwd=cwd)
