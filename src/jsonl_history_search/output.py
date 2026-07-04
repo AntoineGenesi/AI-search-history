@@ -2515,6 +2515,7 @@ def render_status_anchor_text(payload: dict) -> str:
     summary = report["summary"]
     reads = report.get("next_reads") or []
     source_tiers = report.get("source_tiers") or {}
+    follow_through_plan = report.get("follow_through_plan") or {}
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
@@ -2525,8 +2526,9 @@ def render_status_anchor_text(payload: dict) -> str:
         f"Status: {report['status']}",
         f"Answer status: {answer_status}",
         "Evidence contract: raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
-        "Open these source refs first:",
     ]
+    _append_status_follow_through_plan_text(lines, follow_through_plan)
+    lines.append("Open these source refs first:")
     if selected:
         _append_text_read(lines, selected)
     for read in open_first_reads[:4]:
@@ -2626,6 +2628,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     summary = report["summary"]
     reads = report.get("next_reads") or []
     source_tiers = report.get("source_tiers") or {}
+    follow_through_plan = report.get("follow_through_plan") or {}
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
@@ -2638,9 +2641,15 @@ def render_status_anchor_markdown(payload: dict) -> str:
         f"**Answer status:** `{answer_status}`",
         "**Evidence contract:** raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
         "",
-        "## Open These Source Refs First",
+        "## Follow-Through Plan",
         "",
     ]
+    _append_status_follow_through_plan_markdown(lines, follow_through_plan)
+    lines.extend([
+        "",
+        "## Open These Source Refs First",
+        "",
+    ])
     if selected:
         _append_markdown_read(lines, selected)
     for read in open_first_reads[:4]:
@@ -2805,6 +2814,86 @@ def render_agent_loop_cost_contract_markdown(payload: dict) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _append_status_follow_through_plan_text(lines: list[str], plan: dict) -> None:
+    if not plan:
+        return
+    lines.append("Follow-through plan:")
+    lines.append(f"Plan status: {plan.get('status')}")
+    open_first = plan.get("open_first") or []
+    lines.append("Plan open_first:")
+    if open_first:
+        for read in open_first[:4]:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- (no required primary refs surfaced)")
+    then_confirm = plan.get("then_confirm") or []
+    lines.append("Plan then_confirm:")
+    if then_confirm:
+        for group in then_confirm:
+            label = group.get("task_id") or group.get("label") or "secondary_support"
+            lines.append(f"- {label}: {group.get('purpose')}")
+            for read in (group.get("refs") or [])[:4]:
+                _append_text_read(lines, read)
+    else:
+        lines.append("- (no required secondary refs surfaced)")
+    diagnostics = plan.get("do_not_open_by_default") or []
+    lines.append("Plan do_not_open_by_default:")
+    if diagnostics:
+        for read in diagnostics[:5]:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- (no diagnostic refs surfaced)")
+    facets = plan.get("expected_status_answer_facets") or []
+    if facets:
+        lines.append(f"Expected status-answer facets: {', '.join(facets)}")
+    if plan.get("stop_condition"):
+        lines.append(f"Plan stop_condition: {plan.get('stop_condition')}")
+    if plan.get("read_more_boundary_warning"):
+        lines.append(f"Read-more boundary warning: {plan.get('read_more_boundary_warning')}")
+    if plan.get("rerun_policy"):
+        lines.append(f"Rerun policy: {plan.get('rerun_policy')}")
+
+
+def _append_status_follow_through_plan_markdown(lines: list[str], plan: dict) -> None:
+    if not plan:
+        lines.append("- No follow-through plan surfaced.")
+        return
+    lines.append(f"- Plan status: `{plan.get('status')}`")
+    lines.extend(["", "### `open_first`", ""])
+    open_first = plan.get("open_first") or []
+    if open_first:
+        for read in open_first[:4]:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- No required primary refs surfaced.")
+    lines.extend(["", "### `then_confirm`", ""])
+    then_confirm = plan.get("then_confirm") or []
+    if then_confirm:
+        for group in then_confirm:
+            label = group.get("task_id") or group.get("label") or "secondary_support"
+            lines.append(f"- `{label}`: {group.get('purpose')}")
+            for read in (group.get("refs") or [])[:4]:
+                _append_markdown_read(lines, read)
+    else:
+        lines.append("- No required secondary refs surfaced.")
+    lines.extend(["", "### `do_not_open_by_default`", ""])
+    diagnostics = plan.get("do_not_open_by_default") or []
+    if diagnostics:
+        for read in diagnostics[:5]:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- No diagnostic refs surfaced.")
+    facets = plan.get("expected_status_answer_facets") or []
+    if facets:
+        lines.extend(["", f"- Expected status-answer facets: `{', '.join(facets)}`"])
+    if plan.get("stop_condition"):
+        lines.append(f"- Stop condition: {plan.get('stop_condition')}")
+    if plan.get("read_more_boundary_warning"):
+        lines.append(f"- Read-more boundary warning: {plan.get('read_more_boundary_warning')}")
+    if plan.get("rerun_policy"):
+        lines.append(f"- Rerun policy: {plan.get('rerun_policy')}")
 
 
 def render_retained_trace_counters_text(payload: dict) -> str:

@@ -237,19 +237,23 @@ ROUTES: tuple[AskRoute, ...] = (
         first_command_template='jsonl-history-search what-happened-since "{query}" --cwd "$PWD" --format text',
         read_specialization="references/latest-status.md",
         inspect_after=(
+            "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
             "status_anchor.anchor_candidates and selected_anchor",
             "status_anchor.session_activity raw sessions/**/*.jsonl trace after the anchor",
-            "next_reads for raw JSONL/source refs before commits, task artifacts, or repo state",
+            "source_tiers and next_reads only as debugging detail after the follow-through plan leaves a named gap",
         ),
         stop_guidance=(
-            "Run the status route before task/repo recovery scans. Inspect the selected "
-            "anchor and raw session JSONL source refs first. Do not answer from commits, "
-            "current repo state, compacted summaries, or process state alone."
+            "Run the status route before task/repo recovery scans. Use "
+            "status_anchor.follow_through_plan first: open_first required primary refs, then_confirm "
+            "target-window secondary refs, and do_not_open_by_default diagnostics. Do not rerun "
+            "JSON/JQ extraction, open diagnostic/post-window refs, or broaden manual search unless "
+            "a named status facet remains missing or contradictory after the plan reads."
         ),
         manual_search_guidance=(
-            "Repo or task scans are follow-up only after the JSONL route "
-            "identifies the anchor/window and raw session trace, or reports that it cannot find one. "
-            "Treat commits and repo state as secondary support, never as the status anchor."
+            "Repo or task scans are follow-up only after the follow-through plan identifies "
+            "the anchor/window and required raw/session refs, or reports that it cannot find one. "
+            "Treat commits and repo state as secondary support, never as the status anchor; "
+            "diagnostic/post-window refs are not default answer support."
         ),
     ),
     AskRoute(
