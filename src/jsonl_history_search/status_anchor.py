@@ -352,6 +352,11 @@ def status_anchor_report(
         "follow_through_plan": follow_through_plan,
         "target_window": target_window,
         "suppressed_support": suppressed_support,
+        "fail_closed_guidance": _fail_closed_guidance(
+            selected_anchor=selected_anchor,
+            anchor_decision=anchor_decision,
+            session_activity=session_activity,
+        ),
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
@@ -575,6 +580,19 @@ def _select_anchor_with_boundary(
                         },
                         candidates,
                     )
+            if prefer_parent and parent_anchor is None:
+                return {
+                    **base,
+                    "context_boundary": "explicit_parent_main_history_anchor_missing",
+                    "anchor_scope": "parent_thread",
+                    "anchor_reason": "no_proven_parent_main_history_anchor_found",
+                    "status_ref": status_ref,
+                    "selected_anchor": None,
+                    "rejected_anchor_alternatives": _unproven_parent_main_anchor_alternatives(
+                        candidates,
+                        status_thread_keys,
+                    ),
+                }
             if parent_anchor is None:
                 parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
             if parent_anchor:
@@ -917,6 +935,42 @@ def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) 
         if history_mirror:
             return history_mirror
     return None
+
+
+def _unproven_parent_main_anchor_alternatives(candidates: list[dict], thread_keys: set[str]) -> list[dict]:
+    alternatives = []
+    for candidate in candidates:
+        is_never_anchor = _is_never_anchor(candidate)
+        is_eligible_parent_candidate = _is_eligible_anchor(candidate) and not _thread_key_overlap(candidate, thread_keys)
+        if is_never_anchor or is_eligible_parent_candidate:
+            alternatives.append(
+                {
+                    "source_ref": candidate.get("source_ref"),
+                    "timestamp_utc": candidate.get("timestamp_utc"),
+                    "classification": candidate.get("classification"),
+                    "decision": "rejected",
+                    "rationale": _parent_main_rejection_rationale(candidate),
+                    "snippet": candidate.get("snippet"),
+                    "source_kind": candidate.get("source_kind"),
+                    "openable_source_ref": candidate.get("openable_source_ref"),
+                    "openable_target": candidate.get("openable_target"),
+                    "target_window_hits": candidate.get("target_window_hits") or [],
+                    "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+                }
+            )
+        if len(alternatives) >= 8:
+            break
+    return alternatives
+
+
+def _parent_main_rejection_rationale(candidate: dict) -> str:
+    source_kind = candidate.get("source_kind")
+    if source_kind == "codex_sessions" and _is_eligible_anchor(candidate):
+        return (
+            str(candidate.get("rationale") or "").rstrip()
+            + "; rejected for explicit parent/main status because no codex_history:history.jsonl parent anchor or history mirror proves this row"
+        )
+    return str(candidate.get("rationale") or "")
 
 
 def _is_eligible_anchor(candidate: dict) -> bool:
@@ -2208,6 +2262,42 @@ def _agent_instruction(selected_anchor: dict | None, session_activity: dict, nex
         "direct_anchor_openable": bool(selected_anchor and selected_anchor.get("openable_target")),
         "raw_session_trace_status": session_activity.get("status"),
         "commit_only_answer_allowed": False,
+    }
+
+
+def _fail_closed_guidance(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    session_activity: dict,
+) -> dict:
+    if not selected_anchor:
+        return {
+            "mode": "candidate_anchors_required_before_answer",
+            "answer_allowed": False,
+            "guidance": (
+                "Fail closed: no human-authored anchor was selected. Do not answer from visible context, "
+                "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
+                "and rejected alternatives first, then rerun with an explicit timestamp/quoted-message anchor if needed."
+            ),
+            "candidate_fields": [
+                "anchor_candidates",
+                "anchor_decision.rejected_anchor_alternatives",
+            ],
+        }
+    raw_status = session_activity.get("status")
+    answer_allowed = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
+    return {
+        "mode": "selected_anchor_requires_primary_read_followthrough",
+        "answer_allowed": answer_allowed,
+        "guidance": (
+            "Use the selected human history/session anchor and required primary raw JSONL reads before answering. "
+            "Do not answer from inherited context, current-session worker/reviewer prompts, rejected false anchors, "
+            "or secondary repo artifacts unless the primary reads have been inspected."
+        ),
+        "selected_anchor_ref": selected_anchor.get("source_ref"),
+        "anchor_scope": selected_anchor.get("anchor_scope") or anchor_decision.get("anchor_scope"),
+        "raw_session_trace_status": raw_status,
     }
 
 

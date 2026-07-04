@@ -293,6 +293,7 @@ def render_ask_router_text(payload: dict) -> str:
         "Ask Route",
         "Answer status: not-ready/needs-more-proof",
         "Open these source refs first: none yet; run the first command to produce source refs.",
+        f"Run this first: {report.get('first_command')}",
         f"First command: {report.get('first_command')}",
         f"Stop condition: {report.get('stop_guidance')}",
         f"Only continue if: {report.get('manual_search_guidance')}",
@@ -320,6 +321,7 @@ def render_ask_router_markdown(payload: dict) -> str:
         "",
         "- Answer status: `not-ready/needs-more-proof`",
         "- Open these source refs first: none yet; run the first command to produce source refs.",
+        f"- Run this first: `{report.get('first_command')}`",
         f"- First command: `{report.get('first_command')}`",
         f"- Stop condition: {report.get('stop_guidance')}",
         f"- Only continue if: {report.get('manual_search_guidance')}",
@@ -2567,6 +2569,7 @@ def render_status_anchor_text(payload: dict) -> str:
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
+    fail_closed = report.get("fail_closed_guidance") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
@@ -2575,6 +2578,12 @@ def render_status_anchor_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
         "Evidence contract: raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
     ]
+    if fail_closed.get("guidance"):
+        lines.append(
+            "Fail-closed guidance: "
+            f"{fail_closed.get('guidance')} "
+            f"answer_allowed={fail_closed.get('answer_allowed')}"
+        )
     _append_status_follow_through_plan_text(lines, follow_through_plan)
     lines.append("Open these source refs first:")
     if selected:
@@ -2680,6 +2689,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     selected = report.get("selected_anchor")
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
+    fail_closed = report.get("fail_closed_guidance") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
@@ -2692,6 +2702,14 @@ def render_status_anchor_markdown(payload: dict) -> str:
         "## Follow-Through Plan",
         "",
     ]
+    if fail_closed.get("guidance"):
+        lines[6:6] = [
+            "## Fail-Closed Guidance",
+            "",
+            f"- {fail_closed.get('guidance')}",
+            f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
+            "",
+        ]
     _append_status_follow_through_plan_markdown(lines, follow_through_plan)
     lines.extend([
         "",
