@@ -231,8 +231,9 @@ ROUTES: tuple[AskRoute, ...] = (
         route_family="latest_status",
         chosen_route="latest-status / what-happened-since",
         why_it_applies=(
-            "The wording asks what happened after the user was away or since a "
-            "recent anchor, so use the status-anchor route before repo recovery."
+            "The wording asks what happened after the user was away, since a "
+            "recent anchor, or across an explicit task status/handoff window, "
+            "so use the status-anchor route before repo recovery."
         ),
         first_command_template='jsonl-history-search what-happened-since "{query}" --cwd "$PWD" --format text',
         read_specialization="references/latest-status.md",
@@ -397,6 +398,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_process_actual_use_query(normalized):
         return ROUTES[3]
+
+    if _looks_like_task_window_status_handoff_query(normalized):
+        return ROUTES[5]
 
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
@@ -576,6 +580,52 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "unresolved",
             "caveat",
             "provenance",
+        ),
+    )
+
+
+def _looks_like_task_window_status_handoff_query(normalized: str) -> bool:
+    task_handles = re.findall(r"\b[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*\b", normalized)
+    if len(set(task_handles)) < 2:
+        return False
+    if not _has_any(
+        normalized,
+        (
+            "what happened",
+            "status",
+            "handoff",
+            "next action",
+            "next serious action",
+        ),
+    ):
+        return False
+    has_range_connector = (
+        "->" in normalized
+        or _has_any(normalized, (" across ", " between ", " through "))
+        or (" from " in normalized and " to " in normalized)
+    )
+    if not has_range_connector:
+        return False
+    return _has_any(
+        normalized,
+        (
+            "coordinator",
+            "worker",
+            "workers",
+            "reviewer",
+            "reviewers",
+            "commit",
+            "commits",
+            "report",
+            "reports",
+            "validation",
+            "validations",
+            "caveat",
+            "caveats",
+            "blocker",
+            "blockers",
+            "next action",
+            "next serious action",
         ),
     )
 
