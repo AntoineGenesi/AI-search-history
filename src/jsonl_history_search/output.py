@@ -2586,6 +2586,7 @@ def render_status_anchor_text(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
@@ -2599,6 +2600,12 @@ def render_status_anchor_text(payload: dict) -> str:
             "Fail-closed guidance: "
             f"{fail_closed.get('guidance')} "
             f"answer_allowed={fail_closed.get('answer_allowed')}"
+        )
+    if status_boundary:
+        lines.append(
+            "Status as-of boundary: "
+            f"{status_boundary.get('timestamp_utc')} {status_boundary.get('source_ref')} "
+            f"audit_run_requested={report.get('routing', {}).get('audit_run_requested')}"
         )
     _append_status_follow_through_plan_text(lines, follow_through_plan)
     lines.append("Open these source refs first:")
@@ -2706,6 +2713,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
     lines = [
@@ -2714,8 +2722,6 @@ def render_status_anchor_markdown(payload: dict) -> str:
         f"**Status:** {report['status']}",
         f"**Answer status:** `{answer_status}`",
         "**Evidence contract:** raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
-        "",
-        "## Follow-Through Plan",
         "",
     ]
     if fail_closed.get("guidance"):
@@ -2726,6 +2732,19 @@ def render_status_anchor_markdown(payload: dict) -> str:
             f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
             "",
         ]
+    if status_boundary:
+        lines.extend(
+            [
+                "## Status As-Of Boundary",
+                "",
+                (
+                    f"- `{status_boundary.get('timestamp_utc')}` `{status_boundary.get('source_ref')}`; "
+                    f"audit_run_requested=`{report.get('routing', {}).get('audit_run_requested')}`"
+                ),
+                "",
+            ]
+        )
+    lines.extend(["## Follow-Through Plan", ""])
     _append_status_follow_through_plan_markdown(lines, follow_through_plan)
     lines.extend([
         "",

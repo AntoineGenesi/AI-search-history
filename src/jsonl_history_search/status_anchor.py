@@ -89,6 +89,7 @@ NON_ANCHOR_CONTEXT_MARKERS = (
 
 WORKER_PROMPT_MARKERS = (
     "you are the jsh-",
+    "you are the focused fix worker",
     "you are the high-reasoning implementer",
     "you are the implementer/runner",
     "you are the independent reviewer",
@@ -126,6 +127,27 @@ WORKER_PROMPT_MARKERS = (
     "acceptance criteria:",
     "read first:",
     "<turn_aborted>",
+)
+
+STATUS_BOUNDARY_PROMPT_MARKERS = WORKER_PROMPT_MARKERS + (
+    "adversarial smoke",
+    "after a failed review",
+    "current head includes failed review artifact",
+    "do not edit the parent checkout",
+    "do not edit the review artifact",
+    "failed review artifact",
+    "fix requirements:",
+    "fsm state:",
+    "live cli adversarial smoke",
+    "post-status spawned worker",
+    "pressure artifact",
+    "pressure prompt",
+    "review blocker",
+    "review blocker to fix",
+    "reviewer-cited path",
+    "status-shaped pressure",
+    "task worktree",
+    "worker/pressure prompt",
 )
 
 SUBSTANTIVE_WORK_MARKERS = (
@@ -222,12 +244,21 @@ def status_anchor_report(
 ) -> dict:
     latest_messages = latest.get("messages", [])
     target_window = _target_window_from_query(query)
-    anchor_candidates = _rank_anchor_candidates(latest_messages, target_window=target_window)
+    status_as_of_boundary = _status_as_of_boundary_from_messages(query, latest_messages)
+    audit_run_requested = _audit_run_requested(query, target_window)
+    anchor_candidates = _rank_anchor_candidates(
+        latest_messages,
+        target_window=target_window,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
+    )
     anchor_decision = _select_anchor_with_boundary(
         query=query,
         messages=latest_messages,
         candidates=anchor_candidates,
         target_window=target_window,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
     )
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
@@ -243,11 +274,15 @@ def status_anchor_report(
         cwd=cwd,
         codex_home=codex_home,
         target_window=target_window,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
     )
     artifacts = _collect_work_artifacts(
         cwd,
         anchor_timestamp_utc=session_activity.get("anchor_timestamp_utc"),
         target_window=target_window,
+        status_as_of_timestamp_utc=status_as_of_boundary.get("timestamp_utc") if status_as_of_boundary else None,
+        audit_run_requested=audit_run_requested,
     )
     current_value_items = [item for item in artifacts["value_items"] if item.get("current_window_evidence")]
     behavior_deltas = [item for item in current_value_items if item["value_kind"] == "behavior_delta"]
@@ -269,6 +304,8 @@ def status_anchor_report(
         cwd=cwd,
         codex_home=codex_home,
         target_window=target_window,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
     )
     source_tiers = _source_tiers(next_reads)
     follow_through_plan = _follow_through_plan(
@@ -276,7 +313,11 @@ def status_anchor_report(
         target_window=target_window,
         session_activity=session_activity,
     )
-    suppressed_support = _suppressed_answer_facing_support(cwd, target_window=target_window)
+    suppressed_support = _suppressed_answer_facing_support(
+        cwd,
+        target_window=target_window,
+        audit_run_requested=audit_run_requested,
+    )
     blind_spots = []
     if not selected_anchor:
         blind_spots.append("No substantive anchor selected from the searched latest-message scope.")
@@ -305,6 +346,8 @@ def status_anchor_report(
             "anchor_reason": anchor_decision["anchor_reason"],
             "anchor_ref": anchor_decision["anchor_ref"],
             "target_window": target_window,
+            "status_as_of_boundary": status_as_of_boundary,
+            "audit_run_requested": audit_run_requested,
         },
         "source_scope": latest.get("source_scope"),
         "summary": {
@@ -341,6 +384,7 @@ def status_anchor_report(
             "context_boundary": anchor_decision["context_boundary"],
             "anchor_scope": anchor_decision["anchor_scope"],
             "anchor_reason": anchor_decision["anchor_reason"],
+            "status_as_of_boundary_available": status_as_of_boundary is not None,
         },
         "anchor_candidates": anchor_candidates,
         "selected_anchor": selected_anchor,
@@ -351,6 +395,7 @@ def status_anchor_report(
         "source_tiers": source_tiers,
         "follow_through_plan": follow_through_plan,
         "target_window": target_window,
+        "status_as_of_boundary": status_as_of_boundary,
         "suppressed_support": suppressed_support,
         "fail_closed_guidance": _fail_closed_guidance(
             selected_anchor=selected_anchor,
@@ -387,9 +432,15 @@ def is_status_question(query: str) -> bool:
     return any(pattern in normalized for pattern in STATUS_QUERY_PATTERNS)
 
 
-def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None = None) -> list[dict]:
+def _rank_anchor_candidates(
+    messages: list[dict],
+    *,
+    target_window: dict | None = None,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
+) -> list[dict]:
     candidates = []
-    status_cutoff = _status_query_cutoff(messages)
+    status_cutoff = (status_as_of_boundary or {}).get("timestamp_utc") or _status_query_cutoff(messages)
     for index, message in enumerate(messages):
         text = str(message.get("snippet") or "")
         timestamp = message.get("timestamp_utc")
@@ -420,6 +471,11 @@ def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None 
                 "rationale": rationale,
                 "target_window_hits": _target_window_hits(text, target_window),
                 "outside_target_task_ids": _outside_target_task_ids(text, target_window),
+                "newer_than_status_as_of": _is_newer_than_status_as_of(
+                    str(timestamp or ""),
+                    status_as_of_boundary=status_as_of_boundary,
+                    audit_run_requested=audit_run_requested,
+                ),
             }
         )
     candidates.sort(key=lambda item: (item["score"], item.get("timestamp_utc") or ""), reverse=True)
@@ -429,11 +485,71 @@ def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None 
 
 
 def _status_query_cutoff(messages: list[dict]) -> str | None:
+    current_status = _current_status_message(messages)
+    if current_status:
+        return str(current_status.get("timestamp_utc") or "") or None
     for message in messages:
         timestamp = str(message.get("timestamp_utc") or "")
-        if timestamp and is_status_question(str(message.get("snippet") or "")):
+        if (
+            timestamp
+            and is_status_question(str(message.get("snippet") or ""))
+            and not _is_status_boundary_prompt_noise(message)
+        ):
             return timestamp
     return None
+
+
+def _status_as_of_boundary_from_messages(query: str, messages: list[dict]) -> dict | None:
+    if not is_status_question(query):
+        return None
+    status_message = _current_status_message(messages)
+    if not status_message:
+        return None
+    boundary_source = status_message
+    if status_message.get("source_kind") != "codex_history":
+        boundary_source = _history_mirror_candidate(status_message) or status_message
+    timestamp = str(status_message.get("timestamp_utc") or "")
+    if not timestamp:
+        return None
+    return {
+        "kind": "current_status_question_row",
+        "source_ref": boundary_source.get("source_ref"),
+        "source_kind": boundary_source.get("source_kind"),
+        "source_identifier": boundary_source.get("source_identifier"),
+        "openable_source_ref": boundary_source.get("openable_source_ref"),
+        "openable_target": boundary_source.get("openable_target"),
+        "timestamp_utc": timestamp,
+        "local_timestamp": status_message.get("local_timestamp"),
+        "message_index": status_message.get("message_index"),
+        "thread_keys": status_message.get("thread_keys") or [],
+        "snippet": status_message.get("snippet"),
+        "boundary_policy": (
+            "For non-audit status questions, candidate selection, raw session activity, source tiers, "
+            "follow-through, and answer-facing support must not use evidence newer than this row."
+        ),
+    }
+
+
+def _audit_run_requested(query: str, target_window: dict | None) -> bool:
+    if target_window and target_window.get("audit_run_requested"):
+        return True
+    normalized = _normalize(query)
+    return any(marker in normalized for marker in _RUN_AUDIT_MARKERS)
+
+
+def _is_newer_than_status_as_of(
+    timestamp_utc: str,
+    *,
+    status_as_of_boundary: dict | None,
+    audit_run_requested: bool,
+) -> bool:
+    if audit_run_requested or not timestamp_utc or not status_as_of_boundary:
+        return False
+    status_timestamp = parse_datetime(str(status_as_of_boundary.get("timestamp_utc") or ""), timezone.utc)
+    timestamp = parse_datetime(timestamp_utc, timezone.utc)
+    if status_timestamp is None or timestamp is None:
+        return False
+    return timestamp.astimezone(timezone.utc) > status_timestamp.astimezone(timezone.utc)
 
 
 def _score_anchor(text: str, index: int, *, timestamp_utc: str = "", status_cutoff: str | None = None) -> tuple[int, str, str, str]:
@@ -481,6 +597,8 @@ def _select_anchor_with_boundary(
     messages: list[dict],
     candidates: list[dict],
     target_window: dict | None = None,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
 ) -> dict:
     base = {
         "context_boundary": "none",
@@ -488,6 +606,7 @@ def _select_anchor_with_boundary(
         "anchor_reason": "ranked_substantive_or_fallback_candidate",
         "anchor_ref": None,
         "status_ref": None,
+        "status_as_of_boundary": status_as_of_boundary,
         "selected_anchor": None,
         "rejected_anchor_alternatives": [],
         "excluded_as_anchor": [
@@ -516,7 +635,12 @@ def _select_anchor_with_boundary(
             },
             candidates,
         )
-    target_anchor = _target_window_anchor_candidate(candidates, target_window)
+    target_anchor = _target_window_anchor_candidate(
+        candidates,
+        target_window,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
+    )
     if target_anchor:
         return _with_rejected_alternatives(
             {
@@ -582,6 +706,7 @@ def _select_anchor_with_boundary(
                             "anchor_reason": reason,
                             "anchor_ref": same_thread_anchor.get("source_ref"),
                             "status_ref": status_ref,
+                            "status_as_of_boundary": status_as_of_boundary,
                             "selected_anchor": _selected_with_reason(
                                 same_thread_anchor,
                                 "; selected as the latest eligible prior user message in the same thread",
@@ -596,6 +721,7 @@ def _select_anchor_with_boundary(
                     "anchor_scope": "parent_thread",
                     "anchor_reason": "no_proven_parent_main_history_anchor_found",
                     "status_ref": status_ref,
+                    "status_as_of_boundary": status_as_of_boundary,
                     "selected_anchor": None,
                     "rejected_anchor_alternatives": _unproven_parent_main_anchor_alternatives(
                         candidates,
@@ -616,6 +742,7 @@ def _select_anchor_with_boundary(
                         "anchor_reason": reason,
                         "anchor_ref": parent_anchor.get("source_ref"),
                         "status_ref": status_ref,
+                        "status_as_of_boundary": status_as_of_boundary,
                         "selected_anchor": _selected_with_reason(
                             parent_anchor,
                             "; selected as the last eligible parent/main-thread user message before the side-thread boundary",
@@ -629,6 +756,7 @@ def _select_anchor_with_boundary(
                 "anchor_scope": "none",
                 "anchor_reason": "no_eligible_prior_user_message_found",
                 "status_ref": status_ref,
+                "status_as_of_boundary": status_as_of_boundary,
             }
     selected = _select_anchor(candidates)
     if selected:
@@ -750,12 +878,24 @@ def _outside_target_task_ids(text: str, target_window: dict | None) -> list[str]
     return sorted(_task_ids_in_text(_normalize_task_ids(text)) - target_ids)
 
 
-def _target_window_anchor_candidate(candidates: list[dict], target_window: dict | None) -> dict | None:
+def _target_window_anchor_candidate(
+    candidates: list[dict],
+    target_window: dict | None,
+    *,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
+) -> dict | None:
     if not target_window:
         return None
     matches = []
     for candidate in candidates:
         if _is_never_anchor(candidate):
+            continue
+        if _is_newer_than_status_as_of(
+            str(candidate.get("timestamp_utc") or ""),
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        ):
             continue
         hits = set(candidate.get("target_window_hits") or [])
         if not hits:
@@ -911,13 +1051,95 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
 
 
 def _current_status_message(messages: list[dict]) -> dict | None:
-    for index, message in enumerate(messages):
-        if is_status_question(str(message.get("snippet") or "")):
+    status_messages = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if is_status_question(str(message.get("snippet") or ""))
+        and not _is_status_boundary_prompt_noise(message)
+    ]
+    if not status_messages:
+        return None
+    first_index, first_message = status_messages[0]
+    first_timestamp = str(first_message.get("timestamp_utc") or "")
+    same_boundary_rows = [
+        (index, message)
+        for index, message in status_messages
+        if str(message.get("timestamp_utc") or "") == first_timestamp
+    ]
+    for index, message in same_boundary_rows:
+        if message.get("source_kind") == "codex_history":
             current = dict(message)
             current["message_index"] = index
             current["thread_keys"] = _message_thread_keys(message)
             return current
-    return None
+    current = dict(first_message)
+    current["message_index"] = first_index
+    current["thread_keys"] = _message_thread_keys(first_message)
+    return current
+
+
+def _is_status_boundary_prompt_noise(message: dict) -> bool:
+    text = str(message.get("snippet") or "")
+    normalized = _normalize(text)
+    if not normalized:
+        return True
+    if any(marker in normalized for marker in STATUS_BOUNDARY_PROMPT_MARKERS):
+        return True
+    if _looks_like_task_prompt(normalized):
+        return True
+    return any(_mirror_source_looks_like_prompt_noise(mirror) for mirror in message.get("mirror_sources") or [])
+
+
+def _looks_like_task_prompt(normalized: str) -> bool:
+    taskish = (
+        "acceptance criteria:" in normalized
+        or "branch:" in normalized
+        or "checks run" in normalized
+        or "current head" in normalized
+        or "do not revert" in normalized
+        or "review artifact" in normalized
+        or "run:" in normalized
+        or "work only in" in normalized
+        or "worktree:" in normalized
+    )
+    role_or_process = (
+        "fix worker" in normalized
+        or "implementation worker" in normalized
+        or "implementer" in normalized
+        or "reviewer" in normalized
+        or "worker" in normalized
+        or "failed review" in normalized
+        or "pressure run" in normalized
+        or "eval" in normalized
+    )
+    return taskish and role_or_process
+
+
+def _mirror_source_looks_like_prompt_noise(mirror: object) -> bool:
+    if not isinstance(mirror, Mapping):
+        return False
+    text = _normalize(
+        " ".join(
+            str(mirror.get(key) or "")
+            for key in (
+                "source_ref",
+                "source_identifier",
+                "thread_key",
+            )
+        )
+    )
+    return any(
+        marker in text
+        for marker in (
+            "worker",
+            "reviewer",
+            "pressure",
+            "eval",
+            "manual_default",
+            "jsonl_current",
+            "jsonl-layered",
+        )
+    )
 
 
 def _first_eligible_thread_anchor(candidates: list[dict], thread_keys: set[str], *, same_thread: bool) -> dict | None:
@@ -1094,6 +1316,8 @@ def _session_activity_trace(
     cwd: Path,
     codex_home: Path | None,
     target_window: dict | None = None,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
 ) -> dict:
     base = {
         "status": "no_selected_anchor",
@@ -1103,6 +1327,8 @@ def _session_activity_trace(
         "next_reads": [],
         "evidence_boundary": {
             "primary": "raw Codex history/session JSONL after the selected user anchor",
+            "status_as_of_boundary": status_as_of_boundary,
+            "audit_run_requested": audit_run_requested,
             "secondary_only": ["commits/merges", "current repo state", "task/report/review artifacts"],
             "commit_only_answers_allowed": False,
         },
@@ -1155,6 +1381,8 @@ def _session_activity_trace(
                 codex_home=codex_home,
                 cwd=cwd,
                 target_window=target_window,
+                status_as_of_boundary=status_as_of_boundary,
+                audit_run_requested=audit_run_requested,
             )
             _merge_activity_counts(activity, scan["activity_after_anchor"])
             followups.append(
@@ -1280,6 +1508,8 @@ def _scan_session_file_after_anchor(
     codex_home: Path,
     cwd: Path,
     target_window: dict | None = None,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
 ) -> dict:
     activity = _empty_activity_counts()
     first_ref = None
@@ -1310,6 +1540,12 @@ def _scan_session_file_after_anchor(
                 timezone.utc,
             )
             if timestamp is not None and timestamp.astimezone(timezone.utc) < anchor_timestamp:
+                continue
+            if _is_newer_than_status_as_of(
+                timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if timestamp is not None else "",
+                status_as_of_boundary=status_as_of_boundary,
+                audit_run_requested=audit_run_requested,
+            ):
                 continue
             source_ref = _source_ref_for_path_line(path, line_number, codex_home)
             if first_ref is None:
@@ -1524,10 +1760,15 @@ def _collect_work_artifacts(
     *,
     anchor_timestamp_utc: str | None = None,
     target_window: dict | None = None,
+    status_as_of_timestamp_utc: str | None = None,
+    audit_run_requested: bool = False,
 ) -> dict:
     anchor_timestamp = parse_datetime(anchor_timestamp_utc or "", timezone.utc)
     if anchor_timestamp is not None:
         anchor_timestamp = anchor_timestamp.astimezone(timezone.utc)
+    status_as_of_timestamp = parse_datetime(status_as_of_timestamp_utc or "", timezone.utc)
+    if status_as_of_timestamp is not None:
+        status_as_of_timestamp = status_as_of_timestamp.astimezone(timezone.utc)
     tasks: list[dict] = []
     reports: list[dict] = []
     reviews: list[dict] = []
@@ -1550,6 +1791,8 @@ def _collect_work_artifacts(
                         category,
                         work["artifact_terms"],
                         anchor_timestamp=anchor_timestamp,
+                        status_as_of_timestamp=status_as_of_timestamp,
+                        audit_run_requested=audit_run_requested,
                         force_current=target_window_match,
                         target_window_evidence=target_window_match,
                     )
@@ -1579,7 +1822,12 @@ def _collect_work_artifacts(
         "tasks": tasks,
         "reports": reports,
         "reviews": reviews,
-        "commits": _collect_secondary_commits(cwd, anchor_timestamp_utc),
+        "commits": _collect_secondary_commits(
+            cwd,
+            anchor_timestamp_utc,
+            status_as_of_timestamp_utc=status_as_of_timestamp_utc,
+            audit_run_requested=audit_run_requested,
+        ),
         "value_items": value_items,
     }
 
@@ -1615,11 +1863,19 @@ def _work_id_in_target_window(work_id: str, target_window: dict | None) -> bool:
     return bool(target_window and work_id in set(target_window.get("ids") or []))
 
 
-def _collect_secondary_commits(cwd: Path, anchor_timestamp_utc: str | None) -> list[dict]:
+def _collect_secondary_commits(
+    cwd: Path,
+    anchor_timestamp_utc: str | None,
+    *,
+    status_as_of_timestamp_utc: str | None = None,
+    audit_run_requested: bool = False,
+) -> list[dict]:
     if not anchor_timestamp_utc:
         return []
     command = ["git", "-C", str(cwd), "log", "--max-count=8", "--format=%H%x09%cI%x09%s"]
     command.extend(["--since", anchor_timestamp_utc])
+    if status_as_of_timestamp_utc and not audit_run_requested:
+        command.extend(["--until", status_as_of_timestamp_utc])
     try:
         result = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
     except (OSError, subprocess.TimeoutExpired):
@@ -1651,6 +1907,8 @@ def _artifact_item(
     terms: tuple[str, ...],
     *,
     anchor_timestamp,
+    status_as_of_timestamp=None,
+    audit_run_requested: bool = False,
     force_current: bool = False,
     target_window_evidence: bool = False,
 ) -> dict:
@@ -1663,6 +1921,11 @@ def _artifact_item(
             anchor_timestamp is not None
             and evidence_timestamp is not None
             and evidence_timestamp.astimezone(timezone.utc) >= anchor_timestamp
+            and (
+                audit_run_requested
+                or status_as_of_timestamp is None
+                or evidence_timestamp.astimezone(timezone.utc) <= status_as_of_timestamp
+            )
         )
     )
     source_tier = "required_secondary" if current_window else "diagnostic_optional"
@@ -1797,6 +2060,8 @@ def _next_reads(
     cwd: Path,
     codex_home: Path | None,
     target_window: dict | None = None,
+    status_as_of_boundary: dict | None = None,
+    audit_run_requested: bool = False,
 ) -> list[dict]:
     reads = []
     if selected_anchor:
@@ -1834,6 +2099,7 @@ def _next_reads(
             cwd=cwd,
             codex_home=codex_home,
             target_window=target_window,
+            audit_run_requested=audit_run_requested,
         )
     )
     for item in artifacts["value_items"]:
@@ -1881,7 +2147,11 @@ def _next_reads(
             }
         )
     reads = _apply_target_window_primary_dominance(reads, target_window=target_window)
-    reads = _apply_answer_facing_suppression(reads, target_window=target_window)
+    reads = _apply_answer_facing_suppression(
+        reads,
+        target_window=target_window,
+        audit_run_requested=audit_run_requested,
+    )
     return _dedupe_reads(reads)
 
 
@@ -1891,11 +2161,11 @@ def _target_window_follow_on_reads(
     cwd: Path,
     codex_home: Path | None,
     target_window: dict | None,
+    audit_run_requested: bool = False,
 ) -> list[dict]:
     if not target_window:
         return []
     reads = []
-    audit_run_requested = bool(target_window.get("audit_run_requested"))
     for candidate in anchor_decision.get("rejected_anchor_alternatives") or []:
         if not _is_target_window_outside_task_ref(candidate, target_window=target_window):
             continue
@@ -2168,8 +2438,13 @@ def _is_raw_conversation_ref(read: dict) -> bool:
     )
 
 
-def _apply_answer_facing_suppression(reads: list[dict], *, target_window: dict | None) -> list[dict]:
-    if target_window and target_window.get("audit_run_requested"):
+def _apply_answer_facing_suppression(
+    reads: list[dict],
+    *,
+    target_window: dict | None,
+    audit_run_requested: bool = False,
+) -> list[dict]:
+    if audit_run_requested or (target_window and target_window.get("audit_run_requested")):
         return reads
     suppressed = []
     for read in reads:
@@ -2230,8 +2505,13 @@ def _is_suppressed_answer_facing_ref(read: dict) -> bool:
     return private_or_run or (manual_lane and final_output)
 
 
-def _suppressed_answer_facing_support(cwd: Path, *, target_window: dict | None = None) -> dict:
-    audit_run_requested = bool(target_window and target_window.get("audit_run_requested"))
+def _suppressed_answer_facing_support(
+    cwd: Path,
+    *,
+    target_window: dict | None = None,
+    audit_run_requested: bool = False,
+) -> dict:
+    audit_run_requested = bool(audit_run_requested or (target_window and target_window.get("audit_run_requested")))
     if audit_run_requested:
         return {
             "policy": "same-run/private pressure artifacts may be answer-facing because the query explicitly asks to audit the run",
