@@ -580,6 +580,19 @@ def _select_anchor_with_boundary(
                         },
                         candidates,
                     )
+            if prefer_parent and parent_anchor is None:
+                return {
+                    **base,
+                    "context_boundary": "explicit_parent_main_history_anchor_missing",
+                    "anchor_scope": "parent_thread",
+                    "anchor_reason": "no_proven_parent_main_history_anchor_found",
+                    "status_ref": status_ref,
+                    "selected_anchor": None,
+                    "rejected_anchor_alternatives": _unproven_parent_main_anchor_alternatives(
+                        candidates,
+                        status_thread_keys,
+                    ),
+                }
             if parent_anchor is None:
                 parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
             if parent_anchor:
@@ -922,6 +935,42 @@ def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) 
         if history_mirror:
             return history_mirror
     return None
+
+
+def _unproven_parent_main_anchor_alternatives(candidates: list[dict], thread_keys: set[str]) -> list[dict]:
+    alternatives = []
+    for candidate in candidates:
+        is_never_anchor = _is_never_anchor(candidate)
+        is_eligible_parent_candidate = _is_eligible_anchor(candidate) and not _thread_key_overlap(candidate, thread_keys)
+        if is_never_anchor or is_eligible_parent_candidate:
+            alternatives.append(
+                {
+                    "source_ref": candidate.get("source_ref"),
+                    "timestamp_utc": candidate.get("timestamp_utc"),
+                    "classification": candidate.get("classification"),
+                    "decision": "rejected",
+                    "rationale": _parent_main_rejection_rationale(candidate),
+                    "snippet": candidate.get("snippet"),
+                    "source_kind": candidate.get("source_kind"),
+                    "openable_source_ref": candidate.get("openable_source_ref"),
+                    "openable_target": candidate.get("openable_target"),
+                    "target_window_hits": candidate.get("target_window_hits") or [],
+                    "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+                }
+            )
+        if len(alternatives) >= 8:
+            break
+    return alternatives
+
+
+def _parent_main_rejection_rationale(candidate: dict) -> str:
+    source_kind = candidate.get("source_kind")
+    if source_kind == "codex_sessions" and _is_eligible_anchor(candidate):
+        return (
+            str(candidate.get("rationale") or "").rstrip()
+            + "; rejected for explicit parent/main status because no codex_history:history.jsonl parent anchor or history mirror proves this row"
+        )
+    return str(candidate.get("rationale") or "")
 
 
 def _is_eligible_anchor(candidate: dict) -> bool:
