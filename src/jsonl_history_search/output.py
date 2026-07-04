@@ -2588,7 +2588,7 @@ def render_status_anchor_text(payload: dict) -> str:
     fail_closed = report.get("fail_closed_guidance") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
-    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
+    answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
     lines = [
         "Status Anchor",
         f"Status: {report['status']}",
@@ -2703,6 +2703,13 @@ def render_status_anchor_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: dict | None) -> str:
+    fail_closed = report.get("fail_closed_guidance") or {}
+    if fail_closed.get("answer_allowed") is False:
+        return "not-ready/needs-more-proof"
+    return _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
+
+
 def render_status_anchor_markdown(payload: dict) -> str:
     report = payload["status_anchor"]
     summary = report["summary"]
@@ -2715,7 +2722,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     fail_closed = report.get("fail_closed_guidance") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
-    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
+    answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
     lines = [
         "# Status Anchor",
         "",
