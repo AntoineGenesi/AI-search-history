@@ -79,6 +79,9 @@ NON_ANCHOR_CONTEXT_MARKERS = (
     "compacted history summary",
     "inherited summary",
     "inherited conversation summary",
+    "current-session handoff",
+    "current session handoff",
+    "handoff snippet",
     "boundary text",
     "side-thread boundary",
     "side conversation boundary",
@@ -90,6 +93,7 @@ NON_ANCHOR_CONTEXT_MARKERS = (
 WORKER_PROMPT_MARKERS = (
     "you are the jsh-",
     "you are the focused fix worker",
+    "you are the focused fix implementer",
     "you are the high-reasoning implementer",
     "you are the implementer/runner",
     "you are the independent reviewer",
@@ -730,6 +734,8 @@ def _select_anchor_with_boundary(
                 }
             if parent_anchor is None:
                 parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
+            if parent_anchor:
+                parent_anchor = _history_mirror_candidate(parent_anchor) or parent_anchor
             if parent_anchor:
                 reason = "parent_main_last_actual_work_handoff"
                 if not prefer_parent:
@@ -2102,6 +2108,14 @@ def _next_reads(
             audit_run_requested=audit_run_requested,
         )
     )
+    reads.extend(
+        _parent_main_recovery_reads(
+            selected_anchor=selected_anchor,
+            anchor_decision=anchor_decision,
+            cwd=cwd,
+            codex_home=codex_home,
+        )
+    )
     for item in artifacts["value_items"]:
         for ref in item["source_refs"][:2]:
             tier = item.get("source_tier") or "diagnostic_optional"
@@ -2153,6 +2167,66 @@ def _next_reads(
         audit_run_requested=audit_run_requested,
     )
     return _dedupe_reads(reads)
+
+
+def _parent_main_recovery_reads(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    cwd: Path,
+    codex_home: Path | None,
+) -> list[dict]:
+    if selected_anchor or anchor_decision.get("anchor_scope") != "parent_thread":
+        return []
+    reads = []
+    recovery_candidates = [
+        candidate
+        for candidate in anchor_decision.get("rejected_anchor_alternatives") or []
+        if _is_parent_main_recovery_candidate(candidate)
+    ]
+    recovery_candidates.sort(key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)
+    recovery_candidates.sort(key=lambda item: 0 if item.get("source_kind") == "codex_history" else 1)
+    for candidate in recovery_candidates:
+        source_kind = candidate.get("source_kind")
+        if source_kind == "codex_history":
+            reason = (
+                "Inspect candidate canonical history.jsonl parent/main anchor before answering; "
+                "if it is the intended anchor, rerun with its timestamp or quoted message."
+            )
+        else:
+            reason = (
+                "Inspect unproven parent/main session candidate only to locate the matching canonical "
+                "history.jsonl anchor, then rerun with that timestamp or quote before answering."
+            )
+        read = {
+            "reason": reason,
+            "source_ref": candidate.get("source_ref"),
+            "source_kind": source_kind,
+            "snippet": candidate.get("snippet"),
+            "source_tier": "required_primary",
+            "answer_use_required": False,
+            "read_more_actionable": True,
+            "parent_main_anchor_recovery_candidate": True,
+            "canonical_history_candidate": source_kind == "codex_history",
+            "fail_closed_before_answer": True,
+        }
+        _copy_openable_fields(read, candidate)
+        if read.get("openable_target") and not read.get("read_more_command"):
+            read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+        reads.append(read)
+        if len(reads) >= 4:
+            break
+    return reads
+
+
+def _is_parent_main_recovery_candidate(candidate: dict) -> bool:
+    if _is_never_anchor(candidate):
+        return False
+    if candidate.get("classification") not in {"substantive_work_anchor", "ordinary_human_turn", "short_human_turn"}:
+        return False
+    if candidate.get("source_kind") not in {"codex_history", "codex_sessions"}:
+        return False
+    return bool(candidate.get("source_ref") or candidate.get("openable_target"))
 
 
 def _target_window_follow_on_reads(
@@ -2243,12 +2317,20 @@ def _follow_through_plan(
     open_first = [_plan_read(read) for read in required_primary[:4]]
     then_confirm = _follow_through_confirmation_groups(required_secondary, target_ids=target_ids)
     do_not_open_by_default = [_plan_read(read) for read in diagnostic_optional[:8]]
+    has_parent_main_recovery = any(read.get("parent_main_anchor_recovery_candidate") for read in required_primary)
     named_gap = (
         "a named target-window status facet remains missing or contradictory"
         if target_ids and not audit_run_requested
         else "a named status facet remains missing or contradictory"
     )
-    if target_ids and not audit_run_requested:
+    if has_parent_main_recovery:
+        stop_condition = (
+            "Open the parent/main anchor recovery candidate refs only to prove the canonical history.jsonl "
+            "anchor. Do not answer from these candidates, task/report artifacts, commits, or visible context "
+            "until a parent/main history anchor is selected or the command is rerun with an explicit timestamp "
+            "or quoted-message anchor."
+        )
+    elif target_ids and not audit_run_requested:
         stop_condition = (
             "Open the required target-window primary raw ref first, then confirm the target-window "
             "task/report/review/commit refs listed in then_confirm. Stop when those refs cover the "
@@ -2334,6 +2416,9 @@ def _plan_read(read: dict) -> dict:
         "diagnostic_open_policy",
         "target_window_follow_on_context",
         "suppressed_from_answer_facing",
+        "parent_main_anchor_recovery_candidate",
+        "canonical_history_candidate",
+        "fail_closed_before_answer",
     ):
         if key in read:
             planned[key] = read.get(key)
@@ -2575,15 +2660,23 @@ def _copy_openable_fields(read: dict, source: dict) -> None:
 
 def _agent_instruction(selected_anchor: dict | None, session_activity: dict, next_reads: list[dict]) -> dict:
     first_read = next_reads[0] if next_reads else {}
-    return {
-        "first_read_target": first_read.get("openable_target") or first_read.get("source_ref"),
-        "first_read_command": first_read.get("read_more_command"),
-        "stop_condition": (
+    if not selected_anchor and first_read.get("parent_main_anchor_recovery_candidate"):
+        stop_condition = (
+            "Open the parent/main recovery candidate to prove the canonical history.jsonl anchor, then rerun "
+            "with that timestamp or quoted message. Do not answer from visible context, current worker/reviewer "
+            "prompts, task/report artifacts, commits, or repo state while selected_anchor is null."
+        )
+    else:
+        stop_condition = (
             "Start with the selected anchor read-more command, then inspect raw sessions/**/*.jsonl "
             "activity after the anchor before task/report/review artifacts. Commits, merges, and current "
             "repo state are secondary evidence only; do not give a commit-only or repo-status-only answer, "
             "and do not run broad directory lookup unless the direct raw JSONL reads fail or contradict each other."
-        ),
+        )
+    return {
+        "first_read_target": first_read.get("openable_target") or first_read.get("source_ref"),
+        "first_read_command": first_read.get("read_more_command"),
+        "stop_condition": stop_condition,
         "direct_anchor_openable": bool(selected_anchor and selected_anchor.get("openable_target")),
         "raw_session_trace_status": session_activity.get("status"),
         "commit_only_answer_allowed": False,
@@ -2597,18 +2690,31 @@ def _fail_closed_guidance(
     session_activity: dict,
 ) -> dict:
     if not selected_anchor:
+        parent_main_recovery = anchor_decision.get("anchor_scope") == "parent_thread"
+        guidance = (
+            "Fail closed: no human-authored anchor was selected. Do not answer from visible context, "
+            "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
+            "and rejected alternatives first, then rerun with an explicit timestamp/quoted-message anchor if needed."
+        )
+        candidate_fields = [
+            "anchor_candidates",
+            "anchor_decision.rejected_anchor_alternatives",
+        ]
+        if parent_main_recovery:
+            guidance = (
+                "Fail closed: no canonical parent/main history.jsonl anchor was selected. Open only the "
+                "parent/main anchor recovery candidate reads (parent_main_anchor_recovery_candidate) to prove the "
+                "intended parent/main anchor, then rerun with that timestamp or quoted message. Do not answer from "
+                "visible context, inherited summaries, current worker/reviewer prompts, task/report artifacts, "
+                "commits, repo status, or current-session handoff snippets while selected_anchor is null."
+            )
+            candidate_fields.append("source_tiers.required_primary[parent_main_anchor_recovery_candidate]")
         return {
             "mode": "candidate_anchors_required_before_answer",
             "answer_allowed": False,
-            "guidance": (
-                "Fail closed: no human-authored anchor was selected. Do not answer from visible context, "
-                "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
-                "and rejected alternatives first, then rerun with an explicit timestamp/quoted-message anchor if needed."
-            ),
-            "candidate_fields": [
-                "anchor_candidates",
-                "anchor_decision.rejected_anchor_alternatives",
-            ],
+            "guidance": guidance,
+            "candidate_fields": candidate_fields,
+            "parent_main_recovery_required": parent_main_recovery,
         }
     raw_status = session_activity.get("status")
     answer_allowed = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
