@@ -89,6 +89,7 @@ NON_ANCHOR_CONTEXT_MARKERS = (
 
 WORKER_PROMPT_MARKERS = (
     "you are the jsh-",
+    "you are the focused fix worker",
     "you are the high-reasoning implementer",
     "you are the implementer/runner",
     "you are the independent reviewer",
@@ -126,6 +127,27 @@ WORKER_PROMPT_MARKERS = (
     "acceptance criteria:",
     "read first:",
     "<turn_aborted>",
+)
+
+STATUS_BOUNDARY_PROMPT_MARKERS = WORKER_PROMPT_MARKERS + (
+    "adversarial smoke",
+    "after a failed review",
+    "current head includes failed review artifact",
+    "do not edit the parent checkout",
+    "do not edit the review artifact",
+    "failed review artifact",
+    "fix requirements:",
+    "fsm state:",
+    "live cli adversarial smoke",
+    "post-status spawned worker",
+    "pressure artifact",
+    "pressure prompt",
+    "review blocker",
+    "review blocker to fix",
+    "reviewer-cited path",
+    "status-shaped pressure",
+    "task worktree",
+    "worker/pressure prompt",
 )
 
 SUBSTANTIVE_WORK_MARKERS = (
@@ -463,9 +485,16 @@ def _rank_anchor_candidates(
 
 
 def _status_query_cutoff(messages: list[dict]) -> str | None:
+    current_status = _current_status_message(messages)
+    if current_status:
+        return str(current_status.get("timestamp_utc") or "") or None
     for message in messages:
         timestamp = str(message.get("timestamp_utc") or "")
-        if timestamp and is_status_question(str(message.get("snippet") or "")):
+        if (
+            timestamp
+            and is_status_question(str(message.get("snippet") or ""))
+            and not _is_status_boundary_prompt_noise(message)
+        ):
             return timestamp
     return None
 
@@ -1026,6 +1055,7 @@ def _current_status_message(messages: list[dict]) -> dict | None:
         (index, message)
         for index, message in enumerate(messages)
         if is_status_question(str(message.get("snippet") or ""))
+        and not _is_status_boundary_prompt_noise(message)
     ]
     if not status_messages:
         return None
@@ -1046,6 +1076,70 @@ def _current_status_message(messages: list[dict]) -> dict | None:
     current["message_index"] = first_index
     current["thread_keys"] = _message_thread_keys(first_message)
     return current
+
+
+def _is_status_boundary_prompt_noise(message: dict) -> bool:
+    text = str(message.get("snippet") or "")
+    normalized = _normalize(text)
+    if not normalized:
+        return True
+    if any(marker in normalized for marker in STATUS_BOUNDARY_PROMPT_MARKERS):
+        return True
+    if _looks_like_task_prompt(normalized):
+        return True
+    return any(_mirror_source_looks_like_prompt_noise(mirror) for mirror in message.get("mirror_sources") or [])
+
+
+def _looks_like_task_prompt(normalized: str) -> bool:
+    taskish = (
+        "acceptance criteria:" in normalized
+        or "branch:" in normalized
+        or "checks run" in normalized
+        or "current head" in normalized
+        or "do not revert" in normalized
+        or "review artifact" in normalized
+        or "run:" in normalized
+        or "work only in" in normalized
+        or "worktree:" in normalized
+    )
+    role_or_process = (
+        "fix worker" in normalized
+        or "implementation worker" in normalized
+        or "implementer" in normalized
+        or "reviewer" in normalized
+        or "worker" in normalized
+        or "failed review" in normalized
+        or "pressure run" in normalized
+        or "eval" in normalized
+    )
+    return taskish and role_or_process
+
+
+def _mirror_source_looks_like_prompt_noise(mirror: object) -> bool:
+    if not isinstance(mirror, Mapping):
+        return False
+    text = _normalize(
+        " ".join(
+            str(mirror.get(key) or "")
+            for key in (
+                "source_ref",
+                "source_identifier",
+                "thread_key",
+            )
+        )
+    )
+    return any(
+        marker in text
+        for marker in (
+            "worker",
+            "reviewer",
+            "pressure",
+            "eval",
+            "manual_default",
+            "jsonl_current",
+            "jsonl-layered",
+        )
+    )
 
 
 def _first_eligible_thread_anchor(candidates: list[dict], thread_keys: set[str], *, same_thread: bool) -> dict | None:
