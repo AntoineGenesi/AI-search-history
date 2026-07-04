@@ -533,7 +533,17 @@ def _select_anchor_with_boundary(
             candidates,
         )
     if is_status_question(query):
+        prefer_parent = _prefers_parent_main_anchor(query)
         status_message = _current_status_message(messages)
+        if not status_message and prefer_parent:
+            return {
+                **base,
+                "context_boundary": "explicit_parent_main_status_boundary_missing",
+                "anchor_scope": "parent_thread",
+                "anchor_reason": "no_status_question_boundary_for_parent_main_anchor",
+                "selected_anchor": None,
+                "rejected_anchor_alternatives": _unproven_parent_main_status_boundary_alternatives(candidates),
+            }
         if status_message:
             status_ref = status_message.get("source_ref")
             status_index = int(status_message.get("message_index", 0))
@@ -547,7 +557,6 @@ def _select_anchor_with_boundary(
                 key=lambda item: int(item.get("message_index", 0)),
             )
             same_thread_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=True)
-            prefer_parent = _prefers_parent_main_anchor(query)
             explicit_side_thread_local = _explicit_side_thread_local_status(query)
             parent_anchor = None
             if prefer_parent:
@@ -963,6 +972,31 @@ def _unproven_parent_main_anchor_alternatives(candidates: list[dict], thread_key
     return alternatives
 
 
+def _unproven_parent_main_status_boundary_alternatives(candidates: list[dict]) -> list[dict]:
+    alternatives = []
+    for candidate in candidates:
+        if not _is_never_anchor(candidate) and not _is_eligible_anchor(candidate):
+            continue
+        alternatives.append(
+            {
+                "source_ref": candidate.get("source_ref"),
+                "timestamp_utc": candidate.get("timestamp_utc"),
+                "classification": candidate.get("classification"),
+                "decision": "rejected",
+                "rationale": _parent_main_boundary_missing_rationale(candidate),
+                "snippet": candidate.get("snippet"),
+                "source_kind": candidate.get("source_kind"),
+                "openable_source_ref": candidate.get("openable_source_ref"),
+                "openable_target": candidate.get("openable_target"),
+                "target_window_hits": candidate.get("target_window_hits") or [],
+                "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+            }
+        )
+        if len(alternatives) >= 8:
+            break
+    return alternatives
+
+
 def _parent_main_rejection_rationale(candidate: dict) -> str:
     source_kind = candidate.get("source_kind")
     if source_kind == "codex_sessions" and _is_eligible_anchor(candidate):
@@ -971,6 +1005,17 @@ def _parent_main_rejection_rationale(candidate: dict) -> str:
             + "; rejected for explicit parent/main status because no codex_history:history.jsonl parent anchor or history mirror proves this row"
         )
     return str(candidate.get("rationale") or "")
+
+
+def _parent_main_boundary_missing_rationale(candidate: dict) -> str:
+    rationale = str(candidate.get("rationale") or "").rstrip()
+    suffix = (
+        "rejected for explicit parent/main status because the current status-question boundary was not found "
+        "in the searched history/session candidates; selecting a ranked latest interval would be ambiguous"
+    )
+    if candidate.get("source_kind") == "codex_sessions" and _is_eligible_anchor(candidate):
+        suffix += " and no canonical history.jsonl parent anchor or history mirror proves this row"
+    return f"{rationale}; {suffix}" if rationale else suffix
 
 
 def _is_eligible_anchor(candidate: dict) -> bool:
