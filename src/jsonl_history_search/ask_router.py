@@ -240,6 +240,7 @@ ROUTES: tuple[AskRoute, ...] = (
         inspect_after=(
             "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
             "status_anchor.anchor_candidates and selected_anchor",
+            "for main-thread wording, selected_anchor should be the human history.jsonl row, with session/current-context candidates only as follow-up or rejected detail",
             "status_anchor.session_activity raw sessions/**/*.jsonl trace after the anchor",
             "source_tiers and next_reads only as debugging detail after the follow-through plan leaves a named gap",
         ),
@@ -248,7 +249,9 @@ ROUTES: tuple[AskRoute, ...] = (
             "status_anchor.follow_through_plan first: open_first required primary refs, then_confirm "
             "target-window secondary refs, and do_not_open_by_default diagnostics. Do not rerun "
             "JSON/JQ extraction, open diagnostic/post-window refs, or broaden manual search unless "
-            "a named status facet remains missing or contradictory after the plan reads."
+            "a named status facet remains missing or contradictory after the plan reads. For "
+            "main-thread/parent-thread status wording, do not answer from inherited context or a "
+            "current-session prompt when the selected anchor is not a human history.jsonl row."
         ),
         manual_search_guidance=(
             "Repo or task scans are follow-up only after the follow-through plan identifies "

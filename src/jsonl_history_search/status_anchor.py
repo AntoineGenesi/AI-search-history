@@ -407,6 +407,7 @@ def _rank_anchor_candidates(messages: list[dict], *, target_window: dict | None 
                 "message_index": index,
                 "thread_key": message.get("thread_key"),
                 "thread_keys": _message_thread_keys(message),
+                "mirror_sources": message.get("mirror_sources") or [],
                 "snippet": text,
                 "classification": classification,
                 "score": score,
@@ -906,13 +907,15 @@ def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) 
     for candidate in candidates:
         if _thread_key_overlap(candidate, thread_keys):
             continue
-        if candidate.get("source_kind") != "codex_history":
-            continue
         if _is_never_anchor(candidate):
             continue
         if candidate.get("decision") not in {"selected_candidate", "fallback_candidate"}:
             continue
-        return candidate
+        if candidate.get("source_kind") == "codex_history":
+            return candidate
+        history_mirror = _history_mirror_candidate(candidate)
+        if history_mirror:
+            return history_mirror
     return None
 
 
@@ -942,6 +945,32 @@ def _message_thread_keys(message: dict) -> list[str]:
         if mirror_key:
             keys.add(str(mirror_key))
     return sorted(keys)
+
+
+def _history_mirror_candidate(candidate: dict) -> dict | None:
+    for mirror in candidate.get("mirror_sources") or []:
+        if not isinstance(mirror, dict):
+            continue
+        if mirror.get("source_kind") != "codex_history":
+            continue
+        selected = dict(candidate)
+        for key in (
+            "source_kind",
+            "source_ref",
+            "source_identifier",
+            "thread_key",
+            "openable_source_ref",
+            "openable_target",
+        ):
+            if key in mirror:
+                selected[key] = mirror.get(key)
+        selected["thread_keys"] = _message_thread_keys(selected)
+        selected["rationale"] = (
+            str(selected.get("rationale") or "").rstrip()
+            + "; selected the canonical history.jsonl mirror for explicit parent/main-thread intent"
+        )
+        return selected
+    return None
 
 
 def _selected_with_reason(candidate: dict, reason_suffix: str) -> dict:
