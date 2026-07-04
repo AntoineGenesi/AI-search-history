@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .agent_command_cookbook import agent_question_cookbook
 from .sources import Limits, build_source_plan
 
 
@@ -99,6 +100,7 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
         "validate_global_command": (
             "jsonl-history-search validate-install --codex-home ~/.codex --format text"
         ),
+        "agent_question_cookbook": agent_question_cookbook(),
         "jsh1098_route_demos": _jsh1098_route_demos(),
         "claim_boundary": (
             "JSH-1098 showed sampled lower-burden source-window routing, not "

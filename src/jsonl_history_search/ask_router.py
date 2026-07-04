@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from .agent_command_cookbook import agent_question_cookbook, ask_next_commands
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
 
@@ -359,6 +360,7 @@ ROUTES: tuple[AskRoute, ...] = (
 
 def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
+    first_command = route.first_command(query)
     return {
         "ask_router": {
             "status": "matched",
@@ -367,7 +369,12 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
             "why_it_applies": route.why_it_applies,
-            "first_command": route.first_command(query),
+            "first_command": first_command,
+            "next_commands": ask_next_commands(
+                selected_first_command=first_command,
+                route_family=route.route_family,
+            ),
+            "command_cookbook": agent_question_cookbook(),
             "read_specialization": route.read_specialization,
             "inspect_after": list(route.inspect_after),
             "stop_guidance": route.stop_guidance,

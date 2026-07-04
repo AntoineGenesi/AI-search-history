@@ -172,6 +172,20 @@ Developer note: this full inventory includes benchmark, harness, eval,
 diagnostic, and proof commands for local product work. Do not treat their
 presence here as a public first-run path or as evidence of release readiness,
 token savings, all-history coverage, or broad superiority.
+
+Internal command groups:
+  Agent-facing front doors:
+    ask, semantic-debug, what-happened-since, semantic-wrapup,
+    artifact-currentness, skill-check/skill-audit, no-evidence-report,
+    read-more, follow-next-reads, find
+  Local diagnostics:
+    validate-install, diagnose-capabilities, discover-jsonl,
+    structured-tool-events, workflow-repeat-finder, forensics,
+    local-evidence-diagnostic, failure-analysis
+  Eval/benchmark/proof machinery:
+    benchmark, benchmark-real-history-impact, mechanism-eval,
+    eval-decision-loop, agent-use-value-*, validate-harness-artifacts,
+    harness-*, real-history-*, archive, and embedding experiments
 """
 
 
