@@ -1141,6 +1141,13 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         lines.append("Failure modes:")
         for mode in report["failure_modes"][:8]:
             lines.append(f"- {mode.get('failure_mode')}: {mode.get('title')} evidence={mode.get('evidence_count')}")
+            if mode.get("issue_axis"):
+                lines.append(f"  axis: {mode.get('issue_axis')}")
+            if mode.get("why_it_matters"):
+                lines.append(f"  why it matters: {mode.get('why_it_matters')}")
+            for example in (mode.get("examples") or [])[:2]:
+                ref = example.get("source_ref") or {}
+                lines.append(f"  example: {ref.get('path')}:{ref.get('line')} {example.get('snippet')}")
             for ref in mode.get("source_refs", [])[:3]:
                 lines.append(f"  ref: {ref.get('path')}:{ref.get('line')}")
             cause_chain = mode.get("cause_chain") or {}
@@ -1155,7 +1162,19 @@ def render_semantic_wrapup_text(payload: dict) -> str:
                 f"- {suggestion.get('suggestion_id')} {suggestion.get('fix_type')} -> "
                 f"{dest.get('path')}: {suggestion.get('proposed_action')}"
             )
+            if suggestion.get("issue_axis"):
+                lines.append(f"  axis: {suggestion.get('issue_axis')}")
+            if suggestion.get("why_it_matters"):
+                lines.append(f"  why it matters: {suggestion.get('why_it_matters')}")
+            if suggestion.get("doable_suggested_fix"):
+                lines.append(f"  doable fix: {suggestion.get('doable_suggested_fix')}")
             lines.append(f"  destination rationale: {suggestion.get('destination_rationale')}")
+            criteria = suggestion.get("acceptance_criteria") or []
+            if criteria:
+                lines.append(f"  acceptance criteria: {'; '.join(criteria[:3])}")
+            for example in (suggestion.get("examples") or [])[:2]:
+                ref = example.get("source_ref") or {}
+                lines.append(f"  example: {ref.get('path')}:{ref.get('line')} {example.get('snippet')}")
             decisions = [
                 option.get("decision")
                 for option in (suggestion.get("selection_shape") or {}).get("options", [])
@@ -1163,6 +1182,8 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             ] or list(suggestion.get("selection_options") or [])
             if decisions:
                 lines.append(f"  options: {', '.join(decisions)}")
+            if suggestion.get("suggestion_only_contract"):
+                lines.append(f"  contract: {suggestion.get('suggestion_only_contract')}")
     if reads:
         lines.append("Next reads:")
         for read in reads[:8]:
@@ -1351,8 +1372,17 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             lines.append(f"### {mode.get('title')}")
             lines.append("")
             lines.append(f"- Label: `{mode.get('failure_mode')}`")
+            if mode.get("issue_axis"):
+                lines.append(f"- Issue axis: `{mode.get('issue_axis')}`")
+            if mode.get("why_it_matters"):
+                lines.append(f"- Why it matters: {mode.get('why_it_matters')}")
             lines.append(f"- Evidence count: `{mode.get('evidence_count')}`")
             lines.append(f"- Confidence: `{mode.get('confidence')}`")
+            if mode.get("examples"):
+                lines.append("- Examples:")
+                for example in mode.get("examples", [])[:3]:
+                    ref = example.get("source_ref") or {}
+                    lines.append(f"  - `{ref.get('path')}:{ref.get('line')}` {example.get('snippet')}")
             lines.append("- Source refs:")
             for ref in mode.get("source_refs", [])[:5]:
                 lines.append(f"  - `{ref.get('path')}:{ref.get('line')}`")
@@ -1371,8 +1401,24 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         for suggestion in report["fix_suggestions"][:10]:
             dest = suggestion.get("proposed_destination") or {}
             lines.append(f"- `{suggestion.get('suggestion_id')}` `{suggestion.get('fix_type')}` -> `{dest.get('path')}`")
+            lines.append(f"  - Issue family: `{suggestion.get('issue_family') or suggestion.get('failure_mode')}`")
+            if suggestion.get("issue_axis"):
+                lines.append(f"  - Issue axis: `{suggestion.get('issue_axis')}`")
+            if suggestion.get("why_it_matters"):
+                lines.append(f"  - Why it matters: {suggestion.get('why_it_matters')}")
             lines.append(f"  - {suggestion.get('proposed_action')}")
+            if suggestion.get("doable_suggested_fix"):
+                lines.append(f"  - Doable suggested fix: {suggestion.get('doable_suggested_fix')}")
             lines.append(f"  - Destination rationale: {suggestion.get('destination_rationale')}")
+            if suggestion.get("acceptance_criteria"):
+                lines.append("  - Acceptance criteria:")
+                for criterion in suggestion.get("acceptance_criteria", [])[:5]:
+                    lines.append(f"    - {criterion}")
+            if suggestion.get("examples"):
+                lines.append("  - Examples:")
+                for example in suggestion.get("examples", [])[:3]:
+                    ref = example.get("source_ref") or {}
+                    lines.append(f"    - `{ref.get('path')}:{ref.get('line')}` {example.get('snippet')}")
             for ref in (suggestion.get("destination_source_refs") or suggestion.get("destination_refs") or [])[:3]:
                 lines.append(f"  - Destination ref: `{ref.get('path')}:{ref.get('line')}`")
             lines.append(f"  - Auto-apply: `{suggestion.get('auto_apply')}`")
@@ -1383,6 +1429,8 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             ] or list(suggestion.get("selection_options") or [])
             if decisions:
                 lines.append(f"  - Selection options: `{', '.join(decisions)}`")
+            if suggestion.get("suggestion_only_contract"):
+                lines.append(f"  - Contract: {suggestion.get('suggestion_only_contract')}")
     if reads:
         lines.extend(["", "## Next Reads", ""])
         for read in reads[:8]:

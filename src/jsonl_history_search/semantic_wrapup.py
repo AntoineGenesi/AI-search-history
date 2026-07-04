@@ -132,6 +132,31 @@ CURRENT_SESSION_SOURCE_FACETS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
     {
+        "label": "dirty_parent_worktree_hygiene",
+        "terms": (
+            "dirty parent",
+            "parent checkout",
+            "parent master",
+            "wrong checkout",
+            "task worktree",
+            "isolated worktree",
+            "stale dirty worktree",
+            "stale worktree",
+            "worktree state",
+            "worktree-hidden",
+            "git worktree",
+            "git status",
+        ),
+        "fix_type": "worktree/currentness workflow update",
+        "preferred_path": "codex/state/pipeline-state.md",
+        "preferred_kinds": ("pipeline_state", "orchestration_rule", "active_task", "task_front_door"),
+        "inferred_steps": (
+            "Parent checkout, task worktree, or remaining worktree state became ambiguous.",
+            "Agents could validate, edit, or hand off from the wrong tree.",
+            "Before next-loop readiness, the workflow needs explicit parent/worktree classification and source-backed status proof.",
+        ),
+    },
+    {
         "label": "packet_report_bureaucracy",
         "terms": ("packet", "packets", "report", "reports", "schema", "fields", "bureaucracy", "process REDACTED"),
         "fix_type": "CLI/output behavior change",
@@ -207,8 +232,8 @@ FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
         "label": "fsm_goal_selection_and_rabbithole",
         "terms": ("fsm", "rabbithole", "rabbit hole", "goal", "loops", "small REDACTEDy tasks", "coordinate"),
         "fix_type": "project rule/doc update",
-        "preferred_path": "docs/next-fsm-loops-agent-facing-jsonl-plan.md",
-        "preferred_kinds": ("fsm_plan", "orchestration_rule", "pipeline_state"),
+        "preferred_path": "codex/state/pipeline-state.md",
+        "preferred_kinds": ("pipeline_state", "orchestration_rule", "task_front_door"),
         "inferred_steps": (
             "FSM chooses small/process goals or keeps adding chores.",
             "Substantial product blocker remains unresolved.",
@@ -366,6 +391,81 @@ FRICTION_MARKERS = (
     "REDACTED",
     "useless",
 )
+
+ISSUE_AXIS_BY_LABEL = {
+    "case002_retrieval_escalation": "product_tool_issue",
+    "packet_report_bureaucracy": "product_tool_issue",
+    "router_context_hygiene": "skill_runtime_issue",
+    "agent_rules_ignored": "skill_runtime_issue",
+    "assistant_repeated_wrong_rule": "skill_runtime_issue",
+    "raw_local_evidence_boundary": "evidence_handoff_issue",
+    "false_user_quote_or_misattribution": "evidence_handoff_issue",
+    "pre_compaction_plan_preservation": "evidence_handoff_issue",
+    "fix_later_note_not_promoted": "evidence_handoff_issue",
+    "memory_learning_update_needed": "evidence_handoff_issue",
+    "dirty_parent_worktree_hygiene": "agent_workflow_issue",
+    "fsm_goal_selection_and_rabbithole": "agent_workflow_issue",
+    "stop_pause_resume_direction_change": "agent_workflow_issue",
+    "reviewer_proof_claim_boundary": "agent_workflow_issue",
+    "product_delta_integration_staleness": "agent_workflow_issue",
+    "same_task_repair_boundary": "agent_workflow_issue",
+    "stale_issue_or_ticket_reused": "agent_workflow_issue",
+}
+
+WHY_IT_MATTERS_BY_LABEL = {
+    "dirty_parent_worktree_hygiene": (
+        "Dirty parent or stale worktree ambiguity can make a coordinator believe a task is ready "
+        "while changes, task notes, or proof live in the wrong checkout or wrong tree."
+    ),
+    "packet_report_bureaucracy": (
+        "Report/schema work can consume the loop while the user still lacks better source finding, source inspection, or release evidence."
+    ),
+    "router_context_hygiene": (
+        "Wrong routing or broad context loading makes the tool harder to use and can hide the narrow source path the user asked for."
+    ),
+    "false_user_quote_or_misattribution": (
+        "Misquoting the user turns a correction into false durable context and makes later retrieval/debugging less trustworthy."
+    ),
+    "case002_retrieval_escalation": (
+        "Search escalation after sufficient primary evidence increases agent burden and can make JSONL look worse than manual inspection."
+    ),
+    "pre_compaction_plan_preservation": (
+        "If current plans are lost across compaction, future agents restart from stale provenance or ask the user to recover context."
+    ),
+    "raw_local_evidence_boundary": (
+        "Local product diagnosis needs raw source paths and trace evidence; sanitized summaries alone often cannot explain the failure."
+    ),
+    "fsm_goal_selection_and_rabbithole": (
+        "Small process loops can crowd out the substantial product blocker the release decision depends on."
+    ),
+    "stop_pause_resume_direction_change": (
+        "Stop, pause, resume, and direction-change boundaries are controlling instructions; missing them causes agents to continue stale work."
+    ),
+    "agent_rules_ignored": (
+        "Ignored local behavior rules create repeat failures that cannot be fixed by search output alone."
+    ),
+    "fix_later_note_not_promoted": (
+        "Deferred fixes disappear unless the user can explicitly accept, reject, or defer a durable task/update."
+    ),
+    "stale_issue_or_ticket_reused": (
+        "Stale ticket state can send agents to closed or obsolete work instead of current source-backed direction."
+    ),
+    "assistant_repeated_wrong_rule": (
+        "A repeated wrong rule shows the correction did not reach the behavior surface that future agents actually use."
+    ),
+    "memory_learning_update_needed": (
+        "A requested durable lesson needs a source-backed destination or the same failure can recur after the session."
+    ),
+    "reviewer_proof_claim_boundary": (
+        "Weak review/proof boundaries let implementation summaries outrun verified evidence and acceptance criteria."
+    ),
+    "product_delta_integration_staleness": (
+        "Branch-only, dirty, or unintegrated deltas can make later work build on stale assumptions."
+    ),
+    "same_task_repair_boundary": (
+        "Fixable review/setup findings should not become unrelated follow-up tasks, but real product blockers must not be hidden."
+    ),
+}
 
 
 def build_semantic_wrapup_payload(
@@ -1237,11 +1337,20 @@ def _active_task_destinations(cwd: Path) -> list[tuple[str, str]]:
         text = state.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    destinations = []
-    for match in re.findall(r"tasks/[A-Za-z0-9._/\-]+\.md", text):
-        if (cwd / match).is_file():
-            destinations.append(("active_task", match))
-            break
+    destinations: list[tuple[str, str]] = []
+    targeted_patterns = (
+        r"active_task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+        r"Recommended next task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+        r"Recommended next task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+        r"Current task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+    )
+    for pattern in targeted_patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            if match.lower().endswith("none.md"):
+                continue
+            if (cwd / match).is_file():
+                destinations.append(("active_task", match))
+                return destinations
     return destinations
 
 
@@ -1312,7 +1421,57 @@ def _complaint_signals(records, *, query: str) -> list[dict]:
                 **row,
             }
         )
+    _promote_repeated_issue_families(signals)
     return signals
+
+
+def _promote_repeated_issue_families(signals: list[dict]) -> None:
+    dirty_worktree_signals = [
+        signal for signal in signals if _is_dirty_worktree_hygiene_signal(str(signal.get("snippet") or ""))
+    ]
+    if len(dirty_worktree_signals) >= 2:
+        for signal in dirty_worktree_signals:
+            labels = signal.setdefault("labels", [])
+            if "dirty_parent_worktree_hygiene" not in labels:
+                labels.insert(0, "dirty_parent_worktree_hygiene")
+
+
+def _is_dirty_worktree_hygiene_signal(text: str) -> bool:
+    normalized = _normalize(text)
+    has_worktree_or_parent = any(
+        term in normalized
+        for term in (
+            "dirty parent",
+            "parent checkout",
+            "parent master",
+            "wrong checkout",
+            "task worktree",
+            "isolated worktree",
+            "stale dirty worktree",
+            "stale worktree",
+            "worktree-hidden",
+            "worktree state",
+            "git worktree",
+        )
+    )
+    has_status_or_confusion = any(
+        term in normalized
+        for term in (
+            "dirty",
+            "clean",
+            "status",
+            "stale",
+            "hidden",
+            "wrong",
+            "explain",
+            "prove",
+            "edit",
+            "edited",
+            "changes",
+            "git status",
+        )
+    )
+    return has_worktree_or_parent and has_status_or_confusion
 
 
 def _substantive_signals(signals: list[dict]) -> list[dict]:
@@ -1552,6 +1711,9 @@ def _failure_modes(signals: list[dict]) -> list[dict]:
                 "title": _title_for(label),
                 "evidence_count": len(items),
                 "evidence": evidence,
+                "examples": _examples_from_evidence(evidence),
+                "why_it_matters": _why_it_matters(label),
+                "issue_axis": _issue_axis(label),
                 "cause_chain": _cause_chain(label, evidence),
                 "confidence": "high" if len(items) >= 2 else "medium",
                 "uncertainty": _uncertainty(label, len(items)),
@@ -1573,6 +1735,10 @@ def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[d
             {
                 "suggestion_id": f"fix-{index:03d}",
                 "failure_mode": label,
+                "issue_family": label,
+                "issue_axis": _issue_axis(label),
+                "examples": mode.get("examples") or _examples_from_evidence(mode.get("evidence", [])),
+                "why_it_matters": mode.get("why_it_matters") or _why_it_matters(label),
                 "fix_type": pattern["fix_type"],
                 "proposed_destination": destination,
                 "destination_refs": destination.get("source_refs", []),
@@ -1581,12 +1747,20 @@ def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[d
                 "user_selectable": True,
                 "auto_apply": False,
                 "proposed_action": _proposed_action(label, destination),
+                "doable_suggested_fix": _doable_suggested_fix(label, destination),
+                "acceptance_criteria": _acceptance_criteria(label, destination),
                 "evidence_refs": mode["source_refs"],
+                "source_refs": mode["source_refs"],
                 "selection_options": ["accept", "reject", "defer"],
                 "selection_shape": {
                     "required_decision": "accept_reject_or_defer",
                     "options": selection_options,
+                    "contract": "suggestion_only_normal_fsm_required",
                 },
+                "suggestion_only_contract": (
+                    "This suggestion is not applied by semantic-wrapup; accept/reject/defer it, "
+                    "then implement accepted fixes through the normal task/FSM workflow."
+                ),
                 "confidence": mode["confidence"],
                 "uncertainty": mode["uncertainty"],
             }
@@ -1727,6 +1901,10 @@ def _destination_rank(item: dict, pattern: dict[str, Any], mode: dict, preferred
 
     if _looks_archived_or_private_destination(path):
         score -= 2000
+    if _looks_stale_plan_destination(path):
+        score -= 450
+    if _looks_closed_task_destination(item, mode):
+        score -= 650
     if kind == "task_files" and not path.casefold() in evidence_text:
         score -= 120
     return score, -len(path), path
@@ -1758,8 +1936,37 @@ def _looks_archived_or_private_destination(path: str) -> bool:
     return lowered.startswith(".private/") or lowered.startswith(".tmp/plugins/") or "/.private/" in lowered or "/.tmp/plugins/" in lowered
 
 
+def _looks_stale_plan_destination(path: str) -> bool:
+    lowered = path.casefold()
+    return (
+        lowered.startswith("docs/next-")
+        or "old" in lowered
+        or "historical" in lowered
+        or "graveyard" in lowered
+    )
+
+
+def _looks_closed_task_destination(item: dict, mode: dict) -> bool:
+    path = str(item.get("path") or "")
+    kind = str(item.get("kind") or "")
+    if not path.startswith("tasks/"):
+        return False
+    if kind == "active_task":
+        return False
+    evidence_text = " ".join(str(entry.get("snippet") or "") for entry in mode.get("evidence", [])).casefold()
+    if path.casefold() in evidence_text:
+        return False
+    lowered_name = Path(path).name.casefold()
+    return any(term in lowered_name for term in ("closed", "old", "previous", "provenance"))
+
+
 def _proposed_action(label: str, destination: dict) -> str:
     path = destination.get("path")
+    if label == "dirty_parent_worktree_hygiene":
+        return (
+            f"Add or tighten {path} so handoff/next-loop readiness includes parent `git status`, "
+            "`git worktree list`, remaining worktree classification, and whether edits happened in parent or task worktree."
+        )
     if label == "packet_report_bureaucracy":
         return f"Tighten {path} so packet/report fields are allowed only when they improve source finding or inspection."
     if label == "router_context_hygiene":
@@ -1785,6 +1992,55 @@ def _proposed_action(label: str, destination: dict) -> str:
     if label == "memory_learning_update_needed":
         return f"Record the source-backed lesson in {path} so the same failure is less likely to recur."
     return f"Create or amend {path} with a source-backed fix for {label}."
+
+
+def _examples_from_evidence(evidence: list[dict]) -> list[dict]:
+    examples = []
+    for item in evidence[:3]:
+        examples.append(
+            {
+                "source_ref": item.get("source_ref"),
+                "snippet": item.get("snippet"),
+            }
+        )
+    return examples
+
+
+def _issue_axis(label: str) -> str:
+    return ISSUE_AXIS_BY_LABEL.get(label, "agent_workflow_issue")
+
+
+def _why_it_matters(label: str) -> str:
+    return WHY_IT_MATTERS_BY_LABEL.get(
+        label,
+        "The repeated source-backed complaint indicates a workflow failure that needs user selection before any fix is applied.",
+    )
+
+
+def _doable_suggested_fix(label: str, destination: dict) -> str:
+    path = destination.get("path") or "(user decision needed)"
+    if label == "dirty_parent_worktree_hygiene":
+        return (
+            f"Propose a narrow update in {path}: before handoff or next-loop readiness, require "
+            "`git status --short --branch`, `git worktree list`, classification of parent dirt/remaining worktrees, "
+            "and an explicit statement of which checkout received edits."
+        )
+    return _proposed_action(label, destination)
+
+
+def _acceptance_criteria(label: str, destination: dict) -> list[str]:
+    path = destination.get("path") or "(user decision needed)"
+    if label == "dirty_parent_worktree_hygiene":
+        return [
+            "Repeated dirty parent/worktree complaints are grouped under `dirty_parent_worktree_hygiene`.",
+            "The selected workflow surface requires parent status and worktree-list proof before handoff or next-loop readiness.",
+            "The output remains suggestion-only; no task, skill, doc, or memory file is edited unless a user/coordinator accepts the suggestion.",
+        ]
+    return [
+        f"The accepted change targets {path} or a fresher user-selected destination after source inspection.",
+        "The fix is backed by the listed source refs and preserves the semantic-wrapup suggestion-only contract.",
+        "A reviewer can verify the behavior without reading unrelated private transcript context.",
+    ]
 
 
 def _destination_rationale(label: str, destination: dict, mode: dict) -> str:
