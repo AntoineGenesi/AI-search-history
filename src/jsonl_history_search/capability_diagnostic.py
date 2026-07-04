@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .agent_command_cookbook import agent_question_cookbook
 from .evaluation import build_efficiency_eval
 from .install_validation import default_package_root, validate_install
 from .records import parse_record
@@ -156,6 +157,7 @@ def build_capability_diagnostic(args) -> dict[str, Any]:
                     "no_worse_first_pass_hit_rate",
                 ],
             },
+            "agent_command_cookbook": agent_question_cookbook(),
             "examples": [
                 {
                     "label": "exact/path query",

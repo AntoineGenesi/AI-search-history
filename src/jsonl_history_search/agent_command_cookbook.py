@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+def agent_question_cookbook() -> list[dict[str, str]]:
+    return [
+        {
+            "id": "parent_anchor_status",
+            "question_family": "What happened since my last message?",
+            "route": "latest-status / what-happened-since",
+            "first_command": (
+                'jsonl-history-search ask "what happened since my last message in the main thread?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "status_anchor.follow_through_plan open_first, selected_anchor, "
+                "and raw sessions/**/*.jsonl activity after the anchor"
+            ),
+        },
+        {
+            "id": "complaint_mining",
+            "question_family": "What did I keep correcting or complaining about?",
+            "route": "semantic-wrapup",
+            "first_command": 'jsonl-history-search ask "what did I keep correcting?" --cwd "$PWD" --format text',
+            "inspect_next": "semantic_wrapup.failure_modes, fix_suggestions, complaint/correction source refs, and next_reads",
+        },
+        {
+            "id": "source_provenance",
+            "question_family": "Find the source session behind this report/task/review.",
+            "route": "semantic-debug",
+            "first_command": (
+                'jsonl-history-search ask "find the source session behind this report task or review" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": "semantic_debug.source_locator_handoff, source refs, next_reads, and linked task/review/git artifacts",
+        },
+        {
+            "id": "bounded_no_evidence",
+            "question_family": "Is there evidence for this inside the searched source scope?",
+            "route": "bounded-no-evidence / no-evidence-report",
+            "first_command": (
+                'jsonl-history-search ask "is there evidence that <claim> was discussed in this bounded source scope?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": "no_evidence_report.searched_scope, answer_scope, candidate_interpretation, and read_more_guidance",
+        },
+        {
+            "id": "action_proof",
+            "question_family": "What did the worker or agent actually do versus claim?",
+            "route": "action-proof / semantic-debug",
+            "first_command": (
+                'jsonl-history-search ask "what did the worker actually do versus claim?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": "tool_action_proof primary refs, command/tool events, diffs, commits, and review metadata",
+        },
+        {
+            "id": "read_more",
+            "question_family": "Read the exact source evidence returned by a route.",
+            "route": "read-more",
+            "first_command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
+            "inspect_next": "the concrete path:line source ref named by source_locator_handoff, next_reads, or follow_through_plan",
+        },
+    ]
+
+
+def ask_next_commands(*, selected_first_command: str, route_family: str) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = [
+        {
+            "purpose": "run selected first route",
+            "command": selected_first_command,
+            "inspect_next": "the route output's source refs, source locator handoff, follow-through plan, or no-evidence scope",
+        }
+    ]
+    for entry in agent_question_cookbook():
+        if _entry_applies_to_route(entry, route_family):
+            commands.append(
+                {
+                    "purpose": f"same-family example: {entry['question_family']}",
+                    "command": entry["first_command"],
+                    "inspect_next": entry["inspect_next"],
+                }
+            )
+            break
+    commands.append(
+        {
+            "purpose": "open exact source ref returned by the route",
+            "command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
+            "inspect_next": "replace <source-ref> with the concrete path:line from the preceding route output",
+        }
+    )
+    return commands
+
+
+def _entry_applies_to_route(entry: dict[str, str], route_family: str) -> bool:
+    entry_id = entry.get("id")
+    if route_family == "latest_status":
+        return entry_id == "parent_anchor_status"
+    if route_family == "semantic_wrapup":
+        return entry_id == "complaint_mining"
+    if route_family == "bounded_no_evidence":
+        return entry_id == "bounded_no_evidence"
+    if route_family == "action_proof":
+        return entry_id == "action_proof"
+    if route_family in {"orchestration_provenance", "semantic_debug", "remembered_topic", "process_actual_use"}:
+        return entry_id == "source_provenance"
+    return False

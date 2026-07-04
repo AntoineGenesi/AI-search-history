@@ -300,8 +300,16 @@ def render_ask_router_text(payload: dict) -> str:
         f"Chosen route: {report.get('chosen_route')}",
         f"Why: {report.get('why_it_applies')}",
         f"Read: {report.get('read_specialization')}",
-        "Inspect after:",
+        "Next commands:",
     ]
+    for item in report.get("next_commands", []):
+        lines.append(f"- {item.get('purpose')}: {item.get('command')}")
+        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    lines.append("Agent command cookbook:")
+    for item in report.get("command_cookbook", [])[:6]:
+        lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
+        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    lines.append("Inspect after:")
     for item in report.get("inspect_after", []):
         lines.append(f"- {item}")
     lines.extend(
@@ -330,9 +338,17 @@ def render_ask_router_markdown(payload: dict) -> str:
         f"- Why: {report.get('why_it_applies')}",
         f"- Read: `{report.get('read_specialization')}`",
         "",
-        "## Inspect After",
+        "## Next Commands",
         "",
     ]
+    for item in report.get("next_commands", []):
+        lines.append(f"- **{item.get('purpose')}**: `{item.get('command')}`")
+        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    lines.extend(["", "## Agent Command Cookbook", ""])
+    for item in report.get("command_cookbook", [])[:6]:
+        lines.append(f"- **{item.get('question_family')}**: `{item.get('first_command')}`")
+        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    lines.extend(["", "## Inspect After", ""])
     for item in report.get("inspect_after", []):
         lines.append(f"- `{item}`")
     lines.extend(
@@ -4054,6 +4070,12 @@ def render_capability_diagnostic_text(payload: dict) -> str:
     ]
     if report.get("report_written"):
         lines.append(f"Report written: {report['report_written']}")
+    cookbook = report.get("agent_command_cookbook") or []
+    if cookbook:
+        lines.append("Agent command cookbook:")
+        for item in cookbook[:6]:
+            lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
+            lines.append(f"  Inspect: {item.get('inspect_next')}")
     source_plan = report.get("source_plan", {})
     lines.append(
         "Source plan: "
@@ -4144,6 +4166,12 @@ def render_capability_diagnostic_markdown(payload: dict) -> str:
     ]
     if report.get("report_written"):
         lines.append(f"**Report written:** {report['report_written']}")
+    cookbook = report.get("agent_command_cookbook") or []
+    if cookbook:
+        lines.extend(["", "## Agent Command Cookbook", ""])
+        for item in cookbook[:6]:
+            lines.append(f"- **{item.get('question_family')}**: `{item.get('first_command')}`")
+            lines.append(f"  Inspect: {item.get('inspect_next')}")
     lines.extend(["", "## Capabilities", ""])
     for item in report.get("capabilities", {}).values():
         lines.append(
@@ -4843,6 +4871,12 @@ def render_install_validation_text(payload: dict) -> str:
             )
             lines.append(f"- Refresh command: {preflight.get('refresh_command')}")
         lines.append(f"- Validate global command: {preflight.get('validate_global_command')}")
+        cookbook = preflight.get("agent_question_cookbook") or []
+        if cookbook:
+            lines.append("- Agent command cookbook:")
+            for item in cookbook[:6]:
+                lines.append(f"  - {item.get('question_family')}: {item.get('first_command')}")
+                lines.append(f"    Inspect: {item.get('inspect_next')}")
         lines.append("- JSH-1098 proven route demos:")
         for demo in preflight.get("jsh1098_route_demos", []):
             lines.append(f"  - {demo.get('label')}: {demo.get('first_move')}")
@@ -4895,6 +4929,12 @@ def render_install_validation_markdown(payload: dict) -> str:
                 f"- Validate global command: `{preflight.get('validate_global_command')}`",
             ]
         )
+        cookbook = preflight.get("agent_question_cookbook") or []
+        if cookbook:
+            lines.extend(["", "### Agent Command Cookbook", ""])
+            for item in cookbook[:6]:
+                lines.append(f"- **{item.get('question_family')}**: `{item.get('first_command')}`")
+                lines.append(f"  Inspect: {item.get('inspect_next')}")
         stale = preflight.get("stale_or_missing_global_checks") or []
         if stale:
             lines.append(f"- Stale/missing global checks: `{', '.join(str(item) for item in stale)}`")
