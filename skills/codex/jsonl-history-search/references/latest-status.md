@@ -37,6 +37,12 @@ status packet if the selected anchor needs manual inspection.
      `JSH-1141 -> JSH-1143` or `JSH-1141 through JSH-1143`, treat that as the
      target window and prefer its source refs/work products over newer
      current-run recovery or eval artifacts.
+   - If the user says `main thread`, `parent thread`, or asks for the last
+     message before a side conversation, the anchor must be the human
+     `history.jsonl` row when available. Treat session mirrors, compact/current
+     context, worker prompts, reviewer prompts, and sidecar handoffs as
+     follow-up evidence or rejected alternatives, not as the main-thread
+     boundary.
 3. Follow `history.jsonl` session IDs into `sessions/**/*.jsonl`, then inspect
    the raw source refs/read-more commands before answering. Treat
    `source_tiers.required_primary` as the must-open first set.
