@@ -271,6 +271,11 @@ def status_anchor_report(
         target_window=target_window,
     )
     source_tiers = _source_tiers(next_reads)
+    follow_through_plan = _follow_through_plan(
+        source_tiers=source_tiers,
+        target_window=target_window,
+        session_activity=session_activity,
+    )
     suppressed_support = _suppressed_answer_facing_support(cwd, target_window=target_window)
     blind_spots = []
     if not selected_anchor:
@@ -344,6 +349,7 @@ def status_anchor_report(
         "evidence_contract": _evidence_contract(),
         "next_reads": next_reads,
         "source_tiers": source_tiers,
+        "follow_through_plan": follow_through_plan,
         "target_window": target_window,
         "suppressed_support": suppressed_support,
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
@@ -1823,6 +1829,151 @@ def _source_tiers(reads: list[dict]) -> dict:
             "diagnostic_optional stale/demo/example and same-run/private pressure refs are not answer-facing summary support"
         ),
     }
+
+
+def _follow_through_plan(
+    *,
+    source_tiers: dict,
+    target_window: dict | None,
+    session_activity: dict,
+) -> dict:
+    required_primary = list(source_tiers.get("required_primary") or [])
+    required_secondary = list(source_tiers.get("required_secondary") or [])
+    diagnostic_optional = list(source_tiers.get("diagnostic_optional") or [])
+    target_ids = list((target_window or {}).get("ids") or [])
+    audit_run_requested = bool(target_window and target_window.get("audit_run_requested"))
+    open_first = [_plan_read(read) for read in required_primary[:4]]
+    then_confirm = _follow_through_confirmation_groups(required_secondary, target_ids=target_ids)
+    do_not_open_by_default = [_plan_read(read) for read in diagnostic_optional[:8]]
+    named_gap = (
+        "a named target-window status facet remains missing or contradictory"
+        if target_ids and not audit_run_requested
+        else "a named status facet remains missing or contradictory"
+    )
+    if target_ids and not audit_run_requested:
+        stop_condition = (
+            "Open the required target-window primary raw ref first, then confirm the target-window "
+            "task/report/review/commit refs listed in then_confirm. Stop when those refs cover the "
+            "expected status facets; do not open diagnostic/post-window refs or rerun JSON/JQ unless "
+            f"{named_gap}."
+        )
+    else:
+        stop_condition = (
+            "Open required primary raw refs first, then confirm required secondary task/report/review/commit "
+            "refs. Stop when those refs cover the expected status facets; do not open diagnostics or rerun "
+            f"JSON/JQ unless {named_gap}."
+        )
+    return {
+        "status": "ready" if open_first or then_confirm else "no_follow_through_refs",
+        "open_first": open_first,
+        "then_confirm": then_confirm,
+        "do_not_open_by_default": do_not_open_by_default,
+        "stop_condition": stop_condition,
+        "read_more_boundary_warning": _read_more_boundary_warning(
+            target_window=target_window,
+            diagnostic_count=len(diagnostic_optional),
+        ),
+        "expected_status_answer_facets": _expected_status_answer_facets(
+            target_window=target_window,
+            session_activity=session_activity,
+        ),
+        "rerun_policy": (
+            "Use this plan before rerunning what-happened-since as JSON/JQ. Rerun only if the plan is missing, "
+            "internally contradictory, or a named expected facet remains unresolved after the listed reads."
+        ),
+    }
+
+
+def _follow_through_confirmation_groups(reads: list[dict], *, target_ids: list[str]) -> list[dict]:
+    groups = []
+    assigned: set[str] = set()
+    if target_ids:
+        for task_id in target_ids:
+            refs = []
+            for read in reads:
+                ref = str(read.get("source_ref") or "")
+                if ref in assigned:
+                    continue
+                if task_id.casefold() not in _target_window_read_text(read).casefold():
+                    continue
+                refs.append(_plan_read(read))
+                assigned.add(ref)
+            if refs:
+                groups.append(
+                    {
+                        "task_id": task_id,
+                        "refs": refs[:4],
+                        "purpose": "Confirm target-window task/report/review/commit status after open_first.",
+                    }
+                )
+    remaining = [_plan_read(read) for read in reads if str(read.get("source_ref") or "") not in assigned]
+    if remaining:
+        groups.append(
+            {
+                "task_id": None,
+                "label": "current_window_secondary_support",
+                "refs": remaining[:6],
+                "purpose": "Confirm secondary status evidence after required primary raw refs.",
+            }
+        )
+    return groups
+
+
+def _plan_read(read: dict) -> dict:
+    planned = {
+        "source_ref": read.get("source_ref"),
+        "source_tier": read.get("source_tier"),
+        "reason": read.get("reason"),
+        "answer_use_required": bool(read.get("answer_use_required")),
+    }
+    for key in (
+        "openable_target",
+        "read_more_command",
+        "target_window_hits",
+        "outside_target_task_ids",
+        "diagnostic_only",
+        "read_more_actionable",
+        "diagnostic_open_policy",
+        "target_window_follow_on_context",
+        "suppressed_from_answer_facing",
+    ):
+        if key in read:
+            planned[key] = read.get(key)
+    return planned
+
+
+def _read_more_boundary_warning(*, target_window: dict | None, diagnostic_count: int) -> str:
+    if target_window and not target_window.get("audit_run_requested"):
+        return (
+            "Raw read-more uses a bounded window around the opened ref and may show adjacent records outside "
+            "the requested target window. Treat outside-window records as diagnostic only; do not use them as "
+            "answer support unless the user explicitly asks to audit that later run or a named gap remains."
+        )
+    if diagnostic_count:
+        return (
+            "Raw read-more windows can include adjacent or diagnostic context. Keep diagnostics out of answer "
+            "support unless a named gap remains after required primary and secondary reads."
+        )
+    return (
+        "Raw read-more windows are context windows, not a signal to broaden by default. Stop after required "
+        "primary and secondary reads answer the named status facets."
+    )
+
+
+def _expected_status_answer_facets(
+    *,
+    target_window: dict | None,
+    session_activity: dict,
+) -> list[str]:
+    facets = ["anchor_and_boundary", "raw_current_window_activity"]
+    if target_window:
+        facets.append("target_window_task_report_review_status")
+    else:
+        facets.append("current_window_task_report_review_status")
+    if (session_activity.get("activity_after_anchor") or {}).get("spawned_session_calls"):
+        facets.append("worker_reviewer_or_spawned_session_activity")
+    facets.extend(["commits_or_validations", "caveats_non_claims", "unresolved_blockers_or_next_action"])
+    return facets
 
 
 def _apply_target_window_primary_dominance(reads: list[dict], *, target_window: dict | None) -> list[dict]:
