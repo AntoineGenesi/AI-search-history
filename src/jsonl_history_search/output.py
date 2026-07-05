@@ -351,11 +351,12 @@ def render_ask_execute_text(payload: dict) -> str:
             f"Answer status: {action.get('answer_status')}",
             f"Promotion status: {action.get('promotion_status')}",
             f"Stop condition: {action.get('stop')}",
-            "Read/action contract:",
         ]
     )
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
+    _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
+    lines.append("Read/action contract:")
     _append_compact_read_contract(lines, action.get("read"))
     only_continue = action.get("only_continue_if")
     if only_continue:
@@ -398,12 +399,105 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
+    _append_scoped_no_evidence_contract(
+        lines,
+        action,
+        report.get("executed_output") or {},
+        markdown=True,
+    )
     if execution.get("status") == "unsupported_route":
         lines.append(f"- Unsupported route: {execution.get('reason')}")
     else:
         lines.append("- Read/action:")
         _append_compact_read_contract(lines, action.get("read"), markdown=True)
     return "\n".join(lines)
+
+
+def _append_scoped_no_evidence_contract(
+    lines: list[str],
+    action: dict,
+    executed: dict,
+    *,
+    markdown: bool = False,
+) -> None:
+    contract = action.get("scoped_no_evidence_contract")
+    if not isinstance(contract, dict):
+        no_evidence = executed.get("no_evidence") if isinstance(executed.get("no_evidence"), dict) else {}
+        if not no_evidence:
+            return
+        searched_scope = executed.get("searched_scope") if isinstance(executed.get("searched_scope"), dict) else {}
+        scope_counts = executed.get("scope_counts") if isinstance(executed.get("scope_counts"), dict) else {}
+        cap_hit = executed.get("cap_hit") if isinstance(executed.get("cap_hit"), dict) else {}
+        read_more_policy = (
+            no_evidence.get("read_more_policy") if isinstance(no_evidence.get("read_more_policy"), dict) else {}
+        )
+        contract = {
+            "answer_scope": no_evidence.get("answer_scope"),
+            "searched_files": searched_scope.get("searched_files"),
+            "searched_bytes": searched_scope.get("searched_bytes"),
+            "selected_root_count": scope_counts.get("selected_root_count"),
+            "excluded_root_count": scope_counts.get("excluded_root_count"),
+            "missing_root_count": scope_counts.get("missing_root_count"),
+            "cap_hit": cap_hit.get("hit"),
+            "caps_hit": cap_hit.get("caps_hit", []),
+            "not_all_history_absence": no_evidence.get("not_all_history_absence"),
+            "read_more_required_before_scoped_no_evidence_answer": read_more_policy.get(
+                "required_before_scoped_no_evidence_answer"
+            ),
+            "read_more_actionability": read_more_policy.get("actionability"),
+            "saved_report": executed.get("report_written"),
+        }
+    answer_now = action.get("answer_status") == "answer-scoped-no-evidence-now"
+    if markdown:
+        lines.extend(
+            [
+                "",
+                "## Scoped No-Evidence Contract",
+                "",
+                f"- Answer now from searched scope: `{str(answer_now).lower()}`",
+                f"- Answer scope: `{contract.get('answer_scope')}`",
+                (
+                    f"- Searched scope: files=`{contract.get('searched_files')}`, "
+                    f"bytes=`{contract.get('searched_bytes')}`"
+                ),
+                (
+                    f"- Missing/excluded scope: selected_roots=`{contract.get('selected_root_count')}`, "
+                    f"excluded_roots=`{contract.get('excluded_root_count')}`, "
+                    f"missing_roots=`{contract.get('missing_root_count')}`"
+                ),
+                f"- Cap status: hit=`{contract.get('cap_hit')}`, caps_hit=`{contract.get('caps_hit')}`",
+                f"- not_all_history_absence: `{contract.get('not_all_history_absence')}`",
+                (
+                    "- read_more_required_before_scoped_no_evidence_answer: "
+                    f"`{contract.get('read_more_required_before_scoped_no_evidence_answer')}`"
+                ),
+                f"- Saved report: `{contract.get('saved_report') or action.get('saved_report')}`",
+            ]
+        )
+        return
+    lines.extend(
+        [
+            "Scoped no-evidence contract:",
+            f"- answer_now_from_searched_scope: {str(answer_now).lower()}",
+            f"- answer_scope: {contract.get('answer_scope')}",
+            (
+                f"- searched_scope: searched_files={contract.get('searched_files')} "
+                f"searched_bytes={contract.get('searched_bytes')}"
+            ),
+            (
+                f"- missing/excluded scope: selected_root_count={contract.get('selected_root_count')} "
+                f"excluded_root_count={contract.get('excluded_root_count')} "
+                f"missing_root_count={contract.get('missing_root_count')}"
+            ),
+            f"- cap_status: hit={contract.get('cap_hit')} caps_hit={contract.get('caps_hit')}",
+            f"- not_all_history_absence: {contract.get('not_all_history_absence')}",
+            (
+                "- read_more_required_before_scoped_no_evidence_answer: "
+                f"{contract.get('read_more_required_before_scoped_no_evidence_answer')}"
+            ),
+            f"- saved_report: {contract.get('saved_report') or action.get('saved_report')}",
+        ]
+    )
 
 
 def _append_compact_read_contract(lines: list[str], value: object, *, markdown: bool = False) -> None:
