@@ -511,6 +511,9 @@ def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[s
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- {target}{f': {reason}' if reason else ''}")
+    if item.get("verification_or_rerun_only"):
+        policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
+        lines.append(f"  verification/rerun-only: {policy}")
     if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
         policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
         lines.append(f"  diagnostic-only: {policy}")
@@ -530,6 +533,9 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- `{target}`{f': {reason}' if reason else ''}")
+    if item.get("verification_or_rerun_only"):
+        policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
+        lines.append(f"  - Verification/rerun-only: {policy}")
     if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
         policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
         lines.append(f"  - Diagnostic-only: {policy}")
@@ -2586,6 +2592,7 @@ def render_status_anchor_text(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    answer_readiness = report.get("answer_readiness") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
@@ -2601,6 +2608,21 @@ def render_status_anchor_text(payload: dict) -> str:
             f"{fail_closed.get('guidance')} "
             f"answer_allowed={fail_closed.get('answer_allowed')}"
         )
+    if answer_readiness:
+        lines.append(
+            "Answer readiness: "
+            f"status={answer_readiness.get('status')} "
+            f"answer_allowed={answer_readiness.get('answer_allowed')} "
+            f"selected_anchor_answer_ready={answer_readiness.get('selected_anchor_answer_ready')}"
+        )
+        facets = answer_readiness.get("required_answer_facets") or []
+        if facets:
+            lines.append(f"Required answer facets: {', '.join(facets)}")
+        missing = answer_readiness.get("missing_required_answer_facets") or []
+        if missing:
+            lines.append(f"Missing required answer facets: {', '.join(missing)}")
+        if answer_readiness.get("stop_condition"):
+            lines.append(f"Answer-readiness stop condition: {answer_readiness.get('stop_condition')}")
     if status_boundary:
         lines.append(
             "Status as-of boundary: "
@@ -2679,8 +2701,12 @@ def render_status_anchor_text(payload: dict) -> str:
             "Secondary evidence boundary: commits/merges and current repo state can support the answer only after raw JSONL source refs are inspected."
         )
     lines.append("Answer brief:")
-    for item in report.get("answer_brief", []):
-        lines.append(f"- {item}")
+    answer_brief = report.get("answer_brief", [])
+    if answer_brief:
+        for item in answer_brief:
+            lines.append(f"- {item}")
+    elif answer_readiness.get("answer_allowed") is False:
+        lines.append("- (suppressed until required_answer_facets are proven; missing facets are a stop condition)")
     if source_tiers:
         lines.append("Source tiers:")
         for tier in source_tiers.get("tier_order") or ["required_primary", "required_secondary", "diagnostic_optional"]:
@@ -2720,6 +2746,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    answer_readiness = report.get("answer_readiness") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
@@ -2739,6 +2766,25 @@ def render_status_anchor_markdown(payload: dict) -> str:
             f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
             "",
         ]
+    if answer_readiness:
+        lines.extend(
+            [
+                "## Answer Readiness",
+                "",
+                f"- Status: `{answer_readiness.get('status')}`",
+                f"- Answer allowed: `{answer_readiness.get('answer_allowed')}`",
+                f"- Selected anchor answer-ready: `{answer_readiness.get('selected_anchor_answer_ready')}`",
+            ]
+        )
+        facets = answer_readiness.get("required_answer_facets") or []
+        if facets:
+            lines.append(f"- Required answer facets: `{', '.join(facets)}`")
+        missing = answer_readiness.get("missing_required_answer_facets") or []
+        if missing:
+            lines.append(f"- Missing required answer facets: `{', '.join(missing)}`")
+        if answer_readiness.get("stop_condition"):
+            lines.append(f"- Stop condition: {answer_readiness.get('stop_condition')}")
+        lines.append("")
     if status_boundary:
         lines.extend(
             [
@@ -2837,7 +2883,11 @@ def render_status_anchor_markdown(payload: dict) -> str:
             ]
         )
     lines.extend(["## Answer Brief", ""])
-    lines.extend(f"- {item}" for item in report.get("answer_brief", []))
+    answer_brief = report.get("answer_brief", [])
+    if answer_brief:
+        lines.extend(f"- {item}" for item in answer_brief)
+    elif answer_readiness.get("answer_allowed") is False:
+        lines.append("- Suppressed until `required_answer_facets` are proven; missing facets are a stop condition.")
     lines.append("")
     if source_tiers:
         lines.extend(["## Source Tiers", ""])
@@ -2956,6 +3006,11 @@ def _append_status_follow_through_plan_text(lines: list[str], plan: dict) -> Non
     facets = plan.get("expected_status_answer_facets") or []
     if facets:
         lines.append(f"Expected status-answer facets: {', '.join(facets)}")
+    required_facets = plan.get("required_answer_facets") or []
+    if required_facets:
+        lines.append(f"Required answer facets: {', '.join(required_facets)}")
+    if plan.get("required_facets_stop_condition"):
+        lines.append(f"Required-facets stop_condition: {plan.get('required_facets_stop_condition')}")
     if plan.get("stop_condition"):
         lines.append(f"Plan stop_condition: {plan.get('stop_condition')}")
     if plan.get("read_more_boundary_warning"):
@@ -2996,6 +3051,11 @@ def _append_status_follow_through_plan_markdown(lines: list[str], plan: dict) ->
     facets = plan.get("expected_status_answer_facets") or []
     if facets:
         lines.extend(["", f"- Expected status-answer facets: `{', '.join(facets)}`"])
+    required_facets = plan.get("required_answer_facets") or []
+    if required_facets:
+        lines.append(f"- Required answer facets: `{', '.join(required_facets)}`")
+    if plan.get("required_facets_stop_condition"):
+        lines.append(f"- Required-facets stop condition: {plan.get('required_facets_stop_condition')}")
     if plan.get("stop_condition"):
         lines.append(f"- Stop condition: {plan.get('stop_condition')}")
     if plan.get("read_more_boundary_warning"):
