@@ -42,35 +42,46 @@ Rules:
    substantive in the fresh/eval session while dropping the retained top read.
 6. If `answer_ready_contract.answer_ready` is true or
    `answer_use_contract.decision` is `answer_ready_after_source_inspection`,
-   stop broad searching after inspecting the listed source refs. Present the
-   user-selectable fix suggestions or ask which accepted fix to implement; do
-   not run more broad retrieval first unless a returned failure mode lacks
+   inspect `next_reads` with `read_role: required_primary_proof`, then stop
+   broad searching after those refs support the returned failure modes. Present
+   the user-selectable fix suggestions or ask which accepted fix to implement;
+   do not run more broad retrieval first unless a returned failure mode lacks
    source proof.
-7. If an explicit root or a substantive current session includes real
+7. Treat `read_role: optional_diagnostic` refs as visible corroboration,
+   adjacent current-session/setup evidence, or extra diagnostics. Do not open
+   them as normal executable follow-through.
+8. Treat `read_role: conditional_required` refs as required only when a returned
+   failure mode lacks source proof, caps/omitted windows block completeness, or
+   the user asks for exhaustive coverage.
+9. If an explicit root or a substantive current session includes real
    orchestration, inspect `orchestration_evidence` as first-class causal
    evidence: user corrections, main-agent FSM/product-loop commitments,
    worker/subagent outputs, reviewer proof and claim boundaries, same-task
    repair logic, product-delta integration/currentness findings, and
    product-moving versus process/report drift.
-8. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
+10. Detect the local behavior system: `AGENTS.md`, `CLAUDE.md`, task files,
    TODO/backlog docs, skills, learning indexes, tickets, or project-specific
    rules.
-9. Present user-selectable fix suggestions with `destination_source_refs`,
+11. Present user-selectable fix suggestions with `destination_source_refs`,
    `destination_rationale`, and `selection_options` of accept, reject, or
    defer.
-10. Do not auto-edit behavior rules, skills, task files, tickets, or memory
+12. Do not auto-edit behavior rules, skills, task files, tickets, or memory
    docs from this route.
-11. Do not assume everyone has contributor's `wrap-up` skill.
+13. Do not assume everyone has contributor's `wrap-up` skill.
 
 After running:
 
-- inspect `failure_modes[*].source_refs`;
+- inspect `failure_modes[*].source_refs` and `next_reads` with
+  `read_role: required_primary_proof`;
 - obey `answer_use_contract` before finalizing; when it says
   `answer_from_top_next_read_or_handoff_exact_source`, answer from the top
   required read or explicitly hand off that source as the required next read;
 - when it says `answer_ready_after_source_inspection`, inspect the listed
-  source refs, present/ask about the selectable fixes, and stop broad search
-  unless the inspected refs do not support a returned failure mode;
+  required primary proof refs, present/ask about the selectable fixes, and stop
+  broad search unless the inspected refs do not support a returned failure mode;
+- keep optional diagnostic and conditional refs visible in the output, but open
+  them only for named source-proof gaps, cap/omission completeness, setup echo
+  checks, or explicit exhaustive coverage requests;
 - inspect substantive `orchestration_evidence.items[*].source_ref` before
   deciding what worker/reviewer/subagent behavior mattered;
 - use `signal_classification` to separate substantive session evidence from

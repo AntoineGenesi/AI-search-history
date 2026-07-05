@@ -726,6 +726,10 @@ def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[s
     if item.get("verification_or_rerun_only"):
         policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
         lines.append(f"  verification/rerun-only: {policy}")
+    if item.get("read_role") == "conditional_required" or item.get("conditional_required") is True:
+        policy = item.get("diagnostic_open_policy") or "open only when a named proof/completeness condition applies"
+        lines.append(f"  conditional-required: {policy}")
+        return
     if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
         policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
         lines.append(f"  diagnostic-only: {policy}")
@@ -748,6 +752,10 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
     if item.get("verification_or_rerun_only"):
         policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
         lines.append(f"  - Verification/rerun-only: {policy}")
+    if item.get("read_role") == "conditional_required" or item.get("conditional_required") is True:
+        policy = item.get("diagnostic_open_policy") or "open only when a named proof/completeness condition applies"
+        lines.append(f"  - Conditional-required: {policy}")
+        return
     if item.get("diagnostic_only") or item.get("read_more_actionable") is False:
         policy = item.get("diagnostic_open_policy") or "diagnostic-only; do not open as answer evidence"
         lines.append(f"  - Diagnostic-only: {policy}")
@@ -1253,18 +1261,26 @@ def render_semantic_wrapup_text(payload: dict) -> str:
     report = payload["semantic_wrapup"]
     summary = report.get("summary") or {}
     reads = report.get("next_reads") or []
-    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads))
+    required_reads = _required_surface_reads(reads)
+    diagnostic_reads = [read for read in reads if isinstance(read, dict) and read not in required_reads]
+    command_by_target = _read_more_commands_by_target(required_reads)
+    read_role_summary = report.get("read_role_summary") or {}
+    answer_status = _source_use_answer_status(
+        report.get("status"),
+        has_required_reads=bool(required_reads),
+        has_refs=bool(reads),
+    )
     lines = [
         "Semantic wrap-up",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
-        "Open these source refs first:",
+        "Required primary proof reads:",
     ]
-    if reads:
-        for read in reads[:5]:
-            _append_text_read(lines, read)
+    if required_reads:
+        for read in required_reads[:8]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
     else:
-        lines.append("- (no source refs surfaced)")
+        lines.append("- (no required primary proof reads surfaced)")
     contract = report.get("answer_use_contract") or {}
     if contract:
         lines.append(
@@ -1273,7 +1289,7 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             f"source_use_required={contract.get('source_use_required')}"
         )
         if contract.get("answer_ready") is True:
-            lines.append("Answer-ready: yes after inspecting listed source refs.")
+            lines.append("Answer-ready: yes after inspecting required_primary_proof refs.")
         if contract.get("stop_broad_search") is True:
             lines.append("Stop broad search: yes.")
         if contract.get("required_next_action"):
@@ -1281,17 +1297,24 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         if contract.get("stop_condition"):
             lines.append(f"Contract stop condition: {contract.get('stop_condition')}")
     lines.extend([
-        "Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
-        "Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
-        "Required proof reads:",
+        "Stop condition: stop once failure modes are supported by inspected required_primary_proof refs; do not auto-apply fixes.",
+        "Only continue if: a failure mode lacks source proof, caps/omitted windows block completeness, the behavior-system destination is ambiguous, the user asks for exhaustive diagnostics, or the user selects a fix to implement.",
+        (
+            "Read-role summary: "
+            f"required_primary_proof={read_role_summary.get('required_primary_proof_count', len(required_reads))}, "
+            f"optional_diagnostic={read_role_summary.get('optional_diagnostic_count', 0)}, "
+            f"conditional_required={read_role_summary.get('conditional_required_count', 0)}, "
+            f"default_actionable={read_role_summary.get('default_actionable_read_count', len(required_reads))}"
+        ),
+        "Optional/conditional diagnostics:",
     ])
-    if reads:
-        for read in reads[:8]:
+    if diagnostic_reads:
+        for read in diagnostic_reads[:8]:
             _append_text_read(lines, read)
     else:
         lines.append("- none listed")
     lines.extend([
-        "Optional diagnostics/adjacent evidence: behavior-system destinations and fix suggestions below.",
+        "Additional adjacent evidence: behavior-system destinations and fix suggestions below.",
         (
             "Summary: "
             f"{summary.get('session_message_count', 0)} session messages, "
@@ -1320,9 +1343,7 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             f"cap_changed_conclusion={cap_accounting.get('cap_changed_conclusion')}"
         )
         if coverage.get("omitted_or_uncertain_next_reads"):
-            lines.append("Omitted/uncertain rolling-window next reads:")
-            for read in coverage.get("omitted_or_uncertain_next_reads", [])[:5]:
-                _append_text_read(lines, read)
+            lines.append("Omitted/uncertain rolling-window reads are listed above as conditional_required diagnostics.")
     scope_resolution = report.get("scope_resolution") or {}
     if scope_resolution.get("status"):
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
@@ -1431,21 +1452,29 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
     report = payload["semantic_wrapup"]
     summary = report.get("summary") or {}
     reads = report.get("next_reads") or []
-    answer_status = _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads))
+    required_reads = _required_surface_reads(reads)
+    diagnostic_reads = [read for read in reads if isinstance(read, dict) and read not in required_reads]
+    command_by_target = _read_more_commands_by_target(required_reads)
+    read_role_summary = report.get("read_role_summary") or {}
+    answer_status = _source_use_answer_status(
+        report.get("status"),
+        has_required_reads=bool(required_reads),
+        has_refs=bool(reads),
+    )
     lines = [
         "# Semantic Wrap-Up",
         "",
         f"**Status:** `{report.get('status')}`",
         f"**Answer status:** `{answer_status}`",
         "",
-        "## Open These Source Refs First",
+        "## Required Primary Proof Reads",
         "",
     ]
-    if reads:
-        for read in reads[:5]:
-            _append_markdown_read(lines, read)
+    if required_reads:
+        for read in required_reads[:8]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
     else:
-        lines.append("- No source refs surfaced.")
+        lines.append("- No required primary proof reads surfaced.")
     contract = report.get("answer_use_contract") or {}
     if contract:
         lines.extend([
@@ -1458,7 +1487,7 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         if contract.get("required_next_action"):
             lines.append(f"- Required next action: {contract.get('required_next_action')}")
         if contract.get("answer_ready") is True:
-            lines.append("- Answer-ready: `true` after inspecting listed source refs")
+            lines.append("- Answer-ready: `true` after inspecting `required_primary_proof` refs")
         if contract.get("stop_broad_search") is True:
             lines.append("- Stop broad search: `true`")
         if contract.get("stop_condition"):
@@ -1482,14 +1511,21 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         "",
         "## Stop / Continue",
         "",
-        "- Stop condition: stop once failure modes are supported by inspected source refs; do not auto-apply fixes.",
-        "- Only continue if: a failure mode lacks source proof, the behavior-system destination is ambiguous, or the user selects a fix to implement.",
+        "- Stop condition: stop once failure modes are supported by inspected `required_primary_proof` refs; do not auto-apply fixes.",
+        "- Only continue if: a failure mode lacks source proof, caps/omitted windows block completeness, the behavior-system destination is ambiguous, the user asks for exhaustive diagnostics, or the user selects a fix to implement.",
         "",
-        "## Required Proof Reads",
+        "## Read Roles",
+        "",
+        f"- `required_primary_proof`: `{read_role_summary.get('required_primary_proof_count', len(required_reads))}`",
+        f"- `optional_diagnostic`: `{read_role_summary.get('optional_diagnostic_count', 0)}`",
+        f"- `conditional_required`: `{read_role_summary.get('conditional_required_count', 0)}`",
+        f"- `default_actionable`: `{read_role_summary.get('default_actionable_read_count', len(required_reads))}`",
+        "",
+        "## Optional / Conditional Diagnostics",
         "",
     ])
-    if reads:
-        for read in reads[:8]:
+    if diagnostic_reads:
+        for read in diagnostic_reads[:8]:
             _append_markdown_read(lines, read)
     else:
         lines.append("- None listed.")
@@ -1536,10 +1572,10 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             "",
         ])
         if coverage.get("omitted_or_uncertain_next_reads"):
-            lines.extend(["### Omitted Or Uncertain Window Reads", ""])
-            for read in coverage.get("omitted_or_uncertain_next_reads", [])[:8]:
-                _append_markdown_read(lines, read)
-            lines.append("")
+            lines.extend([
+                "Omitted or uncertain rolling-window reads are listed above as `conditional_required` diagnostics.",
+                "",
+            ])
         if coverage.get("assistant_tool_runtime_errors"):
             lines.extend(["### Assistant / Tool / Runtime Errors", ""])
             for item in coverage.get("assistant_tool_runtime_errors", [])[:10]:

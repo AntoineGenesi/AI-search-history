@@ -23,7 +23,10 @@ def agent_question_cookbook() -> list[dict[str, str]]:
             "question_family": "What did I keep correcting or complaining about?",
             "route": "semantic-wrapup",
             "first_command": 'jsonl-history-search ask "what did I keep correcting?" --cwd "$PWD" --format text',
-            "inspect_next": "semantic_wrapup.failure_modes, fix_suggestions, complaint/correction source refs, and next_reads",
+            "inspect_next": (
+                "semantic_wrapup.failure_modes, fix_suggestions, required_primary_proof next_reads, "
+                "and optional/conditional diagnostics only for named gaps"
+            ),
         },
         {
             "id": "source_provenance",
@@ -83,13 +86,25 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
                 }
             )
             break
-    commands.append(
-        {
-            "purpose": "open exact source ref returned by the route",
-            "command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
-            "inspect_next": "replace <source-ref> with the concrete path:line from the preceding route output",
-        }
-    )
+    if route_family == "semantic_wrapup":
+        commands.append(
+            {
+                "purpose": "open required semantic-wrapup proof ref only",
+                "command": 'jsonl-history-search read-more <required_primary_proof source-ref> --cwd "$PWD" --format text',
+                "inspect_next": (
+                    "replace the placeholder only with a next_reads item where read_role is required_primary_proof; "
+                    "optional_diagnostic and conditional_required refs are not default follow-through"
+                ),
+            }
+        )
+    else:
+        commands.append(
+            {
+                "purpose": "open exact source ref returned by the route",
+                "command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
+                "inspect_next": "replace <source-ref> with the concrete path:line from the preceding route output",
+            }
+        )
     return commands
 
 

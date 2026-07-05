@@ -36,6 +36,9 @@ ROLLING_WINDOW_INLINE_LIMIT = 20
 ROLLING_WINDOW_ERROR_INLINE_LIMIT = 30
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
+READ_ROLE_REQUIRED_PRIMARY_PROOF = "required_primary_proof"
+READ_ROLE_OPTIONAL_DIAGNOSTIC = "optional_diagnostic"
+READ_ROLE_CONDITIONAL_REQUIRED = "conditional_required"
 
 ASSISTANT_TOOL_ERROR_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tool_error", ("tool error", "tool failed", "function error", "exception", "traceback")),
@@ -515,11 +518,13 @@ def build_semantic_wrapup_payload(
         setup_echo_signals=setup_echo_signals,
         prefer_setup_signal_refs=bool(explicit_root_setup_echo_scope),
     )
+    read_role_summary = _semantic_read_role_summary(next_reads)
     answer_ready_contract = _answer_ready_contract(
         status=status,
         failure_modes=failure_modes,
         fix_suggestions=fix_suggestions,
         next_reads=next_reads,
+        read_role_summary=read_role_summary,
     )
     answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads, answer_ready_contract)
     payload = {
@@ -555,6 +560,9 @@ def build_semantic_wrapup_payload(
                 "current_session_source_count": current_session_source_selection["returned_count"],
                 "current_session_source_total_count": current_session_source_selection["total_count"],
                 "skill_check_recommendation_present": bool(skill_check_recommendation),
+                "default_actionable_read_count": read_role_summary["default_actionable_read_count"],
+                "optional_diagnostic_read_count": read_role_summary["optional_diagnostic_count"],
+                "conditional_required_read_count": read_role_summary["conditional_required_count"],
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             "failure_modes": failure_modes,
@@ -575,6 +583,7 @@ def build_semantic_wrapup_payload(
             "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract, skill_check_recommendation),
             "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
+            "read_role_summary": read_role_summary,
             "next_reads": next_reads,
             "privacy": {
                 "raw_text_included": True,
@@ -869,6 +878,7 @@ def _answer_ready_contract(
     failure_modes: list[dict],
     fix_suggestions: list[dict],
     next_reads: list[dict],
+    read_role_summary: dict | None = None,
 ) -> dict:
     if status != "found" or not failure_modes:
         return {
@@ -876,26 +886,30 @@ def _answer_ready_contract(
             "decision": "not_answer_ready",
             "reason": "semantic-wrapup did not return source-backed failure modes.",
         }
+    summary = read_role_summary or _semantic_read_role_summary(next_reads)
     return {
         "answer_ready": True,
         "decision": "answer_ready_after_source_inspection",
-        "source_use_required": bool(next_reads),
+        "source_use_required": summary["required_primary_proof_count"] > 0,
         "stop_broad_search": True,
         "selection_required": True,
         "auto_apply": False,
         "failure_mode_count": len(failure_modes),
         "fix_suggestion_count": len(fix_suggestions),
+        "read_role_summary": summary,
         "required_next_action": (
-            "Inspect the listed source refs, then present the user-selectable fix suggestions "
-            "or ask which accepted fix to implement. Do not run broad additional searches first."
+            "Inspect required_primary_proof source refs, then present the user-selectable fix suggestions "
+            "or ask which accepted fix to implement. Do not open optional diagnostics by default."
         ),
         "stop_condition": (
-            "Stop broad searching once the listed source refs support the returned failure modes "
-            "and fix suggestions."
+            "Stop broad searching once required_primary_proof refs support the returned failure modes "
+            "and fix suggestions; optional_diagnostic reads are not required follow-through."
         ),
         "continue_only_if": [
             "a returned failure mode lacks source proof after inspecting listed refs",
+            "a conditional_required read is needed because caps/omissions block completeness",
             "the proposed destination is ambiguous or contradicted by inspected refs",
+            "the user asks for exhaustive coverage or diagnostic corroboration",
             "the user selects a fix and implementation needs the normal task/FSM workflow",
         ],
         "claim_boundary": (
@@ -944,10 +958,11 @@ def _answer_use_contract(
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
         }
     return {
-        "source_use_required": bool(next_reads),
+        "source_use_required": _semantic_read_role_summary(next_reads)["required_primary_proof_count"] > 0,
         "decision": "answer_after_inspecting_source_refs" if next_reads else "no_source_refs_available",
         "required_next_action": (
-            "Inspect the listed source refs before summarizing failure modes or applying fixes."
+            "Inspect required_primary_proof refs before summarizing failure modes or applying fixes; "
+            "open optional diagnostics only for named gaps."
             if next_reads
             else "Do not fabricate failure modes without source refs."
         ),
@@ -1780,11 +1795,25 @@ def _semantic_next_reads(
     refs = []
     seen: set[tuple[str, int]] = set()
 
-    def add(ref: dict, reason: str, facets: list[str] | None = None) -> None:
+    def add(
+        ref: dict,
+        reason: str,
+        facets: list[str] | None = None,
+        *,
+        read_role: str,
+        diagnostic_open_policy: str | None = None,
+        answer_use_required: bool = False,
+    ) -> None:
         key = (str(ref.get("path") or ""), int(ref.get("line") or 0))
         if not key[0] or key in seen:
             return
-        item = {"source_ref": ref, "reason": reason}
+        item = _semantic_read_item(
+            ref=ref,
+            reason=reason,
+            read_role=read_role,
+            diagnostic_open_policy=diagnostic_open_policy,
+            answer_use_required=answer_use_required,
+        )
         if facets:
             item["facets"] = facets
         refs.append(item)
@@ -1801,6 +1830,11 @@ def _semantic_next_reads(
                     ref,
                     "Inspect current-session semantic-wrapup smoke/hardening evidence before answering from active gate or front-door context.",
                     list(source.get("facets") or []),
+                    read_role=READ_ROLE_OPTIONAL_DIAGNOSTIC,
+                    diagnostic_open_policy=(
+                        "Adjacent current-session smoke/hardening evidence; open only if required primary complaint refs "
+                        "leave a named current-session or setup-hardening gap."
+                    ),
                 )
             else:
                 add(
@@ -1810,29 +1844,128 @@ def _semantic_next_reads(
                         "smoke/hardening source and answer from it, or hand off this exact source as required."
                     ),
                     list(source.get("facets") or []),
+                    read_role=READ_ROLE_REQUIRED_PRIMARY_PROOF,
+                    answer_use_required=True,
                 )
-                refs[-1]["answer_use_required"] = True
 
     if failure_modes:
         for ref in evidence_refs:
-            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+            add(
+                ref,
+                "Inspect complaint/correction evidence before applying suggested fix.",
+                read_role=READ_ROLE_REQUIRED_PRIMARY_PROOF,
+            )
         add_current_session_sources()
     elif prefer_setup_signal_refs:
         for signal in setup_echo_signals or []:
             add(
                 signal.get("source_ref") or {},
                 "Inspect selected-session setup/reviewer prompt signal before using old retained semantic-wrapup artifacts.",
+                read_role=READ_ROLE_OPTIONAL_DIAGNOSTIC,
+                diagnostic_open_policy=(
+                    "Setup/reviewer prompt echo check only; do not treat as substantive complaint proof."
+                ),
             )
         add_current_session_sources()
         for ref in evidence_refs:
-            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+            add(
+                ref,
+                "Inspect complaint/correction evidence before applying suggested fix.",
+                read_role=READ_ROLE_CONDITIONAL_REQUIRED,
+                diagnostic_open_policy=(
+                    "Open only if the fail-closed scope is resolved or a returned failure mode still lacks proof."
+                ),
+            )
     else:
         add_current_session_sources()
         for ref in evidence_refs:
-            add(ref, "Inspect complaint/correction evidence before applying suggested fix.")
+            add(
+                ref,
+                "Inspect complaint/correction evidence before applying suggested fix.",
+                read_role=READ_ROLE_CONDITIONAL_REQUIRED,
+                diagnostic_open_policy=(
+                    "Open only if diagnosing why no failure modes were returned or if a proof gap remains."
+                ),
+            )
     for read in (rolling_window_coverage or {}).get("omitted_or_uncertain_next_reads") or []:
-        add(read.get("source_ref") or {}, str(read.get("reason") or "Inspect omitted rolling-window signal."))
+        add(
+            read.get("source_ref") or {},
+            str(read.get("reason") or "Inspect omitted rolling-window signal."),
+            read_role=READ_ROLE_CONDITIONAL_REQUIRED,
+            diagnostic_open_policy=(
+                "Open only if omitted windows, scan caps, or an exhaustive-coverage request make completeness necessary."
+            ),
+        )
     return refs
+
+
+def _semantic_read_item(
+    *,
+    ref: dict,
+    reason: str,
+    read_role: str,
+    diagnostic_open_policy: str | None = None,
+    answer_use_required: bool = False,
+) -> dict:
+    item: dict[str, Any] = {
+        "source_ref": ref,
+        "reason": reason,
+        "read_role": read_role,
+        "proof_role": read_role,
+        "answer_use_required": bool(answer_use_required),
+    }
+    if read_role == READ_ROLE_REQUIRED_PRIMARY_PROOF:
+        item.update(
+            {
+                "read_more_actionable": True,
+                "followthrough_actionable": True,
+                "required_for_answer": True,
+                "diagnostic_only": False,
+            }
+        )
+    elif read_role == READ_ROLE_CONDITIONAL_REQUIRED:
+        item.update(
+            {
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "conditional_required": True,
+                "required_for_answer": False,
+                "diagnostic_open_policy": diagnostic_open_policy
+                or "Open only when a named proof, completeness, cap, or exhaustive-coverage condition applies.",
+            }
+        )
+    else:
+        item.update(
+            {
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "diagnostic_only": True,
+                "required_for_answer": False,
+                "diagnostic_open_policy": diagnostic_open_policy
+                or "Optional diagnostic; not required before answering from primary complaint proof.",
+            }
+        )
+    return item
+
+
+def _semantic_read_role_summary(next_reads: list[dict] | None) -> dict:
+    reads = [read for read in next_reads or [] if isinstance(read, dict)]
+    required = [read for read in reads if read.get("read_role") == READ_ROLE_REQUIRED_PRIMARY_PROOF]
+    optional = [read for read in reads if read.get("read_role") == READ_ROLE_OPTIONAL_DIAGNOSTIC]
+    conditional = [read for read in reads if read.get("read_role") == READ_ROLE_CONDITIONAL_REQUIRED]
+    actionable = [read for read in reads if read.get("read_more_actionable") is not False]
+    return {
+        "total": len(reads),
+        "required_primary_proof_count": len(required),
+        "optional_diagnostic_count": len(optional),
+        "conditional_required_count": len(conditional),
+        "default_actionable_read_count": len(actionable),
+        "policy": (
+            "Open required_primary_proof reads by default. Treat optional_diagnostic reads as visible "
+            "corroboration/setup/context only. Open conditional_required reads only when proof is missing, "
+            "caps or omitted windows block completeness, or the user asks for exhaustive coverage."
+        ),
+    }
 
 
 def _labels_for(normalized: str) -> list[str]:
