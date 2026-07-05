@@ -412,7 +412,7 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
     env = os.environ.copy()
     src_path = str(package_root / "src")
     env["PYTHONPATH"] = src_path if not env.get("PYTHONPATH") else f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
-    result = run_subprocess(
+    route_result = run_subprocess(
         [sys.executable, str(launcher), "why", "did", "I", "mention", "the", "router?"],
         text=True,
         stdout=PIPE,
@@ -421,31 +421,91 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
         cwd=str(package_root),
         env=env,
     )
-    stdout = result.stdout
+    route_stdout = route_result.stdout
+    bounded_payload: dict[str, Any] = {}
+    bounded_returncode: int | None = None
+    bounded_stderr = ""
+    with tempfile.TemporaryDirectory(prefix="jsonl-ask-first-smoke-") as tmp:
+        tmp_path = Path(tmp)
+        root = tmp_path / "sessions"
+        root.mkdir()
+        (root / "session.jsonl").write_text(
+            '{"timestamp":"2026-05-27T09:00:00+00:00","role":"user","text":"alpha only"}\n',
+            encoding="utf-8",
+        )
+        report_output = tmp_path / "ask-first-no-evidence.json"
+        bounded_result = run_subprocess(
+            [
+                sys.executable,
+                str(launcher),
+                "did",
+                "the",
+                "searched",
+                "scope",
+                "contain",
+                "unmatched",
+                "phrase?",
+                "--cwd",
+                str(tmp_path),
+                "--root",
+                str(root),
+                "--allow-arbitrary-root",
+                "--hard-cap-files",
+                "5",
+                "--hard-cap-bytes",
+                "10000",
+                "--report-output",
+                str(report_output),
+                "--format",
+                "json",
+            ],
+            text=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            check=False,
+            cwd=str(package_root),
+            env=env,
+        )
+        bounded_returncode = bounded_result.returncode
+        bounded_stderr = bounded_result.stderr
+        try:
+            bounded_payload = json.loads(bounded_result.stdout).get("ask_execute", {})
+        except json.JSONDecodeError:
+            bounded_payload = {}
     ok = (
-        result.returncode == 0
-        and "Ask Route" in stdout
-        and "First command: jsonl-history-search semantic-debug" in stdout
-        and "--cwd \"$PWD\"" in stdout
-        and "--format text" in stdout
-        and "Read: references/remembered-topic.md" in stdout
+        route_result.returncode == 0
+        and "Ask Route" in route_stdout
+        and "First command: jsonl-history-search semantic-debug" in route_stdout
+        and "--cwd \"$PWD\"" in route_stdout
+        and "--format text" in route_stdout
+        and "Read: references/remembered-topic.md" in route_stdout
+        and bounded_returncode == 0
+        and bounded_payload.get("execution_status") == "executed"
+        and bounded_payload.get("selected_route", {}).get("route_family") == "bounded_no_evidence"
+        and bounded_payload.get("execution", {}).get("command_family") == "no-evidence-report"
+        and bounded_payload.get("answer_action_contract", {}).get("answer_status") == "answer-scoped-no-evidence-now"
     )
     return ValidationCheck(
         id="package_ask_first_launcher_smoke",
         name="Package ask-first launcher smoke",
         status="pass" if ok else "fail",
         detail=(
-            "Package ask-first launcher delegates natural prompts to `jsonl-history-search ask` with text output."
+            "Package ask-first launcher keeps non-bounded prompts route-only and auto-executes bounded no-evidence."
             if ok
-            else "Package ask-first launcher did not return the expected ask router text output."
+            else "Package ask-first launcher did not satisfy the route-only plus bounded no-evidence auto-execute contract."
         ),
         paths=[str(launcher)],
-        recovery=[] if ok else ["Run `python3 scripts/jsonl_ask_first.py \"why did I mention the router?\"` from the package checkout."],
+        recovery=[] if ok else ["Run `python3 scripts/jsonl_ask_first.py \"did the searched scope contain unmatched phrase?\" --root <fixture-root> --allow-arbitrary-root --format json` from the package checkout."],
         metadata={
-            "returncode": result.returncode,
-            "stdout_contains_ask_route": "Ask Route" in stdout,
-            "stdout_contains_first_command": "First command: jsonl-history-search semantic-debug" in stdout,
-            "stderr": result.stderr.strip()[:500],
+            "route_returncode": route_result.returncode,
+            "bounded_returncode": bounded_returncode,
+            "stdout_contains_ask_route": "Ask Route" in route_stdout,
+            "stdout_contains_first_command": "First command: jsonl-history-search semantic-debug" in route_stdout,
+            "non_bounded_route_only": "Ask Execute" not in route_stdout,
+            "bounded_execution_status": bounded_payload.get("execution_status"),
+            "bounded_command_family": bounded_payload.get("execution", {}).get("command_family"),
+            "bounded_answer_status": bounded_payload.get("answer_action_contract", {}).get("answer_status"),
+            "stderr": (route_result.stderr + "\n" + bounded_stderr).strip()[:500],
         },
     )
 

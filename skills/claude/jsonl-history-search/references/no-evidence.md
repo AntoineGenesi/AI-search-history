@@ -8,8 +8,15 @@ artifacts.
 For explicit searched-scope absence questions such as "is there evidence that X
 was discussed in this bounded/source scope?", "did the searched scope contain
 X?", or "prove there is no evidence of X in this selected root", prefer the
-fused ask/execute workflow so route selection, the no-evidence run, compact
-stdout, and the full saved report happen in one command:
+installed ask-first helper. It auto-executes only bounded no-evidence prompts,
+so route selection, the no-evidence run, compact stdout, and the full saved
+report happen from one helper invocation:
+
+```bash
+python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
+```
+
+The direct equivalent is:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-no-evidence-report.json --format text

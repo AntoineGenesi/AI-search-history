@@ -15,6 +15,8 @@ def main(argv: list[str] | None = None) -> int:
         args.extend(["--cwd", os.getcwd()])
     if not _has_option(args, "--format"):
         args.extend(["--format", "text"])
+    if not _has_option(args, "--execute") and not _has_option(args, "--auto-execute-bounded-no-evidence"):
+        args.append("--auto-execute-bounded-no-evidence")
 
     command = [sys.executable, "-m", "jsonl_history_search.cli", "ask", *args]
     return subprocess.run(command, check=False).returncode

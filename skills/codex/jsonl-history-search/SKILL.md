@@ -42,10 +42,12 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
 
-The installed `jsonl_ask_first.py` launcher is the neutral ask-first helper. It
-wraps the canonical `jsonl-history-search ask` command, adds `--cwd "$PWD"` and
-`--format text` when omitted, and exists so the first command can be the
-front-door resolver rather than a repo inventory/setup probe.
+The installed `jsonl_ask_first.py` launcher is the bounded-aware ask-first
+helper. It wraps the canonical `jsonl-history-search ask` command with
+`--auto-execute-bounded-no-evidence`, adds `--cwd "$PWD"` and `--format text`
+when omitted, and exists so the first command can be the front-door resolver rather than a repo inventory/setup probe. For non-bounded prompts it returns
+normal route-only ask output; it does not auto-execute semantic-debug,
+orchestration, currentness, status, skill-audit, or local-artifact routes.
 
 Use `ask --execute` when the receiving-agent goal is to fuse route selection
 with the first safe JSONL run. It only executes allow-listed structured
@@ -177,7 +179,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
-| "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | `ask --execute` then `references/no-evidence.md` if a scope/cap field needs interpretation | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-no-evidence-report.json --format text` |
+| "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | helper auto-executes bounded no-evidence, then `references/no-evidence.md` only if a scope/cap field needs interpretation | `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"` |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -194,7 +196,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
 - "did the agent read/follow the reviewer skill?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/skill-audit.md`
-- "is there evidence that X was discussed in this bounded source scope?" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-no-evidence-report.json --format text`; if promoted, answer from the scoped no-evidence contract without a manual rerun/read-more.
+- "is there evidence that X was discussed in this bounded source scope?" -> `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`; the helper auto-executes only bounded no-evidence and, if promoted, you can answer from the scoped no-evidence contract without a manual rerun/read-more.
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "is ticket ABC-42 still current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
