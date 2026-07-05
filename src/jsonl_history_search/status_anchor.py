@@ -252,6 +252,7 @@ def status_anchor_report(
     audit_run_requested = _audit_run_requested(query, target_window)
     prior_request_occurrence = _prior_request_occurrence_recovery(
         query=query,
+        latest_messages=latest_messages,
         codex_home=codex_home,
         status_as_of_boundary=status_as_of_boundary,
     )
@@ -1055,6 +1056,7 @@ def _target_window_anchor_candidate(
 def _prior_request_occurrence_recovery(
     *,
     query: str,
+    latest_messages: list[dict],
     codex_home: Path | None,
     status_as_of_boundary: dict | None,
 ) -> dict:
@@ -1070,17 +1072,26 @@ def _prior_request_occurrence_recovery(
     if not rows:
         return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
     matches = [row for row in rows if row.get("normalized_text") == normalized_query]
-    if len(matches) < 2:
+    occurrence_mode = "duplicate_prior_request"
+    if len(matches) == 1:
+        occurrence = matches[0]
+        if not _has_out_of_band_current_prompt_echo(query, latest_messages, occurrence):
+            return {"status": "not_found", "reason": "no_prior_occurrence_of_current_request"}
+        if not _out_of_band_single_occurrence_allowed(query, rows, occurrence):
+            return {"status": "not_found", "reason": "no_prior_occurrence_of_current_request"}
+        prior_matches = [occurrence]
+        occurrence_mode = "out_of_band_single_canonical_occurrence"
+    elif len(matches) < 1:
         return {"status": "not_found", "reason": "no_prior_occurrence_of_current_request"}
-
-    current_boundary_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
-    current_boundary_timestamp = str((status_as_of_boundary or {}).get("timestamp_utc") or "")
-    if current_boundary_line is not None:
-        prior_matches = [row for row in matches if int(row.get("line") or 0) < current_boundary_line]
-    elif current_boundary_timestamp:
-        prior_matches = [row for row in matches if str(row.get("timestamp_utc") or "") < current_boundary_timestamp]
     else:
-        prior_matches = matches[:-1]
+        current_boundary_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
+        current_boundary_timestamp = str((status_as_of_boundary or {}).get("timestamp_utc") or "")
+        if current_boundary_line is not None:
+            prior_matches = [row for row in matches if int(row.get("line") or 0) < current_boundary_line]
+        elif current_boundary_timestamp:
+            prior_matches = [row for row in matches if str(row.get("timestamp_utc") or "") < current_boundary_timestamp]
+        else:
+            prior_matches = matches[:-1]
 
     if len(prior_matches) != 1:
         return {
@@ -1090,6 +1101,7 @@ def _prior_request_occurrence_recovery(
             "reason": "expected_exactly_one_prior_occurrence_before_current_request_boundary",
             "occurrence_count": len(matches),
             "prior_occurrence_count": len(prior_matches),
+            "occurrence_mode": occurrence_mode,
             "occurrence_candidates": [_occurrence_candidate(row) for row in prior_matches[:6]],
             "rejected_anchor_alternatives": [_occurrence_candidate(row) for row in prior_matches[:6]],
         }
@@ -1106,8 +1118,13 @@ def _prior_request_occurrence_recovery(
             "reason": "generic_same_thread_status_followup_has_local_anchor",
             "occurrence_count": len(matches),
             "prior_occurrence_count": 1,
+            "occurrence_mode": occurrence_mode,
         }
-    anchor = _preceding_eligible_history_anchor(rows, occurrence)
+    anchor = _preceding_eligible_history_anchor(
+        rows,
+        occurrence,
+        require_parent_main=occurrence_mode == "out_of_band_single_canonical_occurrence",
+    )
     if anchor is None:
         return {
             "status": "ambiguous",
@@ -1116,6 +1133,7 @@ def _prior_request_occurrence_recovery(
             "reason": "unique_prior_occurrence_found_but_no_preceding_eligible_parent_main_history_anchor",
             "occurrence_count": len(matches),
             "prior_occurrence_count": 1,
+            "occurrence_mode": occurrence_mode,
             "occurrence_candidates": [_occurrence_candidate(occurrence)],
             "rejected_anchor_alternatives": [_occurrence_candidate(occurrence)],
         }
@@ -1123,9 +1141,14 @@ def _prior_request_occurrence_recovery(
     boundary = _prior_occurrence_boundary(occurrence)
     return {
         "status": "selected",
-        "reason": "unique_prior_occurrence_and_preceding_parent_main_history_anchor_found",
+        "reason": (
+            "unique_out_of_band_canonical_occurrence_and_preceding_parent_main_history_anchor_found"
+            if occurrence_mode == "out_of_band_single_canonical_occurrence"
+            else "unique_prior_occurrence_and_preceding_parent_main_history_anchor_found"
+        ),
         "occurrence_count": len(matches),
         "prior_occurrence_count": 1,
+        "occurrence_mode": occurrence_mode,
         "status_as_of_boundary": boundary,
         "selected_anchor": anchor,
         "occurrence": _occurrence_candidate(occurrence),
@@ -1175,6 +1198,88 @@ def _is_parent_main_complaint_request(query: str) -> bool:
         and any(marker in normalized for marker in status_or_answer)
         and any(marker in normalized for marker in complaint)
     )
+
+
+def _out_of_band_single_occurrence_allowed(query: str, rows: list[dict], occurrence: dict) -> bool:
+    anchor = _preceding_eligible_history_anchor(rows, occurrence, require_parent_main=True)
+    if anchor is None:
+        return False
+    if is_status_question(query):
+        return _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
+    if _is_parent_main_complaint_request(query):
+        return _canonical_occurrence_has_status_failure_evidence(rows, occurrence)
+    return False
+
+
+def _has_out_of_band_current_prompt_echo(query: str, latest_messages: list[dict], occurrence: dict) -> bool:
+    normalized_query = _normalize(query)
+    if not normalized_query:
+        return False
+    occurrence_timestamp = parse_datetime(str(occurrence.get("timestamp_utc") or ""), timezone.utc)
+    for message in latest_messages:
+        if message.get("source_kind") == "codex_history":
+            continue
+        normalized_text = _normalize(str(message.get("snippet") or ""))
+        if normalized_text != normalized_query and normalized_query not in normalized_text:
+            continue
+        message_timestamp = parse_datetime(str(message.get("timestamp_utc") or ""), timezone.utc)
+        if occurrence_timestamp is not None and message_timestamp is not None:
+            if message_timestamp.astimezone(timezone.utc) <= occurrence_timestamp.astimezone(timezone.utc):
+                continue
+        return True
+    return False
+
+
+def _canonical_occurrence_has_status_failure_evidence(rows: list[dict], occurrence: dict) -> bool:
+    occurrence_line = int(occurrence.get("line") or 0)
+    occurrence_threads = set(occurrence.get("thread_keys") or [])
+    nearby = []
+    for row in rows:
+        line = int(row.get("line") or 0)
+        if abs(line - occurrence_line) > 3:
+            continue
+        if occurrence_threads and not _thread_key_overlap(row, occurrence_threads):
+            continue
+        nearby.append(str(row.get("snippet") or ""))
+    if not nearby:
+        nearby = [str(occurrence.get("snippet") or "")]
+    normalized_nearby = " ".join(_normalize(text) for text in nearby)
+    has_status_boundary = any(is_status_question(text) for text in nearby) or any(
+        marker in normalized_nearby
+        for marker in (
+            "status",
+            "what happened since",
+            "what has happened since",
+            "while i was away",
+        )
+    )
+    has_wrong_context = any(
+        marker in normalized_nearby
+        for marker in (
+            "wrong anchor",
+            "wrong context",
+            "wrong thread",
+            "wrong conversation",
+            "side-thread answer",
+            "side thread answer",
+            "made no sense",
+            "failed to use jsonl",
+            "did not use jsonl",
+            "didn't use jsonl",
+        )
+    )
+    has_parent_main_boundary = any(
+        marker in normalized_nearby
+        for marker in (
+            "parent/main",
+            "parent thread",
+            "main thread",
+            "last actual message",
+            "latest message",
+            "previous relevant time window",
+        )
+    )
+    return has_status_boundary and has_wrong_context and has_parent_main_boundary
 
 
 def _canonical_history_human_rows(path: Path, *, query: str) -> list[dict]:
@@ -1269,14 +1374,22 @@ def _history_row_is_non_human_or_boundary(record: Mapping[str, Any], candidate: 
     return False
 
 
-def _preceding_eligible_history_anchor(rows: list[dict], occurrence: dict) -> dict | None:
+def _preceding_eligible_history_anchor(
+    rows: list[dict],
+    occurrence: dict,
+    *,
+    require_parent_main: bool = False,
+) -> dict | None:
     occurrence_line = int(occurrence.get("line") or 0)
+    occurrence_threads = set(occurrence.get("thread_keys") or [])
     prior_rows = sorted(
         (item for item in rows if int(item.get("line") or 0) < occurrence_line),
         key=lambda item: int(item.get("line") or 0),
         reverse=True,
     )
     for row in prior_rows:
+        if require_parent_main and _thread_key_overlap(row, occurrence_threads):
+            continue
         if _is_never_anchor(row):
             continue
         if not _is_eligible_anchor(row):
