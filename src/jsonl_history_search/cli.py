@@ -2093,6 +2093,9 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "historical_orchestration_provenance_final_support_plan": (
                 packet.get("historical_orchestration_provenance_final_support_plan")
             ),
+            "historical_orchestration_role_evidence_bundle": (
+                packet.get("historical_orchestration_role_evidence_bundle")
+            ),
             "historical_orchestration_role_coverage_source_plan": (
                 packet.get("historical_orchestration_role_coverage_source_plan")
             ),
@@ -2136,13 +2139,26 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
 def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
     if output_key == "semantic_debug":
         handoff = compact.get("answer_ready_handoff") or {}
+        orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
         orchestration_reads = (
-            orchestration_plan.get("primary_historical_final_support_reads")
-            if orchestration_plan.get("status") == "answer_ready"
-            else orchestration_plan.get("missing_role_recovery_refs")
-            or orchestration_plan.get("bounded_non_final_required_reads")
+            orchestration_bundle.get("required_role_reads")
+            if orchestration_bundle.get("status") == "answer_ready"
+            else orchestration_bundle.get("missing_role_recovery_refs")
+            or (
+                orchestration_plan.get("primary_historical_final_support_reads")
+                if orchestration_plan.get("status") == "answer_ready"
+                else orchestration_plan.get("missing_role_recovery_refs")
+                or orchestration_plan.get("bounded_non_final_required_reads")
+            )
         )
+        if not orchestration_reads:
+            orchestration_reads = (
+                orchestration_plan.get("primary_historical_final_support_reads")
+                if orchestration_plan.get("status") == "answer_ready"
+                else orchestration_plan.get("missing_role_recovery_refs")
+                or orchestration_plan.get("bounded_non_final_required_reads")
+            )
         internal_status = (
             handoff.get("answer_readiness_status")
             or compact.get("answer_readiness_summary", {}).get("status")
@@ -2288,6 +2304,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "answer_readiness_summary": compact.get("answer_readiness_summary"),
             "historical_orchestration_provenance_final_support_plan": compact.get(
                 "historical_orchestration_provenance_final_support_plan"
+            ),
+            "historical_orchestration_role_evidence_bundle": compact.get(
+                "historical_orchestration_role_evidence_bundle"
             ),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),

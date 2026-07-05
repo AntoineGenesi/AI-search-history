@@ -3664,6 +3664,11 @@ def render_semantic_debug_text(payload: dict) -> str:
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
+    orchestration_role_bundle = (
+        report.get("historical_orchestration_role_evidence_bundle")
+        or handoff.get("historical_orchestration_role_evidence_bundle")
+        or (report.get("source_locator_handoff") or {}).get("historical_orchestration_role_evidence_bundle")
+    )
     orchestration_role_plan = (
         report.get("historical_orchestration_role_coverage_source_plan")
         or report.get("historical_orchestration_provenance_final_support_plan")
@@ -3678,6 +3683,8 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
     ]
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if orchestration_role_bundle:
+        lines.extend(render_historical_orchestration_role_evidence_bundle_text(orchestration_role_bundle))
     if orchestration_role_plan:
         lines.extend(render_historical_orchestration_role_coverage_source_plan_text(orchestration_role_plan))
     lines.append("Open these source refs first:")
@@ -3917,6 +3924,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
+    orchestration_role_bundle = (
+        report.get("historical_orchestration_role_evidence_bundle")
+        or handoff.get("historical_orchestration_role_evidence_bundle")
+        or (report.get("source_locator_handoff") or {}).get("historical_orchestration_role_evidence_bundle")
+    )
     lines = [
         "# Semantic Debug",
         "",
@@ -3924,6 +3936,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         f"**Answer status:** `{answer_status}`",
     ]
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if orchestration_role_bundle:
+        lines.extend(render_historical_orchestration_role_evidence_bundle_markdown(orchestration_role_bundle))
     lines.extend(["", "## Open These Source Refs First", ""])
     if scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
@@ -5460,6 +5474,83 @@ HISTORICAL_ORCHESTRATION_ROLE_LABELS = {
     "reviewer": "reviewer/rereviewer",
     "secondary_task_review_commit_support": "secondary task/review/commit support",
 }
+
+
+def render_historical_orchestration_role_evidence_bundle_text(bundle: dict) -> list[str]:
+    labels = HISTORICAL_ORCHESTRATION_ROLE_LABELS
+    lines = [
+        "Historical orchestration role evidence bundle:",
+        f"- bundle_name: {bundle.get('bundle_name') or 'historical_orchestration_role_evidence_bundle'}",
+        f"- status: {bundle.get('status')}",
+        f"- required_role_read_count: {bundle.get('required_role_read_count', 0)} / {bundle.get('required_role_read_cap', 5)}",
+        (
+            "- claim_boundaries: raw JSONL supports primary role claims; "
+            "task/review/commit refs are secondary support; current-run/current-task/same-loop echoes do not count"
+        ),
+    ]
+    for group in bundle.get("role_groups") or []:
+        label = group.get("label") or labels.get(group.get("role"), group.get("role"))
+        lines.append(
+            f"- role_group: {label} status={group.get('status')} "
+            f"tier={group.get('support_tier')} sources={group.get('source_count', 0)}"
+        )
+        for read in list(group.get("source_refs") or [])[:2]:
+            lines.append(f"  source: {read.get('target') or '(no source ref)'}")
+    required_reads = bundle.get("required_role_reads") or []
+    if required_reads:
+        lines.append("Required role reads:")
+        for read in required_reads[:5]:
+            _append_historical_orchestration_plan_read(lines, read, labels=labels)
+    if bundle.get("missing_roles"):
+        missing = [labels.get(role, role) for role in bundle.get("missing_roles") or []]
+        lines.append(f"- missing_roles: {', '.join(missing)}")
+        lines.append(
+            f"- missing_role_recovery_ref_count: {bundle.get('missing_role_recovery_ref_count', 0)}"
+        )
+        for item in list(bundle.get("missing_role_recovery_refs") or [])[:5]:
+            role = labels.get(item.get("role"), item.get("role"))
+            lines.append(f"- recovery for {role}: {item.get('target') or '(no target)'}")
+            if item.get("command"):
+                lines.append(f"  command: {item.get('command')}")
+    return lines
+
+
+def render_historical_orchestration_role_evidence_bundle_markdown(bundle: dict) -> list[str]:
+    labels = HISTORICAL_ORCHESTRATION_ROLE_LABELS
+    lines = [
+        "",
+        "## Historical Orchestration Role Evidence Bundle",
+        "",
+        f"- `bundle_name`: `{bundle.get('bundle_name') or 'historical_orchestration_role_evidence_bundle'}`",
+        f"- `status`: `{bundle.get('status')}`",
+        f"- `required_role_read_count`: `{bundle.get('required_role_read_count', 0)} / {bundle.get('required_role_read_cap', 5)}`",
+        "- `claim_boundaries`: raw JSONL supports primary role claims; task/review/commit refs are secondary support; current-run/current-task/same-loop echoes do not count.",
+    ]
+    for group in bundle.get("role_groups") or []:
+        label = group.get("label") or labels.get(group.get("role"), group.get("role"))
+        lines.append(
+            f"- `{label}`: `{group.get('status')}` "
+            f"tier=`{group.get('support_tier')}` sources=`{group.get('source_count', 0)}`"
+        )
+        for read in list(group.get("source_refs") or [])[:2]:
+            lines.append(f"  - source: `{read.get('target') or '(no source ref)'}`")
+    required_reads = bundle.get("required_role_reads") or []
+    if required_reads:
+        lines.extend(["", "Required role reads:"])
+        for read in required_reads[:5]:
+            lines.append(f"- `{read.get('target') or '(no source ref)'}`")
+    if bundle.get("missing_roles"):
+        missing = [labels.get(role, role) for role in bundle.get("missing_roles") or []]
+        lines.append(f"- `missing_roles`: `{', '.join(missing)}`")
+        lines.append(
+            f"- `missing_role_recovery_ref_count`: `{bundle.get('missing_role_recovery_ref_count', 0)}`"
+        )
+        for item in list(bundle.get("missing_role_recovery_refs") or [])[:5]:
+            role = labels.get(item.get("role"), item.get("role"))
+            lines.append(f"- recovery for `{role}`: `{item.get('target') or '(no target)'}`")
+            if item.get("command"):
+                lines.append(f"  - command: `{item.get('command')}`")
+    return lines
 
 
 def render_historical_orchestration_role_coverage_source_plan_text(plan: dict) -> list[str]:
