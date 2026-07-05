@@ -1578,21 +1578,50 @@ def historical_orchestration_requested_roles(query: str) -> list[str]:
 def historical_orchestration_roles_from_text(text: str) -> list[str]:
     lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
     roles: list[str] = []
-    if any(term in lowered for term in ("parent", "coordinator", "orchestrator", "launched", "spawned")):
+    if historical_orchestration_affirmative_role_mention(
+        lowered,
+        ("parent", "coordinator", "orchestrator", "launched", "spawned"),
+    ):
         roles.append("parent_or_coordinator")
-    if any(term in lowered for term in ("worker", "implementer", "implementation", "subagent", "worktree")):
+    if historical_orchestration_affirmative_role_mention(
+        lowered,
+        ("worker", "implementer", "implementation", "subagent", "worktree"),
+    ):
         roles.append("worker")
-    if any(term in lowered for term in ("reviewer", "rereviewer", "review ", "reviewed", "verified", "verification")):
+    if historical_orchestration_affirmative_role_mention(
+        lowered,
+        ("reviewer", "rereviewer", "review ", "reviewed", "verified", "verification"),
+    ):
         roles.append("reviewer")
-    if historical_orchestration_secondary_support_from_text(lowered):
-        roles.append("secondary_task_review_commit_support")
     return dedupe(roles)
+
+
+def historical_orchestration_affirmative_role_mention(text: str, terms: tuple[str, ...]) -> bool:
+    stripped = historical_orchestration_strip_negated_role_absence(text, terms)
+    return any(term in stripped for term in terms)
+
+
+def historical_orchestration_strip_negated_role_absence(text: str, terms: tuple[str, ...]) -> str:
+    result = str(text or "")
+    term_pattern = "|".join(re.escape(term.strip()) for term in terms if term.strip())
+    if not term_pattern:
+        return result
+    absence_nouns = (
+        r"evidence|proof|support|record|records|source|sources|ref|refs|artifact|artifacts|"
+        r"trace|traces|entry|entries"
+    )
+    negators = r"no|not|without|missing|absent|lack(?:s|ed|ing)?|unavailable|unproven"
+    patterns = (
+        rf"\b(?:{negators})\b[^.;\n]{{0,100}}\b(?:{term_pattern})\b[^.;\n]{{0,100}}\b(?:{absence_nouns}|present|found|available)\b",
+        rf"\b(?:{term_pattern})\b[^.;\n]{{0,100}}\b(?:{absence_nouns})\b[^.;\n]{{0,60}}\b(?:not\s+present|not\s+found|missing|absent|unavailable|lacking|none)\b",
+    )
+    for pattern in patterns:
+        result = re.sub(pattern, " ", result)
+    return result
 
 
 def historical_orchestration_secondary_support_from_text(text: str) -> bool:
     lowered = str(text or "").lower().replace("\\", "/")
-    if TASKISH_HANDLE_RE.search(text) or re.search(r"\b(?:jsh|task|case)[-_][a-z0-9][a-z0-9_-]*\b", lowered):
-        return True
     if re.search(r"\b[0-9a-f]{7,40}\b", lowered) and any(term in lowered for term in ("commit", "git")):
         return True
     return any(
@@ -1612,6 +1641,63 @@ def historical_orchestration_secondary_support_from_text(text: str) -> bool:
             "commit:",
             "commit evidence",
             "git show",
+        )
+    )
+
+
+def historical_orchestration_secondary_support_from_ref(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    text: str,
+) -> bool:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    kind = str(read.get("kind") or "").lower()
+    support_text = " ".join(
+        str(part or "")
+        for part in (
+            kind,
+            target,
+            path,
+            read.get("reason"),
+            candidate.get("snippet"),
+            text,
+        )
+    )
+    raw_jsonl = is_jsonl_read_target(target) or path.lower().replace("\\", "/").endswith(".jsonl")
+    artifact_ref = historical_orchestration_secondary_artifact_path(path) or (
+        not raw_jsonl
+        and kind
+        in {
+            "task_or_review_artifact",
+            "artifact",
+            "hint_path",
+            "commit_ref",
+            "git_commit",
+        }
+    )
+    commit_ref = not raw_jsonl and bool(
+        re.search(r"\b[0-9a-f]{7,40}\b", support_text.lower())
+        and any(term in support_text.lower() for term in ("commit", "git show", "git log"))
+    )
+    if not (artifact_ref or commit_ref):
+        return False
+    return historical_orchestration_secondary_support_from_text(support_text)
+
+
+def historical_orchestration_secondary_artifact_path(path: str) -> bool:
+    normalized_path = str(path or "").strip("/").lower().replace("\\", "/")
+    normalized = f"/{normalized_path}"
+    return any(
+        marker in normalized
+        for marker in (
+            "/tasks/",
+            "/reviews/",
+            "/codex/state/reviews/",
+            "/.git/objects/",
+            "/.git/logs/",
         )
     )
 
@@ -1690,6 +1776,9 @@ def historical_orchestration_read_plan_row(
         roles = list(read.get("orchestration_role_hints") or [])
     if not roles and read.get("embedded_source_ref_unwrapped"):
         roles = historical_orchestration_roles_from_text(str(read.get("reason") or ""))
+    if historical_orchestration_secondary_support_from_ref(read, candidate, text=text):
+        roles.append("secondary_task_review_commit_support")
+        roles = dedupe(roles)
     role = str(selection.get("source_chronology_role") or "candidate_or_original_source_ref")
     current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(
         text,
@@ -7799,7 +7888,6 @@ def build_answer_readiness(
     historical_orchestration_fail_closed = (
         bool(historical_orchestration_plan)
         and not historical_orchestration_answer_ready
-        and bool(historical_orchestration_plan.get("bounded_non_final_required_reads"))
     )
     if no_evidence.get("needed"):
         readiness_status = "scoped_no_evidence_ready"
@@ -7845,8 +7933,8 @@ def build_answer_readiness(
         missing = ", ".join(historical_orchestration_contract.get("missing_roles") or [])
         required_before_answer = [
             (
-                "Open the bounded non-final orchestration reads before answering; they are gap checks, "
-                "not final support."
+                "Inspect any bounded non-final orchestration reads before answering; they are gap checks, "
+                "not final support, and missing roles remain explicit gaps."
             ),
         ]
         if missing:
