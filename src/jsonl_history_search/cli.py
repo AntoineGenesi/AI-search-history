@@ -2093,6 +2093,9 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "historical_orchestration_provenance_final_support_plan": (
                 packet.get("historical_orchestration_provenance_final_support_plan")
             ),
+            "historical_orchestration_role_coverage_source_plan": (
+                packet.get("historical_orchestration_role_coverage_source_plan")
+            ),
             "answer_source_discipline_summary": (
                 packet["final_answer_source_use_contract"].get("answer_source_discipline")
             ),

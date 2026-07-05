@@ -3584,12 +3584,22 @@ def render_semantic_debug_text(payload: dict) -> str:
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
+    orchestration_role_plan = (
+        report.get("historical_orchestration_role_coverage_source_plan")
+        or report.get("historical_orchestration_provenance_final_support_plan")
+        or handoff.get("historical_orchestration_role_coverage_source_plan")
+        or handoff.get("historical_orchestration_provenance_final_support_plan")
+        or (report.get("source_locator_handoff") or {}).get("historical_orchestration_role_coverage_source_plan")
+        or (report.get("source_locator_handoff") or {}).get("historical_orchestration_provenance_final_support_plan")
+    )
     lines = [
         "Semantic Debug",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
     ]
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if orchestration_role_plan:
+        lines.extend(render_historical_orchestration_role_coverage_source_plan_text(orchestration_role_plan))
     lines.append("Open these source refs first:")
     if scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
@@ -5362,6 +5372,90 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
             handoff.get("process_actual_use_bucket_evidence_bundle") or {},
         )
     return lines
+
+
+HISTORICAL_ORCHESTRATION_ROLE_LABELS = {
+    "parent_or_coordinator": "parent/coordinator",
+    "worker": "worker/subagent",
+    "reviewer": "reviewer/rereviewer",
+    "secondary_task_review_commit_support": "secondary task/review/commit support",
+}
+
+
+def render_historical_orchestration_role_coverage_source_plan_text(plan: dict) -> list[str]:
+    labels = HISTORICAL_ORCHESTRATION_ROLE_LABELS
+    missing = [labels.get(role, role) for role in plan.get("missing_roles") or []]
+    required = [labels.get(role, role) for role in plan.get("required_roles") or []]
+    covered = [labels.get(role, role) for role in plan.get("covered_roles") or []]
+    lines = [
+        "Historical orchestration role-coverage source plan:",
+        f"- source_plan_name: {plan.get('source_plan_name') or 'historical_orchestration_role_coverage_source_plan'}",
+        f"- status: {plan.get('status')}",
+        f"- required_roles: {', '.join(required) if required else '(none)'}",
+        f"- covered_roles: {', '.join(covered) if covered else '(none)'}",
+        f"- missing_roles: {', '.join(missing) if missing else '(none)'}",
+        (
+            "- final_support_policy: pre-existing raw JSONL refs first; "
+            "current-run/current-task/same-loop echoes do not count as final support"
+        ),
+    ]
+    role_coverage = plan.get("role_coverage") or []
+    if role_coverage:
+        lines.append("- role coverage:")
+        for row in role_coverage:
+            label = labels.get(row.get("role"), row.get("role"))
+            lines.append(
+                "  "
+                f"- {label}: {row.get('status')} "
+                f"tier={row.get('tier')} sources={row.get('source_count', 0)}"
+            )
+    primary_reads = plan.get("primary_historical_final_support_reads") or []
+    lines.append("Primary pre-existing raw JSONL refs:")
+    if primary_reads:
+        for read in primary_reads[:4]:
+            _append_historical_orchestration_plan_read(lines, read, labels=labels)
+    else:
+        lines.append("- (missing)")
+    secondary_reads = plan.get("secondary_task_review_commit_support_reads") or []
+    lines.append("Secondary task/review/commit support refs:")
+    if secondary_reads:
+        for read in secondary_reads[:3]:
+            _append_historical_orchestration_plan_read(lines, read, labels=labels)
+    else:
+        lines.append("- (missing)")
+    non_final_reads = plan.get("bounded_non_final_required_reads") or []
+    if missing or non_final_reads:
+        lines.append("Fail-closed gap checks:")
+        if missing:
+            lines.append(f"- state missing roles before any answer: {', '.join(missing)}")
+        lines.append(
+            "- bounded_non_final_required_read_count: "
+            f"{plan.get('bounded_non_final_required_read_count', len(non_final_reads))}"
+        )
+        if plan.get("current_run_self_echo_candidate_count"):
+            lines.append(
+                "- current_run_current_task_same_loop_echo_count: "
+                f"{plan.get('current_run_self_echo_candidate_count')}; listed later only as diagnostics"
+            )
+    return lines
+
+
+def _append_historical_orchestration_plan_read(
+    lines: list[str],
+    read: dict,
+    *,
+    labels: dict[str, str],
+    diagnostic: bool = False,
+) -> None:
+    roles = [labels.get(role, role) for role in read.get("orchestration_roles") or []]
+    role_text = f" roles={','.join(roles)}" if roles else ""
+    chronology = read.get("source_chronology_role") or "unknown_chronology"
+    reason = f" reason={read.get('reason')}" if read.get("reason") else ""
+    prefix = "diagnostic/non-final" if diagnostic or read.get("diagnostic_only") else "source"
+    lines.append(
+        f"- {prefix}: {read.get('target') or '(no source ref)'}"
+        f"{role_text} chronology={chronology}{reason}"
+    )
 
 
 def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:

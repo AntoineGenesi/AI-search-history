@@ -364,6 +364,9 @@ def build_semantic_debug_payload(
         source_locator_handoff["historical_orchestration_provenance_final_support_plan"] = (
             historical_orchestration_plan
         )
+        source_locator_handoff["historical_orchestration_role_coverage_source_plan"] = (
+            historical_orchestration_plan
+        )
     process_actual_use_read_plan = (
         build_process_actual_use_final_support_read_plan(
             list(source_locator_handoff.get("next_reads") or next_reads),
@@ -589,6 +592,9 @@ def build_semantic_debug_payload(
         answer_ready_handoff["historical_orchestration_provenance_final_support_plan"] = (
             orchestration_summary
         )
+        answer_ready_handoff["historical_orchestration_role_coverage_source_plan"] = (
+            orchestration_summary
+        )
         answer_ready_handoff["source_use_summary"][
             "historical_orchestration_provenance_final_support_plan"
         ] = {
@@ -602,6 +608,20 @@ def build_semantic_debug_payload(
             ),
             "current_run_self_echo_candidate_count": orchestration_summary.get(
                 "current_run_self_echo_candidate_count", 0
+            ),
+            "current_run_current_task_same_loop_refs_count_as_final_support": False,
+        }
+        answer_ready_handoff["source_use_summary"][
+            "historical_orchestration_role_coverage_source_plan"
+        ] = {
+            "link": "semantic_debug.historical_orchestration_role_coverage_source_plan",
+            "status": orchestration_summary.get("status"),
+            "required_primary_roles": orchestration_summary.get("required_primary_roles"),
+            "required_secondary_roles": orchestration_summary.get("required_secondary_roles"),
+            "missing_primary_roles": orchestration_summary.get("missing_primary_roles"),
+            "missing_secondary_roles": orchestration_summary.get("missing_secondary_roles"),
+            "secondary_task_review_commit_support_read_count": orchestration_summary.get(
+                "secondary_task_review_commit_support_read_count", 0
             ),
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
         }
@@ -671,6 +691,7 @@ def build_semantic_debug_payload(
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
+        "historical_orchestration_role_coverage_source_plan": historical_orchestration_plan,
         "historical_orchestration_provenance_final_support_plan": historical_orchestration_plan,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
@@ -1370,6 +1391,14 @@ def apply_historical_provenance_self_echo_policy(
 
 HISTORICAL_ORCHESTRATION_FINAL_SUPPORT_CAP = 6
 HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP = 4
+HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES = [
+    "parent_or_coordinator",
+    "worker",
+    "reviewer",
+]
+HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES = [
+    "secondary_task_review_commit_support",
+]
 
 
 def build_historical_orchestration_provenance_final_support_plan(
@@ -1381,7 +1410,11 @@ def build_historical_orchestration_provenance_final_support_plan(
 ) -> dict[str, Any]:
     if not historical_orchestration_provenance_plan_wanted(query, family=family):
         return {}
-    required_roles = historical_orchestration_requested_roles(query)
+    required_primary_roles = historical_orchestration_requested_roles(query)
+    required_secondary_roles = list(HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES)
+    required_roles = required_primary_roles + [
+        role for role in required_secondary_roles if role not in required_primary_roles
+    ]
     candidate_by_id = {
         str(candidate.get("candidate_id") or ""): candidate
         for candidate in candidates
@@ -1413,26 +1446,57 @@ def build_historical_orchestration_provenance_final_support_plan(
         else:
             non_final.append({**row, "required_non_final_read": True})
 
-    covered_roles = sorted(
-        {
-            role
-            for row in final_support
-            for role in row.get("orchestration_roles") or []
-            if role in required_roles
-        }
-    )
+    covered_primary_role_set = {
+        role
+        for row in final_support
+        for role in row.get("orchestration_roles") or []
+        if role in required_primary_roles
+    }
+    covered_primary_roles = [role for role in required_primary_roles if role in covered_primary_role_set]
+    secondary_support = [
+        row
+        for row in final_support + non_final
+        if historical_orchestration_secondary_support_row_allowed(row)
+    ]
+    covered_secondary_role_set = {
+        role
+        for row in secondary_support
+        for role in row.get("orchestration_roles") or []
+        if role in required_secondary_roles
+    }
+    covered_secondary_roles = [role for role in required_secondary_roles if role in covered_secondary_role_set]
+    covered_roles = covered_primary_roles + [
+        role for role in covered_secondary_roles if role not in covered_primary_roles
+    ]
     missing_roles = [role for role in required_roles if role not in covered_roles]
-    sufficient = bool(final_support) and not missing_roles
+    missing_primary_roles = [role for role in required_primary_roles if role not in covered_primary_roles]
+    missing_secondary_roles = [role for role in required_secondary_roles if role not in covered_secondary_roles]
+    sufficient = bool(final_support) and not missing_primary_roles and not missing_secondary_roles
     status = "answer_ready" if sufficient else "incomplete_primary_coverage"
     return {
         "schema_version": 1,
+        "source_plan_name": "historical_orchestration_role_coverage_source_plan",
         "status": status,
         "applies_to_question_family": family.get("primary"),
+        "required_primary_roles": required_primary_roles,
+        "required_secondary_roles": required_secondary_roles,
         "required_roles": required_roles,
+        "covered_primary_roles": covered_primary_roles,
+        "covered_secondary_roles": covered_secondary_roles,
         "covered_roles": covered_roles,
         "missing_roles": missing_roles,
+        "missing_primary_roles": missing_primary_roles,
+        "missing_secondary_roles": missing_secondary_roles,
+        "role_coverage": historical_orchestration_role_coverage_rows(
+            required_primary_roles=required_primary_roles,
+            required_secondary_roles=required_secondary_roles,
+            final_support=final_support,
+            secondary_support=secondary_support,
+        ),
         "primary_historical_final_support_reads": final_support[:HISTORICAL_ORCHESTRATION_FINAL_SUPPORT_CAP],
         "primary_historical_final_support_read_count": len(final_support),
+        "secondary_task_review_commit_support_reads": secondary_support[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
+        "secondary_task_review_commit_support_read_count": len(secondary_support),
         "bounded_non_final_required_reads": non_final[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
         "bounded_non_final_required_read_count": min(
             len(non_final),
@@ -1450,6 +1514,10 @@ def build_historical_orchestration_provenance_final_support_plan(
                 "Pre-existing raw JSONL refs may support orchestration/provenance claims after inspection "
                 "when they cover the requested parent/coordinator, worker, and reviewer roles."
             ),
+            "secondary_support_policy": (
+                "Pre-existing task, review, or commit refs are secondary support for chronology/provenance "
+                "cross-checks; they do not replace the primary raw parent/worker/reviewer refs."
+            ),
             "current_run_self_echo_policy": (
                 "Current-run command output, same-loop task/status text, and prompt echoes are chronology "
                 "diagnostics only; they do not count as final historical orchestration support."
@@ -1464,6 +1532,7 @@ def build_historical_orchestration_provenance_final_support_plan(
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
             "secondary_or_non_final_reads_count_as_final_support": False,
             "answer_ready_requires_all_requested_roles": True,
+            "answer_ready_requires_secondary_task_review_commit_support": True,
             "release_or_token_savings_claim_supported": False,
         },
     }
@@ -1494,9 +1563,13 @@ def historical_orchestration_provenance_plan_wanted(query: str, *, family: dict[
 
 
 def historical_orchestration_requested_roles(query: str) -> list[str]:
-    roles = historical_orchestration_roles_from_text(query)
+    roles = [
+        role
+        for role in historical_orchestration_roles_from_text(query)
+        if role in HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES
+    ]
     if not roles:
-        roles = ["parent_or_coordinator", "worker", "reviewer"]
+        roles = list(HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES)
     if "worker" in roles and "parent_or_coordinator" not in roles:
         roles.insert(0, "parent_or_coordinator")
     return roles
@@ -1511,7 +1584,91 @@ def historical_orchestration_roles_from_text(text: str) -> list[str]:
         roles.append("worker")
     if any(term in lowered for term in ("reviewer", "rereviewer", "review ", "reviewed", "verified", "verification")):
         roles.append("reviewer")
+    if historical_orchestration_secondary_support_from_text(lowered):
+        roles.append("secondary_task_review_commit_support")
     return dedupe(roles)
+
+
+def historical_orchestration_secondary_support_from_text(text: str) -> bool:
+    lowered = str(text or "").lower().replace("\\", "/")
+    if TASKISH_HANDLE_RE.search(text) or re.search(r"\b(?:jsh|task|case)[-_][a-z0-9][a-z0-9_-]*\b", lowered):
+        return True
+    if re.search(r"\b[0-9a-f]{7,40}\b", lowered) and any(term in lowered for term in ("commit", "git")):
+        return True
+    return any(
+        term in lowered
+        for term in (
+            " task file",
+            " tasks/",
+            "/tasks/",
+            " task status",
+            " review artifact",
+            " review file",
+            " review verdict",
+            " review report",
+            "/reviews/",
+            "codex/state/reviews",
+            " commit ",
+            "commit:",
+            "commit evidence",
+            "git show",
+        )
+    )
+
+
+def historical_orchestration_secondary_support_row_allowed(row: dict[str, Any]) -> bool:
+    roles = set(row.get("orchestration_roles") or [])
+    if "secondary_task_review_commit_support" not in roles:
+        return False
+    if row.get("diagnostic_only") or row.get("read_more_actionable") is False:
+        return False
+    if row.get("source_chronology_role") in {
+        "current_run_self_echo_diagnostic",
+        "current_task_same_loop_diagnostic",
+    }:
+        return False
+    return True
+
+
+def historical_orchestration_role_coverage_rows(
+    *,
+    required_primary_roles: list[str],
+    required_secondary_roles: list[str],
+    final_support: list[dict[str, Any]],
+    secondary_support: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for role in required_primary_roles:
+        sources = [
+            read
+            for read in final_support
+            if role in set(read.get("orchestration_roles") or [])
+        ]
+        rows.append(
+            {
+                "role": role,
+                "tier": "primary_raw_final_support",
+                "status": "covered" if sources else "missing",
+                "source_count": len(sources),
+                "source_targets": [str(read.get("target") or "") for read in sources[:3]],
+            }
+        )
+    for role in required_secondary_roles:
+        sources = [
+            read
+            for read in secondary_support
+            if role in set(read.get("orchestration_roles") or [])
+        ]
+        rows.append(
+            {
+                "role": role,
+                "tier": "secondary_task_review_commit_support",
+                "status": "covered" if sources else "missing",
+                "source_count": len(sources),
+                "source_targets": [str(read.get("target") or "") for read in sources[:3]],
+            }
+        )
+    return rows
 
 
 def historical_orchestration_read_plan_row(
@@ -1646,17 +1803,34 @@ def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any
         return {}
     return {
         "schema_version": plan.get("schema_version", 1),
+        "source_plan_name": plan.get(
+            "source_plan_name",
+            "historical_orchestration_role_coverage_source_plan",
+        ),
         "status": plan.get("status"),
+        "required_primary_roles": list(plan.get("required_primary_roles") or []),
+        "required_secondary_roles": list(plan.get("required_secondary_roles") or []),
         "required_roles": list(plan.get("required_roles") or []),
+        "covered_primary_roles": list(plan.get("covered_primary_roles") or []),
+        "covered_secondary_roles": list(plan.get("covered_secondary_roles") or []),
         "covered_roles": list(plan.get("covered_roles") or []),
         "missing_roles": list(plan.get("missing_roles") or []),
+        "missing_primary_roles": list(plan.get("missing_primary_roles") or []),
+        "missing_secondary_roles": list(plan.get("missing_secondary_roles") or []),
+        "role_coverage": list(plan.get("role_coverage") or []),
         "primary_historical_final_support_read_count": plan.get(
             "primary_historical_final_support_read_count", 0
+        ),
+        "secondary_task_review_commit_support_read_count": plan.get(
+            "secondary_task_review_commit_support_read_count", 0
         ),
         "bounded_non_final_required_read_count": plan.get("bounded_non_final_required_read_count", 0),
         "current_run_self_echo_candidate_count": plan.get("current_run_self_echo_candidate_count", 0),
         "primary_historical_final_support_reads": list(
             plan.get("primary_historical_final_support_reads") or []
+        )[:3],
+        "secondary_task_review_commit_support_reads": list(
+            plan.get("secondary_task_review_commit_support_reads") or []
         )[:3],
         "bounded_non_final_required_reads": list(plan.get("bounded_non_final_required_reads") or [])[:3],
         "claim_boundaries": plan.get("claim_boundaries"),
