@@ -222,6 +222,14 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         ),
     )
     ask.add_argument(
+        "--auto-execute-bounded-no-evidence",
+        action="store_true",
+        help=(
+            "After routing, execute only high-confidence bounded no-evidence prompts "
+            "through the safe no-evidence-report path. All other routes remain route-only."
+        ),
+    )
+    ask.add_argument(
         "--report-output",
         default=None,
         help="Optional path where ask --execute writes the full selected-route JSON report.",
@@ -2239,7 +2247,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ask":
         cwd = str(Path(args.cwd).expanduser().resolve())
         payload = build_ask_router_payload(args.query, cwd=cwd)
-        if args.execute:
+        auto_execute_bounded = (
+            args.auto_execute_bounded_no_evidence
+            and payload["ask_router"].get("route_family") == "bounded_no_evidence"
+        )
+        if args.execute or auto_execute_bounded:
             payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)
         print(render(payload, args.format))
         return 0
