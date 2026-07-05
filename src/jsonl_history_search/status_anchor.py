@@ -256,6 +256,11 @@ def status_anchor_report(
         codex_home=codex_home,
         status_as_of_boundary=status_as_of_boundary,
     )
+    canonical_parent_main_fallback = _canonical_parent_main_status_fallback(
+        query=query,
+        codex_home=codex_home,
+        status_as_of_boundary=status_as_of_boundary,
+    )
     anchor_candidates = _rank_anchor_candidates(
         latest_messages,
         target_window=target_window,
@@ -270,6 +275,7 @@ def status_anchor_report(
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
         prior_request_occurrence=prior_request_occurrence,
+        canonical_parent_main_fallback=canonical_parent_main_fallback,
     )
     status_as_of_boundary = anchor_decision.get("status_as_of_boundary") or status_as_of_boundary
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
@@ -414,6 +420,7 @@ def status_anchor_report(
             "anchor_reason": anchor_decision["anchor_reason"],
             "status_as_of_boundary_available": status_as_of_boundary is not None,
             "prior_request_occurrence_status": prior_request_occurrence.get("status"),
+            "canonical_parent_main_fallback_status": canonical_parent_main_fallback.get("status"),
         },
         "anchor_candidates": anchor_candidates,
         "selected_anchor": selected_anchor,
@@ -428,6 +435,7 @@ def status_anchor_report(
         "target_window": target_window,
         "status_as_of_boundary": status_as_of_boundary,
         "prior_request_occurrence_recovery": prior_request_occurrence,
+        "canonical_parent_main_fallback": canonical_parent_main_fallback,
         "suppressed_support": suppressed_support,
         "fail_closed_guidance": _fail_closed_guidance(
             selected_anchor=selected_anchor,
@@ -633,6 +641,7 @@ def _select_anchor_with_boundary(
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
     prior_request_occurrence: dict | None = None,
+    canonical_parent_main_fallback: dict | None = None,
 ) -> dict:
     base = {
         "context_boundary": "none",
@@ -811,6 +820,27 @@ def _select_anchor_with_boundary(
                             candidates,
                         )
             if prefer_parent and parent_anchor is None:
+                fallback = canonical_parent_main_fallback or {"status": "not_applicable"}
+                if fallback.get("status") == "selected":
+                    selected = fallback.get("selected_anchor") or {}
+                    fallback_boundary = fallback.get("status_as_of_boundary") or status_as_of_boundary
+                    return _with_rejected_alternatives(
+                        {
+                            **base,
+                            "context_boundary": "explicit_parent_main_canonical_history_fallback",
+                            "anchor_scope": "parent_thread",
+                            "anchor_reason": "nearest_preceding_canonical_parent_main_history_anchor",
+                            "anchor_ref": selected.get("source_ref"),
+                            "status_ref": (fallback_boundary or {}).get("source_ref") or status_ref,
+                            "status_as_of_boundary": fallback_boundary,
+                            "selected_anchor": _selected_with_reason(
+                                selected,
+                                "; selected by bounded canonical history fallback for explicit parent/main status",
+                            ),
+                            "canonical_parent_main_fallback": fallback,
+                        },
+                        candidates,
+                    )
                 return {
                     **base,
                     "context_boundary": "explicit_parent_main_history_anchor_missing",
@@ -823,6 +853,7 @@ def _select_anchor_with_boundary(
                         candidates,
                         status_thread_keys,
                     ),
+                    "canonical_parent_main_fallback": fallback,
                 }
             if relative_history_first and parent_anchor is None:
                 return {
@@ -1156,6 +1187,119 @@ def _prior_request_occurrence_recovery(
     }
 
 
+def _canonical_parent_main_status_fallback(
+    *,
+    query: str,
+    codex_home: Path | None,
+    status_as_of_boundary: dict | None,
+) -> dict:
+    if not codex_home or not is_status_question(query) or not _prefers_parent_main_anchor(query):
+        return {"status": "not_applicable", "reason": "query_not_explicit_parent_main_status"}
+    history_path = codex_home / "history.jsonl"
+    if not history_path.is_file():
+        return {"status": "not_applicable", "reason": "canonical_history_missing"}
+    rows = _canonical_history_human_rows(history_path, query=query)
+    if not rows:
+        return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
+    boundary = _canonical_parent_main_boundary_row(
+        rows,
+        query=query,
+        status_as_of_boundary=status_as_of_boundary,
+    )
+    if boundary is None:
+        return {
+            "status": "ambiguous",
+            "context_boundary": "explicit_parent_main_canonical_history_boundary_missing",
+            "anchor_reason": "canonical_parent_main_status_boundary_not_proven",
+            "reason": "could_not_find_unique_canonical_history_status_boundary_for_parent_main_query",
+            "rejected_anchor_alternatives": [
+                _occurrence_candidate(row)
+                for row in _canonical_history_boundary_rows(rows, query=query)[:6]
+            ],
+        }
+    anchor = _preceding_eligible_history_anchor(rows, boundary, require_parent_main=True)
+    if anchor is None:
+        return {
+            "status": "ambiguous",
+            "context_boundary": "explicit_parent_main_canonical_history_anchor_missing",
+            "anchor_reason": "canonical_parent_main_preceding_anchor_not_proven",
+            "reason": "canonical_history_status_boundary_found_but_no_preceding_different_thread_human_anchor",
+            "status_as_of_boundary": _canonical_parent_main_boundary(boundary),
+            "boundary": _occurrence_candidate(boundary),
+            "rejected_anchor_alternatives": [_occurrence_candidate(boundary)],
+        }
+    selected = dict(anchor)
+    selected["rationale"] = (
+        str(selected.get("rationale") or "").rstrip()
+        + "; selected by bounded canonical history fallback before the explicit parent/main status boundary"
+    )
+    return {
+        "status": "selected",
+        "reason": "nearest_preceding_different_thread_canonical_history_human_row_found",
+        "status_as_of_boundary": _canonical_parent_main_boundary(boundary),
+        "selected_anchor": selected,
+        "boundary": _occurrence_candidate(boundary),
+        "rejected_anchor_alternatives": [_occurrence_candidate(boundary)],
+    }
+
+
+def _canonical_parent_main_boundary_row(
+    rows: list[dict],
+    *,
+    query: str,
+    status_as_of_boundary: dict | None,
+) -> dict | None:
+    boundary_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
+    if boundary_line is not None:
+        for row in rows:
+            if int(row.get("line") or 0) != boundary_line:
+                continue
+            if is_status_question(str(row.get("snippet") or "")) and not _is_status_boundary_prompt_noise(row):
+                return row
+        return None
+    candidates = _canonical_history_boundary_rows(rows, query=query)
+    boundary_timestamp = parse_datetime(str((status_as_of_boundary or {}).get("timestamp_utc") or ""), timezone.utc)
+    if boundary_timestamp is not None:
+        bounded = []
+        for row in candidates:
+            row_timestamp = parse_datetime(str(row.get("timestamp_utc") or ""), timezone.utc)
+            if row_timestamp is None:
+                continue
+            if row_timestamp.astimezone(timezone.utc) <= boundary_timestamp.astimezone(timezone.utc):
+                bounded.append(row)
+        candidates = bounded
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _canonical_history_boundary_rows(rows: list[dict], *, query: str) -> list[dict]:
+    return [row for row in rows if _canonical_row_matches_status_query_boundary(row, query=query)]
+
+
+def _canonical_row_matches_status_query_boundary(row: dict, *, query: str) -> bool:
+    text = str(row.get("snippet") or "")
+    normalized_text = _normalize(text)
+    normalized_query = _normalize(query)
+    if not normalized_text or not normalized_query:
+        return False
+    if _is_status_boundary_prompt_noise(row):
+        return False
+    if not is_status_question(text):
+        return False
+    return normalized_query in normalized_text or normalized_text in normalized_query
+
+
+def _canonical_parent_main_boundary(row: dict) -> dict:
+    boundary = _prior_occurrence_boundary(row)
+    boundary["kind"] = "canonical_parent_main_status_boundary"
+    boundary["boundary_policy"] = (
+        "This canonical history.jsonl row is the explicit parent/main status boundary; "
+        "answer-facing support must stay after the selected parent/main anchor and at or before this row."
+    )
+    return boundary
+
+
 def _should_try_prior_request_occurrence(query: str) -> bool:
     return is_status_question(query) or _prefers_parent_main_anchor(query) or _is_parent_main_complaint_request(query)
 
@@ -1323,7 +1467,7 @@ def _history_row_candidate(
     query: str,
     timestamp_utc: str,
 ) -> dict:
-    score, classification, decision, rationale = _score_anchor(text, line_number, timestamp_utc=timestamp_utc)
+    score, classification, decision, rationale = _score_anchor(text, 0, timestamp_utc=timestamp_utc)
     source_identifier = _history_source_identifier(record)
     source_ref = f"codex_history:history.jsonl:{line_number}"
     target_window = _target_window_from_query(query)
@@ -3327,6 +3471,20 @@ def _answer_readiness_contract(
         ),
         "raw_session_trace_status": raw_status,
         "required_answer_facets": required_facets,
+        "task_label_only_summary_allowed": False,
+        "task_label_only_summary_policy": (
+            "Task IDs or task-range labels alone are insufficient. A factual status answer must expand them into "
+            "product-before behavior, product-after behavior, remaining blockers or unproven claims, and cited evidence."
+        ),
+        "answer_quality_contract": {
+            "task_label_only_summary_allowed": False,
+            "required_summary_facets": [
+                "product_before_behavior",
+                "product_after_behavior",
+                "remaining_blockers_or_unproven_claims",
+                "cited_raw_and_task_evidence",
+            ],
+        },
         "facet_status": {
             "selected_anchor_and_boundary": selected_anchor_ready,
             "raw_post_anchor_activity": raw_activity_ready,
