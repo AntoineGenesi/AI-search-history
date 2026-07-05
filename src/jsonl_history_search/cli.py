@@ -2117,11 +2117,28 @@ def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: d
         return False
     searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
     scope_counts = compact.get("scope_counts") if isinstance(compact.get("scope_counts"), dict) else {}
-    searched_scope_has_counts = all(key in searched_scope for key in ("searched_files", "searched_bytes"))
+    cap_hit = compact.get("cap_hit") if isinstance(compact.get("cap_hit"), dict) else {}
+    searched_scope_has_work = (
+        _positive_int(searched_scope.get("searched_files")) > 0
+        and _positive_int(searched_scope.get("searched_bytes")) > 0
+    )
+    if not searched_scope_has_work:
+        return False
     scoped_root_counts_present = all(
         key in scope_counts for key in ("selected_root_count", "excluded_root_count", "missing_root_count")
     )
-    return searched_scope_has_counts and scoped_root_counts_present
+    if not scoped_root_counts_present:
+        return False
+    if _positive_int(scope_counts.get("missing_root_count")) != 0:
+        return False
+    return cap_hit.get("hit") is False
+
+
+def _positive_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
