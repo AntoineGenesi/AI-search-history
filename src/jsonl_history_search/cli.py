@@ -25,7 +25,7 @@ from .agent_loop_cost import (
     write_retained_trace_counter_packet,
 )
 from .archive_snapshot import build_archive_snapshot_proof_payload
-from .ask_router import build_ask_router_payload
+from .ask_router import build_ask_router_payload, execution_kind_for_route_family
 from .capability_diagnostic import build_capability_diagnostic
 from .compact_handoff_usefulness import (
     DEFAULT_ANSWER_USE_FIXTURE as DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE,
@@ -212,8 +212,34 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         ),
     )
     ask.add_argument("query", help="User wording to classify into a JSONL first route.")
-    ask.add_argument("--cwd", default=".")
-    ask.add_argument("--format", choices=("text", "json", "markdown"), default="text")
+    add_common_args(ask)
+    ask.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Execute the selected route only when it is an allow-listed JSONL "
+            "semantic-debug or no-evidence route; unsupported routes return a fail-closed contract."
+        ),
+    )
+    ask.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where ask --execute writes the full selected-route JSON report.",
+    )
+    ask.add_argument("--task", default=None)
+    ask.add_argument("--path", default=None)
+    ask.add_argument("--commit", default=None)
+    ask.add_argument("--branch", default=None)
+    ask.add_argument("--around", default=None)
+    ask.add_argument("--watchlist", action="append", default=[])
+    ask.add_argument("--gold-manifest", default=str(DEFAULT_GOLD_MANIFEST))
+    ask.add_argument("--evaluate-sanitized-manifest-gate", action="store_true")
+    ask.add_argument("--include-manifest", action="store_true")
+    ask.add_argument("--compact-provenance-handoff", action="store_true")
+    ask.add_argument("--evidence-context-window", type=int, default=0)
+    ask.add_argument("--retrieval-mode", choices=RETRIEVAL_MODES, default=RETRIEVAL_MODE_PACKAGE)
+    ask.add_argument("--query-plan", choices=QUERY_PLAN_MODES, default=QUERY_PLAN_MODE_AUTO)
+    ask.add_argument("--continuation-ledger", action="store_true")
     for name in ("plan", "search"):
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
@@ -1783,6 +1809,289 @@ def _configuration_warnings(source_plan: dict) -> list[str]:
     return list(warnings) if isinstance(warnings, list) else []
 
 
+def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
+    route = route_payload["ask_router"]
+    execution_kind = execution_kind_for_route_family(route.get("route_family", ""))
+    selected_route = {
+        "chosen_route": route.get("chosen_route"),
+        "route_family": route.get("route_family"),
+        "why_it_applies": route.get("why_it_applies"),
+        "first_command": route.get("first_command"),
+        "read_specialization": route.get("read_specialization"),
+        "inspect_after": route.get("inspect_after", []),
+        "stop_guidance": route.get("stop_guidance"),
+        "manual_search_guidance": route.get("manual_search_guidance"),
+    }
+    contract = {
+        "ask_execute": {
+            "schema_version": "ask_execute_route_fusion.v1",
+            "query": args.query,
+            "cwd": cwd,
+            "selected_route": selected_route,
+            "execution_status": "unsupported_route",
+            "execution": {
+                "status": "unsupported_route",
+                "route_family": route.get("route_family"),
+                "allowlist": ["semantic-debug", "no-evidence-report"],
+                "command_family": None,
+                "argv": [],
+                "report_written": None,
+                "safety": "router first_command strings are not shell-executed; only structured allow-listed JSONL routes run.",
+            },
+            "executed_output": None,
+            "answer_action_contract": {
+                "answer_status": "not-ready/needs-more-proof",
+                "read": route.get("inspect_after", []),
+                "stop": route.get("stop_guidance"),
+                "only_continue_if": route.get("manual_search_guidance"),
+            },
+        }
+    }
+    if execution_kind is None:
+        contract["ask_execute"]["execution"]["reason"] = (
+            "Selected route is outside ask --execute initial allow-list; run the normal first_command manually if intended."
+        )
+        return contract
+
+    report_output = _ask_execute_report_output(args, execution_kind)
+    execution_args = _execution_args_from_ask(args, command=execution_kind, report_output=report_output)
+    if execution_kind == "semantic-debug":
+        executed_payload = _build_semantic_debug_report_output_payload(execution_args)
+        output_key = "semantic_debug"
+    else:
+        executed_payload = _build_agent_find_report_output_payload(execution_args)
+        output_key = "agent_find"
+
+    compact = executed_payload[output_key]
+    contract["ask_execute"]["execution"].update(
+        {
+            "status": "executed",
+            "command_family": execution_kind,
+            "argv": _structured_execution_argv(execution_args),
+            "report_written": compact.get("report_written"),
+            "output_key": output_key,
+        }
+    )
+    contract["ask_execute"]["execution_status"] = "executed"
+    contract["ask_execute"]["executed_output"] = _compact_executed_output_for_ask(output_key=output_key, compact=compact)
+    contract["ask_execute"]["answer_action_contract"] = _answer_action_contract_from_executed_output(
+        output_key=output_key,
+        compact=compact,
+        selected_route=selected_route,
+    )
+    return contract
+
+
+def _ask_execute_report_output(args: argparse.Namespace, execution_kind: str) -> str:
+    if args.report_output:
+        path = Path(args.report_output).expanduser()
+    else:
+        path = Path(args.cwd).expanduser().resolve() / ".private" / "jsonl" / f"ask-execute-{execution_kind}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _execution_args_from_ask(args: argparse.Namespace, *, command: str, report_output: str) -> argparse.Namespace:
+    values = vars(args).copy()
+    values.update(
+        {
+            "command": command,
+            "query": args.query,
+            "format": "json",
+            "report_output": report_output,
+        }
+    )
+    return argparse.Namespace(**values)
+
+
+def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["jsonl-history-search", args.command, args.query, "--cwd", args.cwd, "--format", "json"]
+    for root in getattr(args, "root", []) or []:
+        argv.extend(["--root", root])
+    if getattr(args, "allow_arbitrary_root", False):
+        argv.append("--allow-arbitrary-root")
+    if getattr(args, "hard_cap_files", None) is not None:
+        argv.extend(["--hard-cap-files", str(args.hard_cap_files)])
+    if getattr(args, "hard_cap_bytes", None) is not None:
+        argv.extend(["--hard-cap-bytes", str(args.hard_cap_bytes)])
+    argv.extend(["--report-output", args.report_output])
+    return argv
+
+
+def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dict:
+    source_plan, intent, plan = payload_from_args(args)
+    payload = build_semantic_debug_payload(
+        args,
+        source_plan=source_plan,
+        intent=intent,
+        plan=plan,
+        default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        mask_context=_mask_context_from_args(args),
+        configuration_warnings=_configuration_warnings(source_plan),
+    )
+    Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+    packet = payload["semantic_debug"]
+    if _semantic_debug_is_scoped_no_evidence(packet):
+        return _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
+    return _short_semantic_debug_report_written_payload(packet, args.report_output)
+
+
+def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
+    source_plan, intent, plan = payload_from_args(args)
+    mask_context = _mask_context_from_args(args)
+    result = run_retrieval_mode(
+        retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
+        plan=plan,
+        intent=intent,
+        default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        cwd=source_plan["cwd"],
+        mask_context=mask_context,
+        use_rg_prefilter=args.rg_prefilter,
+        fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
+        query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
+        continuation_ledger=getattr(args, "continuation_ledger", False),
+    )
+    result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
+    manifest_report = (
+        build_manifest_report(
+            plan,
+            intent,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=source_plan["cwd"],
+        )
+        if args.include_manifest
+        else None
+    )
+    payload = build_agent_find_payload(
+        source_plan=source_plan,
+        search_result=result,
+        manifest_report=manifest_report,
+        output_format="json",
+        report_output=args.report_output,
+        compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
+        evidence_context_window=getattr(args, "evidence_context_window", 0),
+        no_evidence_mode=True,
+    )
+    Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+    if _agent_find_is_no_evidence_report(payload["agent_find"]):
+        return _short_no_evidence_report_written_payload(payload, args.report_output)
+    return _short_report_written_payload(payload, args.report_output)
+
+
+def _short_semantic_debug_report_written_payload(packet: dict, report_output: str) -> dict:
+    payload = {
+        "semantic_debug": {
+            "schema_version": packet["schema_version"],
+            "status": packet["status"],
+            "query": packet["query"],
+            "question_family": packet["question_family"],
+            "report_written": str(Path(report_output).expanduser()),
+            "candidate_count": len(packet["strongest_candidates"]),
+            "event_count": packet["tool_action_proof"]["event_count"],
+            "source_locator_handoff": packet["source_locator_handoff"],
+            "investigation_state": packet["investigation_state"],
+            "answer_ready_handoff": packet["answer_ready_handoff"],
+            "agent_instruction": packet["agent_instruction"],
+            "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
+            "answer_source_discipline_summary": (
+                packet["final_answer_source_use_contract"].get("answer_source_discipline")
+            ),
+            "claim_boundaries": packet["claim_boundaries"],
+            "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
+            "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
+            "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
+            "support_precision_summary": (
+                packet.get("forensics_workflow", {}).get("summary", {}).get("support_summary")
+            ),
+            "decision_context_summary": {
+                "primary_question_family": packet["decision_context"].get("primary_question_family"),
+                "project_time_reconstruction_needed": packet["decision_context"].get(
+                    "project_time_reconstruction_needed"
+                ),
+                "selected_routes": packet["decision_context"].get("selected_routes", []),
+                "confidence": packet["decision_context"].get("confidence"),
+            },
+            "audit_plan_summary": {
+                "watchlist": packet["audit_plan"].get("watchlist", [])[:8],
+                "route_order": packet["audit_plan"].get("route_order", []),
+                "resume_from": packet["audit_plan"].get("resume_from"),
+                "cap_pressure_notes": packet["audit_plan"].get("cap_pressure_notes", []),
+            },
+            "next_reads": packet["next_reads"][:5],
+            "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
+        }
+    }
+    if "compact_provenance_handoff" in packet:
+        payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
+    if "retrieval_diagnostics" in packet:
+        payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
+    if "retrieval_pressure" in packet:
+        payload["semantic_debug"]["retrieval_pressure"] = packet["retrieval_pressure"]
+    return payload
+
+
+def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
+    if output_key == "semantic_debug":
+        handoff = compact.get("answer_ready_handoff") or {}
+        scoped_no_evidence = compact.get("answer_ready_decision") == "scoped_no_evidence"
+        return {
+            "answer_status": "answer-scoped-no-evidence-now"
+            if scoped_no_evidence
+            else handoff.get("answer_readiness_status")
+            or compact.get("answer_readiness_summary", {}).get("status")
+            or compact.get("status"),
+            "read": handoff.get("primary_source_followthrough")
+            or compact.get("source_locator_handoff", {}).get("next_reads")
+            or compact.get("next_reads")
+            or [],
+            "stop": selected_route.get("stop_guidance"),
+            "only_continue_if": (
+                (handoff.get("primary_source_followthrough") or {}).get("only_continue_if")
+                or compact.get("no_evidence", {}).get("read_more_policy")
+                or selected_route.get("manual_search_guidance")
+            ),
+            "saved_report": compact.get("report_written"),
+        }
+    return {
+        "answer_status": compact.get("status"),
+        "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
+        "stop": selected_route.get("stop_guidance"),
+        "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
+        or selected_route.get("manual_search_guidance"),
+        "saved_report": compact.get("report_written"),
+    }
+
+
+def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
+    if output_key == "semantic_debug":
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "report_written": compact.get("report_written"),
+            "question_family": compact.get("question_family"),
+            "candidate_count": compact.get("candidate_count"),
+            "event_count": compact.get("event_count"),
+            "answer_ready_decision": compact.get("answer_ready_decision")
+            or (compact.get("answer_ready_handoff") or {}).get("decision"),
+            "answer_readiness_summary": compact.get("answer_readiness_summary"),
+            "decision_context_summary": compact.get("decision_context_summary"),
+            "audit_plan_summary": compact.get("audit_plan_summary"),
+            "next_reads": compact.get("next_reads", [])[:3],
+            "no_evidence": compact.get("no_evidence"),
+            "message": compact.get("message"),
+        }
+    return {
+        "schema_version": compact.get("schema_version"),
+        "status": compact.get("status"),
+        "report_written": compact.get("report_written"),
+        "searched_scope": compact.get("searched_scope"),
+        "scope_counts": compact.get("scope_counts"),
+        "cap_hit": compact.get("cap_hit"),
+        "no_evidence": compact.get("no_evidence"),
+        "message": compact.get("message"),
+    }
+
+
 def discovery_payload_from_args(args: argparse.Namespace) -> dict:
     cwd = Path(args.cwd).expanduser().resolve()
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
@@ -1818,6 +2127,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ask":
         cwd = str(Path(args.cwd).expanduser().resolve())
         payload = build_ask_router_payload(args.query, cwd=cwd)
+        if args.execute:
+            payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)
         print(render(payload, args.format))
         return 0
     if args.command == "validate-install":
@@ -1965,54 +2276,7 @@ def main(argv: list[str] | None = None) -> int:
             if _semantic_debug_is_scoped_no_evidence(packet):
                 payload = _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
             else:
-                payload = {
-                    "semantic_debug": {
-                        "schema_version": packet["schema_version"],
-                        "status": packet["status"],
-                        "query": packet["query"],
-                        "question_family": packet["question_family"],
-                        "report_written": str(Path(args.report_output).expanduser()),
-                        "candidate_count": len(packet["strongest_candidates"]),
-                        "event_count": packet["tool_action_proof"]["event_count"],
-                        "source_locator_handoff": packet["source_locator_handoff"],
-                        "investigation_state": packet["investigation_state"],
-                        "answer_ready_handoff": packet["answer_ready_handoff"],
-                        "agent_instruction": packet["agent_instruction"],
-                        "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
-                        "answer_source_discipline_summary": (
-                            packet["final_answer_source_use_contract"].get("answer_source_discipline")
-                        ),
-                        "claim_boundaries": packet["claim_boundaries"],
-                        "answer_readiness_summary": summarize_answer_readiness(packet["answer_readiness"]),
-                        "guided_audit_flow_summary": summarize_guided_audit_flow(packet["guided_audit_flow"]),
-                        "forensics_workflow_summary": packet.get("forensics_workflow", {}).get("summary"),
-                        "support_precision_summary": (
-                            packet.get("forensics_workflow", {}).get("summary", {}).get("support_summary")
-                        ),
-                        "decision_context_summary": {
-                            "primary_question_family": packet["decision_context"].get("primary_question_family"),
-                            "project_time_reconstruction_needed": packet["decision_context"].get(
-                                "project_time_reconstruction_needed"
-                            ),
-                            "selected_routes": packet["decision_context"].get("selected_routes", []),
-                            "confidence": packet["decision_context"].get("confidence"),
-                        },
-                        "audit_plan_summary": {
-                            "watchlist": packet["audit_plan"].get("watchlist", [])[:8],
-                            "route_order": packet["audit_plan"].get("route_order", []),
-                            "resume_from": packet["audit_plan"].get("resume_from"),
-                            "cap_pressure_notes": packet["audit_plan"].get("cap_pressure_notes", []),
-                        },
-                        "next_reads": packet["next_reads"][:5],
-                        "message": "Full semantic-debug packet written to report_output; stdout is a compact handoff map.",
-                    }
-                }
-                if "compact_provenance_handoff" in packet:
-                    payload["semantic_debug"]["compact_provenance_handoff"] = packet["compact_provenance_handoff"]
-                if "retrieval_diagnostics" in packet:
-                    payload["semantic_debug"]["retrieval_diagnostics"] = packet["retrieval_diagnostics"]
-                if "retrieval_pressure" in packet:
-                    payload["semantic_debug"]["retrieval_pressure"] = packet["retrieval_pressure"]
+                payload = _short_semantic_debug_report_written_payload(packet, args.report_output)
             rendered = render(payload, args.format)
         print(rendered)
         return 0

@@ -7,6 +7,19 @@ from .agent_command_cookbook import agent_question_cookbook, ask_next_commands
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
 
+EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
+    {
+        "source_window_semantic_debug",
+        "action_proof",
+        "process_actual_use",
+        "orchestration_provenance",
+        "remembered_topic",
+        "semantic_debug",
+    }
+)
+EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
+
+
 @dataclass(frozen=True)
 class AskRoute:
     route_family: str
@@ -385,6 +398,14 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             ),
         }
     }
+
+
+def execution_kind_for_route_family(route_family: str) -> str | None:
+    if route_family in EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES:
+        return "semantic-debug"
+    if route_family in EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES:
+        return "no-evidence-report"
+    return None
 
 
 def classify_ask_route(query: str) -> AskRoute:
