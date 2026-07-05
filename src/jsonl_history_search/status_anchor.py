@@ -681,13 +681,22 @@ def _select_anchor_with_boundary(
         )
     if is_status_question(query):
         prefer_parent = _prefers_parent_main_anchor(query)
+        relative_history_first = _relative_status_requires_history_first_anchor(query) and _has_canonical_history_source(messages)
         status_message = _current_status_message(messages)
-        if not status_message and prefer_parent:
+        if not status_message and (prefer_parent or relative_history_first):
             return {
                 **base,
-                "context_boundary": "explicit_parent_main_status_boundary_missing",
+                "context_boundary": (
+                    "explicit_parent_main_status_boundary_missing"
+                    if prefer_parent
+                    else "relative_status_history_boundary_missing"
+                ),
                 "anchor_scope": "parent_thread",
-                "anchor_reason": "no_status_question_boundary_for_parent_main_anchor",
+                "anchor_reason": (
+                    "no_status_question_boundary_for_parent_main_anchor"
+                    if prefer_parent
+                    else "no_status_question_boundary_for_history_first_relative_status"
+                ),
                 "selected_anchor": None,
                 "rejected_anchor_alternatives": _unproven_parent_main_status_boundary_alternatives(candidates),
             }
@@ -708,35 +717,44 @@ def _select_anchor_with_boundary(
             parent_anchor = None
             if prefer_parent:
                 parent_anchor = _first_history_parent_anchor(older, status_thread_keys)
+            elif relative_history_first:
+                parent_anchor = _first_canonical_history_anchor(older, status_thread_keys, parent_only=False)
             if same_thread_anchor and (explicit_side_thread_local or not prefer_parent):
-                has_prior_same_thread_status = any(
-                    _thread_key_overlap(candidate, status_thread_keys) and candidate.get("classification") == "admin_or_status_turn"
-                    for candidate in older
-                )
-                same_thread_is_substantive = same_thread_anchor.get("classification") == "substantive_work_anchor"
-                if explicit_side_thread_local or same_thread_is_substantive or not has_prior_same_thread_status:
-                    reason = (
-                        "side_thread_follow_up_prior_same_thread_user_message"
-                        if has_prior_same_thread_status
-                        else "latest_prior_same_thread_user_message"
+                if relative_history_first and not explicit_side_thread_local:
+                    same_thread_anchor = _history_mirror_candidate(same_thread_anchor) or same_thread_anchor
+                    if not _is_proven_parent_main_history_anchor(same_thread_anchor):
+                        same_thread_anchor = None
+                if same_thread_anchor is None:
+                    pass
+                else:
+                    has_prior_same_thread_status = any(
+                        _thread_key_overlap(candidate, status_thread_keys) and candidate.get("classification") == "admin_or_status_turn"
+                        for candidate in older
                     )
-                    boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
-                    return _with_rejected_alternatives(
-                        {
-                            **base,
-                            "context_boundary": boundary,
-                            "anchor_scope": "same_thread",
-                            "anchor_reason": reason,
-                            "anchor_ref": same_thread_anchor.get("source_ref"),
-                            "status_ref": status_ref,
-                            "status_as_of_boundary": status_as_of_boundary,
-                            "selected_anchor": _selected_with_reason(
-                                same_thread_anchor,
-                                "; selected as the latest eligible prior user message in the same thread",
-                            ),
-                        },
-                        candidates,
-                    )
+                    same_thread_is_substantive = same_thread_anchor.get("classification") == "substantive_work_anchor"
+                    if explicit_side_thread_local or same_thread_is_substantive or not has_prior_same_thread_status:
+                        reason = (
+                            "side_thread_follow_up_prior_same_thread_user_message"
+                            if has_prior_same_thread_status
+                            else "latest_prior_same_thread_user_message"
+                        )
+                        boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
+                        return _with_rejected_alternatives(
+                            {
+                                **base,
+                                "context_boundary": boundary,
+                                "anchor_scope": "same_thread",
+                                "anchor_reason": reason,
+                                "anchor_ref": same_thread_anchor.get("source_ref"),
+                                "status_ref": status_ref,
+                                "status_as_of_boundary": status_as_of_boundary,
+                                "selected_anchor": _selected_with_reason(
+                                    same_thread_anchor,
+                                    "; selected as the latest eligible prior user message in the same thread",
+                                ),
+                            },
+                            candidates,
+                        )
             if prefer_parent and parent_anchor is None:
                 return {
                     **base,
@@ -751,26 +769,59 @@ def _select_anchor_with_boundary(
                         status_thread_keys,
                     ),
                 }
+            if relative_history_first and parent_anchor is None:
+                return {
+                    **base,
+                    "context_boundary": "relative_status_history_anchor_missing",
+                    "anchor_scope": "parent_thread",
+                    "anchor_reason": "no_canonical_history_anchor_found_for_relative_status",
+                    "status_ref": status_ref,
+                    "status_as_of_boundary": status_as_of_boundary,
+                    "selected_anchor": None,
+                    "rejected_anchor_alternatives": _unproven_parent_main_anchor_alternatives(
+                        candidates,
+                        status_thread_keys,
+                        include_same_thread_unproven=True,
+                    ),
+                }
             if parent_anchor is None:
                 parent_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=False)
             if parent_anchor:
                 parent_anchor = _history_mirror_candidate(parent_anchor) or parent_anchor
             if parent_anchor:
-                reason = "parent_main_last_actual_work_handoff"
-                if not prefer_parent:
-                    reason = "first_side_thread_user_message_after_boundary"
+                parent_is_same_thread = _thread_key_overlap(parent_anchor, status_thread_keys)
+                has_prior_same_thread_status = any(
+                    _thread_key_overlap(candidate, status_thread_keys) and candidate.get("classification") == "admin_or_status_turn"
+                    for candidate in older
+                )
+                if parent_is_same_thread:
+                    reason = (
+                        "side_thread_follow_up_prior_same_thread_user_message"
+                        if has_prior_same_thread_status
+                        else "latest_prior_same_thread_user_message"
+                    )
+                    boundary = "side_thread_follow_up" if has_prior_same_thread_status else "same_thread"
+                    anchor_scope = "same_thread"
+                    reason_suffix = "; selected as the latest eligible prior user message in the same thread"
+                else:
+                    reason = "parent_main_last_actual_work_handoff" if prefer_parent else "first_side_thread_user_message_after_boundary"
+                    boundary = "side_thread"
+                    anchor_scope = "parent_thread"
+                    reason_suffix = "; selected as the last eligible parent/main-thread user message before the side-thread boundary"
+                    if relative_history_first and not prefer_parent:
+                        reason_suffix += " using canonical history.jsonl before unmirrored current-session candidates"
                 return _with_rejected_alternatives(
                     {
                         **base,
-                        "context_boundary": "side_thread",
-                        "anchor_scope": "parent_thread",
+                        "context_boundary": boundary,
+                        "anchor_scope": anchor_scope,
                         "anchor_reason": reason,
                         "anchor_ref": parent_anchor.get("source_ref"),
                         "status_ref": status_ref,
                         "status_as_of_boundary": status_as_of_boundary,
                         "selected_anchor": _selected_with_reason(
                             parent_anchor,
-                            "; selected as the last eligible parent/main-thread user message before the side-thread boundary",
+                            reason_suffix,
                         ),
                     },
                     candidates,
@@ -1016,6 +1067,36 @@ def _prefers_parent_main_anchor(query: str) -> bool:
     )
 
 
+def _relative_status_requires_history_first_anchor(query: str) -> bool:
+    normalized = _normalize(query)
+    return any(
+        marker in normalized
+        for marker in (
+            "what happened since my last message",
+            "what has happened since my last message",
+            "since my last message",
+            "since i last messaged",
+            "since my latest message",
+            "last actual message",
+            "latest actual message",
+            "before this side conversation",
+            "before the side conversation",
+            "before this side thread",
+            "before the side thread",
+        )
+    )
+
+
+def _has_canonical_history_source(messages: list[dict]) -> bool:
+    for message in messages:
+        if message.get("source_kind") == "codex_history":
+            return True
+        for mirror in message.get("mirror_sources") or []:
+            if isinstance(mirror, Mapping) and mirror.get("source_kind") == "codex_history":
+                return True
+    return False
+
+
 def _explicit_side_thread_local_status(query: str) -> bool:
     normalized = _normalize(query)
     return any(
@@ -1178,8 +1259,12 @@ def _first_eligible_thread_anchor(candidates: list[dict], thread_keys: set[str],
 
 
 def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) -> dict | None:
+    return _first_canonical_history_anchor(candidates, thread_keys, parent_only=True)
+
+
+def _first_canonical_history_anchor(candidates: list[dict], thread_keys: set[str], *, parent_only: bool) -> dict | None:
     for candidate in candidates:
-        if _thread_key_overlap(candidate, thread_keys):
+        if parent_only and _thread_key_overlap(candidate, thread_keys):
             continue
         if _is_never_anchor(candidate):
             continue
@@ -1193,12 +1278,19 @@ def _first_history_parent_anchor(candidates: list[dict], thread_keys: set[str]) 
     return None
 
 
-def _unproven_parent_main_anchor_alternatives(candidates: list[dict], thread_keys: set[str]) -> list[dict]:
+def _unproven_parent_main_anchor_alternatives(
+    candidates: list[dict],
+    thread_keys: set[str],
+    *,
+    include_same_thread_unproven: bool = False,
+) -> list[dict]:
     alternatives = []
     for candidate in candidates:
         is_never_anchor = _is_never_anchor(candidate)
-        is_eligible_parent_candidate = _is_eligible_anchor(candidate) and not _thread_key_overlap(candidate, thread_keys)
-        if is_never_anchor or is_eligible_parent_candidate:
+        is_eligible_candidate = _is_eligible_anchor(candidate)
+        if not include_same_thread_unproven:
+            is_eligible_candidate = is_eligible_candidate and not _thread_key_overlap(candidate, thread_keys)
+        if is_never_anchor or is_eligible_candidate:
             alternatives.append(
                 {
                     "source_ref": candidate.get("source_ref"),
@@ -1366,12 +1458,15 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
     anchor_reason = str(anchor_decision.get("anchor_reason") or "")
     return (
         context_boundary.startswith("explicit_parent_main")
+        or context_boundary.startswith("relative_status_history")
         or context_boundary == "parent_main_selected_anchor_unproven"
         or anchor_reason in {
             "first_side_thread_user_message_after_boundary",
             "parent_main_last_actual_work_handoff",
             "no_proven_parent_main_history_anchor_found",
             "no_status_question_boundary_for_parent_main_anchor",
+            "no_canonical_history_anchor_found_for_relative_status",
+            "no_status_question_boundary_for_history_first_relative_status",
         }
     )
 
@@ -2286,6 +2381,33 @@ def _parent_main_recovery_reads(
     ]
     recovery_candidates.sort(key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)
     recovery_candidates.sort(key=lambda item: 0 if item.get("source_kind") == "codex_history" else 1)
+    if codex_home is not None and not any(candidate.get("source_kind") == "codex_history" for candidate in recovery_candidates):
+        history_path = codex_home / "history.jsonl"
+        read = {
+            "reason": (
+                "Discover the canonical history.jsonl parent/main anchor before answering; "
+                "current-session or task-window candidates are not answer support while the history anchor is ambiguous."
+            ),
+            "source_ref": "codex_history:history.jsonl",
+            "source_kind": "codex_history",
+            "source_tier": "required_primary",
+            "answer_use_required": False,
+            "read_more_actionable": False,
+            "verification_or_rerun_only": True,
+            "diagnostic_open_policy": (
+                "canonical history-anchor discovery material only; locate the intended history.jsonl human row, "
+                "then rerun with that timestamp or quoted message before a factual answer"
+            ),
+            "parent_main_anchor_recovery_candidate": True,
+            "canonical_history_candidate": True,
+            "canonical_history_anchor_discovery": True,
+            "fail_closed_before_answer": True,
+            "answer_support_role": "canonical_history_anchor_discovery_only",
+        }
+        if history_path.is_file():
+            read["openable_source_ref"] = {"path": str(history_path)}
+            read["openable_target"] = str(history_path)
+        reads.append(read)
     for candidate in recovery_candidates:
         source_kind = candidate.get("source_kind")
         if source_kind == "codex_history":
@@ -2530,6 +2652,7 @@ def _plan_read(read: dict) -> dict:
         "suppressed_from_answer_facing",
         "parent_main_anchor_recovery_candidate",
         "canonical_history_candidate",
+        "canonical_history_anchor_discovery",
         "fail_closed_before_answer",
         "answer_support_role",
         "verification_or_rerun_only",

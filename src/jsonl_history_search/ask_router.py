@@ -706,6 +706,23 @@ def _looks_like_parent_main_status_anchor_failure_query(normalized: str) -> bool
         "ignored the anchor",
         "made no sense",
     )
+    wrong_context_terms = (
+        "wrong context",
+        "answered the wrong context",
+        "answering the wrong context",
+        "wrong thread",
+        "wrong conversation",
+        "answered the side thread",
+        "answered from the side thread",
+        "answered current context",
+        "used current context",
+        "current context instead",
+        "did not use jsonl",
+        "didn't use jsonl",
+        "failed to use jsonl",
+        "failure to use jsonl",
+        "without jsonl",
+    )
     status_terms = (
         "status",
         "what happened since",
@@ -722,6 +739,8 @@ def _looks_like_parent_main_status_anchor_failure_query(normalized: str) -> bool
         "side-thread",
         "side thread",
         "last actual message",
+        "last message",
+        "latest message",
         "previous relevant time window",
         "before the last answer",
     )
@@ -733,15 +752,24 @@ def _looks_like_parent_main_status_anchor_failure_query(normalized: str) -> bool
         "failed",
         "failure",
         "wrong",
+        "wrong context",
         "nonsense",
         "made no sense",
+        "jsonl",
     )
-    return (
+    strict_anchor_complaint = (
         _has_any(normalized, anchor_failure_terms)
         and _has_any(normalized, status_terms)
         and _has_any(normalized, parent_or_boundary_terms)
         and _has_any(normalized, complaint_terms)
     )
+    wrong_context_complaint = (
+        _has_any(normalized, wrong_context_terms)
+        and _has_any(normalized, parent_or_boundary_terms)
+        and (_has_any(normalized, status_terms) or _has_any(normalized, ("last message", "latest message")))
+        and _has_any(normalized, complaint_terms)
+    )
+    return strict_anchor_complaint or wrong_context_complaint
 
 
 def _looks_like_repeated_complaint_or_failure_query(normalized: str) -> bool:
