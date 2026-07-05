@@ -250,17 +250,18 @@ def status_anchor_report(
     target_window = _target_window_from_query(query)
     status_as_of_boundary = _status_as_of_boundary_from_messages(query, latest_messages)
     audit_run_requested = _audit_run_requested(query, target_window)
+    canonical_parent_main_interval = _canonical_parent_main_status_interval(
+        query=query,
+        codex_home=codex_home,
+        status_as_of_boundary=status_as_of_boundary,
+    )
     prior_request_occurrence = _prior_request_occurrence_recovery(
         query=query,
         latest_messages=latest_messages,
         codex_home=codex_home,
         status_as_of_boundary=status_as_of_boundary,
     )
-    canonical_parent_main_fallback = _canonical_parent_main_status_fallback(
-        query=query,
-        codex_home=codex_home,
-        status_as_of_boundary=status_as_of_boundary,
-    )
+    canonical_parent_main_fallback = _canonical_parent_main_fallback_from_interval(canonical_parent_main_interval)
     anchor_candidates = _rank_anchor_candidates(
         latest_messages,
         target_window=target_window,
@@ -275,6 +276,7 @@ def status_anchor_report(
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
         prior_request_occurrence=prior_request_occurrence,
+        canonical_parent_main_interval=canonical_parent_main_interval,
         canonical_parent_main_fallback=canonical_parent_main_fallback,
     )
     status_as_of_boundary = anchor_decision.get("status_as_of_boundary") or status_as_of_boundary
@@ -420,6 +422,7 @@ def status_anchor_report(
             "anchor_reason": anchor_decision["anchor_reason"],
             "status_as_of_boundary_available": status_as_of_boundary is not None,
             "prior_request_occurrence_status": prior_request_occurrence.get("status"),
+            "canonical_parent_main_interval_status": canonical_parent_main_interval.get("status"),
             "canonical_parent_main_fallback_status": canonical_parent_main_fallback.get("status"),
         },
         "anchor_candidates": anchor_candidates,
@@ -435,6 +438,7 @@ def status_anchor_report(
         "target_window": target_window,
         "status_as_of_boundary": status_as_of_boundary,
         "prior_request_occurrence_recovery": prior_request_occurrence,
+        "canonical_parent_main_status_interval": canonical_parent_main_interval,
         "canonical_parent_main_fallback": canonical_parent_main_fallback,
         "suppressed_support": suppressed_support,
         "fail_closed_guidance": _fail_closed_guidance(
@@ -641,6 +645,7 @@ def _select_anchor_with_boundary(
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
     prior_request_occurrence: dict | None = None,
+    canonical_parent_main_interval: dict | None = None,
     canonical_parent_main_fallback: dict | None = None,
 ) -> dict:
     base = {
@@ -780,7 +785,75 @@ def _select_anchor_with_boundary(
             explicit_side_thread_local = _explicit_side_thread_local_status(query)
             parent_anchor = None
             if prefer_parent:
-                parent_anchor = _first_history_parent_anchor(older, status_thread_keys)
+                interval = canonical_parent_main_interval or {"status": "not_applicable"}
+                if interval.get("status") == "selected":
+                    interval_anchor = interval.get("selected_anchor") or {}
+                    candidate_anchor = _first_history_parent_anchor(older, status_thread_keys)
+                    if not candidate_anchor:
+                        interval_boundary = interval.get("status_as_of_boundary") or status_as_of_boundary
+                        return _with_rejected_alternatives(
+                            {
+                                **base,
+                                "context_boundary": "explicit_parent_main_canonical_history_fallback",
+                                "anchor_scope": "parent_thread",
+                                "anchor_reason": "nearest_preceding_canonical_parent_main_history_anchor",
+                                "anchor_ref": interval_anchor.get("source_ref"),
+                                "status_ref": (interval_boundary or {}).get("source_ref") or status_ref,
+                                "status_as_of_boundary": interval_boundary,
+                                "selected_anchor": _selected_with_reason(
+                                    interval_anchor,
+                                    "; selected by bounded canonical history fallback for explicit parent/main status",
+                                ),
+                                "canonical_parent_main_fallback": canonical_parent_main_fallback,
+                                "canonical_parent_main_status_interval": interval,
+                            },
+                            candidates,
+                        )
+                    if candidate_anchor.get("source_ref") != interval_anchor.get("source_ref"):
+                        interval_boundary = interval.get("status_as_of_boundary") or status_as_of_boundary
+                        return _with_rejected_alternatives(
+                            {
+                                **base,
+                                "context_boundary": "explicit_parent_main_canonical_status_interval",
+                                "anchor_scope": "parent_thread",
+                                "anchor_reason": "canonical_parent_main_status_interval",
+                                "anchor_ref": interval_anchor.get("source_ref"),
+                                "status_ref": (interval_boundary or {}).get("source_ref") or status_ref,
+                                "status_as_of_boundary": interval_boundary,
+                                "selected_anchor": _selected_with_reason(
+                                    interval_anchor,
+                                    "; selected by canonical parent/main status interval before latest-message ranking",
+                                ),
+                                "canonical_parent_main_status_interval": interval,
+                            },
+                            candidates,
+                        )
+                    parent_anchor = candidate_anchor
+                    status_as_of_boundary = interval.get("status_as_of_boundary") or status_as_of_boundary
+                    status_ref = (status_as_of_boundary or {}).get("source_ref") or status_ref
+                elif interval.get("status") == "ambiguous":
+                    interval_boundary = interval.get("status_as_of_boundary") or status_as_of_boundary
+                    context_boundary = interval.get("context_boundary") or "explicit_parent_main_history_anchor_missing"
+                    anchor_reason = interval.get("anchor_reason") or "no_proven_parent_main_history_anchor_found"
+                    if context_boundary == "explicit_parent_main_canonical_history_anchor_missing":
+                        context_boundary = "explicit_parent_main_history_anchor_missing"
+                        anchor_reason = "no_proven_parent_main_history_anchor_found"
+                    return {
+                        **base,
+                        "context_boundary": context_boundary,
+                        "anchor_scope": "parent_thread",
+                        "anchor_reason": anchor_reason,
+                        "status_ref": (interval_boundary or {}).get("source_ref") or status_ref,
+                        "status_as_of_boundary": interval_boundary,
+                        "selected_anchor": None,
+                        "rejected_anchor_alternatives": _unproven_parent_main_anchor_alternatives(
+                            candidates,
+                            status_thread_keys,
+                        ) or interval.get("rejected_anchor_alternatives") or [],
+                        "canonical_parent_main_status_interval": interval,
+                    }
+                else:
+                    parent_anchor = _first_history_parent_anchor(older, status_thread_keys)
             elif relative_history_first:
                 parent_anchor = _first_canonical_history_anchor(older, status_thread_keys, parent_only=False)
             if same_thread_anchor and (explicit_side_thread_local or not prefer_parent):
@@ -838,6 +911,7 @@ def _select_anchor_with_boundary(
                                 "; selected by bounded canonical history fallback for explicit parent/main status",
                             ),
                             "canonical_parent_main_fallback": fallback,
+                            "canonical_parent_main_status_interval": canonical_parent_main_interval,
                         },
                         candidates,
                     )
@@ -854,6 +928,7 @@ def _select_anchor_with_boundary(
                         status_thread_keys,
                     ),
                     "canonical_parent_main_fallback": fallback,
+                    "canonical_parent_main_status_interval": canonical_parent_main_interval,
                 }
             if relative_history_first and parent_anchor is None:
                 return {
@@ -909,6 +984,7 @@ def _select_anchor_with_boundary(
                             parent_anchor,
                             reason_suffix,
                         ),
+                        "canonical_parent_main_status_interval": canonical_parent_main_interval,
                     },
                     candidates,
                 )
@@ -1187,7 +1263,7 @@ def _prior_request_occurrence_recovery(
     }
 
 
-def _canonical_parent_main_status_fallback(
+def _canonical_parent_main_status_interval(
     *,
     query: str,
     codex_home: Path | None,
@@ -1209,6 +1285,7 @@ def _canonical_parent_main_status_fallback(
     if boundary is None:
         return {
             "status": "ambiguous",
+            "kind": "canonical_parent_main_status_interval",
             "context_boundary": "explicit_parent_main_canonical_history_boundary_missing",
             "anchor_reason": "canonical_parent_main_status_boundary_not_proven",
             "reason": "could_not_find_unique_canonical_history_status_boundary_for_parent_main_query",
@@ -1221,6 +1298,7 @@ def _canonical_parent_main_status_fallback(
     if anchor is None:
         return {
             "status": "ambiguous",
+            "kind": "canonical_parent_main_status_interval",
             "context_boundary": "explicit_parent_main_canonical_history_anchor_missing",
             "anchor_reason": "canonical_parent_main_preceding_anchor_not_proven",
             "reason": "canonical_history_status_boundary_found_but_no_preceding_different_thread_human_anchor",
@@ -1235,12 +1313,58 @@ def _canonical_parent_main_status_fallback(
     )
     return {
         "status": "selected",
+        "kind": "canonical_parent_main_status_interval",
         "reason": "nearest_preceding_different_thread_canonical_history_human_row_found",
+        "context_boundary": "explicit_parent_main_canonical_status_interval",
+        "anchor_reason": "canonical_parent_main_status_interval",
         "status_as_of_boundary": _canonical_parent_main_boundary(boundary),
         "selected_anchor": selected,
+        "start_anchor": selected,
         "boundary": _occurrence_candidate(boundary),
         "rejected_anchor_alternatives": [_occurrence_candidate(boundary)],
+        "answer_target_window": {
+            "kind": "canonical_parent_main_status_interval",
+            "start_source_ref": selected.get("source_ref"),
+            "start_timestamp_utc": selected.get("timestamp_utc"),
+            "boundary_source_ref": boundary.get("source_ref"),
+            "boundary_timestamp_utc": boundary.get("timestamp_utc"),
+            "inclusive_start": True,
+            "inclusive_boundary": True,
+            "policy": (
+                "For explicit parent/main status asks, selected anchor, raw session activity, "
+                "source tiers, follow-through, and answer-facing support are constrained to "
+                "this canonical history.jsonl interval."
+            ),
+        },
     }
+
+
+def _canonical_parent_main_fallback_from_interval(interval: dict) -> dict:
+    if interval.get("status") == "selected":
+        return {
+            "status": "selected",
+            "reason": interval.get("reason") or "nearest_preceding_different_thread_canonical_history_human_row_found",
+            "status_as_of_boundary": interval.get("status_as_of_boundary"),
+            "selected_anchor": interval.get("selected_anchor"),
+            "boundary": interval.get("boundary"),
+            "rejected_anchor_alternatives": interval.get("rejected_anchor_alternatives") or [],
+        }
+    if interval.get("status") == "ambiguous":
+        return {
+            key: value
+            for key, value in interval.items()
+            if key
+            in {
+                "status",
+                "context_boundary",
+                "anchor_reason",
+                "reason",
+                "status_as_of_boundary",
+                "boundary",
+                "rejected_anchor_alternatives",
+            }
+        }
+    return dict(interval)
 
 
 def _canonical_parent_main_boundary_row(
