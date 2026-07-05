@@ -2073,6 +2073,7 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             "answer_status": "answer-scoped-no-evidence-now",
             "promotion_status": "promoted_scoped_no_evidence",
             "promotion_scope": "not_found_in_searched_scope",
+            "scoped_no_evidence_contract": _scoped_no_evidence_contract(compact),
             "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
@@ -2086,6 +2087,9 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             "Executed output did not satisfy bounded scoped no-evidence promotion requirements."
         ),
         "internal_answer_status": compact.get("status"),
+        "scoped_no_evidence_contract": (
+            _scoped_no_evidence_contract(compact) if isinstance(compact.get("no_evidence"), dict) else None
+        ),
         "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
         "stop": selected_route.get("stop_guidance"),
         "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
@@ -2132,6 +2136,32 @@ def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: d
     if _positive_int(scope_counts.get("missing_root_count")) != 0:
         return False
     return cap_hit.get("hit") is False
+
+
+def _scoped_no_evidence_contract(compact: dict) -> dict:
+    no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+    searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
+    scope_counts = compact.get("scope_counts") if isinstance(compact.get("scope_counts"), dict) else {}
+    cap_hit = compact.get("cap_hit") if isinstance(compact.get("cap_hit"), dict) else {}
+    read_more_policy = (
+        no_evidence.get("read_more_policy") if isinstance(no_evidence.get("read_more_policy"), dict) else {}
+    )
+    return {
+        "answer_scope": no_evidence.get("answer_scope"),
+        "searched_files": searched_scope.get("searched_files"),
+        "searched_bytes": searched_scope.get("searched_bytes"),
+        "selected_root_count": scope_counts.get("selected_root_count"),
+        "excluded_root_count": scope_counts.get("excluded_root_count"),
+        "missing_root_count": scope_counts.get("missing_root_count"),
+        "cap_hit": cap_hit.get("hit"),
+        "caps_hit": cap_hit.get("caps_hit", []),
+        "not_all_history_absence": no_evidence.get("not_all_history_absence"),
+        "read_more_required_before_scoped_no_evidence_answer": read_more_policy.get(
+            "required_before_scoped_no_evidence_answer"
+        ),
+        "read_more_actionability": read_more_policy.get("actionability"),
+        "saved_report": compact.get("report_written"),
+    }
 
 
 def _positive_int(value: object) -> int:
