@@ -1404,7 +1404,10 @@ def build_historical_orchestration_provenance_final_support_plan(
         row = historical_orchestration_read_plan_row(read, candidate=candidate, query=query)
         if row["final_support_allowed"]:
             final_support.append(row)
-        elif row["source_chronology_role"] == "current_run_self_echo_diagnostic":
+        elif row["source_chronology_role"] in {
+            "current_run_self_echo_diagnostic",
+            "current_task_same_loop_diagnostic",
+        }:
             current_run_echoes.append(row)
             non_final.append({**row, "required_non_final_read": True})
         else:
@@ -1535,9 +1538,16 @@ def historical_orchestration_read_plan_row(
         text,
         query=query,
     )
+    current_task_same_loop = historical_orchestration_current_task_same_loop_candidate(
+        read,
+        candidate=candidate,
+        text=text,
+    )
     raw_jsonl = is_jsonl_read_target(target) or str(source_ref.get("path") or "").endswith(".jsonl")
     actionable = read_is_required_surface_actionable(read)
-    final_support_allowed = bool(raw_jsonl and actionable and not current_run_echo)
+    final_support_allowed = bool(raw_jsonl and actionable and not current_run_echo and not current_task_same_loop)
+    if current_task_same_loop and role == "candidate_or_original_source_ref":
+        role = "current_task_same_loop_diagnostic"
     if role == "candidate_or_original_source_ref" and final_support_allowed:
         role = "pre_existing_raw_jsonl_source_ref"
     return {
@@ -1549,9 +1559,13 @@ def historical_orchestration_read_plan_row(
         "orchestration_roles": roles,
         "final_support_allowed": final_support_allowed,
         "required_final_support_read": final_support_allowed,
-        "read_more_actionable": bool(read.get("read_more_actionable", True)) and not current_run_echo,
-        "followthrough_actionable": bool(read.get("followthrough_actionable", True)) and not current_run_echo,
-        "diagnostic_only": bool(read.get("diagnostic_only")) or current_run_echo,
+        "read_more_actionable": bool(read.get("read_more_actionable", True))
+        and not current_run_echo
+        and not current_task_same_loop,
+        "followthrough_actionable": bool(read.get("followthrough_actionable", True))
+        and not current_run_echo
+        and not current_task_same_loop,
+        "diagnostic_only": bool(read.get("diagnostic_only")) or current_run_echo or current_task_same_loop,
         "final_support_rule": (
             "may_support_historical_orchestration_claims_after_inspection"
             if final_support_allowed
@@ -1559,6 +1573,72 @@ def historical_orchestration_read_plan_row(
         ),
         "raw_text_included": False,
     }
+
+
+def historical_orchestration_current_task_same_loop_candidate(
+    read: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    text: str,
+) -> bool:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    normalized_path = path.lower().replace("\\", "/").replace("-", "_")
+    path_parts = [part for part in normalized_path.split("/") if part]
+    current_task_path_parts = {
+        "current_task",
+        "currenttask",
+        "same_loop",
+        "sameloop",
+        "same_run",
+        "samerun",
+        "current_run",
+        "currentrun",
+        "live_task",
+        "livetask",
+        "this_task",
+        "thistask",
+    }
+    if any(part in current_task_path_parts for part in path_parts):
+        return True
+    basename = path_parts[-1] if path_parts else ""
+    if basename in {"status.jsonl", "task_status.jsonl", "state.jsonl"} and any(
+        part in {"current", "active", "live", "task_state", "task_status"} for part in path_parts
+    ):
+        return True
+
+    lowered = re.sub(
+        r"\s+",
+        " ",
+        " ".join(
+            str(part or "")
+            for part in (
+                text,
+                read.get("reason"),
+                candidate.get("snippet"),
+                target,
+            )
+        )
+        .lower()
+        .replace("_", " "),
+    ).strip()
+    return any(
+        marker in lowered
+        for marker in (
+            "current task",
+            "current-task",
+            "same loop",
+            "same-loop",
+            "same run",
+            "same-run",
+            "live task",
+            "this task",
+            "active task status",
+            "current status row",
+            "task status row",
+        )
+    )
 
 
 def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
