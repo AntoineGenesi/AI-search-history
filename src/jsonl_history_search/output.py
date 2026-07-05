@@ -5424,10 +5424,23 @@ def render_historical_orchestration_role_coverage_source_plan_text(plan: dict) -
     else:
         lines.append("- (missing)")
     non_final_reads = plan.get("bounded_non_final_required_reads") or []
-    if missing or non_final_reads:
+    recovery_refs = plan.get("missing_role_recovery_refs") or []
+    if missing or recovery_refs or non_final_reads:
         lines.append("Fail-closed gap checks:")
         if missing:
             lines.append(f"- state missing roles before any answer: {', '.join(missing)}")
+        if recovery_refs:
+            lines.append(
+                "- missing_role_recovery_ref_count: "
+                f"{plan.get('missing_role_recovery_ref_count', len(recovery_refs))}"
+            )
+            for item in recovery_refs[:3]:
+                role = labels.get(item.get("role"), item.get("role"))
+                command = item.get("command")
+                target = item.get("target") or "(no target)"
+                lines.append(f"- recovery for {role}: {target}")
+                if command:
+                    lines.append(f"  command: {command}")
         lines.append(
             "- bounded_non_final_required_read_count: "
             f"{plan.get('bounded_non_final_required_read_count', len(non_final_reads))}"
