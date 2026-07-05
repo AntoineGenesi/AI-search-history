@@ -287,6 +287,15 @@ def status_anchor_report(
         selected_anchor=selected_anchor,
         anchor_decision=anchor_decision,
     )
+    selected_anchor, anchor_decision, parent_main_anchor_shortlist = _apply_parent_main_anchor_shortlist_contract(
+        query=query,
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+        anchor_candidates=anchor_candidates,
+        canonical_parent_main_interval=canonical_parent_main_interval,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
     anchor_decision = {
         **anchor_decision,
         "selected_anchor": None,
@@ -424,8 +433,14 @@ def status_anchor_report(
             "prior_request_occurrence_status": prior_request_occurrence.get("status"),
             "canonical_parent_main_interval_status": canonical_parent_main_interval.get("status"),
             "canonical_parent_main_fallback_status": canonical_parent_main_fallback.get("status"),
+            "parent_main_anchor_shortlist_status": parent_main_anchor_shortlist.get("status"),
+            "parent_main_anchor_shortlist_candidate_count": parent_main_anchor_shortlist.get("candidate_count", 0),
+            "parent_main_anchor_shortlist_high_confidence_count": parent_main_anchor_shortlist.get(
+                "canonical_high_confidence_count", 0
+            ),
         },
         "anchor_candidates": anchor_candidates,
+        "parent_main_anchor_shortlist": parent_main_anchor_shortlist,
         "selected_anchor": selected_anchor,
         "anchor_decision": anchor_decision,
         "session_activity": session_activity,
@@ -1311,6 +1326,7 @@ def _canonical_parent_main_status_interval(
         str(selected.get("rationale") or "").rstrip()
         + "; selected by bounded canonical history fallback before the explicit parent/main status boundary"
     )
+    anchor_candidates = _canonical_parent_main_anchor_candidates(rows, boundary)
     return {
         "status": "selected",
         "kind": "canonical_parent_main_status_interval",
@@ -1321,6 +1337,7 @@ def _canonical_parent_main_status_interval(
         "selected_anchor": selected,
         "start_anchor": selected,
         "boundary": _occurrence_candidate(boundary),
+        "anchor_candidates": anchor_candidates,
         "rejected_anchor_alternatives": [_occurrence_candidate(boundary)],
         "answer_target_window": {
             "kind": "canonical_parent_main_status_interval",
@@ -1337,6 +1354,28 @@ def _canonical_parent_main_status_interval(
             ),
         },
     }
+
+
+def _canonical_parent_main_anchor_candidates(rows: list[dict], boundary: dict, *, limit: int = 8) -> list[dict]:
+    boundary_line = int(boundary.get("line") or 0)
+    boundary_threads = set(boundary.get("thread_keys") or [])
+    candidates = []
+    for row in sorted(
+        (item for item in rows if int(item.get("line") or 0) < boundary_line),
+        key=lambda item: int(item.get("line") or 0),
+        reverse=True,
+    ):
+        if _thread_key_overlap(row, boundary_threads):
+            continue
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            continue
+        candidate = dict(row)
+        candidate["source_scope"] = "canonical_parent_main_history"
+        candidate["canonical_parent_main_candidate"] = True
+        candidates.append(candidate)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def _canonical_parent_main_fallback_from_interval(interval: dict) -> dict:
@@ -2201,6 +2240,289 @@ def _demote_unproven_parent_main_selected_anchor(
     }
 
 
+def _apply_parent_main_anchor_shortlist_contract(
+    *,
+    query: str,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    anchor_candidates: list[dict],
+    canonical_parent_main_interval: dict,
+    cwd: Path,
+    codex_home: Path | None,
+) -> tuple[dict | None, dict, dict]:
+    if not (_prefers_parent_main_anchor(query) or _is_parent_main_complaint_request(query)):
+        return selected_anchor, anchor_decision, {
+            "contract": "parent_main_anchor_shortlist",
+            "status": "not_applicable",
+            "answer_allowed": True,
+            "candidate_count": 0,
+            "canonical_high_confidence_count": 0,
+            "candidates": [],
+        }
+
+    canonical_candidates = _parent_main_canonical_shortlist_candidates(
+        canonical_parent_main_interval=canonical_parent_main_interval,
+        selected_anchor=selected_anchor,
+    )
+    high_confidence_refs = _parent_main_high_confidence_refs(canonical_candidates)
+    selected_ref = str((selected_anchor or {}).get("source_ref") or "")
+    unique_selected = (
+        bool(selected_anchor)
+        and _is_proven_parent_main_history_anchor(selected_anchor)
+        and selected_ref in high_confidence_refs
+        and len(high_confidence_refs) == 1
+    )
+    diagnostic_candidates = _parent_main_diagnostic_shortlist_candidates(
+        anchor_candidates=anchor_candidates,
+        rejected=(anchor_decision.get("rejected_anchor_alternatives") or []),
+        canonical_refs={str(candidate.get("source_ref") or "") for candidate in canonical_candidates},
+    )
+    status = "selected" if unique_selected else "anchor_ambiguous"
+    answer_allowed = bool(unique_selected)
+    selected_shortlist_ref = selected_ref if unique_selected else None
+    shortlist_candidates = []
+    for candidate in canonical_candidates:
+        ref = str(candidate.get("source_ref") or "")
+        if ref in high_confidence_refs:
+            confidence = "high"
+            ambiguity = "unique_high_confidence" if len(high_confidence_refs) == 1 else "multiple_high_confidence"
+        else:
+            confidence = "medium"
+            ambiguity = "older_canonical_parent_main_candidate"
+        decision = "selected" if unique_selected and ref == selected_ref else "rejected"
+        if status == "anchor_ambiguous" and ref in high_confidence_refs:
+            decision = "ambiguous"
+        shortlist_candidates.append(
+            _parent_main_shortlist_item(
+                candidate,
+                source_scope="canonical_parent_main_history",
+                decision=decision,
+                confidence_label=confidence,
+                ambiguity_label=ambiguity,
+                cwd=cwd,
+                codex_home=codex_home,
+            )
+        )
+    for candidate in diagnostic_candidates:
+        shortlist_candidates.append(
+            _parent_main_shortlist_item(
+                candidate,
+                source_scope=_parent_main_candidate_scope(candidate),
+                decision="diagnostic_rejected",
+                confidence_label="not_anchor",
+                ambiguity_label=_parent_main_diagnostic_ambiguity_label(candidate),
+                cwd=cwd,
+                codex_home=codex_home,
+            )
+        )
+        if len(shortlist_candidates) >= 10:
+            break
+
+    recovery_commands = [
+        item.get("read_more_command")
+        for item in shortlist_candidates
+        if item.get("read_more_command") and item.get("decision") in {"ambiguous", "diagnostic_rejected"}
+    ][:4]
+    recovery = {
+        "read_more_commands": recovery_commands,
+        "rerun_instruction": (
+            "Rerun what-happened-since with the intended canonical history.jsonl timestamp or quoted message "
+            "after opening the ambiguous/recovery refs."
+        ),
+    }
+    shortlist = {
+        "contract": "parent_main_anchor_shortlist",
+        "status": status,
+        "answer_allowed": answer_allowed,
+        "selected_anchor": selected_shortlist_ref,
+        "selection_rule": (
+            "Select exactly one unique high-confidence canonical codex_history:history.jsonl:<line> "
+            "parent/main human row; later current-loop, worker, reviewer, session-only, task, report, "
+            "commit, and repo-state rows are diagnostic or recovery material only."
+        ),
+        "stop_condition": (
+            "Do not synthesize a parent/main status answer unless parent_main_anchor_shortlist.status is "
+            "selected and answer_allowed is true. If ambiguous, open recovery refs and rerun with the "
+            "intended timestamp or quoted message."
+        ),
+        "canonical_high_confidence_count": len(high_confidence_refs),
+        "candidate_count": len(shortlist_candidates),
+        "candidates": shortlist_candidates,
+        "recovery": recovery,
+    }
+    if unique_selected or not selected_anchor:
+        return selected_anchor, anchor_decision, shortlist
+
+    rejected = _shortlist_rejected_anchor_alternatives(shortlist_candidates)
+    for item in anchor_decision.get("rejected_anchor_alternatives") or []:
+        if item.get("source_ref") in {alt.get("source_ref") for alt in rejected}:
+            continue
+        rejected.append(item)
+        if len(rejected) >= 8:
+            break
+    updated_decision = {
+        **anchor_decision,
+        "context_boundary": (
+            "parent_main_anchor_shortlist_ambiguous"
+            if high_confidence_refs
+            else anchor_decision.get("context_boundary")
+        ),
+        "anchor_scope": "parent_thread",
+        "anchor_reason": (
+            "parent_main_anchor_shortlist_requires_unique_high_confidence_canonical_history_anchor"
+            if high_confidence_refs
+            else anchor_decision.get("anchor_reason")
+        ),
+        "anchor_ref": None,
+        "selected_anchor": None,
+        "rejected_anchor_alternatives": rejected[:8],
+        "parent_main_anchor_shortlist_status": status,
+    }
+    return None, updated_decision, shortlist
+
+
+def _parent_main_canonical_shortlist_candidates(
+    *,
+    canonical_parent_main_interval: dict,
+    selected_anchor: dict | None,
+) -> list[dict]:
+    candidates = [dict(candidate) for candidate in canonical_parent_main_interval.get("anchor_candidates") or []]
+    selected = canonical_parent_main_interval.get("selected_anchor") or selected_anchor
+    if selected and not any(candidate.get("source_ref") == selected.get("source_ref") for candidate in candidates):
+        candidates.insert(0, dict(selected))
+    return candidates[:8]
+
+
+def _parent_main_high_confidence_refs(candidates: list[dict]) -> set[str]:
+    if not candidates:
+        return set()
+    top = candidates[0]
+    top_score = int(top.get("score") or 0)
+    top_timestamp = str(top.get("timestamp_utc") or "")
+    refs = {str(top.get("source_ref") or "")}
+    for candidate in candidates[1:]:
+        if int(candidate.get("score") or 0) == top_score and str(candidate.get("timestamp_utc") or "") == top_timestamp:
+            refs.add(str(candidate.get("source_ref") or ""))
+    return {ref for ref in refs if ref}
+
+
+def _parent_main_diagnostic_shortlist_candidates(
+    *,
+    anchor_candidates: list[dict],
+    rejected: list[dict],
+    canonical_refs: set[str],
+) -> list[dict]:
+    diagnostics = []
+    seen = set(canonical_refs)
+    for collection in (rejected, anchor_candidates):
+        for candidate in collection:
+            ref = str(candidate.get("source_ref") or "")
+            if not ref or ref in seen:
+                continue
+            if (
+                candidate.get("source_kind") == "codex_history"
+                or candidate.get("source_kind") == "codex_sessions"
+                or candidate.get("classification")
+                in {
+                    "worker_or_reviewer_prompt",
+                    "non_human_boundary_or_tool_context",
+                    "admin_or_status_turn",
+                    "post_status_context",
+                }
+            ):
+                diagnostics.append(candidate)
+                seen.add(ref)
+            if len(diagnostics) >= 6:
+                return diagnostics
+    return diagnostics
+
+
+def _parent_main_shortlist_item(
+    candidate: dict,
+    *,
+    source_scope: str,
+    decision: str,
+    confidence_label: str,
+    ambiguity_label: str,
+    cwd: Path,
+    codex_home: Path | None,
+) -> dict:
+    item = {
+        "source_ref": candidate.get("source_ref"),
+        "source_kind": candidate.get("source_kind"),
+        "source_scope": candidate.get("source_scope") or source_scope,
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "classification": candidate.get("classification"),
+        "decision": decision,
+        "confidence_label": confidence_label,
+        "ambiguity_label": ambiguity_label,
+        "rationale": candidate.get("rationale"),
+        "snippet": candidate.get("snippet"),
+        "openable_source_ref": candidate.get("openable_source_ref"),
+        "openable_target": candidate.get("openable_target"),
+        "target_window_hits": candidate.get("target_window_hits") or [],
+        "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+    }
+    if item.get("openable_target"):
+        item["openable_target"] = str(item["openable_target"])
+        item["read_more_command"] = candidate.get("read_more_command") or _read_more_command(
+            str(item["openable_target"]),
+            cwd=cwd,
+            codex_home=codex_home,
+        )
+    return item
+
+
+def _parent_main_candidate_scope(candidate: dict) -> str:
+    if candidate.get("classification") in {"worker_or_reviewer_prompt", "non_human_boundary_or_tool_context"}:
+        return "worker_reviewer_or_current_loop_diagnostic"
+    if candidate.get("source_kind") == "codex_history":
+        return "canonical_history_rejected_or_boundary"
+    if candidate.get("source_kind") == "codex_sessions":
+        return "session_only_unproven_parent_main_candidate"
+    return "diagnostic_anchor_candidate"
+
+
+def _parent_main_diagnostic_ambiguity_label(candidate: dict) -> str:
+    classification = candidate.get("classification")
+    if classification == "worker_or_reviewer_prompt":
+        return "worker_or_reviewer_row_not_parent_main_anchor"
+    if classification in {"non_human_boundary_or_tool_context", "admin_or_status_turn", "post_status_context"}:
+        return "later_current_loop_or_boundary_context_not_anchor"
+    if candidate.get("source_kind") == "codex_sessions":
+        return "missing_canonical_history_proof"
+    return "rejected_diagnostic_only"
+
+
+def _shortlist_rejected_anchor_alternatives(shortlist_candidates: list[dict]) -> list[dict]:
+    alternatives = []
+    for item in shortlist_candidates:
+        if item.get("decision") == "selected":
+            continue
+        alternatives.append(
+            {
+                "source_ref": item.get("source_ref"),
+                "timestamp_utc": item.get("timestamp_utc"),
+                "classification": item.get("classification"),
+                "decision": "rejected" if item.get("decision") == "diagnostic_rejected" else item.get("decision"),
+                "rationale": item.get("rationale"),
+                "snippet": item.get("snippet"),
+                "source_kind": item.get("source_kind"),
+                "source_scope": item.get("source_scope"),
+                "confidence_label": item.get("confidence_label"),
+                "ambiguity_label": item.get("ambiguity_label"),
+                "openable_source_ref": item.get("openable_source_ref"),
+                "openable_target": item.get("openable_target"),
+                "read_more_command": item.get("read_more_command"),
+                "target_window_hits": item.get("target_window_hits") or [],
+                "outside_target_task_ids": item.get("outside_target_task_ids") or [],
+            }
+        )
+        if len(alternatives) >= 8:
+            break
+    return alternatives
+
+
 def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
     context_boundary = str(anchor_decision.get("context_boundary") or "")
     anchor_reason = str(anchor_decision.get("anchor_reason") or "")
@@ -2209,6 +2531,7 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
         or context_boundary.startswith("relative_status_history")
         or context_boundary.startswith("prior_request_occurrence")
         or context_boundary == "parent_main_selected_anchor_unproven"
+        or context_boundary == "parent_main_anchor_shortlist_ambiguous"
         or anchor_reason in {
             "first_side_thread_user_message_after_boundary",
             "parent_main_last_actual_work_handoff",
@@ -2219,6 +2542,7 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
             "no_status_question_boundary_for_parent_main_anchor",
             "no_canonical_history_anchor_found_for_relative_status",
             "no_status_question_boundary_for_history_first_relative_status",
+            "parent_main_anchor_shortlist_requires_unique_high_confidence_canonical_history_anchor",
         }
     )
 
@@ -3624,6 +3948,7 @@ def _answer_readiness_contract(
             "anchor_decision.rejected_anchor_alternatives",
             "source_tiers.required_primary[parent_main_anchor_recovery_candidate]",
             "source_tiers.required_primary[prior_request_occurrence_candidate]",
+            "parent_main_anchor_shortlist",
             "source_tiers.diagnostic_optional",
         ],
     }

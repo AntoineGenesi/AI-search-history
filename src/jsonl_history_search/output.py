@@ -2841,6 +2841,7 @@ def render_status_anchor_text(payload: dict) -> str:
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
     answer_readiness = report.get("answer_readiness") or {}
+    parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
@@ -2877,6 +2878,7 @@ def render_status_anchor_text(payload: dict) -> str:
             f"{status_boundary.get('timestamp_utc')} {status_boundary.get('source_ref')} "
             f"audit_run_requested={report.get('routing', {}).get('audit_run_requested')}"
         )
+    _append_parent_main_anchor_shortlist_text(lines, parent_main_shortlist)
     _append_status_follow_through_plan_text(lines, follow_through_plan)
     lines.append("Open these source refs first:")
     if selected:
@@ -2984,6 +2986,43 @@ def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: d
     return _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
 
 
+def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict) -> None:
+    if not shortlist or shortlist.get("status") == "not_applicable":
+        return
+    lines.append("Parent/main anchor shortlist:")
+    lines.append(
+        "Shortlist status: "
+        f"{shortlist.get('status')} "
+        f"answer_allowed={shortlist.get('answer_allowed')} "
+        f"selected_anchor={shortlist.get('selected_anchor')}"
+    )
+    lines.append(
+        "Shortlist candidates: "
+        f"{shortlist.get('candidate_count', 0)} "
+        f"high_confidence={shortlist.get('canonical_high_confidence_count', 0)}"
+    )
+    if shortlist.get("stop_condition"):
+        lines.append(f"Shortlist stop_condition: {shortlist.get('stop_condition')}")
+    for candidate in (shortlist.get("candidates") or [])[:6]:
+        lines.append(
+            "- "
+            f"{candidate.get('source_ref')} "
+            f"scope={candidate.get('source_scope')} "
+            f"kind={candidate.get('source_kind')} "
+            f"timestamp={candidate.get('timestamp_utc')} "
+            f"classification={candidate.get('classification')} "
+            f"decision={candidate.get('decision')} "
+            f"confidence={candidate.get('confidence_label')} "
+            f"ambiguity={candidate.get('ambiguity_label')}: "
+            f"{candidate.get('rationale')}"
+        )
+        if candidate.get("read_more_command"):
+            lines.append(f"  read-more: {candidate.get('read_more_command')}")
+    recovery = shortlist.get("recovery") or {}
+    if recovery.get("rerun_instruction"):
+        lines.append(f"Shortlist recovery: {recovery.get('rerun_instruction')}")
+
+
 def render_status_anchor_markdown(payload: dict) -> str:
     report = payload["status_anchor"]
     summary = report["summary"]
@@ -2995,6 +3034,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
     answer_readiness = report.get("answer_readiness") or {}
+    parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
@@ -3045,6 +3085,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
                 "",
             ]
         )
+    _append_parent_main_anchor_shortlist_markdown(lines, parent_main_shortlist)
     lines.extend(["## Follow-Through Plan", ""])
     _append_status_follow_through_plan_markdown(lines, follow_through_plan)
     lines.extend([
@@ -3156,6 +3197,45 @@ def render_status_anchor_markdown(payload: dict) -> str:
         lines.extend(["## Blind Spots", ""])
         lines.extend(f"- {blind}" for blind in report["blind_spots"])
     return "\n".join(lines)
+
+
+def _append_parent_main_anchor_shortlist_markdown(lines: list[str], shortlist: dict) -> None:
+    if not shortlist or shortlist.get("status") == "not_applicable":
+        return
+    lines.extend(
+        [
+            "## Parent/Main Anchor Shortlist",
+            "",
+            f"- Status: `{shortlist.get('status')}`",
+            f"- Answer allowed: `{shortlist.get('answer_allowed')}`",
+            f"- Selected anchor: `{shortlist.get('selected_anchor')}`",
+            (
+                f"- Candidates: `{shortlist.get('candidate_count', 0)}`; "
+                f"high confidence: `{shortlist.get('canonical_high_confidence_count', 0)}`"
+            ),
+        ]
+    )
+    if shortlist.get("stop_condition"):
+        lines.append(f"- Stop condition: {shortlist.get('stop_condition')}")
+    lines.append("")
+    for candidate in (shortlist.get("candidates") or [])[:6]:
+        lines.append(
+            f"- `{candidate.get('source_ref')}` "
+            f"`scope={candidate.get('source_scope')}` "
+            f"`kind={candidate.get('source_kind')}` "
+            f"`timestamp={candidate.get('timestamp_utc')}` "
+            f"`classification={candidate.get('classification')}` "
+            f"`decision={candidate.get('decision')}` "
+            f"`confidence={candidate.get('confidence_label')}` "
+            f"`ambiguity={candidate.get('ambiguity_label')}`: "
+            f"{candidate.get('rationale')}"
+        )
+        if candidate.get("read_more_command"):
+            lines.append(f"  - Read more: `{candidate.get('read_more_command')}`")
+    recovery = shortlist.get("recovery") or {}
+    if recovery.get("rerun_instruction"):
+        lines.append(f"- Recovery: {recovery.get('rerun_instruction')}")
+    lines.append("")
 
 
 def render_generated_metadata_discovery_text(payload: dict) -> str:
