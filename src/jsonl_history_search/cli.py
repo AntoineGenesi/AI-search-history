@@ -1825,6 +1825,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "route_family": route.get("route_family"),
         "why_it_applies": route.get("why_it_applies"),
         "first_command": route.get("first_command"),
+        "explicit_source_root_count": len(getattr(args, "root", []) or []),
         "read_specialization": route.get("read_specialization"),
         "inspect_after": route.get("inspect_after", []),
         "stop_guidance": route.get("stop_guidance"),
@@ -1910,6 +1911,90 @@ def _execution_args_from_ask(args: argparse.Namespace, *, command: str, report_o
         }
     )
     return argparse.Namespace(**values)
+
+
+def _args_with_bounded_auto_execute_prompt_scope(args: argparse.Namespace) -> argparse.Namespace:
+    values = vars(args).copy()
+    roots = list(values.get("root") or [])
+    extracted_roots = _extract_bounded_auto_execute_roots_from_query(str(values.get("query") or ""))
+    changed = False
+    if not roots and extracted_roots:
+        values["root"] = extracted_roots
+        roots = extracted_roots
+        changed = True
+    if values.get("hard_cap_files") is None:
+        hard_cap_files = _extract_bounded_auto_execute_hard_cap(str(values.get("query") or ""), "files")
+        if hard_cap_files is not None:
+            values["hard_cap_files"] = hard_cap_files
+            changed = True
+    if values.get("hard_cap_bytes") is None:
+        hard_cap_bytes = _extract_bounded_auto_execute_hard_cap(str(values.get("query") or ""), "bytes")
+        if hard_cap_bytes is not None:
+            values["hard_cap_bytes"] = hard_cap_bytes
+            changed = True
+    if (
+        roots
+        and not values.get("allow_arbitrary_root")
+        and values.get("hard_cap_files") is not None
+        and values.get("hard_cap_bytes") is not None
+    ):
+        values["allow_arbitrary_root"] = True
+        changed = True
+    return argparse.Namespace(**values) if changed else args
+
+
+def _extract_bounded_auto_execute_roots_from_query(query: str) -> list[str]:
+    roots: list[str] = []
+    for token in _path_like_tokens(query):
+        cleaned = token.strip().strip("`'\"()[]{}<>.,;:")
+        if not _safe_bounded_fixture_root_token(cleaned):
+            continue
+        if cleaned not in roots:
+            roots.append(cleaned)
+    return roots[:2]
+
+
+def _path_like_tokens(query: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9_./~-]+/[A-Za-z0-9_./~-]+", query)
+    quoted = re.findall(r"[`'\"]([^`'\"]+/[^`'\"]+)[`'\"]", query)
+    return [*tokens, *quoted]
+
+
+def _safe_bounded_fixture_root_token(token: str) -> bool:
+    if not token or len(token) > 240:
+        return False
+    if any(char in token for char in ("$", "*", "?", "\\", "|", ";", "&")):
+        return False
+    if "://" in token:
+        return False
+    path = Path(token)
+    if any(part == ".." for part in path.parts):
+        return False
+    normalized = token.casefold().lstrip("./")
+    return (
+        "tests/fixtures/" in normalized
+        or "fixtures/final_suite_bounded_no_evidence/" in normalized
+        or "final_suite_bounded_no_evidence/" in normalized
+    )
+
+
+def _extract_bounded_auto_execute_hard_cap(query: str, kind: str) -> int | None:
+    patterns = (
+        rf"(?:--)?hard[-_\s]?cap[-_\s]?{kind}\s*(?:=|:)?\s*([0-9][0-9_]*)",
+        rf"{kind}\s+hard[-_\s]?cap\s*(?:=|:)?\s*([0-9][0-9_]*)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, query, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1).replace("_", ""))
+        except ValueError:
+            continue
+        max_value = 10_000 if kind == "files" else 2_000_000_000
+        if 1 <= value <= max_value:
+            return value
+    return None
 
 
 def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
@@ -2115,6 +2200,8 @@ def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
 def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: dict) -> bool:
     if selected_route.get("route_family") != "bounded_no_evidence":
         return False
+    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0:
+        return False
     if compact.get("status") != "no_evidence":
         return False
     no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
@@ -2252,6 +2339,8 @@ def main(argv: list[str] | None = None) -> int:
             and payload["ask_router"].get("route_family") == "bounded_no_evidence"
         )
         if args.execute or auto_execute_bounded:
+            if auto_execute_bounded and not args.execute:
+                args = _args_with_bounded_auto_execute_prompt_scope(args)
             payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)
         print(render(payload, args.format))
         return 0
