@@ -14,8 +14,8 @@ def agent_question_cookbook() -> list[dict[str, str]]:
                 '--cwd "$PWD" --format text'
             ),
             "inspect_next": (
-                "status_anchor.follow_through_plan open_first, selected_anchor, "
-                "and raw sessions/**/*.jsonl activity after the anchor"
+                "status_anchor.parent_main_anchor_shortlist, follow_through_plan open_first, "
+                "selected_anchor, and raw sessions/**/*.jsonl activity after the anchor"
             ),
         },
         {
