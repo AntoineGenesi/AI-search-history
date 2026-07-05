@@ -51,7 +51,10 @@ Use `ask --execute` when the receiving-agent goal is to fuse route selection
 with the first safe JSONL run. It only executes allow-listed structured
 semantic-debug and bounded no-evidence/no-evidence-report routes, writes a full
 JSON report behind a report handle, and returns a compact answer/read/stop
-contract. Unsupported routes fail closed with `execution_status:
+contract. Only bounded no-evidence routes executed through `no-evidence-report`
+may surface promoted scoped no-evidence answer status; semantic-debug execution
+is convenience output and remains inspect-before-answer. Unsupported routes fail
+closed with `execution_status:
 unsupported_route` and the normal first command; they are not shell-executed.
 Use plain `ask` when you only need route classification or when the selected
 route is outside that execution allow-list.
@@ -134,8 +137,11 @@ refs to inspect after, and gives the stop condition for manual search.
 The `ask --execute` output is still not a final answer by itself, but for
 allow-listed semantic-debug and bounded no-evidence routes it does run the
 selected JSONL route and returns one compact contract with selected route
-metadata, execution status, compact executed output, answer/read/stop guidance,
-and a saved report handle for drill-down.
+metadata, execution status, compact executed output, promotion status,
+answer/read/stop guidance, and a saved report handle for drill-down. Treat
+semantic-debug `ask --execute` results as unpromoted inspect-before-answer
+handoffs even when the saved full report contains internal answer-readiness
+fields.
 
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect

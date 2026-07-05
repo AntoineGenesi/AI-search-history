@@ -349,10 +349,13 @@ def render_ask_execute_text(payload: dict) -> str:
     lines.extend(
         [
             f"Answer status: {action.get('answer_status')}",
+            f"Promotion status: {action.get('promotion_status')}",
             f"Stop condition: {action.get('stop')}",
             "Read/action contract:",
         ]
     )
+    if action.get("promotion_reason"):
+        lines.append(f"Promotion reason: {action.get('promotion_reason')}")
     _append_compact_read_contract(lines, action.get("read"))
     only_continue = action.get("only_continue_if")
     if only_continue:
@@ -389,9 +392,12 @@ def render_ask_execute_markdown(payload: dict) -> str:
             "## Answer Action Contract",
             "",
             f"- Answer status: `{action.get('answer_status')}`",
+            f"- Promotion status: `{action.get('promotion_status')}`",
             f"- Stop condition: {action.get('stop')}",
         ]
     )
+    if action.get("promotion_reason"):
+        lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
     if execution.get("status") == "unsupported_route":
         lines.append(f"- Unsupported route: {execution.get('reason')}")
     else:

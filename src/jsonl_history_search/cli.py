@@ -2042,13 +2042,19 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             if orchestration_plan.get("status") == "answer_ready"
             else orchestration_plan.get("bounded_non_final_required_reads")
         )
-        scoped_no_evidence = compact.get("answer_ready_decision") == "scoped_no_evidence"
-        return {
-            "answer_status": "answer-scoped-no-evidence-now"
-            if scoped_no_evidence
-            else handoff.get("answer_readiness_status")
+        internal_status = (
+            handoff.get("answer_readiness_status")
             or compact.get("answer_readiness_summary", {}).get("status")
-            or compact.get("status"),
+            or compact.get("status")
+        )
+        return {
+            "answer_status": _unpromoted_semantic_debug_answer_status(internal_status),
+            "promotion_status": "unpromoted_semantic_debug_execution",
+            "promotion_reason": (
+                "ask --execute semantic-debug remains an execution convenience; promoted scoped answers "
+                "are limited to bounded_no_evidence routes executed through no-evidence-report."
+            ),
+            "internal_answer_status": internal_status,
             "read": orchestration_reads
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
@@ -2062,14 +2068,60 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             ),
             "saved_report": compact.get("report_written"),
         }
+    if _promotable_bounded_no_evidence_contract(compact=compact, selected_route=selected_route):
+        return {
+            "answer_status": "answer-scoped-no-evidence-now",
+            "promotion_status": "promoted_scoped_no_evidence",
+            "promotion_scope": "not_found_in_searched_scope",
+            "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
+            "stop": selected_route.get("stop_guidance"),
+            "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
+            or selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written"),
+        }
     return {
-        "answer_status": compact.get("status"),
+        "answer_status": "not-ready/needs-more-proof",
+        "promotion_status": "unpromoted",
+        "promotion_reason": (
+            "Executed output did not satisfy bounded scoped no-evidence promotion requirements."
+        ),
+        "internal_answer_status": compact.get("status"),
         "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
         "stop": selected_route.get("stop_guidance"),
         "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
         or selected_route.get("manual_search_guidance"),
         "saved_report": compact.get("report_written"),
     }
+
+
+def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
+    if internal_status in {"inspect_recovery_first", "needs_investigation", "not-ready/needs-more-proof"}:
+        return str(internal_status)
+    return "inspect-before-answer"
+
+
+def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: dict) -> bool:
+    if selected_route.get("route_family") != "bounded_no_evidence":
+        return False
+    if compact.get("status") != "no_evidence":
+        return False
+    no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+    if no_evidence.get("answer_scope") != "not_found_in_searched_scope":
+        return False
+    if no_evidence.get("not_all_history_absence") is not True:
+        return False
+    read_more_policy = (
+        no_evidence.get("read_more_policy") if isinstance(no_evidence.get("read_more_policy"), dict) else {}
+    )
+    if read_more_policy.get("required_before_scoped_no_evidence_answer") is not False:
+        return False
+    searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
+    scope_counts = compact.get("scope_counts") if isinstance(compact.get("scope_counts"), dict) else {}
+    searched_scope_has_counts = all(key in searched_scope for key in ("searched_files", "searched_bytes"))
+    scoped_root_counts_present = all(
+        key in scope_counts for key in ("selected_root_count", "excluded_root_count", "missing_root_count")
+    )
+    return searched_scope_has_counts and scoped_root_counts_present
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
