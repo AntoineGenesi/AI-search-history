@@ -360,12 +360,21 @@ def build_semantic_debug_payload(
         query=agent_find["query"]["original"],
         family=family,
     )
+    historical_orchestration_role_evidence_bundle = (
+        build_historical_orchestration_role_evidence_bundle(historical_orchestration_plan)
+        if historical_orchestration_plan
+        else {}
+    )
     if historical_orchestration_plan:
         source_locator_handoff["historical_orchestration_provenance_final_support_plan"] = (
             historical_orchestration_plan
         )
         source_locator_handoff["historical_orchestration_role_coverage_source_plan"] = (
             historical_orchestration_plan
+        )
+    if historical_orchestration_role_evidence_bundle:
+        source_locator_handoff["historical_orchestration_role_evidence_bundle"] = (
+            historical_orchestration_role_evidence_bundle
         )
     process_actual_use_read_plan = (
         build_process_actual_use_final_support_read_plan(
@@ -611,6 +620,33 @@ def build_semantic_debug_payload(
             ),
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
         }
+    if historical_orchestration_role_evidence_bundle:
+        bundle_summary = historical_orchestration_role_evidence_bundle_summary(
+            historical_orchestration_role_evidence_bundle
+        )
+        answer_ready_handoff["historical_orchestration_role_evidence_bundle"] = bundle_summary
+        answer_ready_handoff["links"]["historical_orchestration_role_evidence_bundle"] = (
+            "semantic_debug.historical_orchestration_role_evidence_bundle"
+        )
+        answer_ready_handoff["source_use_summary"][
+            "historical_orchestration_role_evidence_bundle"
+        ] = {
+            "link": "semantic_debug.historical_orchestration_role_evidence_bundle",
+            "status": bundle_summary.get("status"),
+            "required_roles": bundle_summary.get("required_roles"),
+            "covered_roles": bundle_summary.get("covered_roles"),
+            "missing_roles": bundle_summary.get("missing_roles"),
+            "required_role_read_count": bundle_summary.get("required_role_read_count", 0),
+            "required_role_read_cap": bundle_summary.get(
+                "required_role_read_cap",
+                HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP,
+            ),
+            "missing_role_recovery_ref_count": bundle_summary.get(
+                "missing_role_recovery_ref_count", 0
+            ),
+            "answer_ready_claim_allowed": bundle_summary.get("answer_ready_claim_allowed"),
+            "claim_boundaries": bundle_summary.get("claim_boundaries"),
+        }
         answer_ready_handoff["source_use_summary"][
             "historical_orchestration_role_coverage_source_plan"
         ] = {
@@ -691,6 +727,7 @@ def build_semantic_debug_payload(
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
+        "historical_orchestration_role_evidence_bundle": historical_orchestration_role_evidence_bundle,
         "historical_orchestration_role_coverage_source_plan": historical_orchestration_plan,
         "historical_orchestration_provenance_final_support_plan": historical_orchestration_plan,
         "final_answer_source_use_contract": final_answer_contract,
@@ -1451,6 +1488,13 @@ HISTORICAL_ORCHESTRATION_SECONDARY_RECOVERY_SCOPES = [
     "reports",
     "codex/state/reviews",
 ]
+HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP = 5
+HISTORICAL_ORCHESTRATION_ROLE_LABELS = {
+    "parent_or_coordinator": "parent/coordinator",
+    "worker": "worker/subagent",
+    "reviewer": "reviewer/rereviewer",
+    "secondary_task_review_commit_support": "secondary task/review/commit support",
+}
 
 
 def build_historical_orchestration_provenance_final_support_plan(
@@ -1596,6 +1640,231 @@ def build_historical_orchestration_provenance_final_support_plan(
             "release_or_token_savings_claim_supported": False,
         },
     }
+
+
+def build_historical_orchestration_role_evidence_bundle(plan: dict[str, Any]) -> dict[str, Any]:
+    if not plan:
+        return {}
+    required_roles = list(plan.get("required_roles") or [])
+    primary_reads = list(plan.get("primary_historical_final_support_reads") or [])
+    secondary_reads = list(plan.get("secondary_task_review_commit_support_reads") or [])
+    missing_roles = list(plan.get("missing_roles") or [])
+    selected_reads = (
+        historical_orchestration_select_required_role_reads(
+            required_roles=required_roles,
+            primary_reads=primary_reads,
+            secondary_reads=secondary_reads,
+            read_cap=HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP,
+        )
+        if plan.get("status") == "answer_ready" and not missing_roles
+        else []
+    )
+    selected_role_set = {
+        role
+        for read in selected_reads
+        for role in historical_orchestration_bundle_effective_roles(
+            read,
+            required_roles=required_roles,
+            secondary_read_ids={
+                historical_orchestration_read_identity(item) for item in secondary_reads
+            },
+        )
+        if role in required_roles
+    }
+    selected_missing_roles = (
+        [role for role in required_roles if role not in selected_role_set]
+        if selected_reads
+        else []
+    )
+    answer_ready = plan.get("status") == "answer_ready" and not missing_roles and not selected_missing_roles
+    effective_missing_roles = dedupe(missing_roles + selected_missing_roles)
+    role_groups = historical_orchestration_role_evidence_groups(
+        required_roles=required_roles,
+        primary_reads=primary_reads,
+        secondary_reads=secondary_reads,
+        missing_roles=effective_missing_roles,
+        selected_reads=selected_reads,
+    )
+    return {
+        "schema_version": 1,
+        "bundle_name": "historical_orchestration_role_evidence_bundle",
+        "status": "answer_ready" if answer_ready else "not_answer_ready_missing_roles",
+        "source_plan_link": "semantic_debug.historical_orchestration_provenance_final_support_plan",
+        "role_groups": role_groups,
+        "required_roles": required_roles,
+        "covered_roles": [role for role in required_roles if role not in effective_missing_roles],
+        "missing_roles": effective_missing_roles,
+        "missing_role_recovery_refs": (
+            [] if answer_ready else list(plan.get("missing_role_recovery_refs") or [])
+        ),
+        "missing_role_recovery_ref_count": 0
+        if answer_ready
+        else len(plan.get("missing_role_recovery_refs") or []),
+        "required_role_reads": selected_reads if answer_ready else [],
+        "required_role_read_count": len(selected_reads) if answer_ready else 0,
+        "required_role_read_cap": HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP,
+        "dedupe_policy": "dedupe by target/source_ref and select the smallest role-covering read set up to cap",
+        "answer_ready_claim_allowed": answer_ready,
+        "claim_boundaries": {
+            "raw_jsonl_supports_primary_role_claims": True,
+            "task_review_commit_refs_are_secondary_support": True,
+            "current_run_current_task_same_loop_refs_count_as_final_support": False,
+            "secondary_refs_replace_primary_raw_role_support": False,
+            "release_or_token_savings_claim_supported": False,
+            "raw_text_included": False,
+        },
+    }
+
+
+def historical_orchestration_role_evidence_bundle_summary(bundle: dict[str, Any]) -> dict[str, Any]:
+    if not bundle:
+        return {}
+    return {
+        "schema_version": bundle.get("schema_version", 1),
+        "bundle_name": bundle.get("bundle_name", "historical_orchestration_role_evidence_bundle"),
+        "status": bundle.get("status"),
+        "source_plan_link": bundle.get("source_plan_link"),
+        "required_roles": list(bundle.get("required_roles") or []),
+        "covered_roles": list(bundle.get("covered_roles") or []),
+        "missing_roles": list(bundle.get("missing_roles") or []),
+        "role_groups": list(bundle.get("role_groups") or []),
+        "required_role_read_count": bundle.get("required_role_read_count", 0),
+        "required_role_read_cap": bundle.get(
+            "required_role_read_cap",
+            HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP,
+        ),
+        "required_role_reads": list(bundle.get("required_role_reads") or [])[
+            :HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP
+        ],
+        "missing_role_recovery_ref_count": bundle.get("missing_role_recovery_ref_count", 0),
+        "missing_role_recovery_refs": list(bundle.get("missing_role_recovery_refs") or [])[
+            :HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP
+        ],
+        "answer_ready_claim_allowed": bool(bundle.get("answer_ready_claim_allowed")),
+        "claim_boundaries": bundle.get("claim_boundaries"),
+    }
+
+
+def historical_orchestration_select_required_role_reads(
+    *,
+    required_roles: list[str],
+    primary_reads: list[dict[str, Any]],
+    secondary_reads: list[dict[str, Any]],
+    read_cap: int,
+) -> list[dict[str, Any]]:
+    pool = [
+        read
+        for read in primary_reads + secondary_reads
+        if read.get("target")
+        and not read.get("diagnostic_only")
+        and read.get("source_chronology_role")
+        not in {"current_run_self_echo_diagnostic", "current_task_same_loop_diagnostic"}
+    ]
+    secondary_read_ids = {historical_orchestration_read_identity(read) for read in secondary_reads}
+    selected: list[dict[str, Any]] = []
+    covered: set[str] = set()
+    remaining_roles = set(required_roles)
+    while remaining_roles and len(selected) < read_cap:
+        best = None
+        best_roles: set[str] = set()
+        for read in pool:
+            if any(historical_orchestration_same_read(read, existing) for existing in selected):
+                continue
+            read_roles = set(
+                historical_orchestration_bundle_effective_roles(
+                    read,
+                    required_roles=list(remaining_roles),
+                    secondary_read_ids=secondary_read_ids,
+                )
+            )
+            if len(read_roles) > len(best_roles):
+                best = read
+                best_roles = read_roles
+        if best is None or not best_roles:
+            break
+        selected.append(best)
+        covered.update(best_roles)
+        remaining_roles = set(required_roles) - covered
+    return selected
+
+
+def historical_orchestration_role_evidence_groups(
+    *,
+    required_roles: list[str],
+    primary_reads: list[dict[str, Any]],
+    secondary_reads: list[dict[str, Any]],
+    missing_roles: list[str],
+    selected_reads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_targets = {historical_orchestration_read_identity(read) for read in selected_reads}
+    groups: list[dict[str, Any]] = []
+    for role in required_roles:
+        source_pool = secondary_reads if role in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES else primary_reads
+        sources = [
+            read
+            for read in source_pool
+            if role in set(read.get("orchestration_roles") or [])
+            and not read.get("diagnostic_only")
+            and read.get("source_chronology_role")
+            not in {"current_run_self_echo_diagnostic", "current_task_same_loop_diagnostic"}
+        ]
+        tier = (
+            "secondary_task_review_commit_support"
+            if role in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES
+            else "primary_raw_jsonl"
+        )
+        groups.append(
+            {
+                "role": role,
+                "label": HISTORICAL_ORCHESTRATION_ROLE_LABELS.get(role, role),
+                "status": "missing" if role in missing_roles else "covered",
+                "support_tier": tier,
+                "claim_support": (
+                    "secondary_support_only"
+                    if role in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES
+                    else "primary_role_claim_support"
+                ),
+                "source_count": len(sources),
+                "source_refs": sources[:3],
+                "selected_required_read_targets": [
+                    str(read.get("target") or "")
+                    for read in sources
+                    if historical_orchestration_read_identity(read) in selected_targets
+                ][:3],
+            }
+        )
+    return groups
+
+
+def historical_orchestration_bundle_effective_roles(
+    read: dict[str, Any],
+    *,
+    required_roles: list[str],
+    secondary_read_ids: set[str],
+) -> list[str]:
+    roles = [role for role in read.get("orchestration_roles") or [] if role in required_roles]
+    if historical_orchestration_read_identity(read) in secondary_read_ids:
+        return [
+            role
+            for role in roles
+            if role in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES
+        ]
+    return [
+        role
+        for role in roles
+        if role not in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES
+    ]
+
+
+def historical_orchestration_read_identity(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return str(read.get("target") or source_ref_target(source_ref) or source_ref.get("path") or "")
+
+
+def historical_orchestration_same_read(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_identity = historical_orchestration_read_identity(left)
+    right_identity = historical_orchestration_read_identity(right)
+    return bool(left_identity and right_identity and left_identity == right_identity)
 
 
 def historical_orchestration_missing_role_recovery_refs(
@@ -7863,9 +8132,18 @@ def build_final_answer_source_use_contract(
     historical_orchestration_plan = source_locator_handoff.get(
         "historical_orchestration_provenance_final_support_plan"
     ) or {}
+    historical_orchestration_role_evidence_bundle = source_locator_handoff.get(
+        "historical_orchestration_role_evidence_bundle"
+    ) or {}
     if historical_orchestration_plan:
         evidence_inputs["historical_orchestration_provenance_final_support_plan"] = (
             historical_orchestration_plan_summary(historical_orchestration_plan)
+        )
+    if historical_orchestration_role_evidence_bundle:
+        evidence_inputs["historical_orchestration_role_evidence_bundle"] = (
+            historical_orchestration_role_evidence_bundle_summary(
+                historical_orchestration_role_evidence_bundle
+            )
         )
     if status == "no_evidence":
         required_actions.insert(0, "Answer with `not_found_in_searched_scope`, not global absence.")
@@ -7948,6 +8226,7 @@ def build_final_answer_source_use_contract(
             ],
             "source_hierarchy": {
                 "final_support": "pre_existing_raw_jsonl_source_refs",
+                "answer_ready_role_bundle": "semantic_debug.historical_orchestration_role_evidence_bundle",
                 "diagnostic_only": "current_run_current_task_same_loop_echoes",
                 "missing_role_recovery_refs": "exact_role_targeted_recovery_refs_or_commands",
                 "non_final_required_reads": "bounded_non_echo_reads_for_gap_checking_only",
