@@ -1993,6 +1993,9 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "answer_ready_handoff": packet["answer_ready_handoff"],
             "agent_instruction": packet["agent_instruction"],
             "final_answer_source_use_contract": packet["final_answer_source_use_contract"],
+            "historical_orchestration_provenance_final_support_plan": (
+                packet.get("historical_orchestration_provenance_final_support_plan")
+            ),
             "answer_source_discipline_summary": (
                 packet["final_answer_source_use_contract"].get("answer_source_discipline")
             ),
@@ -2033,6 +2036,12 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
 def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
     if output_key == "semantic_debug":
         handoff = compact.get("answer_ready_handoff") or {}
+        orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
+        orchestration_reads = (
+            orchestration_plan.get("primary_historical_final_support_reads")
+            if orchestration_plan.get("status") == "answer_ready"
+            else orchestration_plan.get("bounded_non_final_required_reads")
+        )
         scoped_no_evidence = compact.get("answer_ready_decision") == "scoped_no_evidence"
         return {
             "answer_status": "answer-scoped-no-evidence-now"
@@ -2040,7 +2049,8 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             else handoff.get("answer_readiness_status")
             or compact.get("answer_readiness_summary", {}).get("status")
             or compact.get("status"),
-            "read": handoff.get("primary_source_followthrough")
+            "read": orchestration_reads
+            or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
             or compact.get("next_reads")
             or [],
@@ -2074,6 +2084,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "answer_ready_decision": compact.get("answer_ready_decision")
             or (compact.get("answer_ready_handoff") or {}).get("decision"),
             "answer_readiness_summary": compact.get("answer_readiness_summary"),
+            "historical_orchestration_provenance_final_support_plan": compact.get(
+                "historical_orchestration_provenance_final_support_plan"
+            ),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],

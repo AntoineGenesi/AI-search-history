@@ -354,6 +354,16 @@ def build_semantic_debug_payload(
             audit_plan.get("checkpoint_plan", []),
             source_handle_routing,
         )
+    historical_orchestration_plan = build_historical_orchestration_provenance_final_support_plan(
+        list(source_locator_handoff.get("next_reads") or next_reads),
+        candidates=source_selection_candidates,
+        query=agent_find["query"]["original"],
+        family=family,
+    )
+    if historical_orchestration_plan:
+        source_locator_handoff["historical_orchestration_provenance_final_support_plan"] = (
+            historical_orchestration_plan
+        )
     process_actual_use_read_plan = (
         build_process_actual_use_final_support_read_plan(
             list(source_locator_handoff.get("next_reads") or next_reads),
@@ -574,6 +584,27 @@ def build_semantic_debug_payload(
                 ),
                 "read_more_reduction_proven": False,
             }
+    if historical_orchestration_plan:
+        orchestration_summary = historical_orchestration_plan_summary(historical_orchestration_plan)
+        answer_ready_handoff["historical_orchestration_provenance_final_support_plan"] = (
+            orchestration_summary
+        )
+        answer_ready_handoff["source_use_summary"][
+            "historical_orchestration_provenance_final_support_plan"
+        ] = {
+            "link": "semantic_debug.historical_orchestration_provenance_final_support_plan",
+            "status": orchestration_summary.get("status"),
+            "required_roles": orchestration_summary.get("required_roles"),
+            "covered_roles": orchestration_summary.get("covered_roles"),
+            "missing_roles": orchestration_summary.get("missing_roles"),
+            "primary_historical_final_support_read_count": orchestration_summary.get(
+                "primary_historical_final_support_read_count", 0
+            ),
+            "current_run_self_echo_candidate_count": orchestration_summary.get(
+                "current_run_self_echo_candidate_count", 0
+            ),
+            "current_run_current_task_same_loop_refs_count_as_final_support": False,
+        }
     followthrough = answer_ready_handoff.get("primary_source_followthrough") or {}
     if followthrough.get("applies"):
         final_answer_contract["required_actions"] = [
@@ -640,6 +671,7 @@ def build_semantic_debug_payload(
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
+        "historical_orchestration_provenance_final_support_plan": historical_orchestration_plan,
         "final_answer_source_use_contract": final_answer_contract,
         "token_byte_tradeoffs": tradeoffs,
         "sanitized_manifest_gate_evidence": benchmark_gate,
@@ -1336,6 +1368,301 @@ def apply_historical_provenance_self_echo_policy(
     return result, summary
 
 
+HISTORICAL_ORCHESTRATION_FINAL_SUPPORT_CAP = 6
+HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP = 4
+
+
+def build_historical_orchestration_provenance_final_support_plan(
+    next_reads: list[dict[str, Any]],
+    *,
+    candidates: list[dict[str, Any]],
+    query: str,
+    family: dict[str, Any],
+) -> dict[str, Any]:
+    if not historical_orchestration_provenance_plan_wanted(query, family=family):
+        return {}
+    required_roles = historical_orchestration_requested_roles(query)
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id") is not None
+    }
+    target_to_candidate = {
+        source_ref_target(candidate.get("source_ref") or {}): candidate
+        for candidate in candidates
+        if source_ref_target(candidate.get("source_ref") or {})
+    }
+    final_support: list[dict[str, Any]] = []
+    current_run_echoes: list[dict[str, Any]] = []
+    non_final: list[dict[str, Any]] = []
+    for read in next_reads:
+        candidate = (
+            candidate_by_id.get(str(read.get("candidate_id") or ""))
+            or target_to_candidate.get(str(read.get("target") or ""))
+            or {}
+        )
+        row = historical_orchestration_read_plan_row(read, candidate=candidate, query=query)
+        if row["final_support_allowed"]:
+            final_support.append(row)
+        elif row["source_chronology_role"] in {
+            "current_run_self_echo_diagnostic",
+            "current_task_same_loop_diagnostic",
+        }:
+            current_run_echoes.append(row)
+            non_final.append({**row, "required_non_final_read": True})
+        else:
+            non_final.append({**row, "required_non_final_read": True})
+
+    covered_roles = sorted(
+        {
+            role
+            for row in final_support
+            for role in row.get("orchestration_roles") or []
+            if role in required_roles
+        }
+    )
+    missing_roles = [role for role in required_roles if role not in covered_roles]
+    sufficient = bool(final_support) and not missing_roles
+    status = "answer_ready" if sufficient else "incomplete_primary_coverage"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "applies_to_question_family": family.get("primary"),
+        "required_roles": required_roles,
+        "covered_roles": covered_roles,
+        "missing_roles": missing_roles,
+        "primary_historical_final_support_reads": final_support[:HISTORICAL_ORCHESTRATION_FINAL_SUPPORT_CAP],
+        "primary_historical_final_support_read_count": len(final_support),
+        "bounded_non_final_required_reads": non_final[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
+        "bounded_non_final_required_read_count": min(
+            len(non_final),
+            HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP,
+        ),
+        "current_run_self_echo_candidates": current_run_echoes[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
+        "current_run_self_echo_candidate_count": len(current_run_echoes),
+        "guidance": {
+            "do_first": (
+                "answer_from_primary_historical_final_support_reads"
+                if sufficient
+                else "open_bounded_non_final_required_reads_then_state_missing_roles"
+            ),
+            "primary_historical_policy": (
+                "Pre-existing raw JSONL refs may support orchestration/provenance claims after inspection "
+                "when they cover the requested parent/coordinator, worker, and reviewer roles."
+            ),
+            "current_run_self_echo_policy": (
+                "Current-run command output, same-loop task/status text, and prompt echoes are chronology "
+                "diagnostics only; they do not count as final historical orchestration support."
+            ),
+            "incomplete_coverage_policy": (
+                "If requested roles are missing from primary historical refs, fail closed: inspect only the "
+                "bounded non-final reads and state the missing roles instead of answering from current-run echoes."
+            ),
+            "raw_text_included": False,
+        },
+        "claim_boundaries": {
+            "current_run_current_task_same_loop_refs_count_as_final_support": False,
+            "secondary_or_non_final_reads_count_as_final_support": False,
+            "answer_ready_requires_all_requested_roles": True,
+            "release_or_token_savings_claim_supported": False,
+        },
+    }
+
+
+def historical_orchestration_provenance_plan_wanted(query: str, *, family: dict[str, Any]) -> bool:
+    if historical_provenance_current_scope_requested(query):
+        return False
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    primary = str((family or {}).get("primary") or "")
+    detected = set((family or {}).get("detected_supported") or [])
+    if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"} and "provenance" not in detected:
+        return False
+    return any(
+        term in lowered
+        for term in (
+            "coordinator",
+            "worker",
+            "reviewer",
+            "rereviewer",
+            "subagent",
+            "spawned",
+            "launched",
+            "orchestration",
+            "provenance",
+        )
+    )
+
+
+def historical_orchestration_requested_roles(query: str) -> list[str]:
+    roles = historical_orchestration_roles_from_text(query)
+    if not roles:
+        roles = ["parent_or_coordinator", "worker", "reviewer"]
+    if "worker" in roles and "parent_or_coordinator" not in roles:
+        roles.insert(0, "parent_or_coordinator")
+    return roles
+
+
+def historical_orchestration_roles_from_text(text: str) -> list[str]:
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    roles: list[str] = []
+    if any(term in lowered for term in ("parent", "coordinator", "orchestrator", "launched", "spawned")):
+        roles.append("parent_or_coordinator")
+    if any(term in lowered for term in ("worker", "implementer", "implementation", "subagent", "worktree")):
+        roles.append("worker")
+    if any(term in lowered for term in ("reviewer", "rereviewer", "review ", "reviewed", "verified", "verification")):
+        roles.append("reviewer")
+    return dedupe(roles)
+
+
+def historical_orchestration_read_plan_row(
+    read: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    query: str,
+) -> dict[str, Any]:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    text = historical_provenance_read_text(read, candidate)
+    roles = historical_orchestration_roles_from_text(text)
+    if not roles:
+        roles = list(read.get("orchestration_role_hints") or [])
+    if not roles and read.get("embedded_source_ref_unwrapped"):
+        roles = historical_orchestration_roles_from_text(str(read.get("reason") or ""))
+    role = str(selection.get("source_chronology_role") or "candidate_or_original_source_ref")
+    current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(
+        text,
+        query=query,
+    )
+    current_task_same_loop = historical_orchestration_current_task_same_loop_candidate(
+        read,
+        candidate=candidate,
+        text=text,
+    )
+    raw_jsonl = is_jsonl_read_target(target) or str(source_ref.get("path") or "").endswith(".jsonl")
+    actionable = read_is_required_surface_actionable(read)
+    final_support_allowed = bool(raw_jsonl and actionable and not current_run_echo and not current_task_same_loop)
+    if current_task_same_loop and role == "candidate_or_original_source_ref":
+        role = "current_task_same_loop_diagnostic"
+    if role == "candidate_or_original_source_ref" and final_support_allowed:
+        role = "pre_existing_raw_jsonl_source_ref"
+    return {
+        "kind": read.get("kind"),
+        "target": target,
+        "reason": read.get("reason"),
+        "source_ref": guided_source_ref(source_ref) if source_ref else None,
+        "source_chronology_role": role,
+        "orchestration_roles": roles,
+        "final_support_allowed": final_support_allowed,
+        "required_final_support_read": final_support_allowed,
+        "read_more_actionable": bool(read.get("read_more_actionable", True))
+        and not current_run_echo
+        and not current_task_same_loop,
+        "followthrough_actionable": bool(read.get("followthrough_actionable", True))
+        and not current_run_echo
+        and not current_task_same_loop,
+        "diagnostic_only": bool(read.get("diagnostic_only")) or current_run_echo or current_task_same_loop,
+        "final_support_rule": (
+            "may_support_historical_orchestration_claims_after_inspection"
+            if final_support_allowed
+            else "current_run_or_non_final_lead_do_not_count_as_historical_orchestration_support"
+        ),
+        "raw_text_included": False,
+    }
+
+
+def historical_orchestration_current_task_same_loop_candidate(
+    read: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    text: str,
+) -> bool:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    normalized_path = path.lower().replace("\\", "/").replace("-", "_")
+    path_parts = [part for part in normalized_path.split("/") if part]
+    current_task_path_parts = {
+        "current_task",
+        "currenttask",
+        "same_loop",
+        "sameloop",
+        "same_run",
+        "samerun",
+        "current_run",
+        "currentrun",
+        "live_task",
+        "livetask",
+        "this_task",
+        "thistask",
+    }
+    if any(part in current_task_path_parts for part in path_parts):
+        return True
+    basename = path_parts[-1] if path_parts else ""
+    if basename in {"status.jsonl", "task_status.jsonl", "state.jsonl"} and any(
+        part in {"current", "active", "live", "task_state", "task_status"} for part in path_parts
+    ):
+        return True
+
+    lowered = re.sub(
+        r"\s+",
+        " ",
+        " ".join(
+            str(part or "")
+            for part in (
+                text,
+                read.get("reason"),
+                candidate.get("snippet"),
+                target,
+            )
+        )
+        .lower()
+        .replace("_", " "),
+    ).strip()
+    return any(
+        marker in lowered
+        for marker in (
+            "current task",
+            "current-task",
+            "same loop",
+            "same-loop",
+            "same run",
+            "same-run",
+            "live task",
+            "this task",
+            "active task status",
+            "current status row",
+            "task status row",
+        )
+    )
+
+
+def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    if not plan:
+        return {}
+    return {
+        "schema_version": plan.get("schema_version", 1),
+        "status": plan.get("status"),
+        "required_roles": list(plan.get("required_roles") or []),
+        "covered_roles": list(plan.get("covered_roles") or []),
+        "missing_roles": list(plan.get("missing_roles") or []),
+        "primary_historical_final_support_read_count": plan.get(
+            "primary_historical_final_support_read_count", 0
+        ),
+        "bounded_non_final_required_read_count": plan.get("bounded_non_final_required_read_count", 0),
+        "current_run_self_echo_candidate_count": plan.get("current_run_self_echo_candidate_count", 0),
+        "primary_historical_final_support_reads": list(
+            plan.get("primary_historical_final_support_reads") or []
+        )[:3],
+        "bounded_non_final_required_reads": list(plan.get("bounded_non_final_required_reads") or [])[:3],
+        "claim_boundaries": plan.get("claim_boundaries"),
+    }
+
+
 def historical_provenance_handles(query: str) -> list[str]:
     handles: list[str] = []
     for pattern in (LABELED_HANDLE_RE, BACKTICK_HANDLE_RE, HANDLE_TOKEN_RE, TASKISH_HANDLE_RE):
@@ -1496,6 +1823,7 @@ def embedded_source_ref_next_reads(
                 "candidate_id": candidate_id,
                 "source_ref": embedded_ref,
                 "reason": "inspect original JSONL source ref quoted by diagnostic current-run/tool output",
+                "orchestration_role_hints": historical_orchestration_roles_from_text(text),
                 "embedded_source_ref_unwrapped": {
                     "schema_version": 1,
                     "from_candidate_id": candidate.get("candidate_id"),
@@ -7145,6 +7473,13 @@ def build_final_answer_source_use_contract(
         "uncertainty_labels": [item.get("label") for item in uncertainty],
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
     }
+    historical_orchestration_plan = source_locator_handoff.get(
+        "historical_orchestration_provenance_final_support_plan"
+    ) or {}
+    if historical_orchestration_plan:
+        evidence_inputs["historical_orchestration_provenance_final_support_plan"] = (
+            historical_orchestration_plan_summary(historical_orchestration_plan)
+        )
     if status == "no_evidence":
         required_actions.insert(0, "Answer with `not_found_in_searched_scope`, not global absence.")
         required_actions.append("Name not-searched, missing, or cap-limited scope before concluding no evidence.")
@@ -7152,6 +7487,14 @@ def build_final_answer_source_use_contract(
         source_use_required = False
     else:
         required_actions.insert(0, "Use or cite at least one source ref before making a factual or provenance claim.")
+        if historical_orchestration_plan:
+            required_actions.insert(
+                1,
+                (
+                    "For historical orchestration/provenance, use only promoted pre-existing raw JSONL refs "
+                    "as final support; treat current-run/current-task/same-loop echoes as diagnostics."
+                ),
+            )
         if tool_proof.get("events"):
             required_actions.append("Use structured tool/action proof for claims about what an agent actually ran, edited, tested, or reviewed.")
         if joins.get("status") == "joined":
@@ -7195,6 +7538,32 @@ def build_final_answer_source_use_contract(
         }
         contract["claim_boundaries"]["process_actual_use_behavior_claim"] = (
             "requires primary raw timing or reviewer enforcement evidence"
+        )
+    if historical_orchestration_plan:
+        contract["historical_orchestration_provenance_contract"] = {
+            "status": historical_orchestration_plan.get("status"),
+            "required_roles": list(historical_orchestration_plan.get("required_roles") or []),
+            "covered_roles": list(historical_orchestration_plan.get("covered_roles") or []),
+            "missing_roles": list(historical_orchestration_plan.get("missing_roles") or []),
+            "primary_historical_final_support_read_count": historical_orchestration_plan.get(
+                "primary_historical_final_support_read_count", 0
+            ),
+            "bounded_non_final_required_read_count": historical_orchestration_plan.get(
+                "bounded_non_final_required_read_count", 0
+            ),
+            "answer_shape": [
+                "separate parent/coordinator, worker, and reviewer/rereviewer evidence when requested",
+                "cite pre-existing raw JSONL refs as final support only after inspection",
+                "state missing requested roles instead of relying on current-run echoes",
+            ],
+            "source_hierarchy": {
+                "final_support": "pre_existing_raw_jsonl_source_refs",
+                "diagnostic_only": "current_run_current_task_same_loop_echoes",
+                "non_final_required_reads": "bounded_reads_for_gap_checking_only",
+            },
+        }
+        contract["claim_boundaries"]["historical_orchestration_current_run_support"] = (
+            "current-run/current-task/same-loop refs do not count as final historical orchestration support"
         )
     return contract
 
@@ -7243,6 +7612,21 @@ def build_answer_readiness(
     recovery_available = omitted_window_recovery.get("status") == "available"
     explicit_correction_window_ready = bool(complete_explicit_correction_window_reads(next_reads))
     audit_route_required = any(route_state["required"] for route_state in route_states if route_state["route"] in AUDIT_ROUTE_NAMES)
+    historical_orchestration_contract = final_answer_contract.get(
+        "historical_orchestration_provenance_contract"
+    ) or {}
+    historical_orchestration_plan = source_locator_handoff.get(
+        "historical_orchestration_provenance_final_support_plan"
+    ) or {}
+    historical_orchestration_answer_ready = (
+        historical_orchestration_plan.get("status") == "answer_ready"
+        and bool(historical_orchestration_plan.get("primary_historical_final_support_reads"))
+    )
+    historical_orchestration_fail_closed = (
+        bool(historical_orchestration_plan)
+        and not historical_orchestration_answer_ready
+        and bool(historical_orchestration_plan.get("bounded_non_final_required_reads"))
+    )
     if no_evidence.get("needed"):
         readiness_status = "scoped_no_evidence_ready"
         decision = "state_scoped_no_evidence"
@@ -7267,6 +7651,32 @@ def build_answer_readiness(
         ]
         if omitted_window_recovery.get("promoted_next_read_count", 0):
             required_before_answer.append("Review the promoted next_reads tied to omitted-window recovery before answering.")
+    elif historical_orchestration_answer_ready and final_answer_contract.get("source_use_required"):
+        readiness_status = "answer_ready"
+        decision = "answer_now"
+        allowed_answer_scope = "historical_orchestration_provenance_source_backed"
+        required_before_answer = [
+            (
+                "Answer from promoted pre-existing raw JSONL orchestration refs; do not count "
+                "current-run/current-task/same-loop echoes as final support."
+            ),
+        ]
+        covered = ", ".join(historical_orchestration_contract.get("covered_roles") or [])
+        if covered:
+            required_before_answer.append(f"Keep covered orchestration roles explicit: {covered}.")
+    elif historical_orchestration_fail_closed:
+        readiness_status = "inspect_recovery_first"
+        decision = "inspect_recovery_reads"
+        allowed_answer_scope = "historical_orchestration_provenance_incomplete_non_final_reads"
+        missing = ", ".join(historical_orchestration_contract.get("missing_roles") or [])
+        required_before_answer = [
+            (
+                "Open the bounded non-final orchestration reads before answering; they are gap checks, "
+                "not final support."
+            ),
+        ]
+        if missing:
+            required_before_answer.append(f"State missing requested orchestration roles before any answer: {missing}.")
     elif audit_route_required:
         readiness_status = "audit_route_required"
         decision = "run_audit_route"
@@ -7356,6 +7766,12 @@ def build_answer_readiness(
             "source_handle_count": len((source_handle_routing or {}).get("detected_handles") or []),
             "source_handle_matching_next_read_count": len((source_handle_routing or {}).get("matched_next_reads") or []),
             "process_actual_use_bucket_count": len(process_actual_use_contract.get("bucket_requirements") or []),
+            "historical_orchestration_required_role_count": len(
+                historical_orchestration_contract.get("required_roles") or []
+            ),
+            "historical_orchestration_missing_role_count": len(
+                historical_orchestration_contract.get("missing_roles") or []
+            ),
         },
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "ledger_summary": {
@@ -7406,6 +7822,7 @@ def build_answer_readiness(
             "required_actions": list(final_answer_contract.get("required_actions") or [])[:8],
             "no_evidence_scope": final_answer_contract.get("no_evidence_scope"),
             "process_actual_use_contract": process_actual_use_contract,
+            "historical_orchestration_provenance_contract": historical_orchestration_contract,
         },
         "answer_gate_link": "semantic_debug.guided_audit_flow.answer_gate",
         "answer_readiness_link": "semantic_debug.answer_readiness",
@@ -7506,6 +7923,12 @@ def summarize_answer_readiness(answer_readiness: dict[str, Any]) -> dict[str, An
             "next_read_count": basis.get("next_read_count", 0),
             "omitted_window_recovery_count": basis.get("omitted_window_recovery_count", 0),
             "process_actual_use_bucket_count": basis.get("process_actual_use_bucket_count", 0),
+            "historical_orchestration_required_role_count": basis.get(
+                "historical_orchestration_required_role_count", 0
+            ),
+            "historical_orchestration_missing_role_count": basis.get(
+                "historical_orchestration_missing_role_count", 0
+            ),
         },
         "required_before_answer": list(answer_readiness.get("required_before_answer") or [])[:4],
         "ledger_summary": {
