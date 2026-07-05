@@ -413,6 +413,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_task_window_status_handoff_query(normalized):
         return ROUTES[5]
 
+    if _looks_like_parent_main_status_anchor_failure_query(normalized):
+        return ROUTES[5]
+
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
 
@@ -690,6 +693,55 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
         "catch me up",
     )
     return _has_any(normalized, anchor_terms) and _has_any(normalized, status_verbs)
+
+
+def _looks_like_parent_main_status_anchor_failure_query(normalized: str) -> bool:
+    anchor_failure_terms = (
+        "wrong anchor",
+        "wrong status anchor",
+        "wrong selected anchor",
+        "bad anchor",
+        "selected the wrong",
+        "used the wrong",
+        "ignored the anchor",
+        "made no sense",
+    )
+    status_terms = (
+        "status",
+        "what happened since",
+        "what has happened since",
+        "while i was away",
+        "answer",
+        "side-thread answer",
+        "side thread answer",
+    )
+    parent_or_boundary_terms = (
+        "parent/main",
+        "parent thread",
+        "main thread",
+        "side-thread",
+        "side thread",
+        "last actual message",
+        "previous relevant time window",
+        "before the last answer",
+    )
+    complaint_terms = (
+        "complaint",
+        "complaining",
+        "correction",
+        "correcting",
+        "failed",
+        "failure",
+        "wrong",
+        "nonsense",
+        "made no sense",
+    )
+    return (
+        _has_any(normalized, anchor_failure_terms)
+        and _has_any(normalized, status_terms)
+        and _has_any(normalized, parent_or_boundary_terms)
+        and _has_any(normalized, complaint_terms)
+    )
 
 
 def _looks_like_repeated_complaint_or_failure_query(normalized: str) -> bool:

@@ -267,6 +267,10 @@ def status_anchor_report(
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
         selected_anchor.update(_anchor_decision_fields(anchor_decision, selected_anchor))
+    selected_anchor, anchor_decision = _demote_unproven_parent_main_selected_anchor(
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+    )
     anchor_decision = {
         **anchor_decision,
         "selected_anchor": None,
@@ -293,13 +297,6 @@ def status_anchor_report(
     non_deltas = [item for item in current_value_items if item["value_kind"] == "non_delta"]
     diagnostic_value_items = [item for item in artifacts["value_items"] if not item.get("current_window_evidence")]
     unresolved_blockers = _unresolved_blockers(artifacts, current_window_only=True)
-    answer_brief = _answer_brief(
-        selected_anchor=selected_anchor,
-        session_activity=session_activity,
-        behavior_deltas=behavior_deltas,
-        non_deltas=non_deltas,
-        blockers=unresolved_blockers,
-    )
     next_reads = _next_reads(
         selected_anchor,
         anchor_decision,
@@ -316,6 +313,22 @@ def status_anchor_report(
         source_tiers=source_tiers,
         target_window=target_window,
         session_activity=session_activity,
+    )
+    answer_readiness = _answer_readiness_contract(
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+        session_activity=session_activity,
+        source_tiers=source_tiers,
+        follow_through_plan=follow_through_plan,
+        target_window=target_window,
+    )
+    answer_brief = _answer_brief(
+        selected_anchor=selected_anchor,
+        session_activity=session_activity,
+        behavior_deltas=behavior_deltas,
+        non_deltas=non_deltas,
+        blockers=unresolved_blockers,
+        answer_allowed=answer_readiness["answer_allowed"],
     )
     suppressed_support = _suppressed_answer_facing_support(
         cwd,
@@ -380,6 +393,9 @@ def status_anchor_report(
                 if item.get("target_window_evidence")
             ),
             "suppressed_answer_facing_artifact_count": suppressed_support.get("count", 0),
+            "answer_allowed": answer_readiness["answer_allowed"],
+            "answer_readiness_status": answer_readiness["status"],
+            "missing_required_answer_facet_count": len(answer_readiness["missing_required_answer_facets"]),
             "unresolved_blocker_count": len(unresolved_blockers),
             "raw_session_file_count": session_activity["summary"]["session_file_count"],
             "raw_session_record_count": session_activity["summary"]["records_after_anchor"],
@@ -398,6 +414,8 @@ def status_anchor_report(
         "next_reads": next_reads,
         "source_tiers": source_tiers,
         "follow_through_plan": follow_through_plan,
+        "answer_readiness": answer_readiness,
+        "required_answer_facets": answer_readiness["required_answer_facets"],
         "target_window": target_window,
         "status_as_of_boundary": status_as_of_boundary,
         "suppressed_support": suppressed_support,
@@ -405,6 +423,7 @@ def status_anchor_report(
             selected_anchor=selected_anchor,
             anchor_decision=anchor_decision,
             session_activity=session_activity,
+            answer_readiness=answer_readiness,
         ),
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
@@ -1315,6 +1334,84 @@ def _anchor_decision_fields(anchor_decision: dict, selected_anchor: dict) -> dic
     }
 
 
+def _demote_unproven_parent_main_selected_anchor(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+) -> tuple[dict | None, dict]:
+    if not selected_anchor or not _is_parent_main_status_decision(anchor_decision):
+        return selected_anchor, anchor_decision
+    if _is_proven_parent_main_history_anchor(selected_anchor):
+        return selected_anchor, anchor_decision
+    rejected = _rejected_unproven_parent_main_selected_anchor(selected_anchor)
+    alternatives = [rejected]
+    for item in anchor_decision.get("rejected_anchor_alternatives") or []:
+        if item.get("source_ref") == rejected.get("source_ref"):
+            continue
+        alternatives.append(item)
+    return None, {
+        **anchor_decision,
+        "context_boundary": "parent_main_selected_anchor_unproven",
+        "anchor_scope": "parent_thread",
+        "anchor_reason": "no_proven_parent_main_history_anchor_found",
+        "anchor_ref": None,
+        "selected_anchor": None,
+        "rejected_anchor_alternatives": alternatives[:8],
+        "answer_readiness_demoted_selected_anchor": rejected.get("source_ref"),
+    }
+
+
+def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
+    context_boundary = str(anchor_decision.get("context_boundary") or "")
+    anchor_reason = str(anchor_decision.get("anchor_reason") or "")
+    return (
+        context_boundary.startswith("explicit_parent_main")
+        or context_boundary == "parent_main_selected_anchor_unproven"
+        or anchor_reason in {
+            "first_side_thread_user_message_after_boundary",
+            "parent_main_last_actual_work_handoff",
+            "no_proven_parent_main_history_anchor_found",
+            "no_status_question_boundary_for_parent_main_anchor",
+        }
+    )
+
+
+def _is_proven_parent_main_history_anchor(anchor: dict) -> bool:
+    source_ref = str(anchor.get("source_ref") or "")
+    source_kind = anchor.get("source_kind")
+    if source_kind == "codex_history" and source_ref.startswith("codex_history:history.jsonl:"):
+        return True
+    for mirror in anchor.get("mirror_sources") or []:
+        if not isinstance(mirror, Mapping):
+            continue
+        mirror_ref = str(mirror.get("source_ref") or "")
+        if mirror.get("source_kind") == "codex_history" and mirror_ref.startswith("codex_history:history.jsonl:"):
+            return True
+    return False
+
+
+def _rejected_unproven_parent_main_selected_anchor(anchor: dict) -> dict:
+    rationale = str(anchor.get("rationale") or "").rstrip()
+    suffix = (
+        "rejected for parent/main status answer readiness because this row is not a canonical "
+        "history.jsonl parent/main human anchor or proven history mirror; use only as recovery material"
+    )
+    return {
+        "source_ref": anchor.get("source_ref"),
+        "timestamp_utc": anchor.get("timestamp_utc"),
+        "classification": anchor.get("classification"),
+        "decision": "rejected",
+        "rationale": f"{rationale}; {suffix}" if rationale else suffix,
+        "snippet": anchor.get("snippet"),
+        "source_kind": anchor.get("source_kind"),
+        "openable_source_ref": anchor.get("openable_source_ref"),
+        "openable_target": anchor.get("openable_target"),
+        "read_more_command": anchor.get("read_more_command"),
+        "target_window_hits": anchor.get("target_window_hits") or [],
+        "outside_target_task_ids": anchor.get("outside_target_task_ids") or [],
+    }
+
+
 def _session_activity_trace(
     selected_anchor: dict | None,
     anchor_decision: dict,
@@ -2034,7 +2131,10 @@ def _answer_brief(
     behavior_deltas: list[dict],
     non_deltas: list[dict],
     blockers: list[dict],
+    answer_allowed: bool = True,
 ) -> list[str]:
+    if not answer_allowed:
+        return []
     lines = []
     activity = session_activity.get("activity_after_anchor") or {}
     if selected_anchor:
@@ -2206,9 +2306,15 @@ def _parent_main_recovery_reads(
             "source_tier": "required_primary",
             "answer_use_required": False,
             "read_more_actionable": True,
+            "verification_or_rerun_only": True,
+            "diagnostic_open_policy": (
+                "parent/main recovery candidate; open only to prove the canonical history.jsonl anchor, "
+                "then rerun with that timestamp or quoted message before a factual answer"
+            ),
             "parent_main_anchor_recovery_candidate": True,
             "canonical_history_candidate": source_kind == "codex_history",
             "fail_closed_before_answer": True,
+            "answer_support_role": "verification_rerun_material_only",
         }
         _copy_openable_fields(read, candidate)
         if read.get("openable_target") and not read.get("read_more_command"):
@@ -2357,6 +2463,12 @@ def _follow_through_plan(
             target_window=target_window,
             session_activity=session_activity,
         ),
+        "required_answer_facets": _required_answer_facets(target_window=target_window),
+        "required_facets_stop_condition": (
+            "Do not synthesize a factual status answer until every required_answer_facet is covered "
+            "by inspected required primary raw refs and required secondary refs, or explicitly reported "
+            "as unknown with a next action."
+        ),
         "rerun_policy": (
             "Use this plan before rerunning what-happened-since as JSON/JQ. Rerun only if the plan is missing, "
             "internally contradictory, or a named expected facet remains unresolved after the listed reads."
@@ -2419,6 +2531,8 @@ def _plan_read(read: dict) -> dict:
         "parent_main_anchor_recovery_candidate",
         "canonical_history_candidate",
         "fail_closed_before_answer",
+        "answer_support_role",
+        "verification_or_rerun_only",
     ):
         if key in read:
             planned[key] = read.get(key)
@@ -2457,6 +2571,96 @@ def _expected_status_answer_facets(
         facets.append("worker_reviewer_or_spawned_session_activity")
     facets.extend(["commits_or_validations", "caveats_non_claims", "unresolved_blockers_or_next_action"])
     return facets
+
+
+def _required_answer_facets(*, target_window: dict | None) -> list[str]:
+    task_facet = "target_window_task_outcome_value_deltas" if target_window else "task_outcome_value_deltas"
+    return [
+        "selected_anchor_and_boundary",
+        "raw_post_anchor_activity",
+        task_facet,
+        "unresolved_blockers_or_next_action",
+        "caveats_non_claims",
+    ]
+
+
+def _answer_readiness_contract(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    session_activity: dict,
+    source_tiers: dict,
+    follow_through_plan: dict,
+    target_window: dict | None,
+) -> dict:
+    required_facets = _required_answer_facets(target_window=target_window)
+    missing = []
+    parent_main_status = _is_parent_main_status_decision(anchor_decision)
+    selected_anchor_ready = bool(selected_anchor)
+    if not selected_anchor:
+        missing.append("selected_anchor_and_boundary")
+    elif parent_main_status and not _is_proven_parent_main_history_anchor(selected_anchor):
+        selected_anchor_ready = False
+        missing.append("selected_anchor_and_boundary")
+    raw_status = session_activity.get("status")
+    raw_activity_ready = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
+    if not raw_activity_ready:
+        missing.append("raw_post_anchor_activity")
+    task_facet = "target_window_task_outcome_value_deltas" if target_window else "task_outcome_value_deltas"
+    target_or_task_ready = True
+    recovery_material = any(
+        read.get("parent_main_anchor_recovery_candidate")
+        for read in (source_tiers.get("required_primary") or [])
+    )
+    if recovery_material and "selected_anchor_and_boundary" not in missing:
+        missing.append("selected_anchor_and_boundary")
+    answer_allowed = not missing
+    if parent_main_status:
+        answer_allowed = answer_allowed and bool(selected_anchor and _is_proven_parent_main_history_anchor(selected_anchor))
+    status = "answer_ready" if answer_allowed else "fail_closed_missing_required_facets"
+    stop_condition = (
+        "Answer allowed only after selected_anchor_and_boundary and raw_post_anchor_activity are proven, "
+        "then every required_answer_facet is covered or explicitly caveated. Missing facets are a stop "
+        "condition, not optional guidance."
+    )
+    if recovery_material or not selected_anchor:
+        stop_condition = (
+            "Fail closed before answer: recovery candidates are verification/rerun material only. "
+            "Rerun with a proven timestamp or quoted-message anchor before synthesizing a factual status answer."
+        )
+    return {
+        "status": status,
+        "answer_allowed": answer_allowed,
+        "selected_anchor_answer_ready": bool(
+            selected_anchor
+            and (
+                not parent_main_status
+                or _is_proven_parent_main_history_anchor(selected_anchor)
+            )
+        ),
+        "parent_main_status_answer": parent_main_status,
+        "proven_parent_main_history_anchor": bool(
+            selected_anchor and _is_proven_parent_main_history_anchor(selected_anchor)
+        ),
+        "raw_session_trace_status": raw_status,
+        "required_answer_facets": required_facets,
+        "facet_status": {
+            "selected_anchor_and_boundary": selected_anchor_ready,
+            "raw_post_anchor_activity": raw_activity_ready,
+            task_facet: target_or_task_ready,
+            "unresolved_blockers_or_next_action": True,
+            "caveats_non_claims": True,
+        },
+        "missing_required_answer_facets": missing,
+        "stop_condition": stop_condition,
+        "required_facets_stop_condition": follow_through_plan.get("required_facets_stop_condition"),
+        "non_answer_support_fields": [
+            "anchor_candidates",
+            "anchor_decision.rejected_anchor_alternatives",
+            "source_tiers.required_primary[parent_main_anchor_recovery_candidate]",
+            "source_tiers.diagnostic_optional",
+        ],
+    }
 
 
 def _apply_target_window_primary_dominance(reads: list[dict], *, target_window: dict | None) -> list[dict]:
@@ -2688,11 +2892,12 @@ def _fail_closed_guidance(
     selected_anchor: dict | None,
     anchor_decision: dict,
     session_activity: dict,
+    answer_readiness: dict,
 ) -> dict:
-    if not selected_anchor:
+    if not answer_readiness.get("answer_allowed"):
         parent_main_recovery = anchor_decision.get("anchor_scope") == "parent_thread"
         guidance = (
-            "Fail closed: no human-authored anchor was selected. Do not answer from visible context, "
+            "Fail closed: required answer facets are missing. Do not answer from visible context, "
             "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
             "and rejected alternatives first, then rerun with an explicit timestamp/quoted-message anchor if needed."
         )
@@ -2715,12 +2920,14 @@ def _fail_closed_guidance(
             "guidance": guidance,
             "candidate_fields": candidate_fields,
             "parent_main_recovery_required": parent_main_recovery,
+            "required_answer_facets": answer_readiness.get("required_answer_facets") or [],
+            "missing_required_answer_facets": answer_readiness.get("missing_required_answer_facets") or [],
+            "stop_condition": answer_readiness.get("stop_condition"),
         }
     raw_status = session_activity.get("status")
-    answer_allowed = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
     return {
         "mode": "selected_anchor_requires_primary_read_followthrough",
-        "answer_allowed": answer_allowed,
+        "answer_allowed": True,
         "guidance": (
             "Use the selected human history/session anchor and required primary raw JSONL reads before answering. "
             "Do not answer from inherited context, current-session worker/reviewer prompts, rejected false anchors, "
@@ -2729,6 +2936,8 @@ def _fail_closed_guidance(
         "selected_anchor_ref": selected_anchor.get("source_ref"),
         "anchor_scope": selected_anchor.get("anchor_scope") or anchor_decision.get("anchor_scope"),
         "raw_session_trace_status": raw_status,
+        "required_answer_facets": answer_readiness.get("required_answer_facets") or [],
+        "missing_required_answer_facets": [],
     }
 
 
