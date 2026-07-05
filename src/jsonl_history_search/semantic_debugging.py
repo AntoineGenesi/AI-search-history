@@ -1304,7 +1304,9 @@ def apply_historical_provenance_self_echo_policy(
     include_context_actions: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     handles = historical_provenance_handles(query)
-    if not historical_provenance_self_echo_policy_wanted(query, family=family, handles=handles):
+    policy_wanted = historical_provenance_self_echo_policy_wanted(query, family=family, handles=handles)
+    orchestration_wanted = historical_orchestration_provenance_plan_wanted(query, family=family)
+    if not policy_wanted and not orchestration_wanted:
         if handles and historical_provenance_current_scope_requested(query):
             return ensure_read_more_actionability_defaults(next_reads), {}
         return next_reads, {}
@@ -1319,33 +1321,63 @@ def apply_historical_provenance_self_echo_policy(
         for candidate in candidates
         if source_ref_target(candidate.get("source_ref") or {})
     }
-    unwrapped = embedded_source_ref_next_reads(
-        candidates,
-        query=query,
-        expansion_action_context=expansion_action_context,
-        include_context_actions=include_context_actions,
+    unwrapped = (
+        embedded_source_ref_next_reads(
+            candidates,
+            query=query,
+            expansion_action_context=expansion_action_context,
+            include_context_actions=include_context_actions,
+        )
+        if policy_wanted
+        else []
     )
     annotated: list[dict[str, Any]] = []
     diagnostic_count = 0
+    current_task_same_loop_count = 0
     for index, read in enumerate(next_reads):
         row = dict(read)
         target = str(row.get("target") or "")
         candidate = candidate_by_id.get(str(row.get("candidate_id") or "")) or target_to_candidate.get(target) or {}
         text = historical_provenance_read_text(row, candidate)
-        if historical_provenance_current_run_or_self_echo_candidate(text, query=query):
+        current_run_echo = (
+            (policy_wanted or orchestration_wanted)
+            and historical_provenance_current_run_or_self_echo_candidate(text, query=query)
+        )
+        current_task_same_loop = (
+            orchestration_wanted
+            and historical_orchestration_current_task_same_loop_candidate(
+                row,
+                candidate=candidate,
+                text=text,
+            )
+        )
+        if current_run_echo or current_task_same_loop:
             diagnostic_count += 1
+            if current_task_same_loop:
+                current_task_same_loop_count += 1
+            chronology_role = (
+                "current_task_same_loop_diagnostic"
+                if current_task_same_loop and not current_run_echo
+                else "current_run_self_echo_diagnostic"
+            )
             row["diagnostic_only"] = True
             row["read_more_actionable"] = False
             row["followthrough_actionable"] = False
             row["expansion_actions"] = []
             row["context_actions"] = []
-            row["reason"] = (
-                "current-run/tool-output/self-echo diagnostic; prefer original pre-existing "
-                "source refs for historical provenance unless the prompt asks about the current run/tool/lane"
-            )
+            if current_task_same_loop and not current_run_echo:
+                row["reason"] = (
+                    "current-task/same-loop orchestration status diagnostic; prefer original "
+                    "pre-existing role evidence or exact missing-role recovery refs"
+                )
+            else:
+                row["reason"] = (
+                    "current-run/tool-output/self-echo diagnostic; prefer original pre-existing "
+                    "source refs for historical provenance unless the prompt asks about the current run/tool/lane"
+                )
             row["historical_provenance_selection"] = {
                 "schema_version": 1,
-                "source_chronology_role": "current_run_self_echo_diagnostic",
+                "source_chronology_role": chronology_role,
                 "final_support_allowed": False,
                 "read_more_actionable": False,
                 "followthrough_actionable": False,
@@ -1353,7 +1385,7 @@ def apply_historical_provenance_self_echo_policy(
                 "detected_handles": handles[:8],
                 "raw_text_included": False,
             }
-        else:
+        elif policy_wanted:
             row.setdefault("historical_provenance_selection", {
                 "schema_version": 1,
                 "source_chronology_role": "candidate_or_original_source_ref",
@@ -1378,10 +1410,12 @@ def apply_historical_provenance_self_echo_policy(
         "embedded_source_ref_promoted_count": len(unwrapped),
         "diagnostic_only_next_read_count": sum(1 for item in result if item.get("diagnostic_only")),
         "diagnostic_only_candidate_count": diagnostic_count,
+        "current_task_same_loop_diagnostic_count": current_task_same_loop_count,
         "policy": (
             "For explicit historical provenance handles, current-run command outputs, "
-            "lane prompts, and same-run tool echoes are diagnostics. When they quote "
-            "older JSONL source refs, promote the quoted original refs as actionable reads."
+            "lane prompts, same-run tool echoes, and current-task/same-loop status rows "
+            "are diagnostics. When they quote older JSONL source refs, promote the quoted "
+            "original refs as actionable reads."
         ),
         "current_run_evidence_counts_as_final_support": False,
         "raw_text_included": False,
