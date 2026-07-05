@@ -2140,7 +2140,8 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
         orchestration_reads = (
             orchestration_plan.get("primary_historical_final_support_reads")
             if orchestration_plan.get("status") == "answer_ready"
-            else orchestration_plan.get("bounded_non_final_required_reads")
+            else orchestration_plan.get("missing_role_recovery_refs")
+            or orchestration_plan.get("bounded_non_final_required_reads")
         )
         internal_status = (
             handoff.get("answer_readiness_status")

@@ -1399,6 +1399,24 @@ HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES = [
 HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES = [
     "secondary_task_review_commit_support",
 ]
+HISTORICAL_ORCHESTRATION_ROLE_RECOVERY_TERMS = {
+    "parent_or_coordinator": ["parent", "coordinator", "orchestrator", "launched", "spawned"],
+    "worker": ["worker", "implementer", "implementation", "subagent", "worktree"],
+    "reviewer": ["reviewer", "rereviewer", "reviewed", "verified", "verification"],
+    "secondary_task_review_commit_support": [
+        "task file",
+        "review artifact",
+        "review verdict",
+        "commit",
+        "git show",
+        "codex/state/reviews",
+    ],
+}
+HISTORICAL_ORCHESTRATION_SECONDARY_RECOVERY_SCOPES = [
+    "tasks",
+    "reports",
+    "codex/state/reviews",
+]
 
 
 def build_historical_orchestration_provenance_final_support_plan(
@@ -1442,7 +1460,6 @@ def build_historical_orchestration_provenance_final_support_plan(
             "current_task_same_loop_diagnostic",
         }:
             current_run_echoes.append(row)
-            non_final.append({**row, "required_non_final_read": True})
         else:
             non_final.append({**row, "required_non_final_read": True})
 
@@ -1473,6 +1490,12 @@ def build_historical_orchestration_provenance_final_support_plan(
     missing_secondary_roles = [role for role in required_secondary_roles if role not in covered_secondary_roles]
     sufficient = bool(final_support) and not missing_primary_roles and not missing_secondary_roles
     status = "answer_ready" if sufficient else "incomplete_primary_coverage"
+    missing_role_recovery_refs = historical_orchestration_missing_role_recovery_refs(
+        missing_roles=missing_roles,
+        final_support=final_support,
+        non_final=non_final,
+        query=query,
+    )
     return {
         "schema_version": 1,
         "source_plan_name": "historical_orchestration_role_coverage_source_plan",
@@ -1497,6 +1520,8 @@ def build_historical_orchestration_provenance_final_support_plan(
         "primary_historical_final_support_read_count": len(final_support),
         "secondary_task_review_commit_support_reads": secondary_support[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
         "secondary_task_review_commit_support_read_count": len(secondary_support),
+        "missing_role_recovery_refs": missing_role_recovery_refs,
+        "missing_role_recovery_ref_count": len(missing_role_recovery_refs),
         "bounded_non_final_required_reads": non_final[:HISTORICAL_ORCHESTRATION_NON_FINAL_READ_CAP],
         "bounded_non_final_required_read_count": min(
             len(non_final),
@@ -1523,8 +1548,9 @@ def build_historical_orchestration_provenance_final_support_plan(
                 "diagnostics only; they do not count as final historical orchestration support."
             ),
             "incomplete_coverage_policy": (
-                "If requested roles are missing from primary historical refs, fail closed: inspect only the "
-                "bounded non-final reads and state the missing roles instead of answering from current-run echoes."
+                "If requested roles are missing from primary historical refs, fail closed: use the exact "
+                "missing_role_recovery_refs commands/refs and state the missing roles instead of answering "
+                "from current-run echoes."
             ),
             "raw_text_included": False,
         },
@@ -1536,6 +1562,68 @@ def build_historical_orchestration_provenance_final_support_plan(
             "release_or_token_savings_claim_supported": False,
         },
     }
+
+
+def historical_orchestration_missing_role_recovery_refs(
+    *,
+    missing_roles: list[str],
+    final_support: list[dict[str, Any]],
+    non_final: list[dict[str, Any]],
+    query: str,
+) -> list[dict[str, Any]]:
+    if not missing_roles:
+        return []
+    original_rows = [
+        row
+        for row in final_support + non_final
+        if row.get("target")
+        and row.get("source_chronology_role")
+        not in {"current_run_self_echo_diagnostic", "current_task_same_loop_diagnostic"}
+        and not row.get("diagnostic_only")
+    ]
+    source_paths = dedupe(
+        [
+            str((row.get("source_ref") or {}).get("path") or source_target_path_part(str(row.get("target") or "")))
+            for row in original_rows
+            if (row.get("source_ref") or {}).get("path") or row.get("target")
+        ]
+    )
+    source_targets = [str(row.get("target") or "") for row in original_rows if row.get("target")]
+    handles = historical_provenance_handles(query)
+    rows: list[dict[str, Any]] = []
+    for role in missing_roles:
+        terms = HISTORICAL_ORCHESTRATION_ROLE_RECOVERY_TERMS.get(role, [role])
+        search_terms = dedupe(handles + terms)
+        pattern = "|".join(re.escape(term) for term in search_terms if term)
+        if not pattern:
+            pattern = re.escape(role)
+        scopes = (
+            list(HISTORICAL_ORCHESTRATION_SECONDARY_RECOVERY_SCOPES)
+            if role in HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES
+            else list(source_paths)
+        )
+        if not scopes:
+            scopes = ["."]
+        argv = ["rg", "-n", "--hidden", "-i", "-e", pattern, *scopes]
+        rows.append(
+            {
+                "role": role,
+                "kind": "missing_role_recovery_command",
+                "target": " ".join(scopes[:3]),
+                "source_targets_to_recheck": source_targets[:HISTORICAL_ORCHESTRATION_FINAL_SUPPORT_CAP],
+                "search_terms": search_terms[:12],
+                "argv": argv,
+                "command": shell_command(argv),
+                "recovery_instruction": (
+                    "Run this exact role-targeted recovery command before answering; use only "
+                    "pre-existing raw JSONL refs or legitimate task/review/commit artifacts it finds."
+                ),
+                "current_run_echo_recovery_allowed": False,
+                "final_support_allowed": False,
+                "raw_text_included": False,
+            }
+        )
+    return rows
 
 
 def historical_orchestration_provenance_plan_wanted(query: str, *, family: dict[str, Any]) -> bool:
@@ -1913,6 +2001,7 @@ def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any
         "secondary_task_review_commit_support_read_count": plan.get(
             "secondary_task_review_commit_support_read_count", 0
         ),
+        "missing_role_recovery_ref_count": plan.get("missing_role_recovery_ref_count", 0),
         "bounded_non_final_required_read_count": plan.get("bounded_non_final_required_read_count", 0),
         "current_run_self_echo_candidate_count": plan.get("current_run_self_echo_candidate_count", 0),
         "primary_historical_final_support_reads": list(
@@ -1921,6 +2010,7 @@ def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any
         "secondary_task_review_commit_support_reads": list(
             plan.get("secondary_task_review_commit_support_reads") or []
         )[:3],
+        "missing_role_recovery_refs": list(plan.get("missing_role_recovery_refs") or [])[:3],
         "bounded_non_final_required_reads": list(plan.get("bounded_non_final_required_reads") or [])[:3],
         "claim_boundaries": plan.get("claim_boundaries"),
     }
@@ -7814,6 +7904,9 @@ def build_final_answer_source_use_contract(
             "bounded_non_final_required_read_count": historical_orchestration_plan.get(
                 "bounded_non_final_required_read_count", 0
             ),
+            "missing_role_recovery_ref_count": historical_orchestration_plan.get(
+                "missing_role_recovery_ref_count", 0
+            ),
             "answer_shape": [
                 "separate parent/coordinator, worker, and reviewer/rereviewer evidence when requested",
                 "cite pre-existing raw JSONL refs as final support only after inspection",
@@ -7822,7 +7915,8 @@ def build_final_answer_source_use_contract(
             "source_hierarchy": {
                 "final_support": "pre_existing_raw_jsonl_source_refs",
                 "diagnostic_only": "current_run_current_task_same_loop_echoes",
-                "non_final_required_reads": "bounded_reads_for_gap_checking_only",
+                "missing_role_recovery_refs": "exact_role_targeted_recovery_refs_or_commands",
+                "non_final_required_reads": "bounded_non_echo_reads_for_gap_checking_only",
             },
         }
         contract["claim_boundaries"]["historical_orchestration_current_run_support"] = (
@@ -7933,7 +8027,7 @@ def build_answer_readiness(
         missing = ", ".join(historical_orchestration_contract.get("missing_roles") or [])
         required_before_answer = [
             (
-                "Inspect any bounded non-final orchestration reads before answering; they are gap checks, "
+                "Run the exact missing_role_recovery_refs before answering; they are gap checks, "
                 "not final support, and missing roles remain explicit gaps."
             ),
         ]
