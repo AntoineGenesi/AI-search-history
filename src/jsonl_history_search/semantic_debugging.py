@@ -4031,6 +4031,7 @@ def build_answer_ready_handoff(
         scope_boundary_summary=scope_boundary_summary,
     )
     command_target_privacy = summarize_command_target_privacy(copy_paste_commands)
+    demoted_next_reads = demoted_required_surface_reads(next_reads)
     source_use_summary = {
         "answer_scope": final_answer_contract.get("answer_scope"),
         "source_use_required": final_answer_contract.get("source_use_required"),
@@ -4038,6 +4039,7 @@ def build_answer_ready_handoff(
         "bounded_next_read_count": len(bounded_next_reads),
         "copy_paste_command_count": len(copy_paste_commands),
         "diagnostic_only_excluded_next_read_count": sum(1 for item in next_reads if item.get("diagnostic_only")),
+        "required_surface_demoted_next_read_count": len(demoted_next_reads),
         "blocked_facets": blocked_facets,
         "missing_proof_buckets": list(discipline_summary.get("missing_proof_buckets") or [])[:8],
         "candidate_only_citation_allowed": discipline_summary.get("candidate_only_citation_allowed"),
@@ -4181,6 +4183,14 @@ def read_is_required_surface_actionable(read: dict[str, Any]) -> bool:
         or selection.get("read_more_actionable") is False
         or selection.get("final_support_allowed") is False
     )
+
+
+def demoted_required_surface_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and not read_is_required_surface_actionable(read)
+    ]
 
 
 def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5665,9 +5675,9 @@ def build_source_action_guidance(
         "decision": str(answer_readiness.get("decision") or "gather_more_evidence"),
         "scope_boundary_summary": scope_boundary_summary or {},
         "required_primary_source_actions": bounded_answer_ready_next_reads(next_reads),
-        "optional_diagnostic_reads": [
-            row for row in diagnostic_next_read_summaries(next_reads) if row.get("diagnostic_only")
-        ],
+        "optional_diagnostic_reads": diagnostic_next_read_summaries(
+            demoted_required_surface_reads(next_reads)
+        ),
         "stop_condition": "Stop when inspected source refs support the answer within the searched-scope boundaries.",
         "retrieval_escalation_condition": (
             "Escalate retrieval mode only when package-mode evidence is weak, required facets remain missing, "
@@ -7563,9 +7573,9 @@ def build_investigation_state(
         "link": "semantic_debug.answer_readiness",
     }
     actionable_next_reads = [
-        item for item in next_reads if item.get("followthrough_actionable", True) is not False
+        item for item in next_reads if isinstance(item, dict) and read_is_required_surface_actionable(item)
     ]
-    diagnostic_next_reads = [item for item in next_reads if item.get("diagnostic_only")]
+    diagnostic_next_reads = demoted_required_surface_reads(next_reads)
     return {
         "schema_version": 1,
         "status": investigation_status(answer_state, gaps),
