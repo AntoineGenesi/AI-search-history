@@ -24,6 +24,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "ask_execute" in payload:
+        return render_ask_execute_text(payload)
     if "ask_router" in payload:
         return render_ask_router_text(payload)
     if "failure_analysis" in payload:
@@ -167,6 +169,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "ask_execute" in payload:
+        return render_ask_execute_markdown(payload)
     if "ask_router" in payload:
         return render_ask_router_markdown(payload)
     if "failure_analysis" in payload:
@@ -320,6 +324,114 @@ def render_ask_router_text(payload: dict) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_ask_execute_text(payload: dict) -> str:
+    report = payload["ask_execute"]
+    route = report.get("selected_route") or {}
+    execution = report.get("execution") or {}
+    action = report.get("answer_action_contract") or {}
+    lines = [
+        "Ask Execute",
+        f"Query: {report.get('query')}",
+        f"Chosen route: {route.get('chosen_route')}",
+        f"Route family: {route.get('route_family')}",
+        f"Execution status: {execution.get('status')}",
+        f"Command family: {execution.get('command_family') or '(unsupported)'}",
+        f"First command: {route.get('first_command')}",
+    ]
+    if execution.get("report_written"):
+        lines.append(f"Report written: {execution.get('report_written')}")
+    if execution.get("status") == "unsupported_route":
+        lines.append(f"Unsupported route: {execution.get('reason')}")
+        lines.append(f"Stop condition: {route.get('stop_guidance')}")
+        return "\n".join(lines)
+    lines.extend(
+        [
+            f"Answer status: {action.get('answer_status')}",
+            f"Stop condition: {action.get('stop')}",
+            "Read/action contract:",
+        ]
+    )
+    _append_compact_read_contract(lines, action.get("read"))
+    only_continue = action.get("only_continue_if")
+    if only_continue:
+        lines.append("Only continue if:")
+        _append_compact_read_contract(lines, only_continue)
+    executed = report.get("executed_output") or {}
+    if executed.get("status"):
+        lines.append(f"Executed output status: {executed.get('status')}")
+    if executed.get("message"):
+        lines.append(f"Executed output: {executed.get('message')}")
+    return "\n".join(lines)
+
+
+def render_ask_execute_markdown(payload: dict) -> str:
+    report = payload["ask_execute"]
+    route = report.get("selected_route") or {}
+    execution = report.get("execution") or {}
+    action = report.get("answer_action_contract") or {}
+    lines = [
+        "# JSONL Ask Execute",
+        "",
+        f"- Query: `{report.get('query')}`",
+        f"- Chosen route: `{route.get('chosen_route')}`",
+        f"- Route family: `{route.get('route_family')}`",
+        f"- Execution status: `{execution.get('status')}`",
+        f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
+        f"- First command: `{route.get('first_command')}`",
+    ]
+    if execution.get("report_written"):
+        lines.append(f"- Report written: `{execution.get('report_written')}`")
+    lines.extend(
+        [
+            "",
+            "## Answer Action Contract",
+            "",
+            f"- Answer status: `{action.get('answer_status')}`",
+            f"- Stop condition: {action.get('stop')}",
+        ]
+    )
+    if execution.get("status") == "unsupported_route":
+        lines.append(f"- Unsupported route: {execution.get('reason')}")
+    else:
+        lines.append("- Read/action:")
+        _append_compact_read_contract(lines, action.get("read"), markdown=True)
+    return "\n".join(lines)
+
+
+def _append_compact_read_contract(lines: list[str], value: object, *, markdown: bool = False) -> None:
+    bullet = "- " if markdown else "- "
+    if not value:
+        lines.append(f"{bullet}none")
+        return
+    if isinstance(value, dict):
+        command = value.get("command") or value.get("first_command")
+        if isinstance(command, dict):
+            command = command.get("command")
+        if command:
+            lines.append(f"{bullet}{command}")
+            return
+        appended = False
+        for key in ("decision", "actionability", "required_before_scoped_no_evidence_answer"):
+            if key in value:
+                lines.append(f"{bullet}{key}: {value.get(key)}")
+                appended = True
+        if not appended:
+            lines.append(f"{bullet}{value}")
+        return
+    if isinstance(value, list):
+        for item in value[:5]:
+            if isinstance(item, dict):
+                command = item.get("command")
+                target = item.get("target")
+                reason = item.get("reason") or item.get("purpose")
+                rendered = command or target or reason or str(item)
+                lines.append(f"{bullet}{rendered}")
+            else:
+                lines.append(f"{bullet}{item}")
+        return
+    lines.append(f"{bullet}{value}")
 
 
 def render_ask_router_markdown(payload: dict) -> str:

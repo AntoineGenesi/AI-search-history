@@ -38,6 +38,7 @@ repo recovery, TODO scans, or direct JSONL spelunking:
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
 python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
+jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
 
@@ -45,6 +46,15 @@ The installed `jsonl_ask_first.py` launcher is the neutral ask-first helper. It
 wraps the canonical `jsonl-history-search ask` command, adds `--cwd "$PWD"` and
 `--format text` when omitted, and exists so the first command can be the
 front-door resolver rather than a repo inventory/setup probe.
+
+Use `ask --execute` when the receiving-agent goal is to fuse route selection
+with the first safe JSONL run. It only executes allow-listed structured
+semantic-debug and bounded no-evidence/no-evidence-report routes, writes a full
+JSON report behind a report handle, and returns a compact answer/read/stop
+contract. Unsupported routes fail closed with `execution_status:
+unsupported_route` and the normal first command; they are not shell-executed.
+Use plain `ask` when you only need route classification or when the selected
+route is outside that execution allow-list.
 
 ## Proven Route Demos
 
@@ -97,7 +107,10 @@ Command-shape contract for the first two shell commands:
   If it fails, refresh the skill before relying on this route guidance.
 - After the freshness preflight passes, the next shell command should be
   `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`
-  or `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`.
+  or `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text`
+  for fused semantic-debug/no-evidence routing. Use
+  `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` when
+  you need route-only output.
 - Repo inventory belongs only after `ask` selects a route or a source
   follow-through genuinely needs it.
 
@@ -117,6 +130,12 @@ it does not inspect source refs, raw JSONL, tasks, reports, or repo files. It
 chooses the route family, explains why, prints the exact first command to run,
 names the one specialization/reference to read, says what output fields/source
 refs to inspect after, and gives the stop condition for manual search.
+
+The `ask --execute` output is still not a final answer by itself, but for
+allow-listed semantic-debug and bounded no-evidence routes it does run the
+selected JSONL route and returns one compact contract with selected route
+metadata, execution status, compact executed output, answer/read/stop guidance,
+and a saved report handle for drill-down.
 
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
