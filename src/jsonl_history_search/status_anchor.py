@@ -723,6 +723,16 @@ def _select_anchor_with_boundary(
             "prior_request_occurrence": prior_request_occurrence,
             "rejected_anchor_alternatives": prior_request_occurrence.get("rejected_anchor_alternatives") or [],
         }
+    if prior_request_occurrence.get("status") == "not_found" and _is_parent_main_complaint_request(query):
+        return {
+            **base,
+            "context_boundary": "prior_request_occurrence_not_found",
+            "anchor_scope": "parent_thread",
+            "anchor_reason": "prior_request_occurrence_not_unique",
+            "selected_anchor": None,
+            "prior_request_occurrence": prior_request_occurrence,
+            "rejected_anchor_alternatives": [],
+        }
     if is_status_question(query):
         prefer_parent = _prefers_parent_main_anchor(query)
         relative_history_first = _relative_status_requires_history_first_anchor(query) and _has_canonical_history_source(messages)
