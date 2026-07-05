@@ -1946,7 +1946,7 @@ def _args_with_bounded_auto_execute_prompt_scope(args: argparse.Namespace) -> ar
 def _extract_bounded_auto_execute_roots_from_query(query: str) -> list[str]:
     roots: list[str] = []
     for token in _path_like_tokens(query):
-        cleaned = token.strip().strip("`'\"()[]{}<>.,;:")
+        cleaned = token.strip().strip("`'\"()[]{}<>.,:")
         if not _safe_bounded_fixture_root_token(cleaned):
             continue
         if cleaned not in roots:
@@ -1955,15 +1955,18 @@ def _extract_bounded_auto_execute_roots_from_query(query: str) -> list[str]:
 
 
 def _path_like_tokens(query: str) -> list[str]:
-    tokens = re.findall(r"[A-Za-z0-9_./~-]+/[A-Za-z0-9_./~-]+", query)
-    quoted = re.findall(r"[`'\"]([^`'\"]+/[^`'\"]+)[`'\"]", query)
-    return [*tokens, *quoted]
+    tokens: list[str] = []
+    for raw in re.findall(r"`([^`]+)`|'([^']+)'|\"([^\"]+)\"|(\S+)", query):
+        token = next(part for part in raw if part)
+        if "/" in token:
+            tokens.append(token)
+    return tokens
 
 
 def _safe_bounded_fixture_root_token(token: str) -> bool:
     if not token or len(token) > 240:
         return False
-    if any(char in token for char in ("$", "*", "?", "\\", "|", ";", "&")):
+    if any(char in token for char in ("$", "*", "?", "\\", "|", ";", "&", "=", "[", "]", "{", "}", "<", ">")):
         return False
     if "://" in token:
         return False
@@ -1971,11 +1974,12 @@ def _safe_bounded_fixture_root_token(token: str) -> bool:
     if any(part == ".." for part in path.parts):
         return False
     normalized = token.casefold().lstrip("./")
-    return (
-        "tests/fixtures/" in normalized
-        or "fixtures/final_suite_bounded_no_evidence/" in normalized
-        or "final_suite_bounded_no_evidence/" in normalized
+    fixture_prefixes = (
+        "tests/fixtures/final_suite_bounded_no_evidence/",
+        "fixtures/final_suite_bounded_no_evidence/",
+        "final_suite_bounded_no_evidence/",
     )
+    return normalized.startswith(fixture_prefixes)
 
 
 def _extract_bounded_auto_execute_hard_cap(query: str, kind: str) -> int | None:
