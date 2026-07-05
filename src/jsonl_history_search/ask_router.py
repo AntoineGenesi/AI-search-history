@@ -358,16 +358,18 @@ ROUTES: tuple[AskRoute, ...] = (
         inspect_after=(
             "semantic_wrapup.failure_modes",
             "semantic_wrapup.fix_suggestions",
-            "complaint/correction source refs before proposing any fix",
-            "next_reads source refs before proposing any fix",
+            "semantic_wrapup.next_reads where read_role == required_primary_proof before proposing any fix",
+            "optional_diagnostic and conditional_required reads only for named proof/completeness gaps",
         ),
         stop_guidance=(
-            "Run semantic-wrapup before broad session/manual narrowing. Stop when "
-            "failure modes are supported by inspected source refs; do not auto-apply fixes."
+            "Run semantic-wrapup before broad session/manual narrowing. Open required_primary_proof "
+            "refs first, then stop when failure modes are supported; do not auto-apply fixes "
+            "or open optional diagnostics by default."
         ),
         manual_search_guidance=(
-            "Manual session narrowing is follow-up only for a missing source ref "
-            "or ambiguous failure mode after semantic-wrapup runs."
+            "Manual session narrowing or read-more is follow-up only for a named unsupported, "
+            "incomplete, or ambiguous failure mode, for conditional_required cap/omission coverage, "
+            "or when the user asks for exhaustive diagnostics after semantic-wrapup runs."
         ),
     ),
 )
