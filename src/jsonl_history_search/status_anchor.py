@@ -250,6 +250,11 @@ def status_anchor_report(
     target_window = _target_window_from_query(query)
     status_as_of_boundary = _status_as_of_boundary_from_messages(query, latest_messages)
     audit_run_requested = _audit_run_requested(query, target_window)
+    prior_request_occurrence = _prior_request_occurrence_recovery(
+        query=query,
+        codex_home=codex_home,
+        status_as_of_boundary=status_as_of_boundary,
+    )
     anchor_candidates = _rank_anchor_candidates(
         latest_messages,
         target_window=target_window,
@@ -263,7 +268,9 @@ def status_anchor_report(
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
+        prior_request_occurrence=prior_request_occurrence,
     )
+    status_as_of_boundary = anchor_decision.get("status_as_of_boundary") or status_as_of_boundary
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
         selected_anchor.update(_anchor_decision_fields(anchor_decision, selected_anchor))
@@ -405,6 +412,7 @@ def status_anchor_report(
             "anchor_scope": anchor_decision["anchor_scope"],
             "anchor_reason": anchor_decision["anchor_reason"],
             "status_as_of_boundary_available": status_as_of_boundary is not None,
+            "prior_request_occurrence_status": prior_request_occurrence.get("status"),
         },
         "anchor_candidates": anchor_candidates,
         "selected_anchor": selected_anchor,
@@ -418,6 +426,7 @@ def status_anchor_report(
         "required_answer_facets": answer_readiness["required_answer_facets"],
         "target_window": target_window,
         "status_as_of_boundary": status_as_of_boundary,
+        "prior_request_occurrence_recovery": prior_request_occurrence,
         "suppressed_support": suppressed_support,
         "fail_closed_guidance": _fail_closed_guidance(
             selected_anchor=selected_anchor,
@@ -622,6 +631,7 @@ def _select_anchor_with_boundary(
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
+    prior_request_occurrence: dict | None = None,
 ) -> dict:
     base = {
         "context_boundary": "none",
@@ -679,6 +689,50 @@ def _select_anchor_with_boundary(
             },
             candidates,
         )
+    prior_request_occurrence = prior_request_occurrence or {"status": "not_applicable"}
+    if prior_request_occurrence.get("status") == "selected":
+        occurrence_boundary = prior_request_occurrence.get("status_as_of_boundary") or status_as_of_boundary
+        selected = prior_request_occurrence.get("selected_anchor") or {}
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "prior_request_occurrence",
+                "anchor_scope": "parent_thread",
+                "anchor_reason": "unique_prior_request_occurrence_parent_main_anchor",
+                "anchor_ref": selected.get("source_ref"),
+                "status_ref": (occurrence_boundary or {}).get("source_ref"),
+                "status_as_of_boundary": occurrence_boundary,
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected as the preceding eligible parent/main history row before the unique prior occurrence of the current request",
+                ),
+                "prior_request_occurrence": prior_request_occurrence,
+            },
+            candidates,
+        )
+    if prior_request_occurrence.get("status") == "ambiguous":
+        boundary = prior_request_occurrence.get("status_as_of_boundary") or status_as_of_boundary
+        return {
+            **base,
+            "context_boundary": prior_request_occurrence.get("context_boundary") or "prior_request_occurrence_ambiguous",
+            "anchor_scope": "parent_thread",
+            "anchor_reason": prior_request_occurrence.get("anchor_reason") or "prior_request_occurrence_not_unique",
+            "status_ref": (boundary or {}).get("source_ref"),
+            "status_as_of_boundary": boundary,
+            "selected_anchor": None,
+            "prior_request_occurrence": prior_request_occurrence,
+            "rejected_anchor_alternatives": prior_request_occurrence.get("rejected_anchor_alternatives") or [],
+        }
+    if prior_request_occurrence.get("status") == "not_found" and _is_parent_main_complaint_request(query):
+        return {
+            **base,
+            "context_boundary": "prior_request_occurrence_not_found",
+            "anchor_scope": "parent_thread",
+            "anchor_reason": "prior_request_occurrence_not_unique",
+            "selected_anchor": None,
+            "prior_request_occurrence": prior_request_occurrence,
+            "rejected_anchor_alternatives": [],
+        }
     if is_status_question(query):
         prefer_parent = _prefers_parent_main_anchor(query)
         relative_history_first = _relative_status_requires_history_first_anchor(query) and _has_canonical_history_source(messages)
@@ -996,6 +1050,319 @@ def _target_window_anchor_candidate(
         matches.append(selected)
     matches.sort(key=lambda item: (int(item.get("score") or 0), item.get("timestamp_utc") or ""), reverse=True)
     return matches[0] if matches else None
+
+
+def _prior_request_occurrence_recovery(
+    *,
+    query: str,
+    codex_home: Path | None,
+    status_as_of_boundary: dict | None,
+) -> dict:
+    if not codex_home or not _should_try_prior_request_occurrence(query):
+        return {"status": "not_applicable", "reason": "query_not_status_or_parent_main_complaint"}
+    history_path = codex_home / "history.jsonl"
+    if not history_path.is_file():
+        return {"status": "not_applicable", "reason": "canonical_history_missing"}
+    normalized_query = _normalize(query)
+    if not normalized_query:
+        return {"status": "not_applicable", "reason": "empty_query"}
+    rows = _canonical_history_human_rows(history_path, query=query)
+    if not rows:
+        return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
+    matches = [row for row in rows if row.get("normalized_text") == normalized_query]
+    if len(matches) < 2:
+        return {"status": "not_found", "reason": "no_prior_occurrence_of_current_request"}
+
+    current_boundary_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
+    current_boundary_timestamp = str((status_as_of_boundary or {}).get("timestamp_utc") or "")
+    if current_boundary_line is not None:
+        prior_matches = [row for row in matches if int(row.get("line") or 0) < current_boundary_line]
+    elif current_boundary_timestamp:
+        prior_matches = [row for row in matches if str(row.get("timestamp_utc") or "") < current_boundary_timestamp]
+    else:
+        prior_matches = matches[:-1]
+
+    if len(prior_matches) != 1:
+        return {
+            "status": "ambiguous",
+            "context_boundary": "prior_request_occurrence_ambiguous",
+            "anchor_reason": "prior_request_occurrence_not_unique",
+            "reason": "expected_exactly_one_prior_occurrence_before_current_request_boundary",
+            "occurrence_count": len(matches),
+            "prior_occurrence_count": len(prior_matches),
+            "occurrence_candidates": [_occurrence_candidate(row) for row in prior_matches[:6]],
+            "rejected_anchor_alternatives": [_occurrence_candidate(row) for row in prior_matches[:6]],
+        }
+
+    occurrence = prior_matches[0]
+    if (
+        is_status_question(query)
+        and not _prefers_parent_main_anchor(query)
+        and not _is_parent_main_complaint_request(query)
+        and _has_same_thread_anchor_between_prior_occurrence_and_current(rows, occurrence, status_as_of_boundary)
+    ):
+        return {
+            "status": "not_applicable",
+            "reason": "generic_same_thread_status_followup_has_local_anchor",
+            "occurrence_count": len(matches),
+            "prior_occurrence_count": 1,
+        }
+    anchor = _preceding_eligible_history_anchor(rows, occurrence)
+    if anchor is None:
+        return {
+            "status": "ambiguous",
+            "context_boundary": "prior_request_occurrence_anchor_missing",
+            "anchor_reason": "prior_request_occurrence_preceding_anchor_not_proven",
+            "reason": "unique_prior_occurrence_found_but_no_preceding_eligible_parent_main_history_anchor",
+            "occurrence_count": len(matches),
+            "prior_occurrence_count": 1,
+            "occurrence_candidates": [_occurrence_candidate(occurrence)],
+            "rejected_anchor_alternatives": [_occurrence_candidate(occurrence)],
+        }
+
+    boundary = _prior_occurrence_boundary(occurrence)
+    return {
+        "status": "selected",
+        "reason": "unique_prior_occurrence_and_preceding_parent_main_history_anchor_found",
+        "occurrence_count": len(matches),
+        "prior_occurrence_count": 1,
+        "status_as_of_boundary": boundary,
+        "selected_anchor": anchor,
+        "occurrence": _occurrence_candidate(occurrence),
+        "occurrence_candidates": [_occurrence_candidate(occurrence)],
+    }
+
+
+def _should_try_prior_request_occurrence(query: str) -> bool:
+    return is_status_question(query) or _prefers_parent_main_anchor(query) or _is_parent_main_complaint_request(query)
+
+
+def _is_parent_main_complaint_request(query: str) -> bool:
+    normalized = _normalize(query)
+    parent_or_boundary = (
+        "parent/main",
+        "parent thread",
+        "main thread",
+        "side-thread",
+        "side thread",
+        "last actual message",
+        "last message",
+        "latest message",
+        "wrong context",
+    )
+    status_or_answer = (
+        "status",
+        "answer",
+        "what happened since",
+        "while i was away",
+        "jsonl",
+    )
+    complaint = (
+        "wrong",
+        "wrong anchor",
+        "wrong context",
+        "made no sense",
+        "failed",
+        "failure",
+        "complaint",
+        "correcting",
+        "correction",
+        "did not use",
+        "didn't use",
+    )
+    return (
+        any(marker in normalized for marker in parent_or_boundary)
+        and any(marker in normalized for marker in status_or_answer)
+        and any(marker in normalized for marker in complaint)
+    )
+
+
+def _canonical_history_human_rows(path: Path, *, query: str) -> list[dict]:
+    rows = []
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    with handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            text = _clean_history_text(record.get("text"))
+            timestamp = parse_datetime(record.get("ts") or record.get("timestamp") or record.get("created_at"), timezone.utc)
+            if not text or timestamp is None:
+                continue
+            candidate = _history_row_candidate(
+                record,
+                text=text,
+                path=path,
+                line_number=line_number,
+                query=query,
+                timestamp_utc=timestamp.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            )
+            if _history_row_is_non_human_or_boundary(record, candidate):
+                continue
+            rows.append(candidate)
+    return rows
+
+
+def _history_row_candidate(
+    record: Mapping[str, Any],
+    *,
+    text: str,
+    path: Path,
+    line_number: int,
+    query: str,
+    timestamp_utc: str,
+) -> dict:
+    score, classification, decision, rationale = _score_anchor(text, line_number, timestamp_utc=timestamp_utc)
+    source_identifier = _history_source_identifier(record)
+    source_ref = f"codex_history:history.jsonl:{line_number}"
+    target_window = _target_window_from_query(query)
+    return {
+        "source_ref": source_ref,
+        "source_kind": "codex_history",
+        "source_identifier": source_identifier,
+        "thread_key": source_identifier,
+        "thread_keys": [source_identifier],
+        "mirror_sources": [
+            {
+                "source_kind": "codex_history",
+                "source_ref": source_ref,
+                "source_identifier": source_identifier,
+                "thread_key": source_identifier,
+                "openable_source_ref": {"path": str(path), "line": line_number},
+                "openable_target": f"{path}:{line_number}",
+            }
+        ],
+        "openable_source_ref": {"path": str(path), "line": line_number},
+        "openable_target": f"{path}:{line_number}",
+        "timestamp_utc": timestamp_utc,
+        "local_timestamp": timestamp_utc,
+        "message_index": line_number,
+        "line": line_number,
+        "snippet": _compact(text),
+        "normalized_text": _normalize(text),
+        "classification": classification,
+        "score": score,
+        "decision": decision,
+        "rationale": rationale,
+        "target_window_hits": _target_window_hits(text, target_window),
+        "outside_target_task_ids": _outside_target_task_ids(text, target_window),
+    }
+
+
+def _history_row_is_non_human_or_boundary(record: Mapping[str, Any], candidate: dict) -> bool:
+    classification = classify_conversation_record(record)
+    if classification.label in {
+        ASSISTANT_OR_AGENT_MESSAGE,
+        COMPACTED_HISTORY_SUMMARY,
+        TOOL_ACTION_OUTPUT,
+    }:
+        return True
+    normalized = _normalize(str(candidate.get("snippet") or ""))
+    if any(marker in normalized for marker in NON_ANCHOR_CONTEXT_MARKERS):
+        return True
+    return False
+
+
+def _preceding_eligible_history_anchor(rows: list[dict], occurrence: dict) -> dict | None:
+    occurrence_line = int(occurrence.get("line") or 0)
+    prior_rows = sorted(
+        (item for item in rows if int(item.get("line") or 0) < occurrence_line),
+        key=lambda item: int(item.get("line") or 0),
+        reverse=True,
+    )
+    for row in prior_rows:
+        if _is_never_anchor(row):
+            continue
+        if not _is_eligible_anchor(row):
+            continue
+        selected = dict(row)
+        selected["rationale"] = (
+            str(selected.get("rationale") or "").rstrip()
+            + "; selected by canonical history prior-request occurrence recovery"
+        )
+        return selected
+    return None
+
+
+def _has_same_thread_anchor_between_prior_occurrence_and_current(
+    rows: list[dict],
+    occurrence: dict,
+    status_as_of_boundary: dict | None,
+) -> bool:
+    current_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
+    if current_line is None:
+        return False
+    occurrence_line = int(occurrence.get("line") or 0)
+    occurrence_threads = set(occurrence.get("thread_keys") or [])
+    for row in rows:
+        line = int(row.get("line") or 0)
+        if line <= occurrence_line or line >= current_line:
+            continue
+        if not occurrence_threads.intersection(set(row.get("thread_keys") or [])):
+            continue
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            continue
+        return True
+    return False
+
+
+def _prior_occurrence_boundary(occurrence: dict) -> dict:
+    return {
+        "kind": "prior_request_occurrence_boundary",
+        "source_ref": occurrence.get("source_ref"),
+        "source_kind": occurrence.get("source_kind"),
+        "source_identifier": occurrence.get("source_identifier"),
+        "openable_source_ref": occurrence.get("openable_source_ref"),
+        "openable_target": occurrence.get("openable_target"),
+        "timestamp_utc": occurrence.get("timestamp_utc"),
+        "local_timestamp": occurrence.get("local_timestamp"),
+        "message_index": occurrence.get("message_index"),
+        "thread_keys": occurrence.get("thread_keys") or [],
+        "snippet": occurrence.get("snippet"),
+        "boundary_policy": (
+            "This prior canonical occurrence of the current request is the status/query boundary; "
+            "answer-facing support must stay in the interval after the selected parent/main anchor and at or before this row."
+        ),
+    }
+
+
+def _occurrence_candidate(row: dict) -> dict:
+    return {
+        "source_ref": row.get("source_ref"),
+        "timestamp_utc": row.get("timestamp_utc"),
+        "classification": row.get("classification"),
+        "decision": "rejected",
+        "rationale": "prior request occurrence candidate; use only to disambiguate and rerun, not as answer support",
+        "snippet": row.get("snippet"),
+        "source_kind": row.get("source_kind"),
+        "openable_source_ref": row.get("openable_source_ref"),
+        "openable_target": row.get("openable_target"),
+        "target_window_hits": row.get("target_window_hits") or [],
+        "outside_target_task_ids": row.get("outside_target_task_ids") or [],
+        "prior_request_occurrence_candidate": True,
+        "verification_or_rerun_only": True,
+        "answer_support_role": "prior_request_occurrence_disambiguation_only",
+    }
+
+
+def _history_source_identifier(record: Mapping[str, Any]) -> str:
+    session_id = record.get("session_id")
+    if session_id:
+        digest = hashlib.sha256(str(session_id).encode("utf-8", errors="replace")).hexdigest()[:12]
+        return f"history-session-{digest}"
+    return "history"
+
+
+def _clean_history_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return "\n".join(line.rstrip() for line in str(value).strip().splitlines()).strip()
 
 
 def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
@@ -1459,10 +1826,14 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
     return (
         context_boundary.startswith("explicit_parent_main")
         or context_boundary.startswith("relative_status_history")
+        or context_boundary.startswith("prior_request_occurrence")
         or context_boundary == "parent_main_selected_anchor_unproven"
         or anchor_reason in {
             "first_side_thread_user_message_after_boundary",
             "parent_main_last_actual_work_handoff",
+            "unique_prior_request_occurrence_parent_main_anchor",
+            "prior_request_occurrence_not_unique",
+            "prior_request_occurrence_preceding_anchor_not_proven",
             "no_proven_parent_main_history_anchor_found",
             "no_status_question_boundary_for_parent_main_anchor",
             "no_canonical_history_anchor_found_for_relative_status",
@@ -2286,6 +2657,9 @@ def _next_reads(
         if read.get("openable_target") and not read.get("read_more_command"):
             read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
         reads.append(read)
+    boundary_read = _prior_request_boundary_read(status_as_of_boundary, cwd=cwd, codex_home=codex_home)
+    if boundary_read:
+        reads.append(boundary_read)
     for read in session_activity.get("next_reads") or []:
         reads.append(
             {
@@ -2301,6 +2675,13 @@ def _next_reads(
             codex_home=codex_home,
             target_window=target_window,
             audit_run_requested=audit_run_requested,
+        )
+    )
+    reads.extend(
+        _prior_request_occurrence_recovery_reads(
+            anchor_decision=anchor_decision,
+            cwd=cwd,
+            codex_home=codex_home,
         )
     )
     reads.extend(
@@ -2364,6 +2745,65 @@ def _next_reads(
     return _dedupe_reads(reads)
 
 
+def _prior_request_boundary_read(status_as_of_boundary: dict | None, *, cwd: Path, codex_home: Path | None) -> dict | None:
+    if not status_as_of_boundary or status_as_of_boundary.get("kind") != "prior_request_occurrence_boundary":
+        return None
+    read = {
+        "reason": "Inspect the prior occurrence of the current request; this row is the status/query boundary, not the answer anchor.",
+        "source_ref": status_as_of_boundary.get("source_ref"),
+        "source_kind": status_as_of_boundary.get("source_kind"),
+        "snippet": status_as_of_boundary.get("snippet"),
+        "source_tier": "required_primary",
+        "answer_use_required": True,
+        "prior_request_occurrence_boundary": True,
+        "answer_support_role": "status_query_boundary",
+    }
+    _copy_openable_fields(read, status_as_of_boundary)
+    if read.get("openable_target") and not read.get("read_more_command"):
+        read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+    return read
+
+
+def _prior_request_occurrence_recovery_reads(
+    *,
+    anchor_decision: dict,
+    cwd: Path,
+    codex_home: Path | None,
+) -> list[dict]:
+    prior = anchor_decision.get("prior_request_occurrence") or {}
+    if prior.get("status") != "ambiguous":
+        return []
+    reads = []
+    for candidate in prior.get("occurrence_candidates") or prior.get("rejected_anchor_alternatives") or []:
+        read = {
+            "reason": (
+                "Inspect this exact prior request occurrence candidate only to disambiguate the boundary; "
+                "do not use it as normal answer support."
+            ),
+            "source_ref": candidate.get("source_ref"),
+            "source_kind": candidate.get("source_kind"),
+            "snippet": candidate.get("snippet"),
+            "source_tier": "required_primary",
+            "answer_use_required": False,
+            "read_more_actionable": True,
+            "verification_or_rerun_only": True,
+            "prior_request_occurrence_candidate": True,
+            "fail_closed_before_answer": True,
+            "answer_support_role": "prior_request_occurrence_disambiguation_only",
+            "diagnostic_open_policy": (
+                "prior request occurrence disambiguation only; rerun with an explicit timestamp or quoted-message "
+                "anchor after choosing the intended occurrence"
+            ),
+        }
+        _copy_openable_fields(read, candidate)
+        if read.get("openable_target") and not read.get("read_more_command"):
+            read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+        reads.append(read)
+        if len(reads) >= 4:
+            break
+    return reads
+
+
 def _parent_main_recovery_reads(
     *,
     selected_anchor: dict | None,
@@ -2372,6 +2812,8 @@ def _parent_main_recovery_reads(
     codex_home: Path | None,
 ) -> list[dict]:
     if selected_anchor or anchor_decision.get("anchor_scope") != "parent_thread":
+        return []
+    if str(anchor_decision.get("context_boundary") or "").startswith("prior_request_occurrence"):
         return []
     reads = []
     recovery_candidates = [
@@ -2545,7 +2987,10 @@ def _follow_through_plan(
     open_first = [_plan_read(read) for read in required_primary[:4]]
     then_confirm = _follow_through_confirmation_groups(required_secondary, target_ids=target_ids)
     do_not_open_by_default = [_plan_read(read) for read in diagnostic_optional[:8]]
-    has_parent_main_recovery = any(read.get("parent_main_anchor_recovery_candidate") for read in required_primary)
+    has_parent_main_recovery = any(
+        read.get("parent_main_anchor_recovery_candidate") or read.get("prior_request_occurrence_candidate")
+        for read in required_primary
+    )
     named_gap = (
         "a named target-window status facet remains missing or contradictory"
         if target_ids and not audit_run_requested
@@ -2656,6 +3101,8 @@ def _plan_read(read: dict) -> dict:
         "fail_closed_before_answer",
         "answer_support_role",
         "verification_or_rerun_only",
+        "prior_request_occurrence_boundary",
+        "prior_request_occurrence_candidate",
     ):
         if key in read:
             planned[key] = read.get(key)
@@ -2732,7 +3179,7 @@ def _answer_readiness_contract(
     task_facet = "target_window_task_outcome_value_deltas" if target_window else "task_outcome_value_deltas"
     target_or_task_ready = True
     recovery_material = any(
-        read.get("parent_main_anchor_recovery_candidate")
+        read.get("parent_main_anchor_recovery_candidate") or read.get("prior_request_occurrence_candidate")
         for read in (source_tiers.get("required_primary") or [])
     )
     if recovery_material and "selected_anchor_and_boundary" not in missing:
@@ -2781,6 +3228,7 @@ def _answer_readiness_contract(
             "anchor_candidates",
             "anchor_decision.rejected_anchor_alternatives",
             "source_tiers.required_primary[parent_main_anchor_recovery_candidate]",
+            "source_tiers.required_primary[prior_request_occurrence_candidate]",
             "source_tiers.diagnostic_optional",
         ],
     }
@@ -3031,12 +3479,14 @@ def _fail_closed_guidance(
         if parent_main_recovery:
             guidance = (
                 "Fail closed: no canonical parent/main history.jsonl anchor was selected. Open only the "
-                "parent/main anchor recovery candidate reads (parent_main_anchor_recovery_candidate) to prove the "
-                "intended parent/main anchor, then rerun with that timestamp or quoted message. Do not answer from "
+                "parent/main anchor recovery candidate (parent_main_anchor_recovery_candidate) or "
+                "prior-request occurrence recovery candidate reads to prove the intended "
+                "parent/main anchor and status/query boundary, then rerun with that timestamp or quoted message. Do not answer from "
                 "visible context, inherited summaries, current worker/reviewer prompts, task/report artifacts, "
                 "commits, repo status, or current-session handoff snippets while selected_anchor is null."
             )
             candidate_fields.append("source_tiers.required_primary[parent_main_anchor_recovery_candidate]")
+            candidate_fields.append("source_tiers.required_primary[prior_request_occurrence_candidate]")
         return {
             "mode": "candidate_anchors_required_before_answer",
             "answer_allowed": False,
