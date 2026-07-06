@@ -488,6 +488,8 @@ def replay_read_more_argv(argv: list[str]) -> dict[str, Any]:
             after=args.after,
             next_count=args.next_count,
             max_records=args.max_records,
+            projection=args.projection,
+            compact_text_limit=args.compact_text_limit,
         ),
         plan=plan,
         default_tz=timezone.utc,
@@ -508,6 +510,8 @@ def parse_read_more_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--next-count", type=int, default=3)
     parser.add_argument("--max-records", type=int, default=20)
     parser.add_argument("--format", choices=("json", "markdown", "text"), default="json")
+    parser.add_argument("--projection", choices=("full", "compact"), default="full")
+    parser.add_argument("--compact-text-limit", type=int, default=1200)
     parser.add_argument("--root", action="append", default=[])
     parser.add_argument("--allow-arbitrary-root", action="store_true")
     parser.add_argument("--hard-cap-files", type=int, default=20)

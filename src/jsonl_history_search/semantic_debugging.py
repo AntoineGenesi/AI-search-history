@@ -593,6 +593,21 @@ def build_semantic_debug_payload(
     ]
     next_reads = annotated_next_reads
     source_locator_handoff["next_reads"] = next_reads
+    decision_context["next_reads"] = next_reads[:12]
+    decision_context["next_commands"] = build_next_commands(
+        next_reads,
+        hints=hints,
+        include_semantic_debug_replay=False,
+    )
+    audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
+    audit_plan["replay_commands"] = build_next_commands(
+        next_reads,
+        hints=hints,
+        include_semantic_debug_replay=True,
+    )
+    audit_plan["next_commands"] = decision_context["next_commands"]
+    guided_audit_flow["next_reads"] = guided_next_reads(next_reads)
+    guided_audit_flow["next_commands"] = guided_next_commands(decision_context["next_commands"])
     source_locator_handoff["core_convo_first_read_plan"] = core_convo_first_read_plan
     investigation_state["core_convo_first_read_plan_summary"] = {
         "link": "semantic_debug.core_convo_first_read_plan",
@@ -6936,8 +6951,13 @@ def annotate_core_convo_target_source_read(
             "diagnostic_open_policy",
             "do_not_open_by_default_unless_user_asks_for_current_same_loop_post_hoc_synthetic_or_diagnostic_audit",
         )
-        row.pop("expansion_actions", None)
-        row.pop("context_actions", None)
+        preserve_optional_no_evidence_actions = (
+            row.get("no_evidence_action_role") == "optional_diagnostic_after_scoped_answer"
+            and core_convo_read_targets_raw_history(row)
+        )
+        if not preserve_optional_no_evidence_actions:
+            row.pop("expansion_actions", None)
+            row.pop("context_actions", None)
     else:
         row["diagnostic_only"] = bool(row.get("diagnostic_only", False))
         row.setdefault("read_more_actionable", role != "legitimate_context")
@@ -7117,7 +7137,7 @@ def core_convo_read_is_diagnostic_or_post_hoc(read: dict[str, Any]) -> bool:
     if chronology_role.endswith("_diagnostic") or "diagnostic" in chronology_role:
         return True
     text = core_convo_read_marker_text(read)
-    markers = (
+    hard_diagnostic_markers = (
         "/current/",
         "/current_task/",
         "/current-task/",
@@ -7125,9 +7145,6 @@ def core_convo_read_is_diagnostic_or_post_hoc(read: dict[str, Any]) -> bool:
         "/same_loop/",
         "/posthoc/",
         "/post-hoc/",
-        "/tests/",
-        "/fixtures/",
-        "/smoke/",
         "current-run",
         "current run",
         "same-loop",
@@ -7143,14 +7160,42 @@ def core_convo_read_is_diagnostic_or_post_hoc(read: dict[str, Any]) -> bool:
         "answer key",
         "adjudication",
         "synthetic",
+        "/smoke/",
         "smoke test",
-        "fixture",
         "partial diagnostic",
         "metadata-only diagnostic",
         "unrelated high-lexical",
         "unrelated_high_lexical",
     )
-    return any(marker in text for marker in markers)
+    if any(marker in text for marker in hard_diagnostic_markers):
+        return True
+    path_fixture_markers = ("/tests/", "/fixtures/", "fixture")
+    if any(marker in text for marker in path_fixture_markers):
+        return not core_convo_read_is_actionable_raw_source_ref(read)
+    return False
+
+
+def core_convo_read_is_actionable_raw_source_ref(read: dict[str, Any]) -> bool:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if selection.get("final_support_allowed") is False:
+        return False
+    if selection.get("read_more_actionable") is False or read.get("read_more_actionable") is False:
+        return False
+    return core_convo_read_targets_raw_history(read)
+
+
+def core_convo_read_targets_raw_history(read: dict[str, Any]) -> bool:
+    kind = str(read.get("kind") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or source_ref_target(source_ref) or "")
+    path = str(source_ref.get("path") or source_target_path_part(target) or target)
+    if kind not in {"jsonl_source_ref", "tool_event_source_ref"} and not source_ref.get("path"):
+        return False
+    return bool(target or source_ref.get("path")) and core_convo_path_is_raw_history(path, target)
 
 
 def core_convo_read_marker_text(read: dict[str, Any]) -> str:
