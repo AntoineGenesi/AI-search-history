@@ -18,6 +18,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "semantic_debug",
     }
 )
+EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_analysis"})
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
 
 
@@ -133,6 +134,43 @@ TASK_REVIEW_COMMIT_PROVENANCE_ROUTE = AskRoute(
         "chronology facet. Prefer original historical raw session/tool evidence "
         "and historical task/review/commit refs over current-run echoes or reports "
         "created after the target work."
+    ),
+)
+
+DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
+    route_family="devlog_failure_analysis",
+    chosen_route="devlog/failure-analysis historical-source-reach",
+    why_it_applies=(
+        "The wording asks for a devlog/story reconstruction of agent or "
+        "coordinator failure behavior with dated concrete examples. Use the "
+        "devlog/failure-analysis source-reach package so target historical "
+        "source-window reads and safe repo-phase/category evidence appear "
+        "before current/adjacent diagnostics."
+    ),
+    first_command_template=(
+        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        "--report-output .private/jsonl/ask-execute-devlog-source-reach.json"
+    ),
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "ask_execute.executed_output.target_historical_source_window_reads before diagnostic reads",
+        "ask_execute.executed_output.failure_analysis.devlog_brief and linked failure-analysis report",
+        "ask_execute.executed_output.repo_phase_category_evidence safe repo-phase/category packet",
+        "current/adjacent/same-loop diagnostics only after target historical reads, unless the user asks to audit current output",
+    ),
+    stop_guidance=(
+        "Run ask --execute for the devlog/failure-analysis package before broad "
+        "repo archaeology. Open target_historical_source_window_reads first, then "
+        "use the linked failure_analysis.devlog_brief and safe repo-phase/category "
+        "evidence as boundaries. Treat current/adjacent/same-loop diagnostics as "
+        "non-actionable by default unless the user explicitly asks to audit the "
+        "current route, current output, current lane, or prior answer."
+    ),
+    manual_search_guidance=(
+        "Manual rg or repo artifact reading is follow-up only for named missing "
+        "story facets after the package. Prefer target historical source windows "
+        "and safe repo-phase/category evidence; do not answer mainly from current "
+        "diagnostics or post-hoc artifacts."
     ),
 )
 
@@ -440,6 +478,8 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 
 
 def execution_kind_for_route_family(route_family: str) -> str | None:
+    if route_family in EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES:
+        return "devlog-failure-analysis"
     if route_family in EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES:
         return "semantic-debug"
     if route_family in EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES:
@@ -475,6 +515,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
+
+    if _looks_like_devlog_failure_analysis_query(normalized):
+        return DEVLOG_FAILURE_ANALYSIS_ROUTE
 
     if _looks_like_latest_status_anchor_query(normalized):
         return ROUTES[5]
@@ -700,6 +743,67 @@ def _looks_like_task_review_commit_provenance_query(normalized: str) -> bool:
         if any(term in normalized for term in terms)
     )
     return facet_hits >= 2
+
+
+def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
+    if _looks_like_explicit_current_or_prior_answer_audit(normalized):
+        return False
+    story_terms = (
+        "devlog",
+        "story",
+        "segment",
+        "reconstruct the arc",
+        "reconstruct",
+        "what actually happened",
+        "what happened in",
+        "turn the",
+    )
+    failure_terms = (
+        "failure",
+        "failure mode",
+        "drift",
+        "drifting",
+        "pulled into",
+        "sounded productive",
+        "away from the product",
+        "process mechanics",
+        "workflow/process",
+        "coordinator/review overhead",
+        "concrete examples",
+        "separate what you can prove",
+        "plausible interpretation",
+    )
+    agent_work_terms = (
+        "coordinator",
+        "agent",
+        "agents",
+        "runner",
+        "harness",
+        "docker",
+        "auth",
+        "live-send",
+        "live send",
+        "review overhead",
+        "product behavior",
+    )
+    asks_for_story = _has_any(normalized, story_terms)
+    asks_for_failure = _has_any(normalized, failure_terms)
+    asks_about_agent_work = _has_any(normalized, agent_work_terms)
+    asks_for_dates_or_examples = _has_any(
+        normalized,
+        (
+            "dates",
+            "dated",
+            "timeline",
+            "arc",
+            "concrete examples",
+            "examples",
+            "prove",
+            "proof",
+            "evidence",
+        ),
+    )
+    return asks_for_story and asks_for_failure and asks_about_agent_work and asks_for_dates_or_examples
 
 
 def _looks_like_explicit_current_or_prior_answer_audit(normalized: str) -> bool:

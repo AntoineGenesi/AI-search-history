@@ -1841,7 +1841,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             "execution": {
                 "status": "unsupported_route",
                 "route_family": route.get("route_family"),
-                "allowlist": ["semantic-debug", "no-evidence-report"],
+                "allowlist": ["semantic-debug", "no-evidence-report", "devlog-failure-analysis"],
                 "command_family": None,
                 "argv": [],
                 "report_written": None,
@@ -1867,9 +1867,12 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     if execution_kind == "semantic-debug":
         executed_payload = _build_semantic_debug_report_output_payload(execution_args)
         output_key = "semantic_debug"
-    else:
+    elif execution_kind == "no-evidence-report":
         executed_payload = _build_agent_find_report_output_payload(execution_args)
         output_key = "agent_find"
+    else:
+        executed_payload = _build_devlog_failure_analysis_report_output_payload(execution_args)
+        output_key = "devlog_failure_analysis"
 
     compact = executed_payload[output_key]
     contract["ask_execute"]["execution"].update(
@@ -2015,6 +2018,357 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
+def _ask_execute_sidecar_path(report_output: str, label: str) -> Path:
+    path = Path(report_output).expanduser()
+    return path.with_name(f"{path.stem}.{label}.json")
+
+
+def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespace) -> dict:
+    semantic_report = _ask_execute_sidecar_path(args.report_output, "semantic-debug")
+    repo_report = _ask_execute_sidecar_path(args.report_output, "repo-artifact-evidence")
+    failure_report = _ask_execute_sidecar_path(args.report_output, "failure-analysis")
+
+    semantic_args = _execution_args_from_ask(
+        args,
+        command="semantic-debug",
+        report_output=str(semantic_report),
+    )
+    source_plan, intent, plan = payload_from_args(semantic_args)
+    semantic_payload = build_semantic_debug_payload(
+        semantic_args,
+        source_plan=source_plan,
+        intent=intent,
+        plan=plan,
+        default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        mask_context=_mask_context_from_args(args),
+        configuration_warnings=_configuration_warnings(source_plan),
+    )
+    semantic_report.write_text(render(semantic_payload, "json"), encoding="utf-8")
+    semantic_packet = semantic_payload["semantic_debug"]
+
+    repo_artifact_payload = {
+        "repo_artifact_evidence": _build_devlog_repo_artifact_evidence_packet(
+            cwd=Path(args.cwd).expanduser().resolve(),
+            query=args.query,
+        )
+    }
+    repo_report.write_text(render(repo_artifact_payload, "json"), encoding="utf-8")
+
+    failure_payload = build_failure_analysis_payload(
+        semantic_debug_report=semantic_report,
+        story_id="devlog-source-reach",
+        repo_artifact_evidence_report=repo_report,
+    )
+    failure_report.write_text(render(failure_payload, "json"), encoding="utf-8")
+    failure_packet = failure_payload["failure_analysis"]
+
+    target_reads, diagnostic_reads = _partition_devlog_source_window_reads(
+        semantic_packet,
+        query=args.query,
+    )
+    compact = {
+        "schema_version": 1,
+        "status": semantic_packet.get("status"),
+        "query": args.query,
+        "report_written": str(Path(args.report_output).expanduser()),
+        "linked_reports": {
+            "semantic_debug": str(semantic_report),
+            "failure_analysis": str(failure_report),
+            "repo_artifact_evidence": str(repo_report),
+        },
+        "source_read_order": [
+            "target_historical_source_window_reads",
+            "repo_phase_category_evidence",
+            "diagnostic_source_window_reads",
+        ],
+        "target_historical_source_window_reads": target_reads,
+        "target_historical_source_window_read_count": len(target_reads),
+        "diagnostic_source_window_reads": diagnostic_reads,
+        "diagnostic_source_window_read_count": len(diagnostic_reads),
+        "diagnostic_policy": {
+            "current_adjacent_same_loop_refs_are_default_final_support": False,
+            "actionability": (
+                "diagnostic-only unless the user explicitly asks to audit current output, "
+                "the current route, the current lane, or a prior answer/report"
+            ),
+        },
+        "repo_phase_category_evidence": _compact_repo_phase_category_evidence(
+            repo_artifact_payload["repo_artifact_evidence"]
+        ),
+        "failure_analysis": {
+            "status": failure_packet.get("status"),
+            "report_written": str(failure_report),
+            "devlog_brief": failure_packet.get("devlog_brief"),
+            "story_phase_summary": _compact_story_phase_summary(
+                failure_packet.get("story_phase_summary")
+            ),
+        },
+        "answer_contract": {
+            "answer_status": "inspect_target_history_before_answer",
+            "required_read_order": [
+                "target_historical_source_window_reads",
+                "failure_analysis.devlog_brief",
+                "repo_phase_category_evidence",
+            ],
+            "only_continue_if": (
+                "A named devlog facet remains missing after target historical source-window "
+                "reads and the safe repo-phase/category packet."
+            ),
+        },
+        "privacy_flags": {
+            "raw_private_transcript_text_included": False,
+            "raw_private_session_ids_included": False,
+            "absolute_private_paths_committed": False,
+            "vectors_or_indexes_included": False,
+            "repo_artifact_evidence_is_committed_safe_metadata_only": True,
+        },
+    }
+    Path(args.report_output).expanduser().write_text(
+        render({"devlog_failure_analysis": compact}, "json"),
+        encoding="utf-8",
+    )
+    return {"devlog_failure_analysis": compact}
+
+
+DEVLOG_REPO_ARTIFACT_PREFIXES = (
+    "tasks/",
+    "reports/",
+    "docs/",
+    "codex/state/reviews/",
+)
+DEVLOG_REPO_ARTIFACT_SUFFIXES = (".md", ".json", ".txt")
+DEVLOG_REPO_ARTIFACT_SCAN_LIMIT = 400
+DEVLOG_REPO_ARTIFACT_ROW_LIMIT = 20
+DEVLOG_SAFE_TERM_CATEGORY_MAP = {
+    "docker": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "runner": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "harness": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "auth": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "live-send": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "live send": ("infrastructure_churn", "runner_harness_auth_live_send"),
+    "coordinator": ("workflow_process_overhead", "coordinator_review_process"),
+    "review": ("workflow_process_overhead", "coordinator_review_process"),
+    "workflow": ("workflow_process_overhead", "coordinator_review_process"),
+    "process": ("workflow_process_overhead", "coordinator_review_process"),
+    "product": ("product_behavior_recovery", "product_path_recovery"),
+    "product-path": ("product_behavior_recovery", "product_path_recovery"),
+    "graveyard": ("product_behavior_recovery", "product_path_recovery"),
+    "source window": ("historical_source_reach", "historical_source_window"),
+    "source-window": ("historical_source_reach", "historical_source_window"),
+    "devlog": ("devlog_story_map", "story_reconstruction"),
+}
+
+
+def _build_devlog_repo_artifact_evidence_packet(*, cwd: Path, query: str) -> dict:
+    rows = []
+    for rel_path in _iter_safe_repo_artifact_paths(cwd):
+        try:
+            text = (cwd / rel_path).read_text(encoding="utf-8", errors="ignore")[:200_000].casefold()
+        except OSError:
+            continue
+        matched_terms = [
+            term
+            for term in DEVLOG_SAFE_TERM_CATEGORY_MAP
+            if term in text or term in query.casefold()
+        ]
+        if not matched_terms:
+            continue
+        category_ids = []
+        phase_hints = []
+        for term in matched_terms:
+            category_id, phase_hint = DEVLOG_SAFE_TERM_CATEGORY_MAP[term]
+            if category_id not in category_ids:
+                category_ids.append(category_id)
+            if phase_hint not in phase_hints:
+                phase_hints.append(phase_hint)
+        rows.append(
+            {
+                "safe_handles": [str(rel_path)],
+                "support_surfaces": ["repo_artifact_evidence.safe_repo_scan"],
+                "category_ids": category_ids[:4],
+                "phase_hints": phase_hints[:4],
+                "matched_safe_terms": matched_terms[:8],
+                "evidence_strength": {
+                    "safe_handle_count": 1,
+                    "support_surface_count": 1,
+                    "matched_safe_term_count": len(matched_terms),
+                },
+                "claim_boundaries": [
+                    "safe repo metadata only",
+                    "does not prove root cause, all-history completeness, token savings, speed, or final answer quality",
+                ],
+                "status": "safe_repo_phase_category_evidence",
+            }
+        )
+        if len(rows) >= DEVLOG_REPO_ARTIFACT_ROW_LIMIT:
+            break
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "rows": rows,
+        "row_count": len(rows),
+        "source_policy": {
+            "raw_private_text_included": False,
+            "absolute_private_paths_included": False,
+            "session_ids_included": False,
+            "vectors_or_indexes_included": False,
+            "safe_repo_relative_handles_only": True,
+        },
+    }
+
+
+def _iter_safe_repo_artifact_paths(cwd: Path) -> list[Path]:
+    paths: list[Path] = []
+    for prefix in DEVLOG_REPO_ARTIFACT_PREFIXES:
+        root = cwd / prefix
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if len(paths) >= DEVLOG_REPO_ARTIFACT_SCAN_LIMIT:
+                return paths
+            if not path.is_file() or path.suffix not in DEVLOG_REPO_ARTIFACT_SUFFIXES:
+                continue
+            try:
+                rel = path.relative_to(cwd)
+            except ValueError:
+                continue
+            rel_text = rel.as_posix()
+            if ".private/" in rel_text or not rel_text.startswith(DEVLOG_REPO_ARTIFACT_PREFIXES):
+                continue
+            paths.append(rel)
+    return paths
+
+
+def _compact_repo_phase_category_evidence(packet: dict) -> dict:
+    rows = list(packet.get("rows") or [])
+    categories = sorted(
+        {
+            category
+            for row in rows
+            for category in list(row.get("category_ids") or [])
+        }
+    )
+    phase_hints = sorted(
+        {
+            phase
+            for row in rows
+            for phase in list(row.get("phase_hints") or [])
+        }
+    )
+    return {
+        "status": packet.get("status"),
+        "row_count": packet.get("row_count", len(rows)),
+        "category_ids": categories[:12],
+        "phase_hints": phase_hints[:12],
+        "rows": rows[:8],
+        "source_policy": packet.get("source_policy"),
+    }
+
+
+def _compact_story_phase_summary(summary: object) -> dict:
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        "status": summary.get("status"),
+        "phase_count": summary.get("phase_count"),
+        "usable_phase_count": summary.get("usable_phase_count"),
+        "rows": list(summary.get("rows") or [])[:6],
+        "gap_reasons": list(summary.get("gap_reasons") or [])[:8],
+    }
+
+
+def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[list[dict], list[dict]]:
+    handoff = packet.get("source_locator_handoff") if isinstance(packet.get("source_locator_handoff"), dict) else {}
+    reads = list(handoff.get("next_reads") or packet.get("next_reads") or [])
+    target_reads = []
+    diagnostic_reads = []
+    current_audit_requested = _devlog_current_output_audit_requested(query)
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+        row = dict(read)
+        if _devlog_read_is_diagnostic(row) and not current_audit_requested:
+            row["diagnostic_only"] = True
+            row["read_more_actionable"] = False
+            row["followthrough_actionable"] = False
+            row["diagnostic_open_policy"] = (
+                "diagnostic-only for historical devlog reconstruction unless the user asks "
+                "to audit current output, the current route, the current lane, or a prior answer/report"
+            )
+            row.pop("expansion_actions", None)
+            row.pop("context_actions", None)
+            diagnostic_reads.append(row)
+        elif row.get("target"):
+            row["final_support_candidate"] = True
+            target_reads.append(row)
+    return target_reads[:8], diagnostic_reads[:8]
+
+
+def _devlog_current_output_audit_requested(query: str) -> bool:
+    text = query.casefold()
+    current_terms = (
+        "current output",
+        "current route",
+        "current run",
+        "current lane",
+        "this output",
+        "this route",
+        "this run",
+        "this lane",
+        "prior answer",
+        "previous answer",
+        "last answer",
+        "this report",
+    )
+    audit_terms = ("audit", "check", "inspect", "verify", "did it cite", "did the answer")
+    return any(term in text for term in current_terms) and any(term in text for term in audit_terms)
+
+
+def _devlog_read_is_diagnostic(read: dict) -> bool:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if (
+        read.get("diagnostic_only") is True
+        or read.get("read_more_actionable") is False
+        or selection.get("diagnostic_only") is True
+    ):
+        return True
+    role = str(selection.get("source_chronology_role") or "")
+    if role.endswith("_diagnostic") or "diagnostic" in role:
+        return True
+    text = " ".join(
+        str(value)
+        for value in (
+            read.get("target"),
+            read.get("reason"),
+            read.get("candidate_id"),
+            (read.get("source_ref") or {}).get("path") if isinstance(read.get("source_ref"), dict) else "",
+        )
+    ).casefold()
+    diagnostic_markers = (
+        "/current/",
+        "/current_task/",
+        "/adjacent/",
+        "/posthoc/",
+        "current-run",
+        "current run",
+        "same-loop",
+        "same loop",
+        "current task",
+        "prior-final",
+        "prior final",
+        "previous final",
+        "final answer",
+        "adjudication",
+        "answer-key",
+        "answer key",
+    )
+    return any(marker in text for marker in diagnostic_markers)
+
+
 def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dict:
     source_plan, intent, plan = payload_from_args(args)
     payload = build_semantic_debug_payload(
@@ -2137,6 +2491,30 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
 
 
 def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
+    if output_key == "devlog_failure_analysis":
+        target_reads = list(compact.get("target_historical_source_window_reads") or [])
+        repo_evidence = compact.get("repo_phase_category_evidence") or {}
+        failure_analysis = compact.get("failure_analysis") or {}
+        return {
+            "answer_status": "inspect_target_history_before_answer",
+            "promotion_status": "unpromoted_devlog_failure_analysis_source_reach_package",
+            "promotion_reason": (
+                "The devlog/failure-analysis route is a source-reach package, not final prose; "
+                "open target historical source-window reads before answering."
+            ),
+            "read": target_reads,
+            "then_use": {
+                "failure_analysis_devlog_brief": failure_analysis.get("devlog_brief"),
+                "repo_phase_category_evidence": repo_evidence,
+            },
+            "diagnostics_after": list(compact.get("diagnostic_source_window_reads") or []),
+            "diagnostic_policy": compact.get("diagnostic_policy"),
+            "stop": selected_route.get("stop_guidance"),
+            "only_continue_if": (compact.get("answer_contract") or {}).get("only_continue_if")
+            or selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written"),
+            "linked_reports": compact.get("linked_reports"),
+        }
     if output_key == "semantic_debug":
         handoff = compact.get("answer_ready_handoff") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
@@ -2291,6 +2669,28 @@ def _positive_int(value: object) -> int:
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
+    if output_key == "devlog_failure_analysis":
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "report_written": compact.get("report_written"),
+            "linked_reports": compact.get("linked_reports"),
+            "source_read_order": compact.get("source_read_order"),
+            "target_historical_source_window_reads": compact.get("target_historical_source_window_reads", [])[:5],
+            "target_historical_source_window_read_count": compact.get(
+                "target_historical_source_window_read_count"
+            ),
+            "repo_phase_category_evidence": compact.get("repo_phase_category_evidence"),
+            "failure_analysis": compact.get("failure_analysis"),
+            "diagnostic_source_window_reads": compact.get("diagnostic_source_window_reads", [])[:5],
+            "diagnostic_source_window_read_count": compact.get("diagnostic_source_window_read_count"),
+            "diagnostic_policy": compact.get("diagnostic_policy"),
+            "privacy_flags": compact.get("privacy_flags"),
+            "message": (
+                "Full devlog/failure-analysis source-reach package written to report_output; "
+                "open target historical source-window reads before current/adjacent diagnostics."
+            ),
+        }
     if output_key == "semantic_debug":
         return {
             "schema_version": compact.get("schema_version"),

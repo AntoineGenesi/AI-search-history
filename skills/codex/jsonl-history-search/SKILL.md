@@ -55,7 +55,11 @@ semantic-debug and bounded no-evidence/no-evidence-report routes, writes a full
 JSON report behind a report handle, and returns a compact answer/read/stop
 contract. Only bounded no-evidence routes executed through `no-evidence-report`
 may surface promoted scoped no-evidence answer status; semantic-debug execution
-is convenience output and remains inspect-before-answer. Unsupported routes fail
+is convenience output and remains inspect-before-answer. Devlog/failure-analysis
+execution is a source-reach package: open target historical source-window reads
+before current/adjacent diagnostics, then use the linked
+`failure_analysis.devlog_brief` and safe repo-phase/category evidence as
+boundaries. Unsupported routes fail
 closed with `execution_status:
 unsupported_route` and the normal first command; they are not shell-executed.
 Use plain `ask` when you only need route classification or when the selected
@@ -178,6 +182,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Turn the early coordinator experiment into a devlog segment." "Reconstruct the arc with dates and concrete examples of Docker/runner/harness/auth/live-send/workflow drift." | Devlog/failure-analysis historical source reach | `ask --execute`, then `references/semantic-debugging.md` if a source-field needs interpretation | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | helper auto-executes bounded no-evidence, then `references/no-evidence.md` only if a scope/cap field needs interpretation | `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"` |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
@@ -196,6 +201,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
 - "did the agent read/follow the reviewer skill?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/skill-audit.md`
+- "turn the early coordinator experiment into a devlog segment" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text`; open `target_historical_source_window_reads` before current/adjacent diagnostics, then use `failure_analysis.devlog_brief` and safe repo-phase/category evidence.
 - "is there evidence that X was discussed in this bounded source scope?" -> `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`; the helper auto-executes only bounded no-evidence and, if promoted, you can answer from the scoped no-evidence contract without a manual rerun/read-more.
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
@@ -252,6 +258,14 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   no-evidence contract. Inspect searched files/bytes, missing/excluded scope,
   cap status, answer scope, not_all_history_absence, saved report, and
   read-more stop fields before deciding whether any diagnostics are needed.
+- When `ask` selects devlog/failure-analysis historical source reach, prefer
+  `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text`.
+  Open `target_historical_source_window_reads` first. Treat
+  current/adjacent/same-loop diagnostics as non-actionable by default unless
+  the user explicitly asks to audit current output, the current route, the
+  current lane, or a prior answer/report. Use the linked
+  `failure_analysis.devlog_brief` and safe repo-phase/category evidence as
+  source boundaries before broad repo archaeology.
 - When the user prompt includes a reviewed source case or `real-jsh...` handle,
   installed global-skill workflows still run `validate-install` after reading
   this skill. After freshness preflight passes, run `jsonl-history-search ask`
