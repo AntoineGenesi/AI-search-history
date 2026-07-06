@@ -2066,6 +2066,11 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         semantic_packet,
         query=args.query,
     )
+    if not target_reads:
+        target_reads = _devlog_committed_safe_packet_fallback_reads(
+            repo_artifact_payload["repo_artifact_evidence"],
+            failure_packet=failure_packet,
+        )
     compact = {
         "schema_version": 1,
         "status": semantic_packet.get("status"),
@@ -2282,31 +2287,175 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
     reads = list(handoff.get("next_reads") or packet.get("next_reads") or [])
     target_reads = []
     diagnostic_reads = []
-    current_audit_requested = _devlog_current_output_audit_requested(query)
+    artifact_audit_requested = _devlog_source_artifact_audit_requested(query)
     for read in reads:
         if not isinstance(read, dict):
             continue
         row = dict(read)
-        if _devlog_read_is_diagnostic(row) and not current_audit_requested:
-            row["diagnostic_only"] = True
-            row["read_more_actionable"] = False
-            row["followthrough_actionable"] = False
-            row["diagnostic_open_policy"] = (
-                "diagnostic-only for historical devlog reconstruction unless the user asks "
-                "to audit current output, the current route, the current lane, or a prior answer/report"
-            )
-            row.pop("expansion_actions", None)
-            row.pop("context_actions", None)
-            diagnostic_reads.append(row)
-        elif row.get("target"):
+        if _devlog_read_is_synthetic_or_test_artifact(row) and not artifact_audit_requested:
+            diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="synthetic_test_smoke_artifact"))
+        elif _devlog_read_is_diagnostic(row) and not artifact_audit_requested:
+            diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="chronology_diagnostic"))
+        elif row.get("target") and _devlog_target_read_has_real_source_provenance(row):
+            row = _devlog_mark_real_source_target_read(row)
             row["final_support_candidate"] = True
             target_reads.append(row)
+        elif row.get("target") and artifact_audit_requested:
+            row["final_support_candidate"] = True
+            row["artifact_audit_promoted"] = True
+            target_reads.append(row)
+        elif row.get("target"):
+            diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="missing_real_source_provenance"))
     return target_reads[:8], diagnostic_reads[:8]
 
 
-def _devlog_current_output_audit_requested(query: str) -> bool:
+def _devlog_demote_source_window_read(read: dict, *, reason: str) -> dict:
+    row = dict(read)
+    selection = (
+        dict(row.get("historical_provenance_selection"))
+        if isinstance(row.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if selection:
+        selection["diagnostic_only"] = True
+        selection["final_support_allowed"] = False
+        selection["read_more_actionable"] = False
+        selection["followthrough_actionable"] = False
+        selection.setdefault("raw_text_included", False)
+        selection.setdefault("demotion_reason", reason)
+        row["historical_provenance_selection"] = selection
+    row["diagnostic_only"] = True
+    row["read_more_actionable"] = False
+    row["followthrough_actionable"] = False
+    row["devlog_target_promotion_status"] = "demoted"
+    row["devlog_target_promotion_reason"] = reason
+    row["diagnostic_open_policy"] = (
+        "diagnostic-only for historical devlog reconstruction unless the user asks "
+        "to audit tests/fixtures/smokes, current output, the current route, or a prior report"
+    )
+    row.pop("expansion_actions", None)
+    row.pop("context_actions", None)
+    row.pop("final_support_candidate", None)
+    return row
+
+
+def _devlog_target_read_has_real_source_provenance(read: dict) -> bool:
+    if not read.get("target") or read.get("diagnostic_only") is True or read.get("read_more_actionable") is False:
+        return False
+    if _devlog_read_is_synthetic_or_test_artifact(read):
+        return False
+    if _devlog_raw_jsonl_source_target(read):
+        return True
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if not selection:
+        return False
+    if (
+        selection.get("diagnostic_only") is True
+        or selection.get("final_support_allowed") is not True
+        or selection.get("read_more_actionable") is False
+    ):
+        return False
+    role = str(selection.get("source_chronology_role") or "")
+    if not role or role.endswith("_diagnostic") or "diagnostic" in role:
+        return False
+    positive_roles = {
+        "target_historical_raw_jsonl_source_ref",
+        "candidate_or_original_source_ref",
+        "historical_task_review_commit_secondary_ref",
+        "pre_existing_source_ref_quoted_by_current_run_echo",
+    }
+    return role in positive_roles
+
+
+def _devlog_mark_real_source_target_read(read: dict) -> dict:
+    row = dict(read)
+    if not isinstance(row.get("historical_provenance_selection"), dict):
+        row["historical_provenance_selection"] = {
+            "schema_version": 1,
+            "source_chronology_role": "target_historical_raw_jsonl_source_ref",
+            "final_support_allowed": True,
+            "read_more_actionable": row.get("read_more_actionable", True) is not False,
+            "followthrough_actionable": row.get("followthrough_actionable", True) is not False,
+            "diagnostic_only": False,
+            "raw_text_included": False,
+        }
+    return row
+
+
+def _devlog_raw_jsonl_source_target(read: dict) -> bool:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    path = str(source_ref.get("path") or target.rsplit(":", 1)[0] or "")
+    return target.endswith(".jsonl") or ".jsonl:" in target or path.casefold().replace("\\", "/").endswith(".jsonl")
+
+
+def _devlog_committed_safe_packet_fallback_reads(packet: dict, *, failure_packet: dict) -> list[dict]:
+    rows = list(packet.get("rows") or []) if isinstance(packet, dict) else []
+    fallback_rows = []
+    for index, row in enumerate(rows[:4], 1):
+        if not isinstance(row, dict):
+            continue
+        fallback_rows.append(
+            {
+                "kind": "committed_safe_devlog_packet_fallback",
+                "packet_handle": "repo_phase_category_evidence",
+                "candidate_id": f"devlog-safe-packet-fallback-{index:03d}",
+                "safe_handles": list(row.get("safe_handles") or [])[:4],
+                "category_ids": list(row.get("category_ids") or [])[:4],
+                "phase_hints": list(row.get("phase_hints") or [])[:4],
+                "support_surfaces": list(row.get("support_surfaces") or [])[:4],
+                "evidence_strength": row.get("evidence_strength"),
+                "claim_boundaries": list(row.get("claim_boundaries") or [])[:4],
+                "final_support_candidate": True,
+                "fallback_reason": "no positive real-source JSONL target survived devlog source-quality gating",
+                "historical_provenance_selection": {
+                    "schema_version": 1,
+                    "source_chronology_role": "bounded_committed_safe_packet_fallback",
+                    "final_support_allowed": True,
+                    "read_more_actionable": False,
+                    "followthrough_actionable": True,
+                    "diagnostic_only": False,
+                    "raw_text_included": False,
+                },
+            }
+        )
+    if not fallback_rows:
+        devlog_brief = failure_packet.get("devlog_brief") if isinstance(failure_packet, dict) else {}
+        if isinstance(devlog_brief, dict) and devlog_brief:
+            fallback_rows.append(
+                {
+                    "kind": "committed_safe_devlog_packet_fallback",
+                    "packet_handle": "failure_analysis.devlog_brief",
+                    "candidate_id": "devlog-safe-packet-fallback-brief-001",
+                    "status": devlog_brief.get("status"),
+                    "support_surfaces": ["failure_analysis.devlog_brief"],
+                    "claim_boundaries": [
+                        "committed-safe summary only",
+                        "not a substitute for raw historical source windows when available",
+                    ],
+                    "final_support_candidate": True,
+                    "fallback_reason": "no positive real-source JSONL target survived devlog source-quality gating",
+                    "historical_provenance_selection": {
+                        "schema_version": 1,
+                        "source_chronology_role": "bounded_committed_safe_packet_fallback",
+                        "final_support_allowed": True,
+                        "read_more_actionable": False,
+                        "followthrough_actionable": True,
+                        "diagnostic_only": False,
+                        "raw_text_included": False,
+                    },
+                }
+            )
+    return fallback_rows[:4]
+
+
+def _devlog_source_artifact_audit_requested(query: str) -> bool:
     text = query.casefold()
-    current_terms = (
+    artifact_terms = (
         "current output",
         "current route",
         "current run",
@@ -2318,10 +2467,73 @@ def _devlog_current_output_audit_requested(query: str) -> bool:
         "prior answer",
         "previous answer",
         "last answer",
+        "prior report",
+        "previous report",
+        "last report",
         "this report",
+        "test",
+        "tests",
+        "fixture",
+        "fixtures",
+        "smoke",
+        "smokes",
+        "regression",
+        "current output",
+        "command output",
     )
     audit_terms = ("audit", "check", "inspect", "verify", "did it cite", "did the answer")
-    return any(term in text for term in current_terms) and any(term in text for term in audit_terms)
+    return any(term in text for term in artifact_terms) and any(term in text for term in audit_terms)
+
+
+def _devlog_read_is_synthetic_or_test_artifact(read: dict) -> bool:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    text = " ".join(
+        str(value)
+        for value in (
+            read.get("kind"),
+            read.get("target"),
+            read.get("reason"),
+            read.get("candidate_id"),
+            read.get("source_category"),
+            source_ref.get("path"),
+            selection.get("source_chronology_role"),
+        )
+    ).casefold().replace("\\", "/")
+    path_markers = (
+        "/tests/",
+        "tests/",
+        "/test/",
+        "/fixtures/",
+        "fixtures/",
+        "/fixture/",
+        "/smoke/",
+        "smoke/",
+        "/regression/",
+        "regression/",
+    )
+    text_markers = (
+        "synthetic",
+        "end-to-end smoke",
+        "e2e smoke",
+        "smoke output",
+        "smoke test",
+        "fixture output",
+        "fixture jsonl",
+        "regression fixture",
+        "regression test",
+        "command-output",
+        "command output",
+        "output echo",
+        "route echo",
+        "route-echo",
+        "golden output",
+    )
+    return any(marker in text for marker in path_markers + text_markers)
 
 
 def _devlog_read_is_diagnostic(read: dict) -> bool:
