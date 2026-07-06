@@ -2285,6 +2285,7 @@ def _compact_story_phase_summary(summary: object) -> dict:
 def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[list[dict], list[dict]]:
     handoff = packet.get("source_locator_handoff") if isinstance(packet.get("source_locator_handoff"), dict) else {}
     reads = list(handoff.get("next_reads") or packet.get("next_reads") or [])
+    candidates_by_id, candidates_by_target = _devlog_source_window_candidate_lookups(packet)
     target_reads = []
     diagnostic_reads = []
     artifact_audit_requested = _devlog_source_artifact_audit_requested(query)
@@ -2292,11 +2293,19 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
         if not isinstance(read, dict):
             continue
         row = dict(read)
-        if _devlog_read_is_synthetic_or_test_artifact(row) and not artifact_audit_requested:
-            diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="synthetic_test_smoke_artifact"))
+        candidate = candidates_by_id.get(str(row.get("candidate_id") or "")) or candidates_by_target.get(
+            str(row.get("target") or "")
+        )
+        if _devlog_read_is_invalid_default_target_artifact(row, candidate=candidate) and not artifact_audit_requested:
+            diagnostic_reads.append(
+                _devlog_demote_source_window_read(
+                    row,
+                    reason=_devlog_invalid_default_target_artifact_reason(row, candidate=candidate),
+                )
+            )
         elif _devlog_read_is_diagnostic(row) and not artifact_audit_requested:
             diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="chronology_diagnostic"))
-        elif row.get("target") and _devlog_target_read_has_real_source_provenance(row):
+        elif row.get("target") and _devlog_target_read_has_real_source_provenance(row, candidate=candidate):
             row = _devlog_mark_real_source_target_read(row)
             row["final_support_candidate"] = True
             target_reads.append(row)
@@ -2307,6 +2316,40 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
         elif row.get("target"):
             diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="missing_real_source_provenance"))
     return target_reads[:8], diagnostic_reads[:8]
+
+
+def _devlog_source_window_candidate_lookups(packet: dict) -> tuple[dict[str, dict], dict[str, dict]]:
+    candidates = []
+    for key in ("strongest_candidates", "find_candidates", "timeline"):
+        value = packet.get(key)
+        if isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+    handoff = packet.get("source_locator_handoff") if isinstance(packet.get("source_locator_handoff"), dict) else {}
+    for key in ("source_windows", "source_refs"):
+        value = handoff.get(key)
+        if isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+
+    by_id: dict[str, dict] = {}
+    by_target: dict[str, dict] = {}
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if candidate_id and candidate_id not in by_id:
+            by_id[candidate_id] = candidate
+        target = str(candidate.get("target") or "")
+        if not target and isinstance(candidate.get("source_ref"), dict):
+            target = _devlog_source_ref_target(candidate["source_ref"])
+        if target and target not in by_target:
+            by_target[target] = candidate
+    return by_id, by_target
+
+
+def _devlog_source_ref_target(source_ref: dict) -> str:
+    path = source_ref.get("path")
+    line = source_ref.get("line")
+    if not path:
+        return ""
+    return f"{path}:{line}" if line else str(path)
 
 
 def _devlog_demote_source_window_read(read: dict, *, reason: str) -> dict:
@@ -2339,10 +2382,10 @@ def _devlog_demote_source_window_read(read: dict, *, reason: str) -> dict:
     return row
 
 
-def _devlog_target_read_has_real_source_provenance(read: dict) -> bool:
+def _devlog_target_read_has_real_source_provenance(read: dict, *, candidate: dict | None = None) -> bool:
     if not read.get("target") or read.get("diagnostic_only") is True or read.get("read_more_actionable") is False:
         return False
-    if _devlog_read_is_synthetic_or_test_artifact(read):
+    if _devlog_read_is_invalid_default_target_artifact(read, candidate=candidate):
         return False
     if _devlog_raw_jsonl_source_target(read):
         return True
@@ -2485,7 +2528,20 @@ def _devlog_source_artifact_audit_requested(query: str) -> bool:
     return any(term in text for term in artifact_terms) and any(term in text for term in audit_terms)
 
 
-def _devlog_read_is_synthetic_or_test_artifact(read: dict) -> bool:
+def _devlog_read_is_invalid_default_target_artifact(read: dict, *, candidate: dict | None = None) -> bool:
+    return _devlog_read_is_synthetic_or_test_artifact(
+        read,
+        candidate=candidate,
+    ) or _devlog_read_is_current_generated_or_posthoc_artifact(read, candidate=candidate)
+
+
+def _devlog_invalid_default_target_artifact_reason(read: dict, *, candidate: dict | None = None) -> str:
+    if _devlog_read_is_synthetic_or_test_artifact(read, candidate=candidate):
+        return "synthetic_test_smoke_artifact"
+    return "current_generated_or_posthoc_artifact"
+
+
+def _devlog_read_is_synthetic_or_test_artifact(read: dict, *, candidate: dict | None = None) -> bool:
     selection = (
         read.get("historical_provenance_selection")
         if isinstance(read.get("historical_provenance_selection"), dict)
@@ -2502,6 +2558,7 @@ def _devlog_read_is_synthetic_or_test_artifact(read: dict) -> bool:
             read.get("source_category"),
             source_ref.get("path"),
             selection.get("source_chronology_role"),
+            _devlog_candidate_marker_text(candidate),
         )
     ).casefold().replace("\\", "/")
     path_markers = (
@@ -2526,14 +2583,117 @@ def _devlog_read_is_synthetic_or_test_artifact(read: dict) -> bool:
         "fixture jsonl",
         "regression fixture",
         "regression test",
-        "command-output",
-        "command output",
-        "output echo",
-        "route echo",
-        "route-echo",
         "golden output",
     )
     return any(marker in text for marker in path_markers + text_markers)
+
+
+def _devlog_read_is_current_generated_or_posthoc_artifact(read: dict, *, candidate: dict | None = None) -> bool:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    text = re.sub(
+        r"\s+",
+        " ",
+        " ".join(
+            str(value)
+            for value in (
+                read.get("kind"),
+                read.get("target"),
+                read.get("reason"),
+                read.get("candidate_id"),
+                read.get("source_category"),
+                source_ref.get("path"),
+                source_ref.get("session"),
+                selection.get("source_chronology_role"),
+                selection.get("selection_reason"),
+                _devlog_candidate_marker_text(candidate),
+            )
+        )
+        .casefold()
+        .replace("\\", "/")
+        .replace("_", " "),
+    ).strip()
+    markers = (
+        "/current/",
+        "/current task/",
+        "/current-task/",
+        "/adjacent/",
+        "/posthoc/",
+        "/post-hoc/",
+        "current-run",
+        "current run",
+        "same-loop",
+        "same loop",
+        "same-run",
+        "same run",
+        "same-lane",
+        "same lane",
+        "current task",
+        "current route",
+        "current lane",
+        "ask-execute",
+        "ask --execute",
+        "jsonl-history-search ask",
+        "jsonl history search ask",
+        "devlog-source-reach",
+        "devlog source reach",
+        "pressure command",
+        "pressure artifact",
+        "command-output",
+        "command output",
+        "command echo",
+        "output echo",
+        "route echo",
+        "route-echo",
+        "tool output",
+        "generated output",
+        "source locator handoff",
+        "source-locator-handoff",
+        "source_locator_handoff",
+        "report output",
+        "report-output",
+        "report_output",
+        "process exited with code",
+        "original token count",
+        "prior report",
+        "previous report",
+        "last report",
+        "post-hoc report",
+        "post hoc report",
+        "adjudication",
+        "answer-key",
+        "answer key",
+        "prior-final",
+        "prior final",
+        "previous final",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _devlog_candidate_marker_text(candidate: dict | None) -> str:
+    if not isinstance(candidate, dict):
+        return ""
+    source_ref = candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+    return " ".join(
+        str(value)
+        for value in (
+            candidate.get("candidate_id"),
+            candidate.get("target"),
+            candidate.get("path"),
+            source_ref.get("path"),
+            candidate.get("stage"),
+            " ".join(str(item) for item in candidate.get("stages") or []),
+            " ".join(str(item) for item in candidate.get("reason_codes") or []),
+            " ".join(str(item) for item in candidate.get("artifacts") or []),
+            " ".join(str(item) for item in candidate.get("tasks") or []),
+            candidate.get("selection_reason"),
+            candidate.get("snippet"),
+        )
+    )
 
 
 def _devlog_read_is_diagnostic(read: dict) -> bool:
