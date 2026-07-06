@@ -1441,7 +1441,7 @@ def apply_historical_provenance_self_echo_policy(
                 "detected_handles": handles[:8],
                 "raw_text_included": False,
             }
-        elif policy_wanted:
+        elif policy_wanted or orchestration_wanted:
             row.setdefault("historical_provenance_selection", {
                 "schema_version": 1,
                 "source_chronology_role": category["source_chronology_role"],
@@ -2531,6 +2531,18 @@ def historical_provenance_source_category(
     raw_jsonl = is_jsonl_read_target(target) or path.lower().replace("\\", "/").endswith(".jsonl")
     if handles and not historical_provenance_matches_requested_handle(text, handles):
         return historical_provenance_category_row("unrelated_high_lexical_diagnostic", final=False, diagnostic=True)
+    selection = read.get("historical_provenance_selection") if isinstance(read.get("historical_provenance_selection"), dict) else {}
+    existing_role = str(selection.get("source_chronology_role") or "")
+    if (
+        existing_role in {
+            "target_historical_raw_jsonl_source_ref",
+            "candidate_or_original_source_ref",
+            "pre_existing_source_ref_quoted_by_current_run_echo",
+        }
+        and selection.get("diagnostic_only") is not True
+        and selection.get("final_support_allowed") is True
+    ):
+        return historical_provenance_category_row(existing_role, final=True, diagnostic=False)
     if raw_jsonl:
         return historical_provenance_category_row("target_historical_raw_jsonl_source_ref", final=True, diagnostic=False)
     if historical_provenance_secondary_task_review_commit_ref(read, candidate, text=text):

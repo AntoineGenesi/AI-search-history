@@ -2376,11 +2376,34 @@ def _devlog_source_window_candidate_lookups(packet: dict) -> tuple[dict[str, dic
     for key in ("source_windows", "source_refs"):
         value = handoff.get(key)
         if isinstance(value, list):
-            candidates.extend(
-                _devlog_candidate_lookup_record(item, source=key)
-                for item in value
-                if isinstance(item, dict)
-            )
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                candidates.append(_devlog_candidate_lookup_record(item, source=key))
+                next_read = item.get("next_read") if isinstance(item.get("next_read"), dict) else {}
+                if not next_read:
+                    continue
+                merged = {**item, **next_read}
+                if item.get("source_ref") and not next_read.get("source_ref"):
+                    merged["source_ref"] = item.get("source_ref")
+                if item.get("target") and not next_read.get("target"):
+                    merged["target"] = item.get("target")
+                if item.get("role") and not next_read.get("role"):
+                    merged["role"] = item.get("role")
+                if item.get("timestamp_utc") and not next_read.get("timestamp_utc"):
+                    merged["timestamp_utc"] = item.get("timestamp_utc")
+                candidates.append(_devlog_candidate_lookup_record(merged, source=f"{key}.next_read"))
+    candidate_ordering = handoff.get("candidate_ordering") if isinstance(handoff.get("candidate_ordering"), dict) else {}
+    top_candidates = (
+        candidate_ordering.get("top_candidates")
+        if isinstance(candidate_ordering.get("top_candidates"), list)
+        else []
+    )
+    candidates.extend(
+        _devlog_candidate_lookup_record(item, source="candidate_ordering.top_candidates")
+        for item in top_candidates
+        if isinstance(item, dict)
+    )
 
     by_id: dict[str, dict] = {}
     by_target: dict[str, dict] = {}
@@ -2544,10 +2567,14 @@ def _devlog_candidate_has_source_window_provenance(candidate: dict | None) -> bo
         return False
     sources = set(str(source) for source in candidate.get("_devlog_lookup_sources") or [])
     return (
-        "source_windows" in sources
+        any(source.startswith("source_windows") for source in sources)
         or candidate.get("summary_kind") == "compact_source_window_ref"
         or bool(candidate.get("window_id"))
         or (bool(candidate.get("window_kind")) and isinstance(candidate.get("source_ref"), dict))
+        or (
+            isinstance(candidate.get("source_window_provenance"), dict)
+            and candidate["source_window_provenance"].get("selected_source_window") is True
+        )
     )
 
 
@@ -2618,6 +2645,7 @@ def _devlog_default_target_source_eligibility(read: dict, *, candidate: dict | N
         and chronology_role == "candidate_or_original_source_ref"
         and has_source_window_provenance
         and is_jsonl_target
+        and _devlog_role_is_historical_message(role)
     ):
         return {
             **base,
@@ -2628,7 +2656,17 @@ def _devlog_default_target_source_eligibility(read: dict, *, candidate: dict | N
             "record_role": role or None,
         }
 
-    if is_jsonl_target and _devlog_role_is_historical_message(role):
+    if (
+        is_jsonl_target
+        and _devlog_role_is_historical_message(role)
+        and (
+            has_source_window_provenance
+            or (
+                _devlog_selection_allows_default_target(selection)
+                and chronology_role == "target_historical_raw_jsonl_source_ref"
+            )
+        )
+    ):
         return {
             **base,
             "eligible": True,
@@ -2636,6 +2674,7 @@ def _devlog_default_target_source_eligibility(read: dict, *, candidate: dict | N
             "category": "historical_user_assistant_jsonl_source_window",
             "record_role": role,
             "source_window_provenance": has_source_window_provenance,
+            "source_chronology_role": chronology_role or None,
         }
 
     return {
@@ -2655,7 +2694,7 @@ def _devlog_mark_real_source_target_read(read: dict, *, eligibility: dict | None
     if eligibility:
         row["devlog_target_source_eligibility"] = dict(eligibility)
     if not isinstance(row.get("historical_provenance_selection"), dict):
-        row["historical_provenance_selection"] = {
+        selection = {
             "schema_version": 1,
             "source_chronology_role": "target_historical_raw_jsonl_source_ref",
             "final_support_allowed": True,
@@ -2664,6 +2703,9 @@ def _devlog_mark_real_source_target_read(read: dict, *, eligibility: dict | None
             "diagnostic_only": False,
             "raw_text_included": False,
         }
+        if eligibility and eligibility.get("category"):
+            selection["devlog_target_source_eligibility_category"] = eligibility["category"]
+        row["historical_provenance_selection"] = selection
     else:
         selection = dict(row["historical_provenance_selection"])
         if eligibility and eligibility.get("category"):

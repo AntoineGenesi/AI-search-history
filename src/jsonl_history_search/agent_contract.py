@@ -3783,6 +3783,16 @@ def build_source_window_package(
             "reason": "open source_ref target for surrounding transcript context",
         }
         next_read = {key: value for key, value in next_read.items() if key not in {"expansion_actions", "context_actions"}}
+        if data.get("role") not in (None, "") and next_read.get("role") in (None, ""):
+            next_read["role"] = data.get("role")
+        if data.get("timestamp_utc") not in (None, "") and next_read.get("timestamp_utc") in (None, ""):
+            next_read["timestamp_utc"] = data.get("timestamp_utc")
+        next_read["source_window_provenance"] = {
+            "schema_version": 1,
+            "selected_source_window": True,
+            "window_id": f"sw{index:03d}",
+            "raw_text_included": False,
+        }
         window = {
             "schema_version": 1,
             "window_id": f"sw{index:03d}",
@@ -5650,9 +5660,13 @@ def next_reads_from_candidates(
         if isinstance(candidate, CandidateRow):
             ref = candidate.source_ref
             candidate_id = candidate.candidate_id
+            role = candidate.role
+            timestamp_utc = candidate.timestamp_utc
         else:
             ref = candidate.get("source_ref", {})
             candidate_id = candidate.get("candidate_id")
+            role = candidate.get("role") or candidate.get("record_role") or candidate.get("message_role")
+            timestamp_utc = candidate.get("timestamp_utc")
         target = source_ref_target(ref)
         if target:
             source_ref = dict(ref)
@@ -5668,6 +5682,10 @@ def next_reads_from_candidates(
                     expansion_action_context=expansion_action_context,
                 ),
             }
+            if role not in (None, ""):
+                read["role"] = role
+            if timestamp_utc not in (None, ""):
+                read["timestamp_utc"] = timestamp_utc
             if include_context_actions:
                 read["context_actions"] = context_actions_for_source_ref(
                     source_ref,
@@ -6073,6 +6091,7 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                     "candidate_id": candidate.candidate_id,
                     "rank": candidate.rank,
                     "source_ref": canonical_source_ref(candidate.source_ref),
+                    "role": candidate.role,
                     "timestamp_utc": candidate.timestamp_utc,
                     "confidence": candidate.confidence,
                     "stage": candidate.primary_stage,
@@ -6086,6 +6105,7 @@ def compact_handoff_candidates(candidates: list[dict[str, Any]] | list[Candidate
                     "candidate_id": candidate.get("candidate_id"),
                     "rank": candidate.get("rank"),
                     "source_ref": canonical_source_ref(candidate.get("source_ref") or {}),
+                    "role": candidate.get("role") or candidate.get("record_role") or candidate.get("message_role"),
                     "timestamp_utc": candidate.get("timestamp_utc"),
                     "confidence": candidate.get("confidence"),
                     "stage": candidate.get("stage"),
