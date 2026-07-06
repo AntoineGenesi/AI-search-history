@@ -3340,6 +3340,12 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             or compact.get("answer_readiness_summary", {}).get("status")
             or compact.get("status")
         )
+        route_family = str(selected_route.get("route_family") or "")
+        route_first_reads = (
+            orchestration_reads
+            if route_family == "orchestration_provenance" and orchestration_reads
+            else core_plan.get("read")
+        )
         return {
             "answer_status": _unpromoted_semantic_debug_answer_status(internal_status),
             "promotion_status": "unpromoted_semantic_debug_execution",
@@ -3349,8 +3355,9 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             ),
             "internal_answer_status": internal_status,
             "core_convo_first_read_plan": core_plan,
-            "read": core_plan.get("read")
+            "read": route_first_reads
             or orchestration_reads
+            or core_plan.get("read")
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
             or compact.get("next_reads")
