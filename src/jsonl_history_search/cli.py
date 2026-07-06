@@ -35,6 +35,7 @@ from .compact_handoff_usefulness import (
     render_compact_handoff_answer_use_markdown,
     render_compact_handoff_usefulness_markdown,
 )
+from .coordinator_context import build_coordinator_context_payload
 from .source_tier_answer_use import (
     DEFAULT_FIXTURE as DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE,
     build_source_tier_answer_use_eval_payload,
@@ -1841,7 +1842,12 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             "execution": {
                 "status": "unsupported_route",
                 "route_family": route.get("route_family"),
-                "allowlist": ["semantic-debug", "no-evidence-report", "devlog-failure-analysis"],
+                "allowlist": [
+                    "semantic-debug",
+                    "no-evidence-report",
+                    "devlog-failure-analysis",
+                    "coordinator-context",
+                ],
                 "command_family": None,
                 "argv": [],
                 "report_written": None,
@@ -1870,6 +1876,9 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     elif execution_kind == "no-evidence-report":
         executed_payload = _build_agent_find_report_output_payload(execution_args)
         output_key = "agent_find"
+    elif execution_kind == "coordinator-context":
+        executed_payload = _build_coordinator_context_report_output_payload(execution_args)
+        output_key = "coordinator_context"
     else:
         executed_payload = _build_devlog_failure_analysis_report_output_payload(execution_args)
         output_key = "devlog_failure_analysis"
@@ -2021,6 +2030,19 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
 def _ask_execute_sidecar_path(report_output: str, label: str) -> Path:
     path = Path(report_output).expanduser()
     return path.with_name(f"{path.stem}.{label}.json")
+
+
+def _build_coordinator_context_report_output_payload(args: argparse.Namespace) -> dict:
+    compact = build_coordinator_context_payload(
+        cwd=args.cwd,
+        query=args.query,
+        report_output=args.report_output,
+    )
+    Path(args.report_output).expanduser().write_text(
+        render({"coordinator_context": compact}, "json"),
+        encoding="utf-8",
+    )
+    return {"coordinator_context": compact}
 
 
 def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespace) -> dict:
@@ -3160,6 +3182,29 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
 
 
 def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
+    if output_key == "coordinator_context":
+        return {
+            "answer_status": "context-package-ready-after-next-reads",
+            "promotion_status": "committed_safe_context_package",
+            "promotion_reason": (
+                "The coordinator-context route is executable and committed-safe, "
+                "but receiving agents should inspect required next reads before "
+                "turning it into a substantive handoff or next action."
+            ),
+            "read": compact.get("required_next_reads") or [],
+            "then_use": {
+                "current_state": compact.get("current_state"),
+                "active_task_handles": compact.get("active_task_handles"),
+                "why_goals_guiding_principles": compact.get("why_goals_guiding_principles"),
+                "learnings_failure_modes": compact.get("learnings_failure_modes"),
+            },
+            "diagnostics_after": compact.get("optional_diagnostics") or [],
+            "claim_boundaries": compact.get("claim_boundaries") or [],
+            "privacy_flags": compact.get("source_policy"),
+            "stop": selected_route.get("stop_guidance"),
+            "only_continue_if": selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written"),
+        }
     if output_key == "devlog_failure_analysis":
         target_reads = list(compact.get("target_historical_source_window_reads") or [])
         repo_evidence = compact.get("repo_phase_category_evidence") or {}
@@ -3338,6 +3383,23 @@ def _positive_int(value: object) -> int:
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
+    if output_key == "coordinator_context":
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "report_written": compact.get("report_written"),
+            "source_policy": compact.get("source_policy"),
+            "current_state": compact.get("current_state"),
+            "active_task_handles": compact.get("active_task_handles"),
+            "front_door_handles": compact.get("front_door_handles"),
+            "why_goals_guiding_principles": compact.get("why_goals_guiding_principles"),
+            "learnings_failure_modes": compact.get("learnings_failure_modes"),
+            "required_next_reads": compact.get("required_next_reads", [])[:8],
+            "optional_diagnostics": compact.get("optional_diagnostics", [])[:5],
+            "prior_result_context": compact.get("prior_result_context", [])[:5],
+            "claim_boundaries": compact.get("claim_boundaries"),
+            "message": compact.get("message"),
+        }
     if output_key == "devlog_failure_analysis":
         return {
             "schema_version": compact.get("schema_version"),

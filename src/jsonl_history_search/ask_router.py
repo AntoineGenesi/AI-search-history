@@ -20,6 +20,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
 )
 EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_analysis"})
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
+EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"coordinator_context"})
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,42 @@ DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
         "story facets after the package. Prefer target historical source windows "
         "and safe repo-phase/category evidence; do not answer mainly from current "
         "diagnostics or post-hoc artifacts."
+    ),
+)
+
+COORDINATOR_CONTEXT_ROUTE = AskRoute(
+    route_family="coordinator_context",
+    chosen_route="coordinator-context / current-context-next-reads",
+    why_it_applies=(
+        "The wording asks for a coordinator or receiving-agent current-context "
+        "package across repo front-door surfaces such as TODO, pipeline/current "
+        "state, plans, active tasks, goals, guiding principles, learnings, and "
+        "failure modes to watch. Route to the committed-safe context package "
+        "before generic semantic-wrapup complaint mining."
+    ),
+    first_command_template=(
+        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        "--report-output .private/jsonl/ask-execute-coordinator-context.json"
+    ),
+    read_specialization="references/coordinator-context.md",
+    inspect_after=(
+        "ask_execute.executed_output.current_state and active_task_handles",
+        "ask_execute.executed_output.required_next_reads over TODO, pipeline/current-context state, active tasks, and learnings",
+        "ask_execute.executed_output.why_goals_guiding_principles",
+        "ask_execute.executed_output.learnings_failure_modes and claim_boundaries",
+    ),
+    stop_guidance=(
+        "Run ask --execute for the coordinator-context package before broad "
+        "semantic-wrapup or repo archaeology. Open required next reads first, "
+        "then answer from inspected committed-safe front-door/current-state files. "
+        "Treat optional diagnostics as follow-up only when a named current-context "
+        "facet remains missing or contradictory."
+    ),
+    manual_search_guidance=(
+        "Manual rg or raw JSONL inspection is follow-up only after the context "
+        "package leaves a named gap. This route is a committed-safe current "
+        "context/next-read package, not source-window recovery, launch readiness, "
+        "all-history completeness, token savings, or a final answer generator."
     ),
 )
 
@@ -480,6 +517,8 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 def execution_kind_for_route_family(route_family: str) -> str | None:
     if route_family in EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES:
         return "devlog-failure-analysis"
+    if route_family in EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES:
+        return "coordinator-context"
     if route_family in EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES:
         return "semantic-debug"
     if route_family in EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES:
@@ -539,6 +578,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_ticket_currentness(normalized):
         return ROUTES[8]
+
+    if _looks_like_coordinator_context_query(normalized):
+        return COORDINATOR_CONTEXT_ROUTE
 
     if _looks_like_repeated_complaint_or_failure_query(normalized):
         return ROUTES[9]
@@ -1056,6 +1098,61 @@ def _looks_like_repeated_complaint_or_failure_query(normalized: str) -> bool:
     if _has_any(normalized, complaint_terms) and _has_any(normalized, repeated_terms):
         return True
     return _has_any(normalized, ("why does this keep happening", "why do you keep doing this", "why did this keep happening"))
+
+
+def _looks_like_coordinator_context_query(normalized: str) -> bool:
+    context_intent_terms = (
+        "coordinator context",
+        "current context",
+        "context package",
+        "context handoff",
+        "handoff package",
+        "handoff document",
+        "handoff documents",
+        "handoff docs",
+        "receiving agent",
+        "next reads",
+        "next-read",
+        "gather context",
+        "gather the current",
+        "orient the agent",
+        "catch the agent up",
+        "what should the next agent read",
+        "current-state package",
+    )
+    if not _has_any(normalized, context_intent_terms):
+        return False
+
+    facet_groups = (
+        ("plan", "plans", "planning"),
+        ("handoff", "handoffs"),
+        ("todo", "todos", "task front door", "front door"),
+        ("pipeline", "pipeline state", "current state", "current-context"),
+        ("active task", "active tasks", "task file", "task files"),
+        ("why", "why the work", "purpose", "goal", "goals"),
+        ("guiding principle", "guiding principles", "principles", "product contract"),
+        ("learning", "learnings", "failure mode", "failure modes", "failure-mode", "failure-modes"),
+    )
+    facet_hits = sum(1 for group in facet_groups if _has_any(normalized, group))
+    if facet_hits < 4:
+        return False
+
+    complaint_mining_terms = (
+        "what did i keep",
+        "what have i kept",
+        "keep yelling",
+        "kept yelling",
+        "keep complaining",
+        "kept complaining",
+        "keep correcting",
+        "kept correcting",
+        "repeated complaints",
+        "recurring complaints",
+        "user corrections",
+    )
+    if _has_any(normalized, complaint_mining_terms) and facet_hits < 6:
+        return False
+    return True
 
 
 def _looks_like_local_artifact_verification_query(normalized: str) -> bool:

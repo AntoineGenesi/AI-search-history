@@ -367,6 +367,8 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append(f"Executed output status: {executed.get('status')}")
     if executed.get("message"):
         lines.append(f"Executed output: {executed.get('message')}")
+    if route.get("route_family") == "coordinator_context":
+        _append_coordinator_context_text(lines, executed, action)
     return "\n".join(lines)
 
 
@@ -410,7 +412,111 @@ def render_ask_execute_markdown(payload: dict) -> str:
     else:
         lines.append("- Read/action:")
         _append_compact_read_contract(lines, action.get("read"), markdown=True)
+    if route.get("route_family") == "coordinator_context":
+        _append_coordinator_context_markdown(lines, report.get("executed_output") or {}, action)
     return "\n".join(lines)
+
+
+def _append_coordinator_context_text(lines: list[str], executed: dict, action: dict) -> None:
+    lines.append("Coordinator context package:")
+    active = executed.get("active_task_handles") or []
+    lines.append(f"- active_task_handles: {', '.join(active[:6]) if active else '(none found)'}")
+    lines.append("- required_next_reads:")
+    _append_path_reason_rows(lines, executed.get("required_next_reads"), limit=8)
+    current_state = executed.get("current_state") if isinstance(executed.get("current_state"), dict) else {}
+    summary_lines = current_state.get("summary_lines") if isinstance(current_state.get("summary_lines"), list) else []
+    if summary_lines:
+        lines.append("- current_state:")
+        _append_path_reason_rows(lines, summary_lines, limit=4)
+    why = executed.get("why_goals_guiding_principles")
+    if isinstance(why, dict):
+        goal_rows = why.get("why_and_goals") if isinstance(why.get("why_and_goals"), list) else []
+        principle_rows = why.get("guiding_principles") if isinstance(why.get("guiding_principles"), list) else []
+        if goal_rows:
+            lines.append("- why/goals:")
+            _append_path_reason_rows(lines, goal_rows, limit=3)
+        if principle_rows:
+            lines.append("- guiding_principles:")
+            _append_path_reason_rows(lines, principle_rows, limit=3)
+    learnings = executed.get("learnings_failure_modes")
+    if isinstance(learnings, dict):
+        failure_rows = (
+            learnings.get("failure_modes_to_watch")
+            if isinstance(learnings.get("failure_modes_to_watch"), list)
+            else []
+        )
+        if failure_rows:
+            lines.append("- learnings/failure_modes_to_watch:")
+            _append_path_reason_rows(lines, failure_rows, limit=5)
+    boundaries = action.get("claim_boundaries") or executed.get("claim_boundaries") or []
+    if boundaries:
+        lines.append("- claim_boundaries:")
+        for boundary in boundaries[:5]:
+            lines.append(f"  - {boundary}")
+
+
+def _append_coordinator_context_markdown(lines: list[str], executed: dict, action: dict) -> None:
+    lines.extend(["", "## Coordinator Context Package", ""])
+    active = executed.get("active_task_handles") or []
+    lines.append(f"- Active handles: `{', '.join(active[:6]) if active else '(none found)'}`")
+    lines.append("- Required next reads:")
+    _append_path_reason_rows(lines, executed.get("required_next_reads"), limit=8, markdown=True)
+    current_state = executed.get("current_state") if isinstance(executed.get("current_state"), dict) else {}
+    summary_lines = current_state.get("summary_lines") if isinstance(current_state.get("summary_lines"), list) else []
+    if summary_lines:
+        lines.append("- Current state:")
+        _append_path_reason_rows(lines, summary_lines, limit=4, markdown=True)
+    why = executed.get("why_goals_guiding_principles")
+    if isinstance(why, dict):
+        goal_rows = why.get("why_and_goals") if isinstance(why.get("why_and_goals"), list) else []
+        principle_rows = why.get("guiding_principles") if isinstance(why.get("guiding_principles"), list) else []
+        if goal_rows:
+            lines.append("- Why/goals:")
+            _append_path_reason_rows(lines, goal_rows, limit=3, markdown=True)
+        if principle_rows:
+            lines.append("- Guiding principles:")
+            _append_path_reason_rows(lines, principle_rows, limit=3, markdown=True)
+    learnings = executed.get("learnings_failure_modes")
+    if isinstance(learnings, dict):
+        failure_rows = (
+            learnings.get("failure_modes_to_watch")
+            if isinstance(learnings.get("failure_modes_to_watch"), list)
+            else []
+        )
+        if failure_rows:
+            lines.append("- Learnings/failure modes to watch:")
+            _append_path_reason_rows(lines, failure_rows, limit=5, markdown=True)
+    boundaries = action.get("claim_boundaries") or executed.get("claim_boundaries") or []
+    if boundaries:
+        lines.append("- Claim boundaries:")
+        for boundary in boundaries[:5]:
+            lines.append(f"  - {boundary}")
+
+
+def _append_path_reason_rows(
+    lines: list[str],
+    rows: object,
+    *,
+    limit: int,
+    markdown: bool = False,
+) -> None:
+    if not isinstance(rows, list) or not rows:
+        lines.append("  - none")
+        return
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            lines.append(f"  - {row}")
+            continue
+        path = row.get("path") or row.get("target") or "(unknown)"
+        line = f":{row.get('line')}" if row.get("line") else ""
+        reason = row.get("reason") or row.get("text") or row.get("read_role") or ""
+        exists = ""
+        if "exists" in row:
+            exists = f" exists={str(row.get('exists')).lower()}"
+        if markdown:
+            lines.append(f"  - `{path}{line}`{exists} - {reason}")
+        else:
+            lines.append(f"  - {path}{line}{exists} - {reason}")
 
 
 def _append_scoped_no_evidence_contract(
