@@ -193,6 +193,7 @@ def build_agent_find_payload(
         retrieval_pressure=agent_find.get("retrieval_pressure"),
         expansion_action_context=expansion_action_context,
         include_context_actions=compact_provenance_handoff,
+        include_source_window_expansion_actions=False,
         evidence_context_window=evidence_context_window,
     )
     agent_find["source_locator_handoff"] = handoff
@@ -419,6 +420,7 @@ def compact_provenance_source_window_summaries(source_windows: list[dict[str, An
             continue
         source_ref = window.get("source_ref") or {}
         next_read = window.get("next_read") if isinstance(window.get("next_read"), dict) else {}
+        omitted_fields = window.get("omitted_fields") if isinstance(window.get("omitted_fields"), dict) else {}
         summaries.append(
             {
                 "schema_version": 1,
@@ -435,7 +437,8 @@ def compact_provenance_source_window_summaries(source_windows: list[dict[str, An
                 "searched_scope_boundary": window.get("searched_scope_boundary", {}),
                 "omitted_fields": {
                     "context_actions": bool(window.get("context_actions")),
-                    "expansion_actions": bool(window.get("expansion_actions")),
+                    "expansion_actions": bool(window.get("expansion_actions"))
+                    or bool(omitted_fields.get("expansion_actions")),
                     "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
                     "text_or_snippets": False,
                 },
@@ -3128,6 +3131,7 @@ def build_source_locator_handoff(
     retrieval_pressure: dict[str, Any] | None = None,
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    include_source_window_expansion_actions: bool = True,
     evidence_context_window: int = 0,
 ) -> dict[str, Any]:
     """Build the stable agent handoff for deciding where to read next."""
@@ -3153,6 +3157,7 @@ def build_source_locator_handoff(
         query_plan=query_plan,
         expansion_action_context=expansion_action_context,
         include_context_actions=include_context_actions,
+        include_expansion_actions=include_source_window_expansion_actions,
     )
     source_windows = source_window_result["windows"]
     source_window_selection_policy = source_window_result["selection_policy"]
@@ -3229,7 +3234,14 @@ def build_source_locator_handoff(
             {"field": "target", "action": "included", "preserves_exact_refs": True},
             {"field": "next_read", "action": "included", "preserves_exact_refs": True},
             {"field": "omitted_window_recovery", "action": "bounded", "limit": OMITTED_WINDOW_RECOVERY_LIMIT},
-            {"field": "expansion_actions", "action": "included", "preserves_exact_refs": True},
+            {
+                "field": "expansion_actions",
+                "action": "included" if include_source_window_expansion_actions else "deduped_in_next_reads",
+                "preserves_exact_refs": True,
+                "reason": "default_output_size_guard"
+                if not include_source_window_expansion_actions
+                else "source_window_followup_affordance",
+            },
             {
                 "field": "context_actions",
                 "action": "included" if include_context_actions else "omitted",
@@ -3731,6 +3743,7 @@ def build_source_windows(
     query_plan: dict[str, Any] | None,
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    include_expansion_actions: bool = True,
 ) -> list[dict[str, Any]]:
     return build_source_window_package(
         candidates=candidates,
@@ -3738,6 +3751,7 @@ def build_source_windows(
         query_plan=query_plan,
         expansion_action_context=expansion_action_context,
         include_context_actions=include_context_actions,
+        include_expansion_actions=include_expansion_actions,
     )["windows"]
 
 
@@ -3748,6 +3762,7 @@ def build_source_window_package(
     query_plan: dict[str, Any] | None,
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    include_expansion_actions: bool = True,
 ) -> dict[str, Any]:
     windows: list[dict[str, Any]] = []
     next_read_by_candidate = {
@@ -3808,11 +3823,6 @@ def build_source_window_package(
             "project_hint": project_hint_from_cwd(data.get("cwd")),
             "reason_codes": list(data.get("reason_codes", []))[:SOURCE_WINDOW_REASON_CODE_LIMIT],
             "next_read": next_read,
-            "expansion_actions": read_more_actions_for_source_ref(
-                source_ref,
-                candidate_id=candidate_id,
-                expansion_action_context=expansion_action_context,
-            ),
             "text_included": False,
             "source_window_text_included": False,
             "reason": "open source_ref target for surrounding transcript context",
@@ -3822,6 +3832,18 @@ def build_source_window_package(
                 "not_all_history_absence": True,
             },
         }
+        if include_expansion_actions:
+            window["expansion_actions"] = read_more_actions_for_source_ref(
+                source_ref,
+                candidate_id=candidate_id,
+                expansion_action_context=expansion_action_context,
+            )
+        else:
+            window["omitted_fields"] = {
+                "expansion_actions": True,
+                "exact_actions_preserved_in": "source_locator_handoff.next_reads",
+                "exact_targets_preserved": bool(target),
+            }
         if include_context_actions:
             window["context_actions"] = context_actions_for_source_ref(
                 source_ref,
