@@ -70,6 +70,15 @@ unsupported_route` and the normal first command; they are not shell-executed.
 Use plain `ask` when you only need route classification or when the selected
 route is outside that execution allow-list.
 
+Storage-retention forensics routes are inventory-first. For asks like "why is
+`.private` 23GB?", "what created these large private files?", "who uses them?",
+or "what must be retained for examples/tests/claims?", run `ask` first to get
+the route contract, then follow the local filesystem inventory and repo artifact
+join plan before any JSONL conversation mining. This route is non-destructive:
+do not delete, archive, move, compact VHDX files, prune branches, or perform
+cleanup from this guidance. JSONL is a targeted follow-up only for unresolved
+creator/history gaps after inventory and committed artifacts have been checked.
+
 ## Proven Route Demos
 
 JSH-1098 free-agent traces showed sampled lower-burden source-window routing
@@ -191,6 +200,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "Gather the current coordinator context for the receiving agent: plans, handoff documents, TODO, pipeline state, active tasks, goals, guiding principles, learnings, and failure modes to watch." | Coordinator context/current-state package | `ask --execute`, then `references/coordinator-context.md` | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-coordinator-context.json --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | helper auto-executes bounded no-evidence, then `references/no-evidence.md` only if a scope/cap field needs interpretation | `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"` |
+| "Why is `.private` 23GB?" "What created these large private files?" "Who uses them?" "What must be retained for examples/tests/claims?" | Storage-retention forensics | `ask` then `references/storage-retention.md` | `du -sh .private .private/* 2>/dev/null` |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -210,6 +220,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "turn the early coordinator experiment into a devlog segment" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text`; open `target_historical_source_window_reads` before current/adjacent diagnostics, then use `failure_analysis.devlog_brief` and safe repo-phase/category evidence.
 - "gather the current coordinator context for the receiving agent: plans, handoff documents, TODO, pipeline state, active tasks, goals, guiding principles, learnings, and failure modes to watch" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-coordinator-context.json --format text`; open `required_next_reads` before answering or handing work to another agent.
 - "is there evidence that X was discussed in this bounded source scope?" -> `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`; the helper auto-executes only bounded no-evidence and, if promoted, you can answer from the scoped no-evidence contract without a manual rerun/read-more.
+- "why is .private 23GB?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/storage-retention.md`; run `du -sh .private .private/* 2>/dev/null` first, join large handles to tasks/reports/reviews/scripts/tests/pipeline state, and use targeted JSONL only for unresolved creator/history gaps.
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "is ticket ABC-42 still current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
@@ -255,6 +266,12 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
   parent `.private/worktree-cleanup-archive/<slug>/` before physical worktree
   pruning, and keep branch refs retained unless the user explicitly scopes
   branch ref pruning.
+- For storage-retention forensics, use `ask` to select the
+  `storage_retention_forensics` route, then start with non-destructive
+  filesystem inventory and artifact joins. Do not run cleanup, deletion,
+  archive, move, VHDX compaction, or branch-pruning commands from this route.
+  JSONL conversation history is only a targeted follow-up for a specific
+  unresolved creator/history gap, with caps and searched-scope caveats.
 - Use `ask` before `semantic-debug` for natural quality-sensitive remembered
   instructions, action proof, provenance, no-evidence, and ambiguous semantic
   questions. Use `semantic-debug --format text` before lower-level helper

@@ -59,6 +59,16 @@ def agent_question_cookbook() -> list[dict[str, str]]:
             "inspect_next": "tool_action_proof primary refs, command/tool events, diffs, commits, and review metadata",
         },
         {
+            "id": "storage_retention_forensics",
+            "question_family": "Why is .private large, who created/uses it, and what must be retained?",
+            "route": "storage-retention-forensics / filesystem-inventory-first",
+            "first_command": "du -sh .private .private/* 2>/dev/null",
+            "inspect_next": (
+                "filesystem_inventory first, then artifact_join over tasks/reports/reviews/scripts/tests/"
+                "codex state, then targeted JSONL only for unresolved creator/history gaps"
+            ),
+        },
+        {
             "id": "read_more",
             "question_family": "Read the exact source evidence returned by a route.",
             "route": "read-more",
@@ -69,6 +79,31 @@ def agent_question_cookbook() -> list[dict[str, str]]:
 
 
 def ask_next_commands(*, selected_first_command: str, route_family: str) -> list[dict[str, Any]]:
+    if route_family == "storage_retention_forensics":
+        return [
+            {
+                "purpose": "filesystem_inventory",
+                "command": selected_first_command,
+                "inspect_next": "local size inventory, largest subtrees, top files, and file-type/extension summary",
+            },
+            {
+                "purpose": "artifact_join",
+                "command": "rg -n \"<large-subtree-or-task-handle>\" tasks reports reviews scripts tests codex/state",
+                "inspect_next": "map each large subtree to committed task/report/review/script/test/pipeline-state use or retention evidence",
+            },
+            {
+                "purpose": "targeted_jsonl_follow_up_only_if_gap_remains",
+                "command": (
+                    'jsonl-history-search semantic-debug "who created or used <specific subtree/task handle>?" '
+                    '--cwd "$PWD" --format text'
+                ),
+                "inspect_next": (
+                    "run only after inventory/artifact joins leave a named creator/history gap; keep roots, caps, "
+                    "searched-scope caveats, and echo demotion explicit"
+                ),
+            },
+        ]
+
     commands: list[dict[str, Any]] = [
         {
             "purpose": "run selected first route",
@@ -118,6 +153,8 @@ def _entry_applies_to_route(entry: dict[str, str], route_family: str) -> bool:
         return entry_id == "bounded_no_evidence"
     if route_family == "action_proof":
         return entry_id == "action_proof"
+    if route_family == "storage_retention_forensics":
+        return entry_id == "storage_retention_forensics"
     if route_family in {"orchestration_provenance", "semantic_debug", "remembered_topic", "process_actual_use"}:
         return entry_id == "source_provenance"
     return False

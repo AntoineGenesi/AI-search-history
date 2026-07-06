@@ -1825,6 +1825,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     selected_route = {
         "chosen_route": route.get("chosen_route"),
         "route_family": route.get("route_family"),
+        "first_action_category": route.get("first_action_category"),
         "why_it_applies": route.get("why_it_applies"),
         "first_command": route.get("first_command"),
         "explicit_source_root_count": len(getattr(args, "root", []) or []),

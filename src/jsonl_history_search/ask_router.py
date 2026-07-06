@@ -22,6 +22,7 @@ EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_a
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
 EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"coordinator_context"})
 EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
+STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,42 @@ COORDINATOR_CONTEXT_ROUTE = AskRoute(
         "package leaves a named gap. This route is a committed-safe current "
         "context/next-read package, not source-window recovery, launch readiness, "
         "all-history completeness, token savings, or a final answer generator."
+    ),
+)
+
+STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
+    route_family=STORAGE_RETENTION_ROUTE_FAMILY,
+    chosen_route="storage-retention-forensics / filesystem-inventory-first",
+    why_it_applies=(
+        "The wording asks why local private/storage artifacts are large, what "
+        "created them, who uses them, or what must be retained. The decisive "
+        "evidence starts with disk layout and committed repo artifact joins, not "
+        "recent conversation transcript echoes."
+    ),
+    first_command_template="du -sh .private .private/* 2>/dev/null",
+    read_specialization="references/storage-retention.md",
+    inspect_after=(
+        "filesystem_inventory: local size inventory, largest subtrees, top files, and file-type/extension summary",
+        "artifact_join: map large subtree/task handles to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",
+        "retention_classification: required for current tests/examples, useful retained evidence, claim-critical raw traces, recomputable/cache, stale candidate, or unknown follow-up",
+        "targeted_jsonl_follow_up: only for unresolved creator/history gaps after inventory and repo artifacts, with explicit roots/caps and searched-scope caveats",
+        "echo_demotion: recent command-output echoes are diagnostics unless they contain primary creation or actual-use evidence",
+    ),
+    stop_guidance=(
+        "Start with filesystem inventory and top-file/type summaries, then join "
+        "large subtree handles to committed tasks/reports/reviews/scripts/tests/"
+        "pipeline state. Do not run storage cleanup, deletion, archiving, moves, "
+        "VHDX compaction, branch pruning, or claim/release copy from this route. "
+        "Use JSONL conversation search only after a named creator/history gap "
+        "survives local inventory and artifact joins."
+    ),
+    manual_search_guidance=(
+        "Use non-destructive local commands such as du/find/stat and targeted rg "
+        "over tasks, reports, reviews, scripts, tests, and codex/state. If a "
+        "specific subtree still lacks creator or usage evidence, run a narrowly "
+        "scoped semantic-debug query for that subtree/task handle; preserve cap, "
+        "root, and searched-scope caveats. Demote recent ask/command-output "
+        "echoes unless they are primary creation/use records."
     ),
 )
 
@@ -489,6 +526,9 @@ ROUTES: tuple[AskRoute, ...] = (
 def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
     first_command = route.first_command(query)
+    first_action_category = (
+        "filesystem_inventory" if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY else "route_command"
+    )
     return {
         "ask_router": {
             "status": "matched",
@@ -496,6 +536,7 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "cwd": cwd,
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
+            "first_action_category": first_action_category,
             "why_it_applies": route.why_it_applies,
             "first_command": first_command,
             "next_commands": ask_next_commands(
@@ -540,6 +581,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_bounded_no_evidence_query(normalized):
         return BOUNDED_NO_EVIDENCE_ROUTE
+
+    if _looks_like_storage_retention_forensics_query(normalized):
+        return STORAGE_RETENTION_FORENSICS_ROUTE
 
     if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
         normalized, ("agent", "edits", "edit", "changed", "action")
@@ -616,6 +660,71 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_storage_retention_forensics_query(normalized: str) -> bool:
+    compact = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    storage_subject_terms = (
+        ".private",
+        " private ",
+        "private file",
+        "private files",
+        "private artifact",
+        "private artifacts",
+        "private directory",
+        "large file",
+        "large files",
+        "large subtree",
+        "disk usage",
+        "disk space",
+        "storage",
+        "gb",
+        "gib",
+        "vhdx",
+        "c drive",
+        "c:",
+        "repo storage",
+        "retention",
+        "retained",
+        "retain",
+    )
+    forensic_intent_terms = (
+        "why is",
+        "why are",
+        "why does",
+        "why did",
+        "what created",
+        "who created",
+        "what uses",
+        "who uses",
+        "what is using",
+        "who is using",
+        "what must be retained",
+        "what needs to be retained",
+        "must retain",
+        "need to retain",
+        "needs to retain",
+        "safe to delete",
+        "can i delete",
+        "can we delete",
+        "can be deleted",
+        "can be archived",
+        "cleanup",
+        "clean up",
+        "archive",
+        "retention",
+        "retained",
+        "retain",
+        "claim",
+        "claims",
+        "examples",
+        "tests",
+    )
+    if ".private" in normalized and _has_any(compact, forensic_intent_terms):
+        return True
+    if _has_any(compact, storage_subject_terms) and _has_any(compact, forensic_intent_terms):
+        return True
+    return False
 
 
 def _looks_like_skill_compliance_query(normalized: str) -> bool:
