@@ -51,6 +51,7 @@ def validate_install(
     checks = [
         _check_cli_import(),
         _check_console_script(root),
+        _check_convo_console_alias(root),
         _check_package_skill(root, source_checkout=source_checkout),
         _check_package_helpers(root, source_checkout=source_checkout),
         _check_package_helper_behavior(root, source_checkout=source_checkout),
@@ -182,41 +183,68 @@ def _check_cli_import() -> ValidationCheck:
 
 
 def _check_console_script(package_root: Path) -> ValidationCheck:
-    script = shutil.which("jsonl-history-search")
-    declared = _pyproject_declares_console_script(package_root)
+    return _check_console_command(
+        package_root,
+        command="jsonl-history-search",
+        check_id="console_script",
+        name="Console script availability",
+    )
+
+
+def _check_convo_console_alias(package_root: Path) -> ValidationCheck:
+    return _check_console_command(
+        package_root,
+        command="convo",
+        check_id="console_alias_convo",
+        name="Console alias availability",
+    )
+
+
+def _check_console_command(package_root: Path, *, command: str, check_id: str, name: str) -> ValidationCheck:
+    script = shutil.which(command)
+    declared = _pyproject_declares_console_script(package_root, command)
     if script:
         return ValidationCheck(
-            id="console_script",
-            name="Console script availability",
+            id=check_id,
+            name=name,
             status="pass",
-            detail=f"`jsonl-history-search` is available on PATH at {script}.",
+            detail=f"`{command}` is available on PATH at {script}.",
             paths=[script],
-            metadata={"pyproject_entrypoint_declared": declared},
+            metadata={
+                "pyproject_entrypoint_declared": declared,
+                "entrypoint": "jsonl_history_search.cli:main",
+            },
         )
     status = "warn" if declared else "fail"
     recovery = ["Install the package editable from this checkout: `python3 -m pip install -e .`."]
-    detail = "`jsonl-history-search` is not on PATH."
+    if command == "convo":
+        recovery.append("Refresh stale editable installs so the `convo` console alias is generated.")
+    detail = f"`{command}` is not on PATH."
     if declared:
         detail += " The package declares the console entry point, so source-mode validation can continue."
     else:
         detail += " The package entry point declaration was not found in pyproject.toml."
     return ValidationCheck(
-        id="console_script",
-        name="Console script availability",
+        id=check_id,
+        name=name,
         status=status,
         detail=detail,
         recovery=recovery,
-        metadata={"pyproject_entrypoint_declared": declared},
+        metadata={
+            "pyproject_entrypoint_declared": declared,
+            "entrypoint": "jsonl_history_search.cli:main",
+            "jsonl_history_search_on_path": shutil.which("jsonl-history-search") is not None,
+        },
     )
 
 
-def _pyproject_declares_console_script(package_root: Path) -> bool:
+def _pyproject_declares_console_script(package_root: Path, command: str = "jsonl-history-search") -> bool:
     pyproject = package_root / "pyproject.toml"
     try:
         text = pyproject.read_text(encoding="utf-8")
     except OSError:
         return False
-    return 'jsonl-history-search = "jsonl_history_search.cli:main"' in text
+    return f'{command} = "jsonl_history_search.cli:main"' in text
 
 
 def _check_package_skill(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:

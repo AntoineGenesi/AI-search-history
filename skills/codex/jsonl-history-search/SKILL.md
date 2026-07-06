@@ -1,11 +1,16 @@
 ---
 name: jsonl-history-search
-description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
+description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user says convo; `convo` is a memorable alias for the canonical jsonl-history-search tool. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
 
 # JSONL History Search
+
+The skill name and canonical command remain `jsonl-history-search`. `convo` is
+a memorable alias/trigger for the same tool, not a separate product; when the
+Python package is installed, `convo --help` reaches the same CLI surface as
+`jsonl-history-search --help`.
 
 This skill is a router. Load this file first. For natural user questions that
 ask what happened, why a topic appeared, whether an agent action occurred,
@@ -37,6 +42,7 @@ repo recovery, TODO scans, or direct JSONL spelunking:
 
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
+convo --help
 python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text

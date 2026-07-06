@@ -13,6 +13,7 @@ authors = [{name = "JSONL contributors"}]
 
 [project.scripts]
 jsonl-history-search = "jsonl_history_search.cli:main"
+convo = "jsonl_history_search.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
