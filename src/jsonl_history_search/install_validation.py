@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import hashlib
+import re
 import shutil
 import sys
 import tempfile
@@ -61,9 +62,11 @@ def validate_install(
     checks.extend(_check_redaction_and_fixture_search())
     if codex_home is not None:
         checks.extend(_check_global_codex_install(codex_home.expanduser(), root, source_checkout=source_checkout))
+    checks.extend(_check_install_currentness(root, source_checkout=source_checkout))
 
     counts = _status_counts(checks)
     failed = counts.get("fail", 0) > 0
+    preflight = _agent_preflight(checks, codex_home=codex_home)
     payload = {
         "install_validation": {
             "overall_status": "fail" if failed else "pass",
@@ -71,7 +74,8 @@ def validate_install(
             "user_home_mutated": False,
             "package_root": str(root),
             "codex_home": str(codex_home.expanduser()) if codex_home is not None else None,
-            "agent_preflight": _agent_preflight(checks, codex_home=codex_home),
+            "currentness": _currentness_summary(root, checks, source_checkout=source_checkout, preflight=preflight),
+            "agent_preflight": preflight,
             "summary": counts,
             "checks": [check.to_dict() for check in checks],
             "warnings": [check.detail for check in checks if check.status == "warn"],
@@ -104,9 +108,12 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
         "agent_question_cookbook": agent_question_cookbook(),
         "jsh1098_route_demos": _jsh1098_route_demos(),
         "claim_boundary": (
-            "JSH-1098 showed sampled lower-burden source-window routing, not "
-            "broad release readiness, provider-token savings, all-history "
-            "completeness, or universal superiority."
+            "validate-install proves local package/global-skill health only. "
+            "It makes no remote network calls; no remote/tag/version warning "
+            "does not prove latest upstream, latest tagged release, public "
+            "release currentness; JSH-1098 showed sampled lower-burden "
+            "source-window routing, not broad release readiness, provider-token "
+            "savings, all-history completeness, or universal superiority."
         ),
     }
 
@@ -153,6 +160,315 @@ def _is_source_checkout(package_root: Path) -> bool:
         (package_root / "pyproject.toml").is_file()
         and (package_root / "src" / "jsonl_history_search").is_dir()
     )
+
+
+def _check_install_currentness(package_root: Path, *, source_checkout: bool = True) -> list[ValidationCheck]:
+    return [
+        _check_git_remote_availability(package_root, source_checkout=source_checkout),
+        _check_git_tag_distance(package_root, source_checkout=source_checkout),
+        _check_version_metadata(package_root, source_checkout=source_checkout),
+    ]
+
+
+def _check_git_remote_availability(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+    if not source_checkout:
+        return ValidationCheck(
+            id="git_remote_currentness",
+            name="Git remote availability",
+            status="skip",
+            detail="Git remote currentness is skipped outside a source checkout.",
+            metadata={"source_checkout": False},
+        )
+    if not _git_available(package_root):
+        return ValidationCheck(
+            id="git_remote_currentness",
+            name="Git remote availability",
+            status="skip",
+            detail="Git remote currentness is skipped because the package root is not inside a git worktree.",
+            metadata={"source_checkout": True, "git_worktree": False},
+        )
+    result = _run_git(package_root, "remote", "-v")
+    if result.returncode != 0:
+        return ValidationCheck(
+            id="git_remote_currentness",
+            name="Git remote availability",
+            status="warn",
+            detail=f"Git remote metadata could not be read locally: {result.stderr.strip() or result.stdout.strip()}",
+            recovery=["Inspect local git metadata before making upstream/latest-release claims."],
+            metadata={"git_returncode": result.returncode},
+        )
+    remotes = _parse_git_remote_names(result.stdout)
+    if remotes:
+        return ValidationCheck(
+            id="git_remote_currentness",
+            name="Git remote availability",
+            status="pass",
+            detail=(
+                "Git remotes are configured locally. validate-install still does not fetch or compare "
+                "remote refs, so upstream/latest-release currentness remains unproven."
+            ),
+            metadata={"remote_names": remotes, "remote_count": len(remotes), "remote_currentness_checked": False},
+        )
+    return ValidationCheck(
+        id="git_remote_currentness",
+        name="Git remote availability",
+        status="warn",
+        detail=(
+            "No git remotes are configured in this checkout; validate-install cannot prove upstream "
+            "or latest-release currentness."
+        ),
+        recovery=["Configure or inspect a git remote separately before making upstream/latest-release claims."],
+        metadata={"remote_names": [], "remote_count": 0, "remote_currentness_checked": False},
+    )
+
+
+def _check_git_tag_distance(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+    if not source_checkout:
+        return ValidationCheck(
+            id="git_tag_distance",
+            name="Git describe/tag distance",
+            status="skip",
+            detail="Git tag distance is skipped outside a source checkout.",
+            metadata={"source_checkout": False},
+        )
+    if not _git_available(package_root):
+        return ValidationCheck(
+            id="git_tag_distance",
+            name="Git describe/tag distance",
+            status="skip",
+            detail="Git tag distance is skipped because the package root is not inside a git worktree.",
+            metadata={"source_checkout": True, "git_worktree": False},
+        )
+    result = _run_git(package_root, "describe", "--tags", "--always", "--dirty", "--long")
+    if result.returncode != 0:
+        return ValidationCheck(
+            id="git_tag_distance",
+            name="Git describe/tag distance",
+            status="warn",
+            detail=f"Git describe/tag distance could not be read locally: {result.stderr.strip() or result.stdout.strip()}",
+            recovery=["Inspect local tags separately before making latest-tagged-release claims."],
+            metadata={"git_returncode": result.returncode},
+        )
+    describe = result.stdout.strip()
+    parsed = _parse_git_describe_long(describe)
+    if parsed is None or parsed.get("tag") is None:
+        return ValidationCheck(
+            id="git_tag_distance",
+            name="Git describe/tag distance",
+            status="warn",
+            detail=(
+                f"Git describe did not identify a nearest local tag (`{describe}`); tagged-release "
+                "currentness is unproven."
+            ),
+            recovery=["Create or inspect local tags separately before making tagged-release currentness claims."],
+            metadata={"git_describe": describe, "tag_found": False},
+        )
+    distance = int(parsed["distance"])
+    dirty = bool(parsed["dirty"])
+    metadata = {
+        "git_describe": describe,
+        "nearest_tag": parsed["tag"],
+        "commits_after_tag": distance,
+        "dirty": dirty,
+    }
+    if distance or dirty:
+        dirty_note = " and has uncommitted changes" if dirty else ""
+        return ValidationCheck(
+            id="git_tag_distance",
+            name="Git describe/tag distance",
+            status="warn",
+            detail=(
+                f"Checkout is {distance} commits after nearest local tag `{parsed['tag']}`{dirty_note}; "
+                "the installed checkout is not the same as the latest local tag described here."
+            ),
+            recovery=["Do not describe this install as latest tagged release without a separate release/tag decision."],
+            metadata=metadata,
+        )
+    return ValidationCheck(
+        id="git_tag_distance",
+        name="Git describe/tag distance",
+        status="pass",
+        detail=(
+            f"Checkout is exactly at nearest local tag `{parsed['tag']}`. This is local tag metadata only; "
+            "validate-install does not prove upstream/latest-release currentness."
+        ),
+        metadata=metadata,
+    )
+
+
+def _check_version_metadata(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+    pyproject_version = _read_pyproject_version(package_root / "pyproject.toml") if source_checkout else None
+    module_version = _read_module_version(package_root / "src" / "jsonl_history_search" / "__init__.py")
+    metadata = {
+        "pyproject_version": pyproject_version,
+        "module_version": module_version,
+        "source_checkout": source_checkout,
+    }
+    paths = [str(package_root / "pyproject.toml"), str(package_root / "src" / "jsonl_history_search" / "__init__.py")]
+    if pyproject_version is None and module_version is None:
+        return ValidationCheck(
+            id="version_metadata",
+            name="Version metadata consistency",
+            status="skip",
+            detail="Version metadata consistency is skipped because pyproject and module __version__ were not found.",
+            paths=paths,
+            metadata=metadata,
+        )
+    if pyproject_version is None or module_version is None:
+        return ValidationCheck(
+            id="version_metadata",
+            name="Version metadata consistency",
+            status="warn",
+            detail=(
+                f"Version metadata is incomplete: pyproject version={pyproject_version!r}, "
+                f"module __version__={module_version!r}."
+            ),
+            paths=paths,
+            recovery=["Keep pyproject.toml and src/jsonl_history_search/__init__.py version metadata aligned."],
+            metadata=metadata,
+        )
+    if pyproject_version != module_version:
+        return ValidationCheck(
+            id="version_metadata",
+            name="Version metadata consistency",
+            status="warn",
+            detail=(
+                f"pyproject version `{pyproject_version}` differs from module __version__ `{module_version}`; "
+                "release/version metadata has drift."
+            ),
+            paths=paths,
+            recovery=["Align pyproject.toml and src/jsonl_history_search/__init__.py before publishing or claiming release currentness."],
+            metadata=metadata,
+        )
+    return ValidationCheck(
+        id="version_metadata",
+        name="Version metadata consistency",
+        status="pass",
+        detail=f"pyproject version and module __version__ both report `{pyproject_version}`.",
+        paths=paths,
+        metadata=metadata,
+    )
+
+
+def _currentness_summary(
+    package_root: Path,
+    checks: list[ValidationCheck],
+    *,
+    source_checkout: bool,
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    by_id = {check.id: check for check in checks}
+    remote = by_id.get("git_remote_currentness")
+    tag = by_id.get("git_tag_distance")
+    version = by_id.get("version_metadata")
+    version_metadata = version.metadata if version else {}
+    tag_metadata = tag.metadata if tag else {}
+    remote_metadata = remote.metadata if remote else {}
+    warning_ids = [
+        check_id
+        for check_id in ("git_remote_currentness", "git_tag_distance", "version_metadata")
+        if by_id.get(check_id) is not None and by_id[check_id].status == "warn"
+    ]
+    global_skill = preflight.get("global_skill_freshness", "unknown")
+    return {
+        "local_install_freshness": {
+            "package_root": str(package_root),
+            "editable_project_root": str(package_root) if source_checkout else None,
+            "source_checkout": source_checkout,
+            "global_skill_freshness": global_skill,
+            "local_install_claim": (
+                "Local package checkout and optional global skill parity are validated by local checks only."
+            ),
+        },
+        "git_remote": {
+            "status": remote.status if remote else "not_checked",
+            "remote_names": remote_metadata.get("remote_names"),
+            "remote_count": remote_metadata.get("remote_count"),
+            "remote_currentness_checked": remote_metadata.get("remote_currentness_checked", False),
+            "detail": remote.detail if remote else None,
+        },
+        "git_describe": {
+            "status": tag.status if tag else "not_checked",
+            "describe": tag_metadata.get("git_describe"),
+            "nearest_tag": tag_metadata.get("nearest_tag"),
+            "commits_after_tag": tag_metadata.get("commits_after_tag"),
+            "dirty": tag_metadata.get("dirty"),
+            "detail": tag.detail if tag else None,
+        },
+        "version_metadata": {
+            "status": version.status if version else "not_checked",
+            "pyproject_version": version_metadata.get("pyproject_version"),
+            "module_version": version_metadata.get("module_version"),
+            "detail": version.detail if version else None,
+        },
+        "claim_boundary": (
+            "validate-install is a local diagnostic. It does not fetch remote refs or query package indexes; "
+            "absence of remote/tag/version warnings does not prove latest upstream or latest public release."
+        ),
+        "upstream_latest_release_currentness": "unproven",
+        "warning_check_ids": warning_ids,
+    }
+
+
+def _git_available(package_root: Path) -> bool:
+    return _run_git(package_root, "rev-parse", "--is-inside-work-tree").returncode == 0
+
+
+def _run_git(package_root: Path, *args: str):
+    return run_subprocess(
+        ["git", "-C", str(package_root), *args],
+        text=True,
+        stdout=PIPE,
+        stderr=PIPE,
+        check=False,
+    )
+
+
+def _parse_git_remote_names(output: str) -> list[str]:
+    return sorted({line.split()[0] for line in output.splitlines() if line.split()})
+
+
+def _parse_git_describe_long(describe: str) -> dict[str, Any] | None:
+    dirty = describe.endswith("-dirty")
+    clean = describe[:-6] if dirty else describe
+    match = re.match(r"^(?P<tag>.+)-(?P<distance>\d+)-g(?P<sha>[0-9a-f]+)$", clean)
+    if not match:
+        return None
+    return {
+        "tag": match.group("tag"),
+        "distance": int(match.group("distance")),
+        "sha": match.group("sha"),
+        "dirty": dirty,
+    }
+
+
+def _read_pyproject_version(pyproject: Path) -> str | None:
+    try:
+        lines = pyproject.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    in_project = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_project = line == "[project]"
+            continue
+        if in_project:
+            match = re.match(r"version\s*=\s*['\"]([^'\"]+)['\"]", line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _read_module_version(init_file: Path) -> str | None:
+    try:
+        text = init_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", text, re.MULTILINE)
+    return match.group(1) if match else None
 
 
 def _check_cli_import() -> ValidationCheck:

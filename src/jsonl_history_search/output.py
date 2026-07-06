@@ -5403,6 +5403,40 @@ def render_install_validation_text(payload: dict) -> str:
     ]
     if validation.get("codex_home"):
         lines.append(f"Codex home: {validation['codex_home']}")
+    currentness = validation.get("currentness") or {}
+    if currentness:
+        local = currentness.get("local_install_freshness") or {}
+        remote = currentness.get("git_remote") or {}
+        describe = currentness.get("git_describe") or {}
+        version = currentness.get("version_metadata") or {}
+        lines.append("Currentness:")
+        lines.append(f"- Local package root: {local.get('package_root')}")
+        lines.append(f"- Editable project root: {local.get('editable_project_root') or '(not a source checkout)'}")
+        lines.append(f"- Local global skill freshness: {local.get('global_skill_freshness', 'unknown')}")
+        lines.append(f"- Git remote availability: {remote.get('status', 'unknown')}")
+        if remote.get("remote_names"):
+            lines.append(f"  Remotes: {', '.join(str(item) for item in remote.get('remote_names', []))}")
+        lines.append(f"- Git describe/tag distance: {describe.get('status', 'unknown')}")
+        if describe.get("describe"):
+            lines.append(f"  Describe: {describe.get('describe')}")
+        if describe.get("nearest_tag") is not None:
+            lines.append(
+                f"  Nearest tag: {describe.get('nearest_tag')} "
+                f"({describe.get('commits_after_tag')} commits after tag, dirty={describe.get('dirty')})"
+            )
+        lines.append(
+            "- Version metadata: "
+            f"pyproject={version.get('pyproject_version')!r}, "
+            f"module __version__={version.get('module_version')!r} "
+            f"({version.get('status', 'unknown')})"
+        )
+        if currentness.get("warning_check_ids"):
+            lines.append("- Currentness warnings: " + ", ".join(str(item) for item in currentness["warning_check_ids"]))
+        lines.append(
+            "- Latest upstream/release currentness: "
+            f"{currentness.get('upstream_latest_release_currentness', 'unproven')}"
+        )
+        lines.append(f"- Currentness claim boundary: {currentness.get('claim_boundary')}")
     preflight = validation.get("agent_preflight") or {}
     if preflight:
         lines.append("Agent preflight:")
@@ -5446,10 +5480,47 @@ def render_install_validation_markdown(payload: dict) -> str:
         ),
         f"**Package root:** `{validation.get('package_root')}`",
         f"**Read-only:** {validation.get('read_only')}",
-        "",
-        "| Status | Check | Detail |",
-        "| --- | --- | --- |",
     ]
+    currentness = validation.get("currentness") or {}
+    if currentness:
+        local = currentness.get("local_install_freshness") or {}
+        remote = currentness.get("git_remote") or {}
+        describe = currentness.get("git_describe") or {}
+        version = currentness.get("version_metadata") or {}
+        lines.extend(
+            [
+                "",
+                "## Currentness",
+                "",
+                f"- Local package root: `{local.get('package_root')}`",
+                f"- Editable project root: `{local.get('editable_project_root') or '(not a source checkout)'}`",
+                f"- Local global skill freshness: `{local.get('global_skill_freshness', 'unknown')}`",
+                f"- Git remote availability: `{remote.get('status', 'unknown')}`",
+                f"- Git describe/tag distance: `{describe.get('status', 'unknown')}`",
+                f"- Git describe: `{describe.get('describe')}`",
+                (
+                    f"- Nearest tag: `{describe.get('nearest_tag')}`; "
+                    f"commits after tag: `{describe.get('commits_after_tag')}`; "
+                    f"dirty: `{describe.get('dirty')}`"
+                ),
+                (
+                    f"- Version metadata: pyproject `{version.get('pyproject_version')}`, "
+                    f"module `__version__` `{version.get('module_version')}` "
+                    f"({version.get('status', 'unknown')})"
+                ),
+                (
+                    "- Currentness warnings: `"
+                    + ", ".join(str(item) for item in currentness.get("warning_check_ids", []))
+                    + "`"
+                ),
+                (
+                    "- Latest upstream/release currentness: `"
+                    f"{currentness.get('upstream_latest_release_currentness', 'unproven')}`"
+                ),
+                f"- Currentness claim boundary: {currentness.get('claim_boundary')}",
+            ]
+        )
+    lines.extend(["", "| Status | Check | Detail |", "| --- | --- | --- |"])
     for check in validation.get("checks", []):
         lines.append(
             "| "
