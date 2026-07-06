@@ -42,7 +42,6 @@ repo recovery, TODO scans, or direct JSONL spelunking:
 
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
-convo --help
 python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text

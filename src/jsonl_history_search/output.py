@@ -4617,7 +4617,7 @@ def render_capability_diagnostic_text(payload: dict) -> str:
     cookbook = report.get("agent_command_cookbook") or []
     if cookbook:
         lines.append("Agent command cookbook:")
-        for item in cookbook[:6]:
+        for item in cookbook:
             lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
             lines.append(f"  Inspect: {item.get('inspect_next')}")
     source_plan = report.get("source_plan", {})
@@ -5418,7 +5418,7 @@ def render_install_validation_text(payload: dict) -> str:
         cookbook = preflight.get("agent_question_cookbook") or []
         if cookbook:
             lines.append("- Agent command cookbook:")
-            for item in cookbook[:6]:
+            for item in cookbook:
                 lines.append(f"  - {item.get('question_family')}: {item.get('first_command')}")
                 lines.append(f"    Inspect: {item.get('inspect_next')}")
         lines.append("- JSH-1098 proven route demos:")
