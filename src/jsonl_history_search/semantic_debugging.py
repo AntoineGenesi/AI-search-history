@@ -1344,7 +1344,10 @@ def apply_historical_provenance_self_echo_policy(
     policy_wanted = historical_provenance_self_echo_policy_wanted(query, family=family, handles=handles)
     orchestration_wanted = historical_orchestration_provenance_plan_wanted(query, family=family)
     if not policy_wanted and not orchestration_wanted:
-        if handles and historical_provenance_current_scope_requested(query):
+        if handles and (
+            historical_provenance_current_scope_requested(query)
+            or historical_provenance_prior_answer_or_report_audit_requested(query)
+        ):
             return ensure_read_more_actionability_defaults(next_reads), {}
         return next_reads, {}
 
@@ -1365,12 +1368,13 @@ def apply_historical_provenance_self_echo_policy(
             expansion_action_context=expansion_action_context,
             include_context_actions=include_context_actions,
         )
-        if policy_wanted
+        if policy_wanted or orchestration_wanted
         else []
     )
     annotated: list[dict[str, Any]] = []
     diagnostic_count = 0
     current_task_same_loop_count = 0
+    post_hoc_answer_key_count = 0
     for index, read in enumerate(next_reads):
         row = dict(read)
         target = str(row.get("target") or "")
@@ -1381,31 +1385,46 @@ def apply_historical_provenance_self_echo_policy(
             and historical_provenance_current_run_or_self_echo_candidate(text, query=query)
         )
         current_task_same_loop = (
-            orchestration_wanted
+            (policy_wanted or orchestration_wanted)
             and historical_orchestration_current_task_same_loop_candidate(
                 row,
                 candidate=candidate,
                 text=text,
             )
         )
-        if current_run_echo or current_task_same_loop:
+        category = historical_provenance_source_category(
+            row,
+            candidate=candidate,
+            query=query,
+            handles=handles,
+            current_run_echo=current_run_echo,
+            current_task_same_loop=current_task_same_loop,
+        )
+        if category["diagnostic_only"]:
             diagnostic_count += 1
             if current_task_same_loop:
                 current_task_same_loop_count += 1
-            chronology_role = (
-                "current_task_same_loop_diagnostic"
-                if current_task_same_loop and not current_run_echo
-                else "current_run_self_echo_diagnostic"
-            )
+            if category["source_chronology_role"] == "post_hoc_answer_key_diagnostic":
+                post_hoc_answer_key_count += 1
             row["diagnostic_only"] = True
             row["read_more_actionable"] = False
             row["followthrough_actionable"] = False
             row["expansion_actions"] = []
             row["context_actions"] = []
-            if current_task_same_loop and not current_run_echo:
+            if category["source_chronology_role"] == "current_task_same_loop_diagnostic":
                 row["reason"] = (
                     "current-task/same-loop orchestration status diagnostic; prefer original "
                     "pre-existing role evidence or exact missing-role recovery refs"
+                )
+            elif category["source_chronology_role"] == "post_hoc_answer_key_diagnostic":
+                row["reason"] = (
+                    "post-hoc answer-key/adjudication/final/report diagnostic; prefer target "
+                    "historical raw JSONL or historical task/review/commit refs as proof"
+                )
+            elif category["source_chronology_role"] == "unrelated_high_lexical_diagnostic":
+                row["reason"] = (
+                    "high-lexical diagnostic that does not match the requested task handle; "
+                    "prefer target historical raw JSONL or historical task/review/commit refs"
                 )
             else:
                 row["reason"] = (
@@ -1414,7 +1433,7 @@ def apply_historical_provenance_self_echo_policy(
                 )
             row["historical_provenance_selection"] = {
                 "schema_version": 1,
-                "source_chronology_role": chronology_role,
+                "source_chronology_role": category["source_chronology_role"],
                 "final_support_allowed": False,
                 "read_more_actionable": False,
                 "followthrough_actionable": False,
@@ -1425,8 +1444,8 @@ def apply_historical_provenance_self_echo_policy(
         elif policy_wanted:
             row.setdefault("historical_provenance_selection", {
                 "schema_version": 1,
-                "source_chronology_role": "candidate_or_original_source_ref",
-                "final_support_allowed": True,
+                "source_chronology_role": category["source_chronology_role"],
+                "final_support_allowed": category["final_support_allowed"],
                 "read_more_actionable": row.get("read_more_actionable", True) is not False,
                 "followthrough_actionable": row.get("followthrough_actionable", True) is not False,
                 "diagnostic_only": bool(row.get("diagnostic_only", False)),
@@ -1438,7 +1457,7 @@ def apply_historical_provenance_self_echo_policy(
 
     combined = dedupe_dicts(unwrapped + annotated)
     combined.sort(key=lambda item: item.pop("_historical_provenance_sort_key", (1, 0, 0)))
-    result = combined[:12]
+    result = dedupe_historical_provenance_reads(combined)[:12]
     summary = {
         "schema_version": 1,
         "status": "active",
@@ -1448,11 +1467,13 @@ def apply_historical_provenance_self_echo_policy(
         "diagnostic_only_next_read_count": sum(1 for item in result if item.get("diagnostic_only")),
         "diagnostic_only_candidate_count": diagnostic_count,
         "current_task_same_loop_diagnostic_count": current_task_same_loop_count,
+        "post_hoc_answer_key_diagnostic_count": post_hoc_answer_key_count,
         "policy": (
             "For explicit historical provenance handles, current-run command outputs, "
-            "lane prompts, same-run tool echoes, and current-task/same-loop status rows "
-            "are diagnostics. When they quote older JSONL source refs, promote the quoted "
-            "original refs as actionable reads."
+            "lane prompts, same-run tool echoes, current-task/same-loop status rows, "
+            "post-hoc answer-key/adjudication/final/report rows, and unrelated high-lexical "
+            "rows are diagnostics. Target historical raw JSONL and historical task/review/"
+            "commit refs stay actionable and sort before diagnostics."
         ),
         "current_run_evidence_counts_as_final_support": False,
         "raw_text_included": False,
@@ -1933,6 +1954,8 @@ def historical_orchestration_provenance_plan_wanted(query: str, *, family: dict[
     if historical_provenance_current_scope_requested(query):
         return False
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    if "reviewed source case" in lowered or "reviewed source window" in lowered:
+        return False
     primary = str((family or {}).get("primary") or "")
     detected = set((family or {}).get("detected_supported") or [])
     if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"} and "provenance" not in detected:
@@ -2348,9 +2371,11 @@ def historical_provenance_self_echo_policy_wanted(
 ) -> bool:
     if not handles:
         return False
-    if historical_provenance_current_scope_requested(query):
+    if historical_provenance_current_scope_requested(query) or historical_provenance_prior_answer_or_report_audit_requested(query):
         return False
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    if not TASKISH_HANDLE_RE.search(query or ""):
+        return False
     primary = str((family or {}).get("primary") or "")
     if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"}:
         return False
@@ -2367,10 +2392,39 @@ def historical_provenance_self_echo_policy_wanted(
             "parent",
             "orchestration",
             "provenance",
+            "source chronology",
+            "chronology",
+            "source chain",
+            "evidence chain",
+            "reconstruct",
+            "prove",
+            "proof",
+            "task",
+            "branch",
+            "commit",
+            "merge",
+            "implementation",
+            "fix",
+            "rereview",
             "what changed",
+            "what happened",
             "verified",
         )
     )
+
+
+def dedupe_historical_provenance_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for read in next_reads:
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        key = str(read.get("target") or source_ref_target(source_ref) or source_ref.get("path") or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        result.append(read)
+    return result
 
 
 def historical_provenance_current_scope_requested(query: str) -> bool:
@@ -2383,6 +2437,29 @@ def historical_provenance_current_scope_requested(query: str) -> bool:
             lowered,
         )
     )
+
+
+def historical_provenance_prior_answer_or_report_audit_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    prior_or_report = any(
+        term in lowered
+        for term in (
+            "prior answer",
+            "previous answer",
+            "earlier answer",
+            "last answer",
+            "final answer",
+            "prior final",
+            "previous final",
+            "that report",
+            "this report",
+            "prior report",
+            "previous report",
+            "adjudication report",
+        )
+    )
+    audit = any(term in lowered for term in ("audit", "check", "inspect", "verify", "did it", "did the answer"))
+    return prior_or_report and audit
 
 
 def ensure_read_more_actionability_defaults(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2430,6 +2507,107 @@ def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query
         "process exited with code",
     )
     return any(marker in lowered for marker in current_tool_markers)
+
+
+def historical_provenance_source_category(
+    read: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    query: str,
+    handles: list[str],
+    current_run_echo: bool,
+    current_task_same_loop: bool,
+) -> dict[str, Any]:
+    if current_task_same_loop and not current_run_echo:
+        return historical_provenance_category_row("current_task_same_loop_diagnostic", final=False, diagnostic=True)
+    if current_run_echo:
+        return historical_provenance_category_row("current_run_self_echo_diagnostic", final=False, diagnostic=True)
+    text = historical_provenance_read_text(read, candidate)
+    if historical_provenance_post_hoc_answer_key_candidate(text, query=query):
+        return historical_provenance_category_row("post_hoc_answer_key_diagnostic", final=False, diagnostic=True)
+    target = str(read.get("target") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    raw_jsonl = is_jsonl_read_target(target) or path.lower().replace("\\", "/").endswith(".jsonl")
+    if handles and not historical_provenance_matches_requested_handle(text, handles):
+        return historical_provenance_category_row("unrelated_high_lexical_diagnostic", final=False, diagnostic=True)
+    if raw_jsonl:
+        return historical_provenance_category_row("target_historical_raw_jsonl_source_ref", final=True, diagnostic=False)
+    if historical_provenance_secondary_task_review_commit_ref(read, candidate, text=text):
+        return historical_provenance_category_row("historical_task_review_commit_secondary_ref", final=True, diagnostic=False)
+    return historical_provenance_category_row("candidate_or_original_source_ref", final=True, diagnostic=False)
+
+
+def historical_provenance_category_row(role: str, *, final: bool, diagnostic: bool) -> dict[str, Any]:
+    return {
+        "source_chronology_role": role,
+        "final_support_allowed": final,
+        "diagnostic_only": diagnostic,
+    }
+
+
+def historical_provenance_matches_requested_handle(text: str, handles: list[str]) -> bool:
+    normalized = normalize_source_handle(text)
+    if not normalized:
+        return False
+    return any(normalize_source_handle(handle) in normalized for handle in handles if handle)
+
+
+def historical_provenance_post_hoc_answer_key_candidate(text: str, *, query: str | None = None) -> bool:
+    if historical_provenance_prior_answer_or_report_audit_requested(query or ""):
+        return False
+    lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
+    return any(
+        marker in lowered
+        for marker in (
+            "answer-key",
+            "answer key",
+            "prior final",
+            "previous final",
+            "final_answer",
+            "final answer",
+            "lane final",
+            "manual lane final",
+            "jsonl lane final",
+            "adjudication",
+            "raw trace audit",
+            "raw-trace audit",
+            "source_category_blocker",
+            "source category blocker",
+            "pressure report",
+            "post-merge pressure",
+            "runner report",
+            "value gate",
+        )
+    )
+
+
+def historical_provenance_secondary_task_review_commit_ref(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    text: str,
+) -> bool:
+    target = str(read.get("target") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    if historical_orchestration_secondary_artifact_path(path):
+        return True
+    support = " ".join(
+        str(part or "")
+        for part in (
+            read.get("kind"),
+            target,
+            path,
+            read.get("reason"),
+            candidate.get("snippet"),
+            text,
+        )
+    ).lower()
+    return bool(
+        re.search(r"\b[0-9a-f]{7,40}\b", support)
+        and any(term in support for term in ("commit", "merge", "git show", "git log"))
+    )
 
 
 def historical_provenance_read_text(read: dict[str, Any], candidate: dict[str, Any]) -> str:
@@ -2530,14 +2708,28 @@ def embedded_jsonl_source_refs(text: str) -> list[dict[str, Any]]:
 
 
 def historical_provenance_read_sort_key(read: dict[str, Any], index: int) -> tuple[int, int, int]:
+    selection = read.get("historical_provenance_selection") if isinstance(read.get("historical_provenance_selection"), dict) else {}
+    role = str(selection.get("source_chronology_role") or "")
     if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
-        return (3, 0, index)
+        diagnostic_rank = {
+            "current_run_self_echo_diagnostic": 0,
+            "current_task_same_loop_diagnostic": 1,
+            "post_hoc_answer_key_diagnostic": 2,
+            "unrelated_high_lexical_diagnostic": 3,
+        }.get(role, 4)
+        return (4, diagnostic_rank, index)
     if read.get("embedded_source_ref_unwrapped"):
         return (0, 0, index)
+    role_rank = {
+        "target_historical_raw_jsonl_source_ref": 0,
+        "pre_existing_source_ref_quoted_by_current_run_echo": 0,
+        "historical_task_review_commit_secondary_ref": 1,
+        "candidate_or_original_source_ref": 2,
+    }.get(role, 2)
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     target = str(read.get("target") or "")
     original_jsonl = 0 if target.endswith(".jsonl") or str(source_ref.get("path") or "").endswith(".jsonl") else 1
-    return (1, original_jsonl, index)
+    return (1, role_rank + original_jsonl, index)
 
 
 def process_actual_use_source_tier(*, kind: str, target: str | None, source_ref: dict[str, Any]) -> str:

@@ -13,6 +13,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "action_proof",
         "process_actual_use",
         "orchestration_provenance",
+        "provenance",
         "remembered_topic",
         "semantic_debug",
     }
@@ -99,6 +100,39 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "wrong, capped, missing a required root, or the user asks for weak "
         "context records to be summarized. Preserve the boundary: this proves "
         "not_found_in_searched_scope, not all-history absence."
+    ),
+)
+
+TASK_REVIEW_COMMIT_PROVENANCE_ROUTE = AskRoute(
+    route_family="provenance",
+    chosen_route="task-review-commit-provenance / semantic-debug",
+    why_it_applies=(
+        "The wording names a historical task handle and asks to reconstruct, "
+        "prove, or distinguish task/review/branch/commit/implementation chronology. "
+        "Use semantic-debug provenance/source refs before artifact-currentness or "
+        "repo status anchoring."
+    ),
+    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.source_locator_handoff.next_reads",
+        "historical provenance source chronology roles",
+        "target historical raw JSONL and historical task/review/commit secondary refs before diagnostics",
+        "diagnostic-only current-run, prior-final, adjudication, report, or answer-key-adjacent rows",
+    ),
+    stop_guidance=(
+        "Run semantic-debug before artifact-currentness, TODO scans, or broad repo "
+        "search. Open promoted target historical raw JSONL refs and legitimate "
+        "historical task/review/commit refs first. Treat same-loop/current-run "
+        "output and post-hoc answer-key/adjudication/final material as diagnostics "
+        "unless the user explicitly asks to audit the current run, current lane, "
+        "prior answer, or report."
+    ),
+    manual_search_guidance=(
+        "Manual git/rg is targeted follow-up after semantic-debug names a missing "
+        "chronology facet. Prefer original historical raw session/tool evidence "
+        "and historical task/review/commit refs over current-run echoes or reports "
+        "created after the target work."
     ),
 )
 
@@ -422,9 +456,6 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_reviewed_source_window_prompt(normalized):
         return ROUTES[1]
 
-    if _looks_like_local_artifact_verification_query(normalized):
-        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
-
     if _looks_like_bounded_no_evidence_query(normalized):
         return BOUNDED_NO_EVIDENCE_ROUTE
 
@@ -450,6 +481,12 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[6]
+
+    if _looks_like_task_review_commit_provenance_query(normalized):
+        return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
+
+    if _looks_like_local_artifact_verification_query(normalized):
+        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
     if is_worktree_cleanup_currentness_query(query):
         return ROUTES[7]
@@ -622,6 +659,82 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "provenance",
         ),
     )
+
+
+def _looks_like_task_review_commit_provenance_query(normalized: str) -> bool:
+    if _looks_like_explicit_current_or_prior_answer_audit(normalized):
+        return False
+    has_task_handle = bool(re.search(r"\b[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*\b", normalized))
+    if not has_task_handle:
+        return False
+    asks_for_proof_or_chronology = _has_any(
+        normalized,
+        (
+            "reconstruct",
+            "prove",
+            "proof",
+            "source chronology",
+            "chronology",
+            "provenance",
+            "source chain",
+            "evidence chain",
+            "distinguish",
+            "what actually happened",
+            "what happened",
+            "where did",
+            "find the source",
+        ),
+    )
+    if not asks_for_proof_or_chronology:
+        return False
+    facet_hits = sum(
+        1
+        for terms in (
+            ("task", "ticket"),
+            ("review", "reviewer", "rereview", "rereviewer"),
+            ("branch", "worktree"),
+            ("commit", "merge", "sha"),
+            ("implementation", "implemented", "fix", "fixed"),
+            ("source", "raw evidence", "jsonl", "session", "tool evidence"),
+        )
+        if any(term in normalized for term in terms)
+    )
+    return facet_hits >= 2
+
+
+def _looks_like_explicit_current_or_prior_answer_audit(normalized: str) -> bool:
+    current_scope = _has_any(
+        normalized,
+        (
+            "current run",
+            "this run",
+            "current lane",
+            "this lane",
+            "current tool",
+            "this tool",
+            "current route",
+            "this route",
+            "current report",
+            "this report",
+        ),
+    )
+    prior_answer_or_report = _has_any(
+        normalized,
+        (
+            "prior answer",
+            "previous answer",
+            "earlier answer",
+            "last answer",
+            "final answer",
+            "this report",
+            "that report",
+            "prior report",
+            "previous report",
+            "adjudication report",
+        ),
+    )
+    audit = _has_any(normalized, ("audit", "check", "inspect", "verify", "did the answer", "did it cite"))
+    return current_scope or (prior_answer_or_report and audit)
 
 
 def _looks_like_task_window_status_handoff_query(normalized: str) -> bool:
