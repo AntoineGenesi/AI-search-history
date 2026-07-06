@@ -2297,25 +2297,69 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
             str(row.get("target") or "")
         )
         if _devlog_read_is_invalid_default_target_artifact(row, candidate=candidate) and not artifact_audit_requested:
+            reason = _devlog_invalid_default_target_artifact_reason(row, candidate=candidate)
+            row["devlog_target_source_eligibility"] = {
+                "eligible": False,
+                "default_target_allowed": False,
+                "reason": reason,
+            }
             diagnostic_reads.append(
                 _devlog_demote_source_window_read(
                     row,
-                    reason=_devlog_invalid_default_target_artifact_reason(row, candidate=candidate),
+                    reason=reason,
                 )
             )
         elif _devlog_read_is_diagnostic(row) and not artifact_audit_requested:
+            row["devlog_target_source_eligibility"] = {
+                "eligible": False,
+                "default_target_allowed": False,
+                "reason": "chronology_diagnostic",
+            }
             diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="chronology_diagnostic"))
-        elif row.get("target") and _devlog_target_read_has_real_source_provenance(row, candidate=candidate):
-            row = _devlog_mark_real_source_target_read(row)
-            row["final_support_candidate"] = True
-            target_reads.append(row)
-        elif row.get("target") and artifact_audit_requested:
-            row["final_support_candidate"] = True
-            row["artifact_audit_promoted"] = True
-            target_reads.append(row)
         elif row.get("target"):
-            diagnostic_reads.append(_devlog_demote_source_window_read(row, reason="missing_real_source_provenance"))
+            eligibility = _devlog_default_target_source_eligibility(row, candidate=candidate)
+            if eligibility.get("eligible") is True:
+                row = _devlog_mark_real_source_target_read(row, eligibility=eligibility)
+                row["final_support_candidate"] = True
+                target_reads.append(row)
+            elif artifact_audit_requested:
+                row["final_support_candidate"] = True
+                row["artifact_audit_promoted"] = True
+                row["devlog_target_source_eligibility"] = {
+                    **eligibility,
+                    "artifact_audit_promoted": True,
+                    "default_target_allowed": False,
+                }
+                target_reads.append(row)
+            else:
+                row["devlog_target_source_eligibility"] = eligibility
+                diagnostic_reads.append(
+                    _devlog_demote_source_window_read(
+                        row,
+                        reason=str(eligibility.get("reason") or "missing_positive_target_source_eligibility"),
+                    )
+                )
     return target_reads[:8], diagnostic_reads[:8]
+
+
+def _devlog_candidate_lookup_record(item: dict, *, source: str) -> dict:
+    row = dict(item)
+    row["_devlog_lookup_sources"] = [source]
+    return row
+
+
+def _devlog_merge_candidate_lookup(existing: dict, incoming: dict) -> dict:
+    sources = list(existing.get("_devlog_lookup_sources") or [])
+    for source in list(incoming.get("_devlog_lookup_sources") or []):
+        if source not in sources:
+            sources.append(source)
+    existing["_devlog_lookup_sources"] = sources
+    for key, value in incoming.items():
+        if key == "_devlog_lookup_sources":
+            continue
+        if existing.get(key) in (None, "", [], {}):
+            existing[key] = value
+    return existing
 
 
 def _devlog_source_window_candidate_lookups(packet: dict) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -2323,12 +2367,20 @@ def _devlog_source_window_candidate_lookups(packet: dict) -> tuple[dict[str, dic
     for key in ("strongest_candidates", "find_candidates", "timeline"):
         value = packet.get(key)
         if isinstance(value, list):
-            candidates.extend(item for item in value if isinstance(item, dict))
+            candidates.extend(
+                _devlog_candidate_lookup_record(item, source=key)
+                for item in value
+                if isinstance(item, dict)
+            )
     handoff = packet.get("source_locator_handoff") if isinstance(packet.get("source_locator_handoff"), dict) else {}
     for key in ("source_windows", "source_refs"):
         value = handoff.get(key)
         if isinstance(value, list):
-            candidates.extend(item for item in value if isinstance(item, dict))
+            candidates.extend(
+                _devlog_candidate_lookup_record(item, source=key)
+                for item in value
+                if isinstance(item, dict)
+            )
 
     by_id: dict[str, dict] = {}
     by_target: dict[str, dict] = {}
@@ -2336,11 +2388,15 @@ def _devlog_source_window_candidate_lookups(packet: dict) -> tuple[dict[str, dic
         candidate_id = str(candidate.get("candidate_id") or "")
         if candidate_id and candidate_id not in by_id:
             by_id[candidate_id] = candidate
+        elif candidate_id:
+            by_id[candidate_id] = _devlog_merge_candidate_lookup(by_id[candidate_id], candidate)
         target = str(candidate.get("target") or "")
         if not target and isinstance(candidate.get("source_ref"), dict):
             target = _devlog_source_ref_target(candidate["source_ref"])
         if target and target not in by_target:
             by_target[target] = candidate
+        elif target:
+            by_target[target] = _devlog_merge_candidate_lookup(by_target[target], candidate)
     return by_id, by_target
 
 
@@ -2382,18 +2438,120 @@ def _devlog_demote_source_window_read(read: dict, *, reason: str) -> dict:
     return row
 
 
-def _devlog_target_read_has_real_source_provenance(read: dict, *, candidate: dict | None = None) -> bool:
-    if not read.get("target") or read.get("diagnostic_only") is True or read.get("read_more_actionable") is False:
-        return False
-    if _devlog_read_is_invalid_default_target_artifact(read, candidate=candidate):
-        return False
-    if _devlog_raw_jsonl_source_target(read):
-        return True
+def _devlog_record_role(read: dict, candidate: dict | None) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    candidate_ref = (
+        candidate.get("source_ref")
+        if isinstance(candidate, dict) and isinstance(candidate.get("source_ref"), dict)
+        else {}
+    )
+    values = (
+        read.get("role"),
+        read.get("record_role"),
+        read.get("message_role"),
+        read.get("source_role"),
+        source_ref.get("role"),
+        candidate.get("role") if isinstance(candidate, dict) else None,
+        candidate.get("record_role") if isinstance(candidate, dict) else None,
+        candidate.get("message_role") if isinstance(candidate, dict) else None,
+        candidate.get("source_role") if isinstance(candidate, dict) else None,
+        candidate_ref.get("role"),
+    )
+    for value in values:
+        if value not in (None, ""):
+            return str(value).casefold().replace("-", "_")
+    return ""
+
+
+def _devlog_context_category_text(read: dict, candidate: dict | None) -> str:
     selection = (
         read.get("historical_provenance_selection")
         if isinstance(read.get("historical_provenance_selection"), dict)
         else {}
     )
+    values = [
+        read.get("kind"),
+        read.get("source_category"),
+        read.get("category"),
+        read.get("record_type"),
+        selection.get("source_chronology_role"),
+        selection.get("selection_reason"),
+    ]
+    if isinstance(candidate, dict):
+        values.extend(
+            [
+                candidate.get("kind"),
+                candidate.get("source_category"),
+                candidate.get("category"),
+                candidate.get("record_type"),
+                candidate.get("stage"),
+                " ".join(str(item) for item in candidate.get("stages") or []),
+                " ".join(str(item) for item in candidate.get("reason_codes") or []),
+            ]
+        )
+    return " ".join(str(value) for value in values if value not in (None, "")).casefold().replace("-", "_")
+
+
+def _devlog_role_is_historical_message(role: str) -> bool:
+    return role in {
+        "user",
+        "assistant",
+        "user_message",
+        "assistant_message",
+        "agent_message",
+    }
+
+
+def _devlog_role_or_category_is_default_denied(role: str, category_text: str) -> bool:
+    denied_roles = {
+        "system",
+        "developer",
+        "context",
+        "session",
+        "session_meta",
+        "session_metadata",
+        "turn_context",
+        "tool",
+        "tool_call",
+        "tool_result",
+        "tool_use",
+        "tool_output",
+        "function_call",
+        "function_call_output",
+        "command",
+        "command_output",
+        "token_count",
+    }
+    if role in denied_roles:
+        return True
+    denied_markers = (
+        "developer",
+        "system",
+        "turn_context",
+        "session_meta",
+        "session_metadata",
+        "tool_output",
+        "tool_result",
+        "tool_event",
+        "function_call",
+        "command_output",
+    )
+    return any(marker in category_text for marker in denied_markers)
+
+
+def _devlog_candidate_has_source_window_provenance(candidate: dict | None) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    sources = set(str(source) for source in candidate.get("_devlog_lookup_sources") or [])
+    return (
+        "source_windows" in sources
+        or candidate.get("summary_kind") == "compact_source_window_ref"
+        or bool(candidate.get("window_id"))
+        or (bool(candidate.get("window_kind")) and isinstance(candidate.get("source_ref"), dict))
+    )
+
+
+def _devlog_selection_allows_default_target(selection: dict) -> bool:
     if not selection:
         return False
     if (
@@ -2403,19 +2561,99 @@ def _devlog_target_read_has_real_source_provenance(read: dict, *, candidate: dic
     ):
         return False
     role = str(selection.get("source_chronology_role") or "")
-    if not role or role.endswith("_diagnostic") or "diagnostic" in role:
-        return False
-    positive_roles = {
-        "target_historical_raw_jsonl_source_ref",
-        "candidate_or_original_source_ref",
-        "historical_task_review_commit_secondary_ref",
-        "pre_existing_source_ref_quoted_by_current_run_echo",
+    return bool(role and not role.endswith("_diagnostic") and "diagnostic" not in role)
+
+
+def _devlog_default_target_source_eligibility(read: dict, *, candidate: dict | None = None) -> dict:
+    base = {
+        "schema_version": 1,
+        "eligible": False,
+        "default_target_allowed": False,
     }
-    return role in positive_roles
+    if not read.get("target"):
+        return {**base, "reason": "missing_target"}
+    if read.get("diagnostic_only") is True or read.get("read_more_actionable") is False:
+        return {**base, "reason": "chronology_diagnostic"}
+    if str(read.get("kind") or "").casefold() == "tool_event_source_ref":
+        return {**base, "reason": "tool_event_not_default_devlog_target"}
+    if _devlog_read_is_invalid_default_target_artifact(read, candidate=candidate):
+        return {
+            **base,
+            "reason": _devlog_invalid_default_target_artifact_reason(read, candidate=candidate),
+        }
+
+    role = _devlog_record_role(read, candidate)
+    category_text = _devlog_context_category_text(read, candidate)
+    if _devlog_role_or_category_is_default_denied(role, category_text):
+        return {
+            **base,
+            "reason": "non_message_context_not_default_devlog_target",
+            "record_role": role or None,
+        }
+
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    chronology_role = str(selection.get("source_chronology_role") or "")
+    has_source_window_provenance = _devlog_candidate_has_source_window_provenance(candidate)
+    is_jsonl_target = _devlog_raw_jsonl_source_target(read)
+
+    if (
+        _devlog_selection_allows_default_target(selection)
+        and chronology_role == "pre_existing_source_ref_quoted_by_current_run_echo"
+    ):
+        return {
+            **base,
+            "eligible": True,
+            "default_target_allowed": True,
+            "category": "pre_existing_source_ref_quoted_by_current_run_echo",
+            "source_chronology_role": chronology_role,
+            "record_role": role or None,
+        }
+
+    if (
+        _devlog_selection_allows_default_target(selection)
+        and chronology_role == "candidate_or_original_source_ref"
+        and has_source_window_provenance
+        and is_jsonl_target
+    ):
+        return {
+            **base,
+            "eligible": True,
+            "default_target_allowed": True,
+            "category": "original_source_window_packet_ref",
+            "source_chronology_role": chronology_role,
+            "record_role": role or None,
+        }
+
+    if is_jsonl_target and _devlog_role_is_historical_message(role):
+        return {
+            **base,
+            "eligible": True,
+            "default_target_allowed": True,
+            "category": "historical_user_assistant_jsonl_source_window",
+            "record_role": role,
+            "source_window_provenance": has_source_window_provenance,
+        }
+
+    return {
+        **base,
+        "reason": "missing_positive_target_source_eligibility",
+        "record_role": role or None,
+        "source_window_provenance": has_source_window_provenance,
+    }
 
 
-def _devlog_mark_real_source_target_read(read: dict) -> dict:
+def _devlog_target_read_has_real_source_provenance(read: dict, *, candidate: dict | None = None) -> bool:
+    return _devlog_default_target_source_eligibility(read, candidate=candidate).get("eligible") is True
+
+
+def _devlog_mark_real_source_target_read(read: dict, *, eligibility: dict | None = None) -> dict:
     row = dict(read)
+    if eligibility:
+        row["devlog_target_source_eligibility"] = dict(eligibility)
     if not isinstance(row.get("historical_provenance_selection"), dict):
         row["historical_provenance_selection"] = {
             "schema_version": 1,
@@ -2426,6 +2664,11 @@ def _devlog_mark_real_source_target_read(read: dict) -> dict:
             "diagnostic_only": False,
             "raw_text_included": False,
         }
+    else:
+        selection = dict(row["historical_provenance_selection"])
+        if eligibility and eligibility.get("category"):
+            selection["devlog_target_source_eligibility_category"] = eligibility["category"]
+        row["historical_provenance_selection"] = selection
     return row
 
 
@@ -2455,6 +2698,12 @@ def _devlog_committed_safe_packet_fallback_reads(packet: dict, *, failure_packet
                 "claim_boundaries": list(row.get("claim_boundaries") or [])[:4],
                 "final_support_candidate": True,
                 "fallback_reason": "no positive real-source JSONL target survived devlog source-quality gating",
+                "devlog_target_source_eligibility": {
+                    "schema_version": 1,
+                    "eligible": True,
+                    "default_target_allowed": True,
+                    "category": "bounded_committed_safe_packet_fallback",
+                },
                 "historical_provenance_selection": {
                     "schema_version": 1,
                     "source_chronology_role": "bounded_committed_safe_packet_fallback",
@@ -2482,6 +2731,12 @@ def _devlog_committed_safe_packet_fallback_reads(packet: dict, *, failure_packet
                     ],
                     "final_support_candidate": True,
                     "fallback_reason": "no positive real-source JSONL target survived devlog source-quality gating",
+                    "devlog_target_source_eligibility": {
+                        "schema_version": 1,
+                        "eligible": True,
+                        "default_target_allowed": True,
+                        "category": "bounded_committed_safe_packet_fallback",
+                    },
                     "historical_provenance_selection": {
                         "schema_version": 1,
                         "source_chronology_role": "bounded_committed_safe_packet_fallback",
