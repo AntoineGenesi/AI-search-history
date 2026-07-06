@@ -24,6 +24,20 @@ from .timeutil import parse_datetime
 DEFAULT_STATUS_QUERY = "what happened since my last message?"
 SCHEMA_VERSION = 1
 
+SOURCE_MODES = (
+    "ground_truth_chat_logs",
+    "artifact_assisted_context",
+    "post_hoc_diagnostic",
+)
+
+SOURCE_ROLE_LABELS = (
+    "primary_raw_chat_log",
+    "primary_tool_or_command_trace",
+    "legitimate_pre_existing_artifact",
+    "post_hoc_answer_key_or_same_loop_echo",
+    "diagnostic_only",
+)
+
 STATUS_QUERY_PATTERNS = (
     "what happened since",
     "what has happened since",
@@ -279,6 +293,7 @@ def status_anchor_report(
         canonical_parent_main_interval=canonical_parent_main_interval,
         canonical_parent_main_fallback=canonical_parent_main_fallback,
     )
+    prior_request_occurrence = anchor_decision.get("prior_request_occurrence") or prior_request_occurrence
     status_as_of_boundary = anchor_decision.get("status_as_of_boundary") or status_as_of_boundary
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
@@ -333,6 +348,7 @@ def status_anchor_report(
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
     )
+    next_reads = _with_source_role_labels(next_reads)
     source_tiers = _source_tiers(next_reads)
     follow_through_plan = _follow_through_plan(
         source_tiers=source_tiers,
@@ -742,6 +758,47 @@ def _select_anchor_with_boundary(
         )
     if prior_request_occurrence.get("status") == "ambiguous":
         boundary = prior_request_occurrence.get("status_as_of_boundary") or status_as_of_boundary
+        interval = canonical_parent_main_interval or {"status": "not_applicable"}
+        interval_anchor = interval.get("selected_anchor") or {}
+        interval_refs = _parent_main_high_confidence_refs(interval.get("anchor_candidates") or [])
+        natural_parent_main_status = (
+            is_status_question(query)
+            and _relative_status_requires_history_first_anchor(query)
+            and not _prefers_parent_main_anchor(query)
+            and not _explicit_side_thread_local_status(query)
+        )
+        unique_interval_anchor = (
+            interval.get("status") == "selected"
+            and bool(boundary)
+            and bool(interval_anchor)
+            and _is_proven_parent_main_history_anchor(interval_anchor)
+            and len(interval_refs) == 1
+            and str(interval_anchor.get("source_ref") or "") in interval_refs
+        )
+        if natural_parent_main_status and unique_interval_anchor:
+            interval_boundary = interval.get("status_as_of_boundary") or boundary
+            return _with_rejected_alternatives(
+                {
+                    **base,
+                    "context_boundary": "natural_status_duplicate_prior_parent_main_canonical_fallback",
+                    "anchor_scope": "parent_thread",
+                    "anchor_reason": "nearest_preceding_canonical_parent_main_history_anchor",
+                    "anchor_ref": interval_anchor.get("source_ref"),
+                    "status_ref": (interval_boundary or {}).get("source_ref") or (boundary or {}).get("source_ref"),
+                    "status_as_of_boundary": interval_boundary,
+                    "selected_anchor": _selected_with_reason(
+                        interval_anchor,
+                        "; selected by canonical parent/main history fallback after duplicate prior natural status prompts",
+                    ),
+                    "prior_request_occurrence": {
+                        **prior_request_occurrence,
+                        "fallback_applied": "unique_canonical_parent_main_history_anchor",
+                    },
+                    "canonical_parent_main_fallback": canonical_parent_main_fallback,
+                    "canonical_parent_main_status_interval": interval,
+                },
+                candidates,
+            )
         return {
             **base,
             "context_boundary": prior_request_occurrence.get("context_boundary") or "prior_request_occurrence_ambiguous",
@@ -1284,7 +1341,9 @@ def _canonical_parent_main_status_interval(
     codex_home: Path | None,
     status_as_of_boundary: dict | None,
 ) -> dict:
-    if not codex_home or not is_status_question(query) or not _prefers_parent_main_anchor(query):
+    if not codex_home or not is_status_question(query) or not (
+        _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
+    ):
         return {"status": "not_applicable", "reason": "query_not_explicit_parent_main_status"}
     history_path = codex_home / "history.jsonl"
     if not history_path.is_file():
@@ -2250,7 +2309,11 @@ def _apply_parent_main_anchor_shortlist_contract(
     cwd: Path,
     codex_home: Path | None,
 ) -> tuple[dict | None, dict, dict]:
-    if not (_prefers_parent_main_anchor(query) or _is_parent_main_complaint_request(query)):
+    if not (
+        _prefers_parent_main_anchor(query)
+        or _is_parent_main_complaint_request(query)
+        or str(anchor_decision.get("context_boundary") or "").startswith("natural_status_duplicate_prior_parent_main")
+    ):
         return selected_anchor, anchor_decision, {
             "contract": "parent_main_anchor_shortlist",
             "status": "not_applicable",
@@ -2530,6 +2593,7 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
         context_boundary.startswith("explicit_parent_main")
         or context_boundary.startswith("relative_status_history")
         or context_boundary.startswith("prior_request_occurrence")
+        or context_boundary.startswith("natural_status_duplicate_prior_parent_main")
         or context_boundary == "parent_main_selected_anchor_unproven"
         or context_boundary == "parent_main_anchor_shortlist_ambiguous"
         or anchor_reason in {
@@ -3001,6 +3065,18 @@ def _hash_value(value: Any) -> str | None:
 
 def _evidence_contract() -> dict:
     return {
+        "source_modes": {
+            "ground_truth_chat_logs": "Raw Codex history/session/tool evidence used before secondary artifacts.",
+            "artifact_assisted_context": "Chronologically legitimate task/report/review/commit context used after raw logs.",
+            "post_hoc_diagnostic": "Same-loop, later, answer-key-like, rejected, or diagnostic-only material not counted as primary proof.",
+        },
+        "source_role_labels": {
+            "primary_raw_chat_log": "Raw human chat/history rows such as selected anchors and status boundaries.",
+            "primary_tool_or_command_trace": "Raw session/tool/command trace rows from sessions/**/*.jsonl.",
+            "legitimate_pre_existing_artifact": "Task/report/review/commit artifact context that is allowed only as secondary support.",
+            "post_hoc_answer_key_or_same_loop_echo": "Later/current-loop echoes, pressure artifacts, or answer-key-like material.",
+            "diagnostic_only": "Recovery, disambiguation, stale, or optional material that must not be normal answer support.",
+        },
         "source_tiers": {
             "required_primary": "Selected anchor plus raw current-window Codex history/session JSONL refs.",
             "required_secondary": "Current-window commits and task/report/review artifacts, only after required primary reads.",
@@ -3478,6 +3554,8 @@ def _prior_request_occurrence_recovery_reads(
     prior = anchor_decision.get("prior_request_occurrence") or {}
     if prior.get("status") != "ambiguous":
         return []
+    if prior.get("fallback_applied"):
+        return []
     reads = []
     for candidate in prior.get("occurrence_candidates") or prior.get("rejected_anchor_alternatives") or []:
         read = {
@@ -3667,6 +3745,8 @@ def _source_tiers(reads: list[dict]) -> dict:
         tiers[tier].append(read)
     return {
         "tier_order": ["required_primary", "required_secondary", "diagnostic_optional"],
+        "source_mode_order": list(SOURCE_MODES),
+        "source_role_labels": list(SOURCE_ROLE_LABELS),
         "required_primary": tiers["required_primary"],
         "required_secondary": tiers["required_secondary"],
         "diagnostic_optional": tiers["diagnostic_optional"],
@@ -3676,6 +3756,99 @@ def _source_tiers(reads: list[dict]) -> dict:
             "diagnostic_optional stale/demo/example and same-run/private pressure refs are not answer-facing summary support"
         ),
     }
+
+
+def _with_source_role_labels(reads: list[dict]) -> list[dict]:
+    return [_with_source_role_label(read) for read in reads]
+
+
+def _with_source_role_label(read: dict) -> dict:
+    labeled = dict(read)
+    evidence_mode, source_role_label, reason = _source_role_for_read(labeled)
+    labeled["evidence_mode"] = evidence_mode
+    labeled["source_role_label"] = source_role_label
+    labeled["source_role_reason"] = reason
+    return labeled
+
+
+def _source_role_for_read(read: dict) -> tuple[str, str, str]:
+    source_ref = str(read.get("source_ref") or "")
+    source_kind = str(read.get("source_kind") or "")
+    openable_target = _normalize_pathish(str(read.get("openable_target") or ""))
+    source_tier = str(read.get("source_tier") or "")
+    if _is_post_hoc_or_diagnostic_read(read):
+        label = (
+            "post_hoc_answer_key_or_same_loop_echo"
+            if _is_post_hoc_or_same_loop_read(read)
+            else "diagnostic_only"
+        )
+        return (
+            "post_hoc_diagnostic",
+            label,
+            "diagnostic, recovery, suppressed, same-loop, or later material is not counted as primary status proof",
+        )
+    if source_kind == "codex_history" or source_ref.startswith("codex_history:") or "history.jsonl" in openable_target:
+        return (
+            "ground_truth_chat_logs",
+            "primary_raw_chat_log",
+            "raw canonical history/chat row used as primary status evidence",
+        )
+    if source_kind == "codex_sessions" or source_ref.startswith("codex_sessions:") or "/sessions/" in openable_target:
+        return (
+            "ground_truth_chat_logs",
+            "primary_tool_or_command_trace",
+            "raw session/tool/command trace used before artifact summaries",
+        )
+    if source_tier == "required_secondary" or source_ref.startswith(("tasks/", "reports/", "codex/state/reviews/", "git_commit:")):
+        return (
+            "artifact_assisted_context",
+            "legitimate_pre_existing_artifact",
+            "chronologically eligible artifact or commit context used only after raw JSONL evidence",
+        )
+    return (
+        "post_hoc_diagnostic",
+        "diagnostic_only",
+        "unclassified status read defaults to diagnostic-only until its chronology/source role is proven",
+    )
+
+
+def _is_post_hoc_or_diagnostic_read(read: dict) -> bool:
+    if read.get("diagnostic_only") or str(read.get("source_tier") or "") == "diagnostic_optional":
+        return True
+    diagnostic_flags = (
+        "verification_or_rerun_only",
+        "prior_request_occurrence_candidate",
+        "parent_main_anchor_recovery_candidate",
+        "canonical_history_anchor_discovery",
+        "fail_closed_before_answer",
+        "suppressed_from_answer_facing",
+        "target_window_follow_on_context",
+    )
+    return any(bool(read.get(flag)) for flag in diagnostic_flags)
+
+
+def _is_post_hoc_or_same_loop_read(read: dict) -> bool:
+    source_ref = str(read.get("source_ref") or "").casefold()
+    openable_target = str(read.get("openable_target") or "").casefold()
+    role_text = " ".join(
+        str(read.get(key) or "").casefold()
+        for key in ("answer_support_role", "diagnostic_open_policy", "reason")
+    )
+    text = f"{source_ref} {openable_target} {role_text}"
+    markers = (
+        ".private",
+        "same-run",
+        "same_loop",
+        "current-run",
+        "current loop",
+        "pressure",
+        "answer-key",
+        "answer key",
+        "post-window",
+        "suppressed",
+        "echo",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _follow_through_plan(
@@ -3787,6 +3960,9 @@ def _plan_read(read: dict) -> dict:
     planned = {
         "source_ref": read.get("source_ref"),
         "source_tier": read.get("source_tier"),
+        "evidence_mode": read.get("evidence_mode"),
+        "source_role_label": read.get("source_role_label"),
+        "source_role_reason": read.get("source_role_reason"),
         "reason": read.get("reason"),
         "answer_use_required": bool(read.get("answer_use_required")),
     }

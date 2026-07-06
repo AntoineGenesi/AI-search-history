@@ -21,6 +21,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
 EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_analysis"})
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
 EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"coordinator_context"})
+EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
 
 
 @dataclass(frozen=True)
@@ -515,6 +516,8 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 
 
 def execution_kind_for_route_family(route_family: str) -> str | None:
+    if route_family in EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES:
+        return "what-happened-since"
     if route_family in EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES:
         return "devlog-failure-analysis"
     if route_family in EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES:

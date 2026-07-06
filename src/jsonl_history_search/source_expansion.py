@@ -651,6 +651,7 @@ def build_source_expansion_payload(
                 "status": "source_not_found_or_out_of_scope",
                 "records": [],
                 "scope": source_scope(plan),
+                "canonical_ref_fallback": canonical_ref_fallback(parsed, plan=plan, cwd=cwd),
             }
         }
     source_kind = source_kind_for_path(source_path, plan)
@@ -1396,6 +1397,7 @@ def source_ref_from_parsed_target(parsed: ParsedTarget) -> dict[str, Any]:
 
 def resolve_source_path(path_text: str, *, plan: SourcePlan, cwd: Path) -> Path | None:
     candidates: list[Path] = []
+    candidates.extend(canonical_alias_path_candidates(path_text, plan=plan))
     raw_path = Path(path_text).expanduser()
     candidates.append(raw_path if raw_path.is_absolute() else cwd / raw_path)
     for root in plan.roots:
@@ -1409,6 +1411,88 @@ def resolve_source_path(path_text: str, *, plan: SourcePlan, cwd: Path) -> Path 
         if source_path_allowed(resolved, plan):
             return resolved
     return None
+
+
+def canonical_alias_path_candidates(path_text: str, *, plan: SourcePlan) -> list[Path]:
+    if path_text == "codex_history:history.jsonl":
+        return [root.path.expanduser() for root in plan.roots if root.kind == "codex_history"]
+    if not path_text.startswith("codex_sessions:"):
+        return []
+    alias = path_text[len("codex_sessions:") :].strip("/")
+    if not alias:
+        return []
+    matches: list[Path] = []
+    for root in plan.roots:
+        if root.kind != "codex_sessions":
+            continue
+        base = root.path.expanduser()
+        direct = base / alias
+        if direct.suffix != ".jsonl":
+            direct_with_suffix = direct.with_suffix(".jsonl")
+        else:
+            direct_with_suffix = direct
+        for candidate in (direct, direct_with_suffix):
+            if candidate.is_file():
+                matches.append(candidate)
+        if matches:
+            continue
+        if not base.is_dir():
+            continue
+        for candidate in base.rglob("*.jsonl"):
+            if _codex_session_alias_for_path(candidate, base) == alias:
+                matches.append(candidate)
+                break
+    return matches
+
+
+def _codex_session_alias_for_path(path: Path, base: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(base.resolve())
+        raw = str(rel)
+    except (OSError, ValueError):
+        rel = Path(path.name)
+        raw = path.name
+    parts = rel.parts
+    if len(parts) >= 4 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
+        date_label = "/".join(parts[:3])
+    else:
+        date_label = "unknown-date"
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{date_label}/session-{digest}"
+
+
+def canonical_ref_fallback(parsed: ParsedTarget, *, plan: SourcePlan, cwd: Path) -> dict[str, Any] | None:
+    path_text = parsed.path_text or ""
+    if not (path_text.startswith("codex_history:") or path_text.startswith("codex_sessions:")):
+        return None
+    if path_text.startswith("codex_history:"):
+        openable_targets = [
+            f"{root.path.expanduser()}:{parsed.line}" if parsed.line is not None else str(root.path.expanduser())
+            for root in plan.roots
+            if root.kind == "codex_history"
+        ]
+    else:
+        openable_targets = []
+        for root in plan.roots:
+            if root.kind == "codex_sessions":
+                openable_targets.append(f"<session-jsonl-under-{root.path.expanduser()}>:{parsed.line}")
+    target = openable_targets[0] if openable_targets else None
+    command = None
+    if target:
+        command = (
+            "jsonl-history-search read-more "
+            f"{shlex.quote(target)} --cwd {shlex.quote(str(cwd))} --format json --mode window --before 2 --after 2"
+        )
+    return {
+        "status": "canonical_alias_unresolved",
+        "requested_canonical_ref": parsed.raw_target,
+        "openable_target": target,
+        "read_more_command": command,
+        "guidance": (
+            "Use the openable_target/read_more_command if present. For unresolved codex_sessions aliases, "
+            "rerun the status route and use the row's openable_target."
+        ),
+    }
 
 
 def source_path_allowed(path: Path, plan: SourcePlan) -> bool:

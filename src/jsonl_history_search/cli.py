@@ -1843,6 +1843,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
                 "status": "unsupported_route",
                 "route_family": route.get("route_family"),
                 "allowlist": [
+                    "what-happened-since",
                     "semantic-debug",
                     "no-evidence-report",
                     "devlog-failure-analysis",
@@ -1870,7 +1871,10 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
 
     report_output = _ask_execute_report_output(args, execution_kind)
     execution_args = _execution_args_from_ask(args, command=execution_kind, report_output=report_output)
-    if execution_kind == "semantic-debug":
+    if execution_kind == "what-happened-since":
+        executed_payload = _build_status_anchor_report_output_payload(execution_args)
+        output_key = "status_anchor"
+    elif execution_kind == "semantic-debug":
         executed_payload = _build_semantic_debug_report_output_payload(execution_args)
         output_key = "semantic_debug"
     elif execution_kind == "no-evidence-report":
@@ -2043,6 +2047,16 @@ def _build_coordinator_context_report_output_payload(args: argparse.Namespace) -
         encoding="utf-8",
     )
     return {"coordinator_context": compact}
+
+
+def _build_status_anchor_report_output_payload(args: argparse.Namespace) -> dict:
+    compact = build_status_anchor_payload(args)["status_anchor"]
+    compact["report_written"] = args.report_output
+    Path(args.report_output).expanduser().write_text(
+        render({"status_anchor": compact}, "json"),
+        encoding="utf-8",
+    )
+    return {"status_anchor": compact}
 
 
 def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespace) -> dict:
@@ -3182,6 +3196,28 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
 
 
 def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
+    if output_key == "status_anchor":
+        return {
+            "answer_status": (
+                "status-package-ready-after-required-reads"
+                if (compact.get("answer_readiness") or {}).get("answer_allowed")
+                else "not-ready/needs-more-proof"
+            ),
+            "promotion_status": compact.get("status"),
+            "promotion_reason": (
+                "The latest-status route is executable, but receiving agents should inspect "
+                "required primary raw JSONL reads before turning the packet into a factual status answer."
+            ),
+            "read": (compact.get("follow_through_plan") or {}).get("open_first") or compact.get("next_reads", [])[:4],
+            "then_confirm": (compact.get("follow_through_plan") or {}).get("then_confirm") or [],
+            "diagnostics_after": (compact.get("follow_through_plan") or {}).get("do_not_open_by_default") or [],
+            "evidence_modes": (compact.get("evidence_contract") or {}).get("source_modes"),
+            "source_role_labels": (compact.get("evidence_contract") or {}).get("source_role_labels"),
+            "stop": (compact.get("follow_through_plan") or {}).get("stop_condition")
+            or selected_route.get("stop_guidance"),
+            "only_continue_if": selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written"),
+        }
     if output_key == "coordinator_context":
         return {
             "answer_status": "context-package-ready-after-next-reads",
@@ -3383,6 +3419,29 @@ def _positive_int(value: object) -> int:
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
+    if output_key == "status_anchor":
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "query": compact.get("query"),
+            "routing": compact.get("routing"),
+            "summary": compact.get("summary"),
+            "selected_anchor": compact.get("selected_anchor"),
+            "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
+            "answer_readiness": compact.get("answer_readiness"),
+            "source_tiers": {
+                "tier_order": (compact.get("source_tiers") or {}).get("tier_order"),
+                "counts": (compact.get("source_tiers") or {}).get("counts"),
+                "required_primary": ((compact.get("source_tiers") or {}).get("required_primary") or [])[:6],
+                "required_secondary": ((compact.get("source_tiers") or {}).get("required_secondary") or [])[:6],
+                "diagnostic_optional": ((compact.get("source_tiers") or {}).get("diagnostic_optional") or [])[:6],
+                "source_mode_order": (compact.get("source_tiers") or {}).get("source_mode_order"),
+                "source_role_labels": (compact.get("source_tiers") or {}).get("source_role_labels"),
+            },
+            "follow_through_plan": compact.get("follow_through_plan"),
+            "evidence_contract": compact.get("evidence_contract"),
+            "fail_closed_guidance": compact.get("fail_closed_guidance"),
+        }
     if output_key == "coordinator_context":
         return {
             "schema_version": compact.get("schema_version"),
