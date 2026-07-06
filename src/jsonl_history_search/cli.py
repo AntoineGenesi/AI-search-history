@@ -130,6 +130,7 @@ from .retrieval_modes import QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODES, RETRIEVAL_M
 from .scanner import search
 from .semantic_debugging import (
     DEFAULT_GOLD_MANIFEST,
+    build_core_convo_first_read_plan,
     build_semantic_debug_payload,
     summarize_answer_readiness,
     summarize_guided_audit_flow,
@@ -2107,6 +2108,21 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
             repo_artifact_payload["repo_artifact_evidence"],
             failure_packet=failure_packet,
         )
+    repo_phase_category_evidence = _compact_repo_phase_category_evidence(
+        repo_artifact_payload["repo_artifact_evidence"]
+    )
+    core_convo_first_read_plan = build_core_convo_first_read_plan(
+        target_reads=target_reads,
+        legitimate_context_reads=_devlog_repo_phase_context_reads(repo_phase_category_evidence),
+        diagnostic_reads=diagnostic_reads,
+        route_family="devlog_failure_analysis",
+        plan_source="ask_execute.devlog_failure_analysis",
+    )
+    target_reads = (
+        core_convo_first_read_plan["role_groups"]["target_historical_raw"]
+        + core_convo_first_read_plan["role_groups"]["target_historical_artifact"]
+    )[:8]
+    diagnostic_reads = core_convo_first_read_plan["role_groups"]["diagnostic_or_post_hoc"][:8]
     compact = {
         "schema_version": 1,
         "status": semantic_packet.get("status"),
@@ -2118,10 +2134,12 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
             "repo_artifact_evidence": str(repo_report),
         },
         "source_read_order": [
+            "core_convo_first_read_plan",
             "target_historical_source_window_reads",
             "repo_phase_category_evidence",
             "diagnostic_source_window_reads",
         ],
+        "core_convo_first_read_plan": core_convo_first_read_plan,
         "target_historical_source_window_reads": target_reads,
         "target_historical_source_window_read_count": len(target_reads),
         "diagnostic_source_window_reads": diagnostic_reads,
@@ -2133,9 +2151,7 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
                 "the current route, the current lane, or a prior answer/report"
             ),
         },
-        "repo_phase_category_evidence": _compact_repo_phase_category_evidence(
-            repo_artifact_payload["repo_artifact_evidence"]
-        ),
+        "repo_phase_category_evidence": repo_phase_category_evidence,
         "failure_analysis": {
             "status": failure_packet.get("status"),
             "report_written": str(failure_report),
@@ -2304,6 +2320,32 @@ def _compact_repo_phase_category_evidence(packet: dict) -> dict:
         "rows": rows[:8],
         "source_policy": packet.get("source_policy"),
     }
+
+
+def _devlog_repo_phase_context_reads(packet: dict) -> list[dict]:
+    rows = []
+    for index, row in enumerate(list(packet.get("rows") or [])[:4], 1):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "kind": "repo_phase_category_context",
+                "packet_handle": "repo_phase_category_evidence",
+                "candidate_id": f"repo-phase-context-{index:03d}",
+                "safe_handles": list(row.get("safe_handles") or [])[:4],
+                "category_ids": list(row.get("category_ids") or [])[:4],
+                "phase_hints": list(row.get("phase_hints") or [])[:4],
+                "support_surfaces": list(row.get("support_surfaces") or [])[:4],
+                "target_source_role": "legitimate_context",
+                "final_support_allowed": False,
+                "read_more_actionable": False,
+                "followthrough_actionable": True,
+                "diagnostic_only": False,
+                "diagnostic_open_policy": "not_diagnostic_secondary_context_after_target_history",
+                "raw_text_included": False,
+            }
+        )
+    return rows
 
 
 def _compact_story_phase_summary(summary: object) -> dict:
@@ -3158,6 +3200,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "historical_orchestration_role_coverage_source_plan": (
                 packet.get("historical_orchestration_role_coverage_source_plan")
             ),
+            "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
             "answer_source_discipline_summary": (
                 packet["final_answer_source_use_contract"].get("answer_source_discipline")
             ),
@@ -3243,6 +3286,7 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
         }
     if output_key == "devlog_failure_analysis":
         target_reads = list(compact.get("target_historical_source_window_reads") or [])
+        core_plan = compact.get("core_convo_first_read_plan") or {}
         repo_evidence = compact.get("repo_phase_category_evidence") or {}
         failure_analysis = compact.get("failure_analysis") or {}
         return {
@@ -3252,12 +3296,14 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
                 "The devlog/failure-analysis route is a source-reach package, not final prose; "
                 "open target historical source-window reads before answering."
             ),
-            "read": target_reads,
+            "core_convo_first_read_plan": core_plan,
+            "read": core_plan.get("read") or target_reads,
             "then_use": {
                 "failure_analysis_devlog_brief": failure_analysis.get("devlog_brief"),
                 "repo_phase_category_evidence": repo_evidence,
             },
-            "diagnostics_after": list(compact.get("diagnostic_source_window_reads") or []),
+            "diagnostics_after": core_plan.get("diagnostics_after")
+            or list(compact.get("diagnostic_source_window_reads") or []),
             "diagnostic_policy": compact.get("diagnostic_policy"),
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (compact.get("answer_contract") or {}).get("only_continue_if")
@@ -3267,6 +3313,7 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
         }
     if output_key == "semantic_debug":
         handoff = compact.get("answer_ready_handoff") or {}
+        core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
         orchestration_reads = (
@@ -3300,11 +3347,14 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
                 "are limited to bounded_no_evidence routes executed through no-evidence-report."
             ),
             "internal_answer_status": internal_status,
-            "read": orchestration_reads
+            "core_convo_first_read_plan": core_plan,
+            "read": core_plan.get("read")
+            or orchestration_reads
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
             or compact.get("next_reads")
             or [],
+            "diagnostics_after": core_plan.get("diagnostics_after") or [],
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (
                 (handoff.get("primary_source_followthrough") or {}).get("only_continue_if")
@@ -3466,6 +3516,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "report_written": compact.get("report_written"),
             "linked_reports": compact.get("linked_reports"),
             "source_read_order": compact.get("source_read_order"),
+            "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
             "target_historical_source_window_reads": compact.get("target_historical_source_window_reads", [])[:5],
             "target_historical_source_window_read_count": compact.get(
                 "target_historical_source_window_read_count"
@@ -3498,6 +3549,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "historical_orchestration_role_evidence_bundle": compact.get(
                 "historical_orchestration_role_evidence_bundle"
             ),
+            "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],

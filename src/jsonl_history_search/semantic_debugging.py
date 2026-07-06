@@ -79,6 +79,17 @@ UNSUPPORTED_QUESTION_FAMILIES = {
     "private_bridge_required": "Committed semantic-debug evidence does not require private benchmark bridge artifacts.",
 }
 
+CORE_CONVO_TARGET_SOURCE_ROLE_ORDER = [
+    "target_historical_raw",
+    "target_historical_artifact",
+    "legitimate_context",
+    "diagnostic_or_post_hoc",
+]
+CORE_CONVO_TARGET_SOURCE_ROLE_RANK = {
+    role: index for index, role in enumerate(CORE_CONVO_TARGET_SOURCE_ROLE_ORDER)
+}
+CORE_CONVO_FIRST_READ_PLAN_LIMIT = 12
+
 
 def build_semantic_debug_payload(
     args: Any,
@@ -538,6 +549,63 @@ def build_semantic_debug_payload(
     if action_proof_plan.get("applies"):
         investigation_state["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
         guided_audit_flow["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
+    core_convo_first_read_plan = build_core_convo_first_read_plan(
+        target_reads=dedupe_dicts(
+            list(action_proof_plan.get("primary_proof_refs") or [])
+            + list(action_proof_plan.get("required_proof_reads") or [])
+            + list(
+                historical_orchestration_role_evidence_bundle.get("required_role_reads")
+                or []
+            )
+            + list(historical_orchestration_plan.get("primary_historical_final_support_reads") or [])
+            + list(historical_orchestration_plan.get("bounded_non_final_required_reads") or [])
+            + [
+                read
+                for read in next_reads
+                if isinstance(read, dict)
+                and core_convo_target_source_role(read) in {"target_historical_raw", "target_historical_artifact"}
+            ]
+        ),
+        historical_artifact_reads=dedupe_dicts(
+            list(historical_orchestration_plan.get("secondary_task_review_commit_support_reads") or [])
+            + list(historical_orchestration_plan.get("missing_role_recovery_refs") or [])
+            + list(historical_orchestration_role_evidence_bundle.get("missing_role_recovery_refs") or [])
+        ),
+        legitimate_context_reads=[
+            read
+            for read in next_reads
+            if isinstance(read, dict)
+            and core_convo_target_source_role(read) == "legitimate_context"
+        ],
+        diagnostic_reads=[
+            read
+            for read in next_reads
+            if isinstance(read, dict)
+            and core_convo_target_source_role(read) == "diagnostic_or_post_hoc"
+        ],
+        route_family=str(family.get("primary") or "semantic_debug"),
+        plan_source="semantic_debug",
+    )
+    annotated_next_reads = [
+        annotate_core_convo_target_source_read(read, sequence_index=index)
+        for index, read in enumerate(next_reads)
+        if isinstance(read, dict)
+    ]
+    next_reads = annotated_next_reads
+    source_locator_handoff["next_reads"] = next_reads
+    source_locator_handoff["core_convo_first_read_plan"] = core_convo_first_read_plan
+    investigation_state["core_convo_first_read_plan_summary"] = {
+        "link": "semantic_debug.core_convo_first_read_plan",
+        "status": core_convo_first_read_plan.get("status"),
+        "counts": core_convo_first_read_plan.get("counts"),
+        "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
+    }
+    guided_audit_flow["core_convo_first_read_plan_summary"] = {
+        "link": "semantic_debug.core_convo_first_read_plan",
+        "status": core_convo_first_read_plan.get("status"),
+        "counts": core_convo_first_read_plan.get("counts"),
+        "diagnostic_open_policy": core_convo_first_read_plan.get("diagnostic_open_policy"),
+    }
     agent_instruction = build_agent_instruction(
         query=agent_find["query"]["original"],
         report_output=getattr(args, "report_output", None),
@@ -565,6 +633,21 @@ def build_semantic_debug_payload(
         action_proof_plan=action_proof_plan,
         scope_boundary_summary=scope_boundary_summary,
     )
+    answer_ready_handoff["core_convo_first_read_plan"] = core_convo_first_read_plan
+    answer_ready_handoff["links"]["core_convo_first_read_plan"] = "semantic_debug.core_convo_first_read_plan"
+    answer_ready_handoff["source_use_summary"]["core_convo_first_read_plan"] = {
+        "link": "semantic_debug.core_convo_first_read_plan",
+        "status": core_convo_first_read_plan.get("status"),
+        "counts": core_convo_first_read_plan.get("counts"),
+        "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
+        "diagnostics_are_default_non_actionable": True,
+    }
+    final_answer_contract["evidence_inputs"]["core_convo_first_read_plan"] = {
+        "link": "semantic_debug.core_convo_first_read_plan",
+        "status": core_convo_first_read_plan.get("status"),
+        "counts": core_convo_first_read_plan.get("counts"),
+        "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
+    }
     if process_actual_use_read_plan:
         answer_ready_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
         if process_actual_use_bucket_evidence_bundle:
@@ -723,6 +806,7 @@ def build_semantic_debug_payload(
         "guided_audit_flow": guided_audit_flow,
         "next_reads": next_reads,
         "answer_ready_handoff": answer_ready_handoff,
+        "core_convo_first_read_plan": core_convo_first_read_plan,
         "answer_source_discipline": answer_source_discipline,
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
@@ -6815,6 +6899,302 @@ def mark_scoped_no_evidence_diagnostic_reads(next_reads: list[dict[str, Any]], n
             row["reason"] = f"optional diagnostic after scoped no-evidence answer: {reason}"
         rows.append(row)
     return rows
+
+
+def annotate_core_convo_target_source_read(
+    read: dict[str, Any],
+    *,
+    default_role: str | None = None,
+    source_surface: str | None = None,
+    sequence_index: int = 0,
+) -> dict[str, Any]:
+    row = dict(read)
+    role = core_convo_target_source_role(row, default_role=default_role)
+    row["target_source_role"] = role
+    row["target_source_role_order"] = CORE_CONVO_TARGET_SOURCE_ROLE_RANK[role]
+    if source_surface and not row.get("core_convo_source_surface"):
+        row["core_convo_source_surface"] = source_surface
+    row["core_convo_sequence_index"] = sequence_index
+
+    selection = (
+        row.get("historical_provenance_selection")
+        if isinstance(row.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    final_allowed = row.get("final_support_allowed")
+    if final_allowed is None:
+        final_allowed = selection.get("final_support_allowed")
+    if final_allowed is None:
+        final_allowed = role in {"target_historical_raw", "target_historical_artifact"}
+    row["final_support_allowed"] = bool(final_allowed) and role != "diagnostic_or_post_hoc"
+
+    if role == "diagnostic_or_post_hoc":
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        row.setdefault(
+            "diagnostic_open_policy",
+            "do_not_open_by_default_unless_user_asks_for_current_same_loop_post_hoc_synthetic_or_diagnostic_audit",
+        )
+        row.pop("expansion_actions", None)
+        row.pop("context_actions", None)
+    else:
+        row["diagnostic_only"] = bool(row.get("diagnostic_only", False))
+        row.setdefault("read_more_actionable", role != "legitimate_context")
+        row.setdefault("followthrough_actionable", True)
+        row.setdefault("diagnostic_open_policy", "not_diagnostic")
+    return row
+
+
+def build_core_convo_first_read_plan(
+    *,
+    target_reads: list[dict[str, Any]] | None = None,
+    historical_artifact_reads: list[dict[str, Any]] | None = None,
+    legitimate_context_reads: list[dict[str, Any]] | None = None,
+    diagnostic_reads: list[dict[str, Any]] | None = None,
+    route_family: str | None = None,
+    plan_source: str | None = None,
+    limit: int = CORE_CONVO_FIRST_READ_PLAN_LIMIT,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    sections = [
+        ("target_reads", target_reads or [], None),
+        ("historical_artifact_reads", historical_artifact_reads or [], "target_historical_artifact"),
+        ("legitimate_context_reads", legitimate_context_reads or [], "legitimate_context"),
+        ("diagnostic_reads", diagnostic_reads or [], "diagnostic_or_post_hoc"),
+    ]
+    sequence_index = 0
+    for source_surface, reads, default_role in sections:
+        for read in reads:
+            if not isinstance(read, dict):
+                continue
+            rows.append(
+                annotate_core_convo_target_source_read(
+                    read,
+                    default_role=default_role,
+                    source_surface=source_surface,
+                    sequence_index=sequence_index,
+                )
+            )
+            sequence_index += 1
+
+    deduped = core_convo_dedupe_role_reads(rows)
+    ordered = sorted(
+        deduped,
+        key=lambda item: (
+            int(item.get("target_source_role_order", 99)),
+            int(item.get("core_convo_sequence_index", 0)),
+        ),
+    )
+    actionable = [
+        item for item in ordered if item.get("target_source_role") != "diagnostic_or_post_hoc"
+    ][:limit]
+    diagnostics_after = [
+        item for item in ordered if item.get("target_source_role") == "diagnostic_or_post_hoc"
+    ][:limit]
+    counts = Counter(str(item.get("target_source_role") or "unknown") for item in ordered)
+    groups = {
+        role: [item for item in ordered if item.get("target_source_role") == role][:limit]
+        for role in CORE_CONVO_TARGET_SOURCE_ROLE_ORDER
+    }
+    return {
+        "schema_version": 1,
+        "plan_name": "core_convo_first_read_plan",
+        "route_family": route_family,
+        "plan_source": plan_source,
+        "status": "ready" if actionable or diagnostics_after else "empty",
+        "target_source_role_order": list(CORE_CONVO_TARGET_SOURCE_ROLE_ORDER),
+        "read": actionable,
+        "diagnostics_after": diagnostics_after,
+        "role_groups": groups,
+        "counts": {role: int(counts.get(role, 0)) for role in CORE_CONVO_TARGET_SOURCE_ROLE_ORDER},
+        "diagnostic_open_policy": (
+            "current-run, same-loop, post-hoc, synthetic, partial diagnostic, and unrelated "
+            "high-lexical rows are do-not-open-by-default unless the user explicitly asks to audit them"
+        ),
+        "claim_boundaries": {
+            "target_historical_raw_first": True,
+            "target_historical_artifacts_secondary_to_raw": True,
+            "legitimate_context_is_secondary": True,
+            "diagnostics_are_default_non_actionable": True,
+            "raw_text_included": False,
+        },
+    }
+
+
+def core_convo_dedupe_role_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_identity: dict[str, dict[str, Any]] = {}
+    for read in reads:
+        identity = core_convo_read_identity(read)
+        if not identity:
+            identity = f"sequence:{read.get('core_convo_sequence_index')}"
+        existing = by_identity.get(identity)
+        if existing is None or core_convo_read_sort_tuple(read) < core_convo_read_sort_tuple(existing):
+            by_identity[identity] = read
+    return list(by_identity.values())
+
+
+def core_convo_read_sort_tuple(read: dict[str, Any]) -> tuple[int, int]:
+    return (
+        int(read.get("target_source_role_order", 99)),
+        int(read.get("core_convo_sequence_index", 0)),
+    )
+
+
+def core_convo_read_identity(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return str(
+        read.get("target")
+        or source_ref_target(source_ref)
+        or source_ref.get("path")
+        or read.get("packet_handle")
+        or read.get("kind")
+        or ""
+    )
+
+
+def core_convo_target_source_role(read: dict[str, Any], *, default_role: str | None = None) -> str:
+    explicit = str(read.get("target_source_role") or "")
+    if explicit in CORE_CONVO_TARGET_SOURCE_ROLE_RANK:
+        return explicit
+    if read.get("artifact_audit_promoted") is True and default_role in CORE_CONVO_TARGET_SOURCE_ROLE_RANK:
+        return str(default_role)
+    if core_convo_read_is_diagnostic_or_post_hoc(read):
+        return "diagnostic_or_post_hoc"
+    if default_role in CORE_CONVO_TARGET_SOURCE_ROLE_RANK:
+        return str(default_role)
+
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    chronology_role = str(selection.get("source_chronology_role") or read.get("source_chronology_role") or "")
+    kind = str(read.get("kind") or "")
+    target = str(read.get("target") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    path = str(source_ref.get("path") or source_target_path_part(target) or target)
+    packet_handle = str(read.get("packet_handle") or "")
+    proof_role = str(read.get("proof_role") or "")
+    orchestration_role = str(read.get("role") or "")
+
+    if (
+        chronology_role in {
+            "target_historical_raw_jsonl_source_ref",
+            "candidate_or_original_source_ref",
+            "pre_existing_source_ref_quoted_by_current_run_echo",
+        }
+        or kind in {"jsonl_source_ref", "tool_event_source_ref"}
+        or proof_role in {"candidate_action_source_window", "command_or_tool_call", "command_or_tool_output"}
+        or (kind == "missing_role_recovery_command" and orchestration_role != "secondary_task_review_commit_support")
+    ) and core_convo_path_is_raw_history(path, target):
+        return "target_historical_raw"
+
+    if (
+        chronology_role in {"bounded_committed_safe_packet_fallback", "historical_task_review_commit_artifact"}
+        or kind in {"committed_safe_devlog_packet_fallback", "missing_role_recovery_command"}
+        or packet_handle in {"repo_phase_category_evidence", "failure_analysis.devlog_brief"}
+        or core_convo_path_is_historical_artifact(path, target)
+    ):
+        return "target_historical_artifact"
+
+    return "legitimate_context"
+
+
+def core_convo_read_is_diagnostic_or_post_hoc(read: dict[str, Any]) -> bool:
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    chronology_role = str(selection.get("source_chronology_role") or read.get("source_chronology_role") or "")
+    if read.get("diagnostic_only") is True or selection.get("diagnostic_only") is True:
+        return True
+    if read.get("no_evidence_action_role") == "optional_diagnostic_after_scoped_answer":
+        return True
+    if read.get("read_more_actionable") is False and read.get("followthrough_actionable") is False:
+        return True
+    if chronology_role.endswith("_diagnostic") or "diagnostic" in chronology_role:
+        return True
+    text = core_convo_read_marker_text(read)
+    markers = (
+        "/current/",
+        "/current_task/",
+        "/current-task/",
+        "/same-loop/",
+        "/same_loop/",
+        "/posthoc/",
+        "/post-hoc/",
+        "/tests/",
+        "/fixtures/",
+        "/smoke/",
+        "current-run",
+        "current run",
+        "same-loop",
+        "same loop",
+        "same-run",
+        "same run",
+        "post-hoc",
+        "post hoc",
+        "prior-final",
+        "prior final",
+        "previous final",
+        "answer-key",
+        "answer key",
+        "adjudication",
+        "synthetic",
+        "smoke test",
+        "fixture",
+        "partial diagnostic",
+        "metadata-only diagnostic",
+        "unrelated high-lexical",
+        "unrelated_high_lexical",
+    )
+    return any(marker in text for marker in markers)
+
+
+def core_convo_read_marker_text(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    return (
+        " ".join(
+            str(value)
+            for value in (
+                read.get("kind"),
+                read.get("target"),
+                read.get("reason"),
+                read.get("candidate_id"),
+                read.get("source_category"),
+                read.get("packet_handle"),
+                read.get("target_source_role"),
+                read.get("proof_role"),
+                read.get("role"),
+                source_ref.get("path"),
+                source_ref.get("session"),
+                selection.get("source_chronology_role"),
+                selection.get("selection_reason"),
+            )
+        )
+        .casefold()
+        .replace("\\", "/")
+        .replace("_", " ")
+    )
+
+
+def core_convo_path_is_raw_history(path: str, target: str) -> bool:
+    text = f"{path} {target}".casefold().replace("\\", "/")
+    return ".jsonl" in text or text.startswith("codex_history:") or text.startswith("codex_sessions:")
+
+
+def core_convo_path_is_historical_artifact(path: str, target: str) -> bool:
+    text = f"{path} {target}".casefold().replace("\\", "/")
+    return text.startswith(("tasks/", "reports/", "codex/state/reviews/", "docs/")) or any(
+        marker in text for marker in ("/tasks/", "/reports/", "/codex/state/reviews/", "/docs/")
+    )
 
 
 def build_source_action_guidance(
