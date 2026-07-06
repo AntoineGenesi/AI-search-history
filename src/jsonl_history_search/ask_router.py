@@ -12,6 +12,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "source_window_semantic_debug",
         "action_proof",
         "process_actual_use",
+        "expectation_mismatch",
         "orchestration_provenance",
         "provenance",
         "remembered_topic",
@@ -246,6 +247,36 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
         "scoped semantic-debug query for that subtree/task handle; preserve cap, "
         "root, and searched-scope caveats. Demote recent ask/command-output "
         "echoes unless they are primary creation/use records."
+    ),
+)
+
+EXPECTATION_MISMATCH_ROUTE = AskRoute(
+    route_family="expectation_mismatch",
+    chosen_route="expectation-mismatch / semantic-debug",
+    why_it_applies=(
+        "The wording asks why observed AI/agent behavior diverged from an "
+        "expected stop, instruction, plan, or task state. Route to "
+        "semantic-debug so expectation evidence, observed/action-proof "
+        "evidence, and the divergence point are inspected before diagnostics."
+    ),
+    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.expectation_mismatch_plan.expected_behavior_evidence",
+        "semantic_debug.expectation_mismatch_plan.observed_behavior_or_action_proof",
+        "semantic_debug.expectation_mismatch_plan.divergence_evidence",
+        "semantic_debug.core_convo_first_read_plan",
+        "semantic_debug.expectation_mismatch_plan.diagnostic_or_post_hoc only after target reads",
+    ),
+    stop_guidance=(
+        "Run semantic-debug before broad diagnostics. Open expectation, observed/"
+        "action-proof, and divergence reads first; use current/same-loop/post-hoc "
+        "diagnostics only after those target historical reads leave a named gap."
+    ),
+    manual_search_guidance=(
+        "Manual rg/read-more is follow-up only after the expectation-mismatch "
+        "plan names a missing expected, observed, action-proof, or divergence "
+        "facet. Do not answer mainly from reports, current status, or same-loop echoes."
     ),
 )
 
@@ -599,14 +630,17 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_parent_main_status_anchor_failure_query(normalized):
         return ROUTES[5]
 
+    if _looks_like_latest_status_anchor_query(normalized):
+        return ROUTES[5]
+
+    if _looks_like_expectation_mismatch_query(normalized):
+        return EXPECTATION_MISMATCH_ROUTE
+
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
 
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
-
-    if _looks_like_latest_status_anchor_query(normalized):
-        return ROUTES[5]
 
     if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[6]
@@ -1090,6 +1124,82 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
         "catch me up",
     )
     return _has_any(normalized, anchor_terms) and _has_any(normalized, status_verbs)
+
+
+def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    causal_shape = _has_any(
+        normalized,
+        (
+            "why did",
+            "why was",
+            "why were",
+            "why didn't",
+            "why did it",
+            "why did the ai",
+            "why did the agent",
+            "why did the assistant",
+            "how did it end up",
+            "how did the agent end up",
+        ),
+    )
+    if not causal_shape:
+        return False
+    expectation_terms = (
+        "expected",
+        "expecting",
+        "i expected",
+        "we expected",
+        "supposed to",
+        "should have",
+        "should've",
+        "asked it to",
+        "asked the agent to",
+        "told it to",
+        "told the agent to",
+        "instructed",
+        "instruction",
+        "prior instruction",
+        "plan was",
+        "expected it to stop",
+        "stop after",
+    )
+    observed_terms = (
+        "ai",
+        "agent",
+        "assistant",
+        "codex",
+        "it kept",
+        "kept",
+        "keep",
+        "looping",
+        "loop",
+        "continued",
+        "running",
+        "searching",
+        "broad search",
+        "broad searches",
+        "ignored",
+        "diverged",
+        "instead",
+        "failed to stop",
+    )
+    divergence_terms = (
+        "when i expected",
+        "when we expected",
+        "even though",
+        "instead of",
+        "rather than",
+        "but i expected",
+        "after the action proof",
+        "after action proof",
+        "expected it to stop",
+    )
+    return (
+        _has_any(normalized, expectation_terms)
+        and _has_any(normalized, observed_terms)
+        and _has_any(normalized, divergence_terms)
+    )
 
 
 def _looks_like_parent_main_status_anchor_failure_query(normalized: str) -> bool:

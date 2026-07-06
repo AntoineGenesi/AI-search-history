@@ -63,6 +63,7 @@ DECISION_CONTEXT_ROUTES = {
 }
 
 SUPPORTED_QUESTION_FAMILIES = {
+    "expectation_mismatch": "Why observed AI/agent behavior diverged from an expected stop, instruction, plan, or task state.",
     "why_did_this_happen": "Vague bug, incident, regression, symptom, or assumption questions.",
     "provenance": "Task, path, branch, commit, review, or artifact provenance questions.",
     "claimed_action": "Whether an agent actually ran, edited, tested, reviewed, or claimed a concrete action.",
@@ -609,12 +610,27 @@ def build_semantic_debug_payload(
     guided_audit_flow["next_reads"] = guided_next_reads(next_reads)
     guided_audit_flow["next_commands"] = guided_next_commands(decision_context["next_commands"])
     source_locator_handoff["core_convo_first_read_plan"] = core_convo_first_read_plan
+    expectation_mismatch_plan = build_expectation_mismatch_plan(
+        query=agent_find["query"]["original"],
+        family=family,
+        core_convo_first_read_plan=core_convo_first_read_plan,
+        next_reads=next_reads,
+    )
+    if expectation_mismatch_plan.get("applies"):
+        source_locator_handoff["expectation_mismatch_plan"] = expectation_mismatch_plan
     investigation_state["core_convo_first_read_plan_summary"] = {
         "link": "semantic_debug.core_convo_first_read_plan",
         "status": core_convo_first_read_plan.get("status"),
         "counts": core_convo_first_read_plan.get("counts"),
         "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
     }
+    if expectation_mismatch_plan.get("applies"):
+        investigation_state["expectation_mismatch_plan_summary"] = {
+            "link": "semantic_debug.expectation_mismatch_plan",
+            "status": expectation_mismatch_plan.get("status"),
+            "counts": expectation_mismatch_plan.get("counts"),
+            "read_order": expectation_mismatch_plan.get("read_order"),
+        }
     guided_audit_flow["core_convo_first_read_plan_summary"] = {
         "link": "semantic_debug.core_convo_first_read_plan",
         "status": core_convo_first_read_plan.get("status"),
@@ -663,6 +679,21 @@ def build_semantic_debug_payload(
         "counts": core_convo_first_read_plan.get("counts"),
         "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
     }
+    if expectation_mismatch_plan.get("applies"):
+        answer_ready_handoff["expectation_mismatch_plan"] = expectation_mismatch_plan
+        answer_ready_handoff["links"]["expectation_mismatch_plan"] = "semantic_debug.expectation_mismatch_plan"
+        answer_ready_handoff["source_use_summary"]["expectation_mismatch_plan"] = {
+            "link": "semantic_debug.expectation_mismatch_plan",
+            "status": expectation_mismatch_plan.get("status"),
+            "counts": expectation_mismatch_plan.get("counts"),
+            "diagnostics_are_default_non_actionable": True,
+        }
+        final_answer_contract["evidence_inputs"]["expectation_mismatch_plan"] = {
+            "link": "semantic_debug.expectation_mismatch_plan",
+            "status": expectation_mismatch_plan.get("status"),
+            "counts": expectation_mismatch_plan.get("counts"),
+            "diagnostics_are_default_non_actionable": True,
+        }
     if process_actual_use_read_plan:
         answer_ready_handoff["process_actual_use_final_support_read_plan"] = process_actual_use_read_plan
         if process_actual_use_bucket_evidence_bundle:
@@ -822,6 +853,7 @@ def build_semantic_debug_payload(
         "next_reads": next_reads,
         "answer_ready_handoff": answer_ready_handoff,
         "core_convo_first_read_plan": core_convo_first_read_plan,
+        "expectation_mismatch_plan": expectation_mismatch_plan,
         "answer_source_discipline": answer_source_discipline,
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
@@ -893,6 +925,8 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
     is_process_actual_use = looks_like_process_actual_use_query(text)
     if is_process_actual_use:
         detected.append("process_actual_use")
+    if looks_like_expectation_mismatch_query(text):
+        detected.append("expectation_mismatch")
     if any(word in text for word in ("why", "cause", "caused", "happen", "regression", "bug", "symptom", "assumption")):
         detected.append("why_did_this_happen")
     if any(hints.values()) or any(word in text for word in ("commit", "branch", "task", "review", "provenance", "path")):
@@ -938,6 +972,73 @@ def process_actual_use_detected(family: dict[str, Any]) -> bool:
     return family.get("primary") == "process_actual_use" or "process_actual_use" in set(
         family.get("detected_supported") or []
     )
+
+
+def looks_like_expectation_mismatch_query(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().replace("?", " ").replace("!", " ").split())
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    causal_shape = any(
+        phrase in normalized
+        for phrase in (
+            "why did",
+            "why was",
+            "why were",
+            "why didn't",
+            "how did it end up",
+            "how did the agent end up",
+        )
+    )
+    expectation = any(
+        phrase in normalized
+        for phrase in (
+            "expected",
+            "expecting",
+            "supposed to",
+            "should have",
+            "should've",
+            "asked it to",
+            "told it to",
+            "instructed",
+            "instruction",
+            "prior instruction",
+            "plan was",
+            "stop after",
+        )
+    )
+    observed = any(
+        phrase in normalized
+        for phrase in (
+            "ai",
+            "agent",
+            "assistant",
+            "codex",
+            "it kept",
+            "kept",
+            "looping",
+            "continued",
+            "running",
+            "searching",
+            "ignored",
+            "diverged",
+            "instead",
+            "failed to stop",
+        )
+    )
+    divergence = any(
+        phrase in normalized
+        for phrase in (
+            "when i expected",
+            "when we expected",
+            "even though",
+            "instead of",
+            "rather than",
+            "but i expected",
+            "after the action proof",
+            "after action proof",
+            "expected it to stop",
+        )
+    )
+    return causal_shape and expectation and observed and divergence
 
 
 def looks_like_process_actual_use_query(text: str) -> bool:
@@ -7040,6 +7141,212 @@ def build_core_convo_first_read_plan(
             "raw_text_included": False,
         },
     }
+
+
+EXPECTATION_MISMATCH_READ_ORDER = [
+    "expected_behavior_evidence",
+    "observed_behavior_or_action_proof",
+    "divergence_evidence",
+    "legitimate_context",
+    "diagnostic_or_post_hoc",
+]
+
+
+def build_expectation_mismatch_plan(
+    *,
+    query: str,
+    family: dict[str, Any],
+    core_convo_first_read_plan: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    limit: int = 8,
+) -> dict[str, Any]:
+    detected = set(family.get("detected_supported") or [])
+    applies = family.get("primary") == "expectation_mismatch" or "expectation_mismatch" in detected
+    if not applies:
+        return {"schema_version": 1, "plan_name": "expectation_mismatch_plan", "applies": False}
+
+    core_reads = list(core_convo_first_read_plan.get("read") or [])
+    core_diagnostics = list(core_convo_first_read_plan.get("diagnostics_after") or [])
+    actionable_reads = core_reads or [
+        read
+        for read in next_reads
+        if isinstance(read, dict)
+        and core_convo_target_source_role(read) != "diagnostic_or_post_hoc"
+    ]
+    diagnostic_reads = core_diagnostics or [
+        read
+        for read in next_reads
+        if isinstance(read, dict)
+        and core_convo_target_source_role(read) == "diagnostic_or_post_hoc"
+    ]
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        role: [] for role in EXPECTATION_MISMATCH_READ_ORDER
+    }
+    for read in actionable_reads:
+        if not isinstance(read, dict):
+            continue
+        roles = expectation_mismatch_read_roles(read, query=query)
+        if not roles:
+            roles = ["divergence_evidence"]
+        for role in roles:
+            buckets[role].append(expectation_mismatch_annotated_read(read, role=role))
+
+    for read in diagnostic_reads:
+        if not isinstance(read, dict):
+            continue
+        buckets["diagnostic_or_post_hoc"].append(
+            expectation_mismatch_annotated_read(read, role="diagnostic_or_post_hoc")
+        )
+
+    if not buckets["expected_behavior_evidence"] and actionable_reads:
+        buckets["expected_behavior_evidence"].append(
+            expectation_mismatch_annotated_read(
+                actionable_reads[0],
+                role="expected_behavior_evidence",
+                inferred=True,
+            )
+        )
+    if not buckets["observed_behavior_or_action_proof"] and actionable_reads:
+        candidate = actionable_reads[1] if len(actionable_reads) > 1 else actionable_reads[0]
+        buckets["observed_behavior_or_action_proof"].append(
+            expectation_mismatch_annotated_read(
+                candidate,
+                role="observed_behavior_or_action_proof",
+                inferred=True,
+            )
+        )
+    if not buckets["divergence_evidence"] and actionable_reads:
+        candidate = actionable_reads[2] if len(actionable_reads) > 2 else actionable_reads[-1]
+        buckets["divergence_evidence"].append(
+            expectation_mismatch_annotated_read(candidate, role="divergence_evidence", inferred=True)
+        )
+
+    for role in EXPECTATION_MISMATCH_READ_ORDER:
+        buckets[role] = core_convo_dedupe_role_reads(buckets[role])[:limit]
+
+    read: list[dict[str, Any]] = []
+    for role in ("expected_behavior_evidence", "observed_behavior_or_action_proof", "divergence_evidence"):
+        read.extend(buckets[role])
+    read = core_convo_dedupe_role_reads(read)[:limit]
+
+    counts = {role: len(buckets[role]) for role in EXPECTATION_MISMATCH_READ_ORDER}
+    return {
+        "schema_version": 1,
+        "plan_name": "expectation_mismatch_plan",
+        "applies": True,
+        "status": "ready" if read or buckets["diagnostic_or_post_hoc"] else "empty",
+        "question_family": "expectation_mismatch",
+        "read_order": list(EXPECTATION_MISMATCH_READ_ORDER),
+        "read": read,
+        "expected_behavior_evidence": buckets["expected_behavior_evidence"],
+        "observed_behavior_or_action_proof": buckets["observed_behavior_or_action_proof"],
+        "divergence_evidence": buckets["divergence_evidence"],
+        "legitimate_context": buckets["legitimate_context"],
+        "diagnostic_or_post_hoc": buckets["diagnostic_or_post_hoc"],
+        "diagnostics_after": buckets["diagnostic_or_post_hoc"],
+        "counts": counts,
+        "core_convo_first_read_plan": {
+            "link": "semantic_debug.core_convo_first_read_plan",
+            "status": core_convo_first_read_plan.get("status"),
+            "counts": core_convo_first_read_plan.get("counts"),
+            "target_source_role_order": core_convo_first_read_plan.get("target_source_role_order"),
+        },
+        "claim_boundaries": {
+            "expected_observed_divergence_are_source_roles_not_final_answer": True,
+            "diagnostics_are_default_non_actionable": True,
+            "current_same_loop_or_post_hoc_reports_are_not_default_support": True,
+            "raw_text_included": False,
+        },
+        "stop_condition": (
+            "Open expected behavior, observed/action-proof, and divergence reads before "
+            "diagnostics; answer only after source refs support each needed facet or state the gap."
+        ),
+    }
+
+
+def expectation_mismatch_read_roles(read: dict[str, Any], *, query: str) -> list[str]:
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            read.get("target"),
+            read.get("reason"),
+            read.get("snippet"),
+            read.get("command"),
+            read.get("kind"),
+        )
+    )
+    roles: list[str] = []
+    if any(
+        marker in text
+        for marker in (
+            "expected",
+            "expecting",
+            "supposed",
+            "asked",
+            "told",
+            "instruction",
+            "plan",
+            "stop after",
+            "expected it to stop",
+        )
+    ):
+        roles.append("expected_behavior_evidence")
+    if read.get("action_proof_source_selection") or any(
+        marker in text
+        for marker in (
+            "observed",
+            "kept",
+            "loop",
+            "continued",
+            "running",
+            "search",
+            "tool",
+            "tool call",
+            "tool output",
+            "function_call",
+            "function call",
+        )
+    ):
+        roles.append("observed_behavior_or_action_proof")
+    if any(
+        marker in text
+        for marker in (
+            "diverg",
+            "instead",
+            "rather than",
+            "even though",
+            "failed to stop",
+            "when i expected",
+            "but i expected",
+            "expected it to stop",
+        )
+    ):
+        roles.append("divergence_evidence")
+    if core_convo_target_source_role(read) == "legitimate_context":
+        roles.append("legitimate_context")
+    return dedupe(roles)
+
+
+def expectation_mismatch_annotated_read(
+    read: dict[str, Any],
+    *,
+    role: str,
+    inferred: bool = False,
+) -> dict[str, Any]:
+    row = dict(read)
+    row["expectation_mismatch_role"] = role
+    row["expectation_mismatch_role_order"] = EXPECTATION_MISMATCH_READ_ORDER.index(role)
+    row["expectation_mismatch_inferred_role"] = bool(inferred)
+    if role == "diagnostic_or_post_hoc":
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        row.setdefault(
+            "diagnostic_open_policy",
+            "do_not_open_by_default_until_expected_observed_divergence_reads_leave_named_gap",
+        )
+    return row
 
 
 def core_convo_dedupe_role_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:

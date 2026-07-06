@@ -3202,6 +3202,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
                 packet.get("historical_orchestration_role_coverage_source_plan")
             ),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
+            "expectation_mismatch_plan": packet.get("expectation_mismatch_plan"),
             "answer_source_discipline_summary": (
                 packet["final_answer_source_use_contract"].get("answer_source_discipline")
             ),
@@ -3341,9 +3342,12 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             or compact.get("status")
         )
         route_family = str(selected_route.get("route_family") or "")
+        expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
         route_first_reads = (
             orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
+            else expectation_mismatch_plan.get("read")
+            if route_family == "expectation_mismatch" and expectation_mismatch_plan
             else core_plan.get("read")
         )
         return {
@@ -3355,14 +3359,26 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             ),
             "internal_answer_status": internal_status,
             "core_convo_first_read_plan": core_plan,
+            "expectation_mismatch_plan": expectation_mismatch_plan if route_family == "expectation_mismatch" else None,
             "read": route_first_reads
             or orchestration_reads
+            or expectation_mismatch_plan.get("read")
             or core_plan.get("read")
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
             or compact.get("next_reads")
             or [],
-            "diagnostics_after": core_plan.get("diagnostics_after") or [],
+            "diagnostics_after": (
+                expectation_mismatch_plan.get("diagnostics_after")
+                if route_family == "expectation_mismatch" and expectation_mismatch_plan
+                else core_plan.get("diagnostics_after")
+            )
+            or [],
+            "diagnostic_policy": (
+                "expectation mismatch diagnostics are default non-actionable until expected/observed/divergence reads leave a named gap"
+                if route_family == "expectation_mismatch" and expectation_mismatch_plan
+                else None
+            ),
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (
                 (handoff.get("primary_source_followthrough") or {}).get("only_continue_if")
@@ -3558,6 +3574,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "historical_orchestration_role_evidence_bundle"
             ),
             "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
+            "expectation_mismatch_plan": compact.get("expectation_mismatch_plan"),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
