@@ -127,6 +127,23 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
                 }
             )
             break
+    if route_family == "bounded_no_evidence":
+        commands.append(
+            {
+                "purpose": "scoped no-evidence answer contract",
+                "command": (
+                    "No read-more required when ask --execute reports "
+                    "answer_scope=not_found_in_searched_scope and "
+                    "read_more_required_before_scoped_no_evidence_answer=false"
+                ),
+                "inspect_next": (
+                    "answer from searched_scope, candidate_interpretation, cap/missing-scope fields, "
+                    "and not_all_history_absence; read weak/context refs only as optional diagnostics "
+                    "or on explicit user request"
+                ),
+            }
+        )
+        return commands
     if route_family == "semantic_wrapup":
         commands.append(
             {
