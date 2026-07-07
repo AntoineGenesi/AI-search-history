@@ -34,6 +34,9 @@ ROLLING_WINDOW_PRE_RECORDS = 3
 ROLLING_WINDOW_POST_RECORDS = 6
 ROLLING_WINDOW_INLINE_LIMIT = 20
 ROLLING_WINDOW_ERROR_INLINE_LIMIT = 30
+USER_MESSAGE_FIRST_INLINE_LIMIT = 20
+USER_MESSAGE_CONTEXT_PRE_RECORDS = 2
+USER_MESSAGE_CONTEXT_POST_RECORDS = 2
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
 READ_ROLE_REQUIRED_PRIMARY_PROOF = "required_primary_proof"
@@ -134,6 +137,58 @@ CURRENT_SESSION_SOURCE_FACETS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
+    {
+        "label": "task_running_status_update_stall",
+        "terms": (
+            "status update while a task was running",
+            "status message while a task was running",
+            "while a task was running",
+            "while work was running",
+            "left the process waiting",
+            "waiting for the user",
+            "waiting for user",
+            "stalled the loop",
+            "stall the loop",
+            "nonblocking status",
+            "keep looping",
+        ),
+        "fix_type": "coordination/progress-loop behavior change",
+        "preferred_path": "codex/state/pipeline-state.md",
+        "preferred_kinds": ("pipeline_state", "orchestration_rule", "active_task"),
+        "inferred_steps": (
+            "A status/progress update was sent while work was still running.",
+            "The loop stopped waiting for the user instead of polling or continuing safe non-overlapping work.",
+            "Future coordinator behavior needs explicit nonblocking progress semantics for active tasks.",
+        ),
+    },
+    {
+        "label": "over_conservative_resource_hesitation",
+        "terms": (
+            "over-conservative resource",
+            "over conservative resource",
+            "resource hesitation",
+            "resource guard",
+            "low c-drive",
+            "low c drive",
+            "c-drive space",
+            "c drive space",
+            "free space",
+            "disk space",
+            "10.18 gib",
+            "under-10",
+            "under 10",
+            "too scared",
+            "too cautious",
+        ),
+        "fix_type": "resource-guard decision policy update",
+        "preferred_path": "codex/state/pipeline-state.md",
+        "preferred_kinds": ("pipeline_state", "orchestration_rule", "project_rule"),
+        "inferred_steps": (
+            "Resource warnings were treated as a hard blocker without enough measured context.",
+            "The user corrected the available-space interpretation and expected bounded work to continue.",
+            "Future resource checks need measured thresholds, allowed bounded actions, and explicit escalation rules.",
+        ),
+    },
     {
         "label": "dirty_parent_worktree_hygiene",
         "terms": (
@@ -413,9 +468,17 @@ ISSUE_AXIS_BY_LABEL = {
     "product_delta_integration_staleness": "agent_workflow_issue",
     "same_task_repair_boundary": "agent_workflow_issue",
     "stale_issue_or_ticket_reused": "agent_workflow_issue",
+    "task_running_status_update_stall": "agent_workflow_issue",
+    "over_conservative_resource_hesitation": "agent_workflow_issue",
 }
 
 WHY_IT_MATTERS_BY_LABEL = {
+    "task_running_status_update_stall": (
+        "A progress update must not silently convert an active worker loop into a blocked wait-for-user state."
+    ),
+    "over_conservative_resource_hesitation": (
+        "Resource guards should prevent unsafe work without freezing safe bounded work after a measurable warning is corrected."
+    ),
     "dirty_parent_worktree_hygiene": (
         "Dirty parent or stale worktree ambiguity can make a coordinator believe a task is ready "
         "while changes, task notes, or proof live in the wrong checkout or wrong tree."
@@ -488,6 +551,8 @@ def build_semantic_wrapup_payload(
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
+    user_message_first_evidence = _user_message_first_evidence(records, signals)
+    factual_context = _factual_launch_context(records, signals)
     skill_check_recommendation = _skill_check_recommendation(query, signals)
     rolling_window_coverage = _rolling_window_coverage(
         records,
@@ -503,6 +568,7 @@ def build_semantic_wrapup_payload(
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
     current_session_source_selection = _current_session_source_selection(cwd, query)
+    currentness_boundary = _currentness_boundary(plan, query)
     behavior_system = detect_behavior_system(cwd)
     all_fix_suggestions = _fix_suggestions(all_failure_modes, behavior_system)
     fix_suggestions = all_fix_suggestions[:INLINE_FAILURE_MODE_LIMIT]
@@ -517,6 +583,7 @@ def build_semantic_wrapup_payload(
         rolling_window_coverage,
         setup_echo_signals=setup_echo_signals,
         prefer_setup_signal_refs=bool(explicit_root_setup_echo_scope),
+        allow_current_session_sources_without_failure_modes=not _latest_session_fail_closed(fail_closed_scope),
     )
     read_role_summary = _semantic_read_role_summary(next_reads)
     answer_ready_contract = _answer_ready_contract(
@@ -560,6 +627,9 @@ def build_semantic_wrapup_payload(
                 "current_session_source_count": current_session_source_selection["returned_count"],
                 "current_session_source_total_count": current_session_source_selection["total_count"],
                 "skill_check_recommendation_present": bool(skill_check_recommendation),
+                "user_message_first_candidate_count": user_message_first_evidence["candidate_count"],
+                "user_message_first_cluster_count": user_message_first_evidence["cluster_count"],
+                "factual_context_count": factual_context["count"],
                 "default_actionable_read_count": read_role_summary["default_actionable_read_count"],
                 "optional_diagnostic_read_count": read_role_summary["optional_diagnostic_count"],
                 "conditional_required_read_count": read_role_summary["conditional_required_count"],
@@ -573,9 +643,12 @@ def build_semantic_wrapup_payload(
                 "setup_echo_source_refs": [signal["source_ref"] for signal in setup_echo_signals[:8]],
                 "failure_modes_exclude_setup_echoes": True,
             },
+            "user_message_first_evidence": user_message_first_evidence,
+            "factual_context": factual_context,
             "rolling_window_coverage": rolling_window_coverage,
             "orchestration_evidence": orchestration_evidence,
             "current_session_source_selection": current_session_source_selection,
+            "currentness_boundary": currentness_boundary,
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
@@ -738,6 +811,212 @@ def _assistant_tool_errors(window_records) -> list[dict]:
             }
         )
     return errors
+
+
+def _user_message_first_evidence(records, signals: list[dict]) -> dict:
+    signal_by_ref = {
+        (signal["source_ref"]["path"], int(signal["source_ref"]["line"])): signal
+        for signal in signals
+        if signal.get("source_ref")
+    }
+    classification_counts: dict[str, int] = {
+        "frustration/correction": 0,
+        "directive": 0,
+        "factual_clarification": 0,
+        "launch_criterion": 0,
+        "non_complaint_context": 0,
+    }
+    candidates: list[dict] = []
+    total_user_messages = 0
+    for index, item in enumerate(records):
+        if not _is_user_like(item.record.role):
+            continue
+        total_user_messages += 1
+        row = context_row(item)
+        source_ref = row.get("source_ref") or {}
+        signal = signal_by_ref.get((str(source_ref.get("path") or ""), int(source_ref.get("line") or 0)))
+        classifications = _classify_user_message(item.text, signal)
+        for classification in classifications:
+            classification_counts[classification] = classification_counts.get(classification, 0) + 1
+        if "frustration/correction" not in classifications:
+            continue
+        candidates.append(
+            {
+                "candidate_id": f"u{len(candidates) + 1:03d}",
+                "source_ref": source_ref,
+                "timestamp_utc": row.get("timestamp_utc"),
+                "classifications": classifications,
+                "labels": list((signal or {}).get("labels") or ["general_workflow_failure"]),
+                "friction_markers": list((signal or {}).get("friction_markers") or []),
+                "scope_signal_kind": (signal or {}).get("scope_signal_kind") or "user_message_no_signal",
+                "snippet": row.get("snippet"),
+                "nearby_turn_context": _nearby_turn_context(records, index),
+            }
+        )
+    clusters = _clusters_from_user_message_candidates(candidates)
+    return {
+        "method": (
+            "Read target-session user-authored messages first; classify each user message; "
+            "retain nearby turn context for frustration/correction candidates; cluster those "
+            "candidates before mapping clusters to fix suggestions."
+        ),
+        "source_priority": "target_session_user_messages_before_task_summaries_reports_or_stale_labels",
+        "classifications_required": [
+            "frustration/correction",
+            "directive",
+            "factual_clarification",
+            "launch_criterion",
+            "non_complaint_context",
+        ],
+        "total_user_messages": total_user_messages,
+        "classification_counts": classification_counts,
+        "candidate_count": len(candidates),
+        "candidates_returned": candidates[:USER_MESSAGE_FIRST_INLINE_LIMIT],
+        "candidates_omitted": max(0, len(candidates) - USER_MESSAGE_FIRST_INLINE_LIMIT),
+        "clusters": clusters,
+        "cluster_count": len(clusters),
+        "clustered_before_fix_suggestions": True,
+        "mapping_boundary": (
+            "Only clusters backed by current target-session user-message candidates should be "
+            "ranked as current-session fix suggestions; factual context is preserved separately."
+        ),
+    }
+
+
+def _classify_user_message(text: str, signal: dict | None) -> list[str]:
+    normalized = _normalize(text)
+    classifications: list[str] = []
+    if signal and signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS:
+        classifications.append("frustration/correction")
+    elif any(marker in normalized for marker in FRICTION_MARKERS):
+        classifications.append("frustration/correction")
+
+    if _is_factual_context_text(normalized):
+        classifications.append("factual_clarification")
+    if any(term in normalized for term in ("before launch", "launch", "release", "release-ready", "claim", "criterion", "gate")):
+        classifications.append("launch_criterion")
+    if any(
+        term in normalized
+        for term in (
+            "you are",
+            "work only",
+            "do not",
+            "don't",
+            "must",
+            "required",
+            "implement",
+            "run ",
+            "use ",
+            "read ",
+            "final message",
+        )
+    ):
+        classifications.append("directive")
+    if not classifications:
+        classifications.append("non_complaint_context")
+    return classifications
+
+
+def _is_factual_context_text(normalized: str) -> bool:
+    return (
+        "jsh-1253" in normalized
+        or "2/7" in normalized
+        or "1/7" in normalized
+        or "whx-002" in normalized
+        or "exp-002" in normalized
+        or "partial checkpoint" in normalized
+        or "factual context" in normalized
+    )
+
+
+def _nearby_turn_context(records, center_index: int) -> dict:
+    start = max(0, center_index - USER_MESSAGE_CONTEXT_PRE_RECORDS)
+    end = min(len(records) - 1, center_index + USER_MESSAGE_CONTEXT_POST_RECORDS)
+    items = []
+    for item in records[start : end + 1]:
+        row = context_row(item)
+        items.append(
+            {
+                "role": item.record.role,
+                "source_ref": row.get("source_ref"),
+                "timestamp_utc": row.get("timestamp_utc"),
+                "snippet": row.get("snippet"),
+            }
+        )
+    return {
+        "start_source_ref": items[0].get("source_ref") if items else None,
+        "end_source_ref": items[-1].get("source_ref") if items else None,
+        "record_count": len(items),
+        "records": items,
+    }
+
+
+def _clusters_from_user_message_candidates(candidates: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        labels = candidate.get("labels") or ["general_workflow_failure"]
+        for label in labels:
+            grouped.setdefault(label, []).append(candidate)
+    clusters = []
+    for label, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        clusters.append(
+            {
+                "cluster_id": f"cluster-{len(clusters) + 1:03d}",
+                "label": label,
+                "candidate_count": len(items),
+                "candidate_ids": [item["candidate_id"] for item in items[:8]],
+                "source_refs": [item["source_ref"] for item in items[:5]],
+                "nearby_context_window_count": len([item for item in items if item.get("nearby_turn_context")]),
+            }
+        )
+    return clusters
+
+
+def _factual_launch_context(records, signals: list[dict]) -> dict:
+    signal_refs = {
+        (signal["source_ref"]["path"], int(signal["source_ref"]["line"]))
+        for signal in signals
+        if signal.get("source_ref")
+    }
+    entries = []
+    for item in records:
+        if not _is_user_like(item.record.role):
+            continue
+        row = context_row(item)
+        source_ref = row.get("source_ref") or {}
+        normalized = _normalize(item.text)
+        if not _is_factual_context_text(normalized):
+            continue
+        entries.append(
+            {
+                "context_id": f"fc{len(entries) + 1:03d}",
+                "classification": "factual_launch_context_not_complaint_evidence",
+                "source_ref": source_ref,
+                "timestamp_utc": row.get("timestamp_utc"),
+                "safe_summary": _safe_factual_context_summary(normalized),
+                "excluded_from_failure_mode_grouping": (
+                    (str(source_ref.get("path") or ""), int(source_ref.get("line") or 0)) not in signal_refs
+                ),
+            }
+        )
+    return {
+        "count": len(entries),
+        "entries": entries[:8],
+        "policy": (
+            "Factual launch/checkpoint context is preserved for claim boundaries but is not "
+            "itself complaint evidence unless the user message also contains a substantive correction signal."
+        ),
+    }
+
+
+def _safe_factual_context_summary(normalized: str) -> str:
+    if "jsh-1253" in normalized or "whx-002" in normalized or "exp-002" in normalized:
+        return (
+            "JSH-1253 factual partial checkpoint: 2/7 accepted cases attempted, "
+            "1/7 completed pair, WHX-002 completed, EXP-002 failed closed/interrupted; "
+            "no broad release/provider-token/superiority claim."
+        )
+    return "Factual clarification preserved separately from complaint evidence."
 
 
 def _agent_instruction(
@@ -1030,8 +1309,13 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
         "setup_echo_signal_count": len(setup_echo_signals),
         "substantive_signal_count": len(substantive_signals),
         "first_action": (
-            "Rerun with the parent/user session JSONL or another exact known Codex/Claude session JSONL, "
-            f"for example: {_rerun_with_root_command(query)}"
+            "Latest known session appears to be a receiving-agent/setup session. Identify the parent/user "
+            "session that contains the launch-loop discussion, then rerun with that exact Codex/Claude "
+            f"session JSONL; for example: {_rerun_with_root_command(query)}"
+        ),
+        "stale_artifact_boundary": (
+            "Do not answer mainly from retained semantic-wrapup reports, task summaries, or old hardening "
+            "artifacts until the parent/user session is anchored."
         ),
     }
 
@@ -1070,6 +1354,54 @@ def _rerun_with_root_command(query: str) -> str:
         f"jsonl-history-search semantic-wrapup {quoted_query} "
         '--root <path-to-session.jsonl> --cwd "$PWD" --format json'
     )
+
+
+def _latest_session_fail_closed(fail_closed_scope: dict | None) -> bool:
+    strategy = str((fail_closed_scope or {}).get("strategy") or "")
+    return strategy.startswith("latest_known_session_")
+
+
+def _currentness_boundary(plan: SourcePlan, query: str) -> dict:
+    normalized = _normalize(query)
+    mentions_current = any(
+        term in normalized
+        for term in ("this session", "current session", "current-session", "this run", "current run", "latest session")
+    )
+    short_correction_prompt = bool(
+        re.search(r"\bwhat did i (keep )?(correct|correcting|complain|complaining)\b", normalized)
+    )
+    if plan.scope_resolution.get("status") == "scoped_to_latest_known_session":
+        return {
+            "status": "current_session_attempted",
+            "boundary": "Current-session wording scoped the scan to the latest known session file.",
+            "stale_summary_allowed": False,
+        }
+    if mentions_current:
+        return {
+            "status": "current_session_unanchored",
+            "boundary": "Current-session wording was present but the selected scope is not a verified parent/user session.",
+            "stale_summary_allowed": False,
+        }
+    if short_correction_prompt:
+        return {
+            "status": "broad_history_not_current_session",
+            "boundary": (
+                "This short correction/complaint prompt did not name the current or parent session. "
+                "Any broad-history findings are historical context, not a current-session answer; "
+                "rerun with 'in this session' plus an exact --root parent/user session JSONL for current launch-loop recovery."
+            ),
+            "stale_summary_allowed": True,
+            "current_session_answer_supported": False,
+            "first_action_for_current_session": (
+                "Rerun semantic-wrapup with an exact parent/user session JSONL: "
+                f"{_rerun_with_root_command(query)}"
+            ),
+        }
+    return {
+        "status": "scope_not_current_session_specific",
+        "boundary": "No current-session anchoring was requested or inferred.",
+        "stale_summary_allowed": True,
+    }
 
 
 def _current_session_source_selection(cwd: Path, query: str) -> dict:
@@ -1791,6 +2123,7 @@ def _semantic_next_reads(
     *,
     setup_echo_signals: list[dict] | None = None,
     prefer_setup_signal_refs: bool = False,
+    allow_current_session_sources_without_failure_modes: bool = True,
 ) -> list[dict]:
     refs = []
     seen: set[tuple[str, int]] = set()
@@ -1877,7 +2210,8 @@ def _semantic_next_reads(
                 ),
             )
     else:
-        add_current_session_sources()
+        if allow_current_session_sources_without_failure_modes:
+            add_current_session_sources()
         for ref in evidence_refs:
             add(
                 ref,
@@ -2095,6 +2429,16 @@ def _looks_closed_task_destination(item: dict, mode: dict) -> bool:
 
 def _proposed_action(label: str, destination: dict) -> str:
     path = destination.get("path")
+    if label == "task_running_status_update_stall":
+        return (
+            f"Clarify {path} so a status update during active task execution must poll/continue safe work "
+            "or explicitly record a blocker instead of waiting for a user reply by default."
+        )
+    if label == "over_conservative_resource_hesitation":
+        return (
+            f"Clarify {path} so low-resource warnings use measured thresholds and allowed bounded actions "
+            "rather than treating near-threshold disk space as an automatic hard stop."
+        )
     if label == "dirty_parent_worktree_hygiene":
         return (
             f"Add or tighten {path} so handoff/next-loop readiness includes parent `git status`, "
@@ -2152,6 +2496,17 @@ def _why_it_matters(label: str) -> str:
 
 def _doable_suggested_fix(label: str, destination: dict) -> str:
     path = destination.get("path") or "(user decision needed)"
+    if label == "task_running_status_update_stall":
+        return (
+            f"Propose a narrow update in {path}: status/progress updates during active worker runs are "
+            "nonblocking unless a named blocker is recorded; otherwise poll the worker or continue safe "
+            "non-overlapping coordination."
+        )
+    if label == "over_conservative_resource_hesitation":
+        return (
+            f"Propose a narrow update in {path}: record measured free space, classify hard-stop versus "
+            "warning thresholds, and list safe bounded commands that may continue after warning correction."
+        )
     if label == "dirty_parent_worktree_hygiene":
         return (
             f"Propose a narrow update in {path}: before handoff or next-loop readiness, require "
@@ -2163,6 +2518,18 @@ def _doable_suggested_fix(label: str, destination: dict) -> str:
 
 def _acceptance_criteria(label: str, destination: dict) -> list[str]:
     path = destination.get("path") or "(user decision needed)"
+    if label == "task_running_status_update_stall":
+        return [
+            "Status/update loop-stall complaints are grouped under `task_running_status_update_stall`.",
+            "The selected workflow surface distinguishes nonblocking progress updates from real user-input blockers.",
+            "The output remains suggestion-only and preserves nearby turn context around the user correction.",
+        ]
+    if label == "over_conservative_resource_hesitation":
+        return [
+            "Low-resource hesitation complaints are grouped under `over_conservative_resource_hesitation`.",
+            "The selected workflow surface requires measured threshold handling and safe bounded-work guidance.",
+            "The output remains suggestion-only and preserves the user's factual correction separately from stale storage tasks.",
+        ]
     if label == "dirty_parent_worktree_hygiene":
         return [
             "Repeated dirty parent/worktree complaints are grouped under `dirty_parent_worktree_hygiene`.",
