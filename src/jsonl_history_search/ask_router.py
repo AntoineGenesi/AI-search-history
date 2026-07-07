@@ -647,6 +647,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_task_review_commit_provenance_query(normalized):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
+    if _looks_like_named_ticket_causal_provenance_query(normalized):
+        return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
+
     if _looks_like_local_artifact_verification_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
@@ -979,6 +982,55 @@ def _looks_like_task_review_commit_provenance_query(normalized: str) -> bool:
         if any(term in normalized for term in terms)
     )
     return facet_hits >= 2
+
+
+def _looks_like_named_ticket_causal_provenance_query(normalized: str) -> bool:
+    if _looks_like_explicit_current_or_prior_answer_audit(normalized):
+        return False
+    if _looks_like_action_proof_query(normalized):
+        return False
+    has_named_task_or_ticket = bool(
+        re.search(r"\b[a-z]{2,}-\d+[a-z0-9_-]*\b", normalized)
+        or re.search(r"\b[a-z]+[-_][a-z0-9]+[-_][a-z0-9_-]*\b", normalized)
+    )
+    if not has_named_task_or_ticket:
+        return False
+    causal_shape = _has_any(
+        normalized,
+        (
+            "why did",
+            "why was",
+            "why were",
+            "what caused",
+            "what made",
+            "how did",
+        ),
+    )
+    if not causal_shape:
+        return False
+    causal_or_failure_terms = (
+        "fail",
+        "failed",
+        "failure",
+        "fail closed",
+        "failed closed",
+        "regress",
+        "regressed",
+        "regression",
+        "blocked",
+        "blocker",
+        "stalled",
+        "broke",
+        "broken",
+        "wrong",
+        "bug",
+        "before the fix",
+        "cause",
+        "caused",
+        "happen",
+        "happened",
+    )
+    return _has_any(normalized, causal_or_failure_terms)
 
 
 def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
