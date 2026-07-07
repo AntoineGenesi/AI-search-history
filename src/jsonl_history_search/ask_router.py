@@ -15,6 +15,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "expectation_mismatch",
         "orchestration_provenance",
         "provenance",
+        "remembered_user_wording",
         "remembered_topic",
         "semantic_debug",
     }
@@ -277,6 +278,69 @@ EXPECTATION_MISMATCH_ROUTE = AskRoute(
         "Manual rg/read-more is follow-up only after the expectation-mismatch "
         "plan names a missing expected, observed, action-proof, or divergence "
         "facet. Do not answer mainly from reports, current status, or same-loop echoes."
+    ),
+)
+
+
+REMEMBERED_USER_WORDING_ROUTE = AskRoute(
+    route_family="remembered_user_wording",
+    chosen_route="remembered-user-wording / semantic-debug",
+    why_it_applies=(
+        "The wording asks when, where, or what the user said, asked for, "
+        "told, or requested about a remembered topic. Route to user-role "
+        "semantic-debug so source refs prove user-authored wording instead "
+        "of assistant, tool, environment, task, report, or prompt echoes."
+    ),
+    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --role user --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.question_family / query_plan detected_intents includes when_user_said",
+        "user-authored source refs and timestamps before any assistant/tool/env/task/report echoes",
+        "source_locator_handoff.next_reads and compact read-more follow-through for exact user message context",
+        "role filtering, Codex history/session mirror dedupe, and source-window boundaries before claiming wording",
+    ),
+    stop_guidance=(
+        "Run semantic-debug with --role user before broad manual search. Do not "
+        "claim what the user said, asked, told, or requested until inspected "
+        "source refs show user-authored text with timestamps/source handles; "
+        "assistant, tool, environment, task, report, and current prompt echoes "
+        "are diagnostics only."
+    ),
+    manual_search_guidance=(
+        "Manual rg/read-more is follow-up only after the route leaves a named "
+        "user-wording gap. Prefer user-role raw message refs, timestamped "
+        "source-window reads, and mirror-deduped Codex history/session records "
+        "over assistant summaries, task files, reports, or echoed prompts."
+    ),
+)
+
+
+LATEST_USER_MESSAGES_ROUTE = AskRoute(
+    route_family="latest_user_messages",
+    chosen_route="latest-user-messages / deterministic user-message lookup",
+    why_it_applies=(
+        "The wording asks only for the user's most recent/latest/last message "
+        "or wording, without a topic or status window. Use deterministic "
+        "latest-user lookup before semantic search."
+    ),
+    first_command_template='jsonl-history-search latest-user-messages --cwd "$PWD" --limit 1 --format text',
+    read_specialization="latest-user-messages command",
+    inspect_after=(
+        "latest_user_messages.messages[0].timestamp_utc, text, source_ref, and openable_target",
+        "latest_user_messages.lookup == deterministic_latest_user_messages",
+        "deduplication_strategy and mirror_sources before treating history/session mirrors as distinct messages",
+        "sources warnings, searched files/bytes, and cap boundaries before claiming global latest wording",
+    ),
+    stop_guidance=(
+        "Run latest-user-messages first. Answer only from the newest "
+        "deduplicated user-authored message and preserve timestamp/source ref; "
+        "do not use semantic-debug unless the latest lookup is capped, empty, "
+        "or the user asks for a topical/history explanation."
+    ),
+    manual_search_guidance=(
+        "Manual search is follow-up only when latest-user-messages reports an "
+        "empty/capped/ambiguous scope or the prompt adds a topic, date, status "
+        "window, or explanation request."
     ),
 )
 
@@ -640,6 +704,12 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
+
+    if _looks_like_recency_only_user_wording_query(normalized):
+        return LATEST_USER_MESSAGES_ROUTE
+
+    if _looks_like_remembered_user_wording_query(normalized):
+        return REMEMBERED_USER_WORDING_ROUTE
 
     if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[6]
@@ -1224,6 +1294,53 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
         "catch me up",
     )
     return _has_any(normalized, anchor_terms) and _has_any(normalized, status_verbs)
+
+
+def _looks_like_recency_only_user_wording_query(normalized: str) -> bool:
+    if _has_any(
+        normalized,
+        (
+            "what happened",
+            "what has happened",
+            "what changed",
+            "while i was away",
+            "since my last",
+            "since my latest",
+            "before this worker",
+            "before the worker",
+            "before this reviewer",
+            "before the reviewer",
+            "before this side",
+            "before the side",
+            "status",
+            "catch me up",
+        ),
+    ):
+        return False
+    return any(
+        re.search(pattern, normalized)
+        for pattern in (
+            r"\bwhat did i (?:say|ask|tell|request) (?:most recently|recently|latest|last)\b",
+            r"\bwhat did i last (?:say|ask|tell|request)\b",
+            r"\bwhat (?:was|is) my (?:most recent|latest|last) (?:message|ask|request|instruction)\b",
+            r"\bshow (?:me )?my (?:most recent|latest|last) (?:message|ask|request|instruction)\b",
+        )
+    )
+
+
+def _looks_like_remembered_user_wording_query(normalized: str) -> bool:
+    if _looks_like_recency_only_user_wording_query(normalized):
+        return False
+    return any(
+        re.search(pattern, normalized)
+        for pattern in (
+            r"\b(?:when|where) did i (?:say|tell|ask|request)\b",
+            r"\bwhat did i ask for(?:\b| about\b)",
+            r"\bwhat did i (?:say|tell|ask|request) (?:you )?before about\b",
+            r"\bwhat did i (?:say|tell|ask|request) about\b",
+            r"\bwhat was my (?:ask|request|instruction) about\b",
+        )
+    )
 
 
 def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
