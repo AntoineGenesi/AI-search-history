@@ -70,6 +70,12 @@ DEFAULT_MANUAL_FORBIDDEN_MATERIAL: list[str] = [
     "reviewer notes",
     "rejected-ledger clues",
     "package-internal task discoveries",
+    "private case-packet files",
+    "private source-map files",
+    "expected-facet material",
+    "private adjudication files",
+    "task/review/report answer-key artifacts",
+    "same-loop artifacts that directly answer the case",
 ]
 
 CONTAMINATION_LABELS: list[dict[str, Any]] = [
@@ -184,6 +190,8 @@ def build_paired_agent_benchmark_protocol_payload() -> dict[str, Any]:
             "default_manual": {
                 "allowed_sections": [
                     "benchmark_question",
+                    "reviewed_case_identity",
+                    "source_search_boundary",
                     "generic_allowed_tools",
                     "time_and_command_caps",
                     "output_schema",
@@ -192,12 +200,37 @@ def build_paired_agent_benchmark_protocol_payload() -> dict[str, Any]:
                 "allowed_tools": GENERIC_ALLOWED_TOOLS,
                 "prompt_template": [
                     "Question: <sanitized benchmark question>",
+                    "Reviewed case identity: <enough non-answer-key identity to find the relevant primary source, such as project/date/ask shape/event family>.",
+                    "Source search boundary: <where ordinary shell/file search may look, without expected facets, source maps, or evaluator refs>.",
                     "Allowed tools: rg, sed, head, git, python3.",
+                    "Do not open private case packets, source maps, expected-facet material, adjudication files, task/review/report answer keys, or same-loop artifacts that directly answer this case.",
                     "Caps: stay within the published time, command, file, byte, and output limits.",
                     "Return: answer, source refs, confidence, counters, uncertainty, contamination labels.",
                     "Privacy: keep raw traces private and keep committed output aggregate and sanitized.",
                 ],
                 "forbidden_material": DEFAULT_MANUAL_FORBIDDEN_MATERIAL,
+                "exp_style_private_safe_materialization": {
+                    "allowed": [
+                        "benchmark_question",
+                        "reviewed_case_identity",
+                        "source_search_boundary",
+                        "caps",
+                        "output_schema",
+                        "privacy_rules",
+                    ],
+                    "forbidden": [
+                        "expected facets",
+                        "source maps",
+                        "case packet paths",
+                        "adjudication checklists",
+                        "raw adjudication",
+                        "same-loop answer-key reports/tasks/reviews",
+                    ],
+                    "purpose": (
+                        "Give the manual lane enough reviewed case identity to find the primary source "
+                        "without exposing expected answers or source-location maps."
+                    ),
+                },
             },
             "jsonl_assisted": {
                 "allowed_sections": [
@@ -238,6 +271,7 @@ def build_paired_agent_benchmark_protocol_payload() -> dict[str, Any]:
             "labels": CONTAMINATION_LABELS,
             "notes": [
                 "If the default/manual side sees package guidance or source hints, mark the row contaminated.",
+                "If the default/manual side opens private case packets, source maps, expected facets, adjudication files, task/review/report answer keys, or same-loop answer-key artifacts, mark the row failed closed.",
                 "If roots or source locations were learned after another side searched, mark post_hoc_rooting.",
                 "Shared-knowledge experiments are allowed only as explicitly labeled alternate conditions.",
                 "Unavailable counters stay unavailable; they never become zero for convenience.",
