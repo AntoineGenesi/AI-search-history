@@ -1455,6 +1455,11 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
     if scope_resolution.get("first_action"):
         lines.append(f"First action: {scope_resolution.get('first_action')}")
+    currentness = report.get("currentness_boundary") or {}
+    if currentness:
+        lines.append(f"Currentness boundary: {currentness.get('status')}: {currentness.get('boundary')}")
+        if currentness.get("first_action_for_current_session"):
+            lines.append(f"Current-session anchoring action: {currentness.get('first_action_for_current_session')}")
     skill_check = report.get("skill_check_recommendation") or {}
     if skill_check:
         lines.extend([
@@ -1472,6 +1477,35 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             f"setup_echo={signal_classification.get('setup_echo_signal_count', 0)}, "
             f"failure_modes_exclude_setup_echoes={signal_classification.get('failure_modes_exclude_setup_echoes')}"
         )
+    user_first = report.get("user_message_first_evidence") or {}
+    if user_first:
+        counts = user_first.get("classification_counts") or {}
+        lines.append(
+            "User-message-first evidence: "
+            f"user_messages={user_first.get('total_user_messages', 0)}, "
+            f"candidates={user_first.get('candidate_count', 0)}, "
+            f"clusters={user_first.get('cluster_count', 0)}, "
+            f"clustered_before_fix_suggestions={user_first.get('clustered_before_fix_suggestions')}"
+        )
+        lines.append(
+            "User-message classifications: "
+            f"frustration/correction={counts.get('frustration/correction', 0)}, "
+            f"directive={counts.get('directive', 0)}, "
+            f"factual_clarification={counts.get('factual_clarification', 0)}, "
+            f"launch_criterion={counts.get('launch_criterion', 0)}, "
+            f"non_complaint_context={counts.get('non_complaint_context', 0)}"
+        )
+        for cluster in user_first.get("clusters", [])[:6]:
+            lines.append(
+                f"- cluster {cluster.get('label')} candidates={cluster.get('candidate_count')} "
+                f"context_windows={cluster.get('nearby_context_window_count')}"
+            )
+    factual_context = report.get("factual_context") or {}
+    if factual_context.get("entries"):
+        lines.append(f"Factual context: {factual_context.get('count', 0)} preserved separately from complaint evidence")
+        for entry in factual_context.get("entries", [])[:4]:
+            ref = entry.get("source_ref") or {}
+            lines.append(f"- {ref.get('path')}:{ref.get('line')} {entry.get('safe_summary')}")
     current_sources = report.get("current_session_source_selection") or {}
     if current_sources.get("selected_sources"):
         lines.append(
@@ -1700,6 +1734,51 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             f"**First action:** `{scope_resolution.get('first_action')}`",
             "",
         ])
+    currentness = report.get("currentness_boundary") or {}
+    if currentness:
+        lines.extend([
+            "## Currentness Boundary",
+            "",
+            f"- Status: `{currentness.get('status')}`",
+            f"- Boundary: {currentness.get('boundary')}",
+        ])
+        if currentness.get("first_action_for_current_session"):
+            lines.append(f"- Current-session anchoring action: `{currentness.get('first_action_for_current_session')}`")
+        lines.append("")
+    user_first = report.get("user_message_first_evidence") or {}
+    if user_first:
+        counts = user_first.get("classification_counts") or {}
+        lines.extend([
+            "## User-Message-First Evidence",
+            "",
+            f"- User messages read: `{user_first.get('total_user_messages', 0)}`",
+            f"- Frustration/correction candidates: `{user_first.get('candidate_count', 0)}`",
+            f"- Clusters: `{user_first.get('cluster_count', 0)}`",
+            f"- Clustered before fix suggestions: `{user_first.get('clustered_before_fix_suggestions')}`",
+            f"- Frustration/correction: `{counts.get('frustration/correction', 0)}`",
+            f"- Directive: `{counts.get('directive', 0)}`",
+            f"- Factual clarification: `{counts.get('factual_clarification', 0)}`",
+            f"- Launch criterion: `{counts.get('launch_criterion', 0)}`",
+            f"- Non-complaint context: `{counts.get('non_complaint_context', 0)}`",
+            "",
+        ])
+        for cluster in user_first.get("clusters", [])[:6]:
+            lines.append(
+                f"- `{cluster.get('label')}` candidates=`{cluster.get('candidate_count')}` "
+                f"context_windows=`{cluster.get('nearby_context_window_count')}`"
+            )
+        lines.append("")
+    factual_context = report.get("factual_context") or {}
+    if factual_context.get("entries"):
+        lines.extend([
+            "## Factual Context",
+            "",
+            f"- Preserved separately from complaint evidence: `{factual_context.get('count', 0)}`",
+        ])
+        for entry in factual_context.get("entries", [])[:4]:
+            ref = entry.get("source_ref") or {}
+            lines.append(f"- `{ref.get('path')}:{ref.get('line')}` {entry.get('safe_summary')}")
+        lines.append("")
     current_sources = report.get("current_session_source_selection") or {}
     if current_sources.get("selected_sources"):
         lines.extend([
