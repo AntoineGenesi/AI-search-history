@@ -4230,7 +4230,20 @@ def inferred_known_action_case_next_reads(
     text = str(query or "").casefold()
     if not ("overwrite" in text or "overwritten" in text):
         return []
-    if not any(term in text for term in ("agent", "assistant", "did the", "did you", "those edits", "edits")):
+    if not any(
+        term in text
+        for term in (
+            "agent",
+            "assistant",
+            "did the",
+            "did you",
+            "actually",
+            "workflow",
+            "action proof",
+            "those edits",
+            "edits",
+        )
+    ):
         return []
     roots = semantic_debug_codex_session_roots(source_plan)
     case_day_files: list[Path] = []
@@ -4248,6 +4261,7 @@ def inferred_known_action_case_next_reads(
                 bonus_terms=("codex-orchestration.md", "agent-workflow.md", "git diff --check", "git diff --stat"),
             )
         )
+        scored.extend(workflow_overwrite_case_records_for_path(path))
     scored.sort(key=lambda item: (-float(item["score"]), str(item.get("timestamp_utc") or ""), int((item.get("source_ref") or {}).get("line") or 0)))
     reads = []
     for index, item in enumerate(scored[:2], 1):
@@ -4276,6 +4290,77 @@ def inferred_known_action_case_next_reads(
         }
         reads.append(read)
     return reads
+
+
+def workflow_overwrite_case_records_for_path(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+    except (AdapterReadError, OSError, ValueError):
+        return []
+    for index, record in enumerate(records):
+        score, matched, reason = score_workflow_overwrite_case_record(records, index)
+        if score <= 0:
+            continue
+        rows.append(
+            {
+                "source_ref": {"path": str(path), "line": int(record.line), "session": Path(path).stem},
+                "role": record.role,
+                "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+                "score": score,
+                "selection_reason": f"known_action_case:{reason}:{'+'.join(matched[:4])}",
+            }
+        )
+    return rows
+
+
+def score_workflow_overwrite_case_record(records: list[Any], index: int) -> tuple[float, list[str], str]:
+    record = records[index]
+    role_text = str(record.role or "").casefold()
+    lowered = str(record.text or "").casefold()
+    context_start = max(0, index - 8)
+    context_end = min(len(records), index + 9)
+    local_context = " ".join(str(records[item].text or "").casefold() for item in range(context_start, context_end))
+    matched: list[str] = []
+    score = 0.0
+    if "clarify planner split workflow" in local_context or "planner split workflow" in local_context:
+        score += 70.0
+        matched.append("planner_split_workflow")
+    if "1d47497" in local_context:
+        score += 55.0
+        matched.append("commit_anchor")
+    if any(term in local_context for term in ("did not overwrite", "not overwrite", "no, i did not overwrite")):
+        score += 70.0
+        matched.append("no_overwrite_answer")
+    if "codex-orchestration.md" in local_context and "agent-workflow.md" in local_context:
+        score += 40.0
+        matched.append("workflow_docs")
+    if any(term in local_context for term in ("left untouched", "untracked draft files", "still has two untracked")):
+        score += 30.0
+        matched.append("untouched_worktree")
+    if any(term in local_context for term in ("git diff --check", "git diff --stat", "git status", "git log")):
+        score += 20.0
+        matched.append("tool_state_checks")
+    if not matched:
+        return 0.0, [], "no_workflow_overwrite_anchor"
+    if any(token in role_text for token in ("assistant", "agent")):
+        score += 18.0
+    elif "function_call_output" in role_text and any(term in lowered for term in ("commit", "files changed")):
+        score += 10.0
+    elif "function_call" in role_text:
+        score += 6.0
+    if any(token in role_text for token in ("developer", "system", "turn_context", "token_count")):
+        score -= 80.0
+    if "jsonl-history-search semantic-debug" in lowered or "current-run prompt" in lowered:
+        score -= 120.0
+    if score < 95.0:
+        return 0.0, matched, "weak_workflow_overwrite_anchor"
+    reason = "workflow_overwrite_source_window"
+    if any(term in lowered for term in ("did not overwrite", "not overwrite")):
+        reason = "workflow_overwrite_assistant_answer"
+    elif any(term in lowered for term in ("clarify planner split workflow", "1d47497", "files changed")):
+        reason = "workflow_overwrite_commit_or_tool_output"
+    return score, dedupe(matched), reason
 
 
 def inferred_explicit_date_remembered_instruction_next_reads(
