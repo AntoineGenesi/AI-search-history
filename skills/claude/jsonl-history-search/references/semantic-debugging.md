@@ -36,10 +36,38 @@ save the packet, inspect hidden fields, or debug the tool itself.
 5. `uncertainty`
 6. relevant source refs
 
+## Source Followthrough Protocol
+
+For explicit product/history questions such as `what happened at JSH-1274?`,
+`why did JSH-1272 fail closed?`, or `which source session proves the route
+repair?`, use this staged answer protocol:
+
+1. Route first with `ask`, then run the printed `semantic-debug` command.
+2. Open primary raw/session/tool source refs from the first `semantic-debug`
+   output: `source_locator_handoff.next_reads`, promoted source refs,
+   source-window reads, tool/action proof refs, or required follow-through
+   reads.
+3. Use secondary task/review/report/commit artifacts only after primary refs
+   have been opened. These artifacts can explain chronology, merges, review
+   verdicts, and task state, but they do not replace primary source evidence for
+   what the user, agent, tool, or session actually did or said.
+4. Treat post-hoc answer-key artifacts, current-run/same-loop echoes,
+   prior-final summaries, adjudication material, and reports created after the
+   target work as diagnostics unless the user explicitly asks to audit that
+   artifact.
+5. Answer only the facets covered by inspected primary refs plus necessary
+   secondary context. Keep inference labels such as `likely` or `candidate`
+   when the source chain is incomplete.
+6. Fail closed when primary refs are absent, weak, capped, contradicted, or not
+   opened. Say what was searched, which primary source role is missing, which
+   secondary artifacts were only leads, and the next bounded read or escalation
+   route.
+
 If the route says `answer-after-required-reads`, open the required source refs
-first and answer once the named facets are covered. Do not run broad `rg` over a
-large raw JSONL transcript unless a required facet is still missing after those
-reads.
+first and answer once the named facets are covered. Do not answer from task,
+review, report, or commit artifacts before opening the primary source refs from
+the first route output. Do not run broad `rg` over a large raw JSONL transcript
+unless a required facet is still missing after those reads.
 
 Keep evidence separate from inference. Say `likely contributing assumption` or
 `candidate cause` unless linked evidence supports stronger language.

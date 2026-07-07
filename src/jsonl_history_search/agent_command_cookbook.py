@@ -36,7 +36,10 @@ def agent_question_cookbook() -> list[dict[str, str]]:
                 'jsonl-history-search ask "find the source session behind this report task or review" '
                 '--cwd "$PWD" --format text'
             ),
-            "inspect_next": "semantic_debug.source_locator_handoff, source refs, next_reads, and linked task/review/git artifacts",
+            "inspect_next": (
+                "semantic_debug.source_locator_handoff primary raw/session/tool source refs and next_reads first; "
+                "use linked task/review/report/commit artifacts only after those primary refs have been opened"
+            ),
         },
         {
             "id": "bounded_no_evidence",
@@ -108,7 +111,10 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
         {
             "purpose": "run selected first route",
             "command": selected_first_command,
-            "inspect_next": "the route output's source refs, source locator handoff, follow-through plan, or no-evidence scope",
+            "inspect_next": (
+                "the route output's primary raw/session/tool source refs, source locator handoff, "
+                "follow-through plan, or no-evidence scope before secondary artifacts"
+            ),
         }
     ]
     for entry in agent_question_cookbook():
@@ -137,7 +143,10 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
             {
                 "purpose": "open exact source ref returned by the route",
                 "command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
-                "inspect_next": "replace <source-ref> with the concrete path:line from the preceding route output",
+                "inspect_next": (
+                    "replace <source-ref> with a concrete primary raw/session/tool path:line from the "
+                    "preceding route output before relying on task/review/report/commit artifacts"
+                ),
             }
         )
     return commands

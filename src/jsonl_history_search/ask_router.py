@@ -748,18 +748,28 @@ def classify_ask_route(query: str) -> AskRoute:
         first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
-            "semantic_debug.source_locator_handoff",
-            "top source refs / next_reads",
+            "semantic_debug.source_locator_handoff primary raw/session/tool source refs from the first semantic-debug run",
+            "top primary source refs / next_reads opened with read-more before secondary task/review/report/commit artifacts",
+            "secondary task/review/report/commit artifacts only after primary refs establish chronology, action, wording, or provenance",
+            "post-hoc answer-key, same-loop/current-run, prior-final, and report-created-after-target artifacts as diagnostics only",
             "no-evidence searched scope before widening",
         ),
         stop_guidance=(
-            "Run semantic-debug before broad manual search. Stop when inspected "
-            "source refs are sufficient, or escalate only from explicit weak/no-evidence output."
+            "Run semantic-debug before broad manual search. Open primary raw/"
+            "session/tool source refs from that first route output before "
+            "answering from task, review, report, or commit artifacts. Stop "
+            "when inspected primary refs plus any necessary secondary context "
+            "cover the named facets; fail closed with the searched scope and "
+            "missing facet when primary refs are absent, weak, capped, or "
+            "contradicted."
         ),
         manual_search_guidance=(
             "Manual rg is a targeted follow-up after route output, not the first "
             "move for a natural history question. Prefer compact text read-more "
-            "commands over raw JSON source-window output."
+            "commands over raw JSON source-window output. Treat repo task/review/"
+            "report/commit searches as secondary joins after primary source "
+            "refs are opened, unless semantic-debug explicitly returns scoped "
+            "no-evidence or a named missing-primary-source blocker."
         ),
     )
 
