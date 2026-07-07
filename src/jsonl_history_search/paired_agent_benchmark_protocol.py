@@ -78,6 +78,30 @@ DEFAULT_MANUAL_FORBIDDEN_MATERIAL: list[str] = [
     "same-loop artifacts that directly answer the case",
 ]
 
+EXP_STYLE_MANUAL_SEARCH_BOUNDARY: dict[str, Any] = {
+    "allowed_scope": [
+        "primary raw/session/tool-event/source evidence roots named in the case source boundary",
+        "legitimate repo files needed to understand checked evidence",
+        "git metadata and commit history when used to verify inspected primary evidence",
+    ],
+    "excluded_surfaces": [
+        ".private case-packet/source-map/adjudication files",
+        "committed tasks, reports, reviews, and review-state artifacts",
+        "hard-case libraries or fixtures containing expected facets",
+        "same-loop answer-key artifacts and source maps",
+        "files whose names identify answer keys, source maps, expected facets, adjudications, or case packets",
+    ],
+    "runner_mechanism": (
+        "manual lanes use an explicit allowed-search contract and runner candidate "
+        "classifier for manual target/materialization planning; this is not "
+        "filesystem sandboxing"
+    ),
+    "fail_closed_audit": (
+        "retained command events/output are still audited after the run and the manual "
+        "lane fails closed if forbidden material appears"
+    ),
+}
+
 CONTAMINATION_LABELS: list[dict[str, Any]] = [
     {
         "label": "none",
@@ -231,6 +255,7 @@ def build_paired_agent_benchmark_protocol_payload() -> dict[str, Any]:
                         "without exposing expected answers or source-location maps."
                     ),
                 },
+                "exp_style_search_boundary": EXP_STYLE_MANUAL_SEARCH_BOUNDARY,
             },
             "jsonl_assisted": {
                 "allowed_sections": [
