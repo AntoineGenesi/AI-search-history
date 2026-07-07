@@ -343,8 +343,9 @@ ROUTES: tuple[AskRoute, ...] = (
         route_family="action_proof",
         chosen_route="action-proof / semantic-debug",
         why_it_applies=(
-            "The wording asks whether an agent action changed or overwrote edits, "
-            "so the first evidence should be tool/action proof from conversation logs."
+            "The wording asks whether an agent actually performed a claimed "
+            "action, so the first evidence should be tool/action proof from "
+            "conversation logs."
         ),
         first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/action-proof.md",
@@ -355,7 +356,7 @@ ROUTES: tuple[AskRoute, ...] = (
         ),
         stop_guidance=(
             "Run the action-proof route before broad rg. If primary proof answers "
-            "the overwrite/action question, stop broad searching and answer from inspected refs."
+            "the claimed-action question, stop broad searching and answer from inspected refs."
         ),
         manual_search_guidance=(
             "Manual rg is only for targeted follow-up after the route, or if the "
@@ -616,11 +617,6 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_storage_retention_forensics_query(normalized):
         return STORAGE_RETENTION_FORENSICS_ROUTE
 
-    if _has_any(normalized, ("overwrite", "overwrote", "clobber", "revert", "deleted", "edit")) and _has_any(
-        normalized, ("agent", "edits", "edit", "changed", "action")
-    ):
-        return ROUTES[2]
-
     if _looks_like_process_actual_use_query(normalized):
         return ROUTES[3]
 
@@ -638,6 +634,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
+
+    if _looks_like_action_proof_query(normalized):
+        return ROUTES[2]
 
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
@@ -694,6 +693,55 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _looks_like_action_proof_query(normalized: str) -> bool:
+    actor_terms = ("agent", "worker", "assistant", "ai", "model", "codex", "claude")
+    action_terms = (
+        "actually do",
+        "actually did",
+        "actually run",
+        "actually ran",
+        "actually edit",
+        "actually edited",
+        "actually test",
+        "actually tested",
+        "actually review",
+        "actually reviewed",
+        "actually merge",
+        "actually merged",
+        "actually commit",
+        "actually committed",
+        "performed",
+        "execute",
+        "executed",
+        "run the test",
+        "run tests",
+        "ran tests",
+        "reviewed",
+        "merged",
+        "committed",
+        "overwrite",
+        "overwrote",
+        "clobber",
+        "revert",
+        "deleted",
+        "edit",
+    )
+    claim_contrast_terms = (
+        "only claim",
+        "only claimed",
+        "merely claim",
+        "merely claimed",
+        "versus claim",
+        "vs claim",
+        "or claim",
+        "claimed it",
+        "actually do versus claim",
+    )
+    return _has_any(normalized, actor_terms) and (
+        _has_any(normalized, action_terms) or _has_any(normalized, claim_contrast_terms)
+    )
 
 
 def _looks_like_storage_retention_forensics_query(normalized: str) -> bool:
