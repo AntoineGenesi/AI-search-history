@@ -195,6 +195,18 @@ def build_paired_agent_benchmark_protocol_payload() -> dict[str, Any]:
                 "Do not copy raw prompt text, transcripts, source lines, or query payloads into committed artifacts.",
                 "Use git ls-files .private worktrees to verify no private trace files were tracked.",
             ],
+            "manual_runtime_preflight": {
+                "required_before_real_pair": True,
+                "auth_source": "isolated manual CODEX_HOME must have a linked or copied auth route before launch",
+                "completion_smoke": "run a tiny non-case manual auth/completion smoke before any benchmark prompt",
+                "jsonl_controls_preserved": [
+                    "jsonl-history-search PATH blocker",
+                    "jsonl_history_search import blocker",
+                    "empty isolated manual skills directory",
+                ],
+                "failure_behavior": "if auth/setup preflight fails, do not launch benchmark lane rows; if manual lane fails closed, do not launch the JSONL paired lane",
+                "not_filesystem_sandboxing": True,
+            },
         },
         "prompt_views": {
             "shared_case_packet": {
