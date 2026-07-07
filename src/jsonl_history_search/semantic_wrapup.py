@@ -37,6 +37,25 @@ ROLLING_WINDOW_ERROR_INLINE_LIMIT = 30
 USER_MESSAGE_FIRST_INLINE_LIMIT = 20
 USER_MESSAGE_CONTEXT_PRE_RECORDS = 2
 USER_MESSAGE_CONTEXT_POST_RECORDS = 2
+BEHAVIOR_RULE_FILENAMES = {"AGENTS.md", "CLAUDE.md"}
+IGNORED_BEHAVIOR_DISCOVERY_DIRS = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "__pycache__",
+    ".private",
+    ".venv",
+    "cache",
+    "caches",
+    "node_modules",
+    "venv",
+    "worktrees",
+}
+PLUGIN_IGNORED_BEHAVIOR_DISCOVERY_DIRS = {".archive", ".tmp", "archive", "archives", "temp", "tmp"}
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
 READ_ROLE_REQUIRED_PRIMARY_PROOF = "required_primary_proof"
@@ -1478,7 +1497,7 @@ def _current_session_source_paths(cwd: Path) -> list[str]:
         for path in sorted(cwd.glob(pattern)):
             if len(rels) >= CURRENT_SESSION_SOURCE_SCAN_LIMIT:
                 return rels
-            if not path.is_file() or ".scratch." in path.name or _skip_destination_path(path):
+            if not path.is_file() or ".scratch." in path.name or _skip_destination_path(path, cwd):
                 continue
             try:
                 rel = path.relative_to(cwd).as_posix()
@@ -1669,7 +1688,7 @@ def _discover_behavior_destinations(cwd: Path) -> list[tuple[str, str]]:
         if (cwd / rel).is_file():
             discovered.append(("issue_tracker", rel))
 
-    for rel in _iter_existing(cwd, ["**/AGENTS.md", "**/CLAUDE.md"]):
+    for rel in _iter_recursive_behavior_rule_files(cwd):
         if rel not in {"AGENTS.md", "CLAUDE.md"}:
             discovered.append(("project_rule", rel))
 
@@ -1707,7 +1726,7 @@ def _iter_existing(cwd: Path, patterns: list[str]) -> list[str]:
         for path in sorted(cwd.glob(pattern)):
             if len(rels) >= DESTINATION_SCAN_LIMIT:
                 return rels
-            if _skip_destination_path(path):
+            if _skip_destination_path(path, cwd):
                 continue
             try:
                 rels.append(path.relative_to(cwd).as_posix())
@@ -1716,14 +1735,44 @@ def _iter_existing(cwd: Path, patterns: list[str]) -> list[str]:
     return rels
 
 
-def _skip_destination_path(path: Path) -> bool:
-    ignored = {".git", ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv"}
-    parts = set(path.parts)
-    if any(part in ignored for part in path.parts):
+def _iter_recursive_behavior_rule_files(cwd: Path) -> list[str]:
+    rels: list[str] = []
+    stack = [cwd]
+
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
+        except OSError:
+            continue
+
+        child_dirs: list[Path] = []
+        for path in entries:
+            if len(rels) >= DESTINATION_SCAN_LIMIT:
+                return rels
+            if path.name in BEHAVIOR_RULE_FILENAMES and path.is_file() and not _skip_destination_path(path, cwd):
+                try:
+                    rels.append(path.relative_to(cwd).as_posix())
+                except ValueError:
+                    continue
+                continue
+            if path.is_dir() and not path.is_symlink() and not _skip_destination_path(path, cwd):
+                child_dirs.append(path)
+        stack.extend(reversed(child_dirs))
+
+    return rels
+
+
+def _skip_destination_path(path: Path, cwd: Path | None = None) -> bool:
+    if cwd is not None:
+        try:
+            path = path.relative_to(cwd)
+        except ValueError:
+            pass
+    parts = {part.casefold() for part in path.parts}
+    if any(part in IGNORED_BEHAVIOR_DISCOVERY_DIRS for part in parts):
         return True
-    if ".private" in parts:
-        return True
-    if ".tmp" in parts and "plugins" in parts:
+    if "plugins" in parts and any(part in PLUGIN_IGNORED_BEHAVIOR_DISCOVERY_DIRS for part in parts):
         return True
     return False
 
