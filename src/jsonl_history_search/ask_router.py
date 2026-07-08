@@ -39,7 +39,12 @@ class AskRoute:
     manual_search_guidance: str
 
     def first_command(self, query: str) -> str:
-        escaped = query.replace('"', '\\"')
+        command_query = (
+            _semantic_wrapup_first_command_query(query)
+            if self.route_family == "semantic_wrapup"
+            else query
+        )
+        escaped = command_query.replace('"', '\\"')
         skill = _skill_name_from_query(query)
         return self.first_command_template.format(query=escaped, skill=skill)
 
@@ -776,6 +781,68 @@ def classify_ask_route(query: str) -> AskRoute:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+_CURRENT_SESSION_SCOPE_TERMS = (
+    "in this session",
+    "this session",
+    "current session",
+    "current-session",
+    "this run",
+    "current run",
+    "latest session",
+    "current thread",
+    "this thread",
+)
+
+
+_BROAD_HISTORY_SCOPE_TERMS = (
+    "historically",
+    "historical",
+    "history",
+    "all history",
+    "all-history",
+    "broad history",
+    "whole history",
+    "entire history",
+    "across sessions",
+    "cross-session",
+    "cross session",
+    "previous sessions",
+    "prior sessions",
+    "past sessions",
+    "old sessions",
+    "over time",
+)
+
+
+def _semantic_wrapup_first_command_query(query: str) -> str:
+    normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
+    if not _looks_like_bare_correction_or_complaint_prompt(normalized):
+        return query
+    if _has_any(normalized, _CURRENT_SESSION_SCOPE_TERMS):
+        return query
+    if _has_any(normalized, _BROAD_HISTORY_SCOPE_TERMS):
+        return query
+    return f"{query.rstrip(' ?!')} in this session?"
+
+
+def _looks_like_bare_correction_or_complaint_prompt(normalized: str) -> bool:
+    return _has_any(
+        normalized,
+        (
+            "what did i keep correcting",
+            "what have i kept correcting",
+            "what did i keep complaining",
+            "what have i kept complaining",
+            "what failure modes did i keep correcting",
+            "what failure modes did i keep complaining",
+            "which user corrections kept recurring",
+            "which corrections kept recurring",
+            "what did i keep yelling",
+            "what have i kept yelling",
+        ),
+    )
 
 
 def _looks_like_action_proof_query(normalized: str) -> bool:

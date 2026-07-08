@@ -22,7 +22,7 @@ def agent_question_cookbook() -> list[dict[str, str]]:
             "id": "complaint_mining",
             "question_family": "What did I keep correcting or complaining about?",
             "route": "semantic-wrapup",
-            "first_command": 'jsonl-history-search ask "what did I keep correcting?" --cwd "$PWD" --format text',
+            "first_command": 'jsonl-history-search ask "what did I keep correcting in this session?" --cwd "$PWD" --format text',
             "inspect_next": (
                 "semantic_wrapup.failure_modes, fix_suggestions, required_primary_proof next_reads, "
                 "and optional/conditional diagnostics only for named gaps"
