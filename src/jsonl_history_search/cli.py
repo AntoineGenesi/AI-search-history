@@ -3816,12 +3816,33 @@ def _named_task_action_proof_handoff(
 
 
 def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) -> bool:
-    if route_family != "semantic_debug":
+    normalized = str(query or "").casefold()
+    if route_family == "semantic_debug" and "what happened" in normalized:
+        return bool(_ask_execute_named_task_ids(query))
+    return _named_task_review_failure_causal_answer_wanted(query=query, route_family=route_family)
+
+
+def _named_task_review_failure_causal_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"provenance", "semantic_debug"}:
+        return False
+    if not _ask_execute_named_task_ids(query):
         return False
     normalized = str(query or "").casefold()
-    if "what happened" not in normalized:
+    if not any(term in normalized for term in ("why", "cause", "caused", "reason")):
         return False
-    return bool(_ask_execute_named_task_ids(query))
+    return any(
+        term in normalized
+        for term in (
+            "fail review",
+            "failed review",
+            "review fail",
+            "review failure",
+            "fail verification",
+            "failed verification",
+            "verification fail",
+            "verification failure",
+        )
+    )
 
 
 def _ask_execute_named_task_ids(query: str) -> list[str]:
@@ -5983,17 +6004,26 @@ def _non_user_opened_ref_summaries(opened: list[dict]) -> list[str]:
 
 def _summarize_markdown_file(lines: list[str]) -> str:
     selected: list[str] = []
+    high_signal: list[str] = []
     for raw in lines:
         line = raw.strip()
         if not line:
             continue
         if line.startswith("# ") or _looks_like_markdown_proof_summary_line(line):
             selected.append(line)
-        if len(selected) >= 5:
+        if _looks_like_markdown_review_failure_answer_line(line) or _looks_like_markdown_fix_rereview_answer_line(line):
+            high_signal.append(line)
+        if len(selected) >= 5 and len(high_signal) >= 4:
             break
     if not selected:
         selected = [line.strip() for line in lines if line.strip()][:5]
-    return " | ".join(selected)[:_ASK_ANSWER_MAX_FILE_CHARS]
+    combined = selected[:5]
+    for line in high_signal:
+        if line not in combined:
+            combined.append(line)
+        if len(combined) >= 9:
+            break
+    return " | ".join(combined)[:_ASK_ANSWER_MAX_FILE_CHARS]
 
 
 def _looks_like_markdown_proof_summary_line(line: str) -> bool:
@@ -6009,6 +6039,24 @@ def _looks_like_markdown_proof_summary_line(line: str) -> bool:
             "commit:",
             "review:",
         )
+    )
+
+
+def _looks_like_markdown_review_failure_answer_line(line: str) -> bool:
+    normalized = line.lstrip("-*` ").casefold()
+    return (
+        any(term in normalized for term in ("failed-review", "review failure", "failed review"))
+        or (
+            any(term in normalized for term in ("failed", "failure", "`failed`"))
+            and any(term in normalized for term in ("because", "boundary", "direct support", "overclassified"))
+        )
+    )
+
+
+def _looks_like_markdown_fix_rereview_answer_line(line: str) -> bool:
+    normalized = line.lstrip("-*` ").casefold()
+    return any(term in normalized for term in ("rereview", "re-review", "after fix", "fix/rereview")) and any(
+        term in normalized for term in ("verified", "`verified`", "verdict", "outcome", "fixed")
     )
 
 
@@ -6355,7 +6403,7 @@ def _semantic_wrapup_source_ref_text(ref: dict) -> str:
     return f"{path}:{line}" if line else path
 
 
-def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -> str:
+def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -> str | None:
     task_ids = named.get("task_ids") or []
     task_id = str(task_ids[0]) if task_ids else "the named task"
     task_summaries: list[str] = []
@@ -6374,6 +6422,16 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
         else:
             other_summaries.append(summary)
     query_lower = query.lower()
+    if _named_task_review_failure_causal_answer_wanted(query=query, route_family="provenance"):
+        cause = _named_task_review_failure_cause(task_summaries + review_summaries)
+        outcome = _named_task_review_failure_fix_outcome(review_summaries + task_summaries)
+        if not cause or not outcome:
+            return None
+        return (
+            f"The current review/fix proof for {task_id} says the review failed because {cause} "
+            f"The current fix/rereview outcome proof says {outcome} "
+            "Boundary: this answers from current task/review/commit proof only, not an all-history root-cause claim."
+        )
     if "review" in query_lower or "verify" in query_lower or "verified" in query_lower:
         if review_summaries:
             return (
@@ -6390,6 +6448,74 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     if other_summaries:
         pieces.append(f"commit/probe proof: {_short_join(other_summaries[:1])}")
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _named_task_review_failure_cause(summaries: list[str]) -> str:
+    fragments = _summary_fragments(summaries)
+    for fragment in fragments:
+        normalized = fragment.casefold()
+        if (
+            any(term in normalized for term in ("fail", "failed", "failure"))
+            and any(term in normalized for term in ("review", "verification"))
+            and any(term in normalized for term in ("because", "cause", "overclassified", "violat"))
+        ):
+            return _clean_named_task_review_failure_cause(fragment)
+        if (
+            any(term in normalized for term in ("fail", "failed", "failure"))
+            and "because" in normalized
+            and any(term in normalized for term in ("scope", "boundary", "direct support", "overclassified", "true-support"))
+        ):
+            return _clean_named_task_review_failure_cause(fragment)
+    for fragment in fragments:
+        normalized = fragment.casefold()
+        if (
+            any(term in normalized for term in ("failed-review", "review failure"))
+            and any(term in normalized for term in ("boundary", "direct support", "mixed", "overclassified"))
+        ):
+            return _clean_named_task_review_failure_cause(fragment)
+    return ""
+
+
+def _clean_named_task_review_failure_cause(fragment: str) -> str:
+    cleaned = str(fragment or "").strip().lstrip("-* ").strip()
+    cleaned = re.sub(r"^review:\s*failed\s+because\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^review artifact\s+was\s+`?failed`?\s+because\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^was\s+`?failed`?\s+because\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _named_task_review_failure_fix_outcome(summaries: list[str]) -> str:
+    fragments = _summary_fragments(summaries)
+    verified_verdict = ""
+    for fragment in fragments:
+        normalized = fragment.casefold()
+        if not verified_verdict and "verdict" in normalized and "verified" in normalized:
+            verified_verdict = fragment
+        if any(term in normalized for term in ("rereview", "re-review", "fix/rereview")) and any(
+            term in normalized for term in ("verified", "verification", "outcome")
+        ):
+            return fragment
+        if "fix" in normalized and any(term in normalized for term in ("verified", "verification", "outcome")):
+            return fragment
+        if "failed-review" in normalized and "fixed" in normalized:
+            return f"{verified_verdict}; {fragment}" if verified_verdict else fragment
+    for fragment in fragments:
+        normalized = fragment.casefold()
+        if any(term in normalized for term in ("rereview", "re-review", "after fix", "fix/rereview")):
+            return fragment
+        if verified_verdict and any(term in normalized for term in ("fixed", "source-inspection-first", "no_evidence_report")):
+            return f"{verified_verdict}; {fragment}"
+    return ""
+
+
+def _summary_fragments(summaries: list[str]) -> list[str]:
+    fragments: list[str] = []
+    for summary in summaries:
+        for fragment in str(summary or "").split(" | "):
+            cleaned = fragment.strip()
+            if cleaned:
+                fragments.append(cleaned)
+    return fragments
 
 
 def _short_join(parts: list[str], *, limit: int = 520) -> str:
