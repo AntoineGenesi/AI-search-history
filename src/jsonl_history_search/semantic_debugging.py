@@ -1003,6 +1003,7 @@ def looks_like_expectation_mismatch_query(text: str) -> bool:
             "prior instruction",
             "plan was",
             "stop after",
+            "instead of",
         )
     )
     observed = any(

@@ -1463,6 +1463,7 @@ def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
         "plan was",
         "expected it to stop",
         "stop after",
+        "instead of",
     )
     observed_terms = (
         "ai",
