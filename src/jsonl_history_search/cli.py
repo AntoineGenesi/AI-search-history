@@ -5098,7 +5098,7 @@ def _work_episode_query_hints(query: str) -> dict:
         normalized = _work_episode_token_stem(token)
         if normalized and normalized not in _ASK_ANSWER_WORK_EPISODE_TOKEN_STOPWORDS and normalized not in tokens:
             tokens.append(normalized)
-    ids = []
+    id_candidates: list[tuple[int, str]] = []
     for pattern in (
         r"\b[A-Z][A-Z0-9]+-\d+\b",
         r"#\d+\b",
@@ -5110,8 +5110,11 @@ def _work_episode_query_hints(query: str) -> dict:
             if match.lastindex:
                 value = f"#{match.group(1)}"
             value = value.casefold()
-            if value not in ids:
-                ids.append(value)
+            id_candidates.append((match.start(), value))
+    ids = []
+    for _start, value in sorted(id_candidates, key=lambda item: (item[0], item[1])):
+        if value not in ids:
+            ids.append(value)
     branches = []
     for match in re.finditer(r"\b[a-z0-9._-]+/[a-z0-9._/-]+\b", text):
         value = match.group(0)
@@ -5128,6 +5131,7 @@ def _work_episode_query_hints(query: str) -> dict:
         "tokens": tokens[:16],
         "rare_tokens": rare_tokens[:8],
         "ids": ids[:8],
+        "subject_id": ids[0] if ids else None,
         "branches": branches[:6],
         "commits": commits[:6],
         "dates": dates[:6],
@@ -5279,11 +5283,18 @@ def _select_work_episode_opened_for_answer(
 
 def _work_episode_rejected_next_required_proof(hints: dict) -> str:
     ids = _work_episode_public_hints(hints).get("ids") or []
-    explicit_id_clause = (
-        f" for explicit ids, the primary proof must contain or join to {', '.join(ids)};"
-        if ids
-        else ""
-    )
+    subject_id = str(hints.get("subject_id") or "")
+    if len(ids) > 1 and subject_id:
+        explicit_id_clause = (
+            f" for multiple explicit ids, the primary proof must contain or join to subject "
+            f"{subject_id}, or show a same-entity relation linking {', '.join(ids)};"
+        )
+    else:
+        explicit_id_clause = (
+            f" for explicit ids, the primary proof must contain or join to {', '.join(ids)};"
+            if ids
+            else ""
+        )
     return (
         "Open raw tool/file-edit/diff/test/commit evidence that matches the query episode anchors;"
         f"{explicit_id_clause} do not answer from unrelated action-proof refs."
@@ -5304,11 +5315,27 @@ def _work_episode_explicit_id_gate(item: dict, hints: dict) -> dict:
         for value in ref.get("work_episode_same_entity_join_ids") or []
         if str(value).strip()
     }
-    if query_ids.intersection(join_ids):
-        return {"allowed": True, "reason": "same_entity_join_id"}
     primary_match = _work_episode_text_match(_work_episode_opened_primary_text(item, ref), hints)
-    if primary_match.get("matched_ids"):
-        return {"allowed": True, "reason": "primary_text_contains_explicit_id", "match": primary_match}
+    coverage_ids = join_ids.union(
+        str(value).casefold()
+        for value in primary_match.get("matched_ids") or []
+        if str(value).strip()
+    )
+    subject_id = str(hints.get("subject_id") or "").casefold()
+    if len(query_ids) > 1 and subject_id and subject_id not in coverage_ids:
+        return {
+            "allowed": False,
+            "reason": "primary_proof_missing_subject_query_id",
+            "required_subject_id": subject_id,
+            "required_ids": sorted(query_ids),
+        }
+    if query_ids.intersection(coverage_ids):
+        return {
+            "allowed": True,
+            "reason": "explicit_query_id_covered",
+            "matched_ids": sorted(query_ids.intersection(coverage_ids)),
+            "match": primary_match,
+        }
     return {
         "allowed": False,
         "reason": "primary_proof_missing_explicit_query_id",
@@ -5334,6 +5361,7 @@ def _work_episode_opened_primary_text(item: dict, ref: dict) -> str:
 def _work_episode_public_hints(hints: dict) -> dict:
     return {
         "ids": list(hints.get("ids") or [])[:4],
+        "subject_id": hints.get("subject_id"),
         "branches": list(hints.get("branches") or [])[:4],
         "commits": list(hints.get("commits") or [])[:4],
         "dates": list(hints.get("dates") or [])[:4],
