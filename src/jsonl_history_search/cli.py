@@ -4265,6 +4265,9 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "partial review commit",
     "observed command:",
     "observed answer:",
+    "task note:",
+    "review fixture",
+    "test fixture",
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
@@ -4370,24 +4373,6 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
     if route_family == "remembered_user_wording":
         user_opened = _remembered_user_wording_user_authored_opened(usable)
         if not user_opened:
-            answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
-            return _ask_answer_fail_closed(
-                answer,
-                "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
-                {
-                    "required_next_proof": "raw user-authored message ref",
-                    "suggested_action": (
-                        "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
-                        "do not answer from tool output, function_call_output, assistant, task, or current-run echo rows"
-                    ),
-                    "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
-                },
-            )
-        answer_opened = _remembered_user_wording_non_echo_user_opened(
-            user_opened,
-            query=str(report.get("query") or ""),
-        )
-        if not answer_opened:
             recovery = _recover_remembered_user_wording_clean_opened(
                 report=report,
                 action=action,
@@ -4399,29 +4384,22 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
             if recovered_opened:
                 answer["source_contract"]["remembered_user_wording_recovery"] = {
                     "schema_version": 1,
-                    "status": "clean_user_proof_recovered_after_prompt_echo_rejection",
+                    "status": "clean_user_proof_recovered_after_non_user_refs",
                     "searched_ref_count": recovery.get("searched_ref_count"),
                     "opened_ref_count": recovery.get("opened_ref_count"),
                     "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
                 }
                 answer_opened = recovered_opened
             else:
-                rejected_echo_refs = [
-                    _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
-                    for item in user_opened
-                ] + list(recovery.get("rejected_prompt_echo_refs") or [])
-                answer["proof_summary"] = _prompt_echo_opened_ref_summaries(
-                    user_opened,
-                    query=str(report.get("query") or ""),
-                )
+                answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
                 return _ask_answer_fail_closed(
                     answer,
-                    "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                    "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
                     {
-                        "required_next_proof": "raw user-authored non-echo message ref",
+                        "required_next_proof": "raw user-authored message ref",
                         "suggested_action": (
-                            "inspect older user-message refs that state the target wording directly; already surfaced "
-                            "target reads did not yield clean user-authored non-echo proof"
+                            "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                            "already surfaced target reads did not yield clean user-authored non-echo proof"
                         ),
                         "bounded_recovery": {
                             "status": recovery.get("status") or "no_clean_user_proof_recovered",
@@ -4430,9 +4408,60 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
                             "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
                             "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
                         },
-                        "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
+                        "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
                     },
                 )
+        else:
+            answer_opened = _remembered_user_wording_non_echo_user_opened(
+                user_opened,
+                query=str(report.get("query") or ""),
+            )
+            if not answer_opened:
+                recovery = _recover_remembered_user_wording_clean_opened(
+                    report=report,
+                    action=action,
+                    initially_opened=usable,
+                    cwd=cwd,
+                    query=str(report.get("query") or ""),
+                )
+                recovered_opened = list(recovery.get("opened") or [])
+                if recovered_opened:
+                    answer["source_contract"]["remembered_user_wording_recovery"] = {
+                        "schema_version": 1,
+                        "status": "clean_user_proof_recovered_after_prompt_echo_rejection",
+                        "searched_ref_count": recovery.get("searched_ref_count"),
+                        "opened_ref_count": recovery.get("opened_ref_count"),
+                        "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                    }
+                    answer_opened = recovered_opened
+                else:
+                    rejected_echo_refs = [
+                        _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
+                        for item in user_opened
+                    ] + list(recovery.get("rejected_prompt_echo_refs") or [])
+                    answer["proof_summary"] = _prompt_echo_opened_ref_summaries(
+                        user_opened,
+                        query=str(report.get("query") or ""),
+                    )
+                    return _ask_answer_fail_closed(
+                        answer,
+                        "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                        {
+                            "required_next_proof": "raw user-authored non-echo message ref",
+                            "suggested_action": (
+                                "inspect older user-message refs that state the target wording directly; already surfaced "
+                                "target reads did not yield clean user-authored non-echo proof"
+                            ),
+                            "bounded_recovery": {
+                                "status": recovery.get("status") or "no_clean_user_proof_recovered",
+                                "searched_ref_count": recovery.get("searched_ref_count"),
+                                "opened_ref_count": recovery.get("opened_ref_count"),
+                                "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                                "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                            },
+                            "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
+                        },
+                    )
 
     episode_selection = _select_work_episode_opened_for_answer(
         query=str(report.get("query") or ""),
