@@ -3423,6 +3423,10 @@ def _answer_action_contract_from_executed_output(
             cwd=cwd,
             route_family=route_family,
         )
+        target_proof_handoff = _semantic_debug_target_proof_handoff(
+            compact=compact,
+            route_family=route_family,
+        )
         route_first_reads = (
             orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
@@ -3430,15 +3434,62 @@ def _answer_action_contract_from_executed_output(
             if route_family == "expectation_mismatch" and expectation_mismatch_plan
             else named_task_action_proof.get("read")
             if named_task_action_proof
+            else target_proof_handoff.get("required_primary_proof")
+            if target_proof_handoff
             else core_plan.get("read")
         )
+        answer_status = _unpromoted_semantic_debug_answer_status(internal_status)
+        promotion_status = "unpromoted_semantic_debug_execution"
+        promotion_reason = (
+            "ask --execute semantic-debug remains an execution convenience; promoted scoped answers "
+            "are limited to bounded_no_evidence routes executed through no-evidence-report."
+        )
+        source_inspection_boundary = None
+        if named_task_action_proof.get("status") == "current_named_task_proof_refs_available":
+            answer_status = "answer-ready-after-source-inspection"
+            promotion_status = "semantic_debug_current_named_task_proof_ready_after_source_inspection"
+            promotion_reason = (
+                "ask --execute semantic-debug found current named task/review/commit proof refs; "
+                "inspect those refs before answering and use stale/session diagnostics only for named gaps."
+            )
+            source_inspection_boundary = {
+                "decision": "answer_after_source_inspection",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "current_named_task_review_commit_refs",
+                "diagnostics_default_final_support": False,
+            }
+        elif named_task_action_proof.get("status") == "current_named_task_proof_refs_missing":
+            answer_status = "not-ready/missing-current-named-task-proof"
+            promotion_status = "semantic_debug_named_task_proof_fail_closed"
+            promotion_reason = (
+                "A named task action-proof prompt needs current task/review/commit proof or explicit raw "
+                "worker/reviewer/tool proof for that same task; do not answer from stale or unrelated diagnostics."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_missing_named_task_proof",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "missing_current_named_task_review_commit_refs",
+                "diagnostics_default_final_support": False,
+            }
+        elif target_proof_handoff:
+            answer_status = "answer-ready-after-source-inspection"
+            promotion_status = "semantic_debug_target_proof_ready_after_source_inspection"
+            promotion_reason = (
+                "ask --execute semantic-debug surfaced target raw/source refs as required primary proof; "
+                "inspect them before answering and keep secondary artifacts or diagnostics out of final support "
+                "unless a supported facet remains missing."
+            )
+            source_inspection_boundary = {
+                "decision": "answer_after_source_inspection",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "target_historical_raw_refs",
+                "secondary_context_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
         contract = {
-            "answer_status": _unpromoted_semantic_debug_answer_status(internal_status),
-            "promotion_status": "unpromoted_semantic_debug_execution",
-            "promotion_reason": (
-                "ask --execute semantic-debug remains an execution convenience; promoted scoped answers "
-                "are limited to bounded_no_evidence routes executed through no-evidence-report."
-            ),
+            "answer_status": answer_status,
+            "promotion_status": promotion_status,
+            "promotion_reason": promotion_reason,
             "internal_answer_status": internal_status,
             "core_convo_first_read_plan": core_plan,
             "expectation_mismatch_plan": expectation_mismatch_plan if route_family == "expectation_mismatch" else None,
@@ -3474,6 +3525,14 @@ def _answer_action_contract_from_executed_output(
             ),
             "saved_report": compact.get("report_written"),
         }
+        if source_inspection_boundary:
+            contract["source_inspection_boundary"] = source_inspection_boundary
+        if target_proof_handoff:
+            contract["target_proof_handoff"] = target_proof_handoff
+            contract["diagnostics_after"] = (
+                target_proof_handoff.get("secondary_context_after_source_inspection")
+                or []
+            ) + (target_proof_handoff.get("diagnostics_after") or [])[:4]
         if named_task_action_proof:
             contract["named_task_action_proof_handoff"] = named_task_action_proof
             contract["diagnostics_after"] = (
@@ -3586,6 +3645,52 @@ def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
     if internal_status in {"inspect_recovery_first", "needs_investigation", "not-ready/needs-more-proof"}:
         return str(internal_status)
     return "inspect-before-answer"
+
+
+_ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES = frozenset(
+    {"remembered_user_wording", "semantic_debug", "provenance"}
+)
+
+
+def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str) -> dict:
+    if route_family not in _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES:
+        return {}
+    core_plan = compact.get("core_convo_first_read_plan") or {}
+    reads = [read for read in core_plan.get("read") or [] if isinstance(read, dict)]
+    primary_raw = [
+        read
+        for read in reads
+        if read.get("target_source_role") == "target_historical_raw"
+        and read.get("diagnostic_only") is not True
+        and read.get("read_more_actionable") is not False
+        and read.get("followthrough_actionable") is not False
+    ]
+    if not primary_raw:
+        return {}
+    secondary_context = [
+        read
+        for read in reads
+        if read.get("target_source_role") in {"target_historical_artifact", "legitimate_context"}
+    ][:6]
+    diagnostics_after = [
+        read
+        for read in (core_plan.get("diagnostics_after") or [])
+        if isinstance(read, dict)
+    ][:6]
+    return {
+        "schema_version": 1,
+        "status": "target_primary_proof_refs_available",
+        "route_family": route_family,
+        "answer_readiness_decision": "answer_after_source_inspection",
+        "required_primary_proof": primary_raw[:6],
+        "secondary_context_after_source_inspection": secondary_context,
+        "diagnostics_after": diagnostics_after,
+        "source_boundaries": {
+            "required_primary_proof": "target_historical_raw refs must be opened before answering",
+            "secondary_context": "historical artifacts and legitimate context are secondary joins after raw/source inspection",
+            "diagnostics": "current-run, same-loop, stale, and post-hoc diagnostics are not final support by default",
+        },
+    }
 
 
 def _named_task_action_proof_handoff(*, query: str, cwd: str, route_family: str) -> dict:
