@@ -66,6 +66,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
+from .gittools import git_root_for, last_change_for_path
 from .latest_user_messages import build_latest_user_messages_payload
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
@@ -1905,6 +1906,8 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         output_key=output_key,
         compact=compact,
         selected_route=selected_route,
+        query=args.query,
+        cwd=cwd,
     )
     return contract
 
@@ -3240,7 +3243,17 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
     return payload
 
 
-def _answer_action_contract_from_executed_output(*, output_key: str, compact: dict, selected_route: dict) -> dict:
+_ASK_EXECUTE_TASK_ID_RE = re.compile(r"\b([A-Z]{2,12})[- ]?(\d{1,6})\b", re.IGNORECASE)
+
+
+def _answer_action_contract_from_executed_output(
+    *,
+    output_key: str,
+    compact: dict,
+    selected_route: dict,
+    query: str = "",
+    cwd: str = ".",
+) -> dict:
     if output_key == "status_anchor":
         return {
             "answer_status": (
@@ -3343,14 +3356,21 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
         )
         route_family = str(selected_route.get("route_family") or "")
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
+        named_task_action_proof = _named_task_action_proof_handoff(
+            query=query,
+            cwd=cwd,
+            route_family=route_family,
+        )
         route_first_reads = (
             orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")
             if route_family == "expectation_mismatch" and expectation_mismatch_plan
+            else named_task_action_proof.get("read")
+            if named_task_action_proof
             else core_plan.get("read")
         )
-        return {
+        contract = {
             "answer_status": _unpromoted_semantic_debug_answer_status(internal_status),
             "promotion_status": "unpromoted_semantic_debug_execution",
             "promotion_reason": (
@@ -3381,12 +3401,26 @@ def _answer_action_contract_from_executed_output(*, output_key: str, compact: di
             ),
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (
+                named_task_action_proof.get("only_continue_if")
+                if named_task_action_proof
+                else None
+            )
+            or (
                 (handoff.get("primary_source_followthrough") or {}).get("only_continue_if")
                 or compact.get("no_evidence", {}).get("read_more_policy")
                 or selected_route.get("manual_search_guidance")
             ),
             "saved_report": compact.get("report_written"),
         }
+        if named_task_action_proof:
+            contract["named_task_action_proof_handoff"] = named_task_action_proof
+            contract["diagnostics_after"] = (
+                named_task_action_proof.get("diagnostics_after")
+                or contract.get("diagnostics_after")
+                or []
+            )
+            contract["stop"] = named_task_action_proof.get("stop") or contract["stop"]
+        return contract
     if _promotable_bounded_no_evidence_contract(compact=compact, selected_route=selected_route):
         return {
             "answer_status": "answer-scoped-no-evidence-now",
@@ -3421,6 +3455,196 @@ def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
     if internal_status in {"inspect_recovery_first", "needs_investigation", "not-ready/needs-more-proof"}:
         return str(internal_status)
     return "inspect-before-answer"
+
+
+def _named_task_action_proof_handoff(*, query: str, cwd: str, route_family: str) -> dict:
+    if route_family != "action_proof":
+        return {}
+    task_ids = _ask_execute_named_task_ids(query)
+    if not task_ids:
+        return {}
+    cwd_path = Path(cwd).expanduser().resolve()
+    rows: list[dict] = []
+    boundaries: list[str] = []
+    for task_id in task_ids[:2]:
+        task_rows, task_boundaries = _current_named_task_action_proof_rows(cwd_path, task_id)
+        rows.extend(task_rows)
+        boundaries.extend(task_boundaries)
+    rows = _dedupe_action_contract_rows(rows)
+    if rows:
+        return {
+            "schema_version": 1,
+            "status": "current_named_task_proof_refs_available",
+            "task_ids": task_ids[:2],
+            "read": rows[:6],
+            "diagnostics_after": [
+                {
+                    "kind": "semantic_debug_fallback",
+                    "reason": (
+                        "Inspect semantic_debug.action_proof_plan/source_window_action_proof only after "
+                        "current named task/review/commit refs leave a named proof facet missing."
+                    ),
+                    "link": "semantic_debug.action_proof_plan",
+                }
+            ],
+            "stop": (
+                "Inspect current named task/review/commit refs before stale raw-session refs; if they answer "
+                "whether the named task file was updated, stop broad searching and cite those refs."
+            ),
+            "only_continue_if": [
+                "the current task artifact, review artifact, and path-level commit metadata do not answer the claimed-action question",
+                "the current named task artifacts are missing or conflict with inspected raw worker/reviewer/tool proof",
+                "a required facet remains missing, such as task-file update, review verdict, implementation commit, or merge/closeout commit",
+            ],
+            "missing_current_proof_boundaries": boundaries,
+        }
+    return {
+        "schema_version": 1,
+        "status": "current_named_task_proof_refs_missing",
+        "task_ids": task_ids[:2],
+        "read": [
+            {
+                "kind": "targeted_fail_closed_boundary",
+                "reason": (
+                    "Named current task proof was requested, but no matching task/review artifact was found "
+                    f"under cwd for {', '.join(task_ids[:2])}; do not use stale unrelated raw-session refs "
+                    "as primary proof."
+                ),
+                "task_ids": task_ids[:2],
+            }
+        ],
+        "stop": (
+            "Fail closed for the named task until current task/review/commit proof or raw worker/reviewer/tool "
+            "proof for that task is inspected."
+        ),
+        "only_continue_if": [
+            "run a targeted check for the named task id under tasks/ and codex/state/reviews/",
+            "only then inspect raw worker/reviewer/tool proof that explicitly mentions the same task id",
+        ],
+        "missing_current_proof_boundaries": boundaries,
+    }
+
+
+def _ask_execute_named_task_ids(query: str) -> list[str]:
+    task_ids: list[str] = []
+    for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or ""):
+        task_id = f"{match.group(1).upper()}-{int(match.group(2))}"
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+    return task_ids
+
+
+def _current_named_task_action_proof_rows(cwd: Path, task_id: str) -> tuple[list[dict], list[str]]:
+    slug = task_id.lower()
+    rows: list[dict] = []
+    boundaries: list[str] = []
+    task_paths = _matching_named_task_artifacts(cwd / "tasks", slug)
+    review_paths = _matching_named_task_artifacts(cwd / "codex" / "state" / "reviews", slug)
+
+    if task_paths:
+        for path in task_paths[:2]:
+            rows.append(
+                _named_task_artifact_read(
+                    cwd,
+                    path,
+                    task_id=task_id,
+                    proof_surface="task_file",
+                    reason=f"inspect current {task_id} task artifact; verify progress log and task-file updates",
+                )
+            )
+    else:
+        boundaries.append(f"{task_id}: no matching tasks/{slug}*.md artifact found under cwd")
+
+    if review_paths:
+        for path in review_paths[:2]:
+            rows.append(
+                _named_task_artifact_read(
+                    cwd,
+                    path,
+                    task_id=task_id,
+                    proof_surface="review_artifact",
+                    reason=f"inspect current {task_id} review artifact; verify reviewer verdict and implementation evidence",
+                )
+            )
+    else:
+        boundaries.append(f"{task_id}: no matching codex/state/reviews/{slug}*.md artifact found under cwd")
+
+    repo = git_root_for(cwd) or cwd
+    for path in [*task_paths[:1], *review_paths[:1]]:
+        rel = _safe_relative_path(cwd, path)
+        change = last_change_for_path(path, repo=repo)
+        if change:
+            rows.append(
+                {
+                    "kind": "current_named_task_commit_evidence",
+                    "task_id": task_id,
+                    "proof_surface": "path_last_change_commit",
+                    "target": change.commit,
+                    "commit": change.commit,
+                    "commit_time": change.commit_time,
+                    "subject": change.subject,
+                    "path": change.path,
+                    "command": f"git show --stat --oneline {change.commit} -- {change.path}",
+                    "reason": f"inspect path-level commit evidence for {rel}",
+                }
+            )
+        elif rel:
+            rows.append(
+                {
+                    "kind": "current_named_task_commit_probe",
+                    "task_id": task_id,
+                    "proof_surface": "path_git_log_probe",
+                    "target": rel,
+                    "command": f"git log --oneline -- {rel}",
+                    "reason": f"targeted commit-history probe for {rel}",
+                }
+            )
+            boundaries.append(f"{task_id}: path-level commit metadata unavailable for {rel}")
+
+    return rows, boundaries
+
+
+def _matching_named_task_artifacts(root: Path, slug: str) -> list[Path]:
+    if not root.exists():
+        return []
+    matches = [path for path in root.glob(f"{slug}*.md") if path.is_file() and not path.name.endswith(".scratch.md")]
+    return sorted(matches, key=lambda path: (len(path.name), path.name))
+
+
+def _named_task_artifact_read(cwd: Path, path: Path, *, task_id: str, proof_surface: str, reason: str) -> dict:
+    rel = _safe_relative_path(cwd, path)
+    return {
+        "kind": "current_named_task_artifact",
+        "task_id": task_id,
+        "proof_surface": proof_surface,
+        "target": rel,
+        "path": rel,
+        "reason": reason,
+        "source_boundary": "current repo artifact; inspect contents before treating claimed action as proven",
+    }
+
+
+def _safe_relative_path(cwd: Path, path: Path) -> str:
+    try:
+        return path.resolve(strict=False).relative_to(cwd).as_posix()
+    except ValueError:
+        return str(path.resolve(strict=False))
+
+
+def _dedupe_action_contract_rows(rows: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict] = []
+    for row in rows:
+        key = (
+            str(row.get("kind") or ""),
+            str(row.get("target") or row.get("command") or ""),
+            str(row.get("proof_surface") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: dict) -> bool:
