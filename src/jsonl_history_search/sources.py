@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .expansion import task_slug_variants
+from .records import parse_record
 
 
 PATH_DATE_PART_RE = re.compile(r"^(\d{4})(?:[-_](\d{2})(?:[-_](\d{2}))?)?$")
 YEAR_PART_RE = re.compile(r"^\d{4}$")
 MONTH_OR_DAY_PART_RE = re.compile(r"^\d{2}$")
+LATEST_SESSION_TIMESTAMP_TAIL_BYTES = 64 * 1024
+LATEST_SESSION_TIMESTAMP_MAX_LINES = 120
 
 
 @dataclass
@@ -604,7 +607,7 @@ def resolved_path_is_inside(path: Path, root: Path) -> bool:
 
 
 def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path | None, str | None]:
-    candidates: list[tuple[float, str, Path]] = []
+    candidates: list[tuple[int, float, float, str, Path]] = []
     warning: str | None = None
     started = time.monotonic()
     visited = 0
@@ -618,12 +621,21 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
             if time.monotonic() - started > max_elapsed:
                 warning = "Stopped current-session discovery at max elapsed cap; rerun with explicit --root if the latest session is missing."
                 break
-            dirnames[:] = [name for name in sorted(dirnames) if name not in {".git", ".cache", "node_modules", "__pycache__"}]
+            dirnames[:] = [
+                name
+                for name in sorted(dirnames, reverse=True)
+                if name not in {".git", ".cache", "node_modules", "__pycache__"}
+            ]
             for filename in filenames:
                 if not filename.endswith(".jsonl"):
                     continue
                 path = Path(dirpath) / filename
-                candidates.append((stat_mtime(path), path.as_posix(), path))
+                mtime = stat_mtime(path)
+                latest_event = latest_session_event_timestamp(path)
+                rank_timestamp = latest_event.timestamp() if latest_event is not None else mtime
+                candidates.append(
+                    (1 if latest_event is not None else 0, rank_timestamp, mtime, path.as_posix(), path)
+                )
                 visited += 1
                 if visited >= max_candidates:
                     warning = "Stopped current-session discovery at metadata cap; rerun with explicit --root if the latest session is missing."
@@ -634,8 +646,42 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
             break
     if not candidates:
         return None, warning
-    _mtime, _label, path = max(candidates, key=lambda item: (item[0], item[1]))
+    _has_event_timestamp, _rank_timestamp, _mtime, _label, path = max(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    )
     return path, warning
+
+
+def latest_session_event_timestamp(path: Path) -> datetime | None:
+    tail_lines = _tail_jsonl_lines(
+        path,
+        max_bytes=LATEST_SESSION_TIMESTAMP_TAIL_BYTES,
+        max_lines=LATEST_SESSION_TIMESTAMP_MAX_LINES,
+    )
+    for line in reversed(tail_lines):
+        if not line.strip():
+            continue
+        record = parse_record(line, path=path, line=0, default_tz=timezone.utc)
+        if record.timestamp is not None:
+            return record.timestamp.astimezone(timezone.utc)
+    return None
+
+
+def _tail_jsonl_lines(path: Path, *, max_bytes: int, max_lines: int) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(size - max_bytes, 0)
+            handle.seek(offset)
+            chunk = handle.read(max_bytes)
+    except OSError:
+        return []
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+    return lines[-max_lines:]
 
 
 def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) -> list[Path]:
