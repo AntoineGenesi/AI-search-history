@@ -3756,8 +3756,16 @@ def _named_task_action_proof_handoff(
     cwd_path = Path(cwd).expanduser().resolve()
     rows: list[dict] = []
     boundaries: list[str] = []
+    include_selection_rationale = _named_task_selection_rationale_answer_wanted(
+        query=query,
+        route_family=route_family,
+    )
     for task_id in task_ids[:2]:
-        task_rows, task_boundaries = _current_named_task_action_proof_rows(cwd_path, task_id)
+        task_rows, task_boundaries = _current_named_task_action_proof_rows(
+            cwd_path,
+            task_id,
+            include_selection_rationale=include_selection_rationale,
+        )
         rows.extend(task_rows)
         boundaries.extend(task_boundaries)
     rows = _dedupe_action_contract_rows(rows)
@@ -3819,7 +3827,35 @@ def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) ->
     normalized = str(query or "").casefold()
     if route_family == "semantic_debug" and "what happened" in normalized:
         return bool(_ask_execute_named_task_ids(query))
+    if _named_task_selection_rationale_answer_wanted(query=query, route_family=route_family):
+        return True
     return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
+
+
+def _named_task_selection_rationale_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"provenance", "semantic_debug"}:
+        return False
+    if not _ask_execute_named_task_ids(query):
+        return False
+    normalized = str(query or "").casefold()
+    if "why" not in normalized and "reason" not in normalized and "rationale" not in normalized:
+        return False
+    return any(
+        phrase in normalized
+        for phrase in (
+            "get selected",
+            "got selected",
+            "was selected",
+            "were selected",
+            "selected",
+            "get chosen",
+            "got chosen",
+            "was chosen",
+            "chosen",
+            "selection rationale",
+            "selection reason",
+        )
+    )
 
 
 def _named_task_review_failure_status_answer_wanted(*, query: str, route_family: str) -> bool:
@@ -3864,12 +3900,26 @@ def _ask_execute_named_task_ids(query: str) -> list[str]:
     return task_ids
 
 
-def _current_named_task_action_proof_rows(cwd: Path, task_id: str) -> tuple[list[dict], list[str]]:
+def _current_named_task_action_proof_rows(
+    cwd: Path,
+    task_id: str,
+    *,
+    include_selection_rationale: bool = False,
+) -> tuple[list[dict], list[str]]:
     slug = task_id.lower()
     rows: list[dict] = []
     boundaries: list[str] = []
     task_paths = _matching_named_task_artifacts(cwd / "tasks", slug)
     review_paths = _matching_named_task_artifacts(cwd / "codex" / "state" / "reviews", slug)
+
+    if include_selection_rationale:
+        selection_rows, selection_boundaries = _current_named_task_selection_rationale_rows(
+            cwd,
+            task_id=task_id,
+            task_paths=task_paths,
+        )
+        rows.extend(selection_rows)
+        boundaries.extend(selection_boundaries)
 
     if task_paths:
         for path in task_paths[:2]:
@@ -3932,6 +3982,146 @@ def _current_named_task_action_proof_rows(cwd: Path, task_id: str) -> tuple[list
             boundaries.append(f"{task_id}: path-level commit metadata unavailable for {rel}")
 
     return rows, boundaries
+
+
+def _current_named_task_selection_rationale_rows(
+    cwd: Path,
+    *,
+    task_id: str,
+    task_paths: list[Path],
+) -> tuple[list[dict], list[str]]:
+    rows: list[dict] = []
+    boundaries: list[str] = []
+    if task_paths:
+        task_summary = _named_task_selection_summary_from_task_file(task_paths[0])
+        if task_summary:
+            rel = _safe_relative_path(cwd, task_paths[0])
+            rows.append(
+                {
+                    "kind": "current_named_task_selection_rationale",
+                    "task_id": task_id,
+                    "proof_surface": "task_selection_rationale",
+                    "target": rel,
+                    "path": rel,
+                    "summary": task_summary,
+                    "reason": (
+                        f"inspect current {task_id} task Context/Goal/Selection Notes "
+                        "before raw transcript diagnostics"
+                    ),
+                    "source_boundary": "current repo task selection rationale; prefer over stale/raw tool-output transcript rows",
+                }
+            )
+        else:
+            boundaries.append(f"{task_id}: task artifact did not expose Context/Goal/Selection Notes")
+    pipeline_path = cwd / "codex" / "state" / "pipeline-state.md"
+    pipeline_summary = _named_task_selection_summary_from_pipeline_state(pipeline_path, task_id=task_id)
+    if pipeline_summary:
+        rel = _safe_relative_path(cwd, pipeline_path)
+        rows.append(
+            {
+                "kind": "current_named_task_selection_rationale",
+                "task_id": task_id,
+                "proof_surface": "pipeline_selection_result",
+                "target": rel,
+                "path": rel,
+                "summary": pipeline_summary,
+                "reason": f"inspect pipeline Current {task_id} selection result before raw transcript diagnostics",
+                "source_boundary": "current pipeline selection result; prefer over stale/raw tool-output transcript rows",
+            }
+        )
+    else:
+        boundaries.append(f"{task_id}: no matching Current {task_id} selection result found in pipeline state")
+    return rows, boundaries
+
+
+def _named_task_selection_summary_from_task_file(path: Path) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    parts: list[str] = []
+    for heading in ("Context", "Goal", "Selection Notes"):
+        section = _markdown_section_lines(lines, heading=heading)
+        if not section:
+            continue
+        text = _compact_markdown_section(section, max_lines=5 if heading == "Selection Notes" else 3)
+        if text:
+            parts.append(f"{heading}: {text}")
+    return _short_join(parts, limit=900)
+
+
+def _named_task_selection_summary_from_pipeline_state(path: Path, *, task_id: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    section = _markdown_section_lines(lines, heading=f"Current {task_id} selection result")
+    if not section:
+        section = _plain_label_section_lines(lines, label=f"Current {task_id} selection result")
+    if not section:
+        return ""
+    text = _compact_markdown_section(section, max_lines=8)
+    return f"Current {task_id} selection result: {text}" if text else ""
+
+
+def _markdown_section_lines(lines: list[str], *, heading: str) -> list[str]:
+    wanted = heading.strip().casefold()
+    in_section = False
+    section_level = 0
+    section: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip().rstrip(":").casefold()
+            if in_section and level <= section_level:
+                break
+            if title == wanted:
+                in_section = True
+                section_level = level
+                continue
+        if in_section:
+            section.append(raw)
+    return section
+
+
+def _plain_label_section_lines(lines: list[str], *, label: str) -> list[str]:
+    wanted = label.strip().rstrip(":").casefold()
+    in_section = False
+    section: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        normalized = stripped.rstrip(":").casefold()
+        if not in_section and normalized == wanted:
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if re.match(r"^#{1,6}\s+", stripped):
+            break
+        if re.match(r"^(Current|Prior) JSH-\d+ .+:", stripped):
+            break
+        section.append(raw)
+    return section
+
+
+def _compact_markdown_section(lines: list[str], *, max_lines: int) -> str:
+    selected: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("```"):
+            continue
+        if re.match(r"^#{1,6}\s+", line):
+            continue
+        cleaned = line.lstrip("-* ").strip()
+        if cleaned:
+            selected.append(cleaned)
+        if len(selected) >= max_lines:
+            break
+    return _short_join(selected, limit=700)
 
 
 def _matching_named_task_artifacts(root: Path, slug: str) -> list[Path]:
@@ -5897,6 +6087,20 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
         if ref.get("kind") in {"targeted_fail_closed_boundary", "missing_role_recovery_command"}:
             opened.append({"status": "skipped", "reason": "recovery_or_fail_closed_ref", "ref": ref})
             continue
+        if ref.get("kind") == "current_named_task_selection_rationale":
+            summary = str(ref.get("summary") or "").strip()
+            opened.append(
+                {
+                    "status": "opened" if summary else "skipped",
+                    "reason": "embedded_current_selection_rationale" if summary else "empty_selection_rationale",
+                    "target": ref.get("target"),
+                    "path": ref.get("path"),
+                    "line": None,
+                    "summary": summary[:_ASK_ANSWER_MAX_FILE_CHARS],
+                    "ref": ref,
+                }
+            )
+            continue
         if ref.get("kind") == "current_named_task_commit_evidence":
             summary = " ".join(
                 part
@@ -6997,6 +7201,13 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
         else:
             other_summaries.append(summary)
     query_lower = query.lower()
+    if _named_task_selection_rationale_answer_wanted(query=query, route_family="semantic_debug"):
+        selection_answer = _compose_named_task_selection_rationale_answer(
+            task_id=task_id,
+            opened=opened,
+        )
+        if selection_answer:
+            return selection_answer
     review_failure_status_wanted = _named_task_review_failure_status_answer_wanted(
         query=query,
         route_family="provenance",
@@ -7040,6 +7251,51 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     if other_summaries:
         pieces.append(f"commit/probe proof: {_short_join(other_summaries[:1])}")
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _compose_named_task_selection_rationale_answer(*, task_id: str, opened: list[dict]) -> str | None:
+    selection_summaries: list[str] = []
+    supporting_summaries: list[str] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        if ref.get("proof_surface") in {"task_selection_rationale", "pipeline_selection_result"}:
+            selection_summaries.append(summary)
+        elif ref.get("proof_surface") == "task_file":
+            supporting_summaries.append(summary)
+    if not selection_summaries:
+        return None
+    reason_source = " ".join(selection_summaries)
+    proof_text = _short_join(selection_summaries[:3], limit=900)
+    reason = _named_task_selection_reason_clause(reason_source, task_id=task_id)
+    supporting = _short_join(supporting_summaries[:1], limit=260)
+    return (
+        f"Current selection proof for {task_id} says it was selected because {reason} "
+        f"Proof: {proof_text}"
+        + (f" Supporting task proof: {supporting}" if supporting else "")
+        + " Boundary: this answers from current task/state selection proof, not raw tool-output transcript text or an all-history claim."
+    )
+
+
+def _named_task_selection_reason_clause(proof_text: str, *, task_id: str) -> str:
+    normalized = proof_text.casefold()
+    false_positive = any(term in normalized for term in ("false-positive", "false positive", "false causal"))
+    verified = "verified" in normalized
+    failed_review_prompt_match = re.search(r"why did\s+JSH-\d+\s+fail review\?", proof_text, flags=re.IGNORECASE)
+    failed_review_prompt = failed_review_prompt_match.group(0) if failed_review_prompt_match else ""
+    if false_positive and verified and failed_review_prompt:
+        return (
+            f"fresh installed probes showed `{failed_review_prompt}` was being answered as a failed-review "
+            "causal premise even though current review proof was `VERIFIED`, not failed."
+        )
+    if false_positive and verified:
+        return (
+            "fresh installed probes found a false-positive failed-review causal answer even though current "
+            "review proof was `VERIFIED`, not failed."
+        )
+    return _short_join([proof_text], limit=420)
 
 
 def _named_task_verified_not_failed_review_answer(
