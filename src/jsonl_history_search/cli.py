@@ -3548,6 +3548,22 @@ def _answer_action_contract_from_executed_output(
             or selected_route.get("manual_search_guidance"),
             "saved_report": compact.get("report_written"),
         }
+    if _bounded_no_evidence_scoped_answer_ready(compact=compact, selected_route=selected_route):
+        return {
+            "answer_status": "answer-scoped-no-evidence-now",
+            "promotion_status": "unpromoted",
+            "promotion_reason": (
+                "Scoped no-evidence is answer-ready for the searched scope, but caps "
+                "or other promotion boundaries prevent stronger promotion or all-history absence."
+            ),
+            "promotion_scope": "not_found_in_searched_scope",
+            "scoped_no_evidence_contract": _scoped_no_evidence_contract(compact),
+            "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
+            "stop": selected_route.get("stop_guidance"),
+            "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
+            or selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written"),
+        }
     return {
         "answer_status": "not-ready/needs-more-proof",
         "promotion_status": "unpromoted",
@@ -3766,6 +3782,13 @@ def _dedupe_action_contract_rows(rows: list[dict]) -> list[dict]:
 
 
 def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: dict) -> bool:
+    if not _bounded_no_evidence_scoped_answer_ready(compact=compact, selected_route=selected_route):
+        return False
+    cap_hit = compact.get("cap_hit") if isinstance(compact.get("cap_hit"), dict) else {}
+    return cap_hit.get("hit") is False
+
+
+def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: dict) -> bool:
     if selected_route.get("route_family") != "bounded_no_evidence":
         return False
     if _positive_int(selected_route.get("explicit_source_root_count")) <= 0:
@@ -3784,7 +3807,6 @@ def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: d
         return False
     searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
     scope_counts = compact.get("scope_counts") if isinstance(compact.get("scope_counts"), dict) else {}
-    cap_hit = compact.get("cap_hit") if isinstance(compact.get("cap_hit"), dict) else {}
     searched_scope_has_work = (
         _positive_int(searched_scope.get("searched_files")) > 0
         and _positive_int(searched_scope.get("searched_bytes")) > 0
@@ -3798,7 +3820,7 @@ def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: d
         return False
     if _positive_int(scope_counts.get("missing_root_count")) != 0:
         return False
-    return cap_hit.get("hit") is False
+    return True
 
 
 def _scoped_no_evidence_contract(compact: dict) -> dict:
