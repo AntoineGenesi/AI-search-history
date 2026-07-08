@@ -3791,6 +3791,8 @@ def _ask_execute_named_task_ids(query: str) -> list[str]:
         prefix = match.group(1).upper()
         if prefix in _ASK_EXECUTE_TASK_ID_MONTH_PREFIXES:
             continue
+        if prefix != "JSH":
+            continue
         task_id = f"{prefix}-{int(match.group(2))}"
         if task_id not in task_ids:
             task_ids.append(task_id)
@@ -4146,6 +4148,84 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
 _ASK_ANSWER_MAX_REFS = 6
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
+_ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES = frozenset(
+    {"action_proof", "expectation_mismatch", "provenance", "semantic_debug"}
+)
+_ASK_ANSWER_WORK_EPISODE_SCAN_MAX_FILES = 80
+_ASK_ANSWER_WORK_EPISODE_SCAN_MAX_BYTES = 1_000_000
+_ASK_ANSWER_WORK_EPISODE_FILE_SUFFIXES = frozenset({".json", ".jsonl", ".md", ".markdown", ".diff", ".patch", ".csv"})
+_ASK_ANSWER_WORK_EPISODE_TOKEN_STOPWORDS = frozenset(
+    {
+        "about",
+        "actually",
+        "after",
+        "agent",
+        "claim",
+        "claimed",
+        "closed",
+        "does",
+        "done",
+        "did",
+        "file",
+        "fix",
+        "fixed",
+        "happen",
+        "happened",
+        "issue",
+        "only",
+        "problem",
+        "really",
+        "reviewer",
+        "task",
+        "that",
+        "the",
+        "this",
+        "what",
+        "when",
+        "where",
+        "whether",
+        "which",
+        "worker",
+    }
+)
+_ASK_ANSWER_WORK_EPISODE_PRIMARY_MARKERS = (
+    "changed ",
+    "command_output",
+    "diff --git",
+    "exit_code",
+    "file_edit",
+    "local evidence leads",
+    "pytest",
+    "test_",
+    "tool_call",
+    "with pytest.raises",
+)
+_ASK_ANSWER_MONTH_NUMBERS = {
+    "january": "01",
+    "jan": "01",
+    "february": "02",
+    "feb": "02",
+    "march": "03",
+    "mar": "03",
+    "april": "04",
+    "apr": "04",
+    "may": "05",
+    "june": "06",
+    "jun": "06",
+    "july": "07",
+    "jul": "07",
+    "august": "08",
+    "aug": "08",
+    "september": "09",
+    "sep": "09",
+    "sept": "09",
+    "october": "10",
+    "oct": "10",
+    "november": "11",
+    "nov": "11",
+    "december": "12",
+    "dec": "12",
+}
 _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "work only in this existing worktree",
     "exact finding to fix",
@@ -4229,10 +4309,29 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
             _next_proof_step_from_action(action),
         )
 
+    work_episode = _ask_answer_work_episode_handoff(
+        report=report,
+        action=action,
+        route_family=route_family,
+        cwd=cwd,
+    )
+    if work_episode:
+        answer["source_contract"]["work_episode_resolver"] = _work_episode_public_contract(work_episode)
+
     proof_refs = _collect_ask_answer_proof_refs(action)
+    if work_episode.get("primary_proof_refs"):
+        proof_refs = _dedupe_ask_answer_proof_refs(
+            list(work_episode.get("primary_proof_refs") or []) + proof_refs
+        )
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
     if not usable:
+        if work_episode and work_episode.get("status") != "not_applicable":
+            return _ask_answer_fail_closed(
+                answer,
+                "work episode resolver did not find readable primary behavior proof for the query episode",
+                _work_episode_next_proof_step(work_episode, action),
+            )
         return _ask_answer_fail_closed(
             answer,
             "answer contract did not expose readable local proof refs",
@@ -4277,6 +4376,23 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
                     ],
                 },
             )
+
+    episode_selection = _select_work_episode_opened_for_answer(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        action=action,
+        opened=answer_opened,
+        work_episode=work_episode,
+    )
+    if episode_selection.get("status") == "rejected_unrelated_episode":
+        answer["proof_summary"] = list(episode_selection.get("rejected_summaries") or [])
+        return _ask_answer_fail_closed(
+            answer,
+            "opened action-proof refs did not match the work episode implied by the query",
+            episode_selection,
+        )
+    if episode_selection.get("status") == "selected":
+        answer_opened = list(episode_selection.get("opened") or answer_opened)
 
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
@@ -4365,6 +4481,919 @@ def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_famil
     return False
 
 
+def _ask_answer_work_episode_handoff(*, report: dict, action: dict, route_family: str, cwd: Path) -> dict:
+    if route_family not in _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES:
+        return {}
+    named = (
+        action.get("named_task_action_proof_handoff")
+        if isinstance(action.get("named_task_action_proof_handoff"), dict)
+        else {}
+    )
+    if named:
+        return {}
+    query = str(report.get("query") or "")
+    hints = _work_episode_query_hints(query)
+    if not _work_episode_hints_meaningful(hints):
+        return {"schema_version": 1, "status": "not_applicable", "reason": "query_has_no_episode_anchors"}
+    roots = _ask_answer_execution_roots(report.get("execution") or {}, cwd=cwd)
+    primary_refs: list[dict] = []
+    secondary_refs: list[dict] = []
+    scan_notes: list[str] = []
+    if roots:
+        primary_refs, secondary_refs, scan_notes = _work_episode_refs_from_roots(
+            roots,
+            cwd=cwd,
+            hints=hints,
+        )
+    status = (
+        "primary_proof_refs_available"
+        if primary_refs
+        else "secondary_claim_refs_only"
+        if secondary_refs
+        else "no_matching_episode_refs"
+    )
+    return {
+        "schema_version": 1,
+        "status": status,
+        "route_family": route_family,
+        "query_episode_hints": _work_episode_public_hints(hints),
+        "roots": [_safe_relative_path(cwd, root) for root in roots],
+        "primary_proof_refs": primary_refs[:_ASK_ANSWER_MAX_REFS],
+        "secondary_claim_refs": secondary_refs[:_ASK_ANSWER_MAX_REFS],
+        "scan_notes": scan_notes[:8],
+        "source_boundaries": {
+            "primary_evidence": "raw chat/tool/file-edit, command output, diffs, tests, and commit/diff evidence",
+            "secondary_claims": "tracker status, checklist state, issue state, labels, priority, and assistant summaries",
+            "answer_rule": "answer behavior questions only from primary evidence matching the query episode",
+        },
+    }
+
+
+def _ask_answer_execution_roots(execution: dict, *, cwd: Path) -> list[Path]:
+    argv = list(execution.get("argv") or [])
+    roots: list[Path] = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--root" and index + 1 < len(argv):
+            root = Path(str(argv[index + 1])).expanduser()
+            if not root.is_absolute():
+                root = cwd / root
+            root = root.resolve(strict=False)
+            if root.exists() and root not in roots:
+                roots.append(root)
+            index += 2
+            continue
+        index += 1
+    return roots[:4]
+
+
+def _work_episode_refs_from_roots(roots: list[Path], *, cwd: Path, hints: dict) -> tuple[list[dict], list[dict], list[str]]:
+    primary: list[dict] = []
+    secondary: list[dict] = []
+    notes: list[str] = []
+    paths = _work_episode_scan_paths(roots)
+    text_by_path: dict[Path, str] = {}
+    for path in paths:
+        try:
+            text_by_path[path] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            notes.append(f"skipped {path.name}: {exc}")
+    for path, text in text_by_path.items():
+        path_primary, path_secondary = _work_episode_refs_for_path(
+            path=path,
+            text=text,
+            all_text=text_by_path,
+            cwd=cwd,
+            hints=hints,
+        )
+        primary.extend(path_primary)
+        secondary.extend(path_secondary)
+    primary = _sort_work_episode_refs(_dedupe_ask_answer_proof_refs(primary))
+    secondary = _sort_work_episode_refs(_dedupe_ask_answer_proof_refs(secondary))
+    notes.append(f"scanned {len(text_by_path)} local work-episode artifact files")
+    return primary, secondary, notes
+
+
+def _work_episode_scan_paths(roots: list[Path]) -> list[Path]:
+    paths: list[Path] = []
+    total_bytes = 0
+    for root in roots:
+        root_paths = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        for path in root_paths:
+            if len(paths) >= _ASK_ANSWER_WORK_EPISODE_SCAN_MAX_FILES:
+                return paths
+            if path.suffix.lower() not in _ASK_ANSWER_WORK_EPISODE_FILE_SUFFIXES:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if total_bytes + size > _ASK_ANSWER_WORK_EPISODE_SCAN_MAX_BYTES:
+                return paths
+            paths.append(path)
+            total_bytes += size
+    return paths
+
+
+def _work_episode_refs_for_path(
+    *,
+    path: Path,
+    text: str,
+    all_text: dict[Path, str],
+    cwd: Path,
+    hints: dict,
+) -> tuple[list[dict], list[dict]]:
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return _work_episode_jsonl_refs(path=path, text=text, cwd=cwd, hints=hints)
+    if suffix in {".diff", ".patch"}:
+        match = _work_episode_text_match(text + " " + path.as_posix(), hints)
+        if not match["accepted"]:
+            return [], []
+        return [
+            _work_episode_ref(
+                cwd,
+                path,
+                kind="work_episode_primary_evidence",
+                proof_surface="diff",
+                reason="matching work-episode diff/file-change evidence",
+                match=match,
+            )
+        ], []
+    if suffix in {".md", ".markdown"}:
+        return _work_episode_markdown_refs(path=path, text=text, cwd=cwd, hints=hints)
+    if suffix == ".json":
+        return _work_episode_json_refs(path=path, text=text, all_text=all_text, cwd=cwd, hints=hints)
+    if suffix == ".csv":
+        match = _work_episode_text_match(text + " " + path.as_posix(), hints)
+        if match["accepted"]:
+            return [], [
+                _work_episode_ref(
+                    cwd,
+                    path,
+                    kind="work_episode_secondary_claim",
+                    proof_surface="tracker_csv_status_claim",
+                    reason="matching exported tracker CSV row; status metadata is a claim until corroborated",
+                    match=match,
+                    final_support_allowed=False,
+                )
+            ]
+    return [], []
+
+
+def _work_episode_jsonl_refs(*, path: Path, text: str, cwd: Path, hints: dict) -> tuple[list[dict], list[dict]]:
+    primary: list[dict] = []
+    secondary: list[dict] = []
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            row = {}
+        row_text = _work_episode_json_row_text(row) if isinstance(row, dict) else raw
+        match = _work_episode_text_match(f"{row_text} {path.as_posix()}", hints)
+        if not match["accepted"]:
+            continue
+        kind = str(row.get("kind") or "")
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        payload_type = str(payload.get("type") or "")
+        primary_kind = kind in {"tool_call", "file_edit", "command_output"} or payload_type in {
+            "function_call",
+            "function_call_output",
+        }
+        if primary_kind:
+            primary.append(
+                _work_episode_ref(
+                    cwd,
+                    path,
+                    line=line_no,
+                    kind="work_episode_primary_evidence",
+                    proof_surface=f"raw_jsonl_{kind or payload_type}",
+                    reason="matching raw conversation/tool/file-edit work-episode evidence",
+                    match=match,
+                )
+            )
+        else:
+            secondary.append(
+                _work_episode_ref(
+                    cwd,
+                    path,
+                    line=line_no,
+                    kind="work_episode_secondary_context",
+                    proof_surface=f"raw_jsonl_{kind or payload_type or 'message'}",
+                    reason="matching user/assistant episode context; inspect primary tool/file/test evidence for behavior proof",
+                    match=match,
+                    final_support_allowed=False,
+                )
+            )
+    return primary, secondary
+
+
+def _work_episode_json_row_text(row: dict) -> str:
+    parts = [
+        str(row.get("timestamp") or row.get("ts") or ""),
+        str(row.get("session_id") or ""),
+        str(row.get("event_id") or ""),
+        str(row.get("role") or ""),
+        str(row.get("kind") or ""),
+        str(row.get("tool") or ""),
+        str(row.get("command") or ""),
+        str(row.get("path") or ""),
+        str(row.get("summary") or ""),
+        str(row.get("stdout") or ""),
+        str(row.get("text") or ""),
+        _extract_text_from_json_row(row),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _work_episode_markdown_refs(*, path: Path, text: str, cwd: Path, hints: dict) -> tuple[list[dict], list[dict]]:
+    match = _work_episode_text_match(text + " " + path.as_posix(), hints)
+    if not match["accepted"]:
+        return [], []
+    lower = text.casefold()
+    primary_capable = (
+        "checked boxes are status claims" not in lower
+        and any(marker in lower for marker in _ASK_ANSWER_WORK_EPISODE_PRIMARY_MARKERS)
+    )
+    proof_surface = (
+        "github_pr_local_evidence"
+        if "pull request" in lower or "local evidence leads" in lower
+        else "markdown_verification_or_checklist"
+        if primary_capable
+        else "markdown_status_claim"
+    )
+    if primary_capable:
+        return [
+            _work_episode_ref(
+                cwd,
+                path,
+                kind="work_episode_primary_evidence",
+                proof_surface=proof_surface,
+                reason="matching markdown work-episode evidence lead; status/checklist text remains secondary",
+                match=match,
+            )
+        ], []
+    return [], [
+        _work_episode_ref(
+            cwd,
+            path,
+            kind="work_episode_secondary_claim",
+            proof_surface=proof_surface,
+            reason="matching markdown status/checklist artifact; not behavior proof by itself",
+            match=match,
+            final_support_allowed=False,
+        )
+    ]
+
+
+def _work_episode_json_refs(
+    *,
+    path: Path,
+    text: str,
+    all_text: dict[Path, str],
+    cwd: Path,
+    hints: dict,
+) -> tuple[list[dict], list[dict]]:
+    match = _work_episode_text_match(text + " " + path.as_posix(), hints)
+    if not match["accepted"]:
+        return [], []
+    primary: list[dict] = []
+    secondary: list[dict] = []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    primary_join_allowed = _work_episode_json_primary_joins_allowed(data, hints=hints)
+    same_entity_join_ids = _work_episode_json_primary_entity_ids(data) if primary_join_allowed else []
+    if primary_join_allowed:
+        for lead in _work_episode_json_primary_leads(data):
+            primary.extend(
+                _work_episode_refs_for_lead(
+                    lead=lead,
+                    origin=path,
+                    all_text=all_text,
+                    cwd=cwd,
+                    hints=hints,
+                    parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
+                )
+            )
+        if not primary:
+            primary.extend(
+                _work_episode_refs_by_shared_handles(
+                    handles=_work_episode_json_relation_handles(data),
+                    origin=path,
+                    all_text=all_text,
+                    cwd=cwd,
+                    hints=hints,
+                    parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
+                )
+            )
+    if primary_join_allowed and not primary and _work_episode_json_is_branch_diff_episode(data):
+        diff_rel = (
+            (data.get("work_episode") or {}).get("relations", {}).get("diff")
+            if isinstance((data.get("work_episode") or {}).get("relations"), dict)
+            else None
+        )
+        if diff_rel:
+            primary.extend(
+                _work_episode_refs_for_lead(
+                    lead=str(diff_rel),
+                    origin=path,
+                    all_text=all_text,
+                    cwd=cwd,
+                    hints=hints,
+                    parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
+                )
+            )
+    secondary.append(
+        _work_episode_ref(
+            cwd,
+            path,
+            kind="work_episode_secondary_claim",
+            proof_surface=_work_episode_json_proof_surface(data),
+            reason="matching local tracker/task/episode JSON; status fields are joins or claims until primary evidence corroborates them",
+            match=match,
+            final_support_allowed=False,
+        )
+    )
+    return primary, secondary
+
+
+def _work_episode_json_primary_joins_allowed(data: dict, *, hints: dict) -> bool:
+    query_ids = set(str(value).casefold() for value in hints.get("ids") or [] if value)
+    if not query_ids:
+        return True
+    primary_ids = set(_work_episode_json_primary_entity_ids(data))
+    return bool(primary_ids and query_ids.intersection(primary_ids))
+
+
+def _work_episode_json_primary_entity_ids(data: dict) -> list[str]:
+    ids: list[str] = []
+    work_episode = data.get("work_episode") if isinstance(data.get("work_episode"), dict) else {}
+    identifiers = work_episode.get("identifiers") if isinstance(work_episode.get("identifiers"), dict) else {}
+    issue = data.get("issue") if isinstance(data.get("issue"), dict) else {}
+    pull_request = data.get("pull_request") if isinstance(data.get("pull_request"), dict) else {}
+    for value in (
+        work_episode.get("episode_id"),
+        identifiers.get("task_id"),
+        identifiers.get("issue_id"),
+        identifiers.get("identifier"),
+        issue.get("identifier"),
+    ):
+        if value not in (None, ""):
+            ids.append(str(value).casefold())
+    for value in (issue.get("number"), pull_request.get("number")):
+        if value not in (None, ""):
+            ids.append(f"#{value}".casefold())
+    return ids
+
+
+def _work_episode_json_primary_leads(data: dict) -> list[str]:
+    leads: list[str] = []
+    for value in data.get("primary_evidence_leads") or []:
+        if isinstance(value, str):
+            leads.append(value)
+    work_episode = data.get("work_episode") if isinstance(data.get("work_episode"), dict) else {}
+    for value in work_episode.get("primary_evidence_leads") or []:
+        if isinstance(value, str):
+            leads.append(value)
+    relations = work_episode.get("relations") if isinstance(work_episode.get("relations"), dict) else {}
+    if isinstance(relations.get("diff"), str):
+        leads.append(relations["diff"])
+    return leads
+
+
+def _work_episode_json_relation_handles(data: dict) -> list[str]:
+    handles: list[str] = []
+    work_episode = data.get("work_episode") if isinstance(data.get("work_episode"), dict) else {}
+    identifiers = work_episode.get("identifiers") if isinstance(work_episode.get("identifiers"), dict) else {}
+    issue = data.get("issue") if isinstance(data.get("issue"), dict) else {}
+    pull_request = data.get("pull_request") if isinstance(data.get("pull_request"), dict) else {}
+    linear_issue = data.get("issue") if isinstance(data.get("issue"), dict) else {}
+    for value in [
+        identifiers.get("branch"),
+        identifiers.get("head_commit"),
+        pull_request.get("number"),
+        (pull_request.get("head") or {}).get("ref") if isinstance(pull_request.get("head"), dict) else None,
+        (pull_request.get("head") or {}).get("sha") if isinstance(pull_request.get("head"), dict) else None,
+        issue.get("number"),
+        linear_issue.get("identifier"),
+    ]:
+        if value not in (None, ""):
+            handles.append(str(value))
+    for key in ("linkedBranches", "linkedCommits"):
+        values = linear_issue.get(key)
+        if isinstance(values, list):
+            handles.extend(str(value) for value in values if value not in (None, ""))
+    return handles
+
+
+def _work_episode_json_is_branch_diff_episode(data: dict) -> bool:
+    return str(data.get("fixture_id") or "") == "branch_commit_diff_only" or (
+        isinstance(data.get("work_episode"), dict)
+        and isinstance((data["work_episode"].get("relations") or {}), dict)
+        and bool(data["work_episode"]["relations"].get("diff"))
+    )
+
+
+def _work_episode_json_proof_surface(data: dict) -> str:
+    fixture_id = str(data.get("fixture_id") or "")
+    if fixture_id == "github_export" or "pull_request" in data:
+        return "github_issue_pr_status_claim"
+    if fixture_id == "linear_export":
+        return "linear_issue_status_claim"
+    if fixture_id == "branch_commit_diff_only":
+        return "branch_commit_metadata_claim"
+    return "local_json_status_claim"
+
+
+def _work_episode_refs_for_lead(
+    *,
+    lead: str,
+    origin: Path,
+    all_text: dict[Path, str],
+    cwd: Path,
+    hints: dict,
+    parent_match: dict,
+    same_entity_join_ids: list[str] | None = None,
+) -> list[dict]:
+    refs: list[dict] = []
+    lead_text = lead.casefold()
+    for path, text in all_text.items():
+        if path == origin:
+            continue
+        rel_from_origin = (origin.parent / lead).resolve(strict=False)
+        if path.resolve(strict=False) == rel_from_origin or path.name.casefold() in lead_text:
+            child_match = _work_episode_text_match(f"{text} {path.as_posix()} {lead}", hints)
+            match = child_match if child_match["accepted"] else parent_match
+            if _work_episode_path_primary_capable(path, text):
+                refs.append(
+                    _work_episode_ref(
+                        cwd,
+                        path,
+                        kind="work_episode_primary_evidence",
+                        proof_surface=_work_episode_path_proof_surface(path, text),
+                        reason=f"primary evidence lead from {origin.name}: {lead}",
+                        match=match,
+                        same_entity_join_ids=same_entity_join_ids,
+                    )
+                )
+    if refs:
+        return refs
+    handle = _work_episode_lead_handle(lead)
+    if not handle:
+        return refs
+    return _work_episode_refs_by_shared_handles(
+        handles=[handle],
+        origin=origin,
+        all_text=all_text,
+        cwd=cwd,
+        hints=hints,
+        parent_match=parent_match,
+        same_entity_join_ids=same_entity_join_ids,
+    )
+
+
+def _work_episode_refs_by_shared_handles(
+    *,
+    handles: list[str],
+    origin: Path,
+    all_text: dict[Path, str],
+    cwd: Path,
+    hints: dict,
+    parent_match: dict,
+    same_entity_join_ids: list[str] | None = None,
+) -> list[dict]:
+    refs: list[dict] = []
+    normalized_handles = [handle.casefold() for handle in handles if len(str(handle).strip()) >= 2]
+    if not normalized_handles:
+        return refs
+    for path, text in all_text.items():
+        if path == origin or not _work_episode_path_primary_capable(path, text):
+            continue
+        folded = f"{path.as_posix()} {text}".casefold()
+        if not any(handle in folded for handle in normalized_handles):
+            continue
+        child_match = _work_episode_text_match(folded, hints)
+        refs.append(
+            _work_episode_ref(
+                cwd,
+                path,
+                kind="work_episode_primary_evidence",
+                proof_surface=_work_episode_path_proof_surface(path, text),
+                reason=f"primary evidence joined from local artifact handles in {origin.name}",
+                match=child_match if child_match["accepted"] else parent_match,
+                same_entity_join_ids=same_entity_join_ids,
+            )
+        )
+    return refs
+
+
+def _work_episode_lead_handle(lead: str) -> str:
+    commit = re.search(r"\b[0-9a-f]{7,40}\b", lead, flags=re.IGNORECASE)
+    if commit:
+        return commit.group(0)
+    branch = re.search(r"\b[a-z0-9._-]+/[a-z0-9._/-]+\b", lead, flags=re.IGNORECASE)
+    if branch:
+        return branch.group(0)
+    test_ref = re.search(r"\btests?/[^\s`'\",]+", lead, flags=re.IGNORECASE)
+    if test_ref:
+        return test_ref.group(0)
+    return ""
+
+
+def _work_episode_path_primary_capable(path: Path, text: str) -> bool:
+    suffix = path.suffix.lower()
+    folded = text.casefold()
+    if suffix in {".diff", ".patch", ".jsonl"}:
+        return True
+    if suffix in {".md", ".markdown"}:
+        if "checked boxes are status claims" in folded:
+            return False
+        return any(marker in folded for marker in _ASK_ANSWER_WORK_EPISODE_PRIMARY_MARKERS)
+    return False
+
+
+def _work_episode_path_proof_surface(path: Path, text: str) -> str:
+    suffix = path.suffix.lower()
+    folded = text.casefold()
+    if suffix in {".diff", ".patch"}:
+        return "diff"
+    if suffix == ".jsonl":
+        return "raw_jsonl_episode"
+    if "pull request" in folded or "local evidence leads" in folded:
+        return "github_pr_local_evidence"
+    if "verification notes" in folded or "pytest" in folded:
+        return "markdown_verification_or_checklist"
+    return "local_primary_evidence"
+
+
+def _work_episode_ref(
+    cwd: Path,
+    path: Path,
+    *,
+    kind: str,
+    proof_surface: str,
+    reason: str,
+    match: dict,
+    line: int | None = None,
+    final_support_allowed: bool = True,
+    same_entity_join_ids: list[str] | None = None,
+) -> dict:
+    rel = _safe_relative_path(cwd, path)
+    target = f"{rel}:{line}" if line else rel
+    return {
+        "kind": kind,
+        "proof_surface": proof_surface,
+        "target": target,
+        "path": rel,
+        "source_ref": {"path": rel, **({"line": line} if line else {})},
+        "target_source_role": "target_historical_raw" if final_support_allowed else "target_historical_artifact",
+        "final_support_allowed": final_support_allowed,
+        "diagnostic_only": False,
+        "read_more_actionable": final_support_allowed,
+        "followthrough_actionable": True,
+        "reason": reason,
+        "work_episode_match": {
+            "accepted": match.get("accepted"),
+            "score": match.get("score"),
+            "matched_ids": match.get("matched_ids"),
+            "matched_tokens": match.get("matched_tokens"),
+            "matched_rare_tokens": match.get("matched_rare_tokens"),
+            "matched_dates": match.get("matched_dates"),
+        },
+        "work_episode_same_entity_join_ids": [
+            str(value).casefold()
+            for value in (same_entity_join_ids or [])
+            if str(value).strip()
+        ],
+        "source_boundary": (
+            "primary behavior proof for the matched work episode"
+            if final_support_allowed
+            else "secondary episode context or status claim; not final behavior proof by itself"
+        ),
+    }
+
+
+def _sort_work_episode_refs(refs: list[dict]) -> list[dict]:
+    return sorted(
+        refs,
+        key=lambda item: (
+            item.get("final_support_allowed") is not True,
+            -int((item.get("work_episode_match") or {}).get("score") or 0),
+            str(item.get("target") or ""),
+        ),
+    )
+
+
+def _work_episode_query_hints(query: str) -> dict:
+    text = query.casefold()
+    tokens = []
+    for token in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", text):
+        normalized = _work_episode_token_stem(token)
+        if normalized and normalized not in _ASK_ANSWER_WORK_EPISODE_TOKEN_STOPWORDS and normalized not in tokens:
+            tokens.append(normalized)
+    id_candidates: list[tuple[int, str]] = []
+    for pattern in (
+        r"\b[A-Z][A-Z0-9]+-\d+\b",
+        r"#\d+\b",
+        r"\bissue\s+#?(\d+)\b",
+        r"\bpr\s+#?(\d+)\b",
+    ):
+        for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+            value = match.group(0)
+            if match.lastindex:
+                value = f"#{match.group(1)}"
+            value = value.casefold()
+            id_candidates.append((match.start(), value))
+    ids = []
+    for _start, value in sorted(id_candidates, key=lambda item: (item[0], item[1])):
+        if value not in ids:
+            ids.append(value)
+    branches = []
+    for match in re.finditer(r"\b[a-z0-9._-]+/[a-z0-9._/-]+\b", text):
+        value = match.group(0)
+        if value not in branches:
+            branches.append(value)
+    commits = []
+    for match in re.finditer(r"\b[0-9a-f]{7,40}\b", text):
+        value = match.group(0)
+        if value not in commits:
+            commits.append(value)
+    dates = _work_episode_date_hints(text)
+    rare_tokens = [token for token in tokens if len(token) >= 7]
+    return {
+        "tokens": tokens[:16],
+        "rare_tokens": rare_tokens[:8],
+        "ids": ids[:8],
+        "subject_id": ids[0] if ids else None,
+        "branches": branches[:6],
+        "commits": commits[:6],
+        "dates": dates[:6],
+    }
+
+
+def _work_episode_token_stem(token: str) -> str:
+    token = token.strip("_-").casefold()
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(token) > len(suffix) + 3 and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def _work_episode_date_hints(text: str) -> list[str]:
+    dates: list[str] = []
+    for month, number in _ASK_ANSWER_MONTH_NUMBERS.items():
+        for match in re.finditer(rf"\b{re.escape(month)}\s+([0-9]{{1,2}})\b", text):
+            day = int(match.group(1))
+            if 1 <= day <= 31:
+                value = f"{number}-{day:02d}"
+                if value not in dates:
+                    dates.append(value)
+    for match in re.finditer(r"\b(20\d\d)-([01]\d)-([0-3]\d)\b", text):
+        value = f"{match.group(2)}-{match.group(3)}"
+        if value not in dates:
+            dates.append(value)
+    return dates
+
+
+def _work_episode_hints_meaningful(hints: dict) -> bool:
+    return bool(
+        hints.get("ids")
+        or hints.get("branches")
+        or hints.get("commits")
+        or hints.get("dates")
+        or len(hints.get("tokens") or []) >= 2
+    )
+
+
+def _work_episode_text_match(text: str, hints: dict) -> dict:
+    folded = text.casefold()
+    normalized = " ".join(_work_episode_token_stem(token) for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", folded))
+    matched_ids = [value for value in hints.get("ids") or [] if value in folded]
+    matched_branches = [value for value in hints.get("branches") or [] if value in folded]
+    matched_commits = [value for value in hints.get("commits") or [] if value in folded]
+    matched_dates = [value for value in hints.get("dates") or [] if value in folded]
+    matched_tokens = [
+        token
+        for token in hints.get("tokens") or []
+        if token in normalized or token.replace("_", "-") in folded
+    ]
+    matched_rare = [token for token in hints.get("rare_tokens") or [] if token in matched_tokens]
+    exact_score = 10 * (len(matched_ids) + len(matched_branches) + len(matched_commits)) + 5 * len(matched_dates)
+    score = exact_score + len(matched_tokens) + (2 * len(matched_rare))
+    has_exact = bool(matched_ids or matched_branches or matched_commits or matched_dates)
+    rare_required = bool(hints.get("rare_tokens"))
+    date_required = bool(hints.get("dates"))
+    accepted = bool(has_exact or len(matched_tokens) >= 2 or matched_rare) and (
+        not rare_required or bool(matched_rare or has_exact)
+    ) and (
+        not date_required or bool(matched_dates or matched_ids or matched_branches or matched_commits)
+    )
+    return {
+        "accepted": accepted,
+        "score": score,
+        "matched_ids": matched_ids,
+        "matched_branches": matched_branches,
+        "matched_commits": matched_commits,
+        "matched_dates": matched_dates,
+        "matched_tokens": matched_tokens[:8],
+        "matched_rare_tokens": matched_rare[:8],
+    }
+
+
+def _select_work_episode_opened_for_answer(
+    *,
+    query: str,
+    route_family: str,
+    action: dict,
+    opened: list[dict],
+    work_episode: dict,
+) -> dict:
+    if route_family not in _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES:
+        return {"status": "not_applied", "opened": opened}
+    named = (
+        action.get("named_task_action_proof_handoff")
+        if isinstance(action.get("named_task_action_proof_handoff"), dict)
+        else {}
+    )
+    if named:
+        return {"status": "not_applied", "opened": opened}
+    hints = _work_episode_query_hints(query)
+    if not _work_episode_hints_meaningful(hints):
+        return {"status": "not_applied", "opened": opened}
+    selected: list[tuple[int, dict]] = []
+    rejected: list[dict] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        explicit_id_gate = _work_episode_explicit_id_gate(item, hints)
+        if not explicit_id_gate.get("allowed"):
+            rejected.append(_ref_public_summary(item))
+            continue
+        match = ref.get("work_episode_match") if isinstance(ref.get("work_episode_match"), dict) else {}
+        accepted_by_ref = bool(
+            match.get("accepted")
+            or match.get("matched_ids")
+            or match.get("matched_tokens")
+            or match.get("matched_dates")
+        )
+        if not accepted_by_ref:
+            match = _work_episode_text_match(
+                " ".join(
+                    str(value)
+                    for value in (
+                        item.get("target"),
+                        item.get("summary"),
+                        ref.get("target"),
+                        ref.get("reason"),
+                        ref.get("proof_surface"),
+                    )
+                    if value
+                ),
+                hints,
+            )
+        if match.get("accepted") or accepted_by_ref:
+            selected.append((int(match.get("score") or 0), item))
+        else:
+            rejected.append(_ref_public_summary(item))
+    if selected:
+        selected.sort(key=lambda row: (-row[0], str(row[1].get("target") or "")))
+        return {
+            "status": "selected",
+            "opened": [item for _score, item in selected[:_ASK_ANSWER_MAX_REFS]],
+            "work_episode_status": work_episode.get("status"),
+        }
+    return {
+        "status": "rejected_unrelated_episode",
+        "required_episode_hints": _work_episode_public_hints(hints),
+        "work_episode_status": work_episode.get("status"),
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "rejected_summaries": [
+            f"{item.get('target')}: did not match query episode anchors"
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "next_required_proof": _work_episode_rejected_next_required_proof(hints),
+    }
+
+
+def _work_episode_rejected_next_required_proof(hints: dict) -> str:
+    ids = _work_episode_public_hints(hints).get("ids") or []
+    subject_id = str(hints.get("subject_id") or "")
+    if len(ids) > 1 and subject_id:
+        explicit_id_clause = (
+            f" for multiple explicit ids, the primary proof must contain or join to subject "
+            f"{subject_id}, or show a same-entity relation linking {', '.join(ids)};"
+        )
+    else:
+        explicit_id_clause = (
+            f" for explicit ids, the primary proof must contain or join to {', '.join(ids)};"
+            if ids
+            else ""
+        )
+    return (
+        "Open raw tool/file-edit/diff/test/commit evidence that matches the query episode anchors;"
+        f"{explicit_id_clause} do not answer from unrelated action-proof refs."
+    )
+
+
+def _work_episode_explicit_id_gate(item: dict, hints: dict) -> dict:
+    query_ids = {
+        str(value).casefold()
+        for value in hints.get("ids") or []
+        if str(value).strip()
+    }
+    if not query_ids:
+        return {"allowed": True, "reason": "no_explicit_query_id"}
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    join_ids = {
+        str(value).casefold()
+        for value in ref.get("work_episode_same_entity_join_ids") or []
+        if str(value).strip()
+    }
+    primary_match = _work_episode_text_match(_work_episode_opened_primary_text(item, ref), hints)
+    coverage_ids = join_ids.union(
+        str(value).casefold()
+        for value in primary_match.get("matched_ids") or []
+        if str(value).strip()
+    )
+    subject_id = str(hints.get("subject_id") or "").casefold()
+    if len(query_ids) > 1 and subject_id and subject_id not in coverage_ids:
+        return {
+            "allowed": False,
+            "reason": "primary_proof_missing_subject_query_id",
+            "required_subject_id": subject_id,
+            "required_ids": sorted(query_ids),
+        }
+    if query_ids.intersection(coverage_ids):
+        return {
+            "allowed": True,
+            "reason": "explicit_query_id_covered",
+            "matched_ids": sorted(query_ids.intersection(coverage_ids)),
+            "match": primary_match,
+        }
+    return {
+        "allowed": False,
+        "reason": "primary_proof_missing_explicit_query_id",
+        "required_ids": sorted(query_ids),
+    }
+
+
+def _work_episode_opened_primary_text(item: dict, ref: dict) -> str:
+    return " ".join(
+        str(value)
+        for value in (
+            item.get("target"),
+            item.get("summary"),
+            ref.get("target"),
+            ref.get("path"),
+            ref.get("reason"),
+            ref.get("proof_surface"),
+        )
+        if value
+    )
+
+
+def _work_episode_public_hints(hints: dict) -> dict:
+    return {
+        "ids": list(hints.get("ids") or [])[:4],
+        "subject_id": hints.get("subject_id"),
+        "branches": list(hints.get("branches") or [])[:4],
+        "commits": list(hints.get("commits") or [])[:4],
+        "dates": list(hints.get("dates") or [])[:4],
+        "tokens": list(hints.get("tokens") or [])[:8],
+        "rare_tokens": list(hints.get("rare_tokens") or [])[:4],
+    }
+
+
+def _work_episode_public_contract(work_episode: dict) -> dict:
+    return {
+        "schema_version": work_episode.get("schema_version"),
+        "status": work_episode.get("status"),
+        "query_episode_hints": work_episode.get("query_episode_hints"),
+        "roots": work_episode.get("roots"),
+        "primary_proof_ref_count": len(work_episode.get("primary_proof_refs") or []),
+        "secondary_claim_ref_count": len(work_episode.get("secondary_claim_refs") or []),
+        "source_boundaries": work_episode.get("source_boundaries"),
+        "scan_notes": work_episode.get("scan_notes"),
+    }
+
+
+def _work_episode_next_proof_step(work_episode: dict, action: dict) -> dict:
+    return {
+        "work_episode_resolver": _work_episode_public_contract(work_episode),
+        "secondary_claim_refs": list(work_episode.get("secondary_claim_refs") or [])[:3],
+        "required_next_proof": (
+            "matching raw behavior evidence: tool call/output, file edit, diff, test output, or commit evidence"
+        ),
+        "fallback_action_contract_next_step": _next_proof_step_from_action(action),
+    }
+
+
 def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
     refs: list[dict] = []
     target_handoff = action.get("target_proof_handoff") if isinstance(action.get("target_proof_handoff"), dict) else {}
@@ -4381,8 +5410,12 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
         for item in group if isinstance(group, list) else []:
             if isinstance(item, dict):
                 refs.append(item)
+    return _dedupe_ask_answer_proof_refs(refs)
+
+
+def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
     deduped: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: dict[tuple[str, str, str], dict] = {}
     for item in refs:
         key = (
             str(item.get("kind") or ""),
@@ -4390,10 +5423,30 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
             str(item.get("proof_surface") or ""),
         )
         if key in seen:
+            _merge_work_episode_ref_metadata(seen[key], item)
             continue
-        seen.add(key)
+        seen[key] = item
         deduped.append(item)
     return deduped[:_ASK_ANSWER_MAX_REFS]
+
+
+def _merge_work_episode_ref_metadata(existing: dict, incoming: dict) -> None:
+    existing_join_ids = [
+        str(value).casefold()
+        for value in existing.get("work_episode_same_entity_join_ids") or []
+        if str(value).strip()
+    ]
+    for value in incoming.get("work_episode_same_entity_join_ids") or []:
+        normalized = str(value).casefold()
+        if normalized.strip() and normalized not in existing_join_ids:
+            existing_join_ids.append(normalized)
+    if existing_join_ids:
+        existing["work_episode_same_entity_join_ids"] = existing_join_ids
+
+    existing_match = existing.get("work_episode_match") if isinstance(existing.get("work_episode_match"), dict) else {}
+    incoming_match = incoming.get("work_episode_match") if isinstance(incoming.get("work_episode_match"), dict) else {}
+    if int(incoming_match.get("score") or 0) > int(existing_match.get("score") or 0):
+        existing["work_episode_match"] = incoming_match
 
 
 def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
