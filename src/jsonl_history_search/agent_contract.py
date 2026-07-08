@@ -122,7 +122,10 @@ def build_agent_find_payload(
         expansion_action_context=expansion_action_context,
         include_context_actions=compact_provenance_handoff,
     )
-    if no_evidence_report.get("candidate_interpretation") == "weak_context_only":
+    if no_evidence_report.get("candidate_interpretation") in {
+        "weak_context_only",
+        "claim_boundary_non_support",
+    }:
         next_read_rows = suppress_weak_context_next_reads(
             next_read_rows,
             no_evidence_report=no_evidence_report,
@@ -3142,7 +3145,8 @@ def build_source_locator_handoff(
     candidate_count = len(candidate_rows) or sum(len(group.get("matches", [])) for group in search_result.get("groups", []))
     weak_context_no_evidence = (
         isinstance(no_evidence_report, dict)
-        and no_evidence_report.get("candidate_interpretation") == "weak_context_only"
+        and no_evidence_report.get("candidate_interpretation")
+        in {"weak_context_only", "claim_boundary_non_support"}
     )
     next_read_rows = list(next_reads) if next_reads is not None else []
     if next_reads is None:
@@ -3335,6 +3339,9 @@ def source_locator_no_evidence_meaning(no_evidence_report: dict[str, Any] | None
                 "Weak/context candidates may exist, but the no-evidence report says the target evidence "
                 "was not found in the searched scope."
                 if report.get("candidate_interpretation") == "weak_context_only"
+                else "Candidates may exist, but they are query echoes or claim-boundary/non-goal material; "
+                "the stronger asked claim is not supported in the searched scope."
+                if report.get("candidate_interpretation") == "claim_boundary_non_support"
                 else "No match survived selected roots, caps, filters, and parser scope."
             ),
             "candidate_interpretation": report.get("candidate_interpretation"),
@@ -6330,6 +6337,14 @@ def build_no_evidence_report(
         )
         if weak_context_report:
             return weak_context_report
+        claim_boundary_report = build_claim_boundary_no_evidence_report(
+            source_plan=source_plan,
+            source_scope=source_scope,
+            search_result=search_result,
+            candidates=list(candidates or []),
+        )
+        if claim_boundary_report:
+            return claim_boundary_report
     if status != "no_evidence":
         return {
             "needed": False,
@@ -6381,6 +6396,16 @@ def build_weak_context_no_evidence_report(
     coverage = no_evidence_query_term_coverage(source_plan, candidates)
     if coverage["classification"] != "weak_context_only":
         return None
+    query = source_plan.get("query", {}) if isinstance(source_plan.get("query"), dict) else {}
+    query_text = query_text_from_plan(query)
+    missing_terms = set(coverage.get("missing_terms_any_candidate") or [])
+    if query_asks_for_searched_scope_evidence(query_text) and missing_terms <= {
+        "evidence",
+        "searched",
+        "scope",
+        "searched-scope",
+    }:
+        return None
     scope_clean = searched_scope_clean_for_scoped_no_evidence(source_scope)
     return {
         "needed": True,
@@ -6418,6 +6443,73 @@ def build_weak_context_no_evidence_report(
             "This supports only a searched-scope no-evidence answer for those missing terms; it does "
             "not prove all-history absence or absence from unsearched, excluded, missing, or "
             "budget-deferred locations."
+        ),
+    }
+
+
+def build_claim_boundary_no_evidence_report(
+    *,
+    source_plan: dict,
+    source_scope: dict,
+    search_result: dict,
+    candidates: list[CandidateRow],
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    query = source_plan.get("query", {}) if isinstance(source_plan.get("query"), dict) else {}
+    query_text = query_text_from_plan(query)
+    if not query_asks_for_searched_scope_evidence(query_text):
+        return None
+    coverage = no_evidence_query_term_coverage(source_plan, candidates)
+    if coverage["classification"] != "candidates_cover_query_terms" and not missing_only_scope_scaffold_terms(coverage):
+        return None
+    if any(candidate_likely_supports_stronger_claim(candidate) for candidate in candidates):
+        return None
+    boundary_rows = [
+        row
+        for row in (claim_boundary_candidate(candidate, query_text) for candidate in candidates)
+        if row is not None
+    ]
+    if not boundary_rows:
+        return None
+    scope_clean = searched_scope_clean_for_scoped_no_evidence(source_scope)
+    return {
+        "needed": True,
+        "answer": "claim_not_supported_by_searched_scope",
+        "answer_scope": "not_found_in_searched_scope",
+        "candidate_interpretation": "claim_boundary_non_support",
+        "searched_scope": source_scope["searched_scope"],
+        "excluded_scope": source_scope["excluded_scope"]["rejected_roots"],
+        "excluded_scope_summary": source_scope["excluded_scope"],
+        "not_searched_scope": source_scope["not_searched_scope"],
+        "selected_roots": source_scope["selected_roots"],
+        "private_roots": source_scope["private_roots"],
+        "cap_hit": source_scope["cap_hit"],
+        "deferred_source_count": source_scope["not_searched_scope"]["source_plan"]["sources_deferred_budget"],
+        "retry_guidance": source_scope["not_searched_scope"]["source_plan"]["retry_guidance"],
+        "not_all_history_absence": True,
+        "candidate_rows_found": len(candidates),
+        "weak_candidate_count": len(candidates),
+        "weak_candidates": weak_context_candidates(candidates),
+        "claim_boundary_candidates": boundary_rows[:INLINE_CANDIDATE_LIMIT],
+        "query_term_coverage": coverage,
+        "sufficient_to_stop_for_searched_scope_only": scope_clean,
+        "read_more_guidance": {
+            "required_before_scoped_no_evidence_answer": False,
+            "actionability": "optional_diagnostic_context",
+            "reason": (
+                "Surfaced candidates are query echoes or explicit claim-boundary/non-goal material. "
+                "They do not support the stronger asked claim, so they are optional diagnostics after "
+                "a searched-scope no-support answer."
+            ),
+        },
+        "warnings": search_result.get("warnings", []),
+        "blind_spots": search_result.get("blind_spots", []),
+        "why_not_confident": (
+            "Candidate rows were found, but the surfaced rows were query echoes or explicit claim "
+            "boundaries rather than support for the stronger claim. This supports only a searched-scope "
+            "no-support answer; it does not prove all-history absence or absence from unsearched, "
+            "excluded, missing, or budget-deferred locations."
         ),
     }
 
@@ -6485,6 +6577,111 @@ def best_candidate_coverage(candidates: list[CandidateRow], base_terms: set[str]
 
 def normalize_term_for_coverage(term: Any) -> str:
     return str(term or "").strip().lower()
+
+
+def query_asks_for_searched_scope_evidence(query_text: str) -> bool:
+    lowered = normalize_for_claim_boundary(query_text)
+    return (
+        "evidence" in lowered
+        and ("searched scope" in lowered or "searched-scope" in lowered)
+        and any(token in lowered for token in ("did ", "does ", "that ", "whether ", "is there"))
+    )
+
+
+def query_text_from_plan(query: dict[str, Any]) -> str:
+    return str(
+        query.get("text")
+        or query.get("raw")
+        or query.get("query")
+        or query.get("original")
+        or query.get("normalized")
+        or ""
+    )
+
+
+def missing_only_scope_scaffold_terms(coverage: dict[str, Any]) -> bool:
+    missing_terms = set(coverage.get("missing_terms_any_candidate") or [])
+    return bool(missing_terms) and missing_terms <= {
+        "evidence",
+        "searched",
+        "scope",
+        "searched-scope",
+    }
+
+
+def claim_boundary_candidate(candidate: CandidateRow, query_text: str) -> dict[str, Any] | None:
+    text = normalize_for_claim_boundary(" ".join([candidate.snippet, " ".join(candidate.reasons)]))
+    reasons: list[str] = []
+    if exact_question_echo(text, query_text):
+        reasons.append("query_or_task_setup_echo")
+    if explicit_boundary_non_support(text):
+        reasons.append("explicit_claim_boundary_or_non_goal")
+    if not reasons:
+        return None
+    return {
+        "candidate_id": candidate.candidate_id,
+        "source_ref": candidate.source_ref,
+        "score": candidate.score,
+        "confidence": candidate.confidence,
+        "matched_terms": candidate.matched_terms,
+        "reason_codes": candidate.reason_codes,
+        "boundary_reasons": reasons,
+    }
+
+
+def exact_question_echo(candidate_text: str, query_text: str) -> bool:
+    query = normalize_for_claim_boundary(query_text)
+    if query and query in candidate_text:
+        return True
+    return "is there evidence" in candidate_text and (
+        "searched scope" in candidate_text or "searched-scope" in candidate_text
+    )
+
+
+def explicit_boundary_non_support(candidate_text: str) -> bool:
+    false_boundary = any(
+        marker in candidate_text
+        for marker in (
+            "ranking or cap changed false",
+            "ranking or cap changed\": false",
+            "ranking or cap changed': false",
+        )
+    )
+    ranking_non_goal = (
+        ("no broad" in candidate_text or "not a" in candidate_text or "does not claim" in candidate_text)
+        and any(token in candidate_text for token in ("ranking", "root-selection", "source-window"))
+    )
+    all_history_non_claim = (
+        any(token in candidate_text for token in ("all-history", "all history"))
+        and any(token in candidate_text for token in ("no ", "not ", "does not claim", "claim was verified"))
+    )
+    narrow_answer_readiness = (
+        any(token in candidate_text for token in ("answer/readiness", "answer readiness", "answer-after-source-inspection"))
+        and any(token in candidate_text for token in ("ranking", "all-history", "all history"))
+    )
+    return false_boundary or ranking_non_goal or all_history_non_claim or narrow_answer_readiness
+
+
+def candidate_likely_supports_stronger_claim(candidate: CandidateRow) -> bool:
+    text = normalize_for_claim_boundary(" ".join([candidate.snippet, " ".join(candidate.reasons)]))
+    if exact_question_echo(text, ""):
+        return False
+    if explicit_boundary_non_support(text):
+        return False
+    positive_markers = (
+        "fixed all-history semantic ranking",
+        "fixed all history semantic ranking",
+        "changed all-history semantic ranking",
+        "changed all history semantic ranking",
+        "ranking or cap changed true",
+        "ranking or cap changed\": true",
+        "ranking or cap changed': true",
+    )
+    return any(marker in text for marker in positive_markers)
+
+
+def normalize_for_claim_boundary(value: str) -> str:
+    return " ".join(str(value or "").replace("_", " ").lower().split())
 
 
 def searched_scope_clean_for_scoped_no_evidence(source_scope: dict[str, Any]) -> bool:

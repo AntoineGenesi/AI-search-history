@@ -3910,11 +3910,12 @@ def _promotable_bounded_no_evidence_contract(*, compact: dict, selected_route: d
 def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: dict) -> bool:
     if selected_route.get("route_family") != "bounded_no_evidence":
         return False
-    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0:
-        return False
-    if compact.get("status") != "no_evidence":
-        return False
     no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+    claim_boundary_non_support = no_evidence.get("candidate_interpretation") == "claim_boundary_non_support"
+    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0 and not claim_boundary_non_support:
+        return False
+    if compact.get("status") != "no_evidence" and no_evidence.get("needed") is not True:
+        return False
     if no_evidence.get("answer_scope") != "not_found_in_searched_scope":
         return False
     if no_evidence.get("not_all_history_absence") is not True:
@@ -3960,6 +3961,7 @@ def _scoped_no_evidence_contract(compact: dict) -> dict:
         "cap_hit": cap_hit.get("hit"),
         "caps_hit": cap_hit.get("caps_hit", []),
         "not_all_history_absence": no_evidence.get("not_all_history_absence"),
+        "candidate_interpretation": no_evidence.get("candidate_interpretation"),
         "read_more_required_before_scoped_no_evidence_answer": read_more_policy.get(
             "required_before_scoped_no_evidence_answer"
         ),
