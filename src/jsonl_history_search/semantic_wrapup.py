@@ -37,6 +37,7 @@ ROLLING_WINDOW_ERROR_INLINE_LIMIT = 30
 USER_MESSAGE_FIRST_INLINE_LIMIT = 20
 USER_MESSAGE_CONTEXT_PRE_RECORDS = 2
 USER_MESSAGE_CONTEXT_POST_RECORDS = 2
+CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW = 800
 BEHAVIOR_RULE_FILENAMES = {"AGENTS.md", "CLAUDE.md"}
 IGNORED_BEHAVIOR_DISCOVERY_DIRS = {
     ".cache",
@@ -570,20 +571,25 @@ def build_semantic_wrapup_payload(
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
+    selected_substantive_signals = _current_session_recent_substantive_signals(
+        plan,
+        substantive_signals,
+        signals,
+    )
     user_message_first_evidence = _user_message_first_evidence(records, signals)
     factual_context = _factual_launch_context(records, signals)
     skill_check_recommendation = _skill_check_recommendation(query, signals)
     rolling_window_coverage = _rolling_window_coverage(
         records,
         signals,
-        substantive_signals,
+        selected_substantive_signals,
         setup_echo_signals,
         scan_warnings=scan["warnings"],
     )
     ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
     explicit_root_setup_echo_scope = _explicit_root_setup_echo_only_scope(plan, signals, query)
     fail_closed_scope = ambiguous_prompt_only_scope or explicit_root_setup_echo_scope
-    all_failure_modes = [] if fail_closed_scope else _failure_modes(substantive_signals)
+    all_failure_modes = [] if fail_closed_scope else _failure_modes(selected_substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
     orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
     current_session_source_selection = _current_session_source_selection(cwd, query)
@@ -629,6 +635,7 @@ def build_semantic_wrapup_payload(
                 "assistant_tool_runtime_error_count": rolling_window_coverage["assistant_tool_runtime_error_count"],
                 "cap_changed_conclusion": rolling_window_coverage["cap_accounting"]["cap_changed_conclusion"],
                 "substantive_signal_count": len(substantive_signals),
+                "selected_substantive_signal_count": len(selected_substantive_signals),
                 "setup_echo_signal_count": len(setup_echo_signals),
                 "failure_mode_count": len(failure_modes),
                 "failure_mode_returned_count": len(failure_modes),
@@ -657,10 +664,18 @@ def build_semantic_wrapup_payload(
             "failure_modes": failure_modes,
             "signal_classification": {
                 "substantive_signal_count": len(substantive_signals),
+                "selected_substantive_signal_count": len(selected_substantive_signals),
                 "setup_echo_signal_count": len(setup_echo_signals),
                 "substantive_source_refs": [signal["source_ref"] for signal in substantive_signals[:8]],
+                "selected_substantive_source_refs": [signal["source_ref"] for signal in selected_substantive_signals[:8]],
                 "setup_echo_source_refs": [signal["source_ref"] for signal in setup_echo_signals[:8]],
                 "failure_modes_exclude_setup_echoes": True,
+                "latest_session_recent_signal_filter": _latest_session_recent_signal_filter_summary(
+                    plan,
+                    substantive_signals,
+                    selected_substantive_signals,
+                    signals,
+                ),
             },
             "user_message_first_evidence": user_message_first_evidence,
             "factual_context": factual_context,
@@ -1874,6 +1889,59 @@ def _substantive_signals(signals: list[dict]) -> list[dict]:
     return [signal for signal in signals if signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS]
 
 
+def _current_session_recent_substantive_signals(
+    plan: SourcePlan,
+    substantive_signals: list[dict],
+    all_signals: list[dict],
+) -> list[dict]:
+    if plan.scope_resolution.get("status") != "scoped_to_latest_known_session":
+        return substantive_signals
+    if not substantive_signals:
+        return substantive_signals
+    max_line = _max_signal_line(all_signals)
+    if max_line <= 0:
+        return substantive_signals
+    cutoff = max(1, max_line - CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW)
+    recent = [
+        signal
+        for signal in substantive_signals
+        if _source_ref_line(signal.get("source_ref") or {}) >= cutoff
+    ]
+    return recent or substantive_signals
+
+
+def _latest_session_recent_signal_filter_summary(
+    plan: SourcePlan,
+    substantive_signals: list[dict],
+    selected_substantive_signals: list[dict],
+    all_signals: list[dict],
+) -> dict:
+    active = plan.scope_resolution.get("status") == "scoped_to_latest_known_session"
+    max_line = _max_signal_line(all_signals)
+    cutoff = max(1, max_line - CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW) if max_line > 0 else None
+    return {
+        "active": active,
+        "line_window": CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW if active else None,
+        "max_signal_line": max_line if active else None,
+        "cutoff_line": cutoff if active else None,
+        "total_substantive_signal_count": len(substantive_signals),
+        "selected_substantive_signal_count": len(selected_substantive_signals),
+        "stale_substantive_signal_count": max(0, len(substantive_signals) - len(selected_substantive_signals)),
+        "fallback_to_all_substantive": active and bool(substantive_signals) and selected_substantive_signals == substantive_signals,
+    }
+
+
+def _max_signal_line(signals: list[dict]) -> int:
+    return max((_source_ref_line(signal.get("source_ref") or {}) for signal in signals), default=0)
+
+
+def _source_ref_line(ref: dict) -> int:
+    try:
+        return int(ref.get("line") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _orchestration_evidence(records, *, signals: list[dict], query: str) -> dict:
     signal_by_ref = {
         (signal["source_ref"]["path"], int(signal["source_ref"]["line"])): signal
@@ -2202,6 +2270,8 @@ def _semantic_next_reads(
         seen.add(key)
 
     orchestration_items = (orchestration_evidence or {}).get("items") or []
+    failure_mode_refs = next_read_refs(*[mode.get("evidence", []) for mode in failure_modes])
+    orchestration_refs = next_read_refs(orchestration_items)
     evidence_refs = next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items)
 
     def add_current_session_sources() -> None:
@@ -2231,11 +2301,20 @@ def _semantic_next_reads(
                 )
 
     if failure_modes:
-        for ref in evidence_refs:
+        for ref in failure_mode_refs:
             add(
                 ref,
                 "Inspect complaint/correction evidence before applying suggested fix.",
                 read_role=READ_ROLE_REQUIRED_PRIMARY_PROOF,
+            )
+        for ref in orchestration_refs:
+            add(
+                ref,
+                "Adjacent orchestration evidence; open only if direct complaint/correction proof leaves a named chronology or actor gap.",
+                read_role=READ_ROLE_OPTIONAL_DIAGNOSTIC,
+                diagnostic_open_policy=(
+                    "Do not use adjacent orchestration evidence as default required proof when direct failure-mode refs exist."
+                ),
             )
         add_current_session_sources()
     elif prefer_setup_signal_refs:
