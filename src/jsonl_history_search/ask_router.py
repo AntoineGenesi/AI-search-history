@@ -701,11 +701,11 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_parent_main_status_anchor_failure_query(normalized):
         return ROUTES[5]
 
-    if _looks_like_latest_status_anchor_query(normalized):
-        return ROUTES[5]
-
     if _looks_like_expectation_mismatch_query(normalized):
         return EXPECTATION_MISMATCH_ROUTE
+
+    if _looks_like_latest_status_anchor_query(normalized):
+        return ROUTES[5]
 
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
