@@ -3450,12 +3450,23 @@ def _answer_action_contract_from_executed_output(
             compact=compact,
             route_family=route_family,
         )
+        prefer_named_task_answer = _named_task_clean_answer_surface_wanted(
+            query=query,
+            route_family=route_family,
+        )
         named_task_action_proof = _named_task_action_proof_handoff(
             query=query,
             cwd=cwd,
             route_family=route_family,
             target_proof_available=bool(target_proof_handoff),
+            allow_current_proof_with_target=prefer_named_task_answer,
         )
+        if (
+            target_proof_handoff
+            and prefer_named_task_answer
+            and named_task_action_proof.get("status") == "current_named_task_proof_refs_missing"
+        ):
+            named_task_action_proof = {}
         route_first_reads = (
             orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
@@ -3733,10 +3744,11 @@ def _named_task_action_proof_handoff(
     cwd: str,
     route_family: str,
     target_proof_available: bool = False,
+    allow_current_proof_with_target: bool = False,
 ) -> dict:
     if route_family not in _ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES:
         return {}
-    if route_family != "action_proof" and target_proof_available:
+    if route_family != "action_proof" and target_proof_available and not allow_current_proof_with_target:
         return {}
     task_ids = _ask_execute_named_task_ids(query)
     if not task_ids:
@@ -3801,6 +3813,15 @@ def _named_task_action_proof_handoff(
         ],
         "missing_current_proof_boundaries": boundaries,
     }
+
+
+def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) -> bool:
+    if route_family != "semantic_debug":
+        return False
+    normalized = str(query or "").casefold()
+    if "what happened" not in normalized:
+        return False
+    return bool(_ask_execute_named_task_ids(query))
 
 
 def _ask_execute_named_task_ids(query: str) -> list[str]:
@@ -5506,6 +5527,10 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
         if isinstance(action.get("named_task_action_proof_handoff"), dict)
         else {}
     )
+    if named_handoff.get("status") == "current_named_task_proof_refs_available":
+        return _dedupe_ask_answer_proof_refs(
+            [item for item in named_handoff.get("read") or [] if isinstance(item, dict)]
+        )
     for group in (
         target_handoff.get("required_primary_proof"),
         named_handoff.get("read"),
