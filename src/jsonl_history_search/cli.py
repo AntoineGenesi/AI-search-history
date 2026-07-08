@@ -4159,7 +4159,7 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "observed answer:",
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
-    r"\byou are the\b.{0,120}\b(implementer|reviewer|worker|coordinator)\b",
+    r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
