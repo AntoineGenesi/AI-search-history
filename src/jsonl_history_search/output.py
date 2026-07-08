@@ -3025,6 +3025,7 @@ def render_status_anchor_text(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    clarification = report.get("clarification_request") or {}
     answer_readiness = report.get("answer_readiness") or {}
     parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
@@ -3036,6 +3037,10 @@ def render_status_anchor_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
         "Evidence contract: raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
     ]
+    if clarification.get("request"):
+        lines.append(f"Clarification request: {clarification.get('request')}")
+        if clarification.get("candidate_refs_policy"):
+            lines.append(f"Clarification boundary: {clarification.get('candidate_refs_policy')}")
     if fail_closed.get("guidance"):
         lines.append(
             "Fail-closed guidance: "
@@ -3218,6 +3223,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     instruction = report.get("agent_instruction") or {}
     session_activity = report.get("session_activity") or {}
     fail_closed = report.get("fail_closed_guidance") or {}
+    clarification = report.get("clarification_request") or {}
     answer_readiness = report.get("answer_readiness") or {}
     parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
@@ -3231,14 +3237,27 @@ def render_status_anchor_markdown(payload: dict) -> str:
         "**Evidence contract:** raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
         "",
     ]
+    if clarification.get("request"):
+        lines.extend(
+            [
+                "## Clarification Request",
+                "",
+                f"- {clarification.get('request')}",
+            ]
+        )
+        if clarification.get("candidate_refs_policy"):
+            lines.append(f"- Boundary: {clarification.get('candidate_refs_policy')}")
+        lines.append("")
     if fail_closed.get("guidance"):
-        lines[6:6] = [
-            "## Fail-Closed Guidance",
-            "",
-            f"- {fail_closed.get('guidance')}",
-            f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
-            "",
-        ]
+        lines.extend(
+            [
+                "## Fail-Closed Guidance",
+                "",
+                f"- {fail_closed.get('guidance')}",
+                f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
+                "",
+            ]
+        )
     if answer_readiness:
         lines.extend(
             [

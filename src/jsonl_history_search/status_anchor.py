@@ -371,6 +371,18 @@ def status_anchor_report(
         blockers=unresolved_blockers,
         answer_allowed=answer_readiness["answer_allowed"],
     )
+    fail_closed_guidance = _fail_closed_guidance(
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+        session_activity=session_activity,
+        answer_readiness=answer_readiness,
+    )
+    clarification_request = _clarification_request(
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+        answer_readiness=answer_readiness,
+        fail_closed_guidance=fail_closed_guidance,
+    )
     suppressed_support = _suppressed_answer_facing_support(
         cwd,
         target_window=target_window,
@@ -472,12 +484,8 @@ def status_anchor_report(
         "canonical_parent_main_status_interval": canonical_parent_main_interval,
         "canonical_parent_main_fallback": canonical_parent_main_fallback,
         "suppressed_support": suppressed_support,
-        "fail_closed_guidance": _fail_closed_guidance(
-            selected_anchor=selected_anchor,
-            anchor_decision=anchor_decision,
-            session_activity=session_activity,
-            answer_readiness=answer_readiness,
-        ),
+        "clarification_request": clarification_request,
+        "fail_closed_guidance": fail_closed_guidance,
         "agent_instruction": _agent_instruction(selected_anchor, session_activity, next_reads),
         "work_products": {
             "tasks": artifacts["tasks"],
@@ -4407,6 +4415,40 @@ def _fail_closed_guidance(
         "raw_session_trace_status": raw_status,
         "required_answer_facets": answer_readiness.get("required_answer_facets") or [],
         "missing_required_answer_facets": [],
+    }
+
+
+def _clarification_request(
+    *,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    answer_readiness: dict,
+    fail_closed_guidance: dict,
+) -> dict | None:
+    if selected_anchor or answer_readiness.get("answer_allowed") is not False:
+        return None
+    if anchor_decision.get("anchor_scope") != "parent_thread":
+        return None
+    if not fail_closed_guidance.get("parent_main_recovery_required"):
+        return None
+    return {
+        "status": "needs_user_anchor_clarification",
+        "answer_allowed": False,
+        "selected_anchor": None,
+        "request": (
+            "I cannot safely identify the parent/main anchor. Please provide a quoted instruction/message, "
+            "an exact timestamp, or a thread/session boundary to use as the anchor."
+        ),
+        "accepted_anchor_forms": [
+            "quoted_instruction_or_message",
+            "exact_timestamp",
+            "thread_or_session_boundary",
+        ],
+        "reason": "multiple or unproven parent/main candidates were found and no canonical selected_anchor is available",
+        "candidate_refs_policy": (
+            "Recovery/read-more refs are verification/rerun-only; do not use them as answer support."
+        ),
+        "rerun_instruction": "Rerun what-happened-since with the provided timestamp or quoted message before answering.",
     }
 
 
