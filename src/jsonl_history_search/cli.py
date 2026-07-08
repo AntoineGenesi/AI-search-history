@@ -4215,6 +4215,11 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
     }
 )
 _ASK_ANSWER_MAX_REFS = 6
+_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS = (
+    "expected_behavior_evidence",
+    "observed_behavior_or_action_proof",
+    "divergence_evidence",
+)
 _ASK_ANSWER_REMEMBERED_USER_RECOVERY_MAX_REFS = 16
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
@@ -4523,6 +4528,20 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
     if episode_selection.get("status") == "selected":
         answer_opened = list(episode_selection.get("opened") or answer_opened)
 
+    if route_family == "expectation_mismatch":
+        expectation_gate = _expectation_mismatch_answer_proof_gate(action=action, opened=answer_opened)
+        answer["source_contract"]["expectation_mismatch_answer_gate"] = _expectation_mismatch_gate_public_contract(
+            expectation_gate
+        )
+        if expectation_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(expectation_gate.get("rejected_summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "expectation-mismatch proof facets missing or only diagnostic/tool-output/task-doc evidence was opened",
+                expectation_gate,
+            )
+        answer_opened = list(expectation_gate.get("opened") or answer_opened)
+
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
 
@@ -4560,11 +4579,89 @@ def _ask_answer_fail_closed(answer: dict, reason: str, next_step: object) -> dic
 def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> dict | None:
     route = answer.get("selected_route") if isinstance(answer.get("selected_route"), dict) else {}
     route_family = str(route.get("route_family") or "")
+    if route_family == "expectation_mismatch":
+        return _expectation_mismatch_source_role_explanation(next_step)
     if route_family == "remembered_user_wording":
         return _remembered_user_wording_source_role_explanation(next_step)
     if route_family == "latest_status":
         return _latest_status_source_role_explanation(next_step)
     return None
+
+
+def _expectation_mismatch_source_role_explanation(next_step: object) -> dict | None:
+    if isinstance(next_step, list):
+        planned_roles = _unique_preserving_order(
+            [
+                str(item.get("expectation_mismatch_role") or "")
+                for item in next_step
+                if isinstance(item, dict) and str(item.get("expectation_mismatch_role") or "")
+            ]
+        )
+        missing = [
+            facet
+            for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+            if facet not in planned_roles
+        ]
+        summary = (
+            "Expectation-mismatch answer stayed fail-closed because the route exposed role reads but "
+            "ask --answer did not have opened clean final proof for every required facet."
+        )
+        return {
+            "schema_version": 1,
+            "kind": "expectation_mismatch_source_inspection_required",
+            "summary": summary,
+            "summary_lines": [
+                summary,
+                "Open the expectation_mismatch_plan reads for expected_behavior_evidence, observed_behavior_or_action_proof, and divergence_evidence before composing a causal answer.",
+                "Treat tool-output, docs/task artifacts, diagnostic/post-hoc refs, and same-loop echoes as leads, not final facet proof.",
+            ],
+            "required_facets": list(_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS),
+            "planned_facets": planned_roles,
+            "missing_planned_facets": missing,
+            "required_final_proof": (
+                "Opened clean actionable refs for expected behavior, observed/action proof, and divergence."
+            ),
+        }
+    if not isinstance(next_step, dict) or next_step.get("status") not in {
+        "missing_required_facets",
+        "no_clean_required_facet_refs",
+    }:
+        return None
+    missing = [
+        str(item)
+        for item in next_step.get("missing_facets") or []
+        if str(item) in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+    ]
+    rejected_roles = [
+        str(item)
+        for item in next_step.get("rejected_source_roles") or []
+        if str(item).strip()
+    ]
+    summary = (
+        "Opened expectation-mismatch refs did not cover clean expected/observed/divergence proof facets"
+        + (f"; missing {', '.join(missing)}" if missing else "")
+        + (f"; rejected source roles included {', '.join(rejected_roles)}" if rejected_roles else "")
+        + "."
+    )
+    return {
+        "schema_version": 1,
+        "kind": "expectation_mismatch_missing_facets",
+        "summary": summary,
+        "summary_lines": [
+            f"Expectation-mismatch proof gap: missing clean facets {', '.join(missing) if missing else '(unknown)'}."
+            if missing
+            else "Expectation-mismatch proof gap: opened refs did not provide clean required facets.",
+            "Why not final proof: tool-output, docs/task artifacts, diagnostic/post-hoc refs, and non-final support can be useful leads, but they do not prove the expected behavior, observed/action evidence, and divergence for the same episode.",
+            "Needed proof: open clean actionable refs for expected_behavior_evidence, observed_behavior_or_action_proof, and divergence_evidence before returning a causal answer.",
+        ],
+        "required_facets": list(_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS),
+        "covered_facets": list(next_step.get("covered_facets") or []),
+        "missing_facets": missing,
+        "rejected_source_roles": _unique_preserving_order(rejected_roles),
+        "rejected_ref_count": int(next_step.get("rejected_ref_count") or 0),
+        "rejected_evidence": list(next_step.get("rejected_refs") or [])[:_ASK_ANSWER_MAX_REFS],
+        "required_final_proof": next_step.get("required_next_proof"),
+    }
 
 
 def _remembered_user_wording_source_role_explanation(next_step: object) -> dict | None:
@@ -5964,6 +6061,266 @@ def _extract_text_from_json_row(row: dict) -> str:
     return ""
 
 
+def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict]) -> dict:
+    plan = action.get("expectation_mismatch_plan") if isinstance(action.get("expectation_mismatch_plan"), dict) else {}
+    clean_by_facet: dict[str, list[dict]] = {
+        facet: [] for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+    }
+    rejected: list[dict] = []
+    rejected_lines: list[str] = []
+
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        roles = _expectation_mismatch_opened_roles(item, plan=plan)
+        source = _expectation_mismatch_opened_source_role(item)
+        clean_allowed = source["clean_final_support"]
+        applicable_roles = [
+            role for role in roles if role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+        ]
+        if clean_allowed and applicable_roles:
+            annotated = dict(item)
+            annotated["expectation_mismatch_answer_roles"] = applicable_roles
+            for role in applicable_roles:
+                clean_by_facet[role].append(annotated)
+            continue
+        if applicable_roles or not clean_allowed:
+            public = _ref_public_summary(item)
+            public["expectation_mismatch_roles"] = applicable_roles
+            public["rejected_source_role"] = source["source_role"]
+            public["rejection_reasons"] = source["reasons"]
+            rejected.append(public)
+            rejected_lines.append(
+                f"{item.get('target')}: rejected_source_role={source['source_role']}; "
+                f"roles={','.join(applicable_roles) if applicable_roles else '(none)'}"
+            )
+
+    covered = [
+        facet
+        for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+        if clean_by_facet.get(facet)
+    ]
+    missing = [
+        facet
+        for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+        if facet not in covered
+    ]
+    if not missing:
+        selected: list[dict] = []
+        for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS:
+            for item in clean_by_facet[facet]:
+                if not any(_opened_ref_same_target(item, existing) for existing in selected):
+                    selected.append(item)
+                    break
+        for item in opened:
+            if len(selected) >= _ASK_ANSWER_MAX_REFS:
+                break
+            source = _expectation_mismatch_opened_source_role(item)
+            if source["clean_final_support"] and not any(_opened_ref_same_target(item, existing) for existing in selected):
+                selected.append(item)
+        return {
+            "schema_version": 1,
+            "status": "answer_allowed",
+            "required_facets": list(_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS),
+            "covered_facets": covered,
+            "missing_facets": [],
+            "opened": selected[:_ASK_ANSWER_MAX_REFS],
+            "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+            "rejected_source_roles": _unique_preserving_order(
+                str(item.get("rejected_source_role") or "") for item in rejected
+            ),
+            "plan_status": plan.get("status"),
+            "plan_counts": plan.get("counts"),
+        }
+
+    return {
+        "schema_version": 1,
+        "status": "missing_required_facets" if covered else "no_clean_required_facet_refs",
+        "required_facets": list(_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS),
+        "covered_facets": covered,
+        "missing_facets": missing,
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "rejected_ref_count": len(rejected),
+        "rejected_source_roles": _unique_preserving_order(
+            str(item.get("rejected_source_role") or "") for item in rejected
+        ),
+        "rejected_summary_lines": rejected_lines[:_ASK_ANSWER_MAX_REFS],
+        "required_next_proof": (
+            "Open clean actionable expectation-mismatch proof for expected_behavior_evidence, "
+            "observed_behavior_or_action_proof, and divergence_evidence. Treat tool-output, docs/tasks, "
+            "diagnostics, and post-hoc artifacts as leads only until a facet remains explicitly missing."
+        ),
+        "suggested_action": (
+            "Use the existing expectation_mismatch_plan role buckets, but inspect raw user/assistant/action "
+            "conversation rows or other primary behavior proof for each missing facet before composing a final answer."
+        ),
+        "plan_status": plan.get("status"),
+        "plan_counts": plan.get("counts"),
+    }
+
+
+def _expectation_mismatch_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "required_facets": gate.get("required_facets"),
+        "covered_facets": gate.get("covered_facets"),
+        "missing_facets": gate.get("missing_facets"),
+        "rejected_ref_count": gate.get("rejected_ref_count", len(gate.get("rejected_refs") or [])),
+        "rejected_source_roles": gate.get("rejected_source_roles"),
+        "plan_status": gate.get("plan_status"),
+        "plan_counts": gate.get("plan_counts"),
+    }
+
+
+def _expectation_mismatch_opened_roles(item: dict, *, plan: dict) -> list[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    roles: list[str] = []
+    role = str(ref.get("expectation_mismatch_role") or "")
+    if role:
+        roles.append(role)
+    for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS:
+        for planned in plan.get(facet) or []:
+            if isinstance(planned, dict) and _expectation_mismatch_refs_same_source(ref, planned):
+                roles.append(facet)
+                break
+    return [
+        role
+        for role in _unique_preserving_order(roles)
+        if role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+    ]
+
+
+def _expectation_mismatch_refs_same_source(left: dict, right: dict) -> bool:
+    left_source = left.get("source_ref") if isinstance(left.get("source_ref"), dict) else {}
+    right_source = right.get("source_ref") if isinstance(right.get("source_ref"), dict) else {}
+    left_target = str(left.get("target") or left.get("openable_target") or "")
+    right_target = str(right.get("target") or right.get("openable_target") or "")
+    left_line = _positive_int(left_source.get("line")) or _line_from_target(left_target)
+    right_line = _positive_int(right_source.get("line")) or _line_from_target(right_target)
+    if left_line and right_line and left_line != right_line:
+        return False
+    left_paths = _expectation_mismatch_ref_paths(left)
+    right_paths = _expectation_mismatch_ref_paths(right)
+    for left_path in left_paths:
+        for right_path in right_paths:
+            if _path_strings_same_or_suffix(left_path, right_path):
+                return True
+    return bool(left_target and right_target and _path_strings_same_or_suffix(left_target, right_target))
+
+
+def _expectation_mismatch_ref_paths(ref: dict) -> list[str]:
+    paths: list[str] = []
+    source = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    openable = ref.get("openable_source_ref") if isinstance(ref.get("openable_source_ref"), dict) else {}
+    for value in (
+        source.get("path"),
+        openable.get("path"),
+        ref.get("path"),
+        ref.get("openable_target"),
+        ref.get("target"),
+    ):
+        if not value:
+            continue
+        target, _line = _split_ref_target(str(value))
+        paths.append(target)
+    return _unique_preserving_order(paths)
+
+
+def _path_strings_same_or_suffix(left: str, right: str) -> bool:
+    left_norm = str(left or "").replace("\\", "/").casefold().strip()
+    right_norm = str(right or "").replace("\\", "/").casefold().strip()
+    if not left_norm or not right_norm:
+        return False
+    return (
+        left_norm == right_norm
+        or left_norm.endswith(f"/{right_norm}")
+        or right_norm.endswith(f"/{left_norm}")
+    )
+
+
+def _line_from_target(target: str) -> int | None:
+    if not target:
+        return None
+    _path, line = _split_ref_target(target)
+    return line
+
+
+def _expectation_mismatch_opened_source_role(item: dict) -> dict:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    summary = str(item.get("summary") or "")
+    reasons: list[str] = []
+    if ref.get("diagnostic_only") is True or ref.get("read_more_actionable") is False:
+        reasons.append("diagnostic_or_non_actionable")
+    if ref.get("followthrough_actionable") is False:
+        reasons.append("not_followthrough_actionable")
+    if str(ref.get("target_source_role") or "") == "diagnostic_or_post_hoc":
+        reasons.append("target_source_role_diagnostic_or_post_hoc")
+    if ref.get("final_support_allowed") is False:
+        reasons.append("final_support_not_allowed")
+    payload_type = str(metadata.get("payload_type") or "")
+    if payload_type == "function_call_output" or summary.casefold().startswith("tool output:") or ": tool output:" in summary.casefold():
+        reasons.append("tool_output")
+    path_role = _expectation_mismatch_path_source_role(
+        str(item.get("target") or ""),
+        str(item.get("path") or ""),
+        ref,
+    )
+    if path_role:
+        reasons.append(path_role)
+    if reasons:
+        source_role = _expectation_mismatch_rejection_source_role(reasons)
+        return {"clean_final_support": False, "source_role": source_role, "reasons": _unique_preserving_order(reasons)}
+    return {"clean_final_support": True, "source_role": "clean_actionable_primary", "reasons": []}
+
+
+def _expectation_mismatch_path_source_role(target: str, path: str, ref: dict) -> str | None:
+    values = [target, path]
+    source = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    values.extend(
+        str(value or "")
+        for value in (
+            source.get("path"),
+            ref.get("path"),
+            ref.get("target"),
+            ref.get("openable_target"),
+        )
+    )
+    for value in values:
+        normalized = str(value or "").replace("\\", "/").casefold()
+        if not normalized:
+            continue
+        if "/tasks/" in normalized or normalized.startswith("tasks/"):
+            return "task_artifact"
+        if "/docs/" in normalized or normalized.startswith("docs/"):
+            return "docs_artifact"
+    return None
+
+
+def _expectation_mismatch_rejection_source_role(reasons: list[str]) -> str:
+    priority = (
+        "tool_output",
+        "task_artifact",
+        "docs_artifact",
+        "target_source_role_diagnostic_or_post_hoc",
+        "diagnostic_or_non_actionable",
+        "not_followthrough_actionable",
+        "final_support_not_allowed",
+    )
+    for reason in priority:
+        if reason in reasons:
+            return reason
+    return reasons[0] if reasons else "unknown_rejected_source"
+
+
+def _opened_ref_same_target(left: dict, right: dict) -> bool:
+    return str(left.get("target") or "") == str(right.get("target") or "") or _expectation_mismatch_refs_same_source(
+        left.get("ref") if isinstance(left.get("ref"), dict) else {},
+        right.get("ref") if isinstance(right.get("ref"), dict) else {},
+    )
+
+
 def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
     try:
         row = json.loads(raw)
@@ -6252,6 +6609,8 @@ def _ref_public_summary(item: dict) -> dict:
         "source_tier": ref.get("source_tier"),
         "source_role_label": ref.get("source_role_label"),
         "timestamp_utc": ref.get("timestamp_utc"),
+        "expectation_mismatch_role": ref.get("expectation_mismatch_role"),
+        "expectation_mismatch_inferred_role": ref.get("expectation_mismatch_inferred_role"),
     }
     metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     if metadata:
@@ -6285,9 +6644,38 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_latest_status_answer(query=query, action=action, opened=opened)
     if route_family == "semantic_wrapup":
         return _compose_semantic_wrapup_corrections_answer(query=query, action=action, opened=opened)
-    if route_family in {"action_proof", "expectation_mismatch", "orchestration_provenance", "provenance", "semantic_debug"}:
+    if route_family == "expectation_mismatch":
+        return _compose_expectation_mismatch_answer(opened=opened)
+    if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_expectation_mismatch_answer(*, opened: list[dict]) -> str | None:
+    by_role: dict[str, list[str]] = {
+        role: [] for role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+    }
+    for item in opened:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        roles = [
+            str(role)
+            for role in item.get("expectation_mismatch_answer_roles") or []
+            if str(role) in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+        ]
+        for role in roles:
+            by_role[role].append(summary)
+    if any(not by_role[role] for role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS):
+        return None
+    pieces = []
+    for role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS:
+        pieces.append(f"{role}: {_short_join(by_role[role][:2], limit=360)}")
+    return (
+        "The opened expectation-mismatch proof refs cover expected_behavior_evidence, "
+        "observed_behavior_or_action_proof, and divergence_evidence: "
+        + " ".join(pieces)
+    )
 
 
 def _compose_latest_status_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
