@@ -4344,6 +4344,7 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
             "proof_summary": [],
             "fail_closed_reason": None,
             "next_proof_step": None,
+            "source_role_explanation": None,
             "source_contract": {
                 "built_from": "ask_execute.answer_action_contract",
                 "answer_action_status": action.get("answer_status"),
@@ -4546,7 +4547,184 @@ def _ask_answer_fail_closed(answer: dict, reason: str, next_step: object) -> dic
     answer["answer_status"] = "cannot-answer-directly-yet"
     answer["fail_closed_reason"] = reason
     answer["next_proof_step"] = next_step
+    explanation = _ask_answer_source_role_explanation(answer=answer, next_step=next_step)
+    if explanation:
+        answer["source_role_explanation"] = explanation
+        summary_lines = list(explanation.get("summary_lines") or [])
+        if summary_lines:
+            existing = list(answer.get("proof_summary") or [])
+            answer["proof_summary"] = (existing + summary_lines)[:_ASK_ANSWER_MAX_REFS]
     return {"ask_answer": answer}
+
+
+def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> dict | None:
+    route = answer.get("selected_route") if isinstance(answer.get("selected_route"), dict) else {}
+    route_family = str(route.get("route_family") or "")
+    if route_family == "remembered_user_wording":
+        return _remembered_user_wording_source_role_explanation(next_step)
+    if route_family == "latest_status":
+        return _latest_status_source_role_explanation(next_step)
+    return None
+
+
+def _remembered_user_wording_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict):
+        return None
+    refs = [item for item in next_step.get("rejected_user_prompt_echo_refs") or [] if isinstance(item, dict)]
+    if not refs:
+        return None
+    evidence = []
+    role_labels = []
+    for ref in refs[:_ASK_ANSWER_MAX_REFS]:
+        label = _prompt_echo_source_role_label(ref.get("prompt_echo_reasons") or [])
+        role_labels.append(label)
+        evidence.append(
+            {
+                "target": ref.get("target"),
+                "source_ref": ref.get("source_ref"),
+                "timestamp_utc": ref.get("timestamp_utc"),
+                "source_role": label,
+                "prompt_echo_reasons": ref.get("prompt_echo_reasons") or [],
+            }
+        )
+    summary = (
+        f"Found {len(refs)} user-role/session row(s) containing the target wording, but the useful rejected "
+        "evidence is prompt scaffolding, not clean proof that contributor said the wording."
+    )
+    return {
+        "schema_version": 1,
+        "kind": "remembered_user_wording_rejected_prompt_echo",
+        "summary": summary,
+        "summary_lines": [
+            f"Rejected source-role evidence: {summary}",
+            "Why not final proof: worker/reviewer/task/test prompt scaffolding can quote a phrase for assignment, review, or testing; it does not establish contributor authored the original remembered wording.",
+            "Needed proof: a clean contributor-authored user message row that states the target wording directly and is not an assignment/review/task/test echo.",
+        ],
+        "rejected_source_roles": _unique_preserving_order(role_labels),
+        "rejected_ref_count": len(refs),
+        "rejected_evidence": evidence,
+        "why_not_final_proof": (
+            "These rows are real workflow data, but their role is assignment/review/task/test scaffolding "
+            "or current-query echo, so they cannot answer a remembered-user wording question as final proof."
+        ),
+        "required_final_proof": (
+            "Clean contributor-authored user message row with the target wording, not a worker/reviewer assignment, "
+            "task note, review fixture, test fixture, or current ask echo."
+        ),
+    }
+
+
+def _prompt_echo_source_role_label(reasons: object) -> str:
+    reason_text = " ".join(str(reason).casefold() for reason in reasons if reason)
+    labels = []
+    if "assignment_or_review_scaffolding" in reason_text:
+        labels.append("worker/reviewer assignment or review scaffolding")
+    if "task note:" in reason_text:
+        labels.append("task-note scaffolding")
+    if "review fixture" in reason_text:
+        labels.append("review fixture scaffolding")
+    if "test fixture" in reason_text:
+        labels.append("test fixture scaffolding")
+    if "contains_current_ask_query_text" in reason_text:
+        labels.append("current ask/query echo")
+    return ", ".join(_unique_preserving_order(labels)) if labels else "prompt echo scaffolding"
+
+
+def _latest_status_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict):
+        return None
+    choices = [item for item in next_step.get("anchor_choices") or [] if isinstance(item, dict)]
+    if not choices:
+        return None
+    evidence = []
+    rejected_or_diagnostic_count = 0
+    clean_parent_main_candidates = 0
+    for choice in choices[:_ASK_ANSWER_MAX_REFS]:
+        source_role = _latest_status_anchor_choice_source_role(choice)
+        decision = str(choice.get("decision") or choice.get("confidence") or "")
+        classification = str(choice.get("classification") or "")
+        if decision in {"rejected", "diagnostic_rejected", "ambiguous"} or classification in {
+            "worker_or_reviewer_prompt",
+            "non_human_boundary_or_tool_context",
+            "admin_or_status_turn",
+            "post_status_context",
+        }:
+            rejected_or_diagnostic_count += 1
+        if (
+            str(choice.get("source_scope") or "") == "canonical_parent_main_history"
+            and classification in {"substantive_work_anchor", "ordinary_human_turn", "short_human_turn"}
+        ):
+            clean_parent_main_candidates += 1
+        evidence.append(
+            {
+                "wording": choice.get("wording"),
+                "timestamp_utc": choice.get("timestamp_utc"),
+                "source_ref": choice.get("source_ref"),
+                "openable_target": choice.get("openable_target"),
+                "source_role": source_role,
+                "classification": choice.get("classification"),
+                "decision": choice.get("decision"),
+                "source_scope": choice.get("source_scope"),
+                "ambiguity_label": choice.get("ambiguity_label"),
+            }
+        )
+    clean_status = (
+        "ambiguous_clean_parent_main_candidates_found"
+        if clean_parent_main_candidates
+        else "no_clean_parent_main_anchor_proven"
+    )
+    summary = (
+        "Found candidate latest-status anchors, but the output has not proven one clean parent/main "
+        "user instruction as contributor's last real instruction."
+    )
+    return {
+        "schema_version": 1,
+        "kind": "latest_status_rejected_or_ambiguous_anchor_candidates",
+        "summary": summary,
+        "summary_lines": [
+            f"Rejected/ambiguous anchor evidence: {summary}",
+            "Why not final proof: worker/reviewer/control prompt candidates are real workflow activity or control prompts, but they are not contributor's last real instruction.",
+            f"Clean parent/main anchor status: {clean_status}.",
+            "Needed proof: select or provide one clean parent/main user instruction by quoted message, exact timestamp, or thread/session boundary before answering what happened since it.",
+        ],
+        "candidate_count": len(choices),
+        "rejected_or_diagnostic_candidate_count": rejected_or_diagnostic_count,
+        "clean_parent_main_anchor_status": clean_status,
+        "anchor_candidates": evidence,
+        "why_not_final_proof": (
+            "Rejected diagnostic/control candidates can describe real workflow activity after an anchor, "
+            "but latest-status answers need a proven clean user anchor before summarizing work since it."
+        ),
+        "required_final_proof": (
+            "One clean parent/main contributor-authored instruction, identified by quoted message, exact timestamp, "
+            "or thread/session boundary."
+        ),
+    }
+
+
+def _latest_status_anchor_choice_source_role(choice: dict) -> str:
+    classification = str(choice.get("classification") or "")
+    source_scope = str(choice.get("source_scope") or "")
+    ambiguity = str(choice.get("ambiguity_label") or "")
+    if classification == "worker_or_reviewer_prompt" or "worker_or_reviewer" in ambiguity:
+        return "worker/reviewer control prompt"
+    if classification in {"non_human_boundary_or_tool_context", "admin_or_status_turn", "post_status_context"}:
+        return "workflow/control prompt or boundary context"
+    if source_scope == "canonical_parent_main_history":
+        return "canonical parent/main user-anchor candidate"
+    if source_scope == "session_only_unproven_parent_main_candidate":
+        return "session-only unproven user-anchor candidate"
+    return "ambiguous latest-status anchor candidate"
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique = []
+    for value in values:
+        if value and value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
 
 
 def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
@@ -6272,6 +6450,10 @@ def _latest_status_anchor_choices(action: dict) -> list[dict]:
                 "source_ref": item.get("source_ref"),
                 "openable_target": item.get("openable_target"),
                 "confidence": item.get("confidence") or item.get("decision") or item.get("source_role_label"),
+                "decision": item.get("decision"),
+                "classification": item.get("classification"),
+                "source_scope": item.get("source_scope"),
+                "ambiguity_label": item.get("ambiguity_label"),
             }
         )
         if len(choices) >= 3:
