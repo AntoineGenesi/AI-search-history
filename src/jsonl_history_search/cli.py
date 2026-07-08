@@ -3418,14 +3418,15 @@ def _answer_action_contract_from_executed_output(
         )
         route_family = str(selected_route.get("route_family") or "")
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
+        target_proof_handoff = _semantic_debug_target_proof_handoff(
+            compact=compact,
+            route_family=route_family,
+        )
         named_task_action_proof = _named_task_action_proof_handoff(
             query=query,
             cwd=cwd,
             route_family=route_family,
-        )
-        target_proof_handoff = _semantic_debug_target_proof_handoff(
-            compact=compact,
-            route_family=route_family,
+            target_proof_available=bool(target_proof_handoff),
         )
         route_first_reads = (
             orchestration_reads
@@ -3693,8 +3694,21 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str) ->
     }
 
 
-def _named_task_action_proof_handoff(*, query: str, cwd: str, route_family: str) -> dict:
-    if route_family != "action_proof":
+_ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES = frozenset(
+    {"action_proof", "semantic_debug", "provenance"}
+)
+
+
+def _named_task_action_proof_handoff(
+    *,
+    query: str,
+    cwd: str,
+    route_family: str,
+    target_proof_available: bool = False,
+) -> dict:
+    if route_family not in _ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES:
+        return {}
+    if route_family != "action_proof" and target_proof_available:
         return {}
     task_ids = _ask_execute_named_task_ids(query)
     if not task_ids:
