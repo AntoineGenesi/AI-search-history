@@ -4765,29 +4765,31 @@ def _work_episode_json_refs(
         data = {}
     if not isinstance(data, dict):
         data = {}
-    for lead in _work_episode_json_primary_leads(data):
-        primary.extend(
-            _work_episode_refs_for_lead(
-                lead=lead,
-                origin=path,
-                all_text=all_text,
-                cwd=cwd,
-                hints=hints,
-                parent_match=match,
+    primary_join_allowed = _work_episode_json_primary_joins_allowed(data, hints=hints)
+    if primary_join_allowed:
+        for lead in _work_episode_json_primary_leads(data):
+            primary.extend(
+                _work_episode_refs_for_lead(
+                    lead=lead,
+                    origin=path,
+                    all_text=all_text,
+                    cwd=cwd,
+                    hints=hints,
+                    parent_match=match,
+                )
             )
-        )
-    if not primary:
-        primary.extend(
-            _work_episode_refs_by_shared_handles(
-                handles=_work_episode_json_relation_handles(data),
-                origin=path,
-                all_text=all_text,
-                cwd=cwd,
-                hints=hints,
-                parent_match=match,
+        if not primary:
+            primary.extend(
+                _work_episode_refs_by_shared_handles(
+                    handles=_work_episode_json_relation_handles(data),
+                    origin=path,
+                    all_text=all_text,
+                    cwd=cwd,
+                    hints=hints,
+                    parent_match=match,
+                )
             )
-        )
-    if not primary and _work_episode_json_is_branch_diff_episode(data):
+    if primary_join_allowed and not primary and _work_episode_json_is_branch_diff_episode(data):
         diff_rel = (
             (data.get("work_episode") or {}).get("relations", {}).get("diff")
             if isinstance((data.get("work_episode") or {}).get("relations"), dict)
@@ -4816,6 +4818,35 @@ def _work_episode_json_refs(
         )
     )
     return primary, secondary
+
+
+def _work_episode_json_primary_joins_allowed(data: dict, *, hints: dict) -> bool:
+    query_ids = set(str(value).casefold() for value in hints.get("ids") or [] if value)
+    if not query_ids:
+        return True
+    primary_ids = set(_work_episode_json_primary_entity_ids(data))
+    return bool(primary_ids and query_ids.intersection(primary_ids))
+
+
+def _work_episode_json_primary_entity_ids(data: dict) -> list[str]:
+    ids: list[str] = []
+    work_episode = data.get("work_episode") if isinstance(data.get("work_episode"), dict) else {}
+    identifiers = work_episode.get("identifiers") if isinstance(work_episode.get("identifiers"), dict) else {}
+    issue = data.get("issue") if isinstance(data.get("issue"), dict) else {}
+    pull_request = data.get("pull_request") if isinstance(data.get("pull_request"), dict) else {}
+    for value in (
+        work_episode.get("episode_id"),
+        identifiers.get("task_id"),
+        identifiers.get("issue_id"),
+        identifiers.get("identifier"),
+        issue.get("identifier"),
+    ):
+        if value not in (None, ""):
+            ids.append(str(value).casefold())
+    for value in (issue.get("number"), pull_request.get("number")):
+        if value not in (None, ""):
+            ids.append(f"#{value}".casefold())
+    return ids
 
 
 def _work_episode_json_primary_leads(data: dict) -> list[str]:
@@ -5165,7 +5196,7 @@ def _select_work_episode_opened_for_answer(
     opened: list[dict],
     work_episode: dict,
 ) -> dict:
-    if route_family != "action_proof":
+    if route_family not in _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES:
         return {"status": "not_applied", "opened": opened}
     named = (
         action.get("named_task_action_proof_handoff")
