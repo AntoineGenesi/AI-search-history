@@ -3327,10 +3327,12 @@ def _answer_action_contract_from_executed_output(
     cwd: str = ".",
 ) -> dict:
     if output_key == "status_anchor":
+        source_tiers = compact.get("source_tiers") or {}
+        answer_readiness = compact.get("answer_readiness") or {}
         return {
             "answer_status": (
                 "status-package-ready-after-required-reads"
-                if (compact.get("answer_readiness") or {}).get("answer_allowed")
+                if answer_readiness.get("answer_allowed")
                 else "not-ready/needs-more-proof"
             ),
             "promotion_status": compact.get("status"),
@@ -3338,9 +3340,25 @@ def _answer_action_contract_from_executed_output(
                 "The latest-status route is executable, but receiving agents should inspect "
                 "required primary raw JSONL reads before turning the packet into a factual status answer."
             ),
-            "read": (compact.get("follow_through_plan") or {}).get("open_first") or compact.get("next_reads", [])[:4],
+            "read": (source_tiers.get("required_primary") or [])
+            or (compact.get("follow_through_plan") or {}).get("open_first")
+            or compact.get("next_reads", [])[:4],
             "then_confirm": (compact.get("follow_through_plan") or {}).get("then_confirm") or [],
             "diagnostics_after": (compact.get("follow_through_plan") or {}).get("do_not_open_by_default") or [],
+            "selected_anchor": compact.get("selected_anchor"),
+            "answer_readiness": answer_readiness,
+            "answer_brief": compact.get("answer_brief"),
+            "session_activity": compact.get("session_activity"),
+            "work_products": {
+                "commits": ((compact.get("work_products") or {}).get("commits") or [])[:6],
+            },
+            "source_tiers": {
+                "required_primary": (source_tiers.get("required_primary") or [])[:6],
+                "required_secondary": (source_tiers.get("required_secondary") or [])[:6],
+            },
+            "clarification_request": compact.get("clarification_request"),
+            "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
+            "follow_through_plan": compact.get("follow_through_plan"),
             "evidence_modes": (compact.get("evidence_contract") or {}).get("source_modes"),
             "source_role_labels": (compact.get("evidence_contract") or {}).get("source_role_labels"),
             "stop": (compact.get("follow_through_plan") or {}).get("stop_condition")
@@ -4009,9 +4027,16 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "source_mode_order": (compact.get("source_tiers") or {}).get("source_mode_order"),
                 "source_role_labels": (compact.get("source_tiers") or {}).get("source_role_labels"),
             },
+            "answer_brief": compact.get("answer_brief"),
+            "session_activity": compact.get("session_activity"),
+            "work_products": {
+                "commits": ((compact.get("work_products") or {}).get("commits") or [])[:6],
+            },
+            "clarification_request": compact.get("clarification_request"),
             "follow_through_plan": compact.get("follow_through_plan"),
             "evidence_contract": compact.get("evidence_contract"),
             "fail_closed_guidance": compact.get("fail_closed_guidance"),
+            "report_written": compact.get("report_written"),
         }
     if output_key == "coordinator_context":
         return {
@@ -4136,6 +4161,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "remembered_user_wording",
         "semantic_wrapup",
         "semantic_debug",
+        "latest_status",
     }
 )
 _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
@@ -4459,6 +4485,24 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
 
 
 def _next_proof_step_from_action(action: dict) -> object:
+    clarification = action.get("clarification_request")
+    shortlist = action.get("parent_main_anchor_shortlist")
+    if clarification or shortlist:
+        choices = _latest_status_anchor_choices(action)
+        return {
+            "clarification_request": clarification,
+            "anchor_choices": choices,
+            "accepted_anchor_forms": (
+                clarification.get("accepted_anchor_forms")
+                if isinstance(clarification, dict)
+                else ["quoted_instruction_or_message", "exact_timestamp", "thread_or_session_boundary"]
+            ),
+            "rerun_instruction": (
+                clarification.get("rerun_instruction")
+                if isinstance(clarification, dict)
+                else "Rerun what-happened-since with one selected anchor before answering."
+            ),
+        }
     reads = action.get("read")
     if reads:
         return reads
@@ -5419,12 +5463,20 @@ def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
     seen: dict[tuple[str, str, str], dict] = {}
     for item in refs:
         source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        source_ref_text = item.get("source_ref") if isinstance(item.get("source_ref"), str) else ""
         source_target = ""
         if source_ref:
             source_target = f"{source_ref.get('path') or ''}:{source_ref.get('line') or ''}"
         key = (
             str(item.get("kind") or ""),
-            str(item.get("target") or item.get("path") or item.get("command") or source_target),
+            str(
+                item.get("target")
+                or item.get("openable_target")
+                or item.get("path")
+                or item.get("command")
+                or source_target
+                or source_ref_text
+            ),
             str(item.get("proof_surface") or ""),
         )
         if key in seen:
@@ -5482,8 +5534,22 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
             )
             continue
         source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
-        target = str(source_ref.get("path") or ref.get("path") or ref.get("target") or "")
+        openable_source_ref = (
+            ref.get("openable_source_ref") if isinstance(ref.get("openable_source_ref"), dict) else {}
+        )
+        target = str(
+            source_ref.get("path")
+            or openable_source_ref.get("path")
+            or ref.get("path")
+            or ref.get("openable_target")
+            or ref.get("target")
+            or ""
+        )
+        if not target and isinstance(ref.get("source_ref"), str):
+            target = _target_from_canonical_status_source_ref(str(ref.get("source_ref")))
         line = _positive_int(source_ref.get("line")) or None
+        if not line:
+            line = _positive_int(openable_source_ref.get("line")) or None
         if not line and target:
             target, line = _split_ref_target(target)
         if not target:
@@ -5504,6 +5570,15 @@ def _split_ref_target(target: str) -> tuple[str, int | None]:
     if not match:
         return target, None
     return match.group(1), int(match.group(2))
+
+
+def _target_from_canonical_status_source_ref(source_ref: str) -> str:
+    match = re.match(r"^(?:codex_history|codex_sessions):(.+?)(?::(\d+))?$", source_ref)
+    if not match:
+        return ""
+    path = match.group(1)
+    line = match.group(2)
+    return f"{path}:{line}" if line else path
 
 
 def _read_ask_answer_ref(*, path: Path, line: int | None, ref: dict, cwd: Path) -> dict:
@@ -5761,12 +5836,18 @@ def _looks_like_markdown_proof_summary_line(line: str) -> bool:
 
 def _ref_public_summary(item: dict) -> dict:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref")
     summary = {
         "target": item.get("target"),
         "kind": ref.get("kind"),
         "proof_surface": ref.get("proof_surface"),
         "target_source_role": ref.get("target_source_role"),
         "reason": ref.get("reason"),
+        "source_ref": source_ref,
+        "openable_target": ref.get("openable_target"),
+        "source_tier": ref.get("source_tier"),
+        "source_role_label": ref.get("source_role_label"),
+        "timestamp_utc": ref.get("timestamp_utc"),
     }
     metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     if metadata:
@@ -5796,11 +5877,180 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_named_task_answer(query=query, named=named, opened=opened)
     if route_family == "remembered_user_wording":
         return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
+    if route_family == "latest_status":
+        return _compose_latest_status_answer(query=query, action=action, opened=opened)
     if route_family == "semantic_wrapup":
         return _compose_semantic_wrapup_corrections_answer(query=query, action=action, opened=opened)
     if route_family in {"action_proof", "expectation_mismatch", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_latest_status_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
+    selected_anchor = action.get("selected_anchor") if isinstance(action.get("selected_anchor"), dict) else {}
+    readiness = action.get("answer_readiness") if isinstance(action.get("answer_readiness"), dict) else {}
+    if not selected_anchor or readiness.get("answer_allowed") is not True:
+        return None
+    anchor_text = str(selected_anchor.get("snippet") or selected_anchor.get("text") or "").strip()
+    anchor_time = str(selected_anchor.get("timestamp_utc") or selected_anchor.get("local_timestamp") or "").strip()
+    anchor_ref = str(selected_anchor.get("source_ref") or selected_anchor.get("openable_target") or "").strip()
+    confidence = str(
+        selected_anchor.get("confidence")
+        or selected_anchor.get("decision")
+        or selected_anchor.get("classification")
+        or readiness.get("status")
+        or ""
+    ).strip()
+    boundary = str(
+        selected_anchor.get("anchor_scope")
+        or selected_anchor.get("context_boundary")
+        or (action.get("selected_route") or {}).get("route_family")
+        or "latest_status"
+    ).strip()
+    primary_summaries = [
+        str(item.get("summary") or "").strip()
+        for item in opened
+        if item.get("summary") and _latest_status_opened_is_primary(item)
+    ]
+    if not primary_summaries:
+        primary_summaries = [str(item.get("summary") or "").strip() for item in opened if item.get("summary")]
+    if not primary_summaries:
+        return None
+    source_tiers = action.get("source_tiers") if isinstance(action.get("source_tiers"), dict) else {}
+    secondary_refs = _latest_status_secondary_ref_labels(source_tiers.get("required_secondary") or [])
+    commits = _latest_status_commit_labels(((action.get("work_products") or {}).get("commits") or []))
+    answer_brief = action.get("answer_brief")
+    brief_text = _latest_status_brief_text(answer_brief)
+    session_activity = action.get("session_activity") if isinstance(action.get("session_activity"), dict) else {}
+    session_summary = session_activity.get("summary") if isinstance(session_activity.get("summary"), dict) else {}
+    activity_text = _latest_status_activity_text(session_summary)
+    pieces = [
+        "Selected anchor: "
+        + _short_join(
+            [
+                f'wording="{anchor_text}"' if anchor_text else "",
+                f"timestamp={anchor_time}" if anchor_time else "",
+                f"source_ref={anchor_ref}" if anchor_ref else "",
+                f"confidence={confidence}" if confidence else "",
+                f"boundary={boundary}" if boundary else "",
+            ],
+            limit=520,
+        )
+        + ".",
+        f"Work after that anchor from opened required primary refs: {_short_join(primary_summaries[:4], limit=720)}",
+    ]
+    if brief_text:
+        pieces.append(f"Status-anchor brief: {brief_text}")
+    if activity_text:
+        pieces.append(f"Raw activity summary: {activity_text}")
+    if commits:
+        pieces.append(f"Secondary commit refs: {_short_join(commits[:4], limit=420)}")
+    if secondary_refs:
+        pieces.append(f"Secondary task/report/review refs: {_short_join(secondary_refs[:4], limit=420)}")
+    pieces.append(
+        "Boundary: this is a latest-status answer from selected-anchor and required-primary proof only, "
+        "not an all-history completeness claim."
+    )
+    return " ".join(part for part in pieces if part)
+
+
+def _latest_status_opened_is_primary(item: dict) -> bool:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    return str(ref.get("source_tier") or "") == "required_primary" or bool(ref.get("answer_use_required"))
+
+
+def _latest_status_brief_text(answer_brief: object) -> str:
+    if isinstance(answer_brief, str):
+        return answer_brief.strip()
+    if isinstance(answer_brief, list):
+        values = [str(value).strip() for value in answer_brief if str(value).strip()]
+        return _short_join(values[:3], limit=520)
+    if not isinstance(answer_brief, dict):
+        return ""
+    for key in ("summary", "brief", "answer", "status_summary"):
+        value = answer_brief.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    values = [
+        str(value).strip()
+        for value in answer_brief.values()
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    return _short_join(values[:4], limit=420)
+
+
+def _latest_status_activity_text(summary: dict) -> str:
+    fields = [
+        ("session_files", summary.get("session_file_count")),
+        ("records_after_anchor", summary.get("records_after_anchor")),
+        ("spawned_session_calls", summary.get("spawned_session_call_count")),
+    ]
+    parts = [f"{label}={value}" for label, value in fields if value not in (None, "")]
+    return ", ".join(parts)
+
+
+def _latest_status_secondary_ref_labels(reads: list[dict]) -> list[str]:
+    labels = []
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+        label = str(read.get("source_ref") or read.get("openable_target") or read.get("path") or "").strip()
+        reason = str(read.get("reason") or read.get("source_role_label") or "").strip()
+        if label and reason:
+            labels.append(f"{label} ({reason})")
+        elif label:
+            labels.append(label)
+    return labels
+
+
+def _latest_status_commit_labels(commits: list[dict]) -> list[str]:
+    labels = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        label = str(commit.get("commit") or commit.get("hash") or commit.get("source_ref") or "").strip()
+        subject = str(commit.get("subject") or commit.get("summary") or commit.get("message") or "").strip()
+        if label and subject:
+            labels.append(f"{label} {subject}")
+        elif label:
+            labels.append(label)
+        elif subject:
+            labels.append(subject)
+    return labels
+
+
+def _latest_status_anchor_choices(action: dict) -> list[dict]:
+    candidates: list[dict] = []
+    shortlist = action.get("parent_main_anchor_shortlist")
+    if isinstance(shortlist, dict):
+        for key in ("candidates", "shortlist", "top_candidates", "canonical_candidates"):
+            values = shortlist.get(key)
+            if isinstance(values, list):
+                candidates.extend(item for item in values if isinstance(item, dict))
+    for read in action.get("read") or []:
+        if isinstance(read, dict) and (
+            read.get("parent_main_anchor_recovery_candidate") or read.get("prior_request_occurrence_candidate")
+        ):
+            candidates.append(read)
+    choices: list[dict] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item.get("source_ref") or item.get("openable_target") or item.get("snippet") or item)
+        if key in seen:
+            continue
+        seen.add(key)
+        choices.append(
+            {
+                "wording": item.get("snippet") or item.get("text") or item.get("reason"),
+                "timestamp_utc": item.get("timestamp_utc"),
+                "source_ref": item.get("source_ref"),
+                "openable_target": item.get("openable_target"),
+                "confidence": item.get("confidence") or item.get("decision") or item.get("source_role_label"),
+            }
+        )
+        if len(choices) >= 3:
+            break
+    return choices
 
 
 def _compose_semantic_wrapup_corrections_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
