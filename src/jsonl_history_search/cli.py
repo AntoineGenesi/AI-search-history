@@ -36,6 +36,7 @@ from .compact_handoff_usefulness import (
     render_compact_handoff_answer_use_markdown,
     render_compact_handoff_usefulness_markdown,
 )
+from .conversation_records import classify_conversation_record
 from .coordinator_context import build_coordinator_context_payload
 from .source_tier_answer_use import (
     DEFAULT_FIXTURE as DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE,
@@ -4215,8 +4216,6 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
     proof_refs = _collect_ask_answer_proof_refs(action)
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
-    answer["refs_used"] = [_ref_public_summary(item) for item in usable]
-    answer["proof_summary"] = [item["summary"] for item in usable]
     if not usable:
         return _ask_answer_fail_closed(
             answer,
@@ -4224,11 +4223,32 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
             _next_proof_step_from_action(action),
         )
 
+    answer_opened = usable
+    if route_family == "remembered_user_wording":
+        answer_opened = _remembered_user_wording_user_authored_opened(usable)
+        if not answer_opened:
+            answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
+            return _ask_answer_fail_closed(
+                answer,
+                "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
+                {
+                    "required_next_proof": "raw user-authored message ref",
+                    "suggested_action": (
+                        "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                        "do not answer from tool output, function_call_output, assistant, task, or current-run echo rows"
+                    ),
+                    "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
+                },
+            )
+
+    answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
+    answer["proof_summary"] = [item["summary"] for item in answer_opened]
+
     direct_answer = _compose_ask_answer(
         query=str(report.get("query") or ""),
         route_family=route_family,
         action=action,
-        opened=usable,
+        opened=answer_opened,
     )
     if not direct_answer:
         return _ask_answer_fail_closed(
@@ -4403,29 +4423,42 @@ def _read_ask_answer_ref(*, path: Path, line: int | None, ref: dict, cwd: Path) 
         index = max(0, min(line - 1, len(lines) - 1))
         raw = lines[index]
         summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{index + 1}")
+        record_metadata = _ask_answer_jsonl_record_metadata(raw)
         return {
             "status": "opened",
             "target": f"{rel}:{index + 1}",
             "path": rel,
             "line": index + 1,
             "summary": summary,
+            "record_metadata": record_metadata,
             "ref": ref,
         }
     if path.suffix.lower() == ".jsonl":
         summaries = []
+        record_summaries = []
         for index, raw in enumerate(lines[:8], start=1):
             summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{index}")
             if summary:
                 summaries.append(summary)
+                record_summaries.append(
+                    {
+                        "target": f"{rel}:{index}",
+                        "line": index,
+                        "summary": summary,
+                        "record_metadata": _ask_answer_jsonl_record_metadata(raw),
+                    }
+                )
         summary = " | ".join(summaries)[:_ASK_ANSWER_MAX_FILE_CHARS]
     else:
         summary = _summarize_markdown_file(lines)
+        record_summaries = []
     return {
         "status": "opened",
         "target": rel,
         "path": rel,
         "line": None,
         "summary": summary,
+        "record_summaries": record_summaries,
         "ref": ref,
     }
 
@@ -4478,6 +4511,92 @@ def _extract_text_from_json_row(row: dict) -> str:
     return ""
 
 
+def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    classification = classify_conversation_record(row)
+    simple_top_level_user_text = (
+        classification.label == "unknown"
+        and str(row.get("role") or "").strip().lower() == "user"
+        and bool(str(row.get("text") or row.get("content") or row.get("message") or "").strip())
+        and not isinstance(row.get("payload"), dict)
+        and not isinstance(row.get("message"), dict)
+    )
+    is_user_authored = classification.is_human_authored or simple_top_level_user_text
+    return {
+        "top_type": row.get("type"),
+        "top_role": row.get("role"),
+        "payload_type": payload.get("type"),
+        "payload_role": payload.get("role"),
+        "message_role": message.get("role"),
+        "conversation_label": classification.label,
+        "conversation_confidence": classification.confidence,
+        "conversation_reasons": list(classification.reasons),
+        "is_user_authored": is_user_authored,
+        "user_authorship_basis": (
+            "conversation_record_classifier"
+            if classification.is_human_authored
+            else "simple_top_level_role_user_text"
+            if simple_top_level_user_text
+            else None
+        ),
+    }
+
+
+def _remembered_user_wording_user_authored_opened(opened: list[dict]) -> list[dict]:
+    user_authored: list[dict] = []
+    for item in opened:
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        if metadata.get("is_user_authored") is True:
+            user_authored.append(item)
+            continue
+        for record in item.get("record_summaries") or []:
+            if not isinstance(record, dict):
+                continue
+            record_metadata = (
+                record.get("record_metadata") if isinstance(record.get("record_metadata"), dict) else {}
+            )
+            if record_metadata.get("is_user_authored") is True and record.get("summary"):
+                cloned = dict(item)
+                cloned["target"] = record.get("target") or item.get("target")
+                cloned["line"] = record.get("line")
+                cloned["summary"] = record.get("summary")
+                cloned["record_metadata"] = record_metadata
+                user_authored.append(cloned)
+    return user_authored
+
+
+def _non_user_opened_ref_summaries(opened: list[dict]) -> list[str]:
+    summaries: list[str] = []
+    for item in opened[:_ASK_ANSWER_MAX_REFS]:
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        if not metadata and item.get("record_summaries"):
+            labels = []
+            for record in item.get("record_summaries") or []:
+                if not isinstance(record, dict):
+                    continue
+                record_metadata = (
+                    record.get("record_metadata") if isinstance(record.get("record_metadata"), dict) else {}
+                )
+                label = record_metadata.get("conversation_label")
+                confidence = record_metadata.get("conversation_confidence")
+                if label:
+                    labels.append(f"{record.get('target')}: {label}/{confidence}")
+            if labels:
+                summaries.append("; ".join(labels))
+                continue
+        label = metadata.get("conversation_label") or "non-jsonl-or-unclassified"
+        confidence = metadata.get("conversation_confidence") or "unknown"
+        summaries.append(f"{item.get('target')}: {label}/{confidence}")
+    return summaries
+
+
 def _summarize_markdown_file(lines: list[str]) -> str:
     selected: list[str] = []
     for raw in lines:
@@ -4511,13 +4630,26 @@ def _looks_like_markdown_proof_summary_line(line: str) -> bool:
 
 def _ref_public_summary(item: dict) -> dict:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
-    return {
+    summary = {
         "target": item.get("target"),
         "kind": ref.get("kind"),
         "proof_surface": ref.get("proof_surface"),
         "target_source_role": ref.get("target_source_role"),
         "reason": ref.get("reason"),
     }
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata:
+        summary["record_metadata"] = {
+            "conversation_label": metadata.get("conversation_label"),
+            "conversation_confidence": metadata.get("conversation_confidence"),
+            "is_user_authored": metadata.get("is_user_authored"),
+            "user_authorship_basis": metadata.get("user_authorship_basis"),
+            "top_role": metadata.get("top_role"),
+            "payload_type": metadata.get("payload_type"),
+            "payload_role": metadata.get("payload_role"),
+            "message_role": metadata.get("message_role"),
+        }
+    return summary
 
 
 def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: list[dict]) -> str | None:
