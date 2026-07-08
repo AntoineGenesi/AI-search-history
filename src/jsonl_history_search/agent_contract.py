@@ -6329,14 +6329,6 @@ def build_no_evidence_report(
 ) -> dict:
     source_scope = build_source_scope_summary(source_plan, search_result)
     if status != "no_evidence" and no_evidence_mode:
-        weak_context_report = build_weak_context_no_evidence_report(
-            source_plan=source_plan,
-            source_scope=source_scope,
-            search_result=search_result,
-            candidates=list(candidates or []),
-        )
-        if weak_context_report:
-            return weak_context_report
         claim_boundary_report = build_claim_boundary_no_evidence_report(
             source_plan=source_plan,
             source_scope=source_scope,
@@ -6345,6 +6337,14 @@ def build_no_evidence_report(
         )
         if claim_boundary_report:
             return claim_boundary_report
+        weak_context_report = build_weak_context_no_evidence_report(
+            source_plan=source_plan,
+            source_scope=source_scope,
+            search_result=search_result,
+            candidates=list(candidates or []),
+        )
+        if weak_context_report:
+            return weak_context_report
     if status != "no_evidence":
         return {
             "needed": False,
@@ -6461,7 +6461,10 @@ def build_claim_boundary_no_evidence_report(
     if not query_asks_for_searched_scope_evidence(query_text):
         return None
     coverage = no_evidence_query_term_coverage(source_plan, candidates)
-    if coverage["classification"] != "candidates_cover_query_terms" and not missing_only_scope_scaffold_terms(coverage):
+    if (
+        coverage["classification"] != "candidates_cover_query_terms"
+        and not missing_only_scope_or_claim_verb_terms(coverage)
+    ):
         return None
     if any(candidate_likely_supports_stronger_claim(candidate) for candidate in candidates):
         return None
@@ -6609,6 +6612,19 @@ def missing_only_scope_scaffold_terms(coverage: dict[str, Any]) -> bool:
     }
 
 
+def missing_only_scope_or_claim_verb_terms(coverage: dict[str, Any]) -> bool:
+    missing_terms = set(coverage.get("missing_terms_any_candidate") or [])
+    return bool(missing_terms) and missing_terms <= {
+        "evidence",
+        "prove",
+        "proved",
+        "proves",
+        "scope",
+        "searched",
+        "searched-scope",
+    }
+
+
 def claim_boundary_candidate(candidate: CandidateRow, query_text: str) -> dict[str, Any] | None:
     text = normalize_for_claim_boundary(" ".join([candidate.snippet, " ".join(candidate.reasons)]))
     reasons: list[str] = []
@@ -6648,7 +6664,13 @@ def explicit_boundary_non_support(candidate_text: str) -> bool:
         )
     )
     ranking_non_goal = (
-        ("no broad" in candidate_text or "not a" in candidate_text or "does not claim" in candidate_text)
+        (
+            "no broad" in candidate_text
+            or "not broad" in candidate_text
+            or "not a" in candidate_text
+            or "does not claim" in candidate_text
+            or "not claimed" in candidate_text
+        )
         and any(token in candidate_text for token in ("ranking", "root-selection", "source-window"))
     )
     all_history_non_claim = (
@@ -6673,6 +6695,20 @@ def candidate_likely_supports_stronger_claim(candidate: CandidateRow) -> bool:
         "fixed all history semantic ranking",
         "changed all-history semantic ranking",
         "changed all history semantic ranking",
+        "prove broad semantic-debug ranking correctness",
+        "proved broad semantic-debug ranking correctness",
+        "proves broad semantic-debug ranking correctness",
+        "support broad semantic-debug ranking correctness",
+        "supported broad semantic-debug ranking correctness",
+        "supports broad semantic-debug ranking correctness",
+        "support for broad semantic-debug ranking correctness",
+        "prove broad semantic debug ranking correctness",
+        "proved broad semantic debug ranking correctness",
+        "proves broad semantic debug ranking correctness",
+        "support broad semantic debug ranking correctness",
+        "supported broad semantic debug ranking correctness",
+        "supports broad semantic debug ranking correctness",
+        "support for broad semantic debug ranking correctness",
         "ranking or cap changed true",
         "ranking or cap changed\": true",
         "ranking or cap changed': true",
