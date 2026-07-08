@@ -3819,17 +3819,15 @@ def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) ->
     normalized = str(query or "").casefold()
     if route_family == "semantic_debug" and "what happened" in normalized:
         return bool(_ask_execute_named_task_ids(query))
-    return _named_task_review_failure_causal_answer_wanted(query=query, route_family=route_family)
+    return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
 
 
-def _named_task_review_failure_causal_answer_wanted(*, query: str, route_family: str) -> bool:
+def _named_task_review_failure_status_answer_wanted(*, query: str, route_family: str) -> bool:
     if route_family not in {"provenance", "semantic_debug"}:
         return False
     if not _ask_execute_named_task_ids(query):
         return False
     normalized = str(query or "").casefold()
-    if not any(term in normalized for term in ("why", "cause", "caused", "reason")):
-        return False
     return any(
         term in normalized
         for term in (
@@ -3843,6 +3841,13 @@ def _named_task_review_failure_causal_answer_wanted(*, query: str, route_family:
             "verification failure",
         )
     )
+
+
+def _named_task_review_failure_causal_answer_wanted(*, query: str, route_family: str) -> bool:
+    normalized = str(query or "").casefold()
+    if not any(term in normalized for term in ("why", "cause", "caused", "reason")):
+        return False
+    return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
 
 
 def _ask_execute_named_task_ids(query: str) -> list[str]:
@@ -6992,16 +6997,28 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
         else:
             other_summaries.append(summary)
     query_lower = query.lower()
+    review_failure_status_wanted = _named_task_review_failure_status_answer_wanted(
+        query=query,
+        route_family="provenance",
+    )
     if _named_task_review_failure_causal_answer_wanted(query=query, route_family="provenance"):
         cause = _named_task_review_failure_cause(task_summaries + review_summaries)
         outcome = _named_task_review_failure_fix_outcome(review_summaries + task_summaries)
-        if not cause or not outcome:
-            return None
-        return (
-            f"The current review/fix proof for {task_id} says the review failed because {cause} "
-            f"The current fix/rereview outcome proof says {outcome} "
-            "Boundary: this answers from current task/review/commit proof only, not an all-history root-cause claim."
+        if cause and outcome:
+            return (
+                f"The current review/fix proof for {task_id} says the review failed because {cause} "
+                f"The current fix/rereview outcome proof says {outcome} "
+                "Boundary: this answers from current task/review/commit proof only, not an all-history root-cause claim."
+            )
+    if review_failure_status_wanted:
+        false_premise_answer = _named_task_verified_not_failed_review_answer(
+            task_id=task_id,
+            task_summaries=task_summaries,
+            review_summaries=review_summaries,
         )
+        if false_premise_answer:
+            return false_premise_answer
+        return None
     if "review" in query_lower or "verify" in query_lower or "verified" in query_lower:
         if review_summaries:
             return (
@@ -7018,6 +7035,84 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     if other_summaries:
         pieces.append(f"commit/probe proof: {_short_join(other_summaries[:1])}")
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _named_task_verified_not_failed_review_answer(
+    *,
+    task_id: str,
+    task_summaries: list[str],
+    review_summaries: list[str],
+) -> str | None:
+    review_fragments = [
+        fragment
+        for fragment in _summary_fragments(review_summaries)
+        if not _named_task_fragment_mentions_other_task_id(fragment, task_id)
+    ]
+    relevant_fragments = [
+        fragment
+        for fragment in _summary_fragments(review_summaries + task_summaries)
+        if not _named_task_fragment_mentions_other_task_id(fragment, task_id)
+    ]
+    verified_review = [
+        fragment
+        for fragment in review_fragments
+        if _named_task_fragment_has_verified_review_verdict(fragment)
+    ]
+    if not verified_review:
+        return None
+    if any(_named_task_fragment_has_failed_review_proof(fragment) for fragment in relevant_fragments):
+        return None
+    if any(_named_task_fragment_has_fix_rereview_proof(fragment) for fragment in relevant_fragments):
+        return None
+    proof = _short_join(verified_review[:2])
+    task_proof = _short_join(
+        [
+            fragment
+            for fragment in _summary_fragments(task_summaries)
+            if not _named_task_fragment_mentions_other_task_id(fragment, task_id)
+        ][:2]
+    )
+    return (
+        f"The current review proof for {task_id} does not support the failed-review premise; "
+        f"it shows the review was VERIFIED, not failed: {proof}"
+        + (f" Task proof: {task_proof}" if task_proof else "")
+        + " Boundary: this answers from current task/review/commit proof only, not an all-history claim that no review ever failed."
+    )
+
+
+def _named_task_fragment_mentions_other_task_id(fragment: str, task_id: str) -> bool:
+    task_id_normalized = str(task_id or "").casefold()
+    mentioned_ids = {match.group(0).casefold() for match in _ASK_EXECUTE_TASK_ID_RE.finditer(fragment or "")}
+    return bool(mentioned_ids and task_id_normalized not in mentioned_ids)
+
+
+def _named_task_fragment_has_verified_review_verdict(fragment: str) -> bool:
+    normalized = str(fragment or "").casefold()
+    return "verdict" in normalized and "verified" in normalized
+
+
+def _named_task_fragment_has_failed_review_proof(fragment: str) -> bool:
+    normalized = str(fragment or "").casefold()
+    if "verdict" in normalized and "failed" in normalized:
+        return True
+    if "review:" in normalized and "failed because" in normalized:
+        return True
+    if "review artifact" in normalized and "failed" in normalized and "because" in normalized:
+        return True
+    if "review failure" in normalized or "failed-review" in normalized:
+        return True
+    return False
+
+
+def _named_task_fragment_has_fix_rereview_proof(fragment: str) -> bool:
+    normalized = str(fragment or "").casefold()
+    if any(term in normalized for term in ("fix/rereview", "rereview", "re-review")) and any(
+        term in normalized for term in ("verified", "verification", "outcome", "fixed")
+    ):
+        return True
+    if "after fix" in normalized and any(term in normalized for term in ("verified", "fixed")):
+        return True
+    return False
 
 
 def _named_task_review_failure_cause(summaries: list[str]) -> str:
