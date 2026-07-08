@@ -4146,6 +4146,22 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
 _ASK_ANSWER_MAX_REFS = 6
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
+_REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
+    "work only in this existing worktree",
+    "exact finding to fix",
+    "coordinator live smoke",
+    "command run from task worktree",
+    "do not edit product code",
+    "do not edit the parent checkout",
+    "current branch includes implementation commit",
+    "partial review commit",
+    "observed command:",
+    "observed answer:",
+)
+_REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
+    r"\byou are the\b.{0,120}\b(implementer|reviewer|worker|coordinator)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
@@ -4225,8 +4241,8 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
 
     answer_opened = usable
     if route_family == "remembered_user_wording":
-        answer_opened = _remembered_user_wording_user_authored_opened(usable)
-        if not answer_opened:
+        user_opened = _remembered_user_wording_user_authored_opened(usable)
+        if not user_opened:
             answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
             return _ask_answer_fail_closed(
                 answer,
@@ -4238,6 +4254,27 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
                         "do not answer from tool output, function_call_output, assistant, task, or current-run echo rows"
                     ),
                     "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
+                },
+            )
+        answer_opened = _remembered_user_wording_non_echo_user_opened(
+            user_opened,
+            query=str(report.get("query") or ""),
+        )
+        if not answer_opened:
+            answer["proof_summary"] = _prompt_echo_opened_ref_summaries(user_opened, query=str(report.get("query") or ""))
+            return _ask_answer_fail_closed(
+                answer,
+                "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                {
+                    "required_next_proof": "raw user-authored non-echo message ref",
+                    "suggested_action": (
+                        "inspect older user-message refs that state the target wording directly; do not answer from "
+                        "current assignment, review, test, command-quoting, or prompt-echo rows"
+                    ),
+                    "rejected_user_prompt_echo_refs": [
+                        _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
+                        for item in user_opened
+                    ],
                 },
             )
 
@@ -4570,6 +4607,42 @@ def _remembered_user_wording_user_authored_opened(opened: list[dict]) -> list[di
                 cloned["record_metadata"] = record_metadata
                 user_authored.append(cloned)
     return user_authored
+
+
+def _remembered_user_wording_non_echo_user_opened(opened: list[dict], *, query: str) -> list[dict]:
+    return [
+        item
+        for item in opened
+        if not _remembered_user_wording_prompt_echo_reasons(item, query=query)
+    ]
+
+
+def _remembered_user_wording_prompt_echo_reasons(item: dict, *, query: str) -> list[str]:
+    text = str(item.get("summary") or "").casefold()
+    reasons: list[str] = []
+    query_text = str(query or "").strip().casefold()
+    if query_text and query_text in text:
+        reasons.append("contains_current_ask_query_text")
+    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(str(item.get("summary") or "")):
+        reasons.append("assignment_or_review_scaffolding")
+    for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
+        if marker in text:
+            reasons.append(f"prompt_echo_marker:{marker}")
+    return reasons
+
+
+def _prompt_echo_ref_public_summary(item: dict, *, query: str) -> dict:
+    summary = _ref_public_summary(item)
+    summary["prompt_echo_reasons"] = _remembered_user_wording_prompt_echo_reasons(item, query=query)
+    return summary
+
+
+def _prompt_echo_opened_ref_summaries(opened: list[dict], *, query: str) -> list[str]:
+    summaries: list[str] = []
+    for item in opened[:_ASK_ANSWER_MAX_REFS]:
+        reasons = ",".join(_remembered_user_wording_prompt_echo_reasons(item, query=query))
+        summaries.append(f"{item.get('target')}: rejected_prompt_echo={reasons}")
+    return summaries
 
 
 def _non_user_opened_ref_summaries(opened: list[dict]) -> list[str]:
