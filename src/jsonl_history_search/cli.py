@@ -4173,6 +4173,7 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
     }
 )
 _ASK_ANSWER_MAX_REFS = 6
+_ASK_ANSWER_REMEMBERED_USER_RECOVERY_MAX_REFS = 16
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
 _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES = frozenset(
@@ -4264,6 +4265,9 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "partial review commit",
     "observed command:",
     "observed answer:",
+    "task note:",
+    "review fixture",
+    "test fixture",
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
@@ -4369,40 +4373,95 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
     if route_family == "remembered_user_wording":
         user_opened = _remembered_user_wording_user_authored_opened(usable)
         if not user_opened:
-            answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
-            return _ask_answer_fail_closed(
-                answer,
-                "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
-                {
-                    "required_next_proof": "raw user-authored message ref",
-                    "suggested_action": (
-                        "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
-                        "do not answer from tool output, function_call_output, assistant, task, or current-run echo rows"
-                    ),
-                    "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
-                },
+            recovery = _recover_remembered_user_wording_clean_opened(
+                report=report,
+                action=action,
+                initially_opened=usable,
+                cwd=cwd,
+                query=str(report.get("query") or ""),
             )
-        answer_opened = _remembered_user_wording_non_echo_user_opened(
-            user_opened,
-            query=str(report.get("query") or ""),
-        )
-        if not answer_opened:
-            answer["proof_summary"] = _prompt_echo_opened_ref_summaries(user_opened, query=str(report.get("query") or ""))
-            return _ask_answer_fail_closed(
-                answer,
-                "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
-                {
-                    "required_next_proof": "raw user-authored non-echo message ref",
-                    "suggested_action": (
-                        "inspect older user-message refs that state the target wording directly; do not answer from "
-                        "current assignment, review, test, command-quoting, or prompt-echo rows"
-                    ),
-                    "rejected_user_prompt_echo_refs": [
+            recovered_opened = list(recovery.get("opened") or [])
+            if recovered_opened:
+                answer["source_contract"]["remembered_user_wording_recovery"] = {
+                    "schema_version": 1,
+                    "status": "clean_user_proof_recovered_after_non_user_refs",
+                    "searched_ref_count": recovery.get("searched_ref_count"),
+                    "opened_ref_count": recovery.get("opened_ref_count"),
+                    "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                }
+                answer_opened = recovered_opened
+            else:
+                answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
+                return _ask_answer_fail_closed(
+                    answer,
+                    "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
+                    {
+                        "required_next_proof": "raw user-authored message ref",
+                        "suggested_action": (
+                            "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                            "already surfaced target reads did not yield clean user-authored non-echo proof"
+                        ),
+                        "bounded_recovery": {
+                            "status": recovery.get("status") or "no_clean_user_proof_recovered",
+                            "searched_ref_count": recovery.get("searched_ref_count"),
+                            "opened_ref_count": recovery.get("opened_ref_count"),
+                            "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                            "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                        },
+                        "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
+                    },
+                )
+        else:
+            answer_opened = _remembered_user_wording_non_echo_user_opened(
+                user_opened,
+                query=str(report.get("query") or ""),
+            )
+            if not answer_opened:
+                recovery = _recover_remembered_user_wording_clean_opened(
+                    report=report,
+                    action=action,
+                    initially_opened=usable,
+                    cwd=cwd,
+                    query=str(report.get("query") or ""),
+                )
+                recovered_opened = list(recovery.get("opened") or [])
+                if recovered_opened:
+                    answer["source_contract"]["remembered_user_wording_recovery"] = {
+                        "schema_version": 1,
+                        "status": "clean_user_proof_recovered_after_prompt_echo_rejection",
+                        "searched_ref_count": recovery.get("searched_ref_count"),
+                        "opened_ref_count": recovery.get("opened_ref_count"),
+                        "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                    }
+                    answer_opened = recovered_opened
+                else:
+                    rejected_echo_refs = [
                         _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
                         for item in user_opened
-                    ],
-                },
-            )
+                    ] + list(recovery.get("rejected_prompt_echo_refs") or [])
+                    answer["proof_summary"] = _prompt_echo_opened_ref_summaries(
+                        user_opened,
+                        query=str(report.get("query") or ""),
+                    )
+                    return _ask_answer_fail_closed(
+                        answer,
+                        "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                        {
+                            "required_next_proof": "raw user-authored non-echo message ref",
+                            "suggested_action": (
+                                "inspect older user-message refs that state the target wording directly; already surfaced "
+                                "target reads did not yield clean user-authored non-echo proof"
+                            ),
+                            "bounded_recovery": {
+                                "status": recovery.get("status") or "no_clean_user_proof_recovered",
+                                "searched_ref_count": recovery.get("searched_ref_count"),
+                                "opened_ref_count": recovery.get("opened_ref_count"),
+                                "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                                "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                            },
+                            "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
+                        },
+                    )
 
     episode_selection = _select_work_episode_opened_for_answer(
         query=str(report.get("query") or ""),
@@ -5458,7 +5517,7 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
     return _dedupe_ask_answer_proof_refs(refs)
 
 
-def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
+def _dedupe_ask_answer_proof_refs(refs: list[dict], *, limit: int = _ASK_ANSWER_MAX_REFS) -> list[dict]:
     deduped: list[dict] = []
     seen: dict[tuple[str, str, str], dict] = {}
     for item in refs:
@@ -5484,7 +5543,7 @@ def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
             continue
         seen[key] = item
         deduped.append(item)
-    return deduped[:_ASK_ANSWER_MAX_REFS]
+    return deduped[:limit]
 
 
 def _merge_work_episode_ref_metadata(existing: dict, incoming: dict) -> None:
@@ -5717,6 +5776,100 @@ def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
             else None
         ),
     }
+
+
+def _recover_remembered_user_wording_clean_opened(
+    *,
+    report: dict,
+    action: dict,
+    initially_opened: list[dict],
+    cwd: Path,
+    query: str,
+) -> dict:
+    refs = _remembered_user_wording_recovery_refs(report=report, action=action)
+    if not refs:
+        return {
+            "status": "no_bounded_recovery_refs_available",
+            "opened": [],
+            "searched_ref_count": 0,
+            "opened_ref_count": 0,
+            "rejected_prompt_echo_refs": [],
+            "rejected_non_user_refs": [],
+        }
+    initial_targets = {str(item.get("target") or "") for item in initially_opened if item.get("target")}
+    opened = [
+        item
+        for item in _open_ask_answer_proof_refs(refs, cwd=cwd)
+        if item.get("status") == "opened" and item.get("summary") and str(item.get("target") or "") not in initial_targets
+    ]
+    user_opened = _remembered_user_wording_user_authored_opened(opened)
+    clean_opened = _remembered_user_wording_non_echo_user_opened(user_opened, query=query)
+    rejected_echo = [
+        _prompt_echo_ref_public_summary(item, query=query)
+        for item in user_opened
+        if _remembered_user_wording_prompt_echo_reasons(item, query=query)
+    ]
+    user_targets = {str(item.get("target") or "") for item in user_opened if item.get("target")}
+    rejected_non_user = [
+        _ref_public_summary(item)
+        for item in opened
+        if str(item.get("target") or "") not in user_targets
+    ]
+    return {
+        "status": "clean_user_proof_recovered" if clean_opened else "no_clean_user_proof_recovered",
+        "opened": clean_opened[:_ASK_ANSWER_MAX_REFS],
+        "searched_ref_count": len(refs),
+        "opened_ref_count": len(opened),
+        "rejected_prompt_echo_refs": rejected_echo[:_ASK_ANSWER_MAX_REFS],
+        "rejected_non_user_refs": rejected_non_user[:_ASK_ANSWER_MAX_REFS],
+    }
+
+
+def _remembered_user_wording_recovery_refs(*, report: dict, action: dict) -> list[dict]:
+    refs: list[dict] = []
+
+    def add_group(group: object) -> None:
+        for item in group if isinstance(group, list) else []:
+            if isinstance(item, dict) and _remembered_user_wording_recovery_ref_allowed(item):
+                refs.append(item)
+
+    target_handoff = action.get("target_proof_handoff") if isinstance(action.get("target_proof_handoff"), dict) else {}
+    core_plan = action.get("core_convo_first_read_plan") if isinstance(action.get("core_convo_first_read_plan"), dict) else {}
+    compact = report.get("executed_output") if isinstance(report.get("executed_output"), dict) else {}
+    compact_core = (
+        compact.get("core_convo_first_read_plan")
+        if isinstance(compact.get("core_convo_first_read_plan"), dict)
+        else {}
+    )
+
+    add_group(target_handoff.get("required_primary_proof"))
+    add_group(action.get("read"))
+    add_group(core_plan.get("read"))
+    role_groups = core_plan.get("role_groups") if isinstance(core_plan.get("role_groups"), dict) else {}
+    add_group(role_groups.get("target_historical_raw"))
+    add_group(compact_core.get("read"))
+    compact_role_groups = compact_core.get("role_groups") if isinstance(compact_core.get("role_groups"), dict) else {}
+    add_group(compact_role_groups.get("target_historical_raw"))
+    add_group(compact.get("next_reads"))
+    add_group(target_handoff.get("secondary_context_after_source_inspection"))
+
+    return _dedupe_ask_answer_proof_refs(
+        refs,
+        limit=_ASK_ANSWER_REMEMBERED_USER_RECOVERY_MAX_REFS,
+    )
+
+
+def _remembered_user_wording_recovery_ref_allowed(ref: dict) -> bool:
+    if ref.get("diagnostic_only") is True:
+        return False
+    if ref.get("read_more_actionable") is False or ref.get("followthrough_actionable") is False:
+        return False
+    if ref.get("kind") in {"targeted_fail_closed_boundary", "missing_role_recovery_command"}:
+        return False
+    target_role = str(ref.get("target_source_role") or "")
+    if target_role and target_role == "diagnostic_or_post_hoc":
+        return False
+    return bool(ref.get("source_ref") or ref.get("target") or ref.get("openable_target") or ref.get("path"))
 
 
 def _remembered_user_wording_user_authored_opened(opened: list[dict]) -> list[dict]:
