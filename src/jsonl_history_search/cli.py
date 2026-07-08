@@ -7200,6 +7200,9 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
             review_summaries.append(summary)
         else:
             other_summaries.append(summary)
+    clean_task_summaries = _named_task_current_proof_prose_summaries(task_summaries, task_id=task_id)
+    clean_review_summaries = _named_task_current_proof_prose_summaries(review_summaries, task_id=task_id)
+    clean_other_summaries = _named_task_current_proof_prose_summaries(other_summaries, task_id=task_id)
     query_lower = query.lower()
     if _named_task_selection_rationale_answer_wanted(query=query, route_family="semantic_debug"):
         selection_answer = _compose_named_task_selection_rationale_answer(
@@ -7235,22 +7238,79 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
             )
     if review_failure_status_wanted:
         return None
-    if "review" in query_lower or "verify" in query_lower or "verified" in query_lower:
-        if review_summaries:
+    review_verification_wanted = any(
+        term in query_lower for term in ("reviewer", "verify", "verified", "only claim")
+    )
+    if review_verification_wanted:
+        if clean_review_summaries:
             return (
                 f"The current review proof for {task_id} supports verification: "
-                f"{_short_join(review_summaries[:2])}"
-                + (f" Task proof: {_short_join(task_summaries[:1])}" if task_summaries else "")
+                f"{_short_join(clean_review_summaries[:2])}"
+                + (f" Task proof: {_short_join(clean_task_summaries[:1])}" if clean_task_summaries else "")
             )
         return f"I found current {task_id} proof refs, but no review-artifact summary was readable."
     pieces = []
-    if task_summaries:
-        pieces.append(f"task proof: {_short_join(task_summaries[:2])}")
-    if review_summaries:
-        pieces.append(f"review proof: {_short_join(review_summaries[:2])}")
-    if other_summaries:
-        pieces.append(f"commit/probe proof: {_short_join(other_summaries[:1])}")
+    if clean_task_summaries:
+        pieces.append(f"task proof: {_short_join(clean_task_summaries[:2])}")
+    if clean_review_summaries:
+        pieces.append(f"review proof: {_short_join(clean_review_summaries[:2])}")
+    if clean_other_summaries:
+        pieces.append(f"commit/probe proof: {_short_join(clean_other_summaries[:1])}")
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _named_task_current_proof_prose_summaries(summaries: list[str], *, task_id: str) -> list[str]:
+    cleaned: list[str] = []
+    for summary in summaries:
+        fragments = []
+        for fragment in _summary_fragments([summary]):
+            prose = _named_task_current_proof_prose_fragment(fragment, task_id=task_id)
+            if prose:
+                fragments.append(prose)
+        if fragments:
+            cleaned.append(_short_join(fragments[:5], limit=520))
+    return cleaned
+
+
+def _named_task_current_proof_prose_fragment(fragment: str, *, task_id: str) -> str:
+    text = str(fragment or "").strip()
+    if not text:
+        return ""
+    text = text.lstrip("-* ").strip()
+    normalized = text.casefold()
+    if _named_task_fragment_mentions_other_task_id(text, task_id):
+        return ""
+    if any(
+        marker in normalized
+        for marker in (
+            "tool output: chunk id",
+            "raw prior tool-output",
+            "raw tool-output",
+            "raw tool output",
+            "diagnostic/section-paste",
+            "diagnostic marker",
+        )
+    ):
+        return ""
+    preservation_terms = (
+        "review-proof",
+        "failed-review",
+        "expectation-mismatch",
+        "latest-status",
+        "remembered-user",
+    )
+    if sum(1 for term in preservation_terms if term in normalized) >= 2:
+        return ""
+    label_match = re.match(r"^`?(context|proof)`?:\s*(.*)$", text, flags=re.IGNORECASE)
+    if label_match:
+        label = label_match.group(1).casefold()
+        rest = label_match.group(2).strip().strip("` .")
+        if not rest:
+            return ""
+        if label == "proof":
+            return f"proof noted {rest}"
+        return rest
+    return text
 
 
 def _compose_named_task_selection_rationale_answer(*, task_id: str, opened: list[dict]) -> str | None:
