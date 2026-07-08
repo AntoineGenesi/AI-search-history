@@ -4134,6 +4134,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "orchestration_provenance",
         "provenance",
         "remembered_user_wording",
+        "semantic_wrapup",
         "semantic_debug",
     }
 )
@@ -5417,9 +5418,13 @@ def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
     deduped: list[dict] = []
     seen: dict[tuple[str, str, str], dict] = {}
     for item in refs:
+        source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+        source_target = ""
+        if source_ref:
+            source_target = f"{source_ref.get('path') or ''}:{source_ref.get('line') or ''}"
         key = (
             str(item.get("kind") or ""),
-            str(item.get("target") or item.get("path") or item.get("command") or ""),
+            str(item.get("target") or item.get("path") or item.get("command") or source_target),
             str(item.get("proof_surface") or ""),
         )
         if key in seen:
@@ -5791,9 +5796,135 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_named_task_answer(query=query, named=named, opened=opened)
     if route_family == "remembered_user_wording":
         return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
+    if route_family == "semantic_wrapup":
+        return _compose_semantic_wrapup_corrections_answer(query=query, action=action, opened=opened)
     if route_family in {"action_proof", "expectation_mismatch", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_semantic_wrapup_corrections_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
+    failure_modes = [item for item in action.get("failure_modes") or [] if isinstance(item, dict)]
+    suggestions = {
+        str(item.get("failure_mode") or ""): item
+        for item in action.get("fix_suggestions") or []
+        if isinstance(item, dict)
+    }
+    if not failure_modes or not suggestions:
+        return None
+    opened_by_ref = _semantic_wrapup_opened_by_source_ref(opened)
+    clusters: list[str] = []
+    for mode in failure_modes[:7]:
+        key = str(mode.get("failure_mode") or "")
+        suggestion = suggestions.get(key) or {}
+        refs = _semantic_wrapup_cluster_source_refs(mode=mode, suggestion=suggestion)
+        proof_summaries = [
+            opened_by_ref[ref_key]
+            for ref in refs
+            for ref_key in [_semantic_wrapup_ref_key(ref)]
+            if ref_key in opened_by_ref
+        ][:2]
+        correction = _semantic_wrapup_human_correction(mode=mode, suggestion=suggestion)
+        family = _semantic_wrapup_affected_family(mode=mode, suggestion=suggestion)
+        fix = str(
+            suggestion.get("doable_suggested_fix")
+            or suggestion.get("proposed_action")
+            or mode.get("why_it_matters")
+            or "Preserve this correction as a source-backed product-fix candidate."
+        ).strip()
+        ref_text = ", ".join(_semantic_wrapup_source_ref_text(ref) for ref in refs[:3])
+        proof_text = _short_join(proof_summaries, limit=280) if proof_summaries else "proof opened from required_primary_proof refs"
+        clusters.append(
+            f"{len(clusters) + 1}. Correction: {correction} "
+            f"Affects: {family}. Likely product fix: {fix} "
+            f"Sources: {ref_text}. Proof: {proof_text}"
+        )
+    if not clusters:
+        return None
+    scope = "historical" if "histor" in query.casefold() else "current-session"
+    return (
+        f"Semantic-wrapup found {len(clusters)} source-backed {scope} correction cluster(s). "
+        "These are product-fix candidates, not auto-applied tasks or all-history completeness claims. "
+        + " ".join(clusters)
+    )
+
+
+def _semantic_wrapup_opened_by_source_ref(opened: list[dict]) -> dict[str, str]:
+    by_ref: dict[str, str] = {}
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+        key = _semantic_wrapup_ref_key(source_ref)
+        summary = str(item.get("summary") or "").strip()
+        if key and summary and key not in by_ref:
+            by_ref[key] = summary
+    return by_ref
+
+
+def _semantic_wrapup_cluster_source_refs(*, mode: dict, suggestion: dict) -> list[dict]:
+    refs: list[dict] = []
+    for group in (
+        mode.get("source_refs"),
+        (mode.get("cause_chain") or {}).get("evidence_refs") if isinstance(mode.get("cause_chain"), dict) else None,
+        suggestion.get("source_refs"),
+        suggestion.get("evidence_refs"),
+    ):
+        for item in group if isinstance(group, list) else []:
+            if isinstance(item, dict) and _semantic_wrapup_ref_key(item):
+                refs.append(item)
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for ref in refs:
+        key = _semantic_wrapup_ref_key(ref)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(ref)
+    return deduped
+
+
+def _semantic_wrapup_human_correction(*, mode: dict, suggestion: dict) -> str:
+    examples = mode.get("examples") or suggestion.get("examples") or []
+    for example in examples:
+        if isinstance(example, dict) and str(example.get("snippet") or "").strip():
+            return _short_join([str(example["snippet"]).strip()], limit=180)
+    title = str(mode.get("title") or mode.get("failure_mode") or "Repeated correction").strip()
+    return title.replace("_", " ")
+
+
+def _semantic_wrapup_affected_family(*, mode: dict, suggestion: dict) -> str:
+    failure_mode = str(mode.get("failure_mode") or suggestion.get("failure_mode") or "").casefold()
+    issue_axis = str(mode.get("issue_axis") or suggestion.get("issue_axis") or "").casefold()
+    fix_type = str(suggestion.get("fix_type") or "").casefold()
+    text = " ".join([failure_mode, issue_axis, fix_type])
+    if "false_user_quote" in text or "misattribution" in text:
+        return "When did I say X? / remembered-user-wording proof"
+    if "retrieval" in text or "raw_trace" in text or "action-proof" in text:
+        return "Did the agent actually do X or only claim it? / semantic-debug action proof"
+    if "pre_compaction" in text or "handoff" in text or "memory" in text:
+        return "What happened since my last real instruction / work-episode handoff"
+    if "router" in text:
+        return "Which work episode/source route proves this? / ask routing"
+    if "raw_local" in text or "source" in text or "privacy" in text:
+        return "Which source session/task/review/commit proves this? / source refs"
+    if "agent_rules" in text or "skill" in text:
+        return "What did I keep correcting? / semantic-wrapup agent-rule fixes"
+    return "What did I keep correcting? / semantic-wrapup correction mining"
+
+
+def _semantic_wrapup_ref_key(ref: dict) -> str:
+    path = str(ref.get("path") or "").strip()
+    line = ref.get("line")
+    if not path:
+        return ""
+    return f"{path}:{line or ''}"
+
+
+def _semantic_wrapup_source_ref_text(ref: dict) -> str:
+    path = str(ref.get("path") or "").strip()
+    line = ref.get("line")
+    if not path:
+        return "(unknown source)"
+    return f"{path}:{line}" if line else path
 
 
 def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -> str:
