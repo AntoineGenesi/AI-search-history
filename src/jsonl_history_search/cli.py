@@ -4766,6 +4766,7 @@ def _work_episode_json_refs(
     if not isinstance(data, dict):
         data = {}
     primary_join_allowed = _work_episode_json_primary_joins_allowed(data, hints=hints)
+    same_entity_join_ids = _work_episode_json_primary_entity_ids(data) if primary_join_allowed else []
     if primary_join_allowed:
         for lead in _work_episode_json_primary_leads(data):
             primary.extend(
@@ -4776,6 +4777,7 @@ def _work_episode_json_refs(
                     cwd=cwd,
                     hints=hints,
                     parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
                 )
             )
         if not primary:
@@ -4787,6 +4789,7 @@ def _work_episode_json_refs(
                     cwd=cwd,
                     hints=hints,
                     parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
                 )
             )
     if primary_join_allowed and not primary and _work_episode_json_is_branch_diff_episode(data):
@@ -4804,6 +4807,7 @@ def _work_episode_json_refs(
                     cwd=cwd,
                     hints=hints,
                     parent_match=match,
+                    same_entity_join_ids=same_entity_join_ids,
                 )
             )
     secondary.append(
@@ -4916,6 +4920,7 @@ def _work_episode_refs_for_lead(
     cwd: Path,
     hints: dict,
     parent_match: dict,
+    same_entity_join_ids: list[str] | None = None,
 ) -> list[dict]:
     refs: list[dict] = []
     lead_text = lead.casefold()
@@ -4935,6 +4940,7 @@ def _work_episode_refs_for_lead(
                         proof_surface=_work_episode_path_proof_surface(path, text),
                         reason=f"primary evidence lead from {origin.name}: {lead}",
                         match=match,
+                        same_entity_join_ids=same_entity_join_ids,
                     )
                 )
     if refs:
@@ -4949,6 +4955,7 @@ def _work_episode_refs_for_lead(
         cwd=cwd,
         hints=hints,
         parent_match=parent_match,
+        same_entity_join_ids=same_entity_join_ids,
     )
 
 
@@ -4960,6 +4967,7 @@ def _work_episode_refs_by_shared_handles(
     cwd: Path,
     hints: dict,
     parent_match: dict,
+    same_entity_join_ids: list[str] | None = None,
 ) -> list[dict]:
     refs: list[dict] = []
     normalized_handles = [handle.casefold() for handle in handles if len(str(handle).strip()) >= 2]
@@ -4980,6 +4988,7 @@ def _work_episode_refs_by_shared_handles(
                 proof_surface=_work_episode_path_proof_surface(path, text),
                 reason=f"primary evidence joined from local artifact handles in {origin.name}",
                 match=child_match if child_match["accepted"] else parent_match,
+                same_entity_join_ids=same_entity_join_ids,
             )
         )
     return refs
@@ -5034,6 +5043,7 @@ def _work_episode_ref(
     match: dict,
     line: int | None = None,
     final_support_allowed: bool = True,
+    same_entity_join_ids: list[str] | None = None,
 ) -> dict:
     rel = _safe_relative_path(cwd, path)
     target = f"{rel}:{line}" if line else rel
@@ -5057,6 +5067,11 @@ def _work_episode_ref(
             "matched_rare_tokens": match.get("matched_rare_tokens"),
             "matched_dates": match.get("matched_dates"),
         },
+        "work_episode_same_entity_join_ids": [
+            str(value).casefold()
+            for value in (same_entity_join_ids or [])
+            if str(value).strip()
+        ],
         "source_boundary": (
             "primary behavior proof for the matched work episode"
             if final_support_allowed
@@ -5212,6 +5227,10 @@ def _select_work_episode_opened_for_answer(
     rejected: list[dict] = []
     for item in opened:
         ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        explicit_id_gate = _work_episode_explicit_id_gate(item, hints)
+        if not explicit_id_gate.get("allowed"):
+            rejected.append(_ref_public_summary(item))
+            continue
         match = ref.get("work_episode_match") if isinstance(ref.get("work_episode_match"), dict) else {}
         accepted_by_ref = bool(
             match.get("accepted")
@@ -5254,11 +5273,62 @@ def _select_work_episode_opened_for_answer(
             f"{item.get('target')}: did not match query episode anchors"
             for item in rejected[:_ASK_ANSWER_MAX_REFS]
         ],
-        "next_required_proof": (
-            "Open raw tool/file-edit/diff/test/commit evidence that matches the query episode anchors; "
-            "do not answer from unrelated action-proof refs."
-        ),
+        "next_required_proof": _work_episode_rejected_next_required_proof(hints),
     }
+
+
+def _work_episode_rejected_next_required_proof(hints: dict) -> str:
+    ids = _work_episode_public_hints(hints).get("ids") or []
+    explicit_id_clause = (
+        f" for explicit ids, the primary proof must contain or join to {', '.join(ids)};"
+        if ids
+        else ""
+    )
+    return (
+        "Open raw tool/file-edit/diff/test/commit evidence that matches the query episode anchors;"
+        f"{explicit_id_clause} do not answer from unrelated action-proof refs."
+    )
+
+
+def _work_episode_explicit_id_gate(item: dict, hints: dict) -> dict:
+    query_ids = {
+        str(value).casefold()
+        for value in hints.get("ids") or []
+        if str(value).strip()
+    }
+    if not query_ids:
+        return {"allowed": True, "reason": "no_explicit_query_id"}
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    join_ids = {
+        str(value).casefold()
+        for value in ref.get("work_episode_same_entity_join_ids") or []
+        if str(value).strip()
+    }
+    if query_ids.intersection(join_ids):
+        return {"allowed": True, "reason": "same_entity_join_id"}
+    primary_match = _work_episode_text_match(_work_episode_opened_primary_text(item, ref), hints)
+    if primary_match.get("matched_ids"):
+        return {"allowed": True, "reason": "primary_text_contains_explicit_id", "match": primary_match}
+    return {
+        "allowed": False,
+        "reason": "primary_proof_missing_explicit_query_id",
+        "required_ids": sorted(query_ids),
+    }
+
+
+def _work_episode_opened_primary_text(item: dict, ref: dict) -> str:
+    return " ".join(
+        str(value)
+        for value in (
+            item.get("target"),
+            item.get("summary"),
+            ref.get("target"),
+            ref.get("path"),
+            ref.get("reason"),
+            ref.get("proof_surface"),
+        )
+        if value
+    )
 
 
 def _work_episode_public_hints(hints: dict) -> dict:
@@ -5317,7 +5387,7 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
 
 def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
     deduped: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: dict[tuple[str, str, str], dict] = {}
     for item in refs:
         key = (
             str(item.get("kind") or ""),
@@ -5325,10 +5395,30 @@ def _dedupe_ask_answer_proof_refs(refs: list[dict]) -> list[dict]:
             str(item.get("proof_surface") or ""),
         )
         if key in seen:
+            _merge_work_episode_ref_metadata(seen[key], item)
             continue
-        seen.add(key)
+        seen[key] = item
         deduped.append(item)
     return deduped[:_ASK_ANSWER_MAX_REFS]
+
+
+def _merge_work_episode_ref_metadata(existing: dict, incoming: dict) -> None:
+    existing_join_ids = [
+        str(value).casefold()
+        for value in existing.get("work_episode_same_entity_join_ids") or []
+        if str(value).strip()
+    ]
+    for value in incoming.get("work_episode_same_entity_join_ids") or []:
+        normalized = str(value).casefold()
+        if normalized.strip() and normalized not in existing_join_ids:
+            existing_join_ids.append(normalized)
+    if existing_join_ids:
+        existing["work_episode_same_entity_join_ids"] = existing_join_ids
+
+    existing_match = existing.get("work_episode_match") if isinstance(existing.get("work_episode_match"), dict) else {}
+    incoming_match = incoming.get("work_episode_match") if isinstance(incoming.get("work_episode_match"), dict) else {}
+    if int(incoming_match.get("score") or 0) > int(existing_match.get("score") or 0):
+        existing["work_episode_match"] = incoming_match
 
 
 def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
