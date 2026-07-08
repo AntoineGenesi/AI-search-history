@@ -1828,6 +1828,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "route_family": route.get("route_family"),
         "first_action_category": route.get("first_action_category"),
         "why_it_applies": route.get("why_it_applies"),
+        "structured_execution_query": route.get("structured_execution_query"),
         "first_command": route.get("first_command"),
         "explicit_source_root_count": len(getattr(args, "root", []) or []),
         "read_specialization": route.get("read_specialization"),
@@ -1851,6 +1852,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
                     "no-evidence-report",
                     "devlog-failure-analysis",
                     "coordinator-context",
+                    "semantic-wrapup",
                 ],
                 "command_family": None,
                 "argv": [],
@@ -1873,7 +1875,12 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         return contract
 
     report_output = _ask_execute_report_output(args, execution_kind)
-    execution_args = _execution_args_from_ask(args, command=execution_kind, report_output=report_output)
+    execution_args = _execution_args_from_ask(
+        args,
+        command=execution_kind,
+        report_output=report_output,
+        query=route.get("structured_execution_query") or args.query,
+    )
     if execution_kind == "what-happened-since":
         executed_payload = _build_status_anchor_report_output_payload(execution_args)
         output_key = "status_anchor"
@@ -1886,6 +1893,9 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     elif execution_kind == "coordinator-context":
         executed_payload = _build_coordinator_context_report_output_payload(execution_args)
         output_key = "coordinator_context"
+    elif execution_kind == "semantic-wrapup":
+        executed_payload = _build_semantic_wrapup_report_output_payload(execution_args)
+        output_key = "semantic_wrapup"
     else:
         executed_payload = _build_devlog_failure_analysis_report_output_payload(execution_args)
         output_key = "devlog_failure_analysis"
@@ -1921,12 +1931,18 @@ def _ask_execute_report_output(args: argparse.Namespace, execution_kind: str) ->
     return str(path)
 
 
-def _execution_args_from_ask(args: argparse.Namespace, *, command: str, report_output: str) -> argparse.Namespace:
+def _execution_args_from_ask(
+    args: argparse.Namespace,
+    *,
+    command: str,
+    report_output: str,
+    query: str | None = None,
+) -> argparse.Namespace:
     values = vars(args).copy()
     values.update(
         {
             "command": command,
-            "query": args.query,
+            "query": query if query is not None else args.query,
             "format": "json",
             "report_output": report_output,
         }
@@ -2062,6 +2078,26 @@ def _build_status_anchor_report_output_payload(args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
     return {"status_anchor": compact}
+
+
+def _build_semantic_wrapup_report_output_payload(args: argparse.Namespace) -> dict:
+    from .semantic_wrapup import build_semantic_wrapup_payload
+
+    source_plan, _intent, plan = payload_from_args(args)
+    payload = build_semantic_wrapup_payload(
+        query=args.query,
+        source_plan=source_plan,
+        plan=plan,
+        default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        cwd=Path(args.cwd).expanduser().resolve(),
+        mask_context=_mask_context_from_args(args),
+        output_format="json",
+        report_output=args.report_output,
+    )
+    compact = payload["semantic_wrapup"]
+    compact["report_written"] = args.report_output
+    Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+    return {"semantic_wrapup": compact}
 
 
 def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespace) -> dict:
@@ -3447,6 +3483,59 @@ def _answer_action_contract_from_executed_output(
             )
             contract["stop"] = named_task_action_proof.get("stop") or contract["stop"]
         return contract
+    if output_key == "semantic_wrapup":
+        answer_ready = compact.get("answer_ready_contract") or {}
+        answer_use = compact.get("answer_use_contract") or {}
+        read_role_summary = compact.get("read_role_summary") or {}
+        next_reads = list(compact.get("next_reads") or [])
+        required_primary_reads = [
+            read
+            for read in next_reads
+            if isinstance(read, dict) and read.get("read_role") == "required_primary_proof"
+        ]
+        answer_status = (
+            "semantic-wrapup-ready-after-required-primary-proof"
+            if answer_ready.get("answer_ready") is True
+            else "not-ready/needs-more-proof"
+        )
+        return {
+            "answer_status": answer_status,
+            "promotion_status": "unpromoted_semantic_wrapup_execution",
+            "promotion_reason": (
+                "ask --execute semantic-wrapup is a source-backed evidence handoff, "
+                "not a final answer oracle; inspect required_primary_proof refs first."
+            ),
+            "internal_answer_status": compact.get("status"),
+            "read": required_primary_reads or next_reads[:6],
+            "then_use": {
+                "failure_modes": "semantic_wrapup.failure_modes",
+                "fix_suggestions": "semantic_wrapup.fix_suggestions",
+                "required_primary_proof": "semantic_wrapup.next_reads[read_role=required_primary_proof]",
+                "answer_ready_contract": "semantic_wrapup.answer_ready_contract",
+                "answer_use_contract": "semantic_wrapup.answer_use_contract",
+            },
+            "failure_modes": (compact.get("failure_modes") or [])[:5],
+            "fix_suggestions": (compact.get("fix_suggestions") or [])[:5],
+            "read_role_summary": read_role_summary,
+            "source_inspection_boundary": {
+                "inspect_required_primary_proof_before_answer": True,
+                "optional_diagnostics_default_actionable": False,
+                "source_use_required": answer_ready.get("source_use_required")
+                or answer_use.get("source_use_required"),
+                "stop_guidance": answer_ready.get("stop_guidance") or answer_use.get("stop_guidance"),
+            },
+            "diagnostics_after": [
+                read
+                for read in next_reads
+                if isinstance(read, dict) and read.get("read_role") != "required_primary_proof"
+            ][:5],
+            "stop": answer_ready.get("stop_guidance")
+            or answer_use.get("stop_guidance")
+            or selected_route.get("stop_guidance"),
+            "only_continue_if": selected_route.get("manual_search_guidance"),
+            "saved_report": compact.get("report_written")
+            or (compact.get("context_budget") or {}).get("report_written"),
+        }
     if _promotable_bounded_no_evidence_contract(compact=compact, selected_route=selected_route):
         return {
             "answer_status": "answer-scoped-no-evidence-now",
@@ -3807,6 +3896,42 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "message": (
                 "Full devlog/failure-analysis source-reach package written to report_output; "
                 "open target historical source-window reads before current/adjacent diagnostics."
+            ),
+        }
+    if output_key == "semantic_wrapup":
+        next_reads = list(compact.get("next_reads") or [])
+        required_primary_reads = [
+            read
+            for read in next_reads
+            if isinstance(read, dict) and read.get("read_role") == "required_primary_proof"
+        ]
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "query": compact.get("query"),
+            "route": compact.get("route"),
+            "report_written": compact.get("report_written")
+            or (compact.get("context_budget") or {}).get("report_written"),
+            "summary": compact.get("summary"),
+            "scope_resolution": compact.get("scope_resolution"),
+            "answer_ready_contract": compact.get("answer_ready_contract"),
+            "answer_use_contract": compact.get("answer_use_contract"),
+            "read_role_summary": compact.get("read_role_summary"),
+            "required_primary_proof": required_primary_reads[:6],
+            "next_reads": next_reads[:8],
+            "failure_modes": (compact.get("failure_modes") or [])[:5],
+            "fix_suggestions": (compact.get("fix_suggestions") or [])[:5],
+            "source_inspection_boundary": {
+                "inspect_required_primary_proof_before_answer": True,
+                "optional_diagnostics_default_actionable": False,
+                "source_use_required": (compact.get("answer_ready_contract") or {}).get("source_use_required")
+                or (compact.get("answer_use_contract") or {}).get("source_use_required"),
+                "stop_guidance": (compact.get("answer_ready_contract") or {}).get("stop_guidance")
+                or (compact.get("answer_use_contract") or {}).get("stop_guidance"),
+            },
+            "message": (
+                "Semantic-wrapup executed. Inspect failure_modes, fix_suggestions, "
+                "and required_primary_proof refs before answering or proposing fixes."
             ),
         }
     if output_key == "semantic_debug":

@@ -367,6 +367,8 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append(f"Executed output status: {executed.get('status')}")
     if executed.get("message"):
         lines.append(f"Executed output: {executed.get('message')}")
+    if route.get("route_family") == "semantic_wrapup":
+        _append_semantic_wrapup_execute_text(lines, executed, action)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_text(lines, executed, action)
     return "\n".join(lines)
@@ -412,9 +414,112 @@ def render_ask_execute_markdown(payload: dict) -> str:
     else:
         lines.append("- Read/action:")
         _append_compact_read_contract(lines, action.get("read"), markdown=True)
+    if route.get("route_family") == "semantic_wrapup":
+        _append_semantic_wrapup_execute_markdown(lines, report.get("executed_output") or {}, action)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_markdown(lines, report.get("executed_output") or {}, action)
     return "\n".join(lines)
+
+
+def _append_semantic_wrapup_execute_text(lines: list[str], executed: dict, action: dict) -> None:
+    lines.append("Semantic-wrapup evidence handoff:")
+    lines.append(f"- saved_report: {action.get('saved_report') or executed.get('report_written')}")
+    boundary = action.get("source_inspection_boundary") or executed.get("source_inspection_boundary") or {}
+    if boundary:
+        lines.append(
+            "- source_inspection_boundary: "
+            f"inspect_required_primary_proof_before_answer="
+            f"{boundary.get('inspect_required_primary_proof_before_answer')} "
+            f"optional_diagnostics_default_actionable={boundary.get('optional_diagnostics_default_actionable')}"
+        )
+    read_summary = executed.get("read_role_summary") or action.get("read_role_summary") or {}
+    if read_summary:
+        lines.append(
+            "- read_role_summary: "
+            f"required_primary_proof={read_summary.get('required_primary_proof_count')} "
+            f"optional_diagnostic={read_summary.get('optional_diagnostic_count')} "
+            f"conditional_required={read_summary.get('conditional_required_count')}"
+        )
+    _append_semantic_wrapup_failure_modes(lines, action.get("failure_modes") or executed.get("failure_modes"))
+    _append_semantic_wrapup_fix_suggestions(lines, action.get("fix_suggestions") or executed.get("fix_suggestions"))
+    lines.append("- required_primary_proof:")
+    _append_compact_read_contract(
+        lines,
+        executed.get("required_primary_proof") or action.get("read"),
+    )
+    diagnostics = action.get("diagnostics_after")
+    if diagnostics:
+        lines.append("- diagnostics_after:")
+        _append_compact_read_contract(lines, diagnostics)
+
+
+def _append_semantic_wrapup_execute_markdown(lines: list[str], executed: dict, action: dict) -> None:
+    lines.extend(["", "## Semantic-Wrapup Evidence Handoff", ""])
+    lines.append(f"- Saved report: `{action.get('saved_report') or executed.get('report_written')}`")
+    boundary = action.get("source_inspection_boundary") or executed.get("source_inspection_boundary") or {}
+    if boundary:
+        lines.append(
+            "- Source inspection boundary: "
+            f"`inspect_required_primary_proof_before_answer="
+            f"{boundary.get('inspect_required_primary_proof_before_answer')}`, "
+            f"`optional_diagnostics_default_actionable={boundary.get('optional_diagnostics_default_actionable')}`"
+        )
+    read_summary = executed.get("read_role_summary") or action.get("read_role_summary") or {}
+    if read_summary:
+        lines.append(
+            "- Read role summary: "
+            f"`required_primary_proof={read_summary.get('required_primary_proof_count')}`, "
+            f"`optional_diagnostic={read_summary.get('optional_diagnostic_count')}`, "
+            f"`conditional_required={read_summary.get('conditional_required_count')}`"
+        )
+    _append_semantic_wrapup_failure_modes(lines, action.get("failure_modes") or executed.get("failure_modes"))
+    _append_semantic_wrapup_fix_suggestions(lines, action.get("fix_suggestions") or executed.get("fix_suggestions"))
+    lines.append("- Required primary proof:")
+    _append_compact_read_contract(
+        lines,
+        executed.get("required_primary_proof") or action.get("read"),
+        markdown=True,
+    )
+    diagnostics = action.get("diagnostics_after")
+    if diagnostics:
+        lines.append("- Diagnostics after:")
+        _append_compact_read_contract(lines, diagnostics, markdown=True)
+
+
+def _append_semantic_wrapup_failure_modes(lines: list[str], modes: object) -> None:
+    lines.append("- failure_modes:")
+    if not isinstance(modes, list) or not modes:
+        lines.append("  - none")
+        return
+    for mode in modes[:5]:
+        if not isinstance(mode, dict):
+            lines.append(f"  - {mode}")
+            continue
+        label = mode.get("failure_mode") or mode.get("title") or "(unknown)"
+        title = mode.get("title")
+        count = mode.get("evidence_count")
+        rendered = f"{label}"
+        if title and title != label:
+            rendered = f"{rendered} - {title}"
+        if count is not None:
+            rendered = f"{rendered} (evidence_count={count})"
+        lines.append(f"  - {rendered}")
+
+
+def _append_semantic_wrapup_fix_suggestions(lines: list[str], suggestions: object) -> None:
+    lines.append("- fix_suggestions:")
+    if not isinstance(suggestions, list) or not suggestions:
+        lines.append("  - none")
+        return
+    for suggestion in suggestions[:5]:
+        if not isinstance(suggestion, dict):
+            lines.append(f"  - {suggestion}")
+            continue
+        suggestion_id = suggestion.get("suggestion_id") or "(suggestion)"
+        failure_mode = suggestion.get("failure_mode") or suggestion.get("issue_family") or "(unknown)"
+        action = suggestion.get("proposed_action") or suggestion.get("doable_suggested_fix") or ""
+        suffix = f" - {action}" if action else ""
+        lines.append(f"  - {suggestion_id}: {failure_mode}{suffix}")
 
 
 def _append_coordinator_context_text(lines: list[str], executed: dict, action: dict) -> None:
@@ -631,8 +736,9 @@ def _append_compact_read_contract(lines: list[str], value: object, *, markdown: 
             if isinstance(item, dict):
                 command = item.get("command")
                 target = item.get("target")
+                source_target = _source_target(item)
                 reason = item.get("reason") or item.get("purpose")
-                rendered = command or target or reason or str(item)
+                rendered = command or target or source_target or reason or str(item)
                 lines.append(f"{bullet}{rendered}")
             else:
                 lines.append(f"{bullet}{item}")

@@ -24,6 +24,7 @@ EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_a
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
 EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"coordinator_context"})
 EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
+EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 
 
@@ -38,12 +39,13 @@ class AskRoute:
     stop_guidance: str
     manual_search_guidance: str
 
+    def command_query(self, query: str) -> str:
+        if self.route_family == "semantic_wrapup":
+            return _semantic_wrapup_first_command_query(query)
+        return query
+
     def first_command(self, query: str) -> str:
-        command_query = (
-            _semantic_wrapup_first_command_query(query)
-            if self.route_family == "semantic_wrapup"
-            else query
-        )
+        command_query = self.command_query(query)
         escaped = command_query.replace('"', '\\"')
         skill = _skill_name_from_query(query)
         return self.first_command_template.format(query=escaped, skill=skill)
@@ -626,6 +628,7 @@ ROUTES: tuple[AskRoute, ...] = (
 
 def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
+    structured_execution_query = route.command_query(query)
     first_command = route.first_command(query)
     first_action_category = (
         "filesystem_inventory" if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY else "route_command"
@@ -639,6 +642,7 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "route_family": route.route_family,
             "first_action_category": first_action_category,
             "why_it_applies": route.why_it_applies,
+            "structured_execution_query": structured_execution_query,
             "first_command": first_command,
             "next_commands": ask_next_commands(
                 selected_first_command=first_command,
@@ -668,6 +672,8 @@ def execution_kind_for_route_family(route_family: str) -> str | None:
         return "semantic-debug"
     if route_family in EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES:
         return "no-evidence-report"
+    if route_family in EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES:
+        return "semantic-wrapup"
     return None
 
 
