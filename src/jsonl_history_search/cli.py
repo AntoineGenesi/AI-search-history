@@ -3243,7 +3243,33 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
     return payload
 
 
-_ASK_EXECUTE_TASK_ID_RE = re.compile(r"\b([A-Z]{2,12})[- ]?(\d{1,6})\b", re.IGNORECASE)
+_ASK_EXECUTE_TASK_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,11})-(\d{1,6})\b", re.IGNORECASE)
+_ASK_EXECUTE_TASK_ID_MONTH_PREFIXES = {
+    "JAN",
+    "JANUARY",
+    "FEB",
+    "FEBRUARY",
+    "MAR",
+    "MARCH",
+    "APR",
+    "APRIL",
+    "MAY",
+    "JUN",
+    "JUNE",
+    "JUL",
+    "JULY",
+    "AUG",
+    "AUGUST",
+    "SEP",
+    "SEPT",
+    "SEPTEMBER",
+    "OCT",
+    "OCTOBER",
+    "NOV",
+    "NOVEMBER",
+    "DEC",
+    "DECEMBER",
+}
 
 
 def _answer_action_contract_from_executed_output(
@@ -3528,7 +3554,10 @@ def _named_task_action_proof_handoff(*, query: str, cwd: str, route_family: str)
 def _ask_execute_named_task_ids(query: str) -> list[str]:
     task_ids: list[str] = []
     for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or ""):
-        task_id = f"{match.group(1).upper()}-{int(match.group(2))}"
+        prefix = match.group(1).upper()
+        if prefix in _ASK_EXECUTE_TASK_ID_MONTH_PREFIXES:
+            continue
+        task_id = f"{prefix}-{int(match.group(2))}"
         if task_id not in task_ids:
             task_ids.append(task_id)
     return task_ids
