@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ from .compact_handoff_usefulness import (
     render_compact_handoff_answer_use_markdown,
     render_compact_handoff_usefulness_markdown,
 )
+from .conversation_records import classify_conversation_record
 from .coordinator_context import build_coordinator_context_payload
 from .source_tier_answer_use import (
     DEFAULT_FIXTURE as DEFAULT_SOURCE_TIER_ANSWER_USE_FIXTURE,
@@ -222,6 +224,14 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         help=(
             "Execute the selected route only when it is an allow-listed JSONL "
             "semantic-debug or no-evidence route; unsupported routes return a fail-closed contract."
+        ),
+    )
+    ask.add_argument(
+        "--answer",
+        action="store_true",
+        help=(
+            "Execute the selected safe route, inspect bounded proof refs from the "
+            "answer contract, and return a concise source-backed answer when supported."
         ),
     )
     ask.add_argument(
@@ -4114,6 +4124,669 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
     }
 
 
+_ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
+    {
+        "action_proof",
+        "bounded_no_evidence",
+        "expectation_mismatch",
+        "orchestration_provenance",
+        "provenance",
+        "remembered_user_wording",
+        "semantic_debug",
+    }
+)
+_ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
+    {
+        "not-ready/needs-more-proof",
+        "not-ready/missing-current-named-task-proof",
+        "inspect_recovery_first",
+        "needs_investigation",
+    }
+)
+_ASK_ANSWER_MAX_REFS = 6
+_ASK_ANSWER_MAX_LINE_CHARS = 900
+_ASK_ANSWER_MAX_FILE_CHARS = 1200
+_REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
+    "work only in this existing worktree",
+    "exact finding to fix",
+    "coordinator live smoke",
+    "command run from task worktree",
+    "do not edit product code",
+    "do not edit the parent checkout",
+    "current branch includes implementation commit",
+    "partial review commit",
+    "observed command:",
+    "observed answer:",
+)
+_REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
+    r"\byou are the\b.{0,120}\b(implementer|reviewer|worker|coordinator)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
+    execute_args = args
+    if route_payload["ask_router"].get("route_family") == "bounded_no_evidence":
+        execute_args = _args_with_bounded_auto_execute_prompt_scope(args)
+    execute_payload = _run_ask_execute(execute_args, cwd=cwd, route_payload=route_payload)
+    return _ask_answer_from_execute(execute_payload, cwd=Path(cwd).expanduser().resolve())
+
+
+def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
+    report = execute_payload.get("ask_execute") or {}
+    route = report.get("selected_route") or {}
+    execution = report.get("execution") or {}
+    action = report.get("answer_action_contract") or {}
+    route_family = str(route.get("route_family") or "")
+    base = {
+        "ask_answer": {
+            "schema_version": "ask_answer_proof_followthrough.v1",
+            "query": report.get("query"),
+            "cwd": str(cwd),
+            "selected_route": route,
+            "execution": execution,
+            "answer_status": "cannot-answer-directly-yet",
+            "answer": None,
+            "refs_used": [],
+            "proof_summary": [],
+            "fail_closed_reason": None,
+            "next_proof_step": None,
+            "source_contract": {
+                "built_from": "ask_execute.answer_action_contract",
+                "answer_action_status": action.get("answer_status"),
+                "promotion_status": action.get("promotion_status"),
+                "saved_report": action.get("saved_report") or execution.get("report_written"),
+            },
+        }
+    }
+    answer = base["ask_answer"]
+
+    if execution.get("status") != "executed":
+        return _ask_answer_fail_closed(
+            answer,
+            "selected route is not supported by the safe ask --execute allow-list",
+            route.get("first_command") or route.get("stop_guidance"),
+        )
+    if route_family not in _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES:
+        return _ask_answer_fail_closed(
+            answer,
+            f"route family {route_family or '(unknown)'} is not supported by ask --answer MVP",
+            route.get("stop_guidance") or route.get("manual_search_guidance"),
+        )
+
+    scoped = action.get("scoped_no_evidence_contract")
+    if action.get("answer_status") == "answer-scoped-no-evidence-now" and isinstance(scoped, dict):
+        return _ask_answer_scoped_no_evidence(answer, scoped)
+
+    can_follow_raw_proof = _ask_answer_can_follow_raw_proof_despite_status(
+        action=action,
+        route_family=route_family,
+    )
+    if action.get("answer_status") in _ASK_ANSWER_EXPLICIT_FAIL_STATUSES and not can_follow_raw_proof:
+        return _ask_answer_fail_closed(
+            answer,
+            f"ask --execute contract is {action.get('answer_status')}",
+            _next_proof_step_from_action(action),
+        )
+
+    proof_refs = _collect_ask_answer_proof_refs(action)
+    opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
+    usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
+    if not usable:
+        return _ask_answer_fail_closed(
+            answer,
+            "answer contract did not expose readable local proof refs",
+            _next_proof_step_from_action(action),
+        )
+
+    answer_opened = usable
+    if route_family == "remembered_user_wording":
+        user_opened = _remembered_user_wording_user_authored_opened(usable)
+        if not user_opened:
+            answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
+            return _ask_answer_fail_closed(
+                answer,
+                "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
+                {
+                    "required_next_proof": "raw user-authored message ref",
+                    "suggested_action": (
+                        "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                        "do not answer from tool output, function_call_output, assistant, task, or current-run echo rows"
+                    ),
+                    "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
+                },
+            )
+        answer_opened = _remembered_user_wording_non_echo_user_opened(
+            user_opened,
+            query=str(report.get("query") or ""),
+        )
+        if not answer_opened:
+            answer["proof_summary"] = _prompt_echo_opened_ref_summaries(user_opened, query=str(report.get("query") or ""))
+            return _ask_answer_fail_closed(
+                answer,
+                "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                {
+                    "required_next_proof": "raw user-authored non-echo message ref",
+                    "suggested_action": (
+                        "inspect older user-message refs that state the target wording directly; do not answer from "
+                        "current assignment, review, test, command-quoting, or prompt-echo rows"
+                    ),
+                    "rejected_user_prompt_echo_refs": [
+                        _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
+                        for item in user_opened
+                    ],
+                },
+            )
+
+    answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
+    answer["proof_summary"] = [item["summary"] for item in answer_opened]
+
+    direct_answer = _compose_ask_answer(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        action=action,
+        opened=answer_opened,
+    )
+    if not direct_answer:
+        return _ask_answer_fail_closed(
+            answer,
+            "opened proof refs do not match a supported direct-answer family",
+            _next_proof_step_from_action(action),
+        )
+    answer["answer_status"] = "answered-from-proof"
+    answer["answer"] = direct_answer
+    return base
+
+
+def _ask_answer_fail_closed(answer: dict, reason: str, next_step: object) -> dict:
+    answer["answer_status"] = "cannot-answer-directly-yet"
+    answer["fail_closed_reason"] = reason
+    answer["next_proof_step"] = next_step
+    return {"ask_answer": answer}
+
+
+def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
+    searched_files = scoped.get("searched_files")
+    searched_bytes = scoped.get("searched_bytes")
+    candidate_interpretation = scoped.get("candidate_interpretation")
+    if candidate_interpretation == "claim_boundary_non_support":
+        text = (
+            "No searched-scope support was found for the stronger claim. The found material is "
+            "classified as claim-boundary/non-support, so the answer is scoped no-support, not "
+            "all-history absence."
+        )
+    else:
+        text = (
+            "No evidence was found in the searched scope. This is a searched-scope answer only, "
+            "not all-history absence."
+        )
+    text += f" Scope searched: {searched_files} files, {searched_bytes} bytes."
+    answer["answer_status"] = "answered-from-scoped-no-evidence-contract"
+    answer["answer"] = text
+    answer["refs_used"] = [
+        {
+            "kind": "scoped_no_evidence_contract",
+            "answer_scope": scoped.get("answer_scope"),
+            "searched_files": searched_files,
+            "searched_bytes": searched_bytes,
+            "candidate_interpretation": candidate_interpretation,
+            "saved_report": scoped.get("saved_report"),
+        }
+    ]
+    answer["proof_summary"] = [
+        f"answer_scope={scoped.get('answer_scope')}",
+        f"candidate_interpretation={candidate_interpretation}",
+        f"read_more_required_before_scoped_no_evidence_answer={scoped.get('read_more_required_before_scoped_no_evidence_answer')}",
+    ]
+    return {"ask_answer": answer}
+
+
+def _next_proof_step_from_action(action: dict) -> object:
+    reads = action.get("read")
+    if reads:
+        return reads
+    return action.get("only_continue_if") or action.get("stop")
+
+
+def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_family: str) -> bool:
+    if route_family != "action_proof" or action.get("answer_status") != "inspect_recovery_first":
+        return False
+    for item in action.get("read") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("target_source_role") != "target_historical_raw":
+            continue
+        if item.get("final_support_allowed") is not True:
+            continue
+        if item.get("diagnostic_only") is True:
+            continue
+        if item.get("source_ref") or item.get("target"):
+            return True
+    return False
+
+
+def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
+    refs: list[dict] = []
+    target_handoff = action.get("target_proof_handoff") if isinstance(action.get("target_proof_handoff"), dict) else {}
+    named_handoff = (
+        action.get("named_task_action_proof_handoff")
+        if isinstance(action.get("named_task_action_proof_handoff"), dict)
+        else {}
+    )
+    for group in (
+        target_handoff.get("required_primary_proof"),
+        named_handoff.get("read"),
+        action.get("read"),
+    ):
+        for item in group if isinstance(group, list) else []:
+            if isinstance(item, dict):
+                refs.append(item)
+    deduped: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in refs:
+        key = (
+            str(item.get("kind") or ""),
+            str(item.get("target") or item.get("path") or item.get("command") or ""),
+            str(item.get("proof_surface") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:_ASK_ANSWER_MAX_REFS]
+
+
+def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
+    opened: list[dict] = []
+    for ref in refs:
+        if ref.get("kind") in {"targeted_fail_closed_boundary", "missing_role_recovery_command"}:
+            opened.append({"status": "skipped", "reason": "recovery_or_fail_closed_ref", "ref": ref})
+            continue
+        if ref.get("kind") == "current_named_task_commit_evidence":
+            summary = " ".join(
+                part
+                for part in (
+                    str(ref.get("commit_time") or ""),
+                    str(ref.get("commit") or ref.get("target") or ""),
+                    str(ref.get("subject") or ""),
+                )
+                if part
+            )
+            opened.append(
+                {
+                    "status": "opened",
+                    "target": ref.get("target"),
+                    "path": ref.get("path"),
+                    "line": None,
+                    "summary": summary[:_ASK_ANSWER_MAX_LINE_CHARS],
+                    "ref": ref,
+                }
+            )
+            continue
+        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+        target = str(source_ref.get("path") or ref.get("path") or ref.get("target") or "")
+        line = _positive_int(source_ref.get("line")) or None
+        if not line and target:
+            target, line = _split_ref_target(target)
+        if not target:
+            opened.append({"status": "skipped", "reason": "no_local_file_target", "ref": ref})
+            continue
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        if not path.is_file():
+            opened.append({"status": "skipped", "reason": "target_not_a_file", "target": target, "ref": ref})
+            continue
+        opened.append(_read_ask_answer_ref(path=path, line=line, ref=ref, cwd=cwd))
+    return opened
+
+
+def _split_ref_target(target: str) -> tuple[str, int | None]:
+    match = re.match(r"^(.+):(\d+)$", target)
+    if not match:
+        return target, None
+    return match.group(1), int(match.group(2))
+
+
+def _read_ask_answer_ref(*, path: Path, line: int | None, ref: dict, cwd: Path) -> dict:
+    rel = _safe_relative_path(cwd, path)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return {"status": "error", "reason": str(exc), "target": rel, "ref": ref}
+    if not lines:
+        return {"status": "opened", "target": rel, "line": line, "summary": "", "ref": ref}
+    if line:
+        index = max(0, min(line - 1, len(lines) - 1))
+        raw = lines[index]
+        summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{index + 1}")
+        record_metadata = _ask_answer_jsonl_record_metadata(raw)
+        return {
+            "status": "opened",
+            "target": f"{rel}:{index + 1}",
+            "path": rel,
+            "line": index + 1,
+            "summary": summary,
+            "record_metadata": record_metadata,
+            "ref": ref,
+        }
+    if path.suffix.lower() == ".jsonl":
+        summaries = []
+        record_summaries = []
+        for index, raw in enumerate(lines[:8], start=1):
+            summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{index}")
+            if summary:
+                summaries.append(summary)
+                record_summaries.append(
+                    {
+                        "target": f"{rel}:{index}",
+                        "line": index,
+                        "summary": summary,
+                        "record_metadata": _ask_answer_jsonl_record_metadata(raw),
+                    }
+                )
+        summary = " | ".join(summaries)[:_ASK_ANSWER_MAX_FILE_CHARS]
+    else:
+        summary = _summarize_markdown_file(lines)
+        record_summaries = []
+    return {
+        "status": "opened",
+        "target": rel,
+        "path": rel,
+        "line": None,
+        "summary": summary,
+        "record_summaries": record_summaries,
+        "ref": ref,
+    }
+
+
+def _summarize_jsonl_or_text_line(raw: str, *, fallback: str) -> str:
+    text = raw.strip()
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return text[:_ASK_ANSWER_MAX_LINE_CHARS]
+    if not isinstance(row, dict):
+        return text[:_ASK_ANSWER_MAX_LINE_CHARS]
+    timestamp = str(row.get("timestamp") or row.get("ts") or "")
+    role = str(row.get("role") or "")
+    extracted = _extract_text_from_json_row(row)
+    prefix = " ".join(part for part in (timestamp, role) if part)
+    if prefix and extracted:
+        return f"{prefix}: {extracted[:_ASK_ANSWER_MAX_LINE_CHARS]}"
+    if extracted:
+        return extracted[:_ASK_ANSWER_MAX_LINE_CHARS]
+    return f"{fallback}: {text[:_ASK_ANSWER_MAX_LINE_CHARS]}"
+
+
+def _extract_text_from_json_row(row: dict) -> str:
+    if isinstance(row.get("text"), str):
+        return row["text"].strip()
+    if isinstance(row.get("message"), str):
+        return row["message"].strip()
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    if isinstance(payload.get("text"), str):
+        return payload["text"].strip()
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"].strip())
+        if parts:
+            return " ".join(parts)
+    if payload.get("type") == "function_call":
+        name = payload.get("name") or payload.get("function_name") or "function_call"
+        arguments = payload.get("arguments")
+        if isinstance(arguments, dict) and arguments.get("cmd"):
+            return f"tool call {name}: {arguments.get('cmd')}"
+        return f"tool call {name}: {arguments}"
+    if payload.get("type") == "function_call_output":
+        output = payload.get("output")
+        if isinstance(output, str):
+            return f"tool output: {output.strip()}"
+    return ""
+
+
+def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    classification = classify_conversation_record(row)
+    simple_top_level_user_text = (
+        classification.label == "unknown"
+        and str(row.get("role") or "").strip().lower() == "user"
+        and bool(str(row.get("text") or row.get("content") or row.get("message") or "").strip())
+        and not isinstance(row.get("payload"), dict)
+        and not isinstance(row.get("message"), dict)
+    )
+    is_user_authored = classification.is_human_authored or simple_top_level_user_text
+    return {
+        "top_type": row.get("type"),
+        "top_role": row.get("role"),
+        "payload_type": payload.get("type"),
+        "payload_role": payload.get("role"),
+        "message_role": message.get("role"),
+        "conversation_label": classification.label,
+        "conversation_confidence": classification.confidence,
+        "conversation_reasons": list(classification.reasons),
+        "is_user_authored": is_user_authored,
+        "user_authorship_basis": (
+            "conversation_record_classifier"
+            if classification.is_human_authored
+            else "simple_top_level_role_user_text"
+            if simple_top_level_user_text
+            else None
+        ),
+    }
+
+
+def _remembered_user_wording_user_authored_opened(opened: list[dict]) -> list[dict]:
+    user_authored: list[dict] = []
+    for item in opened:
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        if metadata.get("is_user_authored") is True:
+            user_authored.append(item)
+            continue
+        for record in item.get("record_summaries") or []:
+            if not isinstance(record, dict):
+                continue
+            record_metadata = (
+                record.get("record_metadata") if isinstance(record.get("record_metadata"), dict) else {}
+            )
+            if record_metadata.get("is_user_authored") is True and record.get("summary"):
+                cloned = dict(item)
+                cloned["target"] = record.get("target") or item.get("target")
+                cloned["line"] = record.get("line")
+                cloned["summary"] = record.get("summary")
+                cloned["record_metadata"] = record_metadata
+                user_authored.append(cloned)
+    return user_authored
+
+
+def _remembered_user_wording_non_echo_user_opened(opened: list[dict], *, query: str) -> list[dict]:
+    return [
+        item
+        for item in opened
+        if not _remembered_user_wording_prompt_echo_reasons(item, query=query)
+    ]
+
+
+def _remembered_user_wording_prompt_echo_reasons(item: dict, *, query: str) -> list[str]:
+    text = str(item.get("summary") or "").casefold()
+    reasons: list[str] = []
+    query_text = str(query or "").strip().casefold()
+    if query_text and query_text in text:
+        reasons.append("contains_current_ask_query_text")
+    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(str(item.get("summary") or "")):
+        reasons.append("assignment_or_review_scaffolding")
+    for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
+        if marker in text:
+            reasons.append(f"prompt_echo_marker:{marker}")
+    return reasons
+
+
+def _prompt_echo_ref_public_summary(item: dict, *, query: str) -> dict:
+    summary = _ref_public_summary(item)
+    summary["prompt_echo_reasons"] = _remembered_user_wording_prompt_echo_reasons(item, query=query)
+    return summary
+
+
+def _prompt_echo_opened_ref_summaries(opened: list[dict], *, query: str) -> list[str]:
+    summaries: list[str] = []
+    for item in opened[:_ASK_ANSWER_MAX_REFS]:
+        reasons = ",".join(_remembered_user_wording_prompt_echo_reasons(item, query=query))
+        summaries.append(f"{item.get('target')}: rejected_prompt_echo={reasons}")
+    return summaries
+
+
+def _non_user_opened_ref_summaries(opened: list[dict]) -> list[str]:
+    summaries: list[str] = []
+    for item in opened[:_ASK_ANSWER_MAX_REFS]:
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        if not metadata and item.get("record_summaries"):
+            labels = []
+            for record in item.get("record_summaries") or []:
+                if not isinstance(record, dict):
+                    continue
+                record_metadata = (
+                    record.get("record_metadata") if isinstance(record.get("record_metadata"), dict) else {}
+                )
+                label = record_metadata.get("conversation_label")
+                confidence = record_metadata.get("conversation_confidence")
+                if label:
+                    labels.append(f"{record.get('target')}: {label}/{confidence}")
+            if labels:
+                summaries.append("; ".join(labels))
+                continue
+        label = metadata.get("conversation_label") or "non-jsonl-or-unclassified"
+        confidence = metadata.get("conversation_confidence") or "unknown"
+        summaries.append(f"{item.get('target')}: {label}/{confidence}")
+    return summaries
+
+
+def _summarize_markdown_file(lines: list[str]) -> str:
+    selected: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# ") or _looks_like_markdown_proof_summary_line(line):
+            selected.append(line)
+        if len(selected) >= 5:
+            break
+    if not selected:
+        selected = [line.strip() for line in lines if line.strip()][:5]
+    return " | ".join(selected)[:_ASK_ANSWER_MAX_FILE_CHARS]
+
+
+def _looks_like_markdown_proof_summary_line(line: str) -> bool:
+    normalized = line.lstrip("-*` ").lower()
+    if normalized in {"proof:", "regression test:", "commit:", "review:"}:
+        return False
+    return normalized.startswith(
+        (
+            "status:",
+            "verdict:",
+            "proof:",
+            "regression test:",
+            "commit:",
+            "review:",
+        )
+    )
+
+
+def _ref_public_summary(item: dict) -> dict:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    summary = {
+        "target": item.get("target"),
+        "kind": ref.get("kind"),
+        "proof_surface": ref.get("proof_surface"),
+        "target_source_role": ref.get("target_source_role"),
+        "reason": ref.get("reason"),
+    }
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata:
+        summary["record_metadata"] = {
+            "conversation_label": metadata.get("conversation_label"),
+            "conversation_confidence": metadata.get("conversation_confidence"),
+            "is_user_authored": metadata.get("is_user_authored"),
+            "user_authorship_basis": metadata.get("user_authorship_basis"),
+            "top_role": metadata.get("top_role"),
+            "payload_type": metadata.get("payload_type"),
+            "payload_role": metadata.get("payload_role"),
+            "message_role": metadata.get("message_role"),
+        }
+    return summary
+
+
+def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: list[dict]) -> str | None:
+    summaries = [str(item.get("summary") or "").strip() for item in opened if item.get("summary")]
+    if not summaries:
+        return None
+    named = (
+        action.get("named_task_action_proof_handoff")
+        if isinstance(action.get("named_task_action_proof_handoff"), dict)
+        else {}
+    )
+    if named.get("status") == "current_named_task_proof_refs_available":
+        return _compose_named_task_answer(query=query, named=named, opened=opened)
+    if route_family == "remembered_user_wording":
+        return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
+    if route_family in {"action_proof", "expectation_mismatch", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return f"The opened proof refs show: {_short_join(summaries[:4])}"
+    return None
+
+
+def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -> str:
+    task_ids = named.get("task_ids") or []
+    task_id = str(task_ids[0]) if task_ids else "the named task"
+    task_summaries: list[str] = []
+    review_summaries: list[str] = []
+    other_summaries: list[str] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        proof_surface = ref.get("proof_surface")
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        if proof_surface == "task_file":
+            task_summaries.append(summary)
+        elif proof_surface == "review_artifact":
+            review_summaries.append(summary)
+        else:
+            other_summaries.append(summary)
+    query_lower = query.lower()
+    if "review" in query_lower or "verify" in query_lower or "verified" in query_lower:
+        if review_summaries:
+            return (
+                f"The current review proof for {task_id} supports verification: "
+                f"{_short_join(review_summaries[:2])}"
+                + (f" Task proof: {_short_join(task_summaries[:1])}" if task_summaries else "")
+            )
+        return f"I found current {task_id} proof refs, but no review-artifact summary was readable."
+    pieces = []
+    if task_summaries:
+        pieces.append(f"task proof: {_short_join(task_summaries[:2])}")
+    if review_summaries:
+        pieces.append(f"review proof: {_short_join(review_summaries[:2])}")
+    if other_summaries:
+        pieces.append(f"commit/probe proof: {_short_join(other_summaries[:1])}")
+    return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _short_join(parts: list[str], *, limit: int = 520) -> str:
+    text = " | ".join(part.strip() for part in parts if part.strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
 def discovery_payload_from_args(args: argparse.Namespace) -> dict:
     cwd = Path(args.cwd).expanduser().resolve()
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
@@ -4153,7 +4826,9 @@ def main(argv: list[str] | None = None) -> int:
             args.auto_execute_bounded_no_evidence
             and payload["ask_router"].get("route_family") == "bounded_no_evidence"
         )
-        if args.execute or auto_execute_bounded:
+        if args.answer:
+            payload = _run_ask_answer(args, cwd=cwd, route_payload=payload)
+        elif args.execute or auto_execute_bounded:
             if auto_execute_bounded and not args.execute:
                 args = _args_with_bounded_auto_execute_prompt_scope(args)
             payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)

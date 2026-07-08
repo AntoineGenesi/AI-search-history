@@ -24,6 +24,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "ask_answer" in payload:
+        return render_ask_answer_text(payload)
     if "ask_execute" in payload:
         return render_ask_execute_text(payload)
     if "ask_router" in payload:
@@ -169,6 +171,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "ask_answer" in payload:
+        return render_ask_answer_markdown(payload)
     if "ask_execute" in payload:
         return render_ask_execute_markdown(payload)
     if "ask_router" in payload:
@@ -326,6 +330,49 @@ def render_ask_router_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_ask_answer_text(payload: dict) -> str:
+    report = payload["ask_answer"]
+    route = report.get("selected_route") or {}
+    lines = [
+        "Ask Answer",
+        f"Query: {report.get('query')}",
+        f"Route family: {route.get('route_family')}",
+        f"Answer status: {report.get('answer_status')}",
+    ]
+    if report.get("answer"):
+        lines.append(f"Answer: {report.get('answer')}")
+    if report.get("fail_closed_reason"):
+        lines.append(f"Cannot answer directly yet: {report.get('fail_closed_reason')}")
+    refs = report.get("refs_used") or []
+    if refs:
+        lines.append("Refs used:")
+        for item in refs:
+            bits = [str(item.get("target") or "(unknown target)")]
+            if item.get("kind"):
+                bits.append(f"kind={item.get('kind')}")
+            if item.get("proof_surface"):
+                bits.append(f"proof_surface={item.get('proof_surface')}")
+            if item.get("target_source_role"):
+                bits.append(f"target_source_role={item.get('target_source_role')}")
+            lines.append(f"- {'; '.join(bits)}")
+    proof = report.get("proof_summary") or []
+    if proof:
+        lines.append("Proof summary:")
+        for item in proof[:6]:
+            lines.append(f"- {item}")
+    if report.get("next_proof_step"):
+        lines.append(f"Next proof step: {report.get('next_proof_step')}")
+    source_contract = report.get("source_contract") or {}
+    if source_contract:
+        lines.append(
+            "Source contract: "
+            f"{source_contract.get('built_from')} "
+            f"answer_action_status={source_contract.get('answer_action_status')} "
+            f"promotion_status={source_contract.get('promotion_status')}"
+        )
+    return "\n".join(lines)
+
+
 def render_ask_execute_text(payload: dict) -> str:
     report = payload["ask_execute"]
     route = report.get("selected_route") or {}
@@ -371,6 +418,41 @@ def render_ask_execute_text(payload: dict) -> str:
         _append_semantic_wrapup_execute_text(lines, executed, action)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_text(lines, executed, action)
+    return "\n".join(lines)
+
+
+def render_ask_answer_markdown(payload: dict) -> str:
+    report = payload["ask_answer"]
+    route = report.get("selected_route") or {}
+    lines = [
+        "# JSONL Ask Answer",
+        "",
+        f"- Query: `{report.get('query')}`",
+        f"- Route family: `{route.get('route_family')}`",
+        f"- Answer status: `{report.get('answer_status')}`",
+    ]
+    if report.get("answer"):
+        lines.extend(["", "## Answer", "", str(report.get("answer"))])
+    if report.get("fail_closed_reason"):
+        lines.extend(["", "## Cannot Answer Directly Yet", "", str(report.get("fail_closed_reason"))])
+    refs = report.get("refs_used") or []
+    if refs:
+        lines.extend(["", "## Refs Used"])
+        for item in refs:
+            target = item.get("target") or "(unknown target)"
+            details = []
+            for key in ("kind", "proof_surface", "target_source_role"):
+                if item.get(key):
+                    details.append(f"{key}=`{item.get(key)}`")
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"- `{target}`{suffix}")
+    proof = report.get("proof_summary") or []
+    if proof:
+        lines.extend(["", "## Proof Summary"])
+        for item in proof[:6]:
+            lines.append(f"- {item}")
+    if report.get("next_proof_step"):
+        lines.extend(["", "## Next Proof Step", "", f"`{report.get('next_proof_step')}`"])
     return "\n".join(lines)
 
 
