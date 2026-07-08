@@ -7255,28 +7255,36 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
 
 def _compose_named_task_selection_rationale_answer(*, task_id: str, opened: list[dict]) -> str | None:
     selection_summaries: list[str] = []
-    supporting_summaries: list[str] = []
+    proof_ref_labels: list[str] = []
     for item in opened:
         ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
         summary = str(item.get("summary") or "").strip()
-        if not summary:
-            continue
         if ref.get("proof_surface") in {"task_selection_rationale", "pipeline_selection_result"}:
-            selection_summaries.append(summary)
-        elif ref.get("proof_surface") == "task_file":
-            supporting_summaries.append(summary)
+            if summary:
+                selection_summaries.append(summary)
+            label = _named_task_selection_proof_ref_label(ref)
+            if label and label not in proof_ref_labels:
+                proof_ref_labels.append(label)
     if not selection_summaries:
         return None
     reason_source = " ".join(selection_summaries)
-    proof_text = _short_join(selection_summaries[:3], limit=900)
     reason = _named_task_selection_reason_clause(reason_source, task_id=task_id)
-    supporting = _short_join(supporting_summaries[:1], limit=260)
+    proof_refs = _short_join(proof_ref_labels[:3], limit=220) or "current task/state selection proof"
     return (
         f"Current selection proof for {task_id} says it was selected because {reason} "
-        f"Proof: {proof_text}"
-        + (f" Supporting task proof: {supporting}" if supporting else "")
+        f"Refs used: {proof_refs}."
         + " Boundary: this answers from current task/state selection proof, not raw tool-output transcript text or an all-history claim."
     )
+
+
+def _named_task_selection_proof_ref_label(ref: dict) -> str:
+    surface = str(ref.get("proof_surface") or "")
+    target = str(ref.get("target") or ref.get("path") or "").strip()
+    if surface == "task_selection_rationale":
+        return f"task selection rationale ({target})" if target else "task selection rationale"
+    if surface == "pipeline_selection_result":
+        return f"pipeline selection result ({target})" if target else "pipeline selection result"
+    return target
 
 
 def _named_task_selection_reason_clause(proof_text: str, *, task_id: str) -> str:
@@ -7287,13 +7295,34 @@ def _named_task_selection_reason_clause(proof_text: str, *, task_id: str) -> str
     failed_review_prompt = failed_review_prompt_match.group(0) if failed_review_prompt_match else ""
     if false_positive and verified and failed_review_prompt:
         return (
-            f"fresh installed probes showed `{failed_review_prompt}` was being answered as a failed-review "
-            "causal premise even though current review proof was `VERIFIED`, not failed."
+            f"fresh installed probes showed `{failed_review_prompt}` was being answered as a false-positive "
+            "failed-review causal premise even though current review proof was `VERIFIED`, not failed."
         )
     if false_positive and verified:
         return (
             "fresh installed probes found a false-positive failed-review causal answer even though current "
             "review proof was `VERIFIED`, not failed."
+        )
+    selection_prompt_match = re.search(
+        r"why did\s+JSH-\d+\s+(?:get|got)\s+selected\?",
+        proof_text,
+        flags=re.IGNORECASE,
+    )
+    selection_prompt = selection_prompt_match.group(0) if selection_prompt_match else ""
+    raw_tool_output_issue = (
+        "raw prior tool-output" in normalized
+        or "raw tool-output" in normalized
+        or "raw tool output" in normalized
+    )
+    clean_task_state_proof = (
+        "clean task/state" in normalized
+        or "task/state proof" in normalized
+        or "task/state selection rationale" in normalized
+    )
+    if selection_prompt and raw_tool_output_issue and clean_task_state_proof:
+        return (
+            f"fresh installed probes showed `{selection_prompt}` was answering from raw prior tool-output "
+            "text instead of clean task/state selection proof."
         )
     return _short_join([proof_text], limit=420)
 
