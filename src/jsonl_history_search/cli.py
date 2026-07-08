@@ -3827,9 +3827,22 @@ def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) ->
     normalized = str(query or "").casefold()
     if route_family == "semantic_debug" and "what happened" in normalized:
         return bool(_ask_execute_named_task_ids(query))
+    if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
+        return bool(_ask_execute_named_task_ids(query))
     if _named_task_selection_rationale_answer_wanted(query=query, route_family=route_family):
         return True
     return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
+
+
+def _branch_work_episode_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"action_proof", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    if "what happened" not in normalized:
+        return False
+    if "branch" not in normalized:
+        return False
+    return bool(re.search(r"\b[a-z0-9._-]+/[a-z0-9._/-]+\b", normalized))
 
 
 def _named_task_selection_rationale_answer_wanted(*, query: str, route_family: str) -> bool:
@@ -6855,9 +6868,69 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_semantic_wrapup_corrections_answer(query=query, action=action, opened=opened)
     if route_family == "expectation_mismatch":
         return _compose_expectation_mismatch_answer(opened=opened)
+    if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
+        return _compose_branch_work_episode_answer(query=query, opened=opened)
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_branch_work_episode_answer(*, query: str, opened: list[dict]) -> str | None:
+    branch = _branch_work_episode_label(query)
+    proof_lines = _work_episode_answer_prose_summaries(opened)
+    if not proof_lines:
+        return None
+    return (
+        f"Branch {branch} is supported by opened work-episode proof: "
+        f"{_short_join(proof_lines[:4], limit=760)} "
+        "Boundary: this summarizes branch/work-episode proof and leaves raw refs and proof_summary available for inspection; "
+        "it does not paste raw JSONL event payloads into the final answer."
+    )
+
+
+def _branch_work_episode_label(query: str) -> str:
+    match = re.search(r"\b[a-z0-9._-]+/[a-z0-9._/-]+\b", str(query or ""), flags=re.IGNORECASE)
+    return match.group(0) if match else "the requested branch"
+
+
+def _work_episode_answer_prose_summaries(opened: list[dict]) -> list[str]:
+    cleaned: list[str] = []
+    for item in opened:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        fragments = []
+        for fragment in _summary_fragments([summary]):
+            prose = _work_episode_answer_prose_fragment(fragment, item=item)
+            if prose:
+                fragments.append(prose)
+        if fragments:
+            cleaned.append(_short_join(fragments[:4], limit=420))
+    return cleaned
+
+
+def _work_episode_answer_prose_fragment(fragment: str, *, item: dict) -> str:
+    text = str(fragment or "").strip().lstrip("-* ").strip()
+    if not text:
+        return ""
+    normalized = text.casefold()
+    raw_markers = (
+        '"timestamp"',
+        '"payload"',
+        '"type":"event_msg"',
+        '"type": "event_msg"',
+        "rollout-2026-",
+        "custom_tool_call",
+        "function_call_output",
+    )
+    if any(marker in normalized for marker in raw_markers):
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        surface = str(ref.get("proof_surface") or ref.get("kind") or "opened proof").replace("_", " ")
+        target = str(item.get("target") or ref.get("target") or "").strip()
+        return f"{surface} at {target}" if target else surface
+    text = re.sub(r"^\d{4}-\d{2}-\d{2}T[^\s:]+:?\s*", "", text)
+    text = re.sub(r"^(tool output|tool call)\s*:\s*", "", text, flags=re.IGNORECASE)
+    return text[:_ASK_ANSWER_MAX_LINE_CHARS]
 
 
 def _compose_expectation_mismatch_answer(*, opened: list[dict]) -> str | None:
@@ -7204,6 +7277,17 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     clean_review_summaries = _named_task_current_proof_prose_summaries(review_summaries, task_id=task_id)
     clean_other_summaries = _named_task_current_proof_prose_summaries(other_summaries, task_id=task_id)
     query_lower = query.lower()
+    if _branch_work_episode_answer_wanted(query=query, route_family="provenance"):
+        branch_answer = _compose_named_task_branch_work_episode_answer(
+            query=query,
+            task_id=task_id,
+            clean_task_summaries=clean_task_summaries,
+            clean_review_summaries=clean_review_summaries,
+            clean_other_summaries=clean_other_summaries,
+            opened=opened,
+        )
+        if branch_answer:
+            return branch_answer
     if _named_task_selection_rationale_answer_wanted(query=query, route_family="semantic_debug"):
         selection_answer = _compose_named_task_selection_rationale_answer(
             task_id=task_id,
@@ -7259,6 +7343,36 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
 
 
+def _compose_named_task_branch_work_episode_answer(
+    *,
+    query: str,
+    task_id: str,
+    clean_task_summaries: list[str],
+    clean_review_summaries: list[str],
+    clean_other_summaries: list[str],
+    opened: list[dict],
+) -> str | None:
+    pieces = []
+    if clean_task_summaries:
+        pieces.append(f"task proof: {_short_join(clean_task_summaries[:2], limit=420)}")
+    if clean_review_summaries:
+        pieces.append(f"review proof: {_short_join(clean_review_summaries[:2], limit=420)}")
+    if clean_other_summaries:
+        pieces.append(f"commit/probe proof: {_short_join(clean_other_summaries[:1], limit=260)}")
+    if not pieces:
+        fallback = _work_episode_answer_prose_summaries(opened)
+        if not fallback:
+            return None
+        pieces.append(_short_join(fallback[:3], limit=520))
+    branch = _branch_work_episode_label(query)
+    return (
+        f"Branch {branch} maps to {task_id}. Current task/review/commit proof says "
+        f"{'; '.join(pieces)}. "
+        "Boundary: this branch/work-episode answer is from current proof refs, with raw refs and proof_summary "
+        "kept for inspection, not from pasted raw JSONL event payload."
+    )
+
+
 def _named_task_current_proof_prose_summaries(summaries: list[str], *, task_id: str) -> list[str]:
     cleaned: list[str] = []
     for summary in summaries:
@@ -7283,10 +7397,16 @@ def _named_task_current_proof_prose_fragment(fragment: str, *, task_id: str) -> 
     if any(
         marker in normalized
         for marker in (
+            '"timestamp"',
+            '"payload"',
+            '"type":"event_msg"',
+            '"type": "event_msg"',
             "tool output: chunk id",
             "raw prior tool-output",
             "raw tool-output",
             "raw tool output",
+            "rollout-2026-",
+            "event_msg",
             "diagnostic/section-paste",
             "diagnostic marker",
         )
