@@ -15,6 +15,7 @@ from .conversation_records import (
     SUBAGENT_NOTIFICATION,
     TOOL_ACTION_OUTPUT,
     TURN_CONTROL_OR_STATUS,
+    UNKNOWN,
     classify_conversation_record,
     extract_human_ask,
 )
@@ -229,14 +230,15 @@ def _extract_user_message(
         )
 
     extracted = extract_human_ask(data)
-    if not extracted.ask_text:
+    ask_text = extracted.ask_text or _simple_top_level_user_text(data)
+    if not ask_text:
         return None
     timestamp = parse_datetime(data.get("timestamp") or data.get("created_at") or data.get("time"), default_tz)
     if timestamp is None:
         return None
     return LatestUserMessage(
         timestamp_utc=timestamp.astimezone(timezone.utc),
-        text=extracted.ask_text,
+        text=ask_text,
         source_kind=source.kind,
         source_ref=_session_ref(source.path, codex_home, line=line_number),
         source_identifier=source.identifier,
@@ -245,6 +247,18 @@ def _extract_user_message(
         openable_source_ref=_openable_source_ref(source.path, line_number),
         openable_target=_openable_target(source.path, line_number),
     )
+
+
+def _simple_top_level_user_text(data: Mapping[str, Any]) -> str | None:
+    classification = classify_conversation_record(data)
+    if classification.label != UNKNOWN or classification.confidence != "low":
+        return None
+    if str(data.get("role") or "").strip().casefold() != "user":
+        return None
+    if isinstance(data.get("payload"), Mapping) or isinstance(data.get("message"), Mapping):
+        return None
+    text = _clean_text(data.get("text") or data.get("content") or data.get("message"))
+    return text or None
 
 
 def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUserMessage], int]:
