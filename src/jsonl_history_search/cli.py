@@ -9868,6 +9868,8 @@ def _short_tool_events_report_written_payload(payload: dict, report_output: str)
                 "searched_bytes": efficiency.get("searched_bytes", 0),
             },
             "ai_handoff_packet": report.get("ai_handoff_packet", {}),
+            "detector_schema_gap": report.get("detector_schema_gap"),
+            "detector_observations": report.get("detector_observations"),
             "warnings": payload.get("warnings", []),
             "message": "Full structured tool-events report written to report_output; stdout is a compact handoff map.",
         }

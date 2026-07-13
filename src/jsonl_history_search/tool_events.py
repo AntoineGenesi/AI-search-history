@@ -114,6 +114,7 @@ def build_tool_events_payload(
     )
     events = [event.to_dict() for event in scan["events"]]
     excluded_mentions = scan["excluded_mentions"]
+    detector_observations = scan.get("detector_observations", empty_detector_observations())
     inline_payload = events[:INLINE_EVENT_LIMIT]
     inline_context_bytes = len(json.dumps(inline_payload + excluded_mentions[:20], ensure_ascii=False).encode("utf-8"))
     raw_baseline_bytes = int(scan["searched_bytes"])
@@ -155,6 +156,8 @@ def build_tool_events_payload(
             "sequence_fingerprints": "Adjacent command_run events in the same session and cwd receive deterministic sha256 fingerprints over normalized command chains.",
             "privacy": "Payload excerpts are bounded and may be masked/redacted; raw private transcripts are never required in fixtures.",
         },
+        "detector_observations": detector_observations,
+        "detector_schema_gap": detector_schema_gap(events=events, observations=detector_observations, warnings=scan["warnings"]),
         "warnings": sorted(set(scan["warnings"] + source_plan.get("sources", {}).get("warnings", []))),
     }
     payload = {
@@ -189,6 +192,7 @@ def scan_tool_events(
     stopped = False
     detected_events: list[ToolEvent] = []
     excluded_mentions: list[dict] = []
+    detector_observations = empty_detector_observations()
     event_counter = 0
     filters = filters or ToolEventFilters()
 
@@ -203,6 +207,7 @@ def scan_tool_events(
                     warnings.append("Stopped scanning at max elapsed cap.")
                     stopped = True
                     break
+                observe_record_shape(record, detector_observations)
                 line_events = detect_events_for_record(record, mask_context=mask_context)
                 for event in line_events:
                     event_counter += 1
@@ -228,6 +233,7 @@ def scan_tool_events(
         "searched_bytes": searched_bytes,
         "warnings": sorted(set(warnings + plan.warnings)),
         "blind_spots": sorted(set(plan.blind_spots)),
+        "detector_observations": detector_observations,
         **mask_payload(mask_context),
     }
 
@@ -266,6 +272,8 @@ def detect_events_for_record(record: Record, *, mask_context: MaskContext | None
         events.extend(events_from_tool_output(output_text, base=output_base, tool_name=tool_name))
     elif is_claude_like_tool_record(data):
         events.extend(events_from_claude_like_record(data, record=record, base=base))
+    elif has_claude_message_content_tool_items(data):
+        events.extend(events_from_claude_message_content_items(data, record=record, base=base, mask_context=mask_context))
     return dedupe_events(events)
 
 
@@ -458,6 +466,63 @@ def events_from_claude_like_record(data: dict, *, record: Record, base: dict) ->
     return events
 
 
+def events_from_claude_message_content_items(
+    data: dict,
+    *,
+    record: Record,
+    base: dict,
+    mask_context: MaskContext | None,
+) -> list[ToolEvent]:
+    events: list[ToolEvent] = []
+    for item in claude_message_content_items(data):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "tool_use":
+            name = str(item.get("name") or item.get("tool_name") or item.get("tool") or "unknown_tool")
+            args = item.get("input") or item.get("arguments") or item.get("parameters") or {}
+            item_base = {
+                **base,
+                "tool_name": name,
+                "payload_excerpt": bounded_excerpt(compact_json(item), record=record, mask_context=mask_context),
+            }
+            events.append(
+                ToolEvent(
+                    event_type="tool_call",
+                    event_family="tool",
+                    confidence="high",
+                    evidence_basis=["claude_message_content_tool_use"],
+                    action=action_from_tool(name),
+                    arguments=safe_arguments(args),
+                    **item_base,
+                )
+            )
+            command = command_from_call(name, args)
+            if command:
+                for event in events_from_command(command, base=item_base, arguments=safe_arguments(args)):
+                    event.evidence_basis.append("claude_message_content_tool_use")
+                    events.append(event)
+            elif name == "unknown_tool":
+                events[-1].uncertainty.append("unknown_nested_tool_name_from_claude_message_content")
+            else:
+                for event in events_from_structured_tool_arguments(name, args, base=item_base):
+                    event.evidence_basis.append("claude_message_content_tool_use")
+                    events.append(event)
+        elif item_type == "tool_result":
+            output_text = output_text_from_payload(item)
+            if not output_text:
+                continue
+            item_base = {
+                **base,
+                "tool_name": str(item.get("name") or item.get("tool_name") or "tool_result"),
+                "payload_excerpt": bounded_excerpt(output_text, record=record, mask_context=mask_context),
+            }
+            for event in events_from_tool_output(output_text, base=item_base, tool_name=item_base["tool_name"]):
+                event.evidence_basis.append("claude_message_content_tool_result")
+                events.append(event)
+    return events
+
+
 def add_command_sequences(events: list[ToolEvent], *, start_index: int, filters: ToolEventFilters) -> list[ToolEvent]:
     command_events = [event for event in events if event.event_type == "command_run" and event.command]
     command_events.sort(key=lambda event: (event.source_ref.get("session") or "", event.cwd or "", event.timestamp_utc or "9999", event.source_ref.get("path") or "", event.source_ref.get("line") or 0))
@@ -571,6 +636,41 @@ def compact_ai_handoff(events: list[dict], excluded_mentions: list[dict]) -> dic
     }
 
 
+def detector_schema_gap(*, events: list[dict], observations: dict, warnings: list[str]) -> dict | None:
+    if events:
+        return None
+    cap_warnings = [warning for warning in warnings if "cap" in str(warning).lower()]
+    saw_top_level = int(observations.get("top_level_tool_records") or 0)
+    saw_nested_use = int(observations.get("claude_message_content_tool_use_records") or 0)
+    saw_nested_result = int(observations.get("claude_message_content_tool_result_records") or 0)
+    if saw_nested_use or saw_nested_result:
+        blocker = "nested_claude_tool_payload_unparsed"
+        missing_fields = []
+        next_read = "Inspect nested Claude message.content tool_use/tool_result records; the detector saw structured candidates but emitted no events."
+    elif saw_top_level:
+        blocker = "top_level_tool_payload_unparsed"
+        missing_fields = []
+        next_read = "Inspect top-level tool/function records; the detector saw structured candidates but emitted no events."
+    else:
+        blocker = "no_structured_tool_payloads_in_scanned_scope"
+        missing_fields = [
+            "top-level payload.type=function_call/tool_call/tool_use/tool_result",
+            "top-level name/tool_name plus arguments/input",
+            "Claude message.content[].type=tool_use/tool_result",
+        ]
+        next_read = "Open the selected source refs or broaden the approved source window; scanned records only exposed prose/text-like shapes."
+    return {
+        "status": "no_executable_action_events",
+        "blocker": blocker,
+        "missing_event_roles": ["tool_call", "command_run", "file_read", "git_event", "test_run"],
+        "missing_schema_fields": missing_fields,
+        "detector_observations": observations,
+        "cap_limited": bool(cap_warnings),
+        "cap_warnings": cap_warnings,
+        "next_read": next_read,
+    }
+
+
 def is_structured_tool_call(payload: Any) -> bool:
     return isinstance(payload, dict) and (
         payload.get("type") in {"function_call", "tool_call"}
@@ -587,6 +687,50 @@ def is_claude_like_tool_record(data: dict) -> bool:
     if not isinstance(data, dict):
         return False
     return data.get("type") in {"tool_use", "tool_result"} or data.get("role") == "tool_use" or ("tool_name" in data and ("input" in data or "arguments" in data))
+
+
+def claude_message_content_items(data: dict) -> list[dict]:
+    if not isinstance(data, dict):
+        return []
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [item for item in content if isinstance(item, dict)]
+
+
+def has_claude_message_content_tool_items(data: dict) -> bool:
+    return any(item.get("type") in {"tool_use", "tool_result"} for item in claude_message_content_items(data))
+
+
+def empty_detector_observations() -> dict:
+    return {
+        "records_scanned": 0,
+        "roles": {},
+        "top_level_tool_records": 0,
+        "claude_message_content_tool_use_records": 0,
+        "claude_message_content_tool_result_records": 0,
+        "claude_message_content_text_only_records": 0,
+    }
+
+
+def observe_record_shape(record: Record, observations: dict) -> None:
+    observations["records_scanned"] += 1
+    role = record.role or "unknown"
+    observations["roles"][role] = observations["roles"].get(role, 0) + 1
+    data = record.raw or {}
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    if is_structured_tool_call(payload) or is_structured_tool_output(payload) or is_claude_like_tool_record(data):
+        observations["top_level_tool_records"] += 1
+    item_types = [item.get("type") for item in claude_message_content_items(data)]
+    if "tool_use" in item_types:
+        observations["claude_message_content_tool_use_records"] += 1
+    if "tool_result" in item_types:
+        observations["claude_message_content_tool_result_records"] += 1
+    if item_types and set(item_types) <= {"text"}:
+        observations["claude_message_content_text_only_records"] += 1
 
 
 def tool_name_from_payload(payload: Any) -> str | None:
