@@ -3253,6 +3253,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
                 packet.get("historical_orchestration_role_coverage_source_plan")
             ),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
+            "longitudinal_phase_source_plan": packet.get("longitudinal_phase_source_plan"),
             "expectation_mismatch_plan": packet.get("expectation_mismatch_plan"),
             "process_actual_use_final_support_read_plan": packet.get(
                 "process_actual_use_final_support_read_plan"
@@ -3426,6 +3427,8 @@ def _answer_action_contract_from_executed_output(
         }
     if output_key == "semantic_debug":
         handoff = compact.get("answer_ready_handoff") or {}
+        readiness_summary = compact.get("answer_readiness_summary") or {}
+        longitudinal_phase_source_plan = compact.get("longitudinal_phase_source_plan") or {}
         core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
@@ -3480,6 +3483,16 @@ def _answer_action_contract_from_executed_output(
             if process_actual_use_plan
             else []
         )
+        readiness_gate = _semantic_debug_readiness_source_plan_gate(
+            query=query,
+            route_family=route_family,
+            answer_readiness_summary=readiness_summary,
+            answer_ready_handoff=handoff,
+            longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+            selected_route=selected_route,
+        )
+        if readiness_gate.get("blocked"):
+            return readiness_gate["contract"]
         prefer_named_task_answer = _named_task_clean_answer_surface_wanted(
             query=query,
             route_family=route_family,
@@ -3757,6 +3770,193 @@ def _answer_action_contract_from_executed_output(
         or selected_route.get("manual_search_guidance"),
         "saved_report": compact.get("report_written"),
     }
+
+
+def _semantic_debug_readiness_source_plan_gate(
+    *,
+    query: str,
+    route_family: str,
+    answer_readiness_summary: dict,
+    answer_ready_handoff: dict,
+    longitudinal_phase_source_plan: dict,
+    selected_route: dict,
+) -> dict:
+    if route_family not in {"semantic_debug", "provenance", "orchestration_provenance", "action_proof"}:
+        return {"blocked": False}
+    blocks: list[dict] = []
+    if _longitudinal_phase_plan_blocks_synthesis(longitudinal_phase_source_plan):
+        blocks.append(
+            {
+                "gate": "longitudinal_phase_source_plan",
+                "condition": longitudinal_phase_source_plan.get("status") or "phase_source_recovery_required",
+                "missing_phase_ids": list(longitudinal_phase_source_plan.get("missing_phase_ids") or []),
+                "required_before_answer": list(
+                    longitudinal_phase_source_plan.get("required_before_synthesis") or []
+                )[:6],
+                "next_proof_step": (
+                    "Recover or explicitly bound missing early/mid/recent phase coverage before synthesizing "
+                    "a longitudinal answer."
+                ),
+            }
+        )
+    if _source_followthrough_prompt_blocks_on_readiness(
+        query=query,
+        answer_readiness_summary=answer_readiness_summary,
+        answer_ready_handoff=answer_ready_handoff,
+    ):
+        readiness_required = list(answer_readiness_summary.get("required_before_answer") or [])
+        handoff_required = list(answer_ready_handoff.get("do_not_answer_until") or [])
+        blocks.append(
+            {
+                "gate": "answer_readiness",
+                "condition": answer_readiness_summary.get("decision") or answer_ready_handoff.get("decision"),
+                "required_before_answer": _unique_preserving_order(readiness_required + handoff_required)[:8],
+                "next_proof_step": (
+                    "Open the required recovery/source refs and state the stop criteria before answering "
+                    "which refs to open next or when to stop searching."
+                ),
+            }
+        )
+    if not blocks:
+        return {"blocked": False}
+    guidance = answer_ready_handoff.get("source_action_guidance")
+    if not isinstance(guidance, dict):
+        guidance = {}
+    next_reads = _semantic_debug_readiness_gate_next_reads(
+        answer_ready_handoff=answer_ready_handoff,
+        longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+    )
+    required = _unique_preserving_order(
+        [
+            item
+            for block in blocks
+            for item in block.get("required_before_answer", [])
+            if isinstance(item, str) and item.strip()
+        ]
+    )
+    if not required:
+        required = [str(block.get("next_proof_step")) for block in blocks if block.get("next_proof_step")]
+    contract = {
+        "answer_status": "not-ready/needs-more-proof",
+        "promotion_status": "semantic_debug_readiness_source_plan_gate_fail_closed",
+        "promotion_reason": (
+            "semantic-debug answer promotion is blocked because the executed report still requires "
+            "recovery, stop/source-followthrough proof, or longitudinal phase coverage before synthesis."
+        ),
+        "internal_answer_status": answer_readiness_summary.get("status"),
+        "answer_readiness_summary": answer_readiness_summary,
+        "readiness_source_plan_gate": {
+            "schema_version": 1,
+            "status": "blocked_before_answer_promotion",
+            "blocked_conditions": blocks,
+            "answer_ready_handoff_decision": answer_ready_handoff.get("decision"),
+            "answer_ready_handoff_do_next": answer_ready_handoff.get("do_next"),
+            "longitudinal_phase_source_plan_status": longitudinal_phase_source_plan.get("status"),
+            "required_before_answer": required[:8],
+        },
+        "read": next_reads,
+        "stop": guidance.get("stop_condition") or selected_route.get("stop_guidance"),
+        "only_continue_if": required[:8] or selected_route.get("manual_search_guidance"),
+        "saved_report": answer_ready_handoff.get("report_written"),
+    }
+    if longitudinal_phase_source_plan:
+        contract["longitudinal_phase_source_plan"] = {
+            "status": longitudinal_phase_source_plan.get("status"),
+            "phase_balance_status": longitudinal_phase_source_plan.get("phase_balance_status"),
+            "represented_phase_ids": list(longitudinal_phase_source_plan.get("represented_phase_ids") or []),
+            "missing_phase_ids": list(longitudinal_phase_source_plan.get("missing_phase_ids") or []),
+            "required_before_synthesis": list(
+                longitudinal_phase_source_plan.get("required_before_synthesis") or []
+            )[:6],
+        }
+    return {"blocked": True, "contract": contract}
+
+
+def _longitudinal_phase_plan_blocks_synthesis(plan: dict) -> bool:
+    if not isinstance(plan, dict) or plan.get("applies") is not True:
+        return False
+    if plan.get("status") == "phase_source_recovery_required":
+        return True
+    if plan.get("phase_balance_status") == "phase_recovery_required":
+        return True
+    return bool(plan.get("missing_phase_ids"))
+
+
+def _source_followthrough_prompt_blocks_on_readiness(
+    *,
+    query: str,
+    answer_readiness_summary: dict,
+    answer_ready_handoff: dict,
+) -> bool:
+    if not _source_followthrough_or_stop_quality_prompt(query):
+        return False
+    readiness_decision = answer_readiness_summary.get("decision")
+    handoff_decision = answer_ready_handoff.get("decision")
+    if readiness_decision == "inspect_recovery_reads":
+        return True
+    if handoff_decision in {"diagnostic_only_recovery", "phase_source_plan_first"}:
+        return True
+    if answer_readiness_summary.get("status") in {"inspect_recovery_first", "needs_recovery_reads"}:
+        return True
+    return bool(answer_ready_handoff.get("do_not_answer_until"))
+
+
+def _source_followthrough_or_stop_quality_prompt(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    if not lowered:
+        return False
+    source_followthrough = any(
+        phrase in lowered
+        for phrase in (
+            "source refs",
+            "source ref",
+            "refs should i open",
+            "should i open next",
+            "open next",
+            "which refs",
+            "what refs",
+            "next reads",
+            "next source",
+            "source follow",
+        )
+    )
+    stop_quality = any(
+        phrase in lowered
+        for phrase in (
+            "when should i stop",
+            "stop searching",
+            "stop search",
+            "stop broad search",
+            "stop broad searching",
+            "when to stop",
+            "stop criteria",
+            "stop condition",
+        )
+    )
+    return source_followthrough or stop_quality
+
+
+def _semantic_debug_readiness_gate_next_reads(
+    *,
+    answer_ready_handoff: dict,
+    longitudinal_phase_source_plan: dict,
+) -> list[dict]:
+    reads: list[dict] = []
+    if isinstance(longitudinal_phase_source_plan, dict):
+        for key in ("prioritized_recovery_actions", "prioritized_next_reads_before_synthesis"):
+            values = longitudinal_phase_source_plan.get(key)
+            if isinstance(values, list):
+                reads.extend(item for item in values if isinstance(item, dict))
+    guidance = answer_ready_handoff.get("source_action_guidance")
+    if isinstance(guidance, dict):
+        values = guidance.get("required_primary_source_actions")
+        if isinstance(values, list):
+            reads.extend(
+                item
+                for item in values
+                if isinstance(item, dict) and item.get("diagnostic_only") is not True
+            )
+    return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
 
 
 def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
@@ -4463,6 +4663,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "historical_orchestration_role_evidence_bundle"
             ),
             "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
+            "longitudinal_phase_source_plan": compact.get("longitudinal_phase_source_plan"),
             "expectation_mismatch_plan": compact.get("expectation_mismatch_plan"),
             "process_actual_use_final_support_read_plan": compact.get(
                 "process_actual_use_final_support_read_plan"
