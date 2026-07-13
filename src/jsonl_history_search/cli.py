@@ -8639,12 +8639,13 @@ def _compose_action_chronology_answer(*, opened: list[dict]) -> str | None:
     pieces = []
     for item in opened:
         roles = [str(role) for role in item.get("action_chronology_roles") or [] if str(role).strip()]
-        summary = str(item.get("summary") or "").strip()
+        summary = _action_chronology_public_answer_summary(str(item.get("summary") or "").strip())
         target = str(item.get("target") or "").strip()
         if not roles or not summary:
             continue
         label = ",".join(roles)
-        pieces.append(f"{label}: {summary}" + (f" [{target}]" if target else ""))
+        target_label = _action_chronology_public_ref_label(target)
+        pieces.append(f"{label}: {summary}" + (f" [{target_label}]" if target_label else ""))
     if not pieces:
         return None
     return (
@@ -8652,6 +8653,41 @@ def _compose_action_chronology_answer(*, opened: list[dict]) -> str | None:
         + _short_join(pieces[:4], limit=760)
         + " Boundary: task/review/status artifacts may corroborate this chronology, but they are not primary action proof."
     )
+
+
+def _action_chronology_public_answer_summary(summary: str) -> str:
+    if not summary:
+        return ""
+    return _redact_jsonl_path_targets_for_final_answer(summary)
+
+
+def _action_chronology_public_ref_label(target: str) -> str:
+    if not target:
+        return ""
+    return _redact_jsonl_path_targets_for_final_answer(target)
+
+
+def _redact_jsonl_path_targets_for_final_answer(text: str) -> str:
+    sanitized = str(text or "")
+
+    def _line_label(match: re.Match[str]) -> str:
+        start = match.group("start")
+        end = match.groupdict().get("end")
+        if end:
+            return f"source window lines {start}-{end}"
+        return f"source window line {start}"
+
+    sanitized = re.sub(
+        r"(?P<path>(?:/|~)[^\n\]|;]*?\.jsonl):(?P<start>\d+)(?:-(?P<end>\d+))?",
+        _line_label,
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"\b(?P<path>[A-Za-z0-9._/-]+\.jsonl):(?P<start>\d+)(?:-(?P<end>\d+))?",
+        _line_label,
+        sanitized,
+    )
+    return re.sub(r"\s{2,}", " ", sanitized).strip()
 
 
 def _compose_post_merge_smoke_answer(*, opened: list[dict]) -> str | None:
