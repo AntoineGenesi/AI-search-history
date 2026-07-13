@@ -792,6 +792,76 @@ def build_semantic_debug_payload(
             ),
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
         }
+    longitudinal_phase_source_plan = build_longitudinal_phase_source_plan(
+        query=agent_find["query"]["original"],
+        source_locator_handoff=source_locator_handoff,
+        next_reads=next_reads,
+        scope_boundary_summary=scope_boundary_summary,
+        no_evidence=no_evidence,
+    )
+    if longitudinal_phase_source_plan.get("applies"):
+        source_locator_handoff["longitudinal_phase_source_plan"] = longitudinal_phase_source_plan
+        answer_ready_handoff["longitudinal_phase_source_plan"] = longitudinal_phase_source_plan
+        answer_ready_handoff["links"]["longitudinal_phase_source_plan"] = (
+            "semantic_debug.longitudinal_phase_source_plan"
+        )
+        answer_ready_handoff["source_use_summary"]["longitudinal_phase_source_plan"] = {
+            "link": "semantic_debug.longitudinal_phase_source_plan",
+            "status": longitudinal_phase_source_plan.get("status"),
+            "phase_balance_status": longitudinal_phase_source_plan.get("phase_balance_status"),
+            "missing_phase_count": len(longitudinal_phase_source_plan.get("missing_phase_ids") or []),
+            "current_or_same_wave_echo_count": (
+                longitudinal_phase_source_plan.get("same_wave_current_echoes") or {}
+            ).get("count", 0),
+        }
+        answer_ready_handoff["source_action_guidance"]["longitudinal_phase_source_plan"] = {
+            "link": "semantic_debug.longitudinal_phase_source_plan",
+            "status": longitudinal_phase_source_plan.get("status"),
+            "phase_balance_status": longitudinal_phase_source_plan.get("phase_balance_status"),
+            "required_before_synthesis": longitudinal_phase_source_plan.get("required_before_synthesis"),
+        }
+        if longitudinal_phase_source_plan.get("required_before_synthesis"):
+            answer_ready_handoff["decision"] = "phase_source_plan_first"
+            answer_ready_handoff["do_next"] = "open_or_rerun_phase_source_plan_before_synthesis"
+            answer_ready_handoff["do_not_answer_until"] = dedupe(
+                list(longitudinal_phase_source_plan.get("required_before_synthesis") or [])
+                + list(answer_ready_handoff.get("do_not_answer_until") or [])
+            )[:8]
+            answer_ready_handoff["source_action_guidance"]["decision"] = "phase_source_plan_first"
+            answer_ready_handoff["source_action_guidance"]["stop_condition"] = (
+                "Do not synthesize a longitudinal answer until early/mid/recent phase coverage, "
+                "searched scope/caps, and diagnostic current/same-wave echoes are named."
+            )
+        final_answer_contract["evidence_inputs"]["longitudinal_phase_source_plan"] = {
+            "link": "semantic_debug.longitudinal_phase_source_plan",
+            "status": longitudinal_phase_source_plan.get("status"),
+            "phase_balance_status": longitudinal_phase_source_plan.get("phase_balance_status"),
+            "missing_phase_ids": list(longitudinal_phase_source_plan.get("missing_phase_ids") or []),
+        }
+        final_answer_contract["required_actions"] = dedupe(
+            [
+                (
+                    "For broad longitudinal questions, use semantic_debug.longitudinal_phase_source_plan "
+                    "before synthesis; separate early/mid/recent phases, source families, caps, and current/same-wave echoes."
+                )
+            ]
+            + list(final_answer_contract.get("required_actions") or [])
+        )
+        answer_readiness["longitudinal_phase_source_plan_summary"] = {
+            "link": "semantic_debug.longitudinal_phase_source_plan",
+            "status": longitudinal_phase_source_plan.get("status"),
+            "phase_balance_status": longitudinal_phase_source_plan.get("phase_balance_status"),
+            "represented_phase_ids": list(longitudinal_phase_source_plan.get("represented_phase_ids") or []),
+            "missing_phase_ids": list(longitudinal_phase_source_plan.get("missing_phase_ids") or []),
+        }
+        investigation_state["longitudinal_phase_source_plan_summary"] = (
+            answer_readiness["longitudinal_phase_source_plan_summary"]
+        )
+        guided_audit_flow["longitudinal_phase_source_plan_summary"] = (
+            answer_readiness["longitudinal_phase_source_plan_summary"]
+        )
+        agent_instruction["longitudinal_phase_source_plan"] = longitudinal_phase_source_plan
+        agent_instruction["source_action_guidance"] = answer_ready_handoff["source_action_guidance"]
     followthrough = answer_ready_handoff.get("primary_source_followthrough") or {}
     if followthrough.get("applies"):
         final_answer_contract["required_actions"] = [
@@ -855,6 +925,7 @@ def build_semantic_debug_payload(
         "next_reads": next_reads,
         "answer_ready_handoff": answer_ready_handoff,
         "core_convo_first_read_plan": core_convo_first_read_plan,
+        "longitudinal_phase_source_plan": longitudinal_phase_source_plan,
         "expectation_mismatch_plan": expectation_mismatch_plan,
         "answer_source_discipline": answer_source_discipline,
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
@@ -7761,6 +7832,292 @@ def build_source_action_guidance(
             "or bounded source reads do not support the requested answer."
         ),
     }
+
+
+LONGITUDINAL_PHASES = [
+    {
+        "phase_id": "early_year",
+        "label": "early year",
+        "date_start": "2026-01-01",
+        "date_end": "2026-03-31",
+    },
+    {
+        "phase_id": "mid_year",
+        "label": "mid year",
+        "date_start": "2026-04-01",
+        "date_end": "2026-06-30",
+    },
+    {
+        "phase_id": "recent",
+        "label": "recent",
+        "date_start": "2026-07-01",
+        "date_end": None,
+    },
+]
+
+
+def longitudinal_phase_source_plan_wanted(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower()).strip()
+    if not lowered:
+        return False
+    longitudinal_cues = (
+        "over time",
+        "changed over time",
+        "since the start",
+        "since start",
+        "start of the year",
+        "this year",
+        "timeline",
+        "chronology",
+        "longitudinal",
+        "phases",
+        "evolution",
+    )
+    subject_cues = (
+        "workflow",
+        "workflows",
+        "orchestration",
+        "ai usage",
+        "usage",
+        "changed",
+        "history",
+    )
+    return any(cue in lowered for cue in longitudinal_cues) and any(cue in lowered for cue in subject_cues)
+
+
+def build_longitudinal_phase_source_plan(
+    *,
+    query: str,
+    source_locator_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    scope_boundary_summary: dict[str, Any],
+    no_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    if not longitudinal_phase_source_plan_wanted(query):
+        return {"schema_version": 1, "applies": False}
+
+    read_summaries = [longitudinal_read_summary(read) for read in next_reads if isinstance(read, dict)]
+    actionable_reads = [
+        read
+        for read in read_summaries
+        if read.get("read_more_actionable") is not False and not read.get("diagnostic_only")
+    ]
+    diagnostic_reads = [read for read in read_summaries if read.get("diagnostic_only")]
+    phase_ids = {str(read.get("phase_id")) for read in actionable_reads if read.get("phase_id")}
+    missing_phase_ids = [
+        str(phase["phase_id"])
+        for phase in LONGITUDINAL_PHASES
+        if str(phase["phase_id"]) not in phase_ids
+    ]
+    phase_rows = []
+    for phase in LONGITUDINAL_PHASES:
+        phase_id = str(phase["phase_id"])
+        represented = [read for read in actionable_reads if read.get("phase_id") == phase_id]
+        diagnostics = [read for read in diagnostic_reads if read.get("phase_id") == phase_id]
+        phase_rows.append(
+            {
+                **phase,
+                "status": "represented" if represented else "missing_or_not_selected",
+                "actionable_read_count": len(represented),
+                "diagnostic_echo_count": len(diagnostics),
+                "source_families": sorted({str(read.get("source_family")) for read in represented if read.get("source_family")}),
+                "prioritized_next_reads": represented[:3],
+            }
+        )
+
+    selected_root_families = [
+        str(root.get("kind"))
+        for root in source_locator_handoff.get("selected_roots") or []
+        if isinstance(root, dict) and root.get("kind")
+    ]
+    read_families = Counter(
+        str(read.get("source_family"))
+        for read in read_summaries
+        if read.get("source_family")
+    )
+    source_family_rows = [
+        {
+            "family": family,
+            "selected_root": family in selected_root_families,
+            "surfaced_read_count": int(read_families.get(family, 0)),
+        }
+        for family in sorted(set(selected_root_families) | set(read_families.keys()))
+    ]
+    cap_hit = bool((scope_boundary_summary.get("caps") or {}).get("hit"))
+    phase_balance_status = (
+        "phase_recovery_required"
+        if len(phase_ids) < 2 or missing_phase_ids
+        else "phase_diverse_candidate_reads_present"
+    )
+    required_before_synthesis = []
+    if missing_phase_ids:
+        required_before_synthesis.append(
+            "Recover or explicitly mark missing longitudinal phases before synthesis: "
+            + ", ".join(missing_phase_ids)
+        )
+    if cap_hit:
+        required_before_synthesis.append(
+            "Name cap-limited searched scope before treating surfaced reads as representative."
+        )
+    if diagnostic_reads:
+        required_before_synthesis.append(
+            "Keep current-run/current-task/same-wave prompt echoes diagnostic; do not use them as primary historical proof."
+        )
+    if not required_before_synthesis:
+        required_before_synthesis.append(
+            "Before synthesis, keep phase labels and source-family roles explicit."
+        )
+
+    recovery_actions = longitudinal_phase_recovery_actions(
+        missing_phase_ids=missing_phase_ids,
+        source_families=selected_root_families,
+    )
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "plan_name": "longitudinal_phase_source_plan",
+        "status": (
+            "phase_source_recovery_required"
+            if phase_balance_status == "phase_recovery_required"
+            else "phase_source_plan_ready"
+        ),
+        "phase_balance_status": phase_balance_status,
+        "represented_phase_ids": sorted(phase_ids),
+        "missing_phase_ids": missing_phase_ids,
+        "planned_phases": phase_rows,
+        "source_set_families": source_family_rows,
+        "searched_scope": {
+            "searched_scope": scope_boundary_summary.get("searched_scope") or {},
+            "not_searched_scope": scope_boundary_summary.get("not_searched_scope") or {},
+            "caps": scope_boundary_summary.get("caps") or {},
+            "answer_scope_boundary": scope_boundary_summary.get("answer_scope_boundary"),
+            "not_all_history_boundary": scope_boundary_summary.get("not_all_history_boundary", True),
+            "no_evidence_scope": {
+                "needed": bool(no_evidence.get("needed")),
+                "answer_scope": no_evidence.get("answer_scope"),
+            },
+        },
+        "same_wave_current_echoes": {
+            "count": len(diagnostic_reads),
+            "policy": "diagnostic_or_tainted_not_primary_historical_proof",
+            "examples": diagnostic_reads[:5],
+        },
+        "prioritized_next_reads_before_synthesis": actionable_reads[:6],
+        "prioritized_recovery_actions": recovery_actions,
+        "required_before_synthesis": required_before_synthesis,
+        "claim_boundaries": {
+            "does_not_claim_phase_completeness": True,
+            "does_not_change_ranking": True,
+            "does_not_expand_roots": True,
+            "raw_text_included": False,
+            "current_or_same_wave_echoes_are_primary_proof": False,
+        },
+    }
+
+
+def longitudinal_read_summary(read: dict[str, Any]) -> dict[str, Any]:
+    target = str(read.get("target") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    source_ref = guided_source_ref(source_ref) if source_ref else {}
+    path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
+    date_value = longitudinal_read_date(read, path)
+    phase_id = longitudinal_phase_id(date_value)
+    selection = read.get("historical_provenance_selection") if isinstance(read.get("historical_provenance_selection"), dict) else {}
+    return {
+        "target": target,
+        "kind": read.get("kind"),
+        "source_ref": source_ref or None,
+        "source_family": longitudinal_source_family(path),
+        "date": date_value.isoformat() if date_value else None,
+        "phase_id": phase_id,
+        "diagnostic_only": bool(read.get("diagnostic_only")),
+        "read_more_actionable": read.get("read_more_actionable"),
+        "source_chronology_role": selection.get("source_chronology_role") or read.get("target_source_role"),
+        "reason": read.get("reason"),
+    }
+
+
+def longitudinal_read_date(read: dict[str, Any], path: str) -> datetime | None:
+    for key in ("timestamp_utc", "timestamp", "created_at"):
+        value = read.get(key)
+        if isinstance(value, str) and value.strip():
+            parsed = parse_iso_datetime(value)
+            if parsed:
+                return parsed
+    for regex in (CODEX_SESSION_DATE_RE, CODEX_ROLLOUT_DATE_RE):
+        match = regex.search(path)
+        if match:
+            return datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                tzinfo=timezone.utc,
+            )
+    return None
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def longitudinal_phase_id(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    date = value.date()
+    if date <= datetime(2026, 3, 31, tzinfo=timezone.utc).date():
+        return "early_year"
+    if date <= datetime(2026, 6, 30, tzinfo=timezone.utc).date():
+        return "mid_year"
+    return "recent"
+
+
+def longitudinal_source_family(path: str) -> str:
+    normalized = str(path or "").lower().replace("\\", "/")
+    if "/.codex/sessions/" in normalized:
+        return "codex_sessions"
+    if normalized.endswith("/.codex/history.jsonl") or "/.codex/history.jsonl" in normalized:
+        return "codex_history"
+    if "/.claude/projects/" in normalized:
+        return "claude_projects"
+    if "/tasks/" in normalized:
+        return "repo_tasks"
+    if "/reports/" in normalized:
+        return "repo_reports"
+    if "/codex/state/reviews/" in normalized or "/reviews/" in normalized:
+        return "repo_reviews"
+    return "other"
+
+
+def longitudinal_phase_recovery_actions(*, missing_phase_ids: list[str], source_families: list[str]) -> list[dict[str, Any]]:
+    family_terms = ", ".join(source_families) if source_families else "selected source roots"
+    actions = []
+    for phase in LONGITUDINAL_PHASES:
+        phase_id = str(phase["phase_id"])
+        if phase_id not in missing_phase_ids:
+            continue
+        date_end = phase.get("date_end") or "current run date"
+        actions.append(
+            {
+                "phase_id": phase_id,
+                "date_start": phase.get("date_start"),
+                "date_end": date_end,
+                "source_families_to_try": list(source_families),
+                "action": (
+                    f"Run a bounded phase-specific semantic-debug/find pass over {family_terms}; "
+                    "prefer primary raw user/session windows and pre-existing task/review artifacts, "
+                    "then mark this phase as gap if caps or selected roots cannot support it."
+                ),
+                "final_support_allowed": False,
+                "raw_text_included": False,
+            }
+        )
+    return actions
 
 
 SEMANTIC_DEBUG_RERUN_VALUE_FLAGS = {
