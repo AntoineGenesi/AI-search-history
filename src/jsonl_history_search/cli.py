@@ -3355,6 +3355,8 @@ def _answer_action_contract_from_executed_output(
             "then_confirm": (compact.get("follow_through_plan") or {}).get("then_confirm") or [],
             "diagnostics_after": (compact.get("follow_through_plan") or {}).get("do_not_open_by_default") or [],
             "selected_anchor": compact.get("selected_anchor"),
+            "anchor_decision": compact.get("anchor_decision"),
+            "anchor_candidates": (compact.get("anchor_candidates") or [])[:8],
             "answer_readiness": answer_readiness,
             "answer_brief": compact.get("answer_brief"),
             "session_activity": compact.get("session_activity"),
@@ -8652,6 +8654,21 @@ def _latest_status_commit_labels(commits: list[dict]) -> list[str]:
 
 def _latest_status_anchor_choices(action: dict) -> list[dict]:
     candidates: list[dict] = []
+    anchor_decision = action.get("anchor_decision")
+    if isinstance(anchor_decision, dict):
+        candidates.extend(
+            item
+            for item in anchor_decision.get("rejected_anchor_alternatives") or []
+            if isinstance(item, dict)
+        )
+        chronology = anchor_decision.get("current_user_message_chronology")
+        if isinstance(chronology, dict):
+            candidates.extend(
+                item
+                for item in chronology.get("rejected_anchor_alternatives") or []
+                if isinstance(item, dict)
+            )
+    candidates.extend(item for item in action.get("anchor_candidates") or [] if isinstance(item, dict))
     shortlist = action.get("parent_main_anchor_shortlist")
     if isinstance(shortlist, dict):
         for key in ("candidates", "shortlist", "top_candidates", "canonical_candidates"):

@@ -117,6 +117,13 @@ NON_ANCHOR_CONTEXT_MARKERS = (
 )
 
 WORKER_PROMPT_MARKERS = (
+    "you are a read-only pressure-test agent",
+    "you are jsh-",
+    "read-only pressure-test agent",
+    "read-only pressure agent",
+    "pressure-test agent",
+    "pressure test agent",
+    "pressure agent",
     "you are the jsh-",
     "you are the focused fix worker",
     "you are the focused fix implementer",
@@ -167,12 +174,24 @@ WORKER_PROMPT_MARKERS = (
     "acceptance criteria:",
     "keep all edits in the task worktree",
     "read first:",
+    "role contract:",
     "read the review artifact",
     "read the updated review artifact first",
     "review verdict is failed",
+    "setup-agent",
+    "setup agent",
     "same branch. do not start a new task",
     "same worktree and branch",
     "second rereview failed",
+    "you are not implementing product code",
+    "not implementing product code",
+    "do not edit tracked files",
+    "do not modify tracked files",
+    "write artifacts only under",
+    "private artifacts only under",
+    "your job is one slice only",
+    "do not judge all prompt families",
+    "select the global next task",
     "<turn_aborted>",
 )
 
@@ -672,7 +691,7 @@ def _score_anchor(text: str, index: int, *, timestamp_utc: str = "", status_cuto
         return -100, "empty", "rejected", "empty latest-message row"
     if any(marker in normalized for marker in NON_ANCHOR_CONTEXT_MARKERS):
         return -70 - recency_penalty, "non_human_boundary_or_tool_context", "rejected", "boundary/tool/subagent/inherited context is not a user anchor"
-    if any(marker in normalized for marker in WORKER_PROMPT_MARKERS):
+    if any(marker in normalized for marker in WORKER_PROMPT_MARKERS) or _looks_like_task_prompt(normalized):
         return -55 - recency_penalty, "worker_or_reviewer_prompt", "rejected", "worker/reviewer prompt is not a human status anchor"
     if any(marker in normalized for marker in ADMIN_STATUS_MARKERS):
         return -30 - recency_penalty, "admin_or_status_turn", "rejected", "admin/status turn is useful context but a poor unattended-work anchor"
@@ -2124,13 +2143,15 @@ def _last_substantive_user_instruction_anchor(
             continue
         if not _is_eligible_anchor(candidate):
             continue
+        if not _is_proven_parent_main_history_anchor(candidate):
+            continue
         if _is_newer_than_status_as_of(
             str(candidate.get("timestamp_utc") or ""),
             status_as_of_boundary=status_as_of_boundary,
             audit_run_requested=audit_run_requested,
         ):
             continue
-        return dict(candidate)
+        return _history_mirror_candidate(candidate) or dict(candidate)
     return None
 
 
