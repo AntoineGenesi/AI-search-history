@@ -4539,6 +4539,18 @@ _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
     re.IGNORECASE | re.DOTALL,
 )
+_ACTION_CHRONOLOGY_RECOVERY_MAX_FILES = 120
+_ACTION_CHRONOLOGY_RECOVERY_MAX_BYTES = 3_000_000
+_ACTION_CHRONOLOGY_RECOVERY_WINDOW_LINES = 36
+_ACTION_CHRONOLOGY_FOLLOWUP_MARKERS = (
+    "select jsh",
+    "selected jsh",
+    "launched jsh",
+    "worktree launched",
+    "next task",
+    "thread_spawn",
+    "task_started",
+)
 
 
 def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
@@ -4838,6 +4850,24 @@ def _ask_answer_from_execute(
             action=action,
             opened=answer_opened,
         )
+        if chronology_gate.get("status") != "answer_allowed":
+            recovery = _recover_action_chronology_opened(
+                query=str(report.get("query") or ""),
+                action=action,
+                opened=answer_opened,
+                cwd=cwd,
+            )
+            answer["source_contract"]["action_chronology_source_recovery"] = (
+                _action_chronology_recovery_public_contract(recovery)
+            )
+            recovered_opened = list(recovery.get("opened") or [])
+            if recovered_opened:
+                answer_opened = recovered_opened + list(answer_opened)
+                chronology_gate = _action_chronology_answer_proof_gate(
+                    query=str(report.get("query") or ""),
+                    action=action,
+                    opened=answer_opened,
+                )
         answer["source_contract"]["action_chronology_answer_gate"] = _action_chronology_gate_public_contract(
             chronology_gate
         )
@@ -6421,6 +6451,12 @@ def _extract_text_from_json_row(row: dict) -> str:
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     if isinstance(payload.get("text"), str):
         return payload["text"].strip()
+    if isinstance(payload.get("message"), str):
+        label = str(payload.get("type") or "message")
+        return f"{label}: {payload['message'].strip()}"
+    if isinstance(payload.get("last_agent_message"), str):
+        label = str(payload.get("type") or "last_agent_message")
+        return f"{label}: {payload['last_agent_message'].strip()}"
     content = payload.get("content")
     if isinstance(content, list):
         parts = []
@@ -6570,6 +6606,301 @@ def _action_chronology_answer_proof_gate(*, query: str, action: dict, opened: li
         ),
         "fallback_action_contract_next_step": _next_proof_step_from_action(action),
     }
+
+
+def _recover_action_chronology_opened(*, query: str, action: dict, opened: list[dict], cwd: Path) -> dict:
+    query_ids = [match.group(0).casefold() for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or "")]
+    if not query_ids:
+        return {"schema_version": 1, "status": "not_applicable_no_named_task", "opened": []}
+    if not _action_chronology_requires_boundary_roles(query):
+        return {"schema_version": 1, "status": "not_applicable_not_boundary_prompt", "opened": []}
+
+    date_hints = _unique_preserving_order(
+        _action_chronology_date_hints(opened, action)
+        + _action_chronology_named_task_repo_date_hints(cwd=cwd, query_ids=query_ids)
+    )
+    roots = _action_chronology_recovery_roots(cwd=cwd, date_hints=date_hints)
+    searched_files = 0
+    matched_files = 0
+    recovered: list[dict] = []
+    for path in _action_chronology_recovery_files(roots):
+        searched_files += 1
+        item = _action_chronology_recovered_window_for_file(path=path, query_ids=query_ids, cwd=cwd)
+        if not item:
+            continue
+        matched_files += 1
+        recovered.append(item)
+    recovered.sort(
+        key=lambda item: (
+            ((item.get("ref") or {}).get("action_chronology_recovery") or {}).get("score") or 0,
+            str(item.get("target") or ""),
+        ),
+        reverse=True,
+    )
+    recovered = recovered[:2]
+    return {
+        "schema_version": 1,
+        "status": "primary_chronology_recovered" if recovered else "no_primary_chronology_recovered",
+        "opened": recovered,
+        "searched_roots": [str(root) for root in roots],
+        "searched_file_count": searched_files,
+        "matched_file_count": matched_files,
+        "query_ids": query_ids,
+        "date_hints": date_hints,
+    }
+
+
+def _action_chronology_recovery_public_contract(recovery: dict) -> dict:
+    return {
+        "schema_version": recovery.get("schema_version"),
+        "status": recovery.get("status"),
+        "searched_roots": recovery.get("searched_roots") or [],
+        "searched_file_count": recovery.get("searched_file_count") or 0,
+        "matched_file_count": recovery.get("matched_file_count") or 0,
+        "opened_ref_count": len(recovery.get("opened") or []),
+        "query_ids": recovery.get("query_ids") or [],
+        "date_hints": recovery.get("date_hints") or [],
+    }
+
+
+def _action_chronology_date_hints(opened: list[dict], action: dict) -> list[str]:
+    texts: list[str] = []
+    for item in opened:
+        if isinstance(item, dict):
+            texts.extend(str(value) for value in (item.get("summary"), item.get("target")) if value)
+            ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+            texts.extend(
+                str(value)
+                for value in (
+                    ref.get("commit_time"),
+                    ref.get("timestamp_utc"),
+                    ref.get("target"),
+                    ref.get("reason"),
+                )
+                if value
+            )
+    named = action.get("named_task_action_proof_handoff") if isinstance(action.get("named_task_action_proof_handoff"), dict) else {}
+    for ref in named.get("read") if isinstance(named.get("read"), list) else []:
+        if isinstance(ref, dict):
+            texts.extend(str(value) for value in (ref.get("commit_time"), ref.get("timestamp_utc")) if value)
+    hints: list[str] = []
+    for text in texts:
+        for match in re.finditer(r"\b(20\d\d)-(\d\d)-(\d\d)\b", text):
+            date = "-".join(match.groups())
+            if date not in hints:
+                hints.append(date)
+    return hints[:4]
+
+
+def _action_chronology_named_task_repo_date_hints(*, cwd: Path, query_ids: list[str]) -> list[str]:
+    repo = git_root_for(cwd) or cwd
+    hints: list[str] = []
+    for task_id in query_ids:
+        slug = task_id.casefold()
+        candidates = list((cwd / "tasks").glob(f"{slug}*.md")) + list(
+            (cwd / "codex" / "state" / "reviews").glob(f"{slug}*.md")
+        )
+        for path in candidates[:4]:
+            change = last_change_for_path(path, repo=repo)
+            if not change or not change.commit_time:
+                continue
+            match = re.match(r"(20\d\d-\d\d-\d\d)", change.commit_time)
+            if match and match.group(1) not in hints:
+                hints.append(match.group(1))
+    return hints[:4]
+
+
+def _action_chronology_recovery_roots(*, cwd: Path, date_hints: list[str]) -> list[Path]:
+    home_sessions = Path.home() / ".codex" / "sessions"
+    base_roots = [cwd / "sessions", cwd / ".codex" / "sessions", home_sessions]
+    roots: list[Path] = []
+    for root in base_roots:
+        if not root.is_dir():
+            continue
+        if root == home_sessions:
+            if not date_hints:
+                continue
+            for date in date_hints:
+                year, month, day = date.split("-")
+                dated = root / year / month / day
+                if dated.is_dir() and dated not in roots:
+                    roots.append(dated)
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _action_chronology_recovery_files(roots: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            candidates = sorted(root.rglob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if path.stat().st_size > _ACTION_CHRONOLOGY_RECOVERY_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            files.append(path)
+            if len(files) >= _ACTION_CHRONOLOGY_RECOVERY_MAX_FILES:
+                return files
+    return files
+
+
+def _action_chronology_recovered_window_for_file(*, path: Path, query_ids: list[str], cwd: Path) -> dict | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    lowered = [line.casefold() for line in lines]
+    if not any(any(task_id in line for task_id in query_ids) for line in lowered):
+        return None
+
+    boundary_index = _action_chronology_boundary_index(lowered, query_ids)
+    if boundary_index is None:
+        return None
+    start = max(0, boundary_index - _ACTION_CHRONOLOGY_RECOVERY_WINDOW_LINES + 1)
+    window_lines = lines[start : boundary_index + 1]
+    window_text = "\n".join(window_lines).casefold()
+    if not _action_chronology_window_has_primary_events(window_text):
+        return None
+    post_boundary_text = "\n".join(lines[boundary_index + 1 :]).casefold()
+    followup_markers = [marker for marker in _ACTION_CHRONOLOGY_FOLLOWUP_MARKERS if marker in post_boundary_text]
+    if followup_markers:
+        return None
+
+    rel = _safe_relative_path(cwd, path)
+    summary = _action_chronology_recovered_window_summary(
+        rel=rel,
+        start_line=start + 1,
+        boundary_line=boundary_index + 1,
+        line_count=len(lines),
+        window_lines=window_lines,
+        no_followup_markers=not followup_markers,
+        query_ids=query_ids,
+    )
+    score = _action_chronology_recovered_window_score(window_text)
+    return {
+        "status": "opened",
+        "target": f"{rel}:{start + 1}-{boundary_index + 1}",
+        "path": rel,
+        "line": boundary_index + 1,
+        "summary": summary[:_ASK_ANSWER_MAX_FILE_CHARS],
+        "record_metadata": {
+            "conversation_label": "action_chronology_recovered_window",
+            "conversation_confidence": "high",
+            "top_role": "assistant",
+        },
+        "ref": {
+            "kind": "jsonl_source_ref",
+            "target": f"{rel}:{start + 1}-{boundary_index + 1}",
+            "source_ref": {"path": str(path), "line": start + 1},
+            "openable_target": f"{path}:{start + 1}",
+            "proof_surface": "raw_jsonl_action_chronology_window",
+            "target_source_role": "target_historical_raw",
+            "proof_role": "command_or_tool_call",
+            "reason": (
+                "bounded action chronology recovery for named stop-boundary prompt: "
+                + ", ".join(query_ids)
+            ),
+            "action_chronology_recovery": {
+                "boundary_line": boundary_index + 1,
+                "line_count": len(lines),
+                "post_boundary_followup_markers_found": followup_markers,
+                "score": score,
+            },
+        },
+    }
+
+
+def _action_chronology_boundary_index(lines: list[str], query_ids: list[str]) -> int | None:
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not any(task_id in line for task_id in query_ids):
+            continue
+        if any(term in line for term in ("task_complete", "final answer", "implemented and committed", "closeout")):
+            return index
+    return None
+
+
+def _action_chronology_window_has_primary_events(text: str) -> bool:
+    return (
+        ("function_call" in text or "tool call" in text)
+        and ("function_call_output" in text or "tool output" in text)
+        and any(term in text for term in ("git status", "git show", "git commit", "git add", "commit:"))
+        and any(term in text for term in ("task_complete", "final answer", "implemented and committed", "closeout"))
+    )
+
+
+def _action_chronology_recovered_window_score(text: str) -> int:
+    score = 0
+    if "implemented and committed" in text:
+        score += 8
+    if "on the task branch" in text:
+        score += 4
+    if "git add" in text or "git commit" in text:
+        score += 3
+    if "git status" in text:
+        score += 2
+    if "task_complete" in text:
+        score += 2
+    if "review artifact committed" in text or "verdict: `verified`" in text or "verdict: verified" in text:
+        score -= 4
+    return score
+
+
+def _action_chronology_recovered_window_summary(
+    *,
+    rel: str,
+    start_line: int,
+    boundary_line: int,
+    line_count: int,
+    window_lines: list[str],
+    no_followup_markers: bool,
+    query_ids: list[str],
+) -> str:
+    line_summaries: list[str] = []
+    for offset, raw in enumerate(window_lines, start=start_line):
+        summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{offset}")
+        lower = summary.casefold()
+        if any(
+            marker in lower
+            for marker in (
+                "tool call",
+                "tool output",
+                "git status",
+                "git show",
+                "git add",
+                "commit",
+                "task_complete",
+                "final answer",
+                "implemented and committed",
+            )
+        ):
+            line_summaries.append(f"line {offset}: {summary}")
+        if len(line_summaries) >= 6:
+            break
+    absence = (
+        f"no next task selected or launched after boundary: source file ends at line {line_count}; "
+        "post-boundary marker scan found no next task, selected, launched, thread_spawn, or task_started markers"
+        if no_followup_markers and boundary_line == line_count
+        else "post-boundary marker scan found no next task, selected, launched, thread_spawn, or task_started markers"
+    )
+    return (
+        f"Recovered primary action chronology window for {', '.join(query_ids)} "
+        f"{rel}:{start_line}-{boundary_line}: "
+        "tool call/tool output chronology; final answer and task_complete closeout chronology; "
+        f"git status/worktree/commit repo process chronology; {absence}. "
+        + " | ".join(line_summaries)
+        + f" | boundary line {boundary_line}."
+    )
 
 
 def _action_chronology_required_roles(query: str) -> list[str]:
