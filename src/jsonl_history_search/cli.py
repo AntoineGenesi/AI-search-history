@@ -3532,17 +3532,30 @@ def _answer_action_contract_from_executed_output(
             "are limited to bounded_no_evidence routes executed through no-evidence-report."
         )
         source_inspection_boundary = None
-        if named_task_action_proof.get("status") == "current_named_task_proof_refs_available":
+        if named_task_action_proof.get("status") in {
+            "current_named_task_proof_refs_available",
+            "current_named_task_stopped_episode_proof_refs_available",
+        }:
             answer_status = "answer-ready-after-source-inspection"
             promotion_status = "semantic_debug_current_named_task_proof_ready_after_source_inspection"
+            required_primary_proof_source = "current_named_task_review_commit_refs"
+            if named_task_action_proof.get("status") == "current_named_task_stopped_episode_proof_refs_available":
+                promotion_status = "semantic_debug_current_named_task_stopped_episode_proof_ready_after_source_inspection"
+                required_primary_proof_source = "stable_task_state_report_refs"
             promotion_reason = (
                 "ask --execute semantic-debug found current named task/review/commit proof refs; "
                 "inspect those refs before answering and use stale/session diagnostics only for named gaps."
             )
+            if named_task_action_proof.get("status") == "current_named_task_stopped_episode_proof_refs_available":
+                promotion_reason = (
+                    "ask --execute semantic-debug found stable local task/state/report proof for a named "
+                    "stopped-before-implementation episode; inspect those refs before answering and keep "
+                    "current-run transcript echoes out of final support."
+                )
             source_inspection_boundary = {
                 "decision": "answer_after_source_inspection",
                 "inspect_required_primary_proof_before_answer": True,
-                "required_primary_proof_source": "current_named_task_review_commit_refs",
+                "required_primary_proof_source": required_primary_proof_source,
                 "diagnostics_default_final_support": False,
             }
         elif named_task_action_proof.get("status") == "current_named_task_proof_refs_missing":
@@ -4041,19 +4054,29 @@ def _named_task_action_proof_handoff(
         query=query,
         route_family=route_family,
     )
+    include_stopped_before_implementation = _named_task_stopped_before_implementation_answer_wanted(
+        query=query,
+        route_family=route_family,
+    )
     for task_id in task_ids[:2]:
         task_rows, task_boundaries = _current_named_task_action_proof_rows(
             cwd_path,
             task_id,
             include_selection_rationale=include_selection_rationale,
+            include_stopped_before_implementation=include_stopped_before_implementation,
         )
         rows.extend(task_rows)
         boundaries.extend(task_boundaries)
     rows = _dedupe_action_contract_rows(rows)
     if rows:
+        status = "current_named_task_proof_refs_available"
+        if include_stopped_before_implementation and any(
+            row.get("proof_surface") == "stopped_before_implementation_causal_proof" for row in rows
+        ):
+            status = "current_named_task_stopped_episode_proof_refs_available"
         return {
             "schema_version": 1,
-            "status": "current_named_task_proof_refs_available",
+            "status": status,
             "task_ids": task_ids[:2],
             "read": rows[:6],
             "diagnostics_after": [
@@ -4111,6 +4134,8 @@ def _named_task_clean_answer_surface_wanted(*, query: str, route_family: str) ->
     if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
         return bool(_ask_execute_named_task_ids(query))
     if _named_task_selection_rationale_answer_wanted(query=query, route_family=route_family):
+        return True
+    if _named_task_stopped_before_implementation_answer_wanted(query=query, route_family=route_family):
         return True
     return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
 
@@ -4180,6 +4205,28 @@ def _named_task_review_failure_causal_answer_wanted(*, query: str, route_family:
     return _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family)
 
 
+def _named_task_stopped_before_implementation_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"provenance", "semantic_debug"}:
+        return False
+    if not _ask_execute_named_task_ids(query):
+        return False
+    normalized = str(query or "").casefold()
+    if not any(term in normalized for term in ("why", "reason", "cause", "caused")):
+        return False
+    stopped = any(
+        phrase in normalized
+        for phrase in (
+            "stopped before implementation",
+            "stopped before implementing",
+            "aborted before implementation",
+            "aborted before implementing",
+            "cancelled before implementation",
+            "canceled before implementation",
+        )
+    )
+    return stopped
+
+
 def _ask_execute_named_task_ids(query: str) -> list[str]:
     task_ids: list[str] = []
     for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or ""):
@@ -4199,6 +4246,7 @@ def _current_named_task_action_proof_rows(
     task_id: str,
     *,
     include_selection_rationale: bool = False,
+    include_stopped_before_implementation: bool = False,
 ) -> tuple[list[dict], list[str]]:
     slug = task_id.lower()
     rows: list[dict] = []
@@ -4214,6 +4262,14 @@ def _current_named_task_action_proof_rows(
         )
         rows.extend(selection_rows)
         boundaries.extend(selection_boundaries)
+
+    if include_stopped_before_implementation:
+        stopped_rows, stopped_boundaries = _current_named_task_stopped_before_implementation_rows(
+            cwd,
+            task_id=task_id,
+        )
+        rows.extend(stopped_rows)
+        boundaries.extend(stopped_boundaries)
 
     if task_paths:
         for path in task_paths[:2]:
@@ -4276,6 +4332,122 @@ def _current_named_task_action_proof_rows(
             boundaries.append(f"{task_id}: path-level commit metadata unavailable for {rel}")
 
     return rows, boundaries
+
+
+def _current_named_task_stopped_before_implementation_rows(
+    cwd: Path,
+    *,
+    task_id: str,
+) -> tuple[list[dict], list[str]]:
+    rows: list[dict] = []
+    boundaries: list[str] = []
+    candidate_paths = [
+        cwd / "codex" / "state" / "pipeline-state.md",
+        cwd / "TODO.md",
+        cwd / "reports" / "jsh-1307-outside-user-explicit-family-discovery.md",
+        cwd / "reports" / "jsh-1316-beta-usefulness-explicit-family-gate.md",
+        cwd / "reports" / "jsh-1328-post-slice-fixes-beta-usefulness-regate.md",
+    ]
+    for path in candidate_paths:
+        matches = _stopped_before_implementation_matches(path, task_id=task_id)
+        if not matches:
+            if path.exists():
+                boundaries.append(f"{task_id}: no stopped-before-implementation causal proof found in {_safe_relative_path(cwd, path)}")
+            continue
+        for match in matches[:1]:
+            rows.append(
+                {
+                    "kind": "current_named_task_artifact",
+                    "task_id": task_id,
+                    "proof_surface": "stopped_before_implementation_causal_proof",
+                    "target": f"{_safe_relative_path(cwd, path)}:{match['line']}",
+                    "path": _safe_relative_path(cwd, path),
+                    "line": match["line"],
+                    "reason": (
+                        f"inspect stable local artifact proof explaining why {task_id} "
+                        "was stopped before implementation"
+                    ),
+                    "summary": match["summary"],
+                    "source_boundary": (
+                        "stable repo task/state/report artifact; current-run tool outputs, "
+                        "read-more echoes, slice prompts, and post-hoc diagnostics are not final support"
+                    ),
+                    "matched_terms": match["matched_terms"],
+                }
+            )
+        if rows:
+            break
+    if not rows:
+        boundaries.append(
+            f"{task_id}: no stable task/state/report artifact contained both stopped-before-implementation "
+            "wording and a clean causal reason"
+        )
+    return rows, boundaries
+
+
+def _stopped_before_implementation_matches(path: Path, *, task_id: str) -> list[dict]:
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    task_lower = task_id.casefold()
+    matches: list[dict] = []
+    for index, raw in enumerate(lines, start=1):
+        if task_lower not in raw.casefold():
+            continue
+        window_start = max(0, index - 3)
+        window_end = min(len(lines), index + 3)
+        window_text = " ".join(line.strip() for line in lines[window_start:window_end] if line.strip())
+        matched_terms = _stopped_before_implementation_support_terms(window_text, task_id=task_id)
+        if matched_terms:
+            matches.append(
+                {
+                    "line": index,
+                    "matched_terms": matched_terms,
+                    "summary": _short_join([window_text], limit=_ASK_ANSWER_MAX_FILE_CHARS),
+                }
+            )
+    return matches[:4]
+
+
+def _stopped_before_implementation_support_terms(text: str, *, task_id: str) -> list[str]:
+    normalized = str(text or "").casefold()
+    if task_id.casefold() not in normalized:
+        return []
+    stop_terms = [
+        "stopped before implementation",
+        "stopped before implementing",
+        "aborted before implementation",
+        "aborted before implementing",
+        "worker was stopped",
+        "worker stopped",
+    ]
+    cause_terms = [
+        "mostly admin/docs",
+        "admin/docs",
+        "currentness",
+        "rather than a real product fix",
+        "not a real product fix",
+        "false start",
+    ]
+    cleanup_terms = [
+        "empty worktree",
+        "empty branch",
+        "removed",
+        "reverted",
+    ]
+    matched: list[str] = []
+    if any(term in normalized for term in stop_terms):
+        matched.append("stopped_before_implementation")
+    if any(term in normalized for term in cause_terms):
+        matched.append("clean_causal_reason")
+    if any(term in normalized for term in cleanup_terms):
+        matched.append("cleanup_outcome")
+    if {"stopped_before_implementation", "clean_causal_reason"}.issubset(matched):
+        return matched
+    return []
 
 
 def _current_named_task_selection_rationale_rows(
@@ -6640,7 +6812,10 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
         if isinstance(action.get("named_task_action_proof_handoff"), dict)
         else {}
     )
-    if named_handoff.get("status") == "current_named_task_proof_refs_available":
+    if named_handoff.get("status") in {
+        "current_named_task_proof_refs_available",
+        "current_named_task_stopped_episode_proof_refs_available",
+    }:
         return _dedupe_ask_answer_proof_refs(
             [item for item in named_handoff.get("read") or [] if isinstance(item, dict)]
         )
@@ -6708,6 +6883,23 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
     for ref in refs:
         if ref.get("kind") in {"targeted_fail_closed_boundary", "missing_role_recovery_command"}:
             opened.append({"status": "skipped", "reason": "recovery_or_fail_closed_ref", "ref": ref})
+            continue
+        if (
+            ref.get("kind") == "current_named_task_artifact"
+            and ref.get("proof_surface") == "stopped_before_implementation_causal_proof"
+        ):
+            summary = str(ref.get("summary") or "").strip()
+            opened.append(
+                {
+                    "status": "opened" if summary else "skipped",
+                    "reason": "embedded_stopped_before_implementation_causal_proof" if summary else "empty_stopped_episode_proof",
+                    "target": ref.get("target"),
+                    "path": ref.get("path"),
+                    "line": ref.get("line"),
+                    "summary": summary[:_ASK_ANSWER_MAX_FILE_CHARS],
+                    "ref": ref,
+                }
+            )
             continue
         if ref.get("kind") == "current_named_task_selection_rationale":
             summary = str(ref.get("summary") or "").strip()
@@ -8737,7 +8929,10 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         action_chronology_answer = _compose_action_chronology_answer(opened=opened)
         if action_chronology_answer:
             return action_chronology_answer
-    if named.get("status") == "current_named_task_proof_refs_available":
+    if named.get("status") in {
+        "current_named_task_proof_refs_available",
+        "current_named_task_stopped_episode_proof_refs_available",
+    }:
         return _compose_named_task_answer(query=query, named=named, opened=opened)
     if route_family == "remembered_user_wording":
         return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
@@ -9346,6 +9541,13 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
         )
         if selection_answer:
             return selection_answer
+    if _named_task_stopped_before_implementation_answer_wanted(query=query, route_family="semantic_debug"):
+        stopped_answer = _compose_named_task_stopped_before_implementation_answer(
+            task_id=task_id,
+            opened=opened,
+        )
+        if stopped_answer:
+            return stopped_answer
     if _named_task_merge_provenance_answer_wanted(query=query, route_family="provenance"):
         merge_answer = _compose_named_task_merge_provenance_answer(
             task_id=task_id,
@@ -9643,6 +9845,70 @@ def _compose_named_task_selection_rationale_answer(*, task_id: str, opened: list
         f"Refs used: {proof_refs}."
         + " Boundary: this answers from current task/state selection proof, not raw tool-output transcript text or an all-history claim."
     )
+
+
+def _compose_named_task_stopped_before_implementation_answer(*, task_id: str, opened: list[dict]) -> str | None:
+    proof_summaries: list[str] = []
+    proof_ref_labels: list[str] = []
+    rejected: list[str] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        summary = str(item.get("summary") or "").strip()
+        if ref.get("proof_surface") != "stopped_before_implementation_causal_proof":
+            continue
+        if _named_task_stopped_before_implementation_summary_supported(summary, task_id=task_id):
+            proof_summaries.append(summary)
+            target = str(item.get("target") or ref.get("target") or "").strip()
+            if target:
+                proof_ref_labels.append(target)
+        else:
+            rejected.append(str(item.get("target") or ref.get("target") or "unlabeled ref"))
+    if not proof_summaries:
+        return None
+    cause = _named_task_stopped_before_implementation_cause_clause(
+        _short_join(proof_summaries[:2], limit=900),
+        task_id=task_id,
+    )
+    refs = _short_join(proof_ref_labels[:3], limit=240) or "stable local task/state/report artifact proof"
+    boundary = (
+        "Boundary: this answers only the named stopped-before-implementation episode from stable "
+        "local task/state/report artifacts; current-run transcript echoes, nested read-more output, "
+        "slice prompts, and post-hoc diagnostics are not final support."
+    )
+    if rejected:
+        boundary += f" Rejected unsupported stopped-task refs: {_short_join(rejected[:2], limit=160)}."
+    return f"{task_id} was stopped before implementation because {cause} Refs used: {refs}. {boundary}"
+
+
+def _named_task_stopped_before_implementation_summary_supported(summary: str, *, task_id: str) -> bool:
+    return bool(_stopped_before_implementation_support_terms(summary, task_id=task_id))
+
+
+def _named_task_stopped_before_implementation_cause_clause(proof_text: str, *, task_id: str) -> str:
+    normalized = str(proof_text or "").casefold()
+    cause_parts: list[str] = []
+    if "mostly admin/docs" in normalized:
+        cause_parts.append("it was mostly admin/docs work")
+    elif "admin/docs" in normalized:
+        cause_parts.append("it was admin/docs work")
+    if "currentness" in normalized:
+        cause_parts.append("currentness work")
+    if "rather than a real product fix" in normalized or "not a real product fix" in normalized:
+        cause_parts.append("rather than a real product fix")
+    if not cause_parts and "false start" in normalized:
+        cause_parts.append("it was a false start")
+    cleanup_parts: list[str] = []
+    if "empty worktree" in normalized or "empty branch" in normalized:
+        cleanup_parts.append("the empty branch/worktree were removed")
+    elif "removed" in normalized:
+        cleanup_parts.append("the false-start artifacts were removed")
+    if "reverted" in normalized:
+        cleanup_parts.append("the selection/handoff commits were reverted")
+    cause = _short_join(cause_parts, limit=260) or _short_join([proof_text], limit=360)
+    cleanup = _short_join(cleanup_parts, limit=220)
+    if cleanup:
+        return f"{cause}; {cleanup}."
+    return f"{cause}."
 
 
 def _named_task_selection_proof_ref_label(ref: dict) -> str:
