@@ -78,6 +78,7 @@ from .mechanism_eval import DEFAULT_FIXTURE as DEFAULT_MECHANISM_EVAL_FIXTURE
 from .mechanism_eval import build_mechanism_eval_payload
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
+from .prompt_echo import setup_echo_classification
 from .output import render
 from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
@@ -4602,6 +4603,15 @@ _ASK_ANSWER_MONTH_NUMBERS = {
 }
 _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "work only in this existing worktree",
+    "work only in this isolated worktree",
+    "you are not alone in the codebase",
+    "task: execute",
+    "task branch:",
+    "current branch checkpoint:",
+    "task file:",
+    "scratch file:",
+    "required proof before handoff",
+    "before final response",
     "exact finding to fix",
     "coordinator live smoke",
     "command run from task worktree",
@@ -4616,7 +4626,7 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "test fixture",
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
-    r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
+    r"\byou are (?:(?:the|an?)\b.{0,160}\b)?(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
     re.IGNORECASE | re.DOTALL,
 )
 _ACTION_CHRONOLOGY_RECOVERY_MAX_FILES = 120
@@ -7969,17 +7979,24 @@ def _remembered_user_wording_non_echo_user_opened(opened: list[dict], *, query: 
 
 
 def _remembered_user_wording_prompt_echo_reasons(item: dict, *, query: str) -> list[str]:
-    text = str(item.get("summary") or "").casefold()
+    raw_text = str(item.get("summary") or "")
+    text = raw_text.casefold()
+    shared_echo = setup_echo_classification(raw_text, query=query)
+    if shared_echo.get("explicit_prompt_scaffold_query"):
+        return []
     reasons: list[str] = []
     query_text = str(query or "").strip().casefold()
     if query_text and query_text in text:
         reasons.append("contains_current_ask_query_text")
-    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(str(item.get("summary") or "")):
+    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(raw_text):
         reasons.append("assignment_or_review_scaffolding")
+    if shared_echo.get("is_setup_echo"):
+        reason = str(shared_echo.get("reason") or "setup_echo")
+        reasons.append(f"setup_echo:{reason}")
     for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
         if marker in text:
             reasons.append(f"prompt_echo_marker:{marker}")
-    return reasons
+    return _unique_preserving_order(reasons)
 
 
 def _prompt_echo_ref_public_summary(item: dict, *, query: str) -> dict:

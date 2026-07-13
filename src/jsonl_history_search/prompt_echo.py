@@ -60,6 +60,8 @@ STRONG_SETUP_ECHO_MARKERS = (
 
 ORCHESTRATION_ECHO_MARKERS = (
     "required startup",
+    "required proof before handoff",
+    "before final response",
     "implementation constraints",
     "acceptance criteria",
     "reviewer focus",
@@ -67,24 +69,40 @@ ORCHESTRATION_ECHO_MARKERS = (
     "raw/internal traces",
     "rerun the losing lanes",
     "you are the isolated implementer",
+    "you are the cwd-verified isolated implementer",
     "task orchestration",
     "branch `task/",
+    "task branch:",
+    "current branch checkpoint:",
+    "task file:",
+    "scratch file:",
     "worktree `",
+    "local path:",
+    "session id",
 )
 
 GATE_ASSIGNMENT_ROLE_MARKERS = (
+    "you are worker",
+    "you are implementer",
+    "you are reviewer",
+    "you are coordinator",
     "you are the implementation/gate worker",
     "you are the implementer worker",
     "you are the implementation worker",
     "you are the gate worker",
+    "you are the cwd-verified isolated implementer worker",
     "you are the evaluated fresh receiving agent",
 )
 
 GATE_ASSIGNMENT_SETUP_MARKERS = (
     "work only in this isolated worktree",
+    "you are not alone in the codebase",
     "parent checkout must remain untouched",
     "implement/run one task only",
     "implement one task only",
+    "task: execute",
+    "do not review your own work",
+    "do not mark the task",
     "required reading:",
     "process/fsm:",
     "fsm/process:",
@@ -101,6 +119,8 @@ GATE_ASSIGNMENT_SETUP_MARKERS = (
     "do not claim broad release readiness",
     "do not run the full bounded gate",
     "leave ready for independent review",
+    "run branch-code smokes",
+    "final response must include commit sha",
 )
 
 GATE_ASSIGNMENT_INTENT_MARKERS = (
@@ -115,6 +135,25 @@ GATE_ASSIGNMENT_INTENT_MARKERS = (
     "lane prompt",
 )
 
+EXPLICIT_SCAFFOLD_QUERY_MARKERS = (
+    "assignment prompt",
+    "assigned prompt",
+    "worker assignment",
+    "implementer assignment",
+    "reviewer assignment",
+    "coordinator assignment",
+    "task prompt",
+    "gate prompt",
+    "current gate prompt",
+    "scaffold",
+    "scaffolding",
+    "setup prompt",
+    "system prompt",
+    "developer prompt",
+    "prompt itself",
+    "tasking prompt",
+)
+
 
 def clearly_intends_current_session(query: str) -> bool:
     normalized = normalize_text(query)
@@ -124,6 +163,7 @@ def clearly_intends_current_session(query: str) -> bool:
 def setup_echo_classification(text: str, *, query: str = "") -> dict:
     normalized = normalize_text(text)
     normalized_query = normalize_text(query)
+    explicitly_requested = explicitly_requests_prompt_scaffold(query)
     strong = [marker for marker in STRONG_SETUP_ECHO_MARKERS if marker in normalized]
     orchestration = [marker for marker in ORCHESTRATION_ECHO_MARKERS if marker in normalized]
     gate_roles = [marker for marker in GATE_ASSIGNMENT_ROLE_MARKERS if marker in normalized]
@@ -135,9 +175,14 @@ def setup_echo_classification(text: str, *, query: str = "") -> dict:
         or (len(gate_setup) >= 2 and gate_intent)
         or (query_embedded and gate_setup)
     )
-    is_echo = bool(strong or gate_assignment_echo or (query_embedded and orchestration))
+    is_echo = bool(
+        not explicitly_requested
+        and (strong or gate_assignment_echo or (query_embedded and orchestration))
+    )
     reason = "none"
-    if strong:
+    if explicitly_requested and (strong or gate_assignment_echo or (query_embedded and orchestration)):
+        reason = "explicit_prompt_or_assignment_query"
+    elif strong:
         reason = "fresh_prompt_or_benchmark_setup_marker"
     elif gate_assignment_echo:
         reason = "gate_eval_or_lane_assignment_setup_marker"
@@ -149,7 +194,13 @@ def setup_echo_classification(text: str, *, query: str = "") -> dict:
         "markers": (strong + gate_roles + gate_setup + gate_intent + orchestration)[:8],
         "query_embedded": query_embedded,
         "current_session_intended": clearly_intends_current_session(query),
+        "explicit_prompt_scaffold_query": explicitly_requested,
     }
+
+
+def explicitly_requests_prompt_scaffold(query: str) -> bool:
+    normalized = normalize_text(query)
+    return any(marker in normalized for marker in EXPLICIT_SCAFFOLD_QUERY_MARKERS)
 
 
 def normalize_text(text: str) -> str:
