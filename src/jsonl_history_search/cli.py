@@ -4980,6 +4980,9 @@ _ASK_ANSWER_MONTH_NUMBERS = {
     "dec": "12",
 }
 _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
+    "you are a read-only",
+    "you are the read-only",
+    "read-only pressure agent",
     "work only in this existing worktree",
     "work only in this isolated worktree",
     "you are not alone in the codebase",
@@ -5004,7 +5007,8 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
     "test fixture",
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
-    r"\byou are (?:(?:the|an?)\b.{0,160}\b)?(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
+    r"\byou are (?:(?:the|an?|a)\b.{0,160}\b)?"
+    r"(implementer|re-?reviewer|reviewer|worker|coordinator|read-only\b.{0,80}\b(?:agent|slice))\b",
     re.IGNORECASE | re.DOTALL,
 )
 _QUOTED_STATUS_BOUNDARY_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")

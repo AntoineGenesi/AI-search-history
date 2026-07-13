@@ -84,9 +84,12 @@ ORCHESTRATION_ECHO_MARKERS = (
 )
 
 GATE_ASSIGNMENT_ROLE_MARKERS = (
+    "you are a read-only",
+    "you are the read-only",
     "you are read-only slice",
     "you are the read-only slice",
     "you are read-only agent",
+    "read-only pressure agent",
     "you are worker",
     "you are implementer",
     "you are reviewer",
