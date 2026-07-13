@@ -6452,29 +6452,17 @@ def _action_chronology_answer_wanted(*, query: str, route_family: str) -> bool:
         or "really" in normalized
         or "versus claim" in normalized
     )
-    chronology_shape = any(
-        term in normalized
-        for term in (
-            "stop after",
-            "stopped after",
-            "after jsh-",
-            "next task",
-            "selected",
-            "launched",
-            "follow-up",
-            "follow up",
-            "coordinator",
-        )
-    )
     review_verification_shape = any(
         term in normalized
         for term in ("reviewer", "verify", "verified", "review verdict", "review artifact")
     )
-    if review_verification_shape and not any(
-        term in normalized for term in ("stop", "after", "next task", "selected", "launched")
-    ):
+    if review_verification_shape and not _action_chronology_requires_boundary_roles(query):
         return False
-    return claim_shape and chronology_shape
+    if route_family == "action_proof":
+        return claim_shape and (
+            "coordinator" in normalized or _action_chronology_requires_boundary_roles(query)
+        )
+    return claim_shape and _action_chronology_requires_boundary_roles(query)
 
 
 def _action_chronology_candidate_refs(action: dict) -> list[dict]:
@@ -6587,7 +6575,7 @@ def _action_chronology_answer_proof_gate(*, query: str, action: dict, opened: li
 def _action_chronology_required_roles(query: str) -> list[str]:
     normalized = str(query or "").casefold()
     roles = ["observed_message_or_command_chronology"]
-    if any(term in normalized for term in ("stop", "after", "next task", "selected", "launched", "coordinator")):
+    if _action_chronology_requires_boundary_roles(query):
         roles.extend(
             [
                 "stop_or_closeout_chronology",
@@ -6595,7 +6583,60 @@ def _action_chronology_required_roles(query: str) -> list[str]:
                 "repo_or_process_state_chronology",
             ]
         )
+    elif _action_chronology_requires_repo_or_process_roles(normalized):
+        roles.append("repo_or_process_state_chronology")
     return _unique_preserving_order(roles)
+
+
+def _action_chronology_requires_boundary_roles(query: str) -> bool:
+    normalized = str(query or "").casefold()
+    if re.search(r"\b(stop|stopped|stopping|closeout|closed out)\b", normalized):
+        return True
+    if re.search(r"\b(selected|launched)\b", normalized) and any(
+        term in normalized for term in ("next", "task", "after", "follow-up", "follow up")
+    ):
+        return True
+    return any(
+        term in normalized
+        for term in (
+            "stop after",
+            "stopped after",
+            "stop boundary",
+            "after boundary",
+            "after jsh-",
+            "after task",
+            "no next task",
+            "next task",
+            "selected next",
+            "selected/launched",
+            "selected or launched",
+            "launched next",
+            "follow-up",
+            "follow up",
+            "closeout",
+            "closed out",
+        )
+    )
+
+
+def _action_chronology_requires_repo_or_process_roles(normalized_query: str) -> bool:
+    return any(
+        term in normalized_query
+        for term in (
+            "git status",
+            "git worktree",
+            "repo state",
+            "repository state",
+            "worktree state",
+            "process state",
+            "running process",
+            "background process",
+            "dirty",
+            "clean",
+            "committed",
+            "commit",
+        )
+    )
 
 
 def _action_chronology_opened_source_role(item: dict) -> dict:
