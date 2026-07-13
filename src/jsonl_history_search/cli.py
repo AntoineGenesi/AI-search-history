@@ -4990,7 +4990,7 @@ def _ask_answer_from_execute(
             _next_proof_step_from_action(action),
         )
     answer["answer_status"] = "answered-from-proof"
-    answer["answer"] = direct_answer
+    answer["answer"] = _sanitize_final_answer_prose(direct_answer)
     return base
 
 
@@ -8141,6 +8141,18 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _sanitize_final_answer_prose(text: str) -> str:
+    sanitized = str(text or "")
+    sanitized = re.sub(r"tool output:\s*Chunk ID[^\n.;]*", "opened tool-output proof ref", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r'"type"\s*:\s*"event_msg"', "event message record", sanitized)
+    sanitized = re.sub(r'"timestamp"\s*:\s*"[^"]*"', "event timestamp", sanitized)
+    sanitized = sanitized.replace('"timestamp"', "event timestamp")
+    sanitized = sanitized.replace('"payload"', "event payload")
+    sanitized = sanitized.replace('"type":"event_msg"', "event message record")
+    sanitized = sanitized.replace('"type": "event_msg"', "event message record")
+    return re.sub(r"\s{2,}", " ", sanitized).strip()
 
 
 def _compose_process_actual_use_answer(*, action: dict, opened: list[dict]) -> str | None:

@@ -41,6 +41,8 @@ SOURCE_ROLE_LABELS = (
 STATUS_QUERY_PATTERNS = (
     "what happened since",
     "what has happened since",
+    "what happened before",
+    "what has happened before",
     "what did you do while i was away",
     "while i was away",
     "status since",
@@ -50,11 +52,17 @@ STATUS_QUERY_PATTERNS = (
     "time before that",
     "what changed after",
     "what happened in the main thread",
+    "message before",
+    "last substantive instruction",
+    "last substantive message",
+    "last real instruction",
 )
 
 ADMIN_STATUS_MARKERS = (
     "what happened since",
     "what has happened since",
+    "what happened before",
+    "what has happened before",
     "what did you do while i was away",
     "while i was away",
     "what happened in the main thread",
@@ -67,6 +75,10 @@ ADMIN_STATUS_MARKERS = (
     "side thread",
     "latest admin",
     "last message",
+    "last substantive instruction",
+    "last substantive message",
+    "last real instruction",
+    "message before",
     "last actual message",
     "not the status question",
     "too narrow",
@@ -723,6 +735,42 @@ def _select_anchor_with_boundary(
         ],
     }
     by_ref = {candidate.get("source_ref"): candidate for candidate in candidates}
+    user_chronology = _current_user_message_chronology_decision(
+        query=query,
+        candidates=candidates,
+        status_as_of_boundary=status_as_of_boundary,
+        audit_run_requested=audit_run_requested,
+    )
+    if user_chronology.get("status") == "selected":
+        selected = user_chronology.get("selected_anchor") or {}
+        boundary = user_chronology.get("status_as_of_boundary") or status_as_of_boundary
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": user_chronology.get("context_boundary"),
+                "anchor_scope": "current_user_message_chronology",
+                "anchor_reason": user_chronology.get("anchor_reason"),
+                "anchor_ref": selected.get("source_ref"),
+                "status_ref": (boundary or {}).get("source_ref"),
+                "status_as_of_boundary": boundary,
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected from user-message chronology before status/control/artifact fallback",
+                ),
+                "current_user_message_chronology": user_chronology,
+            },
+            candidates,
+        )
+    if user_chronology.get("status") == "ambiguous":
+        return {
+            **base,
+            "context_boundary": user_chronology.get("context_boundary"),
+            "anchor_scope": "current_user_message_chronology",
+            "anchor_reason": user_chronology.get("anchor_reason"),
+            "selected_anchor": None,
+            "current_user_message_chronology": user_chronology,
+            "rejected_anchor_alternatives": user_chronology.get("rejected_anchor_alternatives") or [],
+        }
     explicit_anchor = _explicit_anchor_candidate(query, candidates)
     if explicit_anchor:
         return _with_rejected_alternatives(
@@ -1867,6 +1915,302 @@ def _clean_history_text(value: Any) -> str:
     if value is None:
         return ""
     return "\n".join(line.rstrip() for line in str(value).strip().splitlines()).strip()
+
+
+def _current_user_message_chronology_decision(
+    *,
+    query: str,
+    candidates: list[dict],
+    status_as_of_boundary: dict | None,
+    audit_run_requested: bool,
+) -> dict:
+    normalized = _normalize(query)
+    target_fragments = _current_user_boundary_target_fragments(query)
+    wants_prior = _wants_message_before_named_anchor(normalized)
+    if target_fragments and not wants_prior:
+        return {"status": "not_applicable"}
+    if target_fragments:
+        target = _find_current_user_boundary_target(
+            candidates,
+            target_fragments,
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        )
+        if not target:
+            return {
+                "status": "ambiguous",
+                "context_boundary": "current_user_message_boundary_target_missing",
+                "anchor_reason": "named_or_quoted_user_message_boundary_not_found",
+                "reason": "could_not_find_a_user_message_matching_the_named_or_quoted_boundary",
+                "target_fragments": target_fragments,
+                "rejected_anchor_alternatives": _current_user_chronology_alternatives(candidates),
+            }
+        if wants_prior:
+            selected = _preceding_current_user_anchor(candidates, target)
+            if not selected:
+                return {
+                    "status": "ambiguous",
+                    "context_boundary": "current_user_message_before_anchor_missing",
+                    "anchor_reason": "message_before_named_user_boundary_not_proven",
+                    "reason": "named_or_quoted_user_boundary_found_but_no_preceding_eligible_user_message_was_found",
+                    "target_boundary": _current_user_boundary_candidate(target),
+                    "rejected_anchor_alternatives": [target] + _current_user_chronology_alternatives(candidates),
+                }
+            boundary = _status_boundary_from_user_candidate(
+                target,
+                kind="current_user_message_boundary",
+                policy=(
+                    "This named/quoted user message is the before/not-after boundary; answer-facing support "
+                    "must stay after the selected prior user anchor and at or before this boundary."
+                ),
+            )
+            return {
+                "status": "selected",
+                "context_boundary": "current_user_message_before_named_boundary",
+                "anchor_reason": "preceding_user_message_before_named_boundary",
+                "reason": "selected_preceding_user_message_before_named_or_quoted_user_boundary",
+                "selected_anchor": selected,
+                "status_as_of_boundary": boundary,
+                "target_boundary": _current_user_boundary_candidate(target),
+                "target_fragments": target_fragments,
+            }
+        return {
+            "status": "selected",
+            "context_boundary": "current_user_message_exact_anchor",
+            "anchor_reason": "named_or_quoted_user_message_anchor",
+            "reason": "selected_user_message_matching_named_or_quoted_boundary",
+            "selected_anchor": target,
+            "status_as_of_boundary": status_as_of_boundary,
+            "target_boundary": _current_user_boundary_candidate(target),
+            "target_fragments": target_fragments,
+        }
+    if _wants_last_substantive_instruction(normalized):
+        selected = _last_substantive_user_instruction_anchor(
+            candidates,
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        )
+        if selected:
+            return {
+                "status": "selected",
+                "context_boundary": "current_user_last_substantive_instruction",
+                "anchor_reason": "last_substantive_user_instruction_anchor",
+                "reason": "selected_latest_substantive_user_instruction_before_current_status_boundary",
+                "selected_anchor": selected,
+                "status_as_of_boundary": status_as_of_boundary,
+            }
+        return {
+            "status": "ambiguous",
+            "context_boundary": "current_user_last_substantive_instruction_missing",
+            "anchor_reason": "last_substantive_user_instruction_not_proven",
+            "reason": "no_substantive_user_instruction_anchor_found_before_status_or_control_rows",
+            "rejected_anchor_alternatives": _current_user_chronology_alternatives(candidates),
+        }
+    return {"status": "not_applicable"}
+
+
+def _current_user_boundary_target_fragments(query: str) -> list[str]:
+    fragments = [
+        _normalize(match.group(1))
+        for match in _QUOTED_ANCHOR_RE.finditer(query)
+        if len(_normalize(match.group(1)).split()) >= 3
+    ]
+    for pattern in (
+        r"\bmessage\s+before\s+(?P<target>.+?)(?:\?|$)",
+        r"\bbefore\s+(?:the\s+)?(?P<target>.+?)\s+message\b",
+    ):
+        for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+            fragment = _clean_boundary_fragment(match.group("target"))
+            if fragment:
+                fragments.append(fragment)
+    deduped = []
+    for fragment in fragments:
+        if fragment and fragment not in deduped:
+            deduped.append(fragment)
+    return deduped
+
+
+def _clean_boundary_fragment(value: str) -> str:
+    fragment = _normalize(value)
+    fragment = re.sub(r"\bnot\s+after\s+it\b.*$", "", fragment).strip()
+    fragment = re.sub(r"\bnot\s+after\b.*$", "", fragment).strip()
+    fragment = re.sub(r"\s+", " ", fragment).strip(" ,.;:-")
+    if any(
+        marker in fragment
+        for marker in (
+            "last answer",
+            "last actual",
+            "last message",
+            "last time",
+            "time before",
+            "previous relevant",
+            "answering",
+            "giving another answer",
+            "giving an answer",
+            "giving answer",
+        )
+    ):
+        return ""
+    words = fragment.split()
+    while words and words[0] in {"the", "a", "an"}:
+        words.pop(0)
+    while words and words[-1] in {"message", "msg", "turn", "anchor"}:
+        words.pop()
+    if len(words) < 3:
+        return ""
+    return " ".join(words)
+
+
+def _wants_message_before_named_anchor(normalized_query: str) -> bool:
+    return (
+        "message before" in normalized_query
+        or "before the" in normalized_query
+        or "before " in normalized_query and " not after" in normalized_query
+    )
+
+
+def _wants_last_substantive_instruction(normalized_query: str) -> bool:
+    return any(
+        marker in normalized_query
+        for marker in (
+            "last substantive instruction",
+            "latest substantive instruction",
+            "last substantive message",
+            "latest substantive message",
+            "last real instruction",
+            "latest real instruction",
+        )
+    )
+
+
+def _find_current_user_boundary_target(
+    candidates: list[dict],
+    fragments: list[str],
+    *,
+    status_as_of_boundary: dict | None,
+    audit_run_requested: bool,
+) -> dict | None:
+    matches = []
+    for candidate in candidates:
+        if _is_never_anchor(candidate):
+            continue
+        if not _is_eligible_anchor(candidate):
+            continue
+        if _is_newer_than_status_as_of(
+            str(candidate.get("timestamp_utc") or ""),
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        ):
+            continue
+        snippet = _normalize(str(candidate.get("snippet") or ""))
+        if not any(fragment and (fragment in snippet or snippet in fragment) for fragment in fragments):
+            continue
+        selected = dict(candidate)
+        selected["current_user_boundary_target"] = True
+        selected["matched_boundary_fragments"] = [fragment for fragment in fragments if fragment in snippet or snippet in fragment]
+        matches.append(selected)
+    matches.sort(key=_chronology_sort_key, reverse=True)
+    return matches[0] if matches else None
+
+
+def _last_substantive_user_instruction_anchor(
+    candidates: list[dict],
+    *,
+    status_as_of_boundary: dict | None,
+    audit_run_requested: bool,
+) -> dict | None:
+    for candidate in sorted(candidates, key=_chronology_sort_key, reverse=True):
+        if candidate.get("classification") != "substantive_work_anchor":
+            continue
+        if not _is_eligible_anchor(candidate):
+            continue
+        if _is_newer_than_status_as_of(
+            str(candidate.get("timestamp_utc") or ""),
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        ):
+            continue
+        return dict(candidate)
+    return None
+
+
+def _preceding_current_user_anchor(candidates: list[dict], target: dict) -> dict | None:
+    older = [
+        candidate
+        for candidate in candidates
+        if candidate.get("source_ref") != target.get("source_ref")
+        and _is_eligible_anchor(candidate)
+        and not _is_never_anchor(candidate)
+        and _candidate_is_before(candidate, target)
+    ]
+    if not older:
+        return None
+    older.sort(key=_chronology_sort_key, reverse=True)
+    return dict(older[0])
+
+
+def _candidate_is_before(candidate: dict, target: dict) -> bool:
+    candidate_time = parse_datetime(str(candidate.get("timestamp_utc") or ""), timezone.utc)
+    target_time = parse_datetime(str(target.get("timestamp_utc") or ""), timezone.utc)
+    if candidate_time is not None and target_time is not None:
+        return candidate_time.astimezone(timezone.utc) < target_time.astimezone(timezone.utc)
+    try:
+        return int(candidate.get("message_index") or 0) > int(target.get("message_index") or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _chronology_sort_key(candidate: dict) -> tuple[str, int]:
+    timestamp = str(candidate.get("timestamp_utc") or "")
+    try:
+        index = -int(candidate.get("message_index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    return (timestamp, index)
+
+
+def _status_boundary_from_user_candidate(candidate: dict, *, kind: str, policy: str) -> dict:
+    return {
+        "kind": kind,
+        "source_ref": candidate.get("source_ref"),
+        "source_kind": candidate.get("source_kind"),
+        "source_identifier": candidate.get("source_identifier"),
+        "openable_source_ref": candidate.get("openable_source_ref"),
+        "openable_target": candidate.get("openable_target"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "local_timestamp": candidate.get("local_timestamp"),
+        "message_index": candidate.get("message_index"),
+        "thread_keys": candidate.get("thread_keys") or [],
+        "snippet": candidate.get("snippet"),
+        "boundary_policy": policy,
+    }
+
+
+def _current_user_boundary_candidate(candidate: dict) -> dict:
+    return {
+        "source_ref": candidate.get("source_ref"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "classification": candidate.get("classification"),
+        "decision": candidate.get("decision"),
+        "rationale": candidate.get("rationale"),
+        "snippet": candidate.get("snippet"),
+        "source_kind": candidate.get("source_kind"),
+        "openable_source_ref": candidate.get("openable_source_ref"),
+        "openable_target": candidate.get("openable_target"),
+        "current_user_boundary_target": bool(candidate.get("current_user_boundary_target")),
+        "matched_boundary_fragments": candidate.get("matched_boundary_fragments") or [],
+    }
+
+
+def _current_user_chronology_alternatives(candidates: list[dict], *, limit: int = 8) -> list[dict]:
+    alternatives = []
+    for candidate in sorted(candidates, key=_chronology_sort_key, reverse=True):
+        if len(alternatives) >= limit:
+            break
+        if not (_is_never_anchor(candidate) or _is_eligible_anchor(candidate)):
+            continue
+        alternatives.append(_current_user_boundary_candidate(candidate))
+    return alternatives
 
 
 def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
@@ -3552,17 +3896,26 @@ def _next_reads(
 
 
 def _prior_request_boundary_read(status_as_of_boundary: dict | None, *, cwd: Path, codex_home: Path | None) -> dict | None:
-    if not status_as_of_boundary or status_as_of_boundary.get("kind") != "prior_request_occurrence_boundary":
+    if not status_as_of_boundary or status_as_of_boundary.get("kind") not in {
+        "prior_request_occurrence_boundary",
+        "current_user_message_boundary",
+    }:
         return None
+    current_user_boundary = status_as_of_boundary.get("kind") == "current_user_message_boundary"
     read = {
-        "reason": "Inspect the prior occurrence of the current request; this row is the status/query boundary, not the answer anchor.",
+        "reason": (
+            "Inspect the named user-message boundary; this row bounds the before/not-after answer interval."
+            if current_user_boundary
+            else "Inspect the prior occurrence of the current request; this row is the status/query boundary, not the answer anchor."
+        ),
         "source_ref": status_as_of_boundary.get("source_ref"),
         "source_kind": status_as_of_boundary.get("source_kind"),
         "snippet": status_as_of_boundary.get("snippet"),
         "source_tier": "required_primary",
         "answer_use_required": True,
-        "prior_request_occurrence_boundary": True,
-        "answer_support_role": "status_query_boundary",
+        "prior_request_occurrence_boundary": not current_user_boundary,
+        "current_user_message_boundary": current_user_boundary,
+        "answer_support_role": "current_user_message_boundary" if current_user_boundary else "status_query_boundary",
     }
     _copy_openable_fields(read, status_as_of_boundary)
     if read.get("openable_target") and not read.get("read_more_command"):
@@ -4008,6 +4361,7 @@ def _plan_read(read: dict) -> dict:
         "answer_support_role",
         "verification_or_rerun_only",
         "prior_request_occurrence_boundary",
+        "current_user_message_boundary",
         "prior_request_occurrence_candidate",
     ):
         if key in read:
@@ -4444,6 +4798,26 @@ def _clarification_request(
 ) -> dict | None:
     if selected_anchor or answer_readiness.get("answer_allowed") is not False:
         return None
+    if anchor_decision.get("anchor_scope") == "current_user_message_chronology":
+        return {
+            "status": "needs_user_anchor_clarification",
+            "answer_allowed": False,
+            "selected_anchor": None,
+            "request": (
+                "I cannot safely identify the intended user-message boundary. Please provide the exact quoted "
+                "message, a timestamp, or say whether you mean the message itself or the user message before it."
+            ),
+            "accepted_anchor_forms": [
+                "quoted_instruction_or_message",
+                "exact_timestamp",
+                "message_itself_or_message_before",
+            ],
+            "reason": anchor_decision.get("anchor_reason") or "current user-message chronology did not produce one safe anchor",
+            "candidate_refs_policy": (
+                "Rejected/status/control candidates are verification-only; do not use them as answer support."
+            ),
+            "rerun_instruction": "Rerun what-happened-since with the exact quoted user message or timestamp before answering.",
+        }
     if anchor_decision.get("anchor_scope") != "parent_thread":
         return None
     if not fail_closed_guidance.get("parent_main_recovery_required"):
