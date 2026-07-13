@@ -4873,6 +4873,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "orchestration_provenance",
         "process_actual_use",
         "provenance",
+        "remembered_topic",
         "remembered_user_wording",
         "semantic_wrapup",
         "semantic_debug",
@@ -5094,6 +5095,23 @@ def _ask_answer_from_execute(
             f"route family {route_family or '(unknown)'} is not supported by ask --answer MVP",
             route.get("stop_guidance") or route.get("manual_search_guidance"),
         )
+    if route_family == "remembered_topic" and not _remembered_topic_causal_instruction_answer_wanted(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+    ):
+        return _ask_answer_fail_closed(
+            answer,
+            "remembered-topic causal answer recovery is scoped to coordinating-vs-implementing user-instruction prompts",
+            {
+                "required_next_proof": "clean user-authored coordination-vs-implementation instruction row",
+                "searched_scope": "selected remembered-topic causal recovery only",
+                "suggested_action": (
+                    "use semantic-debug source refs as leads, then inspect raw user-authored message rows; "
+                    "ask --answer will not infer a causal remembered-topic answer from task/report/tool echoes "
+                    "or from unsupported remembered-topic wording."
+                ),
+            },
+        )
 
     scoped = action.get("scoped_no_evidence_contract")
     if action.get("answer_status") == "answer-scoped-no-evidence-now" and isinstance(scoped, dict):
@@ -5180,7 +5198,12 @@ def _ask_answer_from_execute(
         )
 
     answer_opened = usable
-    if route_family == "remembered_user_wording":
+    if route_family in {"remembered_user_wording", "remembered_topic"}:
+        remembered_recovery_contract_key = (
+            "remembered_topic_causal_user_instruction_recovery"
+            if route_family == "remembered_topic"
+            else "remembered_user_wording_recovery"
+        )
         user_opened = _remembered_user_wording_user_authored_opened(usable)
         if not user_opened:
             recovery = _recover_remembered_user_wording_clean_opened(
@@ -5192,7 +5215,7 @@ def _ask_answer_from_execute(
             )
             recovered_opened = list(recovery.get("opened") or [])
             if recovered_opened:
-                answer["source_contract"]["remembered_user_wording_recovery"] = {
+                answer["source_contract"][remembered_recovery_contract_key] = {
                     "schema_version": 1,
                     "status": "clean_user_proof_recovered_after_non_user_refs",
                     "searched_ref_count": recovery.get("searched_ref_count"),
@@ -5208,7 +5231,7 @@ def _ask_answer_from_execute(
                 )
                 latest_opened = list(latest_recovery.get("opened") or [])
                 if latest_opened:
-                    answer["source_contract"]["remembered_user_wording_recovery"] = {
+                    answer["source_contract"][remembered_recovery_contract_key] = {
                         "schema_version": 1,
                         "status": "clean_user_proof_recovered_from_bounded_user_message_scan",
                         "searched_scope": latest_recovery.get("searched_scope"),
@@ -5256,7 +5279,7 @@ def _ask_answer_from_execute(
                 )
                 recovered_opened = list(recovery.get("opened") or [])
                 if recovered_opened:
-                    answer["source_contract"]["remembered_user_wording_recovery"] = {
+                    answer["source_contract"][remembered_recovery_contract_key] = {
                         "schema_version": 1,
                         "status": "clean_user_proof_recovered_after_prompt_echo_rejection",
                         "searched_ref_count": recovery.get("searched_ref_count"),
@@ -5272,7 +5295,7 @@ def _ask_answer_from_execute(
                     )
                     latest_opened = list(latest_recovery.get("opened") or [])
                     if latest_opened:
-                        answer["source_contract"]["remembered_user_wording_recovery"] = {
+                        answer["source_contract"][remembered_recovery_contract_key] = {
                             "schema_version": 1,
                             "status": "clean_user_proof_recovered_from_bounded_user_message_scan",
                             "searched_scope": latest_recovery.get("searched_scope"),
@@ -5312,6 +5335,67 @@ def _ask_answer_from_execute(
                                 "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
                             },
                         )
+
+    if route_family == "remembered_topic":
+        supported_opened = [
+            item
+            for item in answer_opened
+            if _remembered_topic_causal_opened_supports_answer(
+                query=str(report.get("query") or ""),
+                item=item,
+            )
+        ]
+        if supported_opened:
+            answer_opened = supported_opened
+        else:
+            latest_recovery = _recover_remembered_topic_causal_instruction_from_latest_user_messages(
+                query=str(report.get("query") or ""),
+                config=remembered_user_latest_recovery,
+                cwd=cwd,
+            )
+            latest_opened = [
+                item
+                for item in latest_recovery.get("opened") or []
+                if _remembered_topic_causal_opened_supports_answer(
+                    query=str(report.get("query") or ""),
+                    item=item,
+                )
+            ]
+            answer["source_contract"]["remembered_topic_causal_user_instruction_recovery"] = {
+                "schema_version": 1,
+                "status": (
+                    "clean_user_instruction_proof_recovered_from_bounded_user_message_scan"
+                    if latest_opened
+                    else "no_clean_user_instruction_proof_recovered"
+                ),
+                "searched_scope": latest_recovery.get("searched_scope"),
+                "searched_files": latest_recovery.get("searched_files"),
+                "candidate_user_message_count": latest_recovery.get("candidate_user_message_count"),
+                "matched_user_message_count": latest_recovery.get("matched_user_message_count"),
+                "rejected_prompt_echo_ref_count": latest_recovery.get("rejected_prompt_echo_ref_count"),
+                "prior_opened_ref_count": len(answer_opened),
+            }
+            if latest_opened:
+                answer_opened = latest_opened
+            else:
+                answer["proof_summary"] = [
+                    f"{item.get('target')}: rejected_remembered_topic_causal_support_missing"
+                    for item in answer_opened[:_ASK_ANSWER_MAX_REFS]
+                ]
+                return _ask_answer_fail_closed(
+                    answer,
+                    "opened remembered-topic user refs did not cleanly support the coordination-vs-implementation instruction",
+                    {
+                        "required_next_proof": "clean user-authored coordination-vs-implementation instruction row",
+                        "suggested_action": (
+                            "inspect raw user-message refs that explain coordinator/main Codex should coordinate "
+                            "the FSM/product loop and delegate implementation to agents; do not use eval-lane, "
+                            "task-assignment, report, diagnostic, tool-output, or current-query echoes as final support"
+                        ),
+                        "user_message_recovery": _remembered_user_latest_recovery_public(latest_recovery),
+                        "opened_ref_metadata": [_ref_public_summary(item) for item in answer_opened],
+                    },
+                )
 
     episode_selection = _select_work_episode_opened_for_answer(
         query=str(report.get("query") or ""),
@@ -5454,6 +5538,8 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
         return _action_chronology_source_role_explanation(next_step)
     if route_family == "remembered_user_wording":
         return _remembered_user_wording_source_role_explanation(next_step)
+    if route_family == "remembered_topic":
+        return _remembered_topic_causal_source_role_explanation(next_step)
     if route_family == "latest_status":
         return _latest_status_source_role_explanation(next_step)
     return None
@@ -5637,6 +5723,45 @@ def _remembered_user_wording_source_role_explanation(next_step: object) -> dict 
             "task note, review fixture, test fixture, or current ask echo."
         ),
     }
+
+
+def _remembered_topic_causal_source_role_explanation(next_step: object) -> dict | None:
+    base = _remembered_user_wording_source_role_explanation(next_step)
+    if not base:
+        return None
+    explanation = dict(base)
+    kind = str(explanation.get("kind") or "remembered_user_wording_user_message_recovery_empty")
+    explanation["kind"] = kind.replace("remembered_user_wording", "remembered_topic_causal")
+    summary = str(explanation.get("summary") or "")
+    if summary:
+        explanation["summary"] = summary.replace(
+            "Remembered-user wording",
+            "Remembered-topic causal instruction",
+        ).replace(
+            "remembered-user wording",
+            "remembered-topic causal instruction",
+        )
+    summary_lines = []
+    for line in explanation.get("summary_lines") or []:
+        rewritten = str(line).replace(
+            "Remembered-user wording",
+            "Remembered-topic causal instruction",
+        ).replace(
+            "remembered-user wording",
+            "remembered-topic causal instruction",
+        )
+        rewritten = rewritten.replace(
+            "the user's original instruction",
+            "the user's original coordination-vs-implementation instruction",
+        )
+        summary_lines.append(rewritten)
+    if summary_lines:
+        explanation["summary_lines"] = summary_lines
+    explanation["required_final_proof"] = (
+        "Clean contributor-authored user message row explaining the coordination-vs-implementation instruction, "
+        "not a worker/reviewer assignment, task note, report, tool output, diagnostic, or current ask echo."
+    )
+    return explanation
 
 
 def _prompt_echo_source_role_label(reasons: object) -> str:
@@ -5875,7 +6000,7 @@ def _next_proof_step_from_action(action: dict) -> object:
 
 
 def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_family: str) -> bool:
-    if route_family != "action_proof" or action.get("answer_status") != "inspect_recovery_first":
+    if route_family not in {"action_proof", "remembered_topic"} or action.get("answer_status") != "inspect_recovery_first":
         return False
     for item in action.get("read") or []:
         if not isinstance(item, dict):
@@ -8396,6 +8521,103 @@ def _recover_remembered_user_wording_from_latest_user_messages(
     }
 
 
+def _recover_remembered_topic_causal_instruction_from_latest_user_messages(
+    *,
+    query: str,
+    config: dict | None,
+    cwd: Path,
+) -> dict:
+    if not config:
+        return {
+            "status": "not_run_explicit_root_without_codex_home",
+            "opened": [],
+            "searched_scope": "not_searched",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "rejected_prompt_echo_ref_count": 0,
+            "rejected_non_support_ref_count": 0,
+            "query_terms": [],
+        }
+    terms = _remembered_user_wording_topic_terms(query)
+    if not terms:
+        return {
+            "status": "not_run_no_topic_terms",
+            "opened": [],
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "rejected_prompt_echo_ref_count": 0,
+            "rejected_non_support_ref_count": 0,
+            "query_terms": [],
+        }
+    try:
+        result = latest_user_messages(
+            codex_home=Path(str(config.get("codex_home") or "")).expanduser(),
+            default_tz=timezone.utc,
+            limit=_ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT,
+            max_files=max(1, int(config.get("max_files") or 200)),
+            max_bytes=max(1, int(config.get("max_bytes") or 100 * 1024 * 1024)),
+            max_elapsed=max(0.1, float(config.get("max_elapsed") or 15.0)),
+            snippet_chars=0,
+        )
+    except Exception as exc:  # pragma: no cover - defensive CLI recovery surface
+        return {
+            "status": "error",
+            "error": str(exc),
+            "opened": [],
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "rejected_prompt_echo_ref_count": 0,
+            "rejected_non_support_ref_count": 0,
+            "query_terms": sorted(terms),
+        }
+    messages = [item for item in result.get("messages") or [] if isinstance(item, dict)]
+    scored = [
+        (score, item)
+        for item in messages
+        if (score := _remembered_user_message_topic_score(item, terms)) >= min(2, len(terms))
+    ]
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            str(pair[1].get("timestamp_utc") or ""),
+            1 if pair[1].get("source_kind") == "codex_history" else 0,
+        ),
+        reverse=True,
+    )
+    opened: list[dict] = []
+    rejected_prompt_echo: list[dict] = []
+    rejected_non_support = 0
+    for score, message in scored:
+        item = _latest_user_message_recovery_opened_item(message, score=score, cwd=cwd)
+        if _remembered_user_wording_prompt_echo_reasons(item, query=query):
+            rejected_prompt_echo.append(_prompt_echo_ref_public_summary(item, query=query))
+            continue
+        if not _remembered_topic_causal_opened_supports_answer(query=query, item=item):
+            rejected_non_support += 1
+            continue
+        opened.append(item)
+        break
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return {
+        "status": "clean_user_instruction_proof_recovered" if opened else "no_matching_user_instruction_proof_found",
+        "opened": opened,
+        "searched_scope": result.get("source_scope") or "codex_history_and_codex_sessions_only",
+        "searched_files": summary.get("searched_files"),
+        "candidate_user_message_count": summary.get("candidate_user_message_count"),
+        "matched_user_message_count": len(scored),
+        "rejected_prompt_echo_ref_count": len(rejected_prompt_echo),
+        "rejected_prompt_echo_refs": rejected_prompt_echo[:_ASK_ANSWER_MAX_REFS],
+        "rejected_non_support_ref_count": rejected_non_support,
+        "query_terms": sorted(terms),
+        "warnings": (result.get("sources") or {}).get("warnings") if isinstance(result.get("sources"), dict) else [],
+    }
+
+
 def _remembered_user_latest_recovery_public(recovery: dict) -> dict:
     return {
         "status": recovery.get("status"),
@@ -8404,6 +8626,7 @@ def _remembered_user_latest_recovery_public(recovery: dict) -> dict:
         "candidate_user_message_count": recovery.get("candidate_user_message_count"),
         "matched_user_message_count": recovery.get("matched_user_message_count"),
         "rejected_prompt_echo_ref_count": recovery.get("rejected_prompt_echo_ref_count"),
+        "rejected_non_support_ref_count": recovery.get("rejected_non_support_ref_count"),
         "query_terms": recovery.get("query_terms") or [],
     }
 
@@ -8936,6 +9159,8 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_named_task_answer(query=query, named=named, opened=opened)
     if route_family == "remembered_user_wording":
         return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
+    if route_family == "remembered_topic":
+        return _compose_remembered_topic_causal_instruction_answer(query=query, opened=opened)
     if route_family == "latest_status":
         return _compose_latest_status_answer(query=query, action=action, opened=opened)
     if route_family == "semantic_wrapup":
@@ -8961,6 +9186,79 @@ def _sanitize_final_answer_prose(text: str) -> str:
     sanitized = sanitized.replace('"type":"event_msg"', "event message record")
     sanitized = sanitized.replace('"type": "event_msg"', "event message record")
     return re.sub(r"\s{2,}", " ", sanitized).strip()
+
+
+def _remembered_topic_causal_instruction_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family != "remembered_topic":
+        return False
+    normalized = _simple_normalize(query)
+    if "instead of" not in normalized:
+        return False
+    if not re.search(r"\bwhy did i (?:mention|say|ask for|request|bring up|call out)\b", normalized):
+        return False
+    terms = _remembered_user_wording_topic_terms(query)
+    has_coordination = any(term.startswith("coordinat") for term in terms)
+    has_implementation = any(term.startswith("implement") for term in terms)
+    return has_coordination and has_implementation
+
+
+def _remembered_topic_causal_opened_supports_answer(*, query: str, item: dict) -> bool:
+    if not _remembered_topic_causal_instruction_answer_wanted(
+        query=query,
+        route_family="remembered_topic",
+    ):
+        return False
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata.get("is_user_authored") is not True:
+        return False
+    if _remembered_user_wording_prompt_echo_reasons(item, query=query):
+        return False
+    text = str(item.get("summary") or "").casefold()
+    has_coordination = any(term in text for term in ("coordinating", "coordinate", "coordinator"))
+    has_implementation = any(
+        term in text
+        for term in ("implementing", "implementation", "implementer", "implementers", "agents")
+    )
+    has_instructional_reason = any(
+        term in text
+        for term in (
+            "fsm",
+            "orchestration loop",
+            "product loop",
+            "main codex",
+            "delegate",
+            "agents are for",
+            "broken down",
+            "split",
+            "rabbithole",
+            "impactful thing next",
+        )
+    )
+    return has_coordination and has_implementation and has_instructional_reason
+
+
+def _compose_remembered_topic_causal_instruction_answer(*, query: str, opened: list[dict]) -> str | None:
+    if not _remembered_topic_causal_instruction_answer_wanted(
+        query=query,
+        route_family="remembered_topic",
+    ):
+        return None
+    summaries = [str(item.get("summary") or "").strip() for item in opened if item.get("summary")]
+    if not summaries:
+        return None
+    joined = " ".join(summaries).casefold()
+    if not (
+        any(term in joined for term in ("coordinating", "coordinate", "coordinator"))
+        and any(term in joined for term in ("implementing", "implementation", "implementer", "agents"))
+    ):
+        return None
+    source_summary = _short_join(summaries[:2], limit=520)
+    return (
+        "You mentioned coordinating instead of implementing because the opened user-authored instruction "
+        "says the main/coordinator Codex should coordinate the FSM/product loop, select and split the work, "
+        "and delegate implementation to implementer agents instead of doing the product-code implementation "
+        f"itself. Opened proof: {source_summary}"
+    )
 
 
 def _compose_process_actual_use_answer(*, action: dict, opened: list[dict]) -> str | None:

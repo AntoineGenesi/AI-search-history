@@ -30,6 +30,8 @@ STRONG_SETUP_ECHO_MARKERS = (
     "receiving agent",
     "lane prompt",
     "worker lane",
+    "manual_default lane",
+    "manual default lane",
     "jsonl lane",
     "manual/default",
     "manual comparator",

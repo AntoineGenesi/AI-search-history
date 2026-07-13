@@ -701,6 +701,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_parent_main_status_anchor_failure_query(normalized):
         return ROUTES[5]
 
+    if _looks_like_remembered_topic_causal_instruction_query(normalized):
+        return ROUTES[6]
+
     if _looks_like_expectation_mismatch_query(normalized):
         return EXPECTATION_MISMATCH_ROUTE
 
@@ -1433,6 +1436,49 @@ def _looks_like_remembered_user_wording_query(normalized: str) -> bool:
             r"\bwhat was my (?:ask|request|instruction) about\b",
         )
     )
+
+
+def _looks_like_remembered_topic_causal_instruction_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    if " instead of " not in normalized:
+        return False
+    match = re.search(
+        r"\bwhy did i (?:mention|say|ask for|request|bring up|call out)\s+(.+?)\s+instead of\s+(.+)\b",
+        normalized,
+    )
+    if not match:
+        return False
+    left_terms = _substantive_topic_terms(match.group(1))
+    right_terms = _substantive_topic_terms(match.group(2))
+    return bool(left_terms and right_terms)
+
+
+def _substantive_topic_terms(text: str) -> set[str]:
+    stopwords = {
+        "about",
+        "again",
+        "agent",
+        "ask",
+        "asked",
+        "codex",
+        "did",
+        "for",
+        "instead",
+        "main",
+        "mention",
+        "say",
+        "that",
+        "the",
+        "this",
+        "why",
+        "you",
+    }
+    terms = set()
+    for raw in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", text.casefold()):
+        term = raw.replace("_", "-").strip("-")
+        if term not in stopwords:
+            terms.add(term)
+    return terms
 
 
 def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
