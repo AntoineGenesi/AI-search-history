@@ -577,6 +577,10 @@ def build_semantic_wrapup_payload(
         signals,
     )
     user_message_first_evidence = _user_message_first_evidence(records, signals)
+    selected_substantive_signals = _promote_user_message_first_cluster_signals(
+        selected_substantive_signals,
+        user_message_first_evidence,
+    )
     factual_context = _factual_launch_context(records, signals)
     skill_check_recommendation = _skill_check_recommendation(query, signals)
     rolling_window_coverage = _rolling_window_coverage(
@@ -591,6 +595,11 @@ def build_semantic_wrapup_payload(
     fail_closed_scope = ambiguous_prompt_only_scope or explicit_root_setup_echo_scope
     all_failure_modes = [] if fail_closed_scope else _failure_modes(selected_substantive_signals)
     failure_modes = all_failure_modes[:INLINE_FAILURE_MODE_LIMIT]
+    cluster_promotion = _cluster_promotion_surface(
+        user_message_first_evidence,
+        returned_failure_modes=failure_modes,
+        all_failure_modes=all_failure_modes,
+    )
     orchestration_evidence = _orchestration_evidence(records, signals=signals, query=query)
     current_session_source_selection = _current_session_source_selection(cwd, query)
     currentness_boundary = _currentness_boundary(plan, query)
@@ -617,6 +626,7 @@ def build_semantic_wrapup_payload(
         fix_suggestions=fix_suggestions,
         next_reads=next_reads,
         read_role_summary=read_role_summary,
+        cluster_promotion=cluster_promotion,
     )
     answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads, answer_ready_contract)
     payload = {
@@ -655,6 +665,9 @@ def build_semantic_wrapup_payload(
                 "skill_check_recommendation_present": bool(skill_check_recommendation),
                 "user_message_first_candidate_count": user_message_first_evidence["candidate_count"],
                 "user_message_first_cluster_count": user_message_first_evidence["cluster_count"],
+                "cluster_promoted_count": cluster_promotion["promoted_count"],
+                "cluster_parked_count": cluster_promotion["parked_count"],
+                "cluster_truncated_count": cluster_promotion["truncated_count"],
                 "factual_context_count": factual_context["count"],
                 "default_actionable_read_count": read_role_summary["default_actionable_read_count"],
                 "optional_diagnostic_read_count": read_role_summary["optional_diagnostic_count"],
@@ -665,6 +678,7 @@ def build_semantic_wrapup_payload(
             "signal_classification": {
                 "substantive_signal_count": len(substantive_signals),
                 "selected_substantive_signal_count": len(selected_substantive_signals),
+                "user_message_first_cluster_promoted_signal_count": cluster_promotion["synthetic_signal_count"],
                 "setup_echo_signal_count": len(setup_echo_signals),
                 "substantive_source_refs": [signal["source_ref"] for signal in substantive_signals[:8]],
                 "selected_substantive_source_refs": [signal["source_ref"] for signal in selected_substantive_signals[:8]],
@@ -678,6 +692,7 @@ def build_semantic_wrapup_payload(
                 ),
             },
             "user_message_first_evidence": user_message_first_evidence,
+            "cluster_promotion": cluster_promotion,
             "factual_context": factual_context,
             "rolling_window_coverage": rolling_window_coverage,
             "orchestration_evidence": orchestration_evidence,
@@ -1000,10 +1015,59 @@ def _clusters_from_user_message_candidates(candidates: list[dict]) -> list[dict]
                 "candidate_count": len(items),
                 "candidate_ids": [item["candidate_id"] for item in items[:8]],
                 "source_refs": [item["source_ref"] for item in items[:5]],
+                "examples": [
+                    {
+                        "source_ref": item.get("source_ref"),
+                        "timestamp_utc": item.get("timestamp_utc"),
+                        "snippet": item.get("snippet"),
+                    }
+                    for item in items[:3]
+                ],
                 "nearby_context_window_count": len([item for item in items if item.get("nearby_turn_context")]),
             }
         )
     return clusters
+
+
+def _promote_user_message_first_cluster_signals(
+    selected_signals: list[dict],
+    user_message_first_evidence: dict,
+) -> list[dict]:
+    promoted = list(selected_signals)
+    represented_labels = {
+        str(label)
+        for signal in selected_signals
+        for label in (signal.get("labels") or [])
+    }
+    for cluster in user_message_first_evidence.get("clusters") or []:
+        label = str(cluster.get("label") or "")
+        if not label or label in represented_labels:
+            continue
+        candidate_count = int(cluster.get("candidate_count") or 0)
+        if candidate_count < 2:
+            continue
+        examples = [item for item in cluster.get("examples") or [] if isinstance(item, dict)]
+        if not examples:
+            continue
+        for index, example in enumerate(examples, 1):
+            source_ref = example.get("source_ref") if isinstance(example.get("source_ref"), dict) else {}
+            promoted.append(
+                {
+                    "signal_id": f"{cluster.get('cluster_id') or 'cluster'}-promotion-{index}",
+                    "labels": [label],
+                    "friction_markers": [],
+                    "scope_signal_kind": "user_message_first_cluster",
+                    "actor_label": "user_message_first_cluster",
+                    "source_ref": source_ref,
+                    "timestamp_utc": example.get("timestamp_utc"),
+                    "snippet": example.get("snippet")
+                    or f"User-message-first cluster `{label}` had {candidate_count} correction candidate(s).",
+                    "cluster_candidate_count": candidate_count,
+                    "cluster_id": cluster.get("cluster_id"),
+                }
+            )
+        represented_labels.add(label)
+    return promoted
 
 
 def _factual_launch_context(records, signals: list[dict]) -> dict:
@@ -1112,7 +1176,7 @@ def _agent_instruction(
 
 
 def _skill_check_recommendation(query: str, signals: list[dict]) -> dict | None:
-    text = " ".join([query] + [str(signal.get("snippet") or "") for signal in signals]).lower()
+    text = query.lower()
     if not _looks_like_skill_use_compliance_signal(text):
         return None
     skill = _extract_named_skill(text)
@@ -1192,12 +1256,27 @@ def _answer_ready_contract(
     fix_suggestions: list[dict],
     next_reads: list[dict],
     read_role_summary: dict | None = None,
+    cluster_promotion: dict | None = None,
 ) -> dict:
     if status != "found" or not failure_modes:
         return {
             "answer_ready": False,
             "decision": "not_answer_ready",
             "reason": "semantic-wrapup did not return source-backed failure modes.",
+        }
+    if not fix_suggestions:
+        return {
+            "answer_ready": False,
+            "decision": "not_answer_ready",
+            "reason": "semantic-wrapup returned failure modes without user-selectable fix suggestions.",
+        }
+    cluster_gate = _cluster_promotion_answer_ready_gate(failure_modes, cluster_promotion or {})
+    if not cluster_gate["answer_surface_ready"]:
+        return {
+            "answer_ready": False,
+            "decision": "not_answer_ready",
+            "reason": cluster_gate["reason"],
+            "cluster_promotion_status": cluster_gate,
         }
     summary = read_role_summary or _semantic_read_role_summary(next_reads)
     return {
@@ -1209,6 +1288,7 @@ def _answer_ready_contract(
         "auto_apply": False,
         "failure_mode_count": len(failure_modes),
         "fix_suggestion_count": len(fix_suggestions),
+        "cluster_promotion_status": cluster_gate,
         "read_role_summary": summary,
         "required_next_action": (
             "Inspect required_primary_proof source refs, then present the user-selectable fix suggestions "
@@ -1229,6 +1309,37 @@ def _answer_ready_contract(
             "This is an answer-ready failure-mode/fix-suggestion handoff after source inspection; "
             "it does not auto-apply changes or prove broad all-history completeness."
         ),
+    }
+
+
+def _cluster_promotion_answer_ready_gate(failure_modes: list[dict], cluster_promotion: dict) -> dict:
+    labels = {str(mode.get("failure_mode") or "") for mode in failure_modes}
+    non_generic_labels = labels - {"general_workflow_failure"}
+    ranked_clusters = [item for item in cluster_promotion.get("ranked_clusters") or [] if isinstance(item, dict)]
+    parked_without_reason = [
+        item
+        for item in ranked_clusters
+        if item.get("promotion_status") in {"parked", "truncated"} and not str(item.get("reason") or "").strip()
+    ]
+    if len(ranked_clusters) > 1 and not non_generic_labels:
+        return {
+            "answer_surface_ready": False,
+            "reason": "multiple correction clusters were detected but only a generic failure mode was returned",
+            "promoted_failure_modes": sorted(labels),
+            "parked_without_reason_count": len(parked_without_reason),
+        }
+    if parked_without_reason:
+        return {
+            "answer_surface_ready": False,
+            "reason": "one or more detected correction clusters lacked promoted/parked reasoning",
+            "promoted_failure_modes": sorted(labels),
+            "parked_without_reason_count": len(parked_without_reason),
+        }
+    return {
+        "answer_surface_ready": True,
+        "reason": "promoted clusters and parked/truncated reasons are sufficient for next-task selection",
+        "promoted_failure_modes": sorted(labels),
+        "parked_without_reason_count": 0,
     }
 
 
@@ -1720,6 +1831,7 @@ def _active_task_destinations(cwd: Path) -> list[tuple[str, str]]:
         return []
     destinations: list[tuple[str, str]] = []
     targeted_patterns = (
+        r"Active selected product task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
         r"active_task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
         r"Recommended next task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
         r"Recommended next task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
@@ -2169,22 +2281,98 @@ def _failure_modes(signals: list[dict]) -> list[dict]:
     modes = []
     for label, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
         evidence = items[:5]
+        evidence_count = max(
+            [len(items)]
+            + [
+                int(item.get("cluster_candidate_count") or 0)
+                for item in items
+                if str(item.get("cluster_candidate_count") or "").isdigit()
+            ]
+        )
         modes.append(
             {
                 "failure_mode": label,
                 "title": _title_for(label),
-                "evidence_count": len(items),
+                "evidence_count": evidence_count,
                 "evidence": evidence,
                 "examples": _examples_from_evidence(evidence),
                 "why_it_matters": _why_it_matters(label),
                 "issue_axis": _issue_axis(label),
                 "cause_chain": _cause_chain(label, evidence),
-                "confidence": "high" if len(items) >= 2 else "medium",
-                "uncertainty": _uncertainty(label, len(items)),
+                "confidence": "high" if evidence_count >= 2 else "medium",
+                "uncertainty": _uncertainty(label, evidence_count),
                 "source_refs": [item["source_ref"] for item in evidence],
             }
         )
     return modes
+
+
+def _cluster_promotion_surface(
+    user_message_first_evidence: dict,
+    *,
+    returned_failure_modes: list[dict],
+    all_failure_modes: list[dict],
+) -> dict:
+    returned_labels = {str(mode.get("failure_mode") or "") for mode in returned_failure_modes}
+    all_labels = {str(mode.get("failure_mode") or "") for mode in all_failure_modes}
+    ranked_clusters: list[dict] = []
+    synthetic_signal_count = 0
+    for cluster in user_message_first_evidence.get("clusters") or []:
+        label = str(cluster.get("label") or "")
+        candidate_count = int(cluster.get("candidate_count") or 0)
+        if label in returned_labels:
+            status = "promoted"
+            reason = "cluster is returned as an actionable failure mode and fix suggestion candidate"
+        elif label in all_labels:
+            status = "truncated"
+            reason = "cluster mapped to a failure mode but was outside the inline returned limit"
+        elif candidate_count < 2:
+            status = "parked"
+            reason = "single-candidate cluster parked until another source-backed correction corroborates it"
+        else:
+            status = "parked"
+            reason = (
+                "cluster was detected in user-message-first evidence but did not survive the "
+                "current-session substantive promotion filter; inspect its structured refs before "
+                "treating it as a primary fix"
+            )
+        if any(
+            signal.get("scope_signal_kind") == "user_message_first_cluster"
+            for mode in returned_failure_modes
+            if mode.get("failure_mode") == label
+            for signal in mode.get("evidence") or []
+        ):
+            synthetic_signal_count += len(cluster.get("examples") or [])
+        ranked_clusters.append(
+            {
+                "cluster_id": cluster.get("cluster_id"),
+                "label": label,
+                "candidate_count": candidate_count,
+                "promotion_status": status,
+                "reason": reason,
+                "source_refs": cluster.get("source_refs") or [],
+                "examples": cluster.get("examples") or [],
+            }
+        )
+    promoted = [item for item in ranked_clusters if item["promotion_status"] == "promoted"]
+    parked = [item for item in ranked_clusters if item["promotion_status"] == "parked"]
+    truncated = [item for item in ranked_clusters if item["promotion_status"] == "truncated"]
+    return {
+        "method": (
+            "Map user-message-first correction clusters to returned failure modes when they have "
+            "source-backed corroboration; otherwise keep an explicit parked/truncated reason."
+        ),
+        "promotion_threshold": "candidate_count >= 2 or already represented by selected substantive signals",
+        "ranked_clusters": ranked_clusters,
+        "promoted_count": len(promoted),
+        "parked_count": len(parked),
+        "truncated_count": len(truncated),
+        "synthetic_signal_count": synthetic_signal_count,
+        "answer_surface_requirement": (
+            "answer_ready requires at least one non-generic promoted cluster and explicit reasons "
+            "for detected clusters that are not returned inline"
+        ),
+    }
 
 
 def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[dict]:
