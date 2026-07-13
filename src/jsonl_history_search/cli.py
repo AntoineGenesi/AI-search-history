@@ -4834,6 +4834,7 @@ _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:(?:the|an?)\b.{0,160}\b)?(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
     re.IGNORECASE | re.DOTALL,
 )
+_QUOTED_STATUS_BOUNDARY_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")
 _ACTION_CHRONOLOGY_RECOVERY_MAX_FILES = 120
 _ACTION_CHRONOLOGY_RECOVERY_MAX_BYTES = 3_000_000
 _ACTION_CHRONOLOGY_RECOVERY_WINDOW_LINES = 36
@@ -4931,6 +4932,32 @@ def _ask_answer_from_execute(
         route_family=route_family,
     )
     if action.get("answer_status") in _ASK_ANSWER_EXPLICIT_FAIL_STATUSES and not can_follow_raw_proof:
+        quote_boundary_recovery = _recover_latest_status_quoted_before_boundary(
+            query=str(report.get("query") or ""),
+            route_family=route_family,
+            config=remembered_user_latest_recovery,
+            cwd=cwd,
+        )
+        if quote_boundary_recovery.get("status") == "clean_user_boundary_recovered":
+            recovered_opened = list(quote_boundary_recovery.get("opened") or [])
+            answer["source_contract"]["latest_status_quote_boundary_recovery"] = (
+                _latest_status_quote_boundary_recovery_public(quote_boundary_recovery)
+            )
+            answer["refs_used"] = [_ref_public_summary(item) for item in recovered_opened]
+            answer["proof_summary"] = [item["summary"] for item in recovered_opened if item.get("summary")]
+            answer["answer_status"] = "answered-from-proof"
+            answer["answer"] = _sanitize_final_answer_prose(
+                _compose_latest_status_quote_boundary_plan_answer(
+                    query=str(report.get("query") or ""),
+                    recovery=quote_boundary_recovery,
+                    opened=recovered_opened,
+                )
+            )
+            return base
+        if quote_boundary_recovery.get("status") != "not_applicable":
+            answer["source_contract"]["latest_status_quote_boundary_recovery"] = (
+                _latest_status_quote_boundary_recovery_public(quote_boundary_recovery)
+            )
         return _ask_answer_fail_closed(
             answer,
             f"ask --execute contract is {action.get('answer_status')}",
@@ -8187,6 +8214,152 @@ def _remembered_user_latest_recovery_public(recovery: dict) -> dict:
         "rejected_prompt_echo_ref_count": recovery.get("rejected_prompt_echo_ref_count"),
         "query_terms": recovery.get("query_terms") or [],
     }
+
+
+def _recover_latest_status_quoted_before_boundary(
+    *,
+    query: str,
+    route_family: str,
+    config: dict | None,
+    cwd: Path,
+) -> dict:
+    phrases = _latest_status_quoted_before_boundary_phrases(query)
+    if route_family != "latest_status" or not phrases:
+        return {"status": "not_applicable", "opened": []}
+    if not config:
+        return {
+            "status": "not_run_explicit_root_without_codex_home",
+            "opened": [],
+            "quoted_boundary_phrases": phrases,
+            "searched_scope": "not_searched",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "rejected_prompt_echo_ref_count": 0,
+        }
+    try:
+        result = latest_user_messages(
+            codex_home=Path(str(config.get("codex_home") or "")).expanduser(),
+            default_tz=timezone.utc,
+            limit=_ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT,
+            max_files=max(1, int(config.get("max_files") or 200)),
+            max_bytes=max(1, int(config.get("max_bytes") or 100 * 1024 * 1024)),
+            max_elapsed=max(0.1, float(config.get("max_elapsed") or 15.0)),
+            snippet_chars=0,
+        )
+    except Exception as exc:  # pragma: no cover - defensive CLI recovery surface
+        return {
+            "status": "error",
+            "error": str(exc),
+            "opened": [],
+            "quoted_boundary_phrases": phrases,
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "rejected_prompt_echo_ref_count": 0,
+        }
+    messages = [item for item in result.get("messages") or [] if isinstance(item, dict)]
+    normalized_phrases = [_simple_normalize(phrase) for phrase in phrases if _simple_normalize(phrase)]
+    matched_messages = []
+    rejected_prompt_echo: list[dict] = []
+    for message in messages:
+        snippet = _simple_normalize(str(message.get("snippet") or ""))
+        if not any(phrase and phrase in snippet for phrase in normalized_phrases):
+            continue
+        matched_messages.append(message)
+        score = max(1, len(snippet.split()))
+        item = _latest_user_message_recovery_opened_item(message, score=score, cwd=cwd)
+        if _remembered_user_wording_prompt_echo_reasons(item, query=query):
+            rejected_prompt_echo.append(_prompt_echo_ref_public_summary(item, query=query))
+            continue
+        summary = str(item.get("summary") or "")
+        if not any(phrase and phrase in _simple_normalize(summary) for phrase in normalized_phrases):
+            continue
+        summary_lc = summary.casefold()
+        if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(summary) or "do not edit product code" in summary_lc:
+            rejected_prompt_echo.append(_prompt_echo_ref_public_summary(item, query=query))
+            continue
+        opened = [item]
+        summary_packet = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        return {
+            "status": "clean_user_boundary_recovered",
+            "opened": opened,
+            "quoted_boundary_phrases": phrases,
+            "recovered_boundary_phrase": phrases[0],
+            "searched_scope": result.get("source_scope") or "codex_history_and_codex_sessions_only",
+            "searched_files": summary_packet.get("searched_files"),
+            "candidate_user_message_count": summary_packet.get("candidate_user_message_count"),
+            "matched_user_message_count": len(matched_messages),
+            "rejected_prompt_echo_ref_count": len(rejected_prompt_echo),
+            "rejected_prompt_echo_refs": rejected_prompt_echo[:_ASK_ANSWER_MAX_REFS],
+        }
+    summary_packet = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return {
+        "status": "no_matching_quoted_user_message_found",
+        "opened": [],
+        "quoted_boundary_phrases": phrases,
+        "searched_scope": result.get("source_scope") or "codex_history_and_codex_sessions_only",
+        "searched_files": summary_packet.get("searched_files"),
+        "candidate_user_message_count": summary_packet.get("candidate_user_message_count"),
+        "matched_user_message_count": len(matched_messages),
+        "rejected_prompt_echo_ref_count": len(rejected_prompt_echo),
+        "rejected_prompt_echo_refs": rejected_prompt_echo[:_ASK_ANSWER_MAX_REFS],
+    }
+
+
+def _latest_status_quoted_before_boundary_phrases(query: str) -> list[str]:
+    normalized = _simple_normalize(query)
+    if "before" not in normalized or "not after" not in normalized:
+        return []
+    phrases = []
+    for match in _QUOTED_STATUS_BOUNDARY_RE.finditer(str(query or "")):
+        phrase = _simple_normalize(match.group(1))
+        if len(phrase.split()) >= 3 and phrase not in phrases:
+            phrases.append(phrase)
+    return phrases
+
+
+def _simple_normalize(text: str) -> str:
+    return " ".join(str(text or "").casefold().split())
+
+
+def _latest_status_quote_boundary_recovery_public(recovery: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "status": recovery.get("status"),
+        "searched_scope": recovery.get("searched_scope"),
+        "searched_files": recovery.get("searched_files"),
+        "candidate_user_message_count": recovery.get("candidate_user_message_count"),
+        "matched_user_message_count": recovery.get("matched_user_message_count"),
+        "quoted_boundary_phrases": recovery.get("quoted_boundary_phrases") or [],
+        "recovered_boundary_phrase": recovery.get("recovered_boundary_phrase"),
+        "rejected_prompt_echo_ref_count": recovery.get("rejected_prompt_echo_ref_count"),
+    }
+
+
+def _compose_latest_status_quote_boundary_plan_answer(
+    *,
+    query: str,
+    recovery: dict,
+    opened: list[dict],
+) -> str:
+    boundary = opened[0] if opened else {}
+    summary = str(boundary.get("summary") or "").strip()
+    timestamp = str((boundary.get("ref") or {}).get("timestamp_utc") or "").strip()
+    phrase = str(recovery.get("recovered_boundary_phrase") or "").strip()
+    if not phrase:
+        phrase = _short_join(_latest_status_quoted_before_boundary_phrases(query)[:1], limit=120)
+    parts = [
+        "Recovered before-boundary user message:",
+        f"timestamp={timestamp}" if timestamp else "",
+        f'wording="{phrase}"' if phrase else "",
+        "direction=before_this_boundary_not_after_it.",
+        "Source plan: use refs_used[0] as the user-authored boundary proof, then inspect raw conversation/session records at or before that timestamp or line for the requested status; do not use later Slice/task assignment prompts as contributor's substantive boundary.",
+    ]
+    if summary:
+        parts.append(f"Boundary proof summary: {summary}")
+    return " ".join(part for part in parts if part)
 
 
 def _remembered_user_wording_topic_terms(query: str) -> set[str]:
