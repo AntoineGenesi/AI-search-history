@@ -3533,6 +3533,12 @@ def _answer_action_contract_from_executed_output(
             "promotion_reason": promotion_reason,
             "internal_answer_status": internal_status,
             "core_convo_first_read_plan": core_plan,
+            "action_proof_plan": (
+                compact.get("action_proof_plan")
+                if route_family in {"action_proof", "semantic_debug", "provenance"}
+                and isinstance(compact.get("action_proof_plan"), dict)
+                else None
+            ),
             "expectation_mismatch_plan": expectation_mismatch_plan if route_family == "expectation_mismatch" else None,
             "read": route_first_reads
             or orchestration_reads
@@ -4461,6 +4467,7 @@ _ASK_ANSWER_WORK_EPISODE_TOKEN_STOPWORDS = frozenset(
         "problem",
         "really",
         "reviewer",
+        "selected",
         "task",
         "that",
         "the",
@@ -4471,6 +4478,8 @@ _ASK_ANSWER_WORK_EPISODE_TOKEN_STOPWORDS = frozenset(
         "whether",
         "which",
         "worker",
+        "coordinator",
+        "launched",
     }
 )
 _ASK_ANSWER_WORK_EPISODE_PRIMARY_MARKERS = (
@@ -4529,6 +4538,18 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:the|an?)\b.{0,160}\b(implementer|re-?reviewer|reviewer|worker|coordinator)\b",
     re.IGNORECASE | re.DOTALL,
+)
+_ACTION_CHRONOLOGY_RECOVERY_MAX_FILES = 120
+_ACTION_CHRONOLOGY_RECOVERY_MAX_BYTES = 3_000_000
+_ACTION_CHRONOLOGY_RECOVERY_WINDOW_LINES = 36
+_ACTION_CHRONOLOGY_FOLLOWUP_MARKERS = (
+    "select jsh",
+    "selected jsh",
+    "launched jsh",
+    "worktree launched",
+    "next task",
+    "thread_spawn",
+    "task_started",
 )
 
 
@@ -4630,7 +4651,15 @@ def _ask_answer_from_execute(
     if work_episode:
         answer["source_contract"]["work_episode_resolver"] = _work_episode_public_contract(work_episode)
 
+    action_chronology_wanted = _action_chronology_answer_wanted(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+    )
     proof_refs = _collect_ask_answer_proof_refs(action)
+    if action_chronology_wanted:
+        proof_refs = _dedupe_ask_answer_proof_refs(
+            _action_chronology_candidate_refs(action) + proof_refs
+        )
     if work_episode.get("primary_proof_refs"):
         proof_refs = _dedupe_ask_answer_proof_refs(
             list(work_episode.get("primary_proof_refs") or []) + proof_refs
@@ -4815,6 +4844,42 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(expectation_gate.get("opened") or answer_opened)
 
+    if action_chronology_wanted:
+        chronology_gate = _action_chronology_answer_proof_gate(
+            query=str(report.get("query") or ""),
+            action=action,
+            opened=answer_opened,
+        )
+        if chronology_gate.get("status") != "answer_allowed":
+            recovery = _recover_action_chronology_opened(
+                query=str(report.get("query") or ""),
+                action=action,
+                opened=answer_opened,
+                cwd=cwd,
+            )
+            answer["source_contract"]["action_chronology_source_recovery"] = (
+                _action_chronology_recovery_public_contract(recovery)
+            )
+            recovered_opened = list(recovery.get("opened") or [])
+            if recovered_opened:
+                answer_opened = recovered_opened + list(answer_opened)
+                chronology_gate = _action_chronology_answer_proof_gate(
+                    query=str(report.get("query") or ""),
+                    action=action,
+                    opened=answer_opened,
+                )
+        answer["source_contract"]["action_chronology_answer_gate"] = _action_chronology_gate_public_contract(
+            chronology_gate
+        )
+        if chronology_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(chronology_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "claim-vs-action chronology proof roles missing or only corroborating artifacts were opened",
+                chronology_gate,
+            )
+        answer_opened = list(chronology_gate.get("opened") or answer_opened)
+
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
 
@@ -4854,6 +4919,8 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
     route_family = str(route.get("route_family") or "")
     if route_family == "expectation_mismatch":
         return _expectation_mismatch_source_role_explanation(next_step)
+    if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return _action_chronology_source_role_explanation(next_step)
     if route_family == "remembered_user_wording":
         return _remembered_user_wording_source_role_explanation(next_step)
     if route_family == "latest_status":
@@ -4933,6 +5000,37 @@ def _expectation_mismatch_source_role_explanation(next_step: object) -> dict | N
         "rejected_source_roles": _unique_preserving_order(rejected_roles),
         "rejected_ref_count": int(next_step.get("rejected_ref_count") or 0),
         "rejected_evidence": list(next_step.get("rejected_refs") or [])[:_ASK_ANSWER_MAX_REFS],
+        "required_final_proof": next_step.get("required_next_proof"),
+    }
+
+
+def _action_chronology_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict) or next_step.get("status") != "missing_primary_action_chronology":
+        return None
+    missing = [str(item) for item in next_step.get("missing_roles") or [] if str(item).strip()]
+    corroborating = [item for item in next_step.get("corroborating_refs") or [] if isinstance(item, dict)]
+    rejected = [item for item in next_step.get("rejected_refs") or [] if isinstance(item, dict)]
+    summary = (
+        "Claim-vs-action answer stayed fail-closed because opened refs did not provide primary chronological "
+        "evidence for the requested stop/follow-up action"
+        + (f"; missing roles: {', '.join(missing)}" if missing else "")
+        + "."
+    )
+    return {
+        "schema_version": 1,
+        "kind": "action_chronology_primary_roles_required",
+        "summary": summary,
+        "summary_lines": [
+            summary,
+            "Why not final proof: task/review/status/TODO/state artifacts can corroborate what was recorded, but they do not by themselves prove what the coordinator did after the boundary.",
+            "Needed proof: raw chronological session messages/tool calls, command output, git/worktree/process state, and selected/launched-task presence or absence for the same action episode.",
+        ],
+        "required_roles": list(next_step.get("required_roles") or []),
+        "missing_roles": missing,
+        "corroborating_ref_count": len(corroborating),
+        "rejected_ref_count": len(rejected),
+        "corroborating_evidence": corroborating[:_ASK_ANSWER_MAX_REFS],
+        "rejected_evidence": rejected[:_ASK_ANSWER_MAX_REFS],
         "required_final_proof": next_step.get("required_next_proof"),
     }
 
@@ -6353,6 +6451,12 @@ def _extract_text_from_json_row(row: dict) -> str:
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     if isinstance(payload.get("text"), str):
         return payload["text"].strip()
+    if isinstance(payload.get("message"), str):
+        label = str(payload.get("type") or "message")
+        return f"{label}: {payload['message'].strip()}"
+    if isinstance(payload.get("last_agent_message"), str):
+        label = str(payload.get("type") or "last_agent_message")
+        return f"{label}: {payload['last_agent_message'].strip()}"
     content = payload.get("content")
     if isinstance(content, list):
         parts = []
@@ -6372,6 +6476,593 @@ def _extract_text_from_json_row(row: dict) -> str:
         if isinstance(output, str):
             return f"tool output: {output.strip()}"
     return ""
+
+
+def _action_chronology_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    claim_shape = (
+        "only claim" in normalized
+        or "actually" in normalized
+        or "really" in normalized
+        or "versus claim" in normalized
+    )
+    review_verification_shape = any(
+        term in normalized
+        for term in ("reviewer", "verify", "verified", "review verdict", "review artifact")
+    )
+    if review_verification_shape and not _action_chronology_requires_boundary_roles(query):
+        return False
+    if route_family == "action_proof":
+        return claim_shape and (
+            "coordinator" in normalized or _action_chronology_requires_boundary_roles(query)
+        )
+    return claim_shape and _action_chronology_requires_boundary_roles(query)
+
+
+def _action_chronology_candidate_refs(action: dict) -> list[dict]:
+    refs: list[dict] = []
+    action_plan = action.get("action_proof_plan") if isinstance(action.get("action_proof_plan"), dict) else {}
+    core_plan = action.get("core_convo_first_read_plan") if isinstance(action.get("core_convo_first_read_plan"), dict) else {}
+    for group in (
+        action_plan.get("required_proof_reads"),
+        action_plan.get("primary_proof_refs"),
+    ):
+        for item in group if isinstance(group, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("diagnostic_only") is True:
+                continue
+            if item.get("target_source_role") == "diagnostic_or_post_hoc":
+                continue
+            if item.get("read_more_actionable") is False or item.get("followthrough_actionable") is False:
+                continue
+            refs.append(item)
+    for item in core_plan.get("read") if isinstance(core_plan.get("read"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("target_source_role") != "target_historical_raw":
+            continue
+        if item.get("diagnostic_only") is True:
+            continue
+        if item.get("read_more_actionable") is False or item.get("followthrough_actionable") is False:
+            continue
+        refs.append(item)
+    return _dedupe_ask_answer_proof_refs(refs)
+
+
+def _action_chronology_answer_proof_gate(*, query: str, action: dict, opened: list[dict]) -> dict:
+    query_ids = {match.group(0).casefold() for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or "")}
+    primary: list[dict] = []
+    corroborating: list[dict] = []
+    rejected: list[dict] = []
+    covered_roles: list[str] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        source = _action_chronology_opened_source_role(item)
+        public = _ref_public_summary(item)
+        public["action_chronology_source_role"] = source["source_role"]
+        public["action_chronology_roles"] = source["roles"]
+        if source["source_role"] == "primary_action_chronology":
+            if not _action_chronology_opened_matches_query(item, query_ids=query_ids):
+                public["rejection_reason"] = "primary chronology ref did not match requested task/action handle"
+                rejected.append(public)
+                continue
+            annotated = dict(item)
+            annotated["action_chronology_roles"] = source["roles"]
+            primary.append(annotated)
+            covered_roles.extend(source["roles"])
+        elif source["source_role"] == "corroborating_artifact":
+            corroborating.append(public)
+        else:
+            rejected.append(public)
+
+    required_roles = _action_chronology_required_roles(query)
+    covered = _unique_preserving_order(covered_roles)
+    missing = [role for role in required_roles if role not in covered]
+    summary_lines = []
+    if primary:
+        summary_lines.extend(
+            f"{item.get('target')}: primary_action_chronology roles={','.join(item.get('action_chronology_roles') or [])}"
+            for item in primary[:_ASK_ANSWER_MAX_REFS]
+        )
+    if corroborating:
+        summary_lines.append(
+            "Corroborating artifacts opened but not sufficient as primary chronology proof: "
+            + _short_join([str(item.get("target") or "") for item in corroborating[:3]], limit=320)
+        )
+    if rejected:
+        summary_lines.append(
+            "Rejected non-matching or non-primary action refs: "
+            + _short_join([str(item.get("target") or "") for item in rejected[:3]], limit=320)
+        )
+    if primary and not missing:
+        return {
+            "schema_version": 1,
+            "status": "answer_allowed",
+            "opened": primary[:_ASK_ANSWER_MAX_REFS],
+            "covered_roles": covered,
+            "required_roles": required_roles,
+            "corroborating_refs": corroborating[:_ASK_ANSWER_MAX_REFS],
+            "summary_lines": summary_lines,
+        }
+    return {
+        "schema_version": 1,
+        "status": "missing_primary_action_chronology",
+        "covered_roles": covered,
+        "missing_roles": missing or required_roles,
+        "required_roles": required_roles,
+        "corroborating_refs": corroborating[:_ASK_ANSWER_MAX_REFS],
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "summary_lines": summary_lines
+        or [
+            "Only task/review/status/commit artifacts or non-matching diagnostics were opened; primary chronological action proof is still required."
+        ],
+        "required_next_proof": (
+            "Open raw chronological evidence for the same action: session messages/tool calls, command output, "
+            "git/worktree/process state, and selected/launched-task presence or absence when the prompt asks whether work stopped."
+        ),
+        "fallback_action_contract_next_step": _next_proof_step_from_action(action),
+    }
+
+
+def _recover_action_chronology_opened(*, query: str, action: dict, opened: list[dict], cwd: Path) -> dict:
+    query_ids = [match.group(0).casefold() for match in _ASK_EXECUTE_TASK_ID_RE.finditer(query or "")]
+    if not query_ids:
+        return {"schema_version": 1, "status": "not_applicable_no_named_task", "opened": []}
+    if not _action_chronology_requires_boundary_roles(query):
+        return {"schema_version": 1, "status": "not_applicable_not_boundary_prompt", "opened": []}
+
+    date_hints = _unique_preserving_order(
+        _action_chronology_date_hints(opened, action)
+        + _action_chronology_named_task_repo_date_hints(cwd=cwd, query_ids=query_ids)
+    )
+    roots = _action_chronology_recovery_roots(cwd=cwd, date_hints=date_hints)
+    searched_files = 0
+    matched_files = 0
+    recovered: list[dict] = []
+    for path in _action_chronology_recovery_files(roots):
+        searched_files += 1
+        item = _action_chronology_recovered_window_for_file(path=path, query_ids=query_ids, cwd=cwd)
+        if not item:
+            continue
+        matched_files += 1
+        recovered.append(item)
+    recovered.sort(
+        key=lambda item: (
+            ((item.get("ref") or {}).get("action_chronology_recovery") or {}).get("score") or 0,
+            str(item.get("target") or ""),
+        ),
+        reverse=True,
+    )
+    recovered = recovered[:2]
+    return {
+        "schema_version": 1,
+        "status": "primary_chronology_recovered" if recovered else "no_primary_chronology_recovered",
+        "opened": recovered,
+        "searched_roots": [str(root) for root in roots],
+        "searched_file_count": searched_files,
+        "matched_file_count": matched_files,
+        "query_ids": query_ids,
+        "date_hints": date_hints,
+    }
+
+
+def _action_chronology_recovery_public_contract(recovery: dict) -> dict:
+    return {
+        "schema_version": recovery.get("schema_version"),
+        "status": recovery.get("status"),
+        "searched_roots": recovery.get("searched_roots") or [],
+        "searched_file_count": recovery.get("searched_file_count") or 0,
+        "matched_file_count": recovery.get("matched_file_count") or 0,
+        "opened_ref_count": len(recovery.get("opened") or []),
+        "query_ids": recovery.get("query_ids") or [],
+        "date_hints": recovery.get("date_hints") or [],
+    }
+
+
+def _action_chronology_date_hints(opened: list[dict], action: dict) -> list[str]:
+    texts: list[str] = []
+    for item in opened:
+        if isinstance(item, dict):
+            texts.extend(str(value) for value in (item.get("summary"), item.get("target")) if value)
+            ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+            texts.extend(
+                str(value)
+                for value in (
+                    ref.get("commit_time"),
+                    ref.get("timestamp_utc"),
+                    ref.get("target"),
+                    ref.get("reason"),
+                )
+                if value
+            )
+    named = action.get("named_task_action_proof_handoff") if isinstance(action.get("named_task_action_proof_handoff"), dict) else {}
+    for ref in named.get("read") if isinstance(named.get("read"), list) else []:
+        if isinstance(ref, dict):
+            texts.extend(str(value) for value in (ref.get("commit_time"), ref.get("timestamp_utc")) if value)
+    hints: list[str] = []
+    for text in texts:
+        for match in re.finditer(r"\b(20\d\d)-(\d\d)-(\d\d)\b", text):
+            date = "-".join(match.groups())
+            if date not in hints:
+                hints.append(date)
+    return hints[:4]
+
+
+def _action_chronology_named_task_repo_date_hints(*, cwd: Path, query_ids: list[str]) -> list[str]:
+    repo = git_root_for(cwd) or cwd
+    hints: list[str] = []
+    for task_id in query_ids:
+        slug = task_id.casefold()
+        candidates = list((cwd / "tasks").glob(f"{slug}*.md")) + list(
+            (cwd / "codex" / "state" / "reviews").glob(f"{slug}*.md")
+        )
+        for path in candidates[:4]:
+            change = last_change_for_path(path, repo=repo)
+            if not change or not change.commit_time:
+                continue
+            match = re.match(r"(20\d\d-\d\d-\d\d)", change.commit_time)
+            if match and match.group(1) not in hints:
+                hints.append(match.group(1))
+    return hints[:4]
+
+
+def _action_chronology_recovery_roots(*, cwd: Path, date_hints: list[str]) -> list[Path]:
+    home_sessions = Path.home() / ".codex" / "sessions"
+    base_roots = [cwd / "sessions", cwd / ".codex" / "sessions", home_sessions]
+    roots: list[Path] = []
+    for root in base_roots:
+        if not root.is_dir():
+            continue
+        if root == home_sessions:
+            if not date_hints:
+                continue
+            for date in date_hints:
+                year, month, day = date.split("-")
+                dated = root / year / month / day
+                if dated.is_dir() and dated not in roots:
+                    roots.append(dated)
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _action_chronology_recovery_files(roots: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            candidates = sorted(root.rglob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if path.stat().st_size > _ACTION_CHRONOLOGY_RECOVERY_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            files.append(path)
+            if len(files) >= _ACTION_CHRONOLOGY_RECOVERY_MAX_FILES:
+                return files
+    return files
+
+
+def _action_chronology_recovered_window_for_file(*, path: Path, query_ids: list[str], cwd: Path) -> dict | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    lowered = [line.casefold() for line in lines]
+    if not any(any(task_id in line for task_id in query_ids) for line in lowered):
+        return None
+
+    boundary_index = _action_chronology_boundary_index(lowered, query_ids)
+    if boundary_index is None:
+        return None
+    start = max(0, boundary_index - _ACTION_CHRONOLOGY_RECOVERY_WINDOW_LINES + 1)
+    window_lines = lines[start : boundary_index + 1]
+    window_text = "\n".join(window_lines).casefold()
+    if not _action_chronology_window_has_primary_events(window_text):
+        return None
+    post_boundary_text = "\n".join(lines[boundary_index + 1 :]).casefold()
+    followup_markers = [marker for marker in _ACTION_CHRONOLOGY_FOLLOWUP_MARKERS if marker in post_boundary_text]
+    if followup_markers:
+        return None
+
+    rel = _safe_relative_path(cwd, path)
+    summary = _action_chronology_recovered_window_summary(
+        rel=rel,
+        start_line=start + 1,
+        boundary_line=boundary_index + 1,
+        line_count=len(lines),
+        window_lines=window_lines,
+        no_followup_markers=not followup_markers,
+        query_ids=query_ids,
+    )
+    score = _action_chronology_recovered_window_score(window_text)
+    return {
+        "status": "opened",
+        "target": f"{rel}:{start + 1}-{boundary_index + 1}",
+        "path": rel,
+        "line": boundary_index + 1,
+        "summary": summary[:_ASK_ANSWER_MAX_FILE_CHARS],
+        "record_metadata": {
+            "conversation_label": "action_chronology_recovered_window",
+            "conversation_confidence": "high",
+            "top_role": "assistant",
+        },
+        "ref": {
+            "kind": "jsonl_source_ref",
+            "target": f"{rel}:{start + 1}-{boundary_index + 1}",
+            "source_ref": {"path": str(path), "line": start + 1},
+            "openable_target": f"{path}:{start + 1}",
+            "proof_surface": "raw_jsonl_action_chronology_window",
+            "target_source_role": "target_historical_raw",
+            "proof_role": "command_or_tool_call",
+            "reason": (
+                "bounded action chronology recovery for named stop-boundary prompt: "
+                + ", ".join(query_ids)
+            ),
+            "action_chronology_recovery": {
+                "boundary_line": boundary_index + 1,
+                "line_count": len(lines),
+                "post_boundary_followup_markers_found": followup_markers,
+                "score": score,
+            },
+        },
+    }
+
+
+def _action_chronology_boundary_index(lines: list[str], query_ids: list[str]) -> int | None:
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not any(task_id in line for task_id in query_ids):
+            continue
+        if any(term in line for term in ("task_complete", "final answer", "implemented and committed", "closeout")):
+            return index
+    return None
+
+
+def _action_chronology_window_has_primary_events(text: str) -> bool:
+    return (
+        ("function_call" in text or "tool call" in text)
+        and ("function_call_output" in text or "tool output" in text)
+        and any(term in text for term in ("git status", "git show", "git commit", "git add", "commit:"))
+        and any(term in text for term in ("task_complete", "final answer", "implemented and committed", "closeout"))
+    )
+
+
+def _action_chronology_recovered_window_score(text: str) -> int:
+    score = 0
+    if "implemented and committed" in text:
+        score += 8
+    if "on the task branch" in text:
+        score += 4
+    if "git add" in text or "git commit" in text:
+        score += 3
+    if "git status" in text:
+        score += 2
+    if "task_complete" in text:
+        score += 2
+    if "review artifact committed" in text or "verdict: `verified`" in text or "verdict: verified" in text:
+        score -= 4
+    return score
+
+
+def _action_chronology_recovered_window_summary(
+    *,
+    rel: str,
+    start_line: int,
+    boundary_line: int,
+    line_count: int,
+    window_lines: list[str],
+    no_followup_markers: bool,
+    query_ids: list[str],
+) -> str:
+    line_summaries: list[str] = []
+    for offset, raw in enumerate(window_lines, start=start_line):
+        summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{offset}")
+        lower = summary.casefold()
+        if any(
+            marker in lower
+            for marker in (
+                "tool call",
+                "tool output",
+                "git status",
+                "git show",
+                "git add",
+                "commit",
+                "task_complete",
+                "final answer",
+                "implemented and committed",
+            )
+        ):
+            line_summaries.append(f"line {offset}: {summary}")
+        if len(line_summaries) >= 6:
+            break
+    absence = (
+        f"no next task selected or launched after boundary: source file ends at line {line_count}; "
+        "post-boundary marker scan found no next task, selected, launched, thread_spawn, or task_started markers"
+        if no_followup_markers and boundary_line == line_count
+        else "post-boundary marker scan found no next task, selected, launched, thread_spawn, or task_started markers"
+    )
+    return (
+        f"Recovered primary action chronology window for {', '.join(query_ids)} "
+        f"{rel}:{start_line}-{boundary_line}: "
+        "tool call/tool output chronology; final answer and task_complete closeout chronology; "
+        f"git status/worktree/commit repo process chronology; {absence}. "
+        + " | ".join(line_summaries)
+        + f" | boundary line {boundary_line}."
+    )
+
+
+def _action_chronology_required_roles(query: str) -> list[str]:
+    normalized = str(query or "").casefold()
+    roles = ["observed_message_or_command_chronology"]
+    if _action_chronology_requires_boundary_roles(query):
+        roles.extend(
+            [
+                "stop_or_closeout_chronology",
+                "followup_selection_or_absence_chronology",
+                "repo_or_process_state_chronology",
+            ]
+        )
+    elif _action_chronology_requires_repo_or_process_roles(normalized):
+        roles.append("repo_or_process_state_chronology")
+    return _unique_preserving_order(roles)
+
+
+def _action_chronology_requires_boundary_roles(query: str) -> bool:
+    normalized = str(query or "").casefold()
+    if re.search(r"\b(stop|stopped|stopping|closeout|closed out)\b", normalized):
+        return True
+    if re.search(r"\b(selected|launched)\b", normalized) and any(
+        term in normalized for term in ("next", "task", "after", "follow-up", "follow up")
+    ):
+        return True
+    return any(
+        term in normalized
+        for term in (
+            "stop after",
+            "stopped after",
+            "stop boundary",
+            "after boundary",
+            "after jsh-",
+            "after task",
+            "no next task",
+            "next task",
+            "selected next",
+            "selected/launched",
+            "selected or launched",
+            "launched next",
+            "follow-up",
+            "follow up",
+            "closeout",
+            "closed out",
+        )
+    )
+
+
+def _action_chronology_requires_repo_or_process_roles(normalized_query: str) -> bool:
+    return any(
+        term in normalized_query
+        for term in (
+            "git status",
+            "git worktree",
+            "repo state",
+            "repository state",
+            "worktree state",
+            "process state",
+            "running process",
+            "background process",
+            "dirty",
+            "clean",
+            "committed",
+            "commit",
+        )
+    )
+
+
+def _action_chronology_opened_source_role(item: dict) -> dict:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    surface = str(ref.get("proof_surface") or "")
+    target_role = str(ref.get("target_source_role") or "")
+    proof_role = str(ref.get("proof_role") or "")
+    kind = str(ref.get("kind") or "")
+    summary = str(item.get("summary") or "")
+    target = str(item.get("target") or "")
+    source_text = " ".join([summary, target, surface, target_role, proof_role, kind]).casefold()
+    if surface in {
+        "task_file",
+        "review_artifact",
+        "path_last_change_commit",
+        "task_selection_rationale",
+        "pipeline_selection_result",
+    } or target_role in {"target_historical_artifact", "legitimate_context"}:
+        return {
+            "source_role": "corroborating_artifact",
+            "roles": _action_chronology_text_roles(source_text),
+        }
+    primary_markers = {
+        "target_historical_raw",
+        "command_or_tool_call",
+        "command_or_tool_output",
+        "changed_check_or_commit_evidence",
+    }
+    if (
+        target_role in primary_markers
+        or proof_role in primary_markers
+        or kind == "jsonl_source_ref"
+        or str(item.get("path") or "").endswith(".jsonl")
+    ):
+        return {
+            "source_role": "primary_action_chronology",
+            "roles": _action_chronology_text_roles(source_text),
+        }
+    return {
+        "source_role": "diagnostic_or_unknown",
+        "roles": _action_chronology_text_roles(source_text),
+    }
+
+
+def _action_chronology_text_roles(text: str) -> list[str]:
+    roles: list[str] = []
+    if any(
+        term in text
+        for term in (
+            "tool call",
+            "tool output",
+            "function_call",
+            "agent_message",
+            "user_message",
+            " assistant:",
+            " user:",
+            "system:",
+        )
+    ):
+        roles.append("observed_message_or_command_chronology")
+    if any(term in text for term in ("stop", "stopped", "closeout", "closed", "task_complete", "final answer")):
+        roles.append("stop_or_closeout_chronology")
+    if any(term in text for term in ("no next", "next task", "selected", "launched", "thread_spawn", "task_started")):
+        roles.append("followup_selection_or_absence_chronology")
+    if any(term in text for term in ("git status", "git worktree", "process", "worktree", "dirty", "clean", "commit")):
+        roles.append("repo_or_process_state_chronology")
+    return _unique_preserving_order(roles)
+
+
+def _action_chronology_opened_matches_query(item: dict, *, query_ids: set[str]) -> bool:
+    if not query_ids:
+        return True
+    text = " ".join(
+        str(value)
+        for value in (
+            item.get("target"),
+            item.get("summary"),
+            (item.get("ref") or {}).get("target") if isinstance(item.get("ref"), dict) else "",
+            (item.get("ref") or {}).get("reason") if isinstance(item.get("ref"), dict) else "",
+        )
+        if value
+    ).casefold()
+    return bool(query_ids.intersection(text.split()) or any(task_id in text for task_id in query_ids))
+
+
+def _action_chronology_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "covered_roles": gate.get("covered_roles") or [],
+        "missing_roles": gate.get("missing_roles") or [],
+        "required_roles": gate.get("required_roles") or [],
+        "corroborating_ref_count": len(gate.get("corroborating_refs") or []),
+        "rejected_ref_count": len(gate.get("rejected_refs") or []),
+    }
 
 
 def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict]) -> dict:
@@ -7153,6 +7844,10 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         if isinstance(action.get("named_task_action_proof_handoff"), dict)
         else {}
     )
+    if _action_chronology_answer_wanted(query=query, route_family=route_family):
+        action_chronology_answer = _compose_action_chronology_answer(opened=opened)
+        if action_chronology_answer:
+            return action_chronology_answer
     if named.get("status") == "current_named_task_proof_refs_available":
         return _compose_named_task_answer(query=query, named=named, opened=opened)
     if route_family == "remembered_user_wording":
@@ -7168,6 +7863,25 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_action_chronology_answer(*, opened: list[dict]) -> str | None:
+    pieces = []
+    for item in opened:
+        roles = [str(role) for role in item.get("action_chronology_roles") or [] if str(role).strip()]
+        summary = str(item.get("summary") or "").strip()
+        target = str(item.get("target") or "").strip()
+        if not roles or not summary:
+            continue
+        label = ",".join(roles)
+        pieces.append(f"{label}: {summary}" + (f" [{target}]" if target else ""))
+    if not pieces:
+        return None
+    return (
+        "Primary action chronology shows: "
+        + _short_join(pieces[:4], limit=760)
+        + " Boundary: task/review/status artifacts may corroborate this chronology, but they are not primary action proof."
+    )
 
 
 def _compose_branch_work_episode_answer(*, query: str, opened: list[dict]) -> str | None:
