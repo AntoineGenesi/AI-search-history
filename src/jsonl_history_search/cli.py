@@ -8498,7 +8498,7 @@ def _compose_semantic_wrapup_corrections_answer(*, query: str, action: dict, ope
         return None
     opened_by_ref = _semantic_wrapup_opened_by_source_ref(opened)
     clusters: list[str] = []
-    for mode in failure_modes[:7]:
+    for mode in failure_modes[:5]:
         key = str(mode.get("failure_mode") or "")
         suggestion = suggestions.get(key) or {}
         refs = _semantic_wrapup_cluster_source_refs(mode=mode, suggestion=suggestion)
@@ -8516,8 +8516,12 @@ def _compose_semantic_wrapup_corrections_answer(*, query: str, action: dict, ope
             or mode.get("why_it_matters")
             or "Preserve this correction as a source-backed product-fix candidate."
         ).strip()
-        ref_text = ", ".join(_semantic_wrapup_source_ref_text(ref) for ref in refs[:3])
-        proof_text = _short_join(proof_summaries, limit=280) if proof_summaries else "proof opened from required_primary_proof refs"
+        ref_text = f"{len(refs)} structured source ref(s) in the semantic_wrapup payload"
+        proof_text = (
+            "required proof refs were opened; inspect refs_used for exact source locations"
+            if proof_summaries
+            else "proof is available from required_primary_proof refs"
+        )
         clusters.append(
             f"{len(clusters) + 1}. Correction: {correction} "
             f"Affects: {family}. Likely product fix: {fix} "
@@ -8570,9 +8574,29 @@ def _semantic_wrapup_human_correction(*, mode: dict, suggestion: dict) -> str:
     examples = mode.get("examples") or suggestion.get("examples") or []
     for example in examples:
         if isinstance(example, dict) and str(example.get("snippet") or "").strip():
-            return _short_join([str(example["snippet"]).strip()], limit=180)
+            snippet = str(example["snippet"]).strip()
+            if _semantic_wrapup_snippet_has_raw_local_path(snippet):
+                continue
+            return _short_join([snippet], limit=180)
     title = str(mode.get("title") or mode.get("failure_mode") or "Repeated correction").strip()
     return title.replace("_", " ")
+
+
+def _semantic_wrapup_snippet_has_raw_local_path(snippet: str) -> bool:
+    text = snippet.casefold()
+    return any(
+        marker in text
+        for marker in (
+            "/home/",
+            "/users/",
+            "/tmp/",
+            "worktree:",
+            "branch:",
+            "isolated implementer",
+            "work on exactly one task",
+            "product-code changes must stay",
+        )
+    )
 
 
 def _semantic_wrapup_affected_family(*, mode: dict, suggestion: dict) -> str:
