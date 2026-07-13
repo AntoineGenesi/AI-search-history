@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import timezone
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
@@ -69,7 +70,7 @@ from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
 from .gittools import git_root_for, last_change_for_path
-from .latest_user_messages import build_latest_user_messages_payload
+from .latest_user_messages import build_latest_user_messages_payload, latest_user_messages
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
@@ -4429,6 +4430,7 @@ _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS = (
     "divergence_evidence",
 )
 _ASK_ANSWER_REMEMBERED_USER_RECOVERY_MAX_REFS = 16
+_ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT = 200
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
 _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES = frozenset(
@@ -4535,10 +4537,33 @@ def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) 
     if route_payload["ask_router"].get("route_family") == "bounded_no_evidence":
         execute_args = _args_with_bounded_auto_execute_prompt_scope(args)
     execute_payload = _run_ask_execute(execute_args, cwd=cwd, route_payload=route_payload)
-    return _ask_answer_from_execute(execute_payload, cwd=Path(cwd).expanduser().resolve())
+    recovery = _remembered_user_wording_latest_recovery_config(args)
+    return _ask_answer_from_execute(
+        execute_payload,
+        cwd=Path(cwd).expanduser().resolve(),
+        remembered_user_latest_recovery=recovery,
+    )
 
 
-def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
+def _remembered_user_wording_latest_recovery_config(args: argparse.Namespace) -> dict | None:
+    explicit_roots = bool(getattr(args, "root", None))
+    explicit_codex_home = bool(getattr(args, "codex_home", None))
+    if explicit_roots and not explicit_codex_home:
+        return None
+    return {
+        "codex_home": str(Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"),
+        "max_files": int(getattr(args, "max_files", 200) or 200),
+        "max_bytes": int(getattr(args, "max_bytes", 100 * 1024 * 1024) or 100 * 1024 * 1024),
+        "max_elapsed": float(getattr(args, "max_elapsed", 15.0) or 15.0),
+    }
+
+
+def _ask_answer_from_execute(
+    execute_payload: dict,
+    *,
+    cwd: Path,
+    remembered_user_latest_recovery: dict | None = None,
+) -> dict:
     report = execute_payload.get("ask_execute") or {}
     route = report.get("selected_route") or {}
     execution = report.get("execution") or {}
@@ -4647,26 +4672,46 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
                 }
                 answer_opened = recovered_opened
             else:
-                answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
-                return _ask_answer_fail_closed(
-                    answer,
-                    "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
-                    {
-                        "required_next_proof": "raw user-authored message ref",
-                        "suggested_action": (
-                            "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
-                            "already surfaced target reads did not yield clean user-authored non-echo proof"
-                        ),
-                        "bounded_recovery": {
-                            "status": recovery.get("status") or "no_clean_user_proof_recovered",
-                            "searched_ref_count": recovery.get("searched_ref_count"),
-                            "opened_ref_count": recovery.get("opened_ref_count"),
-                            "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
-                            "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
-                        },
-                        "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
-                    },
+                latest_recovery = _recover_remembered_user_wording_from_latest_user_messages(
+                    query=str(report.get("query") or ""),
+                    config=remembered_user_latest_recovery,
+                    cwd=cwd,
                 )
+                latest_opened = list(latest_recovery.get("opened") or [])
+                if latest_opened:
+                    answer["source_contract"]["remembered_user_wording_recovery"] = {
+                        "schema_version": 1,
+                        "status": "clean_user_proof_recovered_from_bounded_user_message_scan",
+                        "searched_scope": latest_recovery.get("searched_scope"),
+                        "searched_files": latest_recovery.get("searched_files"),
+                        "candidate_user_message_count": latest_recovery.get("candidate_user_message_count"),
+                        "matched_user_message_count": latest_recovery.get("matched_user_message_count"),
+                        "rejected_prompt_echo_ref_count": latest_recovery.get("rejected_prompt_echo_ref_count"),
+                        "prior_packet_recovery_status": recovery.get("status") or "no_clean_user_proof_recovered",
+                    }
+                    answer_opened = latest_opened
+                else:
+                    answer["proof_summary"] = _non_user_opened_ref_summaries(usable)
+                    return _ask_answer_fail_closed(
+                        answer,
+                        "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
+                        {
+                            "required_next_proof": "raw user-authored message ref",
+                            "suggested_action": (
+                                "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                                "already surfaced target reads did not yield clean user-authored non-echo proof"
+                            ),
+                            "bounded_recovery": {
+                                "status": recovery.get("status") or "no_clean_user_proof_recovered",
+                                "searched_ref_count": recovery.get("searched_ref_count"),
+                                "opened_ref_count": recovery.get("opened_ref_count"),
+                                "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                                "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                            },
+                            "user_message_recovery": _remembered_user_latest_recovery_public(latest_recovery),
+                            "opened_ref_metadata": [_ref_public_summary(item) for item in usable],
+                        },
+                    )
         else:
             answer_opened = _remembered_user_wording_non_echo_user_opened(
                 user_opened,
@@ -4691,33 +4736,53 @@ def _ask_answer_from_execute(execute_payload: dict, *, cwd: Path) -> dict:
                     }
                     answer_opened = recovered_opened
                 else:
-                    rejected_echo_refs = [
-                        _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
-                        for item in user_opened
-                    ] + list(recovery.get("rejected_prompt_echo_refs") or [])
-                    answer["proof_summary"] = _prompt_echo_opened_ref_summaries(
-                        user_opened,
+                    latest_recovery = _recover_remembered_user_wording_from_latest_user_messages(
                         query=str(report.get("query") or ""),
+                        config=remembered_user_latest_recovery,
+                        cwd=cwd,
                     )
-                    return _ask_answer_fail_closed(
-                        answer,
-                        "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
-                        {
-                            "required_next_proof": "raw user-authored non-echo message ref",
-                            "suggested_action": (
-                                "inspect older user-message refs that state the target wording directly; already surfaced "
-                                "target reads did not yield clean user-authored non-echo proof"
-                            ),
-                            "bounded_recovery": {
-                                "status": recovery.get("status") or "no_clean_user_proof_recovered",
-                                "searched_ref_count": recovery.get("searched_ref_count"),
-                                "opened_ref_count": recovery.get("opened_ref_count"),
-                                "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
-                                "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                    latest_opened = list(latest_recovery.get("opened") or [])
+                    if latest_opened:
+                        answer["source_contract"]["remembered_user_wording_recovery"] = {
+                            "schema_version": 1,
+                            "status": "clean_user_proof_recovered_from_bounded_user_message_scan",
+                            "searched_scope": latest_recovery.get("searched_scope"),
+                            "searched_files": latest_recovery.get("searched_files"),
+                            "candidate_user_message_count": latest_recovery.get("candidate_user_message_count"),
+                            "matched_user_message_count": latest_recovery.get("matched_user_message_count"),
+                            "prior_packet_recovery_status": recovery.get("status") or "no_clean_user_proof_recovered",
+                            "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                        }
+                        answer_opened = latest_opened
+                    else:
+                        rejected_echo_refs = [
+                            _prompt_echo_ref_public_summary(item, query=str(report.get("query") or ""))
+                            for item in user_opened
+                        ] + list(recovery.get("rejected_prompt_echo_refs") or [])
+                        answer["proof_summary"] = _prompt_echo_opened_ref_summaries(
+                            user_opened,
+                            query=str(report.get("query") or ""),
+                        )
+                        return _ask_answer_fail_closed(
+                            answer,
+                            "opened remembered-user-wording user refs were assignment/review/test prompt echoes, not clean remembered wording proof",
+                            {
+                                "required_next_proof": "raw user-authored non-echo message ref",
+                                "suggested_action": (
+                                    "inspect older user-message refs that state the target wording directly; already surfaced "
+                                    "target reads did not yield clean user-authored non-echo proof"
+                                ),
+                                "bounded_recovery": {
+                                    "status": recovery.get("status") or "no_clean_user_proof_recovered",
+                                    "searched_ref_count": recovery.get("searched_ref_count"),
+                                    "opened_ref_count": recovery.get("opened_ref_count"),
+                                    "rejected_prompt_echo_ref_count": len(recovery.get("rejected_prompt_echo_refs") or []),
+                                    "rejected_non_user_ref_count": len(recovery.get("rejected_non_user_refs") or []),
+                                },
+                                "user_message_recovery": _remembered_user_latest_recovery_public(latest_recovery),
+                                "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
                             },
-                            "rejected_user_prompt_echo_refs": rejected_echo_refs[:_ASK_ANSWER_MAX_REFS],
-                        },
-                    )
+                        )
 
     episode_selection = _select_work_episode_opened_for_answer(
         query=str(report.get("query") or ""),
@@ -4876,6 +4941,32 @@ def _remembered_user_wording_source_role_explanation(next_step: object) -> dict 
     if not isinstance(next_step, dict):
         return None
     refs = [item for item in next_step.get("rejected_user_prompt_echo_refs") or [] if isinstance(item, dict)]
+    if not refs and isinstance(next_step.get("user_message_recovery"), dict):
+        recovery = next_step["user_message_recovery"]
+        status = str(recovery.get("status") or "not_run")
+        searched_scope = str(recovery.get("searched_scope") or "codex_history_and_codex_sessions_only")
+        searched_files = recovery.get("searched_files")
+        matched = recovery.get("matched_user_message_count")
+        summary = (
+            "Remembered-user wording answer stayed fail-closed because surfaced proof refs were not clean "
+            f"user-authored message evidence, and bounded user-message recovery over {searched_scope} "
+            f"found {matched if matched is not None else 0} topic-matching user row(s)."
+        )
+        return {
+            "schema_version": 1,
+            "kind": "remembered_user_wording_user_message_recovery_empty",
+            "summary": summary,
+            "summary_lines": [
+                summary,
+                "Why not final proof: assistant/tool/task/report/current echoes may mention the topic, but they do not prove the user's original instruction.",
+                "Needed proof: a raw user-authored Codex history/session message row matching the remembered instruction topic.",
+            ],
+            "searched_scope": searched_scope,
+            "recovery_status": status,
+            "searched_files": searched_files,
+            "matched_user_message_count": matched,
+            "required_final_proof": "Clean user-authored message row, not assistant restatement, task artifact, worker prompt, tool output, or current ask echo.",
+        }
     if not refs:
         return None
     evidence = []
@@ -6625,6 +6716,210 @@ def _recover_remembered_user_wording_clean_opened(
         "opened_ref_count": len(opened),
         "rejected_prompt_echo_refs": rejected_echo[:_ASK_ANSWER_MAX_REFS],
         "rejected_non_user_refs": rejected_non_user[:_ASK_ANSWER_MAX_REFS],
+    }
+
+
+def _recover_remembered_user_wording_from_latest_user_messages(
+    *,
+    query: str,
+    config: dict | None,
+    cwd: Path,
+) -> dict:
+    if not config:
+        return {
+            "status": "not_run_explicit_root_without_codex_home",
+            "opened": [],
+            "searched_scope": "not_searched",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "query_terms": [],
+        }
+    terms = _remembered_user_wording_topic_terms(query)
+    if not terms:
+        return {
+            "status": "not_run_no_topic_terms",
+            "opened": [],
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "query_terms": [],
+        }
+    try:
+        result = latest_user_messages(
+            codex_home=Path(str(config.get("codex_home") or "")).expanduser(),
+            default_tz=timezone.utc,
+            limit=_ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT,
+            max_files=max(1, int(config.get("max_files") or 200)),
+            max_bytes=max(1, int(config.get("max_bytes") or 100 * 1024 * 1024)),
+            max_elapsed=max(0.1, float(config.get("max_elapsed") or 15.0)),
+            snippet_chars=0,
+        )
+    except Exception as exc:  # pragma: no cover - defensive CLI recovery surface
+        return {
+            "status": "error",
+            "error": str(exc),
+            "opened": [],
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "searched_files": 0,
+            "candidate_user_message_count": 0,
+            "matched_user_message_count": 0,
+            "query_terms": sorted(terms),
+        }
+    messages = [item for item in result.get("messages") or [] if isinstance(item, dict)]
+    scored = [
+        (score, item)
+        for item in messages
+        if (score := _remembered_user_message_topic_score(item, terms)) >= min(2, len(terms))
+    ]
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            str(pair[1].get("timestamp_utc") or ""),
+            1 if pair[1].get("source_kind") == "codex_history" else 0,
+        ),
+        reverse=True,
+    )
+    opened: list[dict] = []
+    rejected_prompt_echo: list[dict] = []
+    for score, message in scored:
+        item = _latest_user_message_recovery_opened_item(message, score=score, cwd=cwd)
+        if _remembered_user_wording_prompt_echo_reasons(item, query=query):
+            rejected_prompt_echo.append(_prompt_echo_ref_public_summary(item, query=query))
+            continue
+        opened.append(item)
+        if len(opened) >= 1:
+            break
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return {
+        "status": "clean_user_proof_recovered" if opened else "no_matching_user_message_found",
+        "opened": opened,
+        "searched_scope": result.get("source_scope") or "codex_history_and_codex_sessions_only",
+        "searched_files": summary.get("searched_files"),
+        "candidate_user_message_count": summary.get("candidate_user_message_count"),
+        "matched_user_message_count": len(scored),
+        "rejected_prompt_echo_ref_count": len(rejected_prompt_echo),
+        "rejected_prompt_echo_refs": rejected_prompt_echo[:_ASK_ANSWER_MAX_REFS],
+        "query_terms": sorted(terms),
+        "warnings": (result.get("sources") or {}).get("warnings") if isinstance(result.get("sources"), dict) else [],
+    }
+
+
+def _remembered_user_latest_recovery_public(recovery: dict) -> dict:
+    return {
+        "status": recovery.get("status"),
+        "searched_scope": recovery.get("searched_scope"),
+        "searched_files": recovery.get("searched_files"),
+        "candidate_user_message_count": recovery.get("candidate_user_message_count"),
+        "matched_user_message_count": recovery.get("matched_user_message_count"),
+        "rejected_prompt_echo_ref_count": recovery.get("rejected_prompt_echo_ref_count"),
+        "query_terms": recovery.get("query_terms") or [],
+    }
+
+
+def _remembered_user_wording_topic_terms(query: str) -> set[str]:
+    stopwords = {
+        "about",
+        "after",
+        "again",
+        "asked",
+        "before",
+        "constraint",
+        "constraints",
+        "did",
+        "exactly",
+        "for",
+        "give",
+        "gave",
+        "instruction",
+        "instructions",
+        "into",
+        "message",
+        "request",
+        "requested",
+        "say",
+        "said",
+        "tell",
+        "that",
+        "the",
+        "this",
+        "what",
+        "when",
+        "where",
+        "with",
+        "you",
+        "your",
+    }
+    terms = set()
+    for raw in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", query.casefold()):
+        term = raw.replace("_", "-").strip("-")
+        if term in stopwords:
+            continue
+        stem = _remembered_user_wording_stem(term)
+        if len(stem) >= 3 and stem not in stopwords:
+            terms.add(stem)
+    return terms
+
+
+def _remembered_user_wording_stem(term: str) -> str:
+    for suffix in ("ing", "ingly", "edly", "ed", "es", "s"):
+        if len(term) > len(suffix) + 3 and term.endswith(suffix):
+            return term[: -len(suffix)]
+    return term
+
+
+def _remembered_user_message_topic_score(message: dict, terms: set[str]) -> int:
+    text_terms = {
+        _remembered_user_wording_stem(raw)
+        for raw in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", str(message.get("snippet") or "").casefold())
+    }
+    return len(terms & text_terms)
+
+
+def _latest_user_message_recovery_opened_item(message: dict, *, score: int, cwd: Path) -> dict:
+    target = str(message.get("openable_target") or message.get("source_ref") or "")
+    path_text, line = _split_ref_target(target) if target else ("", None)
+    rel_target = target
+    if path_text:
+        rel_path = _safe_relative_path(cwd, Path(path_text).expanduser())
+        rel_target = f"{rel_path}:{line}" if line else rel_path
+    ref = {
+        "kind": "jsonl_source_ref",
+        "target_source_role": "target_historical_raw",
+        "reason": "bounded user-message recovery matched remembered-instruction topic terms",
+        "source_ref": message.get("openable_source_ref"),
+        "openable_target": message.get("openable_target"),
+        "source_tier": "primary_raw_chat_log",
+        "source_role_label": "user_authored_raw_message",
+        "timestamp_utc": message.get("timestamp_utc"),
+        "remembered_user_recovery": {
+            "searched_scope": "codex_history_and_codex_sessions_only",
+            "topic_score": score,
+        },
+    }
+    summary = " ".join(
+        part
+        for part in (str(message.get("timestamp_utc") or ""), "user:", str(message.get("snippet") or ""))
+        if part
+    )
+    return {
+        "status": "opened",
+        "target": rel_target,
+        "path": rel_target.rsplit(":", 1)[0] if ":" in rel_target else rel_target,
+        "line": line,
+        "summary": summary[:_ASK_ANSWER_MAX_LINE_CHARS],
+        "record_metadata": {
+            "conversation_label": "user_message",
+            "conversation_confidence": "high",
+            "is_user_authored": True,
+            "user_authorship_basis": "latest_user_messages_human_filter",
+            "top_role": "user",
+            "payload_type": None,
+            "payload_role": None,
+            "message_role": "user",
+        },
+        "ref": ref,
     }
 
 
