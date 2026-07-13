@@ -51,6 +51,8 @@ LABELED_HANDLE_RE = re.compile(
     re.IGNORECASE,
 )
 EMBEDDED_JSONL_SOURCE_REF_RE = re.compile(r"(?P<path>/(?:(?!\.jsonl)[^`\"'\n\r])+?\.jsonl):(?P<line>\d+)(?!\d)")
+CODEX_SESSION_DATE_RE = re.compile(r"/\.codex/sessions/(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})/")
+CODEX_ROLLOUT_DATE_RE = re.compile(r"/rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})t", re.IGNORECASE)
 
 DECISION_CONTEXT_ROUTES = {
     "conversation_reconstruction",
@@ -1585,6 +1587,10 @@ def apply_historical_provenance_self_echo_policy(
             (policy_wanted or orchestration_wanted)
             and historical_provenance_current_run_or_self_echo_candidate(text, query=query)
         )
+        current_day_jsonl_echo = (
+            (policy_wanted or orchestration_wanted)
+            and historical_provenance_current_day_jsonl_echo_candidate(row, query=query)
+        )
         current_task_same_loop = (
             (policy_wanted or orchestration_wanted)
             and historical_orchestration_current_task_same_loop_candidate(
@@ -1598,7 +1604,7 @@ def apply_historical_provenance_self_echo_policy(
             candidate=candidate,
             query=query,
             handles=handles,
-            current_run_echo=current_run_echo,
+            current_run_echo=current_run_echo or current_day_jsonl_echo,
             current_task_same_loop=current_task_same_loop,
         )
         if category["diagnostic_only"]:
@@ -2609,6 +2615,11 @@ def historical_provenance_self_echo_policy_wanted(
             "rereview",
             "what changed",
             "what happened",
+            "historical",
+            "harness",
+            "trouble",
+            "struggle",
+            "struggled",
             "verified",
         )
     )
@@ -2708,6 +2719,38 @@ def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query
         "process exited with code",
     )
     return any(marker in lowered for marker in current_tool_markers)
+
+
+def historical_provenance_current_day_jsonl_echo_candidate(read: dict[str, Any], *, query: str) -> bool:
+    if historical_provenance_current_scope_requested(query):
+        return False
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = str(read.get("target") or "")
+    path = str(source_ref.get("path") or source_target_path_part(target) or "")
+    if not path.endswith(".jsonl"):
+        return False
+    source_date = codex_session_path_date(path)
+    if source_date is None:
+        return False
+    today = {datetime.now().date(), datetime.now(timezone.utc).date()}
+    return source_date in today
+
+
+def codex_session_path_date(path: str) -> Any:
+    normalized = str(path or "").lower().replace("\\", "/")
+    for pattern in (CODEX_SESSION_DATE_RE, CODEX_ROLLOUT_DATE_RE):
+        match = pattern.search(normalized)
+        if not match:
+            continue
+        try:
+            return datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ).date()
+        except ValueError:
+            return None
+    return None
 
 
 def historical_provenance_source_category(
@@ -5477,6 +5520,17 @@ def build_answer_ready_handoff(
     if primary_followthrough_first:
         decision = "primary_source_followthrough_first"
         do_next = "run_primary_source_window_command_then_answer_if_supported"
+    diagnostic_only_recovery = (
+        readiness_decision in {"inspect_recovery_reads", "run_audit_route"}
+        and not bounded_next_reads
+        and bool(demoted_required_surface_reads(next_reads))
+    )
+    if diagnostic_only_recovery:
+        decision = "diagnostic_only_recovery"
+        do_next = "do_not_treat_diagnostic_reads_as_primary_refine_scope_or_escalate"
+        do_not_answer_until.append(
+            "Do not open diagnostic-only current/self-echo reads as primary proof; refine source scope or escalate only if the historical claim still needs evidence."
+        )
     copy_paste_commands = (
         []
         if scoped_no_evidence_answer
@@ -7676,14 +7730,31 @@ def build_source_action_guidance(
                 "the scoped no-evidence answer."
             ),
         }
+    required_actions = bounded_answer_ready_next_reads(next_reads)
+    diagnostic_reads = diagnostic_next_read_summaries(demoted_required_surface_reads(next_reads))
+    if not required_actions and diagnostic_reads:
+        return {
+            "schema_version": 1,
+            "decision": "diagnostic_only_reads_not_primary_proof",
+            "scope_boundary_summary": scope_boundary_summary or {},
+            "required_primary_source_actions": [],
+            "optional_diagnostic_reads": diagnostic_reads,
+            "stop_condition": (
+                "Do not treat diagnostic-only current/self-echo reads as primary evidence. Stop required "
+                "read-more on those refs; refine source scope, use targeted historical artifact/source-handle "
+                "search, or escalate retrieval only if the requested historical claim still lacks evidence."
+            ),
+            "retrieval_escalation_condition": (
+                "Escalate retrieval mode only when no pre-existing historical source refs or artifact handles "
+                "support the answer after the diagnostic echo boundary is recognized."
+            ),
+        }
     return {
         "schema_version": 1,
         "decision": str(answer_readiness.get("decision") or "gather_more_evidence"),
         "scope_boundary_summary": scope_boundary_summary or {},
-        "required_primary_source_actions": bounded_answer_ready_next_reads(next_reads),
-        "optional_diagnostic_reads": diagnostic_next_read_summaries(
-            demoted_required_surface_reads(next_reads)
-        ),
+        "required_primary_source_actions": required_actions,
+        "optional_diagnostic_reads": diagnostic_reads,
         "stop_condition": "Stop when inspected source refs support the answer within the searched-scope boundaries.",
         "retrieval_escalation_condition": (
             "Escalate retrieval mode only when package-mode evidence is weak, required facets remain missing, "
