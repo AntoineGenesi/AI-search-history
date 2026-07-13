@@ -8441,7 +8441,11 @@ def _summarize_markdown_file(lines: list[str]) -> str:
             continue
         if line.startswith("# ") or _looks_like_markdown_proof_summary_line(line):
             selected.append(line)
-        if _looks_like_markdown_review_failure_answer_line(line) or _looks_like_markdown_fix_rereview_answer_line(line):
+        if (
+            _looks_like_markdown_review_failure_answer_line(line)
+            or _looks_like_markdown_fix_rereview_answer_line(line)
+            or _looks_like_markdown_merge_commit_answer_line(line)
+        ):
             high_signal.append(line)
         if len(selected) >= 5 and len(high_signal) >= 4:
             break
@@ -8468,6 +8472,29 @@ def _looks_like_markdown_proof_summary_line(line: str) -> bool:
             "regression test:",
             "commit:",
             "review:",
+            "merge commit:",
+            "merge proof:",
+            "parent merge commit:",
+            "implementation commit:",
+            "review commit:",
+            "close commit:",
+            "closeout commit:",
+        )
+    )
+
+
+def _looks_like_markdown_merge_commit_answer_line(line: str) -> bool:
+    normalized = line.lstrip("-*` ").casefold()
+    if not re.search(r"\b[0-9a-f]{7,40}\b", normalized):
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "merge commit",
+            "parent merge",
+            "merge proof",
+            "merged",
+            "integrated on parent",
         )
     )
 
@@ -9110,6 +9137,15 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
         )
         if selection_answer:
             return selection_answer
+    if _named_task_merge_provenance_answer_wanted(query=query, route_family="provenance"):
+        merge_answer = _compose_named_task_merge_provenance_answer(
+            task_id=task_id,
+            clean_task_summaries=clean_task_summaries,
+            clean_review_summaries=clean_review_summaries,
+            opened=opened,
+        )
+        if merge_answer:
+            return merge_answer
     review_failure_status_wanted = _named_task_review_failure_status_answer_wanted(
         query=query,
         route_family="provenance",
@@ -9156,6 +9192,134 @@ def _compose_named_task_answer(*, query: str, named: dict, opened: list[dict]) -
     if clean_other_summaries:
         pieces.append(f"commit/probe proof: {_short_join(clean_other_summaries[:1])}")
     return f"Current proof for {task_id} shows " + "; ".join(pieces) + "."
+
+
+def _named_task_merge_provenance_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"provenance", "semantic_debug"}:
+        return False
+    if not _ask_execute_named_task_ids(query):
+        return False
+    normalized = str(query or "").casefold()
+    if not any(term in normalized for term in ("merge", "merged")):
+        return False
+    return any(term in normalized for term in ("source", "session", "task", "review", "commit", "prove"))
+
+
+def _compose_named_task_merge_provenance_answer(
+    *,
+    task_id: str,
+    clean_task_summaries: list[str],
+    clean_review_summaries: list[str],
+    opened: list[dict],
+) -> str | None:
+    task_proof = _named_task_merge_provenance_role_summary(clean_task_summaries)
+    review_proof = _named_task_merge_provenance_role_summary(clean_review_summaries)
+    merge_commits = _named_task_merge_commit_hashes(opened, task_id=task_id)
+    source_sessions = _named_task_source_session_proof_summaries(opened)
+    if not (task_proof or review_proof or merge_commits or source_sessions):
+        return None
+    pieces = []
+    if source_sessions:
+        pieces.append(f"source-session proof: {_short_join(source_sessions[:2], limit=260)}")
+    else:
+        pieces.append("source-session proof: missing/unresolved in the opened proof refs")
+    if task_proof:
+        pieces.append(f"task artifact proof: {task_proof}")
+    else:
+        pieces.append("task artifact proof: missing/unresolved in the opened proof refs")
+    if review_proof:
+        pieces.append(f"review artifact proof: {review_proof}")
+    else:
+        pieces.append("review artifact proof: missing/unresolved in the opened proof refs")
+    if merge_commits:
+        pieces.append(f"merge commit proof: {', '.join(merge_commits[:3])}")
+    else:
+        pieces.append("merge commit proof: missing/unresolved in the opened proof refs")
+    return (
+        f"Current merge provenance proof for {task_id}: "
+        + "; ".join(pieces)
+        + ". Boundary: task and review artifacts corroborate task/review roles; only an actual merge commit is used for the merge-commit role."
+    )
+
+
+def _named_task_merge_provenance_role_summary(summaries: list[str]) -> str:
+    fragments: list[str] = []
+    for fragment in _summary_fragments(summaries):
+        normalized = fragment.casefold()
+        if any(marker in normalized for marker in ("close commit", "closeout commit", "close jsh")) and not any(
+            marker in normalized for marker in ("merge commit", "parent merge", "merge proof")
+        ):
+            continue
+        fragments.append(fragment)
+    return _short_join(fragments[:4], limit=360)
+
+
+def _named_task_source_session_proof_summaries(opened: list[dict]) -> list[str]:
+    summaries: list[str] = []
+    for item in opened:
+        target = str(item.get("target") or item.get("path") or "").casefold()
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        kind = str(ref.get("kind") or "")
+        proof_surface = str(ref.get("proof_surface") or "")
+        if ".jsonl" not in target and "session" not in kind and "session" not in proof_surface:
+            continue
+        summary = str(item.get("summary") or "").strip()
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def _named_task_merge_commit_hashes(opened: list[dict], *, task_id: str) -> list[str]:
+    commits: list[str] = []
+    for item in opened:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        for fragment in _summary_fragments([summary]):
+            if _named_task_fragment_mentions_other_task_id(fragment, task_id):
+                continue
+            if not _named_task_fragment_is_merge_commit_proof(fragment):
+                continue
+            for commit in _named_task_merge_commit_hashes_from_fragment(fragment):
+                normalized = commit.lower()
+                if normalized not in commits:
+                    commits.append(normalized)
+    return commits
+
+
+def _named_task_merge_commit_hashes_from_fragment(fragment: str) -> list[str]:
+    text = str(fragment or "")
+    hashes: list[str] = []
+    patterns = (
+        r"(?:parent\s+)?merge\s+commit\s*[:` ]+\s*`?([0-9a-f]{7,40})\b",
+        r"merge\s+proof\s*[:` ]+\s*`?([0-9a-f]{7,40})\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            commit = match.group(1).lower()
+            if commit not in hashes:
+                hashes.append(commit)
+    return hashes
+
+
+def _named_task_fragment_is_merge_commit_proof(fragment: str) -> bool:
+    normalized = str(fragment or "").casefold()
+    if not any(
+        marker in normalized
+        for marker in (
+            "merge commit",
+            "parent merge",
+            "merge proof",
+            "merged",
+            "integrated on parent",
+        )
+    ):
+        return False
+    if any(marker in normalized for marker in ("close commit", "closeout commit", "close jsh")) and not any(
+        marker in normalized for marker in ("merge commit", "parent merge", "merge proof")
+    ):
+        return False
+    return True
 
 
 def _compose_named_task_branch_work_episode_answer(
