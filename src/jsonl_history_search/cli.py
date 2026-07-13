@@ -4312,11 +4312,14 @@ def _scoped_no_evidence_contract(compact: dict) -> dict:
         "answer_scope": no_evidence.get("answer_scope"),
         "searched_files": searched_scope.get("searched_files"),
         "searched_bytes": searched_scope.get("searched_bytes"),
+        "searched_root_kinds": searched_scope.get("root_kinds", []),
+        "searched_root_privacy_labels": searched_scope.get("root_privacy_labels", []),
         "selected_root_count": scope_counts.get("selected_root_count"),
         "excluded_root_count": scope_counts.get("excluded_root_count"),
         "missing_root_count": scope_counts.get("missing_root_count"),
         "cap_hit": cap_hit.get("hit"),
         "caps_hit": cap_hit.get("caps_hit", []),
+        "outside_selected_roots": no_evidence.get("outside_selected_roots"),
         "not_all_history_absence": no_evidence.get("not_all_history_absence"),
         "candidate_interpretation": no_evidence.get("candidate_interpretation"),
         "read_more_required_before_scoped_no_evidence_answer": read_more_policy.get(
@@ -4706,7 +4709,7 @@ def _ask_answer_from_execute(
 
     scoped = action.get("scoped_no_evidence_contract")
     if action.get("answer_status") == "answer-scoped-no-evidence-now" and isinstance(scoped, dict):
-        return _ask_answer_scoped_no_evidence(answer, scoped)
+        return _ask_answer_scoped_no_evidence(answer, scoped, cwd=cwd)
 
     can_follow_raw_proof = _ask_answer_can_follow_raw_proof_despite_status(
         action=action,
@@ -5312,10 +5315,15 @@ def _unique_preserving_order(values: list[str]) -> list[str]:
     return unique
 
 
-def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
+def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> dict:
     searched_files = scoped.get("searched_files")
     searched_bytes = scoped.get("searched_bytes")
     candidate_interpretation = scoped.get("candidate_interpretation")
+    root_kinds = [str(kind) for kind in scoped.get("searched_root_kinds") or [] if str(kind).strip()]
+    root_kind_text = ", ".join(root_kinds[:4])
+    if len(root_kinds) > 4:
+        root_kind_text += f", +{len(root_kinds) - 4} more"
+    root_label = _scoped_no_evidence_root_label(scoped)
     if candidate_interpretation == "claim_boundary_non_support":
         text = (
             "No searched-scope support was found for the stronger claim. The found material is "
@@ -5327,7 +5335,21 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
             "No evidence was found in the searched scope. This is a searched-scope answer only, "
             "not all-history absence."
         )
-    text += f" Scope searched: {searched_files} files, {searched_bytes} bytes."
+    text += f" Scope searched: {searched_files} files, {searched_bytes} bytes"
+    if root_kind_text:
+        text += f" across {root_label} ({root_kind_text})"
+    text += "."
+    repo_boundary = _scoped_no_evidence_current_repo_boundary(scoped=scoped, cwd=cwd)
+    if repo_boundary:
+        text += f" {repo_boundary}"
+    if scoped.get("cap_hit") is True:
+        caps_text = ", ".join(str(item) for item in (scoped.get("caps_hit") or [])[:4] if str(item).strip())
+        text += " Cap boundary: search or retention caps were hit"
+        if caps_text:
+            text += f" ({caps_text})"
+        text += ", so unsearched or unretained material may exist outside this answer."
+    if scoped.get("read_more_actionability") == "optional_diagnostic_context":
+        text += " Diagnostic candidate reads remain optional; they are not required before this scoped no-support answer."
     answer["answer_status"] = "answered-from-scoped-no-evidence-contract"
     answer["answer"] = text
     answer["refs_used"] = [
@@ -5336,6 +5358,10 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
             "answer_scope": scoped.get("answer_scope"),
             "searched_files": searched_files,
             "searched_bytes": searched_bytes,
+            "searched_root_kinds": root_kinds,
+            "current_repo_docs_tasks_searched": repo_boundary == "",
+            "cap_hit": scoped.get("cap_hit"),
+            "caps_hit": scoped.get("caps_hit", []),
             "candidate_interpretation": candidate_interpretation,
             "saved_report": scoped.get("saved_report"),
         }
@@ -5343,9 +5369,39 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict) -> dict:
     answer["proof_summary"] = [
         f"answer_scope={scoped.get('answer_scope')}",
         f"candidate_interpretation={candidate_interpretation}",
+        f"searched_root_kinds={','.join(root_kinds) if root_kinds else '(unknown)'}",
+        f"cap_hit={scoped.get('cap_hit')}",
         f"read_more_required_before_scoped_no_evidence_answer={scoped.get('read_more_required_before_scoped_no_evidence_answer')}",
     ]
     return {"ask_answer": answer}
+
+
+def _scoped_no_evidence_root_label(scoped: dict) -> str:
+    privacy_labels = {str(item) for item in scoped.get("searched_root_privacy_labels") or [] if str(item).strip()}
+    root_kinds = {str(item) for item in scoped.get("searched_root_kinds") or [] if str(item).strip()}
+    transcript_kinds = {"codex_sessions", "codex_history", "claude_projects"}
+    if root_kinds and root_kinds <= transcript_kinds:
+        return "private transcript roots" if "private_root" in privacy_labels else "transcript roots"
+    if "private_root" in privacy_labels:
+        return "selected private roots"
+    return "selected roots"
+
+
+def _scoped_no_evidence_current_repo_boundary(*, scoped: dict, cwd: Path) -> str:
+    root_kinds = {str(item) for item in scoped.get("searched_root_kinds") or [] if str(item).strip()}
+    if not root_kinds:
+        return ""
+    repo_artifact_dirs = [cwd / "tasks", cwd / "docs", cwd / "codex" / "state"]
+    if not any(path.exists() for path in repo_artifact_dirs):
+        return ""
+    repo_root_kinds = {"cwd", "current_repo", "repo_artifacts", "task_docs", "project_docs"}
+    if root_kinds & repo_root_kinds:
+        return ""
+    outside_selected = str(scoped.get("outside_selected_roots") or "not searched unless explicitly selected")
+    return (
+        "Current repo docs/tasks under the cwd were not part of this no-evidence search "
+        f"({outside_selected}), so repo artifacts can still contain evidence outside this answer."
+    )
 
 
 def _next_proof_step_from_action(action: dict) -> object:
@@ -9926,10 +9982,15 @@ def _no_evidence_searched_scope_summary(
     searched = no_evidence.get("searched_scope") if isinstance(no_evidence.get("searched_scope"), dict) else {}
     files = searched.get("searched_files") if searched_files is None else searched_files
     bytes_ = searched.get("searched_bytes") if searched_bytes is None else searched_bytes
+    roots = [root for root in searched.get("roots") or [] if isinstance(root, dict)]
     return {
         "searched_files": int(files or 0),
         "searched_bytes": int(bytes_ or 0),
         "result_meaning": searched.get("result_meaning"),
+        "root_kinds": _unique_preserving_order([str(root.get("kind") or "") for root in roots]),
+        "root_privacy_labels": _unique_preserving_order(
+            [str(root.get("privacy_label") or "") for root in roots]
+        ),
     }
 
 
@@ -9985,6 +10046,7 @@ def _no_evidence_cap_hit(no_evidence: dict) -> dict:
 
 def _no_evidence_boundary_summary(no_evidence: dict, *, locator_meaning: dict | None = None) -> dict:
     locator_meaning = locator_meaning or {}
+    not_searched = no_evidence.get("not_searched_scope") if isinstance(no_evidence.get("not_searched_scope"), dict) else {}
     summary = {
         "needed": bool(no_evidence.get("needed")),
         "answer_scope": no_evidence.get("answer_scope")
@@ -9995,6 +10057,8 @@ def _no_evidence_boundary_summary(no_evidence: dict, *, locator_meaning: dict | 
         ),
         "read_more_policy": _no_evidence_read_more_policy(no_evidence),
     }
+    if not_searched.get("outside_selected_roots"):
+        summary["outside_selected_roots"] = not_searched.get("outside_selected_roots")
     if no_evidence.get("candidate_interpretation"):
         summary["candidate_interpretation"] = no_evidence.get("candidate_interpretation")
     coverage = no_evidence.get("query_term_coverage") if isinstance(no_evidence.get("query_term_coverage"), dict) else {}
