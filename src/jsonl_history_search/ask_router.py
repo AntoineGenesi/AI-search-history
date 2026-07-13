@@ -1418,9 +1418,11 @@ def _looks_like_remembered_user_wording_query(normalized: str) -> bool:
         re.search(pattern, normalized)
         for pattern in (
             r"\b(?:when|where) did i (?:say|tell|ask|request)\b",
+            r"\bwhat exactly did i ask for(?:\b| about\b)",
             r"\bwhat did i ask for(?:\b| about\b)",
             r"\bwhat did i (?:say|tell|ask|request) (?:you )?before about\b",
             r"\bwhat did i (?:say|tell|ask|request) about\b",
+            r"\bwhat constraint did i give (?:you )?(?:about|on|for)\b",
             r"\bwhat was my (?:ask|request|instruction) about\b",
         )
     )
