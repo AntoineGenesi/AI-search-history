@@ -4948,8 +4948,14 @@ def _ask_answer_from_execute(
         query=str(report.get("query") or ""),
         route_family=route_family,
     )
+    post_merge_smoke_wanted = _post_merge_smoke_answer_wanted(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+    )
+    if post_merge_smoke_wanted:
+        action_chronology_wanted = False
     proof_refs = _collect_ask_answer_proof_refs(action)
-    if action_chronology_wanted:
+    if action_chronology_wanted or post_merge_smoke_wanted:
         proof_refs = _dedupe_ask_answer_proof_refs(
             _action_chronology_candidate_refs(action) + proof_refs
         )
@@ -5151,6 +5157,20 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(process_gate.get("opened") or answer_opened)
 
+    if post_merge_smoke_wanted:
+        smoke_gate = _post_merge_smoke_answer_proof_gate(opened=answer_opened)
+        answer["source_contract"]["post_merge_smoke_answer_gate"] = (
+            _post_merge_smoke_gate_public_contract(smoke_gate)
+        )
+        if smoke_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(smoke_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "post-merge smoke proof missing; stop/closeout chronology is not smoke execution proof",
+                smoke_gate,
+            )
+        answer_opened = list(smoke_gate.get("opened") or answer_opened)
+
     if action_chronology_wanted:
         chronology_gate = _action_chronology_answer_proof_gate(
             query=str(report.get("query") or ""),
@@ -5227,6 +5247,9 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
     if route_family == "expectation_mismatch":
         return _expectation_mismatch_source_role_explanation(next_step)
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        smoke_explanation = _post_merge_smoke_source_role_explanation(next_step)
+        if smoke_explanation:
+            return smoke_explanation
         return _action_chronology_source_role_explanation(next_step)
     if route_family == "remembered_user_wording":
         return _remembered_user_wording_source_role_explanation(next_step)
@@ -6838,6 +6861,164 @@ def _extract_text_from_json_row(row: dict) -> str:
     return ""
 
 
+def _post_merge_smoke_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    post_merge = any(marker in normalized for marker in ("post-merge", "post merge", "postmerge"))
+    smoke = any(marker in normalized for marker in ("smoke", "smokes", "smoke test", "smoke check"))
+    claim_shape = (
+        "only claim" in normalized
+        or "actually" in normalized
+        or "really" in normalized
+        or "versus claim" in normalized
+    )
+    return post_merge and smoke and claim_shape
+
+
+def _post_merge_smoke_answer_proof_gate(*, opened: list[dict]) -> dict:
+    direct: list[dict] = []
+    rejected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        role = _post_merge_smoke_opened_source_role(item)
+        public = _ref_public_summary(item)
+        public["post_merge_smoke_source_role"] = role["source_role"]
+        public["post_merge_smoke_reasons"] = role["reasons"]
+        if role["source_role"] == "direct_post_merge_smoke_proof":
+            annotated = dict(item)
+            annotated["post_merge_smoke_reasons"] = role["reasons"]
+            direct.append(annotated)
+        else:
+            rejected.append(public)
+
+    if direct:
+        return {
+            "schema_version": 1,
+            "status": "answer_allowed",
+            "opened": direct[:_ASK_ANSWER_MAX_REFS],
+            "required_proof": "direct_post_merge_smoke_command_or_result",
+            "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+            "summary_lines": [
+                f"{item.get('target')}: direct_post_merge_smoke_proof reasons={','.join(item.get('post_merge_smoke_reasons') or [])}"
+                for item in direct[:_ASK_ANSWER_MAX_REFS]
+            ],
+        }
+    return {
+        "schema_version": 1,
+        "status": "missing_direct_post_merge_smoke_proof",
+        "required_proof": "direct_post_merge_smoke_command_or_result",
+        "missing_roles": ["direct_post_merge_smoke_command_or_result"],
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "summary_lines": [
+            "Opened action-proof refs did not contain direct post-merge smoke command/result evidence; "
+            "stop, closeout, merge, and generic task chronology are not smoke execution proof."
+        ],
+        "required_next_proof": (
+            "Open raw command/tool output or a reviewed artifact that explicitly records the post-merge "
+            "smoke commands/results for the named work episode."
+        ),
+        "acceptable_evidence": [
+            "raw exec/tool call for post-merge smoke commands",
+            "raw exec/tool output showing smoke pass/fail results",
+            "reviewed post-merge artifact that records the exact smoke commands or results",
+        ],
+    }
+
+
+def _post_merge_smoke_opened_source_role(item: dict) -> dict:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    text = " ".join(
+        str(value)
+        for value in (
+            item.get("summary"),
+            item.get("target"),
+            ref.get("reason"),
+            ref.get("proof_surface"),
+            ref.get("proof_role"),
+            ref.get("target_source_role"),
+            ref.get("kind"),
+        )
+        if value
+    ).casefold()
+    has_post_merge = any(marker in text for marker in ("post-merge", "post merge", "postmerge"))
+    has_smoke = any(marker in text for marker in ("smoke", "smokes", "smoke test", "smoke check"))
+    has_command_or_result = any(
+        marker in text
+        for marker in (
+            "tool call",
+            "tool output",
+            "function_call",
+            "function_call_output",
+            "exec_command",
+            "jsonl-history-search",
+            "pytest",
+            "compileall",
+            "git diff --check",
+            "passed",
+            "failed",
+            "exit code 0",
+            "process exited with code 0",
+            "command",
+            "result",
+        )
+    )
+    direct_surface = (
+        str(ref.get("target_source_role") or "") == "target_historical_raw"
+        or str(ref.get("proof_role") or "") in {"command_or_tool_call", "command_or_tool_output"}
+        or str(ref.get("kind") or "") == "jsonl_source_ref"
+        or str(item.get("path") or "").endswith(".jsonl")
+    )
+    reviewed_surface = str(ref.get("proof_surface") or "") in {"review_artifact", "task_file"} or str(
+        item.get("path") or ""
+    ).endswith(".md")
+    if has_post_merge and has_smoke and has_command_or_result and (direct_surface or reviewed_surface):
+        reasons = ["post_merge_smoke_terms", "command_or_result_terms"]
+        reasons.append("raw_tool_or_jsonl" if direct_surface else "reviewed_artifact")
+        return {"source_role": "direct_post_merge_smoke_proof", "reasons": reasons}
+    return {
+        "source_role": "not_direct_post_merge_smoke_proof",
+        "reasons": [
+            reason
+            for reason, present in (
+                ("missing_post_merge_terms", not has_post_merge),
+                ("missing_smoke_terms", not has_smoke),
+                ("missing_command_or_result_terms", not has_command_or_result),
+                ("unsupported_source_surface", not (direct_surface or reviewed_surface)),
+            )
+            if present
+        ],
+    }
+
+
+def _post_merge_smoke_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "required_proof": gate.get("required_proof"),
+        "missing_roles": gate.get("missing_roles") or [],
+        "direct_ref_count": len(gate.get("opened") or []),
+        "rejected_ref_count": len(gate.get("rejected_refs") or []),
+    }
+
+
+def _post_merge_smoke_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict) or next_step.get("status") != "missing_direct_post_merge_smoke_proof":
+        return None
+    return {
+        "schema_version": 1,
+        "kind": "post_merge_smoke_direct_proof_required",
+        "summary_lines": list(next_step.get("summary_lines") or [])[:_ASK_ANSWER_MAX_REFS],
+        "required_final_proof": next_step.get("required_next_proof"),
+        "acceptable_evidence": next_step.get("acceptable_evidence") or [],
+        "why_not_final_proof": (
+            "Stop/closeout chronology, merge/status proof, and generic task summaries can establish adjacent workflow "
+            "state, but they do not prove that post-merge smoke commands actually ran."
+        ),
+    }
+
+
 def _action_chronology_answer_wanted(*, query: str, route_family: str) -> bool:
     if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return False
@@ -8340,6 +8521,8 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         if isinstance(action.get("named_task_action_proof_handoff"), dict)
         else {}
     )
+    if _post_merge_smoke_answer_wanted(query=query, route_family=route_family):
+        return _compose_post_merge_smoke_answer(opened=opened)
     if _action_chronology_answer_wanted(query=query, route_family=route_family):
         action_chronology_answer = _compose_action_chronology_answer(opened=opened)
         if action_chronology_answer:
@@ -8431,6 +8614,30 @@ def _compose_action_chronology_answer(*, opened: list[dict]) -> str | None:
         "Primary action chronology shows: "
         + _short_join(pieces[:4], limit=760)
         + " Boundary: task/review/status artifacts may corroborate this chronology, but they are not primary action proof."
+    )
+
+
+def _compose_post_merge_smoke_answer(*, opened: list[dict]) -> str | None:
+    pieces = []
+    for item in opened:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        reasons = [
+            str(reason)
+            for reason in item.get("post_merge_smoke_reasons") or []
+            if str(reason).strip()
+        ]
+        label = "direct post-merge smoke proof"
+        if reasons:
+            label += f" ({','.join(reasons)})"
+        pieces.append(f"{label}: {summary}")
+    if not pieces:
+        return None
+    return (
+        "Direct post-merge smoke proof shows: "
+        + _short_join(pieces[:4], limit=760)
+        + " Boundary: stop/closeout chronology and generic merge/status proof are not used as smoke execution proof."
     )
 
 
