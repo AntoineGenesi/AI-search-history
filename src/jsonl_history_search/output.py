@@ -4069,6 +4069,11 @@ def render_semantic_debug_text(payload: dict) -> str:
         or (report.get("source_locator_handoff") or {}).get("historical_orchestration_role_coverage_source_plan")
         or (report.get("source_locator_handoff") or {}).get("historical_orchestration_provenance_final_support_plan")
     )
+    longitudinal_plan = (
+        report.get("longitudinal_phase_source_plan")
+        or handoff.get("longitudinal_phase_source_plan")
+        or (report.get("source_locator_handoff") or {}).get("longitudinal_phase_source_plan")
+    )
     lines = [
         "Semantic Debug",
         f"Status: {report.get('status')}",
@@ -4079,6 +4084,8 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.extend(render_historical_orchestration_role_evidence_bundle_text(orchestration_role_bundle))
     if orchestration_role_plan:
         lines.extend(render_historical_orchestration_role_coverage_source_plan_text(orchestration_role_plan))
+    if longitudinal_plan and longitudinal_plan.get("applies"):
+        lines.extend(render_longitudinal_phase_source_plan_text(longitudinal_plan))
     lines.append("Open these source refs first:")
     if scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
@@ -4321,6 +4328,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         or handoff.get("historical_orchestration_role_evidence_bundle")
         or (report.get("source_locator_handoff") or {}).get("historical_orchestration_role_evidence_bundle")
     )
+    longitudinal_plan = (
+        report.get("longitudinal_phase_source_plan")
+        or handoff.get("longitudinal_phase_source_plan")
+        or (report.get("source_locator_handoff") or {}).get("longitudinal_phase_source_plan")
+    )
     lines = [
         "# Semantic Debug",
         "",
@@ -4330,6 +4342,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_markdown(orchestration_role_bundle))
+    if longitudinal_plan and longitudinal_plan.get("applies"):
+        lines.extend(render_longitudinal_phase_source_plan_markdown(longitudinal_plan))
     lines.extend(["", "## Open These Source Refs First", ""])
     if scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
@@ -6084,6 +6098,65 @@ def render_historical_orchestration_role_coverage_source_plan_text(plan: dict) -
                 "- current_run_current_task_same_loop_echo_count: "
                 f"{plan.get('current_run_self_echo_candidate_count')}; listed later only as diagnostics"
             )
+    return lines
+
+
+def render_longitudinal_phase_source_plan_text(plan: dict) -> list[str]:
+    lines = [
+        "Longitudinal phase/source plan:",
+        f"- status: {plan.get('status')}",
+        f"- phase_balance_status: {plan.get('phase_balance_status')}",
+        f"- represented phases: {', '.join(plan.get('represented_phase_ids') or []) or 'none'}",
+        f"- missing phases: {', '.join(plan.get('missing_phase_ids') or []) or 'none'}",
+    ]
+    echoes = plan.get("same_wave_current_echoes") or {}
+    lines.append(
+        f"- current/same-wave echoes: {echoes.get('count', 0)} "
+        f"({echoes.get('policy') or 'diagnostic_only'})"
+    )
+    lines.append("Planned phases:")
+    for phase in list(plan.get("planned_phases") or [])[:6]:
+        families = ", ".join(phase.get("source_families") or []) or "none"
+        lines.append(
+            f"- {phase.get('phase_id')}: {phase.get('status')}; "
+            f"reads={phase.get('actionable_read_count', 0)}; source_families={families}"
+        )
+    lines.append("Source-set families:")
+    for family in list(plan.get("source_set_families") or [])[:8]:
+        lines.append(
+            f"- {family.get('family')}: surfaced_reads={family.get('surfaced_read_count', 0)}; "
+            f"selected_root={family.get('selected_root')}"
+        )
+    for action in list(plan.get("required_before_synthesis") or [])[:4]:
+        lines.append(f"- before synthesis: {action}")
+    return lines
+
+
+def render_longitudinal_phase_source_plan_markdown(plan: dict) -> list[str]:
+    lines = [
+        "",
+        "## Longitudinal Phase/Source Plan",
+        "",
+        f"- `status`: `{plan.get('status')}`",
+        f"- `phase_balance_status`: `{plan.get('phase_balance_status')}`",
+        f"- Represented phases: {', '.join(plan.get('represented_phase_ids') or []) or 'none'}",
+        f"- Missing phases: {', '.join(plan.get('missing_phase_ids') or []) or 'none'}",
+    ]
+    echoes = plan.get("same_wave_current_echoes") or {}
+    lines.append(
+        f"- Current/same-wave echoes: {echoes.get('count', 0)} "
+        f"({echoes.get('policy') or 'diagnostic_only'})"
+    )
+    lines.extend(["", "Planned phases:"])
+    for phase in list(plan.get("planned_phases") or [])[:6]:
+        families = ", ".join(phase.get("source_families") or []) or "none"
+        lines.append(
+            f"- `{phase.get('phase_id')}`: `{phase.get('status')}`; "
+            f"reads={phase.get('actionable_read_count', 0)}; source_families={families}"
+        )
+    lines.extend(["", "Required before synthesis:"])
+    for action in list(plan.get("required_before_synthesis") or [])[:4]:
+        lines.append(f"- {action}")
     return lines
 
 
