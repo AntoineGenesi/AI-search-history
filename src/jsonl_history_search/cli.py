@@ -3708,6 +3708,7 @@ def _answer_action_contract_from_executed_output(
             },
             "failure_modes": (compact.get("failure_modes") or [])[:5],
             "fix_suggestions": (compact.get("fix_suggestions") or [])[:5],
+            "root_handoff_contract": compact.get("root_handoff_contract"),
             "read_role_summary": read_role_summary,
             "source_inspection_boundary": {
                 "inspect_required_primary_proof_before_answer": True,
@@ -4627,6 +4628,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             or (compact.get("context_budget") or {}).get("report_written"),
             "summary": compact.get("summary"),
             "scope_resolution": compact.get("scope_resolution"),
+            "root_handoff_contract": compact.get("root_handoff_contract"),
             "answer_ready_contract": compact.get("answer_ready_contract"),
             "answer_use_contract": compact.get("answer_use_contract"),
             "read_role_summary": compact.get("read_role_summary"),
@@ -5641,6 +5643,14 @@ def _scoped_no_evidence_current_repo_boundary(*, scoped: dict, cwd: Path) -> str
 
 
 def _next_proof_step_from_action(action: dict) -> object:
+    root_handoff = action.get("root_handoff_contract")
+    if isinstance(root_handoff, dict) and root_handoff:
+        return {
+            "root_handoff_contract": root_handoff,
+            "rerun_command": root_handoff.get("recommended_rerun_command"),
+            "missing_root_guidance": root_handoff.get("missing_root_guidance"),
+            "candidate_roots": root_handoff.get("candidate_roots") or [],
+        }
     clarification = action.get("clarification_request")
     shortlist = action.get("parent_main_anchor_shortlist")
     if clarification or shortlist:

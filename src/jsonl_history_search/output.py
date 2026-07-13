@@ -1643,6 +1643,17 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         lines.append(f"Scope: {scope_resolution.get('status')} ({scope_resolution.get('strategy')})")
     if scope_resolution.get("first_action"):
         lines.append(f"First action: {scope_resolution.get('first_action')}")
+    root_handoff = report.get("root_handoff_contract") or {}
+    if root_handoff:
+        lines.append(
+            "Root handoff: "
+            f"{root_handoff.get('status')} "
+            f"candidate_count={root_handoff.get('candidate_count')}"
+        )
+        if root_handoff.get("recommended_rerun_command"):
+            lines.append(f"Root handoff rerun: {root_handoff.get('recommended_rerun_command')}")
+        elif root_handoff.get("missing_root_guidance"):
+            lines.append(f"Root handoff guidance: {root_handoff.get('missing_root_guidance')}")
     currentness = report.get("currentness_boundary") or {}
     if currentness:
         lines.append(f"Currentness boundary: {currentness.get('status')}: {currentness.get('boundary')}")
@@ -1922,6 +1933,19 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             f"**First action:** `{scope_resolution.get('first_action')}`",
             "",
         ])
+    root_handoff = report.get("root_handoff_contract") or {}
+    if root_handoff:
+        lines.extend([
+            "## Root Handoff",
+            "",
+            f"- Status: `{root_handoff.get('status')}`",
+            f"- Candidate roots: `{root_handoff.get('candidate_count')}`",
+        ])
+        if root_handoff.get("recommended_rerun_command"):
+            lines.append(f"- Rerun: `{root_handoff.get('recommended_rerun_command')}`")
+        elif root_handoff.get("missing_root_guidance"):
+            lines.append(f"- Guidance: `{root_handoff.get('missing_root_guidance')}`")
+        lines.append("")
     currentness = report.get("currentness_boundary") or {}
     if currentness:
         lines.extend([

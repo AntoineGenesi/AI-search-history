@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import time
@@ -9,7 +10,7 @@ from typing import Any
 from .masking import MaskContext
 from .prompt_echo import setup_echo_classification
 from .skill_audit import context_row, next_read_refs, scan_records
-from .sources import SourcePlan
+from .sources import PlannedRoot, SourcePlan, latest_session_event_timestamp
 
 
 SCHEMA_VERSION = 1
@@ -38,6 +39,9 @@ USER_MESSAGE_FIRST_INLINE_LIMIT = 20
 USER_MESSAGE_CONTEXT_PRE_RECORDS = 2
 USER_MESSAGE_CONTEXT_POST_RECORDS = 2
 CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW = 800
+ROOT_HANDOFF_CANDIDATE_LIMIT = 3
+ROOT_HANDOFF_SCAN_CANDIDATE_LIMIT = 40
+ROOT_HANDOFF_SCAN_MAX_ELAPSED = 2.0
 BEHAVIOR_RULE_FILENAMES = {"AGENTS.md", "CLAUDE.md"}
 IGNORED_BEHAVIOR_DISCOVERY_DIRS = {
     ".cache",
@@ -610,6 +614,19 @@ def build_semantic_wrapup_payload(
     scope_resolution = _scope_resolution(plan, source_plan, query)
     if fail_closed_scope:
         scope_resolution.update(fail_closed_scope)
+    root_handoff_contract = _root_handoff_contract(
+        plan=plan,
+        query=query,
+        fail_closed_scope=fail_closed_scope,
+        signals=signals,
+        setup_echo_signals=setup_echo_signals,
+        default_tz=default_tz,
+        mask_context=mask_context,
+    )
+    if root_handoff_contract:
+        scope_resolution["root_handoff_status"] = root_handoff_contract["status"]
+        scope_resolution["root_handoff_candidate_count"] = root_handoff_contract["candidate_count"]
+        scope_resolution["root_handoff_contract"] = root_handoff_contract
     next_reads = _semantic_next_reads(
         failure_modes,
         orchestration_evidence,
@@ -628,7 +645,13 @@ def build_semantic_wrapup_payload(
         read_role_summary=read_role_summary,
         cluster_promotion=cluster_promotion,
     )
-    answer_use_contract = _answer_use_contract(status, scope_resolution, next_reads, answer_ready_contract)
+    answer_use_contract = _answer_use_contract(
+        status,
+        scope_resolution,
+        next_reads,
+        answer_ready_contract,
+        root_handoff_contract=root_handoff_contract,
+    )
     payload = {
         "semantic_wrapup": {
             "schema_version": SCHEMA_VERSION,
@@ -701,8 +724,16 @@ def build_semantic_wrapup_payload(
             "fix_suggestions": fix_suggestions,
             "behavior_system": behavior_system,
             "scope_resolution": scope_resolution,
+            "root_handoff_contract": root_handoff_contract,
             "skill_check_recommendation": skill_check_recommendation,
-            "agent_instruction": _agent_instruction(status, scope_resolution, next_reads, answer_use_contract, skill_check_recommendation),
+            "agent_instruction": _agent_instruction(
+                status,
+                scope_resolution,
+                next_reads,
+                answer_use_contract,
+                skill_check_recommendation,
+                root_handoff_contract=root_handoff_contract,
+            ),
             "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
             "read_role_summary": read_role_summary,
@@ -1123,6 +1154,7 @@ def _agent_instruction(
     next_reads: list[dict] | None = None,
     answer_use_contract: dict | None = None,
     skill_check_recommendation: dict | None = None,
+    root_handoff_contract: dict | None = None,
 ) -> dict:
     contract = answer_use_contract or {}
     if contract.get("decision") == "answer_from_top_next_read_or_handoff_exact_source":
@@ -1138,13 +1170,19 @@ def _agent_instruction(
             "fallback_next_step": scope_resolution.get("first_action"),
         }
     if status == "scope_ambiguous":
+        handoff_action = (root_handoff_contract or {}).get("recommended_rerun_command") or (
+            root_handoff_contract or {}
+        ).get("missing_root_guidance")
         instruction = {
             "selection_required": False,
             "do_not_auto_apply": True,
             "source_use_required": False,
-            "next_step": scope_resolution.get("first_action")
+            "next_step": handoff_action
+            or scope_resolution.get("first_action")
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
         }
+        if root_handoff_contract:
+            instruction["root_handoff_contract"] = root_handoff_contract
         if skill_check_recommendation:
             instruction["focused_follow_up"] = skill_check_recommendation
         return instruction
@@ -1348,6 +1386,7 @@ def _answer_use_contract(
     scope_resolution: dict,
     next_reads: list[dict],
     answer_ready_contract: dict | None = None,
+    root_handoff_contract: dict | None = None,
 ) -> dict:
     if (answer_ready_contract or {}).get("answer_ready") is True:
         return dict(answer_ready_contract or {})
@@ -1375,11 +1414,16 @@ def _answer_use_contract(
             "fallback_if_source_insufficient": scope_resolution.get("first_action"),
         }
     if status == "scope_ambiguous":
+        handoff_action = (root_handoff_contract or {}).get("recommended_rerun_command") or (
+            root_handoff_contract or {}
+        ).get("missing_root_guidance")
         return {
             "source_use_required": False,
             "decision": "fail_closed_until_exact_session_root",
-            "required_next_action": scope_resolution.get("first_action")
+            "required_next_action": handoff_action
+            or scope_resolution.get("first_action")
             or "Rerun semantic-wrapup with an explicit --root session JSONL before applying fixes.",
+            "root_handoff_contract": root_handoff_contract,
         }
     return {
         "source_use_required": _semantic_read_role_summary(next_reads)["required_primary_proof_count"] > 0,
@@ -1493,11 +1537,234 @@ def _explicit_root_setup_echo_only_scope(plan: SourcePlan, signals: list[dict], 
     }
 
 
+def _root_handoff_contract(
+    *,
+    plan: SourcePlan,
+    query: str,
+    fail_closed_scope: dict | None,
+    signals: list[dict],
+    setup_echo_signals: list[dict],
+    default_tz,
+    mask_context: MaskContext | None,
+) -> dict | None:
+    if not _latest_session_fail_closed(fail_closed_scope):
+        return None
+    selected_root = plan.roots[0] if plan.roots else None
+    selected_path = selected_root.path if selected_root is not None else None
+    selected_ref = _selected_session_root_ref(selected_path, setup_echo_signals)
+    selected_rejection = {
+        "source_ref": selected_ref,
+        "root_kind": selected_root.kind if selected_root is not None else None,
+        "status": (fail_closed_scope or {}).get("selected_latest_session_status"),
+        "reason": (fail_closed_scope or {}).get("reason"),
+        "strategy": (fail_closed_scope or {}).get("strategy"),
+        "setup_echo_signal_count": len(setup_echo_signals),
+        "substantive_signal_count": len(
+            [signal for signal in signals if signal.get("scope_signal_kind") == "user_complaint"]
+        ),
+        "evidence_source_role": "rejected_latest_setup_or_prompt_echo_session",
+    }
+    candidates: list[dict] = []
+    scanned = 0
+    for candidate_path, root_kind in _recent_neighbor_session_candidates(selected_path):
+        scanned += 1
+        candidate = _evaluate_root_handoff_candidate(
+            candidate_path,
+            root_kind=root_kind,
+            query=query,
+            default_tz=default_tz,
+            mask_context=mask_context,
+            template_plan=plan,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+        if len(candidates) >= ROOT_HANDOFF_CANDIDATE_LIMIT:
+            break
+    status = "candidate_roots_found" if candidates else "missing_trustworthy_substantive_root"
+    contract = {
+        "status": status,
+        "decision": "handoff_to_candidate_root" if candidates else "fail_closed_missing_root",
+        "candidate_count": len(candidates),
+        "candidate_roots": candidates,
+        "selected_latest_session_rejection": selected_rejection,
+        "scan_policy": (
+            "When ambient latest/current-session semantic-wrapup is setup-dominant, scan only recent neighboring "
+            "known Codex/Claude session JSONLs under the same session root and recommend roots that contain "
+            "substantive user complaint/correction signals under the existing semantic-wrapup classifier."
+        ),
+        "scanned_neighbor_session_count": scanned,
+        "scan_candidate_limit": ROOT_HANDOFF_SCAN_CANDIDATE_LIMIT,
+        "why_not_answer_from_ambient": (
+            "The selected latest session contains setup, worker/reviewer, or semantic-wrapup prompt echoes, "
+            "so it is safer to rerun on a source-backed parent/current substantive session than to promote "
+            "those echoes as correction proof."
+        ),
+        "missing_root_guidance": (
+            "No trustworthy neighboring parent/user session or current substantive session root was found "
+            "in the bounded recent-session handoff scan. Fail closed: ask for or supply the exact "
+            f"Codex/Claude session JSONL and rerun {_rerun_with_root_command(query)}."
+        ),
+    }
+    if candidates:
+        contract["recommended_root"] = candidates[0]
+        contract["recommended_rerun_command"] = candidates[0]["rerun_command"]
+        contract["ask_followup_shape"] = (
+            "Use the recommended rerun command, inspect required_primary_proof refs from that explicit-root "
+            "semantic-wrapup result, then answer from those source refs."
+        )
+    return contract
+
+
+def _selected_session_root_ref(path: Path | None, setup_echo_signals: list[dict]) -> dict:
+    if setup_echo_signals:
+        ref = setup_echo_signals[0].get("source_ref") or {}
+        if ref.get("path"):
+            return {"path": ref.get("path"), "line": ref.get("line") or 1}
+    return {"path": str(path), "line": 1} if path is not None else {}
+
+
+def _recent_neighbor_session_candidates(selected_path: Path | None) -> list[tuple[Path, str]]:
+    if selected_path is None:
+        return []
+    base, root_kind = _session_root_base_and_kind(selected_path)
+    if base is None:
+        return []
+    selected_resolved = selected_path.expanduser().resolve()
+    selected_rank = _session_rank_timestamp(selected_path)
+    candidates: list[tuple[float, float, str, Path]] = []
+    started = time.monotonic()
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(base):
+        if time.monotonic() - started > ROOT_HANDOFF_SCAN_MAX_ELAPSED:
+            break
+        dirnames[:] = [
+            name
+            for name in sorted(dirnames, reverse=True)
+            if name not in {".git", ".cache", "node_modules", "__pycache__"}
+        ]
+        for filename in sorted(filenames, reverse=True):
+            if not filename.endswith(".jsonl"):
+                continue
+            path = Path(dirpath) / filename
+            try:
+                if path.expanduser().resolve() == selected_resolved:
+                    continue
+            except OSError:
+                continue
+            rank = _session_rank_timestamp(path)
+            if selected_rank is not None and rank is not None and rank >= selected_rank:
+                continue
+            mtime = _safe_mtime(path)
+            candidates.append((rank or mtime, mtime, path.as_posix(), path))
+            visited += 1
+            if visited >= ROOT_HANDOFF_SCAN_CANDIDATE_LIMIT:
+                break
+        if visited >= ROOT_HANDOFF_SCAN_CANDIDATE_LIMIT:
+            break
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [(path, root_kind) for *_rank, path in candidates[:ROOT_HANDOFF_SCAN_CANDIDATE_LIMIT]]
+
+
+def _session_root_base_and_kind(path: Path) -> tuple[Path | None, str]:
+    expanded = path.expanduser()
+    for parent in expanded.parents:
+        if parent.name == "sessions":
+            return parent, "codex_session_file"
+        if parent.name == "projects":
+            return parent, "claude_session_file"
+    return None, "unknown_jsonl"
+
+
+def _session_rank_timestamp(path: Path) -> float | None:
+    try:
+        latest_event = latest_session_event_timestamp(path)
+    except OSError:
+        latest_event = None
+    if latest_event is not None:
+        return latest_event.timestamp()
+    mtime = _safe_mtime(path)
+    return mtime if mtime > 0 else None
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _evaluate_root_handoff_candidate(
+    path: Path,
+    *,
+    root_kind: str,
+    query: str,
+    default_tz,
+    mask_context: MaskContext | None,
+    template_plan: SourcePlan,
+) -> dict | None:
+    candidate_plan = SourcePlan(
+        roots=[
+            PlannedRoot(
+                kind=root_kind,
+                path=path,
+                reason="bounded root-handoff candidate for setup-dominant ambient semantic-wrapup",
+                recursive=False,
+                known=True,
+            )
+        ],
+        limits=template_plan.limits,
+        scope_resolution={
+            "status": "root_handoff_candidate_scan",
+            "strategy": "recent_neighbor_known_session_file",
+        },
+    )
+    scan = scan_records(candidate_plan, default_tz=default_tz, mask_context=mask_context)
+    candidate_signals = _complaint_signals(scan["records"], query=query)
+    substantive = _substantive_signals(candidate_signals)
+    if not substantive:
+        return None
+    setup_count = len([signal for signal in candidate_signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS])
+    first_signal = substantive[0]
+    source_ref = first_signal.get("source_ref") or {"path": str(path), "line": 1}
+    labels = sorted(
+        {
+            str(label)
+            for signal in substantive
+            for label in (signal.get("labels") or [])
+            if str(label).strip()
+        }
+    )
+    return {
+        "root": str(path),
+        "source_ref": source_ref,
+        "root_kind": root_kind,
+        "rerun_command": _rerun_with_specific_root_command(query, path),
+        "evidence_source_role": "candidate_parent_substantive_user_correction_signal",
+        "why_safer": (
+            "This neighboring session has substantive user complaint/correction signals under the existing "
+            "semantic-wrapup classifier, while the ambient latest session was setup-echo dominant."
+        ),
+        "substantive_signal_count": len(substantive),
+        "setup_echo_signal_count": setup_count,
+        "top_labels": labels[:5],
+        "timestamp_utc": first_signal.get("timestamp_utc"),
+    }
+
+
 def _rerun_with_root_command(query: str) -> str:
     quoted_query = shlex.quote(query)
     return (
         f"jsonl-history-search semantic-wrapup {quoted_query} "
         '--root <path-to-session.jsonl> --cwd "$PWD" --format json'
+    )
+
+
+def _rerun_with_specific_root_command(query: str, root: Path) -> str:
+    quoted_query = shlex.quote(query)
+    quoted_root = shlex.quote(str(root))
+    return (
+        f"jsonl-history-search semantic-wrapup {quoted_query} "
+        f"--root {quoted_root} --cwd \"$PWD\" --format json"
     )
 
 
