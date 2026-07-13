@@ -3253,6 +3253,12 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             ),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
             "expectation_mismatch_plan": packet.get("expectation_mismatch_plan"),
+            "process_actual_use_final_support_read_plan": packet.get(
+                "process_actual_use_final_support_read_plan"
+            ),
+            "process_actual_use_bucket_evidence_bundle": packet.get(
+                "process_actual_use_bucket_evidence_bundle"
+            ),
             "answer_source_discipline_summary": (
                 packet["final_answer_source_use_contract"].get("answer_source_discipline")
             ),
@@ -3451,6 +3457,28 @@ def _answer_action_contract_from_executed_output(
             compact=compact,
             route_family=route_family,
         )
+        process_actual_use_plan = (
+            compact.get("process_actual_use_final_support_read_plan")
+            if route_family == "process_actual_use"
+            and isinstance(compact.get("process_actual_use_final_support_read_plan"), dict)
+            else {}
+        )
+        process_actual_use_required_reads = (
+            list(process_actual_use_plan.get("required_primary_raw_final_support_reads") or [])
+            if process_actual_use_plan
+            else []
+        )
+        process_actual_use_secondary_reads = (
+            list(process_actual_use_plan.get("secondary_leads") or [])
+            if process_actual_use_plan
+            else []
+        )
+        process_actual_use_diagnostic_reads = (
+            list(process_actual_use_plan.get("post_hoc_answer_key_candidates") or [])
+            + list(process_actual_use_plan.get("diagnostic_only_candidates") or [])
+            if process_actual_use_plan
+            else []
+        )
         prefer_named_task_answer = _named_task_clean_answer_surface_wanted(
             query=query,
             route_family=route_family,
@@ -3473,6 +3501,8 @@ def _answer_action_contract_from_executed_output(
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")
             if route_family == "expectation_mismatch" and expectation_mismatch_plan
+            else process_actual_use_required_reads
+            if route_family == "process_actual_use" and process_actual_use_required_reads
             else named_task_action_proof.get("read")
             if named_task_action_proof
             else target_proof_handoff.get("required_primary_proof")
@@ -3527,6 +3557,36 @@ def _answer_action_contract_from_executed_output(
                 "secondary_context_default_final_support": False,
                 "diagnostics_default_final_support": False,
             }
+        elif route_family == "process_actual_use" and process_actual_use_required_reads:
+            answer_status = "answer-ready-after-source-inspection"
+            promotion_status = "semantic_debug_process_actual_use_bucket_proof_ready_after_source_inspection"
+            promotion_reason = (
+                "ask --execute semantic-debug surfaced process actual-use primary raw final-support reads; "
+                "inspect those reads before answering and keep artifact existence, task/review/report diffs, "
+                "prior final prose, and current-run tool output out of final behavior proof."
+            )
+            source_inspection_boundary = {
+                "decision": "answer_after_source_inspection",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "process_actual_use_primary_raw_final_support_reads",
+                "secondary_context_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
+        elif route_family == "process_actual_use":
+            answer_status = "not-ready/needs-more-proof"
+            promotion_status = "semantic_debug_process_actual_use_primary_bucket_proof_missing"
+            promotion_reason = (
+                "Process actual-use answers need primary raw timing or reviewer-enforcement evidence for "
+                "consulted-before-planning and behavior/scope/claim-boundary buckets; secondary artifacts, "
+                "task/report diffs, prior final prose, and same-run tool output are not enough."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_process_actual_use_primary_bucket_proof",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "missing_process_actual_use_primary_raw_final_support_reads",
+                "secondary_context_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
         contract = {
             "answer_status": answer_status,
             "promotion_status": promotion_status,
@@ -3540,9 +3600,17 @@ def _answer_action_contract_from_executed_output(
                 else None
             ),
             "expectation_mismatch_plan": expectation_mismatch_plan if route_family == "expectation_mismatch" else None,
+            "process_actual_use_final_support_read_plan": (
+                process_actual_use_plan if route_family == "process_actual_use" else None
+            ),
             "read": route_first_reads
             or orchestration_reads
             or expectation_mismatch_plan.get("read")
+            or (
+                process_actual_use_secondary_reads + process_actual_use_diagnostic_reads
+                if route_family == "process_actual_use"
+                else []
+            )
             or core_plan.get("read")
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
@@ -3551,6 +3619,8 @@ def _answer_action_contract_from_executed_output(
             "diagnostics_after": (
                 expectation_mismatch_plan.get("diagnostics_after")
                 if route_family == "expectation_mismatch" and expectation_mismatch_plan
+                else process_actual_use_secondary_reads + process_actual_use_diagnostic_reads
+                if route_family == "process_actual_use"
                 else core_plan.get("diagnostics_after")
             )
             or [],
@@ -4390,6 +4460,12 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             ),
             "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
             "expectation_mismatch_plan": compact.get("expectation_mismatch_plan"),
+            "process_actual_use_final_support_read_plan": compact.get(
+                "process_actual_use_final_support_read_plan"
+            ),
+            "process_actual_use_bucket_evidence_bundle": compact.get(
+                "process_actual_use_bucket_evidence_bundle"
+            ),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
@@ -4414,6 +4490,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "bounded_no_evidence",
         "expectation_mismatch",
         "orchestration_provenance",
+        "process_actual_use",
         "provenance",
         "remembered_user_wording",
         "semantic_wrapup",
@@ -4843,6 +4920,20 @@ def _ask_answer_from_execute(
                 expectation_gate,
             )
         answer_opened = list(expectation_gate.get("opened") or answer_opened)
+
+    if route_family == "process_actual_use":
+        process_gate = _process_actual_use_answer_proof_gate(action=action, opened=answer_opened)
+        answer["source_contract"]["process_actual_use_answer_gate"] = (
+            _process_actual_use_gate_public_contract(process_gate)
+        )
+        if process_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(process_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "process actual-use proof buckets missing or only secondary/tool-output/report/task evidence was opened",
+                process_gate,
+            )
+        answer_opened = list(process_gate.get("opened") or answer_opened)
 
     if action_chronology_wanted:
         chronology_gate = _action_chronology_answer_proof_gate(
@@ -7163,6 +7254,135 @@ def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict])
     }
 
 
+def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict]) -> dict:
+    plan = (
+        action.get("process_actual_use_final_support_read_plan")
+        if isinstance(action.get("process_actual_use_final_support_read_plan"), dict)
+        else {}
+    )
+    bundle = (
+        plan.get("process_actual_use_bucket_evidence_bundle")
+        if isinstance(plan.get("process_actual_use_bucket_evidence_bundle"), dict)
+        else {}
+    )
+    summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
+    required_targets = {
+        str(item.get("target") or "")
+        for item in plan.get("required_primary_raw_final_support_reads") or []
+        if isinstance(item, dict) and str(item.get("target") or "").strip()
+    }
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        selection = (
+            ref.get("process_actual_use_selection")
+            if isinstance(ref.get("process_actual_use_selection"), dict)
+            else {}
+        )
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        payload_type = str(metadata.get("payload_type") or "").casefold()
+        target = str(ref.get("target") or item.get("target") or "")
+        source_tier = str(ref.get("actual_use_source_tier") or selection.get("source_tier") or "")
+        chronology_role = str(
+            ref.get("source_chronology_role")
+            or selection.get("source_chronology_role")
+            or selection.get("anti_contamination_role")
+            or ""
+        )
+        selected_buckets = [
+            str(bucket) for bucket in selection.get("selected_buckets") or ref.get("selected_buckets") or []
+        ]
+        final_support_allowed = bool(ref.get("final_support_allowed") or selection.get("final_support_allowed"))
+        reject_reasons: list[str] = []
+        if required_targets and target not in required_targets and str(item.get("target") or "") not in required_targets:
+            reject_reasons.append("not_in_required_primary_raw_final_support_reads")
+        if source_tier != "primary_raw_timing_evidence":
+            reject_reasons.append("not_primary_raw_timing_evidence")
+        if chronology_role and chronology_role != "primary_raw_evidence":
+            reject_reasons.append(f"not_primary_raw_chronology:{chronology_role}")
+        if not final_support_allowed:
+            reject_reasons.append("final_support_not_allowed")
+        if payload_type in {"function_call_output", "custom_tool_call", "function_call"}:
+            reject_reasons.append(f"tool_output_or_call_row:{payload_type}")
+        if not set(selected_buckets).intersection(
+            {"consulted_before_planning", "changed_behavior_scope_or_claim_boundaries"}
+        ):
+            reject_reasons.append("missing_behavior_change_or_before_planning_bucket")
+        if reject_reasons:
+            row = dict(item)
+            row["process_actual_use_reject_reasons"] = reject_reasons
+            rejected.append(row)
+            continue
+        row = dict(item)
+        row["process_actual_use_selected_buckets"] = selected_buckets
+        allowed.append(row)
+
+    covered_buckets = sorted(
+        {
+            bucket
+            for item in allowed
+            for bucket in item.get("process_actual_use_selected_buckets") or []
+            if str(bucket).strip()
+        }
+    )
+    return {
+        "schema_version": 1,
+        "status": "answer_allowed" if allowed else "blocked",
+        "opened": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected": rejected[:_ASK_ANSWER_MAX_REFS],
+        "covered_buckets": covered_buckets,
+        "missing_or_excluded_buckets": list(summary.get("missing_or_excluded_buckets") or []),
+        "secondary_only_buckets": list(summary.get("secondary_only_buckets") or []),
+        "required_primary_raw_final_support_read_count": len(required_targets),
+        "allowed_ref_count": len(allowed),
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            _process_actual_use_rejected_summary_line(item)
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "required_next_proof": (
+            "primary raw timing or reviewer-enforcement evidence for consulted-before-planning "
+            "and behavior/scope/claim-boundary buckets"
+        ),
+    }
+
+
+def _process_actual_use_rejected_summary_line(item: dict) -> str:
+    target = str(item.get("target") or "").strip()
+    reasons = ", ".join(str(reason) for reason in item.get("process_actual_use_reject_reasons") or [])
+    summary = str(item.get("summary") or "").strip()
+    prefix = f"{target}: " if target else ""
+    suffix = f" ({reasons})" if reasons else ""
+    return f"{prefix}{summary}{suffix}"[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+def _process_actual_use_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "covered_buckets": list(gate.get("covered_buckets") or []),
+        "missing_or_excluded_buckets": list(gate.get("missing_or_excluded_buckets") or []),
+        "secondary_only_buckets": list(gate.get("secondary_only_buckets") or []),
+        "required_primary_raw_final_support_read_count": gate.get("required_primary_raw_final_support_read_count"),
+        "allowed_ref_count": gate.get("allowed_ref_count"),
+        "rejected_ref_count": gate.get("rejected_ref_count"),
+        "required_next_proof": gate.get("required_next_proof"),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "process_actual_use_reject_reasons": list(item.get("process_actual_use_reject_reasons") or []),
+                "actual_use_source_tier": (
+                    (item.get("ref") or {}).get("actual_use_source_tier")
+                    if isinstance(item.get("ref"), dict)
+                    else None
+                ),
+            }
+            for item in list(gate.get("rejected") or [])[:_ASK_ANSWER_MAX_REFS]
+        ],
+    }
+
+
 def _expectation_mismatch_gate_public_contract(gate: dict) -> dict:
     return {
         "schema_version": gate.get("schema_version"),
@@ -7858,11 +8078,53 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_semantic_wrapup_corrections_answer(query=query, action=action, opened=opened)
     if route_family == "expectation_mismatch":
         return _compose_expectation_mismatch_answer(opened=opened)
+    if route_family == "process_actual_use":
+        return _compose_process_actual_use_answer(action=action, opened=opened)
     if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
         return _compose_branch_work_episode_answer(query=query, opened=opened)
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
+
+
+def _compose_process_actual_use_answer(*, action: dict, opened: list[dict]) -> str | None:
+    summaries = [str(item.get("summary") or "").strip() for item in opened if item.get("summary")]
+    if not summaries:
+        return None
+    covered = sorted(
+        {
+            bucket
+            for item in opened
+            for bucket in item.get("process_actual_use_selected_buckets") or []
+            if str(bucket).strip()
+        }
+    )
+    plan = (
+        action.get("process_actual_use_final_support_read_plan")
+        if isinstance(action.get("process_actual_use_final_support_read_plan"), dict)
+        else {}
+    )
+    bundle = (
+        plan.get("process_actual_use_bucket_evidence_bundle")
+        if isinstance(plan.get("process_actual_use_bucket_evidence_bundle"), dict)
+        else {}
+    )
+    bundle_summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
+    missing = list(bundle_summary.get("missing_or_excluded_buckets") or [])
+    secondary_only = list(bundle_summary.get("secondary_only_buckets") or [])
+    pieces = [
+        "Primary process actual-use proof covers buckets: "
+        + (", ".join(covered) if covered else "(none)"),
+        "Opened primary refs show: " + _short_join(summaries[:3], limit=620),
+    ]
+    if secondary_only:
+        pieces.append("Secondary-only buckets not counted as behavior proof: " + ", ".join(secondary_only))
+    if missing:
+        pieces.append("Missing or excluded buckets: " + ", ".join(missing))
+    pieces.append(
+        "Boundary: artifact existence/citation, task/review/report diffs, prior final prose, and current-run tool output are not behavior-changing proof."
+    )
+    return " ".join(pieces)
 
 
 def _compose_action_chronology_answer(*, opened: list[dict]) -> str | None:
