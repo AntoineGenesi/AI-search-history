@@ -966,7 +966,9 @@ def _user_message_first_evidence(records, signals: list[dict]) -> dict:
 def _classify_user_message(text: str, signal: dict | None) -> list[str]:
     normalized = _normalize(text)
     classifications: list[str] = []
-    if signal and signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS:
+    if signal and signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS:
+        pass
+    elif signal:
         classifications.append("frustration/correction")
     elif any(marker in normalized for marker in FRICTION_MARKERS):
         classifications.append("frustration/correction")
@@ -1870,6 +1872,9 @@ def _is_current_session_complaint_fix_query(query: str) -> bool:
         for term in (
             "complain",
             "complaint",
+            "correct",
+            "correcting",
+            "correction",
             "failure mode",
             "failure modes",
             "needs fixing",
@@ -2729,7 +2734,7 @@ def _semantic_next_reads(
     orchestration_refs = next_read_refs(orchestration_items)
     evidence_refs = next_read_refs(*[mode.get("evidence", []) for mode in failure_modes], orchestration_items)
 
-    def add_current_session_sources() -> None:
+    def add_current_session_sources(*, required_without_failure_modes: bool = True) -> None:
         for source in (current_session_source_selection or {}).get("selected_sources") or []:
             ref = source.get("source_ref") or {}
             if failure_modes:
@@ -2743,7 +2748,7 @@ def _semantic_next_reads(
                         "leave a named current-session or setup-hardening gap."
                     ),
                 )
-            else:
+            elif required_without_failure_modes:
                 add(
                     ref,
                     (
@@ -2753,6 +2758,17 @@ def _semantic_next_reads(
                     list(source.get("facets") or []),
                     read_role=READ_ROLE_REQUIRED_PRIMARY_PROOF,
                     answer_use_required=True,
+                )
+            else:
+                add(
+                    ref,
+                    "Retained current-session semantic-wrapup smoke/hardening source; diagnostic only while the selected root is setup-only.",
+                    list(source.get("facets") or []),
+                    read_role=READ_ROLE_OPTIONAL_DIAGNOSTIC,
+                    diagnostic_open_policy=(
+                        "Open only after confirming the selected explicit root is setup-only and a named "
+                        "semantic-wrapup hardening/history question remains."
+                    ),
                 )
 
     if failure_modes:
@@ -2782,7 +2798,7 @@ def _semantic_next_reads(
                     "Setup/reviewer prompt echo check only; do not treat as substantive complaint proof."
                 ),
             )
-        add_current_session_sources()
+        add_current_session_sources(required_without_failure_modes=False)
         for ref in evidence_refs:
             add(
                 ref,

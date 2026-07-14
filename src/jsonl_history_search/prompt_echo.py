@@ -94,6 +94,7 @@ GATE_ASSIGNMENT_ROLE_MARKERS = (
     "you are implementer",
     "you are reviewer",
     "you are coordinator",
+    "you are the isolated implementer",
     "you are the implementation/gate worker",
     "you are the implementer worker",
     "you are the implementation worker",
@@ -104,13 +105,17 @@ GATE_ASSIGNMENT_ROLE_MARKERS = (
 
 GATE_ASSIGNMENT_SETUP_MARKERS = (
     "work only in this isolated worktree",
+    "work only in this worktree",
     "you are not alone in the codebase",
     "parent checkout must remain untouched",
+    "do not work in the parent checkout",
+    "do not edit the parent checkout",
     "do not edit product code",
     "tracked files",
     "you may create files only under",
     "implement/run one task only",
     "implement one task only",
+    "implement exactly one task",
     "task: execute",
     "do not review your own work",
     "do not mark the task",
@@ -141,6 +146,8 @@ GATE_ASSIGNMENT_SETUP_MARKERS = (
     "do not run the full bounded gate",
     "leave ready for independent review",
     "run branch-code smokes",
+    "write scratch notes",
+    "update the task progress log",
     "final response must include commit sha",
 )
 
