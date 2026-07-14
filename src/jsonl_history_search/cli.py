@@ -3819,6 +3819,11 @@ def _semantic_debug_readiness_source_plan_gate(
         query=query,
         answer_readiness_summary=answer_readiness_summary,
         answer_ready_handoff=answer_ready_handoff,
+    ) or _broad_workflow_history_prompt_blocks_on_readiness(
+        query=query,
+        route_family=route_family,
+        answer_readiness_summary=answer_readiness_summary,
+        answer_ready_handoff=answer_ready_handoff,
     ):
         readiness_required = list(answer_readiness_summary.get("required_before_answer") or [])
         handoff_required = list(answer_ready_handoff.get("do_not_answer_until") or [])
@@ -3917,6 +3922,41 @@ def _source_followthrough_prompt_blocks_on_readiness(
     return bool(answer_ready_handoff.get("do_not_answer_until"))
 
 
+def _broad_workflow_history_prompt_blocks_on_readiness(
+    *,
+    query: str,
+    route_family: str,
+    answer_readiness_summary: dict,
+    answer_ready_handoff: dict,
+) -> bool:
+    if not _broad_workflow_history_prompt(query=query, route_family=route_family):
+        return False
+    return _semantic_debug_recovery_first_readiness_required(
+        answer_readiness_summary=answer_readiness_summary,
+        answer_ready_handoff=answer_ready_handoff,
+    )
+
+
+def _semantic_debug_recovery_first_readiness_required(
+    *,
+    answer_readiness_summary: dict,
+    answer_ready_handoff: dict,
+) -> bool:
+    readiness_decision = answer_readiness_summary.get("decision")
+    handoff_decision = answer_ready_handoff.get("decision")
+    readiness_status = answer_readiness_summary.get("status")
+    handoff_status = answer_ready_handoff.get("answer_readiness_status")
+    if readiness_decision == "inspect_recovery_reads" or handoff_decision == "inspect_recovery_reads":
+        return True
+    if answer_readiness_summary.get("allowed_answer_scope") == "recovery_first":
+        return True
+    if readiness_status in {"inspect_recovery_first", "needs_recovery_reads"}:
+        return True
+    if handoff_status in {"inspect_recovery_first", "needs_recovery_reads"}:
+        return True
+    return bool(answer_ready_handoff.get("do_not_answer_until"))
+
+
 def _source_followthrough_or_stop_quality_prompt(query: str) -> bool:
     lowered = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
     if not lowered:
@@ -3950,6 +3990,29 @@ def _source_followthrough_or_stop_quality_prompt(query: str) -> bool:
         )
     )
     return source_followthrough or stop_quality
+
+
+def _broad_workflow_history_prompt(*, query: str, route_family: str) -> bool:
+    if route_family != "semantic_debug":
+        return False
+    lowered = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    if not lowered:
+        return False
+    asks_what_happened = "what happened" in lowered or "why did this happen" in lowered
+    broad_span = any(marker in lowered for marker in ("across", "over", "throughout", "history"))
+    workflow_history = any(
+        marker in lowered
+        for marker in (
+            "workflow history",
+            "workflow",
+            "agent failure",
+            "agent failures",
+            "repeated failure",
+            "repeated failures",
+            "repeated agent",
+        )
+    )
+    return asks_what_happened and broad_span and workflow_history
 
 
 def _semantic_debug_readiness_gate_next_reads(
@@ -5152,9 +5215,14 @@ def _ask_answer_from_execute(
             answer["source_contract"]["latest_status_quote_boundary_recovery"] = (
                 _latest_status_quote_boundary_recovery_public(quote_boundary_recovery)
             )
+        fail_reason = f"ask --execute contract is {action.get('answer_status')}"
+        if action.get("promotion_status") == "semantic_debug_readiness_source_plan_gate_fail_closed":
+            fail_reason = "semantic-debug recovery/source readiness gate is not satisfied"
+            if isinstance(action.get("readiness_source_plan_gate"), dict):
+                answer["source_contract"]["readiness_source_plan_gate"] = action["readiness_source_plan_gate"]
         return _ask_answer_fail_closed(
             answer,
-            f"ask --execute contract is {action.get('answer_status')}",
+            fail_reason,
             _next_proof_step_from_action(action),
         )
 
@@ -5495,6 +5563,27 @@ def _ask_answer_from_execute(
                 chronology_gate,
             )
         answer_opened = list(chronology_gate.get("opened") or answer_opened)
+
+    if _broad_workflow_history_prompt(query=str(report.get("query") or ""), route_family=route_family):
+        workflow_gate = _workflow_history_final_proof_gate(
+            query=str(report.get("query") or ""),
+            opened=answer_opened,
+        )
+        answer["source_contract"]["workflow_history_final_proof_gate"] = (
+            _workflow_history_final_proof_gate_public_contract(workflow_gate)
+        )
+        if workflow_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(workflow_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "broad workflow-history proof contained only current-run prompt/tool echo material",
+                {
+                    "workflow_history_final_proof_gate": _workflow_history_final_proof_gate_public_contract(
+                        workflow_gate
+                    )
+                },
+            )
+        answer_opened = list(workflow_gate.get("opened") or answer_opened)
 
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
@@ -8153,6 +8242,105 @@ def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict]) -
             "primary raw timing or reviewer-enforcement evidence for consulted-before-planning "
             "and behavior/scope/claim-boundary buckets"
         ),
+    }
+
+
+def _workflow_history_final_proof_gate(*, query: str, opened: list[dict]) -> dict:
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        reasons = _workflow_history_final_proof_reject_reasons(item, query=query)
+        if reasons:
+            row = dict(item)
+            row["workflow_history_reject_reasons"] = reasons
+            rejected.append(row)
+            continue
+        allowed.append(item)
+    status = "answer_allowed" if allowed else "blocked_current_run_echo_only"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "opened": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected": rejected[:_ASK_ANSWER_MAX_REFS],
+        "allowed_ref_count": len(allowed),
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            _workflow_history_rejected_summary_line(item)
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "required_next_proof": (
+            "clean historical workflow evidence after recovery reads are opened; do not use current-run "
+            "assignment prompts, current command/tool-call rows, or action-proof-looking self material as "
+            "final support for broad workflow-history synthesis"
+        ),
+    }
+
+
+def _workflow_history_final_proof_reject_reasons(item: dict, *, query: str) -> list[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    summary = str(item.get("summary") or "")
+    folded = summary.casefold()
+    reasons: list[str] = []
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    if payload_type in {"function_call", "function_call_output", "custom_tool_call"}:
+        reasons.append(f"current_tool_call_or_output_echo:{payload_type}")
+    if str(ref.get("kind") or "") == "tool_event_source_ref":
+        reasons.append("action_proof_tool_event_self_material")
+    echo = setup_echo_classification(summary, query=query)
+    if echo.get("is_setup_echo") is True:
+        reasons.append(f"assignment_or_review_prompt_echo:{echo.get('reason') or 'setup_echo'}")
+    if _workflow_history_current_command_echo(summary, query=query):
+        reasons.append("current_command_invocation_echo")
+    if ref.get("diagnostic_only") is True or ref.get("target_source_role") == "diagnostic_or_post_hoc":
+        reasons.append("diagnostic_or_post_hoc_not_final_support")
+    if ref.get("final_support_allowed") is False:
+        reasons.append("final_support_not_allowed")
+    if any(marker in folded for marker in ("current-run diagnostic", "same-loop recap", "current ask --execute")):
+        reasons.append("current_run_self_echo")
+    return _unique_preserving_order(reasons)
+
+
+def _workflow_history_current_command_echo(summary: str, *, query: str) -> bool:
+    folded = str(summary or "").casefold()
+    normalized_query = " ".join(str(query or "").casefold().split())
+    command_marker = any(
+        marker in folded
+        for marker in (
+            "ask --answer",
+            "jsonl_history_search.cli ask",
+            "jsonl-history-search ask",
+            "python3 -m jsonl_history_search.cli",
+            "pythonpath=src",
+        )
+    )
+    query_echo = bool(normalized_query and normalized_query in " ".join(folded.split()))
+    return command_marker and query_echo
+
+
+def _workflow_history_rejected_summary_line(item: dict) -> str:
+    target = str(item.get("target") or "").strip()
+    reasons = ", ".join(str(reason) for reason in item.get("workflow_history_reject_reasons") or [])
+    prefix = f"{target}: " if target else ""
+    return f"{prefix}rejected_broad_workflow_history_final_support={reasons}"[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+def _workflow_history_final_proof_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "allowed_ref_count": gate.get("allowed_ref_count"),
+        "rejected_ref_count": gate.get("rejected_ref_count"),
+        "required_next_proof": gate.get("required_next_proof"),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "workflow_history_reject_reasons": list(item.get("workflow_history_reject_reasons") or []),
+            }
+            for item in list(gate.get("rejected") or [])[:_ASK_ANSWER_MAX_REFS]
+        ],
     }
 
 
