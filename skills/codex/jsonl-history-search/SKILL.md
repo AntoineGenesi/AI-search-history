@@ -141,6 +141,11 @@ Command-shape contract for the first two shell commands:
   you need route-only output.
 - Repo inventory belongs only after `ask` selects a route or a source
   follow-through genuinely needs it.
+- For exact source inspection, copy the route's source ref into
+  `jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text`.
+  Do not invent `read-more --context`; use `--mode window --before/--after`.
+- For focused candidate search, use `jsonl-history-search find "<query>" --max-matches 20 --cwd "$PWD" --format text`.
+  Do not invent `find --max-results`; the JSONL cap flag is `--max-matches`.
 
 Use `ask` first for prompts like "did the agent overwrite those edits?", "what
 happened while I was away?", "why did I mention the router skill?", "which TODO
