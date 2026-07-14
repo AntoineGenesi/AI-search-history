@@ -95,6 +95,7 @@ GATE_ASSIGNMENT_ROLE_MARKERS = (
     "you are reviewer",
     "you are coordinator",
     "you are the isolated implementer",
+    "use the reviewer skill",
     "you are the implementation/gate worker",
     "you are the implementer worker",
     "you are the implementation worker",
@@ -111,6 +112,8 @@ GATE_ASSIGNMENT_SETUP_MARKERS = (
     "do not work in the parent checkout",
     "do not edit the parent checkout",
     "do not edit product code",
+    "do not modify product code",
+    "review only",
     "tracked files",
     "you may create files only under",
     "implement/run one task only",
@@ -149,6 +152,8 @@ GATE_ASSIGNMENT_SETUP_MARKERS = (
     "write scratch notes",
     "update the task progress log",
     "final response must include commit sha",
+    "write an independent review artifact",
+    "scope to check",
 )
 
 GATE_ASSIGNMENT_INTENT_MARKERS = (
