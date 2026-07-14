@@ -63,6 +63,8 @@ IGNORED_BEHAVIOR_DISCOVERY_DIRS = {
 PLUGIN_IGNORED_BEHAVIOR_DISCOVERY_DIRS = {".archive", ".tmp", "archive", "archives", "temp", "tmp"}
 
 SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
+SESSION_METADATA_SIGNAL_KINDS = {"environment_context_metadata", "world_state_metadata"}
+NON_SUBSTANTIVE_SIGNAL_KINDS = SETUP_SIGNAL_KINDS | SESSION_METADATA_SIGNAL_KINDS
 READ_ROLE_REQUIRED_PRIMARY_PROOF = "required_primary_proof"
 READ_ROLE_OPTIONAL_DIAGNOSTIC = "optional_diagnostic"
 READ_ROLE_CONDITIONAL_REQUIRED = "conditional_required"
@@ -575,6 +577,9 @@ def build_semantic_wrapup_payload(
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
+    session_metadata_signals = [
+        signal for signal in signals if signal.get("scope_signal_kind") in SESSION_METADATA_SIGNAL_KINDS
+    ]
     selected_substantive_signals = _current_session_recent_substantive_signals(
         plan,
         substantive_signals,
@@ -634,7 +639,8 @@ def build_semantic_wrapup_payload(
         rolling_window_coverage,
         setup_echo_signals=setup_echo_signals,
         prefer_setup_signal_refs=bool(explicit_root_setup_echo_scope),
-        allow_current_session_sources_without_failure_modes=not _latest_session_fail_closed(fail_closed_scope),
+        allow_current_session_sources_without_failure_modes=not _latest_session_fail_closed(fail_closed_scope)
+        and not _non_substantive_only_signal_scope(signals),
     )
     read_role_summary = _semantic_read_role_summary(next_reads)
     answer_ready_contract = _answer_ready_contract(
@@ -670,6 +676,7 @@ def build_semantic_wrapup_payload(
                 "substantive_signal_count": len(substantive_signals),
                 "selected_substantive_signal_count": len(selected_substantive_signals),
                 "setup_echo_signal_count": len(setup_echo_signals),
+                "session_metadata_signal_count": len(session_metadata_signals),
                 "failure_mode_count": len(failure_modes),
                 "failure_mode_returned_count": len(failure_modes),
                 "failure_mode_total_count": len(all_failure_modes),
@@ -703,10 +710,13 @@ def build_semantic_wrapup_payload(
                 "selected_substantive_signal_count": len(selected_substantive_signals),
                 "user_message_first_cluster_promoted_signal_count": cluster_promotion["synthetic_signal_count"],
                 "setup_echo_signal_count": len(setup_echo_signals),
+                "session_metadata_signal_count": len(session_metadata_signals),
                 "substantive_source_refs": [signal["source_ref"] for signal in substantive_signals[:8]],
                 "selected_substantive_source_refs": [signal["source_ref"] for signal in selected_substantive_signals[:8]],
                 "setup_echo_source_refs": [signal["source_ref"] for signal in setup_echo_signals[:8]],
+                "session_metadata_source_refs": [signal["source_ref"] for signal in session_metadata_signals[:8]],
                 "failure_modes_exclude_setup_echoes": True,
+                "failure_modes_exclude_session_metadata": True,
                 "latest_session_recent_signal_filter": _latest_session_recent_signal_filter_summary(
                     plan,
                     substantive_signals,
@@ -966,7 +976,9 @@ def _user_message_first_evidence(records, signals: list[dict]) -> dict:
 def _classify_user_message(text: str, signal: dict | None) -> list[str]:
     normalized = _normalize(text)
     classifications: list[str] = []
-    if signal and signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS:
+    if _is_session_metadata_context(normalized):
+        classifications.append("non_complaint_context")
+    elif signal and signal.get("scope_signal_kind") in NON_SUBSTANTIVE_SIGNAL_KINDS:
         pass
     elif signal:
         classifications.append("frustration/correction")
@@ -1537,6 +1549,12 @@ def _explicit_root_setup_echo_only_scope(plan: SourcePlan, signals: list[dict], 
             "echoes, or rerun semantic-wrapup with the parent/user session JSONL."
         ),
     }
+
+
+def _non_substantive_only_signal_scope(signals: list[dict]) -> bool:
+    return bool(signals) and all(
+        signal.get("scope_signal_kind") in NON_SUBSTANTIVE_SIGNAL_KINDS for signal in signals
+    )
 
 
 def _root_handoff_contract(
@@ -2270,7 +2288,7 @@ def _is_dirty_worktree_hygiene_signal(text: str) -> bool:
 
 
 def _substantive_signals(signals: list[dict]) -> list[dict]:
-    return [signal for signal in signals if signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS]
+    return [signal for signal in signals if signal.get("scope_signal_kind") not in NON_SUBSTANTIVE_SIGNAL_KINDS]
 
 
 def _current_session_recent_substantive_signals(
@@ -2422,7 +2440,7 @@ def _select_orchestration_items(ranked: list[dict], *, limit: int) -> list[dict]
 def _orchestration_categories(text: str, *, role: str | None, query: str, signal: dict | None) -> list[str]:
     normalized = _normalize(text)
     categories: list[str] = []
-    if signal and signal.get("scope_signal_kind") not in SETUP_SIGNAL_KINDS:
+    if signal and signal.get("scope_signal_kind") not in NON_SUBSTANTIVE_SIGNAL_KINDS:
         categories.append("user_complaint_or_correction")
     if _looks_like_semantic_wrapup_prompt(normalized, query):
         categories.append("semantic_wrapup_prompt_echo")
@@ -2501,6 +2519,10 @@ def _count_values(items: list[dict], key: str) -> dict[str, int]:
 
 
 def _scope_signal_kind(normalized_text: str, query: str) -> str:
+    if _is_environment_context_metadata(normalized_text):
+        return "environment_context_metadata"
+    if _is_world_state_metadata(normalized_text):
+        return "world_state_metadata"
     if _looks_like_semantic_wrapup_prompt(normalized_text, query):
         return "semantic_wrapup_prompt"
     echo = setup_echo_classification(normalized_text, query=query)
@@ -2543,6 +2565,28 @@ def _looks_like_semantic_wrapup_prompt(normalized_text: str, query: str) -> bool
     )
     query_embedded = normalized_query and normalized_query in normalized_text
     return semantic_wrapup_marker and current_session_prompt and (lane_prompt_marker or query_embedded)
+
+
+def _is_session_metadata_context(normalized_text: str) -> bool:
+    return _is_environment_context_metadata(normalized_text) or _is_world_state_metadata(normalized_text)
+
+
+def _is_environment_context_metadata(normalized_text: str) -> bool:
+    return (
+        normalized_text.startswith("<environment_context>")
+        and "</environment_context>" in normalized_text
+        and "<cwd>" in normalized_text
+        and "<shell>" in normalized_text
+        and "<filesystem>" in normalized_text
+    )
+
+
+def _is_world_state_metadata(normalized_text: str) -> bool:
+    return (
+        normalized_text.startswith('{"full": true, "state":')
+        and '"environments"' in normalized_text
+        and '"filesystem"' in normalized_text
+    )
 
 
 def _failure_modes(signals: list[dict]) -> list[dict]:
