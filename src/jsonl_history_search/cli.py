@@ -5520,6 +5520,27 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(process_gate.get("opened") or answer_opened)
 
+    if _named_task_repair_causality_answer_wanted(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+    ):
+        repair_gate = _named_task_repair_causality_final_proof_gate(
+            query=str(report.get("query") or ""),
+            opened=answer_opened,
+            work_episode=work_episode,
+        )
+        answer["source_contract"]["named_task_repair_causality_answer_gate"] = (
+            _named_task_repair_causality_gate_public_contract(repair_gate)
+        )
+        if repair_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(repair_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "same-task repair/review proof missing; current-run command/task/output echoes are not final support",
+                repair_gate,
+            )
+        answer_opened = list(repair_gate.get("opened") or answer_opened)
+
     if post_merge_smoke_wanted:
         smoke_gate = _post_merge_smoke_answer_proof_gate(opened=answer_opened)
         answer["source_contract"]["post_merge_smoke_answer_gate"] = (
@@ -5631,6 +5652,9 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
     if route_family == "expectation_mismatch":
         return _expectation_mismatch_source_role_explanation(next_step)
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        repair_explanation = _named_task_repair_causality_source_role_explanation(next_step)
+        if repair_explanation:
+            return repair_explanation
         smoke_explanation = _post_merge_smoke_source_role_explanation(next_step)
         if smoke_explanation:
             return smoke_explanation
@@ -7500,6 +7524,136 @@ def _post_merge_smoke_source_role_explanation(next_step: object) -> dict | None:
         "why_not_final_proof": (
             "Stop/closeout chronology, merge/status proof, and generic task summaries can establish adjacent workflow "
             "state, but they do not prove that post-merge smoke commands actually ran."
+        ),
+    }
+
+
+def _named_task_repair_causality_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    if not re.search(r"\b[A-Z][A-Z0-9]+-\d+\b", query, flags=re.IGNORECASE):
+        return False
+    causal_shape = any(marker in normalized for marker in ("why", "because", "need", "needed"))
+    review_shape = any(marker in normalized for marker in ("review", "reviewer", "rereview", "re-review"))
+    repair_shape = any(marker in normalized for marker in ("repair", "repairs", "fixed review", "changes requested"))
+    return causal_shape and review_shape and repair_shape
+
+
+def _named_task_repair_causality_final_proof_gate(
+    *,
+    query: str,
+    opened: list[dict],
+    work_episode: dict,
+) -> dict:
+    if not _named_task_repair_causality_answer_wanted(query=query, route_family="semantic_debug"):
+        return {"schema_version": 1, "status": "not_applicable", "opened": opened}
+    if work_episode.get("status") == "primary_proof_refs_available":
+        return {
+            "schema_version": 1,
+            "status": "answer_allowed",
+            "opened": opened[:_ASK_ANSWER_MAX_REFS],
+            "required_roles": [
+                "same_task_review_failure_evidence",
+                "same_task_repair_implementation_or_test_evidence",
+            ],
+            "missing_roles": [],
+            "rejected_ref_count": 0,
+        }
+
+    rejected = []
+    for item in opened:
+        reasons = _named_task_repair_causality_reject_reasons(item, query=query)
+        public = _ref_public_summary(item)
+        public["repair_causality_reject_reasons"] = reasons
+        rejected.append(public)
+
+    return {
+        "schema_version": 1,
+        "status": "missing_same_task_repair_review_proof",
+        "work_episode_status": work_episode.get("status"),
+        "required_roles": [
+            "same_task_review_failure_evidence",
+            "same_task_repair_implementation_or_test_evidence",
+        ],
+        "missing_roles": [
+            "same_task_review_failure_evidence",
+            "same_task_repair_implementation_or_test_evidence",
+        ],
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            "Opened refs were not promoted because the work-episode resolver found no same-task primary "
+            "proof; current command/task/output echoes can remain diagnostic but are not final support."
+        ],
+        "required_next_proof": (
+            "Open same-task review failure evidence plus same-task repair implementation/test proof for the named "
+            "task before answering why review repairs were needed."
+        ),
+        "acceptable_evidence": [
+            "same-task independent review artifact describing the failed review finding",
+            "same-task implementer fix record, diff, or command/test output addressing that finding",
+            "same-task final verified review or post-fix proof that links the repair to the finding",
+        ],
+    }
+
+
+def _named_task_repair_causality_reject_reasons(item: dict, *, query: str) -> list[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    summary = str(item.get("summary") or "")
+    reasons: list[str] = []
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    if payload_type in {"function_call", "function_call_output", "custom_tool_call"}:
+        reasons.append(f"current_tool_call_or_output_echo:{payload_type}")
+    if _workflow_history_current_command_echo(summary, query=query):
+        reasons.append("current_command_invocation_echo")
+    echo = setup_echo_classification(summary, query=query)
+    if echo.get("is_setup_echo") is True:
+        reasons.append(f"assignment_or_review_prompt_echo:{echo.get('reason') or 'setup_echo'}")
+    if ref.get("diagnostic_only") is True or ref.get("target_source_role") == "diagnostic_or_post_hoc":
+        reasons.append("diagnostic_or_post_hoc_not_final_support")
+    if ref.get("final_support_allowed") is False:
+        reasons.append("final_support_not_allowed")
+    if not reasons:
+        reasons.append("no_same_task_work_episode_primary_proof")
+    return _unique_preserving_order(reasons)
+
+
+def _named_task_repair_causality_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "work_episode_status": gate.get("work_episode_status"),
+        "required_roles": list(gate.get("required_roles") or []),
+        "missing_roles": list(gate.get("missing_roles") or []),
+        "rejected_ref_count": gate.get("rejected_ref_count"),
+        "required_next_proof": gate.get("required_next_proof"),
+        "acceptable_evidence": list(gate.get("acceptable_evidence") or []),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "repair_causality_reject_reasons": list(item.get("repair_causality_reject_reasons") or []),
+            }
+            for item in list(gate.get("rejected_refs") or [])[:_ASK_ANSWER_MAX_REFS]
+        ],
+    }
+
+
+def _named_task_repair_causality_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict) or next_step.get("status") != "missing_same_task_repair_review_proof":
+        return None
+    return {
+        "schema_version": 1,
+        "kind": "named_task_repair_causality_same_task_proof_required",
+        "summary_lines": list(next_step.get("summary_lines") or [])[:_ASK_ANSWER_MAX_REFS],
+        "required_final_proof": next_step.get("required_next_proof"),
+        "required_roles": list(next_step.get("required_roles") or []),
+        "missing_roles": list(next_step.get("missing_roles") or []),
+        "acceptable_evidence": list(next_step.get("acceptable_evidence") or []),
+        "why_not_final_proof": (
+            "A current command, assignment prompt, task output, or same-loop report can diagnose why the search failed, "
+            "but it does not prove the historical same-task review failures or repairs."
         ),
     }
 
