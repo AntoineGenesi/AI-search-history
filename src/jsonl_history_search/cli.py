@@ -5638,6 +5638,28 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(workflow_gate.get("opened") or answer_opened)
 
+    current_run_gate = _current_run_final_support_gate(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        opened=answer_opened,
+    )
+    if current_run_gate.get("applies"):
+        answer["source_contract"]["current_run_final_support_gate"] = (
+            _current_run_final_support_gate_public_contract(current_run_gate)
+        )
+        if current_run_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(current_run_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "current-run/control proof cannot support this historical answer without primary historical evidence",
+                {
+                    "current_run_final_support_gate": _current_run_final_support_gate_public_contract(
+                        current_run_gate
+                    )
+                },
+            )
+        answer_opened = list(current_run_gate.get("opened") or answer_opened)
+
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
 
@@ -8543,6 +8565,212 @@ def _workflow_history_rejected_summary_line(item: dict) -> str:
     reasons = ", ".join(str(reason) for reason in item.get("workflow_history_reject_reasons") or [])
     prefix = f"{target}: " if target else ""
     return f"{prefix}rejected_broad_workflow_history_final_support={reasons}"[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+CURRENT_RUN_FINAL_SUPPORT_ROUTE_FAMILIES = frozenset(
+    {
+        "latest_status",
+        "semantic_debug",
+        "expectation_mismatch",
+        "remembered_user_wording",
+        "remembered_topic",
+        "semantic_wrapup",
+        "action_proof",
+        "provenance",
+        "orchestration_provenance",
+    }
+)
+
+
+def _current_run_final_support_gate(*, query: str, route_family: str, opened: list[dict]) -> dict:
+    if route_family not in CURRENT_RUN_FINAL_SUPPORT_ROUTE_FAMILIES:
+        return {"schema_version": 1, "applies": False, "status": "not_applicable"}
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        reasons = _current_run_final_support_reject_reasons(item, query=query)
+        if reasons:
+            row = dict(item)
+            row["current_run_final_support_reject_reasons"] = reasons
+            rejected.append(row)
+            continue
+        allowed.append(item)
+    if allowed:
+        status = "answer_allowed"
+    elif rejected:
+        status = "blocked_current_run_control_only"
+    else:
+        status = "blocked_no_opened_final_support"
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "route_family": route_family,
+        "status": status,
+        "opened": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected": rejected[:_ASK_ANSWER_MAX_REFS],
+        "allowed_ref_count": len(allowed),
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            _current_run_rejected_summary_line(item)
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "required_next_proof": (
+            "primary historical/user/task/review/commit evidence for the requested episode; "
+            "current-run assignment, control, probe, generated-report, and tool-output refs are diagnostics only"
+        ),
+    }
+
+
+def _current_run_final_support_reject_reasons(item: dict, *, query: str) -> list[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    summary = str(item.get("summary") or "")
+    text = _current_run_final_support_text(item)
+    folded = re.sub(r"\s+", " ", text.casefold().replace("_", " ")).strip()
+    reasons: list[str] = []
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    has_current_markers = _current_run_ref_markers_present(folded)
+    has_query_or_command_echo = _current_run_query_or_command_echo(folded, query=query)
+    if (
+        payload_type in {"function_call", "function_call_output", "custom_tool_call"}
+        and (has_current_markers or has_query_or_command_echo)
+    ):
+        reasons.append(f"current_tool_call_or_output_echo:{payload_type}")
+    echo = setup_echo_classification(summary, query=query)
+    if echo.get("is_setup_echo") is True:
+        reasons.append(f"assignment_or_control_prompt_echo:{echo.get('reason') or 'setup_echo'}")
+    if has_current_markers:
+        reasons.append("current_run_control_or_generated_artifact")
+    if has_query_or_command_echo:
+        reasons.append("current_query_or_command_echo")
+    if ref.get("diagnostic_only") is True or ref.get("target_source_role") == "diagnostic_or_post_hoc":
+        reasons.append("diagnostic_or_post_hoc_not_final_support")
+    if ref.get("final_support_allowed") is False:
+        reasons.append("final_support_not_allowed")
+    return _unique_preserving_order(reasons)
+
+
+def _current_run_final_support_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    return " ".join(
+        str(value or "")
+        for value in (
+            item.get("target"),
+            item.get("path"),
+            item.get("summary"),
+            item.get("reason"),
+            ref.get("kind"),
+            ref.get("target"),
+            ref.get("path"),
+            ref.get("openable_target"),
+            ref.get("reason"),
+            ref.get("target_source_role"),
+            ref.get("source_tier"),
+            ref.get("read_role"),
+            ref.get("proof_surface"),
+            source_ref.get("path"),
+            metadata.get("payload_type"),
+            metadata.get("top_role"),
+            metadata.get("message_role"),
+        )
+    )
+
+
+def _current_run_ref_markers_present(folded: str) -> bool:
+    markers = (
+        "/sessions/current/",
+        "/current/",
+        "/current run/",
+        "/current-run/",
+        "/current task/",
+        "/current-task/",
+        "/same-loop/",
+        "/same loop/",
+        "/same-run/",
+        "/same run/",
+        "/same-lane/",
+        "/same lane/",
+        "/slice-a/",
+        "/slice-b/",
+        "/slice-c/",
+        "/slice-d/",
+        "current-run",
+        "current run",
+        "same-loop",
+        "same loop",
+        "same-run",
+        "same run",
+        "same-lane",
+        "same lane",
+        "control prompt",
+        "current prompt",
+        "current assignment",
+        "assignment prompt",
+        "read-only slice",
+        "pressure agent",
+        "run live cli",
+        "run live current-master",
+        "save artifacts",
+        "generated report",
+        "current generated report",
+        "tool output window",
+        "semantic-debug output",
+        "semantic debug output",
+        "source locator handoff",
+        "answer ready handoff",
+        "original token count",
+        "process exited with code",
+    )
+    return any(marker in folded for marker in markers)
+
+
+def _current_run_query_or_command_echo(folded: str, *, query: str) -> bool:
+    normalized_query = re.sub(r"\s+", " ", str(query or "").casefold().replace("_", " ")).strip()
+    query_echo = bool(normalized_query and normalized_query in folded)
+    command_marker = any(
+        marker in folded
+        for marker in (
+            "jsonl-history-search",
+            "jsonl history search",
+            "python3 -m jsonl_history_search",
+            "ask --answer",
+            "ask --execute",
+            "semantic-debug",
+            "semantic wrapup",
+            "semantic-wrapup",
+            "what-happened-since",
+        )
+    )
+    return query_echo and (command_marker or "prompt:" in folded or "selected prompt" in folded)
+
+
+def _current_run_rejected_summary_line(item: dict) -> str:
+    target = str(item.get("target") or "").strip()
+    reasons = ", ".join(str(reason) for reason in item.get("current_run_final_support_reject_reasons") or [])
+    prefix = f"{target}: " if target else ""
+    return f"{prefix}rejected_current_run_final_support={reasons}"[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+def _current_run_final_support_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "route_family": gate.get("route_family"),
+        "allowed_ref_count": gate.get("allowed_ref_count", 0),
+        "rejected_ref_count": gate.get("rejected_ref_count", 0),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "reject_reasons": list(item.get("current_run_final_support_reject_reasons") or []),
+            }
+            for item in gate.get("rejected", [])[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "required_next_proof": gate.get("required_next_proof"),
+    }
 
 
 def _workflow_history_final_proof_gate_public_contract(gate: dict) -> dict:
