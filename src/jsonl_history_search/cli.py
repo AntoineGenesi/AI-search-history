@@ -7376,11 +7376,13 @@ def _post_merge_smoke_answer_proof_gate(*, opened: list[dict]) -> dict:
 
 def _post_merge_smoke_opened_source_role(item: dict) -> dict:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    target = str(item.get("target") or "")
+    path = str(item.get("path") or "")
     text = " ".join(
         str(value)
         for value in (
             item.get("summary"),
-            item.get("target"),
+            target,
             ref.get("reason"),
             ref.get("proof_surface"),
             ref.get("proof_role"),
@@ -7415,15 +7417,40 @@ def _post_merge_smoke_opened_source_role(item: dict) -> dict:
         str(ref.get("target_source_role") or "") == "target_historical_raw"
         or str(ref.get("proof_role") or "") in {"command_or_tool_call", "command_or_tool_output"}
         or str(ref.get("kind") or "") == "jsonl_source_ref"
-        or str(item.get("path") or "").endswith(".jsonl")
+        or path.endswith(".jsonl")
     )
-    reviewed_surface = str(ref.get("proof_surface") or "") in {"review_artifact", "task_file"} or str(
-        item.get("path") or ""
-    ).endswith(".md")
-    if has_post_merge and has_smoke and has_command_or_result and (direct_surface or reviewed_surface):
+    review_artifact_surface = (
+        str(ref.get("proof_surface") or "") == "review_artifact"
+        or "/codex/state/reviews/" in target
+        or target.startswith("codex/state/reviews/")
+        or "/codex/state/reviews/" in path
+        or path.startswith("codex/state/reviews/")
+    )
+    verifies_post_merge_smokes = any(
+        marker in text
+        for marker in (
+            "verified post-merge",
+            "post-merge verified",
+            "post-merge checks passed",
+            "post-merge pressure passed",
+            "post-merge smokes passed",
+            "post-merge smoke passed",
+            "post-merge installed validation and smokes passed",
+            "post-merge verification passed",
+        )
+    )
+    independent_review_surface = review_artifact_surface and verifies_post_merge_smokes
+    if has_post_merge and has_smoke and has_command_or_result and (direct_surface or independent_review_surface):
         reasons = ["post_merge_smoke_terms", "command_or_result_terms"]
-        reasons.append("raw_tool_or_jsonl" if direct_surface else "reviewed_artifact")
+        reasons.append("raw_tool_or_jsonl" if direct_surface else "independent_review_artifact")
         return {"source_role": "direct_post_merge_smoke_proof", "reasons": reasons}
+    task_file_surface = (
+        str(ref.get("proof_surface") or "") == "task_file"
+        or "/tasks/" in target
+        or target.startswith("tasks/")
+        or "/tasks/" in path
+        or path.startswith("tasks/")
+    )
     return {
         "source_role": "not_direct_post_merge_smoke_proof",
         "reasons": [
@@ -7432,7 +7459,12 @@ def _post_merge_smoke_opened_source_role(item: dict) -> dict:
                 ("missing_post_merge_terms", not has_post_merge),
                 ("missing_smoke_terms", not has_smoke),
                 ("missing_command_or_result_terms", not has_command_or_result),
-                ("unsupported_source_surface", not (direct_surface or reviewed_surface)),
+                ("task_closeout_not_direct_smoke_proof", task_file_surface and not direct_surface),
+                (
+                    "review_artifact_missing_explicit_post_merge_smoke_verification",
+                    review_artifact_surface and not verifies_post_merge_smokes,
+                ),
+                ("unsupported_source_surface", not (direct_surface or review_artifact_surface or task_file_surface)),
             )
             if present
         ],
