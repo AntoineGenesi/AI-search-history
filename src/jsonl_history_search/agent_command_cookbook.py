@@ -75,8 +75,11 @@ def agent_question_cookbook() -> list[dict[str, str]]:
             "id": "read_more",
             "question_family": "Read the exact source evidence returned by a route.",
             "route": "read-more",
-            "first_command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
-            "inspect_next": "the concrete path:line source ref named by source_locator_handoff, next_reads, or follow_through_plan",
+            "first_command": 'jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text',
+            "inspect_next": (
+                "the concrete path:line source ref named by source_locator_handoff, next_reads, or follow_through_plan; "
+                "use --mode window --before/--after for surrounding context, not a --context flag"
+            ),
         },
     ]
 
@@ -148,7 +151,10 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
         commands.append(
             {
                 "purpose": "open required semantic-wrapup proof ref only",
-                "command": 'jsonl-history-search read-more <required_primary_proof source-ref> --cwd "$PWD" --format text',
+                "command": (
+                    'jsonl-history-search read-more <required_primary_proof source-ref> '
+                    '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+                ),
                 "inspect_next": (
                     "replace the placeholder only with a next_reads item where read_role is required_primary_proof; "
                     "optional_diagnostic and conditional_required refs are not default follow-through"
@@ -159,10 +165,14 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
         commands.append(
             {
                 "purpose": "open exact source ref returned by the route",
-                "command": 'jsonl-history-search read-more <source-ref> --cwd "$PWD" --format text',
+                "command": (
+                    'jsonl-history-search read-more <source-ref> '
+                    '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+                ),
                 "inspect_next": (
                     "replace <source-ref> with a concrete primary raw/session/tool path:line from the "
-                    "preceding route output before relying on task/review/report/commit artifacts"
+                    "preceding route output before relying on task/review/report/commit artifacts; "
+                    "for context use --mode window --before/--after, not --context"
                 ),
             }
         )

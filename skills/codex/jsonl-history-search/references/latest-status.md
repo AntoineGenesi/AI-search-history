@@ -44,8 +44,11 @@ status packet if the selected anchor needs manual inspection.
      follow-up evidence or rejected alternatives, not as the main-thread
      boundary.
 3. Follow `history.jsonl` session IDs into `sessions/**/*.jsonl`, then inspect
-   the raw source refs/read-more commands before answering. Treat
-   `source_tiers.required_primary` as the must-open first set.
+   the raw source refs/read-more commands before answering. Copy the exact
+   source ref into
+   `jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text`;
+   do not guess `read-more --context`. Treat `source_tiers.required_primary`
+   as the must-open first set.
 4. Reconstruct the long window from raw JSONL first:
    - conversation actions;
    - tool calls;

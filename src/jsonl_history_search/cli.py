@@ -196,6 +196,29 @@ Internal command groups:
 """
 
 
+def _command_shape_guidance(argv: list[str]) -> str | None:
+    if not argv:
+        return None
+    command = argv[0]
+    if command == "find" and "--max-results" in argv:
+        return "\n".join(
+            [
+                "Invalid JSONL command shape: `find` does not accept `--max-results`.",
+                "Use `--max-matches` instead.",
+                'Example: jsonl-history-search find "<query>" --max-matches 20 --cwd "$PWD" --format text',
+            ]
+        )
+    if command == "read-more" and "--context" in argv:
+        return "\n".join(
+            [
+                "Invalid JSONL command shape: `read-more` does not accept `--context`.",
+                "Use a bounded window read with `--mode window --before N --after N`.",
+                'Example: jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text',
+            ]
+        )
+    return None
+
+
 def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jsonl-history-search",
@@ -10859,6 +10882,11 @@ def main(argv: list[str] | None = None) -> int:
     if effective_argv == ["--help-internal"]:
         print(build_parser(public_help=False).format_help())
         return 0
+
+    command_shape_guidance = _command_shape_guidance(effective_argv)
+    if command_shape_guidance:
+        print(command_shape_guidance, file=sys.stderr)
+        return 2
 
     args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
