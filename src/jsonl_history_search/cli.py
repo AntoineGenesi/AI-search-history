@@ -3486,6 +3486,7 @@ def _answer_action_contract_from_executed_output(
         target_proof_handoff = _semantic_debug_target_proof_handoff(
             compact=compact,
             route_family=route_family,
+            query=query,
         )
         process_actual_use_plan = (
             compact.get("process_actual_use_final_support_read_plan")
@@ -3595,7 +3596,7 @@ def _answer_action_contract_from_executed_output(
                 "required_primary_proof_source": "missing_current_named_task_review_commit_refs",
                 "diagnostics_default_final_support": False,
             }
-        elif target_proof_handoff:
+        elif target_proof_handoff.get("status") == "target_primary_proof_refs_available":
             answer_status = "answer-ready-after-source-inspection"
             promotion_status = "semantic_debug_target_proof_ready_after_source_inspection"
             promotion_reason = (
@@ -3607,6 +3608,22 @@ def _answer_action_contract_from_executed_output(
                 "decision": "answer_after_source_inspection",
                 "inspect_required_primary_proof_before_answer": True,
                 "required_primary_proof_source": "target_historical_raw_refs",
+                "secondary_context_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
+        elif target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch":
+            answer_status = "not-ready/target-source-role-mismatch"
+            promotion_status = "semantic_debug_target_episode_source_role_gate_fail_closed"
+            promotion_reason = (
+                "ask --execute semantic-debug found raw/source refs, but they did not match the named "
+                "target episode/entity requested by the query. Keep them as diagnostics and recover "
+                "same-target primary proof before answering."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_same_target_primary_proof",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "same_target_historical_raw_refs",
+                "missing_target_episode_ids": target_proof_handoff.get("required_target_ids") or [],
                 "secondary_context_default_final_support": False,
                 "diagnostics_default_final_support": False,
             }
@@ -3699,6 +3716,8 @@ def _answer_action_contract_from_executed_output(
             contract["source_inspection_boundary"] = source_inspection_boundary
         if target_proof_handoff:
             contract["target_proof_handoff"] = target_proof_handoff
+            if target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch":
+                contract["read"] = target_proof_handoff.get("read") or []
             contract["diagnostics_after"] = (
                 target_proof_handoff.get("secondary_context_after_source_inspection")
                 or []
@@ -4073,7 +4092,7 @@ _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES = frozenset(
 )
 
 
-def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str) -> dict:
+def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, query: str = "") -> dict:
     if route_family not in _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES:
         return {}
     core_plan = compact.get("core_convo_first_read_plan") or {}
@@ -4088,6 +4107,51 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str) ->
     ]
     if not primary_raw:
         return {}
+    target_gate = _target_episode_refs_gate(
+        query=query,
+        route_family=route_family,
+        refs=primary_raw,
+        required_source_role="target_historical_raw",
+    )
+    if target_gate.get("applies") and target_gate.get("status") != "answer_allowed":
+        return {
+            "schema_version": 1,
+            "status": "target_primary_proof_refs_mismatch",
+            "route_family": route_family,
+            "answer_readiness_decision": "recover_same_target_primary_proof",
+            "required_target_ids": target_gate.get("required_target_ids") or [],
+            "required_primary_proof": [],
+            "rejected_primary_proof": target_gate.get("rejected_refs") or [],
+            "rejected_primary_proof_count": target_gate.get("rejected_ref_count", 0),
+            "source_boundaries": {
+                "required_primary_proof": (
+                    "target_historical_raw refs must match the named task/entity in the query before "
+                    "answer-ready promotion"
+                ),
+                "wrong_target_refs": (
+                    "opened raw refs for stale or adjacent episodes remain diagnostics/leads only"
+                ),
+                "diagnostics": "current-run, same-loop, stale, and post-hoc diagnostics are not final support by default",
+            },
+            "read": [
+                {
+                    "kind": "targeted_fail_closed_boundary",
+                    "reason": (
+                        "Target/source-role gate rejected available raw refs because they did not match "
+                        "the requested target episode/entity."
+                    ),
+                    "required_target_ids": target_gate.get("required_target_ids") or [],
+                    "required_source_roles": ["target_historical_raw"],
+                    "rejected_ref_count": target_gate.get("rejected_ref_count", 0),
+                }
+            ],
+            "only_continue_if": [
+                "open primary raw/session/tool evidence that explicitly mentions the requested task/entity",
+                "use wrong-task raw refs, generated tool output, reports, reviews, code diffs, and skill text as diagnostics only",
+            ],
+        }
+    if target_gate.get("applies"):
+        primary_raw = list(target_gate.get("allowed_refs") or primary_raw)
     secondary_context = [
         read
         for read in reads
@@ -4111,6 +4175,266 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str) ->
             "secondary_context": "historical artifacts and legitimate context are secondary joins after raw/source inspection",
             "diagnostics": "current-run, same-loop, stale, and post-hoc diagnostics are not final support by default",
         },
+    }
+
+
+_TARGET_EPISODE_SOURCE_ROLE_ROUTE_FAMILIES = frozenset(
+    {
+        "action_proof",
+        "expectation_mismatch",
+        "latest_status",
+        "process_actual_use",
+        "provenance",
+        "orchestration_provenance",
+        "remembered_topic",
+        "semantic_debug",
+        "semantic_wrapup",
+    }
+)
+
+
+def _target_episode_refs_gate(
+    *,
+    query: str,
+    route_family: str,
+    refs: list[dict],
+    required_source_role: str,
+) -> dict:
+    required_ids = _explicit_query_episode_ids(query)
+    if route_family not in _TARGET_EPISODE_SOURCE_ROLE_ROUTE_FAMILIES or not required_ids:
+        return {"schema_version": 1, "applies": False, "status": "not_applicable"}
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    for item in refs:
+        reasons = _target_episode_ref_reject_reasons(item, required_ids=required_ids)
+        if reasons:
+            row = dict(item)
+            row["target_episode_source_role_reject_reasons"] = reasons
+            rejected.append(row)
+            continue
+        allowed.append(item)
+    status = "answer_allowed" if allowed else "blocked_target_episode_mismatch"
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "route_family": route_family,
+        "status": status,
+        "required_target_ids": required_ids,
+        "required_source_role": required_source_role,
+        "allowed_refs": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "allowed_ref_count": len(allowed),
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            _target_episode_rejected_summary_line(item)
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
+        "required_next_proof": (
+            "Open primary proof refs for the requested target episode/entity "
+            f"({', '.join(required_ids)}) with source role {required_source_role}; wrong-task raw refs, "
+            "stale command/tool refs, skill text, code diffs, implementation summaries, prior reports/reviews, "
+            "and generated tool-output windows are diagnostics only."
+        ),
+    }
+
+
+def _explicit_query_episode_ids(query: str) -> list[str]:
+    ids: list[str] = []
+    for task_id in _ask_execute_named_task_ids(query):
+        normalized = task_id.casefold()
+        if normalized not in ids:
+            ids.append(normalized)
+    return ids
+
+
+def _target_episode_ref_reject_reasons(item: dict, *, required_ids: list[str]) -> list[str]:
+    if not required_ids:
+        return []
+    text = _target_episode_ref_match_text(item)
+    matched = [target_id for target_id in required_ids if target_id in text]
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else item
+    join_ids = {
+        str(value).casefold()
+        for value in ref.get("work_episode_same_entity_join_ids") or []
+        if str(value).strip()
+    }
+    matched.extend(target_id for target_id in required_ids if target_id in join_ids)
+    if matched:
+        return []
+    return [f"missing_requested_target_episode:{','.join(required_ids)}"]
+
+
+def _target_episode_ref_match_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else item
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    historical_selection = (
+        ref.get("historical_provenance_selection")
+        if isinstance(ref.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    values = [
+        item.get("target"),
+        item.get("path"),
+        item.get("summary"),
+        item.get("snippet"),
+        item.get("text"),
+        item.get("source_ref"),
+        item.get("openable_target"),
+        item.get("timestamp_utc"),
+        item.get("local_timestamp"),
+        item.get("reason"),
+        ref.get("kind"),
+        ref.get("target"),
+        ref.get("path"),
+        ref.get("openable_target"),
+        ref.get("reason"),
+        ref.get("proof_surface"),
+        ref.get("proof_role"),
+        ref.get("target_source_role"),
+        ref.get("source_role"),
+        source_ref.get("path"),
+        metadata.get("payload_type"),
+        metadata.get("top_role"),
+        metadata.get("message_role"),
+        " ".join(str(value) for value in historical_selection.get("detected_handles") or []),
+    ]
+    return " ".join(str(value or "") for value in values).casefold().replace("_", "-")
+
+
+def _target_episode_rejected_summary_line(item: dict) -> str:
+    target = str(item.get("target") or item.get("path") or "").strip()
+    reasons = ", ".join(str(reason) for reason in item.get("target_episode_source_role_reject_reasons") or [])
+    prefix = f"{target}: " if target else ""
+    return f"{prefix}rejected_target_episode_source_role={reasons}"[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+def _target_episode_source_role_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "route_family": gate.get("route_family"),
+        "required_target_ids": list(gate.get("required_target_ids") or []),
+        "required_source_role": gate.get("required_source_role"),
+        "allowed_ref_count": gate.get("allowed_ref_count", 0),
+        "rejected_ref_count": gate.get("rejected_ref_count", 0),
+        "required_next_proof": gate.get("required_next_proof"),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "reject_reasons": list(item.get("target_episode_source_role_reject_reasons") or []),
+            }
+            for item in list(gate.get("rejected_refs") or [])[:_ASK_ANSWER_MAX_REFS]
+        ],
+    }
+
+
+def _target_episode_required_source_role(route_family: str) -> str:
+    return {
+        "action_proof": "primary raw action/tool proof for the requested task/action",
+        "expectation_mismatch": "expected/observed/divergence proof for the requested episode",
+        "latest_status": "selected anchor and required primary status refs for the requested task/window",
+        "process_actual_use": "primary raw timing/effect proof for the requested process/action",
+        "remembered_topic": "primary user-authored instruction wording for the requested topic",
+        "semantic_wrapup": "required primary correction-root proof for the requested correction",
+    }.get(route_family, "primary proof refs for the requested target episode/entity")
+
+
+def _target_episode_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict):
+        return None
+    if next_step.get("status") not in {
+        "blocked_target_episode_mismatch",
+        "target_primary_proof_refs_mismatch",
+        "blocked_latest_status_target_anchor_mismatch",
+    }:
+        return None
+    required_ids = list(next_step.get("required_target_ids") or [])
+    required_role = str(next_step.get("required_source_role") or "same-target primary proof")
+    lines = list(next_step.get("summary_lines") or [])
+    if not lines:
+        lines = [
+            "Opened refs were rejected because they did not match the requested target episode/entity.",
+            f"Needed proof: {required_role} for {', '.join(required_ids) if required_ids else 'the named target'}.",
+        ]
+    return {
+        "schema_version": 1,
+        "kind": "target_episode_source_role_proof_required",
+        "summary_lines": lines[:_ASK_ANSWER_MAX_REFS],
+        "required_target_ids": required_ids,
+        "required_source_role": required_role,
+        "required_final_proof": next_step.get("required_next_proof"),
+        "why_not_final_proof": (
+            "Wrong-task raw refs, stale older command/tool refs, skill text, code diffs, implementation "
+            "summaries, prior reports/reviews, and generated tool-output windows can be diagnostics or "
+            "leads, but they do not support answer-ready or final answers for the named target."
+        ),
+    }
+
+
+def _latest_status_target_episode_anchor_gate(*, query: str, action: dict, opened: list[dict]) -> dict:
+    required_ids = _explicit_query_episode_ids(query)
+    if not required_ids:
+        return {"schema_version": 1, "applies": False, "status": "not_applicable"}
+    selected_anchor = action.get("selected_anchor") if isinstance(action.get("selected_anchor"), dict) else {}
+    anchor_text = _target_episode_ref_match_text(selected_anchor)
+    matched_anchor_ids = [target_id for target_id in required_ids if target_id in anchor_text]
+    opened_gate = _target_episode_refs_gate(
+        query=query,
+        route_family="latest_status",
+        refs=opened,
+        required_source_role=_target_episode_required_source_role("latest_status"),
+    )
+    if matched_anchor_ids and opened_gate.get("status") == "answer_allowed":
+        return {
+            "schema_version": 1,
+            "applies": True,
+            "status": "answer_allowed",
+            "required_target_ids": required_ids,
+            "matched_anchor_ids": matched_anchor_ids,
+            "opened_gate": _target_episode_source_role_gate_public_contract(opened_gate),
+        }
+    reasons: list[str] = []
+    if not matched_anchor_ids:
+        reasons.append("selected_anchor_missing_requested_target_id")
+    if opened_gate.get("status") != "answer_allowed":
+        reasons.append("opened_required_primary_refs_missing_requested_target_id")
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "blocked_latest_status_target_anchor_mismatch",
+        "required_target_ids": required_ids,
+        "required_source_role": _target_episode_required_source_role("latest_status"),
+        "matched_anchor_ids": matched_anchor_ids,
+        "reasons": reasons,
+        "selected_anchor": {
+            "source_ref": selected_anchor.get("source_ref") or selected_anchor.get("openable_target"),
+            "timestamp_utc": selected_anchor.get("timestamp_utc") or selected_anchor.get("local_timestamp"),
+            "snippet": selected_anchor.get("snippet") or selected_anchor.get("text"),
+        },
+        "opened_gate": _target_episode_source_role_gate_public_contract(opened_gate),
+        "summary_lines": [
+            "Latest-status target gate rejected the selected anchor or required refs because they did not match "
+            f"{', '.join(required_ids)}; reasons={','.join(reasons) if reasons else '(unknown)'}."
+        ],
+        "required_next_proof": (
+            "Select/open a status anchor and required primary status refs that explicitly match the requested "
+            f"target episode/entity ({', '.join(required_ids)}). Adjacent task anchors are diagnostics only."
+        ),
+    }
+
+
+def _latest_status_target_episode_anchor_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "required_target_ids": list(gate.get("required_target_ids") or []),
+        "required_source_role": gate.get("required_source_role"),
+        "matched_anchor_ids": list(gate.get("matched_anchor_ids") or []),
+        "reasons": list(gate.get("reasons") or []),
+        "selected_anchor": gate.get("selected_anchor") or {},
+        "opened_gate": gate.get("opened_gate") or {},
+        "required_next_proof": gate.get("required_next_proof"),
     }
 
 
@@ -4986,7 +5310,7 @@ _ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT = 200
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
 _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES = frozenset(
-    {"action_proof", "expectation_mismatch", "provenance", "semantic_debug"}
+    {"action_proof", "provenance", "semantic_debug"}
 )
 _ASK_ANSWER_WORK_EPISODE_SCAN_MAX_FILES = 80
 _ASK_ANSWER_WORK_EPISODE_SCAN_MAX_BYTES = 1_000_000
@@ -5519,7 +5843,11 @@ def _ask_answer_from_execute(
         answer_opened = list(episode_selection.get("opened") or answer_opened)
 
     if route_family == "expectation_mismatch":
-        expectation_gate = _expectation_mismatch_answer_proof_gate(action=action, opened=answer_opened)
+        expectation_gate = _expectation_mismatch_answer_proof_gate(
+            action=action,
+            opened=answer_opened,
+            query=str(report.get("query") or ""),
+        )
         answer["source_contract"]["expectation_mismatch_answer_gate"] = _expectation_mismatch_gate_public_contract(
             expectation_gate
         )
@@ -5533,7 +5861,11 @@ def _ask_answer_from_execute(
         answer_opened = list(expectation_gate.get("opened") or answer_opened)
 
     if route_family == "process_actual_use":
-        process_gate = _process_actual_use_answer_proof_gate(action=action, opened=answer_opened)
+        process_gate = _process_actual_use_answer_proof_gate(
+            action=action,
+            opened=answer_opened,
+            query=str(report.get("query") or ""),
+        )
         answer["source_contract"]["process_actual_use_answer_gate"] = (
             _process_actual_use_gate_public_contract(process_gate)
         )
@@ -5568,7 +5900,10 @@ def _ask_answer_from_execute(
         answer_opened = list(repair_gate.get("opened") or answer_opened)
 
     if post_merge_smoke_wanted:
-        smoke_gate = _post_merge_smoke_answer_proof_gate(opened=answer_opened)
+        smoke_gate = _post_merge_smoke_answer_proof_gate(
+            opened=answer_opened,
+            query=str(report.get("query") or ""),
+        )
         answer["source_contract"]["post_merge_smoke_answer_gate"] = (
             _post_merge_smoke_gate_public_contract(smoke_gate)
         )
@@ -5638,6 +5973,43 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(workflow_gate.get("opened") or answer_opened)
 
+    if route_family == "latest_status":
+        latest_target_gate = _latest_status_target_episode_anchor_gate(
+            query=str(report.get("query") or ""),
+            action=action,
+            opened=answer_opened,
+        )
+        if latest_target_gate.get("applies"):
+            answer["source_contract"]["latest_status_target_episode_anchor_gate"] = (
+                _latest_status_target_episode_anchor_gate_public_contract(latest_target_gate)
+            )
+            if latest_target_gate.get("status") != "answer_allowed":
+                answer["proof_summary"] = list(latest_target_gate.get("summary_lines") or [])
+                return _ask_answer_fail_closed(
+                    answer,
+                    "latest-status selected anchor did not match the requested target episode/entity",
+                    latest_target_gate,
+                )
+
+    target_episode_gate = _target_episode_refs_gate(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        refs=answer_opened,
+        required_source_role=_target_episode_required_source_role(route_family),
+    )
+    if target_episode_gate.get("applies"):
+        answer["source_contract"]["target_episode_source_role_answer_gate"] = (
+            _target_episode_source_role_gate_public_contract(target_episode_gate)
+        )
+        if target_episode_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(target_episode_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "opened proof refs did not match the requested target episode/entity and required source role",
+                target_episode_gate,
+            )
+        answer_opened = list(target_episode_gate.get("allowed_refs") or answer_opened)
+
     current_run_gate = _current_run_final_support_gate(
         query=str(report.get("query") or ""),
         route_family=route_family,
@@ -5697,6 +6069,9 @@ def _ask_answer_fail_closed(answer: dict, reason: str, next_step: object) -> dic
 def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> dict | None:
     route = answer.get("selected_route") if isinstance(answer.get("selected_route"), dict) else {}
     route_family = str(route.get("route_family") or "")
+    target_explanation = _target_episode_source_role_explanation(next_step)
+    if target_explanation:
+        return target_explanation
     if route_family == "expectation_mismatch":
         return _expectation_mismatch_source_role_explanation(next_step)
     if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
@@ -7401,17 +7776,21 @@ def _post_merge_smoke_answer_wanted(*, query: str, route_family: str) -> bool:
     return post_merge and smoke and claim_shape
 
 
-def _post_merge_smoke_answer_proof_gate(*, opened: list[dict]) -> dict:
+def _post_merge_smoke_answer_proof_gate(*, opened: list[dict], query: str = "") -> dict:
     direct: list[dict] = []
     rejected: list[dict] = []
     for item in opened:
         if item.get("status") != "opened" or not item.get("summary"):
             continue
+        target_reasons = _target_episode_ref_reject_reasons(
+            item,
+            required_ids=_explicit_query_episode_ids(query),
+        )
         role = _post_merge_smoke_opened_source_role(item)
         public = _ref_public_summary(item)
         public["post_merge_smoke_source_role"] = role["source_role"]
-        public["post_merge_smoke_reasons"] = role["reasons"]
-        if role["source_role"] == "direct_post_merge_smoke_proof":
+        public["post_merge_smoke_reasons"] = target_reasons + role["reasons"]
+        if role["source_role"] == "direct_post_merge_smoke_proof" and not target_reasons:
             annotated = dict(item)
             annotated["post_merge_smoke_reasons"] = role["reasons"]
             direct.append(annotated)
@@ -8293,7 +8672,7 @@ def _action_chronology_gate_public_contract(gate: dict) -> dict:
     }
 
 
-def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict]) -> dict:
+def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict], query: str = "") -> dict:
     plan = action.get("expectation_mismatch_plan") if isinstance(action.get("expectation_mismatch_plan"), dict) else {}
     clean_by_facet: dict[str, list[dict]] = {
         facet: [] for facet in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
@@ -8304,9 +8683,13 @@ def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict])
     for item in opened:
         if item.get("status") != "opened" or not item.get("summary"):
             continue
+        target_reasons = _target_episode_ref_reject_reasons(
+            item,
+            required_ids=_explicit_query_episode_ids(query),
+        )
         roles = _expectation_mismatch_opened_roles(item, plan=plan)
         source = _expectation_mismatch_opened_source_role(item)
-        clean_allowed = source["clean_final_support"]
+        clean_allowed = source["clean_final_support"] and not target_reasons
         applicable_roles = [
             role for role in roles if role in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
         ]
@@ -8320,7 +8703,7 @@ def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict])
             public = _ref_public_summary(item)
             public["expectation_mismatch_roles"] = applicable_roles
             public["rejected_source_role"] = source["source_role"]
-            public["rejection_reasons"] = source["reasons"]
+            public["rejection_reasons"] = target_reasons + source["reasons"]
             rejected.append(public)
             rejected_lines.append(
                 f"{item.get('target')}: rejected_source_role={source['source_role']}; "
@@ -8391,7 +8774,7 @@ def _expectation_mismatch_answer_proof_gate(*, action: dict, opened: list[dict])
     }
 
 
-def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict]) -> dict:
+def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict], query: str = "") -> dict:
     plan = (
         action.get("process_actual_use_final_support_read_plan")
         if isinstance(action.get("process_actual_use_final_support_read_plan"), dict)
@@ -8431,7 +8814,10 @@ def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict]) -
             str(bucket) for bucket in selection.get("selected_buckets") or ref.get("selected_buckets") or []
         ]
         final_support_allowed = bool(ref.get("final_support_allowed") or selection.get("final_support_allowed"))
-        reject_reasons: list[str] = []
+        reject_reasons: list[str] = _target_episode_ref_reject_reasons(
+            item,
+            required_ids=_explicit_query_episode_ids(query),
+        )
         if required_targets and target not in required_targets and str(item.get("target") or "") not in required_targets:
             reject_reasons.append("not_in_required_primary_raw_final_support_reads")
         if source_tier != "primary_raw_timing_evidence":
