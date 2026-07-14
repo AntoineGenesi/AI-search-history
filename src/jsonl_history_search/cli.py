@@ -4378,7 +4378,6 @@ def _semantic_wrapup_correction_root_query(query: str) -> bool:
 
 def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
-    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     text = _semantic_wrapup_correction_root_ref_text(item)
     path_text = _semantic_wrapup_correction_root_path_text(item)
     reject_reasons: list[str] = []
@@ -4390,7 +4389,16 @@ def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
         reject_reasons.append("non_actionable_ref")
     if str(ref.get("target_source_role") or "") == "diagnostic_or_post_hoc":
         reject_reasons.append("target_source_role_diagnostic_or_post_hoc")
-    artifact_reason = _semantic_wrapup_correction_root_artifact_reject_reason(path_text=path_text, text=text)
+    raw_primary_reasons = _semantic_wrapup_correction_root_primary_ref_reasons(
+        item,
+        text=text,
+        path_text=path_text,
+    )
+    artifact_reason = _semantic_wrapup_correction_root_artifact_reject_reason(
+        path_text=path_text,
+        text=text,
+        raw_primary_proof=bool(raw_primary_reasons),
+    )
     if artifact_reason:
         reject_reasons.append(artifact_reason)
     if reject_reasons:
@@ -4406,13 +4414,36 @@ def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
             "reject_reasons": [],
             "allow_reasons": ["explicit_correction_root_primary_proof_role"],
         }
+    if raw_primary_reasons:
+        return {
+            "source_role": "primary_correction_root_proof",
+            "reject_reasons": [],
+            "allow_reasons": raw_primary_reasons,
+        }
+    return {
+        "source_role": "not_primary_correction_root_proof",
+        "reject_reasons": ["missing_same_target_primary_correction_root_proof"],
+        "allow_reasons": [],
+    }
+
+
+def _semantic_wrapup_correction_root_primary_ref_reasons(
+    item: dict,
+    *,
+    text: str | None = None,
+    path_text: str | None = None,
+) -> list[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    normalized_text = text if text is not None else _semantic_wrapup_correction_root_ref_text(item)
+    normalized_path = path_text if path_text is not None else _semantic_wrapup_correction_root_path_text(item)
     kind = str(ref.get("kind") or item.get("kind") or "").casefold()
     target_role = str(ref.get("target_source_role") or "").casefold()
     source_tier = str(ref.get("source_tier") or "").casefold()
     source_role_label = str(ref.get("source_role_label") or "").casefold()
     raw_session_surface = (
         kind == "jsonl_source_ref"
-        or ".jsonl" in path_text
+        or ".jsonl" in normalized_path
         or target_role == "target_historical_raw"
         or "primary_raw" in source_tier
     )
@@ -4422,24 +4453,23 @@ def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
         or str(metadata.get("message_role") or "").casefold() == "user"
         or "user_authored_raw_message" in source_role_label
     )
-    correction_root_terms = "correction" in text and any(term in text for term in ("root", "current correction", "genuine"))
+    correction_root_terms = "correction" in normalized_text and any(
+        term in normalized_text for term in ("root", "current correction", "genuine")
+    )
     if raw_session_surface and (user_authored or correction_root_terms):
         reasons = ["raw_session_or_user_correction_root_evidence"]
         if user_authored:
             reasons.append("user_authored")
-        return {
-            "source_role": "primary_correction_root_proof",
-            "reject_reasons": [],
-            "allow_reasons": reasons,
-        }
-    return {
-        "source_role": "not_primary_correction_root_proof",
-        "reject_reasons": ["missing_same_target_primary_correction_root_proof"],
-        "allow_reasons": [],
-    }
+        return reasons
+    return []
 
 
-def _semantic_wrapup_correction_root_artifact_reject_reason(*, path_text: str, text: str) -> str | None:
+def _semantic_wrapup_correction_root_artifact_reject_reason(
+    *,
+    path_text: str,
+    text: str,
+    raw_primary_proof: bool = False,
+) -> str | None:
     artifact_checks = (
         (
             "implementation_summary_or_report",
@@ -4469,10 +4499,14 @@ def _semantic_wrapup_correction_root_artifact_reject_reason(*, path_text: str, t
             ),
         ),
     )
-    haystacks = (path_text, text)
     for reason, markers in artifact_checks:
-        if any(marker in haystack for marker in markers for haystack in haystacks):
-            return reason
+        for marker in markers:
+            if marker in path_text:
+                return reason
+            if marker in text:
+                if raw_primary_proof and reason == "slice_or_eval_prompt" and marker == "assignment prompt":
+                    continue
+                return reason
     return None
 
 
@@ -9292,16 +9326,22 @@ def _current_run_final_support_reject_reasons(item: dict, *, query: str) -> list
     reasons: list[str] = []
     payload_type = str(metadata.get("payload_type") or "").casefold()
     has_current_markers = _current_run_ref_markers_present(folded)
+    has_hard_current_markers = _current_run_ref_hard_markers_present(folded)
     has_query_or_command_echo = _current_run_query_or_command_echo(folded, query=query)
+    historical_raw_correction_root_proof = bool(
+        _semantic_wrapup_correction_root_query(query)
+        and _semantic_wrapup_correction_root_primary_ref_reasons(item)
+        and not has_hard_current_markers
+    )
     if (
         payload_type in {"function_call", "function_call_output", "custom_tool_call"}
         and (has_current_markers or has_query_or_command_echo)
     ):
         reasons.append(f"current_tool_call_or_output_echo:{payload_type}")
     echo = setup_echo_classification(summary, query=query)
-    if echo.get("is_setup_echo") is True:
+    if echo.get("is_setup_echo") is True and not historical_raw_correction_root_proof:
         reasons.append(f"assignment_or_control_prompt_echo:{echo.get('reason') or 'setup_echo'}")
-    if has_current_markers:
+    if has_current_markers and not historical_raw_correction_root_proof:
         reasons.append("current_run_control_or_generated_artifact")
     if has_query_or_command_echo:
         reasons.append("current_query_or_command_echo")
@@ -9370,6 +9410,50 @@ def _current_run_ref_markers_present(folded: str) -> bool:
         "current prompt",
         "current assignment",
         "assignment prompt",
+        "read-only slice",
+        "pressure agent",
+        "run live cli",
+        "run live current-master",
+        "save artifacts",
+        "generated report",
+        "current generated report",
+        "tool output window",
+        "semantic-debug output",
+        "semantic debug output",
+        "source locator handoff",
+        "answer ready handoff",
+        "original token count",
+        "process exited with code",
+    )
+    return any(marker in folded for marker in markers)
+
+
+def _current_run_ref_hard_markers_present(folded: str) -> bool:
+    markers = (
+        "/sessions/current/",
+        "/current/",
+        "/current run/",
+        "/current-run/",
+        "/current task/",
+        "/current-task/",
+        "/same-loop/",
+        "/same loop/",
+        "/same-run/",
+        "/same run/",
+        "/same-lane/",
+        "/same lane/",
+        "/slice-a/",
+        "/slice-b/",
+        "/slice-c/",
+        "/slice-d/",
+        "current-run",
+        "current run",
+        "same-loop",
+        "same loop",
+        "same-run",
+        "same run",
+        "same-lane",
+        "same lane",
         "read-only slice",
         "pressure agent",
         "run live cli",
