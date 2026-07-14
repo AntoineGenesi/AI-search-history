@@ -4302,6 +4302,238 @@ def _target_episode_ref_match_text(item: dict) -> str:
     return " ".join(str(value or "") for value in values).casefold().replace("_", "-")
 
 
+def _semantic_wrapup_correction_root_final_support_gate(
+    *,
+    query: str,
+    route_family: str,
+    opened: list[dict],
+) -> dict:
+    required_ids = _explicit_query_episode_ids(query)
+    if (
+        route_family != "semantic_wrapup"
+        or not required_ids
+        or not _semantic_wrapup_correction_root_query(query)
+    ):
+        return {"schema_version": 1, "applies": False, "status": "not_applicable"}
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        target_reasons = _target_episode_ref_reject_reasons(item, required_ids=required_ids)
+        role = _semantic_wrapup_correction_root_ref_role(item)
+        reasons = target_reasons + list(role.get("reject_reasons") or [])
+        if role.get("source_role") == "primary_correction_root_proof" and not target_reasons:
+            annotated = dict(item)
+            annotated["semanticwrapup_correction_root_source_role"] = role.get("source_role")
+            annotated["semanticwrapup_correction_root_source_role_reasons"] = list(role.get("allow_reasons") or [])
+            allowed.append(annotated)
+            continue
+        row = dict(item)
+        row["semanticwrapup_correction_root_source_role"] = role.get("source_role")
+        row["target_episode_source_role_reject_reasons"] = _unique_preserving_order(
+            reasons or ["missing_same_target_primary_correction_root_proof"]
+        )
+        rejected.append(row)
+    status = "answer_allowed" if allowed else "blocked_semanticwrapup_correction_root_source_role"
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "route_family": route_family,
+        "status": status,
+        "required_target_ids": required_ids,
+        "required_source_role": (
+            "same-target primary correction-root/user/session/root evidence, or an explicit "
+            "correction-root primary-proof source role"
+        ),
+        "allowed_refs": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected_refs": rejected[:_ASK_ANSWER_MAX_REFS],
+        "allowed_ref_count": len(allowed),
+        "rejected_ref_count": len(rejected),
+        "summary_lines": [
+            _target_episode_rejected_summary_line(item)
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ]
+        or [
+            "Semanticwrapup correction-root answer stayed fail-closed because no same-target primary "
+            "correction-root proof ref was opened."
+        ],
+        "required_next_proof": (
+            "Open same-target primary correction-root proof for "
+            f"{', '.join(required_ids)}: raw user/session/root evidence, or a source ref explicitly labeled "
+            "as correction-root primary proof. Same-target implementation summaries, reports, code diffs, "
+            "skill text, generated reports, current command/tool output, and slice/eval prompts are diagnostics only."
+        ),
+    }
+
+
+def _semantic_wrapup_correction_root_query(query: str) -> bool:
+    normalized = str(query or "").casefold().replace("_", " ").replace("-", " ")
+    return (
+        "correction root" in normalized
+        or "current correction" in normalized
+        or ("correction" in normalized and "root" in normalized)
+    )
+
+
+def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    text = _semantic_wrapup_correction_root_ref_text(item)
+    path_text = _semantic_wrapup_correction_root_path_text(item)
+    reject_reasons: list[str] = []
+    if ref.get("diagnostic_only") is True:
+        reject_reasons.append("diagnostic_only_ref")
+    if ref.get("final_support_allowed") is False:
+        reject_reasons.append("final_support_not_allowed")
+    if ref.get("read_more_actionable") is False or ref.get("followthrough_actionable") is False:
+        reject_reasons.append("non_actionable_ref")
+    if str(ref.get("target_source_role") or "") == "diagnostic_or_post_hoc":
+        reject_reasons.append("target_source_role_diagnostic_or_post_hoc")
+    artifact_reason = _semantic_wrapup_correction_root_artifact_reject_reason(path_text=path_text, text=text)
+    if artifact_reason:
+        reject_reasons.append(artifact_reason)
+    if reject_reasons:
+        return {
+            "source_role": _unique_preserving_order(reject_reasons)[0],
+            "reject_reasons": _unique_preserving_order(reject_reasons),
+            "allow_reasons": [],
+        }
+    explicit_role = _semantic_wrapup_explicit_correction_root_primary_role(text)
+    if explicit_role:
+        return {
+            "source_role": "primary_correction_root_proof",
+            "reject_reasons": [],
+            "allow_reasons": ["explicit_correction_root_primary_proof_role"],
+        }
+    kind = str(ref.get("kind") or item.get("kind") or "").casefold()
+    target_role = str(ref.get("target_source_role") or "").casefold()
+    source_tier = str(ref.get("source_tier") or "").casefold()
+    source_role_label = str(ref.get("source_role_label") or "").casefold()
+    raw_session_surface = (
+        kind == "jsonl_source_ref"
+        or ".jsonl" in path_text
+        or target_role == "target_historical_raw"
+        or "primary_raw" in source_tier
+    )
+    user_authored = (
+        metadata.get("is_user_authored") is True
+        or str(metadata.get("top_role") or "").casefold() == "user"
+        or str(metadata.get("message_role") or "").casefold() == "user"
+        or "user_authored_raw_message" in source_role_label
+    )
+    correction_root_terms = "correction" in text and any(term in text for term in ("root", "current correction", "genuine"))
+    if raw_session_surface and (user_authored or correction_root_terms):
+        reasons = ["raw_session_or_user_correction_root_evidence"]
+        if user_authored:
+            reasons.append("user_authored")
+        return {
+            "source_role": "primary_correction_root_proof",
+            "reject_reasons": [],
+            "allow_reasons": reasons,
+        }
+    return {
+        "source_role": "not_primary_correction_root_proof",
+        "reject_reasons": ["missing_same_target_primary_correction_root_proof"],
+        "allow_reasons": [],
+    }
+
+
+def _semantic_wrapup_correction_root_artifact_reject_reason(*, path_text: str, text: str) -> str | None:
+    artifact_checks = (
+        (
+            "implementation_summary_or_report",
+            ("implementation-summary", "implementation summary", "/reports/", "reports/"),
+        ),
+        ("code_diff_surface", ("code-diff", "code diff", ".diff", ".patch", "git diff")),
+        ("skill_text_surface", ("/skills/", "skill.md", "skill text")),
+        (
+            "generated_report_or_tool_output",
+            ("generated report", "tool output:", "function-call-output", "function call output"),
+        ),
+        (
+            "current_command_or_control_output",
+            ("current command", "current-run", "current run", "command output", "exec-command"),
+        ),
+        (
+            "slice_or_eval_prompt",
+            (
+                "slice ",
+                "slice-",
+                "/slice-",
+                "/slice_",
+                "eval prompt",
+                "evaluation prompt",
+                "pressure agent",
+                "assignment prompt",
+            ),
+        ),
+    )
+    haystacks = (path_text, text)
+    for reason, markers in artifact_checks:
+        if any(marker in haystack for marker in markers for haystack in haystacks):
+            return reason
+    return None
+
+
+def _semantic_wrapup_explicit_correction_root_primary_role(text: str) -> bool:
+    has_correction_root = any(
+        marker in text
+        for marker in (
+            "correction-root",
+            "correction root",
+            "current-correction",
+            "current correction",
+        )
+    )
+    return has_correction_root and "primary" in text and "proof" in text
+
+
+def _semantic_wrapup_correction_root_ref_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    values = [
+        item.get("target"),
+        item.get("path"),
+        item.get("summary"),
+        item.get("snippet"),
+        item.get("text"),
+        item.get("reason"),
+        ref.get("kind"),
+        ref.get("target"),
+        ref.get("path"),
+        ref.get("openable_target"),
+        ref.get("reason"),
+        ref.get("proof_surface"),
+        ref.get("proof_role"),
+        ref.get("target_source_role"),
+        ref.get("source_role"),
+        ref.get("source_role_label"),
+        ref.get("source_tier"),
+        ref.get("read_role"),
+        source_ref.get("path"),
+        metadata.get("payload_type"),
+        metadata.get("top_role"),
+        metadata.get("message_role"),
+    ]
+    return " ".join(str(value or "") for value in values).casefold().replace("_", "-")
+
+
+def _semantic_wrapup_correction_root_path_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    values = [
+        item.get("target"),
+        item.get("path"),
+        ref.get("target"),
+        ref.get("path"),
+        ref.get("openable_target"),
+        source_ref.get("path"),
+    ]
+    return " ".join(str(value or "") for value in values).replace("\\", "/").casefold().replace("_", "-")
+
+
 def _target_episode_rejected_summary_line(item: dict) -> str:
     target = str(item.get("target") or item.get("path") or "").strip()
     reasons = ", ".join(str(reason) for reason in item.get("target_episode_source_role_reject_reasons") or [])
@@ -4329,6 +4561,29 @@ def _target_episode_source_role_gate_public_contract(gate: dict) -> dict:
     }
 
 
+def _semantic_wrapup_correction_root_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "status": gate.get("status"),
+        "route_family": gate.get("route_family"),
+        "required_target_ids": list(gate.get("required_target_ids") or []),
+        "required_source_role": gate.get("required_source_role"),
+        "allowed_ref_count": gate.get("allowed_ref_count", 0),
+        "rejected_ref_count": gate.get("rejected_ref_count", 0),
+        "required_next_proof": gate.get("required_next_proof"),
+        "rejected_refs": [
+            {
+                **_ref_public_summary(item),
+                "semanticwrapup_correction_root_source_role": item.get(
+                    "semanticwrapup_correction_root_source_role"
+                ),
+                "reject_reasons": list(item.get("target_episode_source_role_reject_reasons") or []),
+            }
+            for item in list(gate.get("rejected_refs") or [])[:_ASK_ANSWER_MAX_REFS]
+        ],
+    }
+
+
 def _target_episode_required_source_role(route_family: str) -> str:
     return {
         "action_proof": "primary raw action/tool proof for the requested task/action",
@@ -4345,6 +4600,7 @@ def _target_episode_source_role_explanation(next_step: object) -> dict | None:
         return None
     if next_step.get("status") not in {
         "blocked_target_episode_mismatch",
+        "blocked_semanticwrapup_correction_root_source_role",
         "target_primary_proof_refs_mismatch",
         "blocked_latest_status_target_anchor_mismatch",
     }:
@@ -5990,6 +6246,24 @@ def _ask_answer_from_execute(
                     "latest-status selected anchor did not match the requested target episode/entity",
                     latest_target_gate,
                 )
+
+    semanticwrapup_correction_root_gate = _semantic_wrapup_correction_root_final_support_gate(
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        opened=answer_opened,
+    )
+    if semanticwrapup_correction_root_gate.get("applies"):
+        answer["source_contract"]["semanticwrapup_correction_root_final_support_gate"] = (
+            _semantic_wrapup_correction_root_gate_public_contract(semanticwrapup_correction_root_gate)
+        )
+        if semanticwrapup_correction_root_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(semanticwrapup_correction_root_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "semanticwrapup correction-root proof missing same-target primary source-role support",
+                semanticwrapup_correction_root_gate,
+            )
+        answer_opened = list(semanticwrapup_correction_root_gate.get("allowed_refs") or answer_opened)
 
     target_episode_gate = _target_episode_refs_gate(
         query=str(report.get("query") or ""),
