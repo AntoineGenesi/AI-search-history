@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import sys
 from datetime import timezone
 from pathlib import Path
@@ -5229,17 +5230,19 @@ def _ask_answer_from_execute(
             answer["source_contract"]["latest_status_quote_boundary_recovery"] = (
                 _latest_status_quote_boundary_recovery_public(quote_boundary_recovery)
             )
-            answer["refs_used"] = [_ref_public_summary(item) for item in recovered_opened]
-            answer["proof_summary"] = [item["summary"] for item in recovered_opened if item.get("summary")]
-            answer["answer_status"] = "answered-from-proof"
-            answer["answer"] = _sanitize_final_answer_prose(
-                _compose_latest_status_quote_boundary_plan_answer(
-                    query=str(report.get("query") or ""),
+            answer["proof_summary"] = [
+                f"Diagnostic boundary anchor only: {item['summary']}"
+                for item in recovered_opened
+                if item.get("summary")
+            ]
+            return _ask_answer_fail_closed(
+                answer,
+                "quoted before-boundary recovery found only the boundary anchor, not proof of the preceding status/window",
+                _latest_status_quote_boundary_anchor_only_next_step(
                     recovery=quote_boundary_recovery,
                     opened=recovered_opened,
-                )
+                ),
             )
-            return base
         if quote_boundary_recovery.get("status") != "not_applicable":
             answer["source_contract"]["latest_status_quote_boundary_recovery"] = (
                 _latest_status_quote_boundary_recovery_public(quote_boundary_recovery)
@@ -9160,28 +9163,29 @@ def _latest_status_quote_boundary_recovery_public(recovery: dict) -> dict:
     }
 
 
-def _compose_latest_status_quote_boundary_plan_answer(
-    *,
-    query: str,
-    recovery: dict,
-    opened: list[dict],
-) -> str:
-    boundary = opened[0] if opened else {}
-    summary = str(boundary.get("summary") or "").strip()
-    timestamp = str((boundary.get("ref") or {}).get("timestamp_utc") or "").strip()
-    phrase = str(recovery.get("recovered_boundary_phrase") or "").strip()
-    if not phrase:
-        phrase = _short_join(_latest_status_quoted_before_boundary_phrases(query)[:1], limit=120)
-    parts = [
-        "Recovered before-boundary user message:",
-        f"timestamp={timestamp}" if timestamp else "",
-        f'wording="{phrase}"' if phrase else "",
-        "direction=before_this_boundary_not_after_it.",
-        "Source plan: use refs_used[0] as the user-authored boundary proof, then inspect raw conversation/session records at or before that timestamp or line for the requested status; do not use later Slice/task assignment prompts as contributor's substantive boundary.",
-    ]
-    if summary:
-        parts.append(f"Boundary proof summary: {summary}")
-    return " ".join(part for part in parts if part)
+def _latest_status_quote_boundary_anchor_only_next_step(*, recovery: dict, opened: list[dict]) -> dict:
+    diagnostic_refs = [_ref_public_summary(item) for item in opened[:_ASK_ANSWER_MAX_REFS]]
+    boundary_target = ""
+    if diagnostic_refs:
+        boundary_target = str(diagnostic_refs[0].get("target") or diagnostic_refs[0].get("openable_target") or "")
+    read_more_command = None
+    if boundary_target:
+        read_more_command = (
+            "jsonl-history-search read-more "
+            f"{shlex.quote(boundary_target)} --mode window --before 10 --after 0 --cwd \"$PWD\" --format json"
+        )
+    return {
+        "status": "boundary_anchor_only_not_final_proof",
+        "required_next_proof": "source-role appropriate raw evidence at or before the recovered boundary that proves the requested preceding status/window",
+        "diagnostic_boundary_refs": diagnostic_refs,
+        "quoted_boundary_phrases": recovery.get("quoted_boundary_phrases") or [],
+        "suggested_action": (
+            "Treat the recovered quote as an anchor/diagnostic ref only. Open the preceding raw history/session "
+            "window and answer from status/window evidence at or before that boundary; do not finalize from the "
+            "quoted boundary line alone or from later task/slice prompt echoes."
+        ),
+        "suggested_read_more_command": read_more_command,
+    }
 
 
 def _remembered_user_wording_topic_terms(query: str) -> set[str]:
