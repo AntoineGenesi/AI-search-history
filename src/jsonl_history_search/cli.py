@@ -6393,8 +6393,23 @@ def _ask_answer_from_execute(
                         current_run_gate
                     )
                 },
-            )
+        )
         answer_opened = list(current_run_gate.get("opened") or answer_opened)
+
+    final_veto = _ask_answer_finalization_veto(
+        answer=answer,
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+        action=action,
+        opened=answer_opened,
+    )
+    if final_veto.get("blocked"):
+        answer["proof_summary"] = list(final_veto.get("summary_lines") or answer.get("proof_summary") or [])
+        return _ask_answer_fail_closed(
+            answer,
+            str(final_veto.get("reason") or "answer source contract is not ready for final support"),
+            final_veto.get("next_step"),
+        )
 
     answer["refs_used"] = [_ref_public_summary(item) for item in answer_opened]
     answer["proof_summary"] = [item["summary"] for item in answer_opened]
@@ -6414,6 +6429,112 @@ def _ask_answer_from_execute(
     answer["answer_status"] = "answered-from-proof"
     answer["answer"] = _sanitize_final_answer_prose(direct_answer)
     return base
+
+
+def _ask_answer_finalization_veto(
+    *,
+    answer: dict,
+    query: str,
+    route_family: str,
+    action: dict,
+    opened: list[dict],
+) -> dict:
+    if _action_chronology_final_role_gate_wanted(query=query, route_family=route_family):
+        chronology_gate = (
+            answer.get("source_contract", {}).get("action_chronology_answer_gate")
+            if isinstance(answer.get("source_contract", {}).get("action_chronology_answer_gate"), dict)
+            else {}
+        )
+        if chronology_gate.get("status") != "answer_allowed":
+            chronology_gate = _action_chronology_answer_proof_gate(
+                query=query,
+                action=action,
+                opened=opened,
+            )
+            answer["source_contract"]["action_chronology_answer_gate"] = _action_chronology_gate_public_contract(
+                chronology_gate
+            )
+        if chronology_gate.get("status") != "answer_allowed":
+            return {
+                "blocked": True,
+                "reason": "claim-vs-action chronology proof roles missing or only corroborating artifacts were opened",
+                "next_step": chronology_gate,
+                "summary_lines": chronology_gate.get("summary_lines") or [],
+            }
+
+    merge_gate = _named_task_merge_provenance_final_proof_gate(
+        query=query,
+        route_family=route_family,
+        opened=opened,
+    )
+    if merge_gate.get("applies"):
+        answer["source_contract"]["named_task_merge_provenance_answer_gate"] = (
+            _named_task_merge_provenance_gate_public_contract(merge_gate)
+        )
+        if merge_gate.get("status") != "answer_allowed":
+            return {
+                "blocked": True,
+                "reason": "named-task merge provenance proof roles missing in opened refs",
+                "next_step": merge_gate,
+                "summary_lines": merge_gate.get("summary_lines") or [],
+            }
+
+    if _answer_action_contract_blocks_final_answer(action):
+        return {
+            "blocked": True,
+            "reason": _answer_action_contract_veto_reason(action),
+            "next_step": _answer_action_contract_veto_next_step(action, query=query),
+            "summary_lines": [],
+        }
+    return {"blocked": False}
+
+
+def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
+    answer_status = str(action.get("answer_status") or "").casefold()
+    promotion_status = str(action.get("promotion_status") or "").casefold()
+    if not answer_status and not promotion_status:
+        return False
+    if answer_status.startswith("not-ready"):
+        return True
+    if answer_status in {"cannot-answer-directly-yet", "needs_investigation"}:
+        return True
+    if "target-source-role-mismatch" in answer_status or "target-source-role-mismatch" in promotion_status:
+        return True
+    if "gate_fail_closed" in promotion_status or promotion_status.endswith("fail_closed"):
+        return True
+    return False
+
+
+def _answer_action_contract_veto_reason(action: dict) -> str:
+    answer_status = str(action.get("answer_status") or "(unknown)")
+    promotion_status = str(action.get("promotion_status") or "")
+    if promotion_status:
+        return f"ask --execute source contract is {answer_status} / {promotion_status}"
+    return f"ask --execute source contract is {answer_status}"
+
+
+def _answer_action_contract_veto_next_step(action: dict, *, query: str) -> object:
+    if _action_chronology_requires_boundary_roles(query):
+        required_roles = _action_chronology_required_roles(query)
+        return {
+            "schema_version": 1,
+            "status": "missing_primary_action_chronology",
+            "covered_roles": [],
+            "missing_roles": required_roles,
+            "required_roles": required_roles,
+            "corroborating_refs": [],
+            "rejected_refs": [],
+            "summary_lines": [
+                "The answer action contract says the surfaced evidence is not answer-ready for this target/source role."
+            ],
+            "required_next_proof": (
+                "Open same-target raw stop/exhaustion chronology: session messages/tool calls, command output, "
+                "repo/worktree/process state, selected/launched-task presence or absence, and explicit remaining-work "
+                "or exhaustion evidence."
+            ),
+            "fallback_action_contract_next_step": _next_proof_step_from_action(action),
+        }
+    return _next_proof_step_from_action(action)
 
 
 def _ask_answer_fail_closed(answer: dict, reason: str, next_step: object) -> dict:
@@ -6442,6 +6563,9 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
         repair_explanation = _named_task_repair_causality_source_role_explanation(next_step)
         if repair_explanation:
             return repair_explanation
+        merge_explanation = _named_task_merge_provenance_source_role_explanation(next_step)
+        if merge_explanation:
+            return merge_explanation
         smoke_explanation = _post_merge_smoke_source_role_explanation(next_step)
         if smoke_explanation:
             return smoke_explanation
@@ -8472,6 +8596,28 @@ def _action_chronology_answer_wanted(*, query: str, route_family: str) -> bool:
     return claim_shape and _action_chronology_requires_boundary_roles(query)
 
 
+def _action_chronology_final_role_gate_wanted(*, query: str, route_family: str) -> bool:
+    if _action_chronology_answer_wanted(query=query, route_family=route_family):
+        return True
+    if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    review_verification_shape = any(
+        term in normalized
+        for term in ("reviewer", "verify", "verified", "review verdict", "review artifact")
+    )
+    if review_verification_shape and not _action_chronology_requires_boundary_roles(query):
+        return False
+    if not _ask_execute_named_task_ids(query):
+        return False
+    action_vs_claim = (
+        "versus claim" in normalized
+        or "only claim" in normalized
+        or ("actually" in normalized and any(term in normalized for term in ("worker", "agent", "did ")))
+    )
+    return action_vs_claim and any(term in normalized for term in ("worker", "agent", "did ", "ran", "run"))
+
+
 def _action_chronology_candidate_refs(action: dict) -> list[dict]:
     refs: list[dict] = []
     action_plan = action.get("action_proof_plan") if isinstance(action.get("action_proof_plan"), dict) else {}
@@ -8574,6 +8720,11 @@ def _action_chronology_answer_proof_gate(*, query: str, action: dict, opened: li
         "required_next_proof": (
             "Open raw chronological evidence for the same action: session messages/tool calls, command output, "
             "git/worktree/process state, and selected/launched-task presence or absence when the prompt asks whether work stopped."
+            + (
+                " Include explicit stop/exhaustion chronology and remaining-work or exhaustion state proof."
+                if "exhaustion_or_remaining_work_state_chronology" in required_roles
+                else ""
+            )
         ),
         "fallback_action_contract_next_step": _next_proof_step_from_action(action),
     }
@@ -8885,6 +9036,8 @@ def _action_chronology_required_roles(query: str) -> list[str]:
                 "repo_or_process_state_chronology",
             ]
         )
+        if any(term in normalized for term in ("exhaust", "exhausted", "exhaustion", "remaining work")):
+            roles.append("exhaustion_or_remaining_work_state_chronology")
     elif _action_chronology_requires_repo_or_process_roles(normalized):
         roles.append("repo_or_process_state_chronology")
     return _unique_preserving_order(roles)
@@ -8893,6 +9046,8 @@ def _action_chronology_required_roles(query: str) -> list[str]:
 def _action_chronology_requires_boundary_roles(query: str) -> bool:
     normalized = str(query or "").casefold()
     if re.search(r"\b(stop|stopped|stopping|closeout|closed out)\b", normalized):
+        return True
+    if re.search(r"\b(exhaust|exhausted|exhaustion|remaining work)\b", normalized):
         return True
     if re.search(r"\b(selected|launched)\b", normalized) and any(
         term in normalized for term in ("next", "task", "after", "follow-up", "follow up")
@@ -9005,6 +9160,8 @@ def _action_chronology_text_roles(text: str) -> list[str]:
         roles.append("followup_selection_or_absence_chronology")
     if any(term in text for term in ("git status", "git worktree", "process", "worktree", "dirty", "clean", "commit")):
         roles.append("repo_or_process_state_chronology")
+    if any(term in text for term in ("exhaust", "exhausted", "exhaustion", "remaining work", "nothing left")):
+        roles.append("exhaustion_or_remaining_work_state_chronology")
     return _unique_preserving_order(roles)
 
 
@@ -11418,6 +11575,144 @@ def _compose_named_task_merge_provenance_answer(
         + "; ".join(pieces)
         + ". Boundary: task and review artifacts corroborate task/review roles; only an actual merge commit is used for the merge-commit role."
     )
+
+
+_NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES = (
+    "source_session_proof",
+    "task_artifact_proof",
+    "review_artifact_proof",
+    "merge_commit_proof",
+)
+
+
+def _named_task_merge_provenance_final_proof_gate(
+    *,
+    query: str,
+    route_family: str,
+    opened: list[dict],
+) -> dict:
+    if not _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
+        return {"schema_version": 1, "applies": False, "status": "not_applicable"}
+    task_ids = _ask_execute_named_task_ids(query)
+    task_id = str(task_ids[0]).casefold() if task_ids else ""
+    role_evidence = _named_task_merge_provenance_role_evidence(opened, task_id=task_id)
+    missing = [
+        role
+        for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
+        if not role_evidence.get(role)
+    ]
+    status = "answer_allowed" if not missing else "missing_required_merge_provenance_roles"
+    summary_lines = []
+    if missing:
+        summary_lines.append(
+            "Named-task merge provenance proof is missing required roles: " + ", ".join(missing) + "."
+        )
+    else:
+        summary_lines.append(
+            "Named-task merge provenance proof has source-session, task, review, and merge-commit roles."
+        )
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": status,
+        "task_id": task_id,
+        "required_roles": list(_NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES),
+        "missing_roles": missing,
+        "role_evidence": role_evidence,
+        "summary_lines": summary_lines,
+        "required_next_proof": (
+            "Open same-task source-session, task artifact, review artifact, and actual merge-commit proof "
+            f"for {task_id or 'the named task'} before answering merge provenance."
+        ),
+        "acceptable_evidence": [
+            "source-session row or raw transcript reference for the task implementation/review/merge episode",
+            "same-task task artifact recording implementation/review/merge state",
+            "same-task independent review artifact or review proof",
+            "actual parent merge commit hash or git-derived merge proof, not only closeout/status prose",
+        ],
+    }
+
+
+def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: str) -> dict:
+    evidence: dict[str, list[dict]] = {
+        role: [] for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
+    }
+    for item in opened:
+        if item.get("status") != "opened":
+            continue
+        summary = str(item.get("summary") or "")
+        if not summary:
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        target = str(item.get("target") or item.get("path") or ref.get("target") or ref.get("path") or "")
+        text = " ".join(
+            str(value or "")
+            for value in (
+                summary,
+                target,
+                ref.get("kind"),
+                ref.get("proof_surface"),
+                ref.get("target_source_role"),
+                ref.get("proof_role"),
+            )
+        ).casefold()
+        if task_id and _named_task_fragment_mentions_other_task_id(text, task_id):
+            continue
+        public = _ref_public_summary(item)
+        if ".jsonl" in target.casefold() or "session" in text:
+            evidence["source_session_proof"].append(public)
+        if ref.get("proof_surface") == "task_file" or "/tasks/" in f"/{target}".casefold():
+            evidence["task_artifact_proof"].append(public)
+        if ref.get("proof_surface") == "review_artifact" or "codex/state/reviews" in target.casefold():
+            evidence["review_artifact_proof"].append(public)
+        if _named_task_merge_commit_hashes([item], task_id=task_id or "the named task"):
+            public = dict(public)
+            public["merge_commits"] = _named_task_merge_commit_hashes([item], task_id=task_id or "the named task")
+            evidence["merge_commit_proof"].append(public)
+    return {
+        role: values[:_ASK_ANSWER_MAX_REFS]
+        for role, values in evidence.items()
+        if values
+    }
+
+
+def _named_task_merge_provenance_gate_public_contract(gate: dict) -> dict:
+    return {
+        "schema_version": gate.get("schema_version"),
+        "applies": gate.get("applies"),
+        "status": gate.get("status"),
+        "task_id": gate.get("task_id"),
+        "required_roles": list(gate.get("required_roles") or []),
+        "missing_roles": list(gate.get("missing_roles") or []),
+        "role_evidence": gate.get("role_evidence") or {},
+        "required_next_proof": gate.get("required_next_proof"),
+        "acceptable_evidence": list(gate.get("acceptable_evidence") or []),
+    }
+
+
+def _named_task_merge_provenance_source_role_explanation(next_step: object) -> dict | None:
+    if not isinstance(next_step, dict) or next_step.get("status") != "missing_required_merge_provenance_roles":
+        return None
+    missing = [str(item) for item in next_step.get("missing_roles") or [] if str(item).strip()]
+    summary = (
+        "Named-task merge provenance stayed fail-closed because opened refs did not cover every requested "
+        f"source role; missing {', '.join(missing) if missing else '(unknown)'}."
+    )
+    return {
+        "schema_version": 1,
+        "kind": "named_task_merge_provenance_required_roles_missing",
+        "summary": summary,
+        "summary_lines": [
+            summary,
+            "Why not final proof: task/review/closeout artifacts can corroborate adjacent workflow state, but a prompt asking for source session/task/review/commit proof needs each requested role.",
+            "Needed proof: same-task source-session evidence, task artifact, review artifact, and actual merge-commit proof.",
+        ],
+        "required_roles": list(next_step.get("required_roles") or []),
+        "missing_roles": missing,
+        "role_evidence": next_step.get("role_evidence") or {},
+        "required_final_proof": next_step.get("required_next_proof"),
+        "acceptable_evidence": list(next_step.get("acceptable_evidence") or []),
+    }
 
 
 def _named_task_merge_provenance_role_summary(summaries: list[str]) -> str:
