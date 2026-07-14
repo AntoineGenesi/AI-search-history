@@ -4380,6 +4380,7 @@ def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
     text = _semantic_wrapup_correction_root_ref_text(item)
     path_text = _semantic_wrapup_correction_root_path_text(item)
+    surface_text = _semantic_wrapup_correction_root_surface_text(item)
     reject_reasons: list[str] = []
     if ref.get("diagnostic_only") is True:
         reject_reasons.append("diagnostic_only_ref")
@@ -4397,6 +4398,7 @@ def _semantic_wrapup_correction_root_ref_role(item: dict) -> dict:
     artifact_reason = _semantic_wrapup_correction_root_artifact_reject_reason(
         path_text=path_text,
         text=text,
+        surface_text=surface_text,
         raw_primary_proof=bool(raw_primary_reasons),
     )
     if artifact_reason:
@@ -4468,6 +4470,7 @@ def _semantic_wrapup_correction_root_artifact_reject_reason(
     *,
     path_text: str,
     text: str,
+    surface_text: str,
     raw_primary_proof: bool = False,
 ) -> str | None:
     artifact_checks = (
@@ -4483,7 +4486,15 @@ def _semantic_wrapup_correction_root_artifact_reject_reason(
         ),
         (
             "current_command_or_control_output",
-            ("current command", "current-run", "current run", "command output", "exec-command"),
+            (
+                "current command",
+                "current-run",
+                "current run",
+                "command output",
+                "exec-command",
+                "function-call",
+                "custom-tool-call",
+            ),
         ),
         (
             "slice_or_eval_prompt",
@@ -4501,10 +4512,19 @@ def _semantic_wrapup_correction_root_artifact_reject_reason(
     )
     for reason, markers in artifact_checks:
         for marker in markers:
-            if marker in path_text:
+            if marker in path_text or marker in surface_text:
                 return reason
             if marker in text:
-                if raw_primary_proof and reason == "slice_or_eval_prompt" and marker == "assignment prompt":
+                if raw_primary_proof and (
+                    reason
+                    in {
+                        "implementation_summary_or_report",
+                        "code_diff_surface",
+                        "skill_text_surface",
+                        "generated_report_or_tool_output",
+                    }
+                    or (reason == "slice_or_eval_prompt" and marker == "assignment prompt")
+                ):
                     continue
                 return reason
     return None
@@ -4564,6 +4584,34 @@ def _semantic_wrapup_correction_root_path_text(item: dict) -> str:
         ref.get("path"),
         ref.get("openable_target"),
         source_ref.get("path"),
+    ]
+    return " ".join(str(value or "") for value in values).replace("\\", "/").casefold().replace("_", "-")
+
+
+def _semantic_wrapup_correction_root_surface_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    values = [
+        item.get("target"),
+        item.get("path"),
+        ref.get("kind"),
+        ref.get("target"),
+        ref.get("path"),
+        ref.get("openable_target"),
+        ref.get("reason"),
+        ref.get("proof_surface"),
+        ref.get("proof_role"),
+        ref.get("target_source_role"),
+        ref.get("source_role"),
+        ref.get("source_role_label"),
+        ref.get("source_tier"),
+        ref.get("read_role"),
+        source_ref.get("path"),
+        metadata.get("top_type"),
+        metadata.get("payload_type"),
+        metadata.get("payload_role"),
+        metadata.get("conversation_label"),
     ]
     return " ".join(str(value or "") for value in values).replace("\\", "/").casefold().replace("_", "-")
 
@@ -9323,10 +9371,12 @@ def _current_run_final_support_reject_reasons(item: dict, *, query: str) -> list
     summary = str(item.get("summary") or "")
     text = _current_run_final_support_text(item)
     folded = re.sub(r"\s+", " ", text.casefold().replace("_", " ")).strip()
+    surface_text = _current_run_final_support_hard_surface_text(item)
+    surface_folded = re.sub(r"\s+", " ", surface_text.casefold().replace("_", " ")).strip()
     reasons: list[str] = []
     payload_type = str(metadata.get("payload_type") or "").casefold()
     has_current_markers = _current_run_ref_markers_present(folded)
-    has_hard_current_markers = _current_run_ref_hard_markers_present(folded)
+    has_hard_current_markers = _current_run_ref_hard_markers_present(surface_folded)
     has_query_or_command_echo = _current_run_query_or_command_echo(folded, query=query)
     historical_raw_correction_root_proof = bool(
         _semantic_wrapup_correction_root_query(query)
@@ -9376,6 +9426,34 @@ def _current_run_final_support_text(item: dict) -> str:
             metadata.get("payload_type"),
             metadata.get("top_role"),
             metadata.get("message_role"),
+        )
+    )
+
+
+def _current_run_final_support_hard_surface_text(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    return " ".join(
+        str(value or "")
+        for value in (
+            item.get("target"),
+            item.get("path"),
+            item.get("reason"),
+            ref.get("kind"),
+            ref.get("target"),
+            ref.get("path"),
+            ref.get("openable_target"),
+            ref.get("reason"),
+            ref.get("target_source_role"),
+            ref.get("source_tier"),
+            ref.get("read_role"),
+            ref.get("proof_surface"),
+            source_ref.get("path"),
+            metadata.get("top_type"),
+            metadata.get("payload_type"),
+            metadata.get("payload_role"),
+            metadata.get("conversation_label"),
         )
     )
 
