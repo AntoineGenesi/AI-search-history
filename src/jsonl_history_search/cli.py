@@ -4482,7 +4482,15 @@ def _semantic_wrapup_correction_root_artifact_reject_reason(
         ("skill_text_surface", ("/skills/", "skill.md", "skill text")),
         (
             "generated_report_or_tool_output",
-            ("generated report", "tool output:", "function-call-output", "function call output"),
+            (
+                "generated report",
+                "generated-report",
+                "generated-output",
+                "tool output",
+                "tool-output",
+                "function-call-output",
+                "function call output",
+            ),
         ),
         (
             "current_command_or_control_output",
