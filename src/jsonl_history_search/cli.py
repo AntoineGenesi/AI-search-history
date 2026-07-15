@@ -6848,6 +6848,45 @@ def _ask_answer_source_role_explanation(*, answer: dict, next_step: object) -> d
 
 def _expectation_mismatch_source_role_explanation(next_step: object) -> dict | None:
     if isinstance(next_step, list):
+        guidance = [
+            item
+            for item in next_step
+            if isinstance(item, dict)
+            and item.get("kind") == "expectation_mismatch_missing_facet_guidance"
+        ]
+        if guidance:
+            first = guidance[0]
+            missing = [
+                str(item)
+                for item in first.get("missing_facets") or []
+                if str(item) in _ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS
+            ]
+            summary = (
+                "Expectation-mismatch answer stayed fail-closed because no clean actionable "
+                "target historical expected/observed/divergence reads were available."
+            )
+            return {
+                "schema_version": 1,
+                "kind": "expectation_mismatch_missing_facets",
+                "summary": summary,
+                "summary_lines": [
+                    f"Expectation-mismatch proof gap: missing clean facets {', '.join(missing) if missing else '(unknown)'}.",
+                    "Why not final proof: repair/control/setup/current assignment or wrong-target reads are diagnostic leads only.",
+                    "Needed proof: open clean target historical raw/session/tool evidence for expected_behavior_evidence, observed_behavior_or_action_proof, and divergence_evidence before returning a causal answer.",
+                ],
+                "required_facets": list(_ASK_ANSWER_EXPECTATION_MISMATCH_REQUIRED_FACETS),
+                "covered_facets": [],
+                "missing_facets": missing,
+                "rejected_source_roles": _unique_preserving_order(
+                    str(reason)
+                    for item in guidance
+                    for reason in item.get("demotion_reasons") or []
+                    if str(reason).strip()
+                ),
+                "rejected_ref_count": int(first.get("demoted_candidate_count") or 0),
+                "rejected_evidence": [],
+                "required_final_proof": first.get("required_next_proof"),
+            }
         planned_roles = _unique_preserving_order(
             [
                 str(item.get("expectation_mismatch_role") or "")
