@@ -12314,10 +12314,23 @@ def _completed_task_status_label(summaries: list[str]) -> str:
     return ""
 
 
+_FINAL_ANSWER_LOCAL_PATH_RE = re.compile(
+    r"""
+    (?<![\w.-])
+    (?:
+        /home/[A-Za-z0-9_.-]+
+        | /Users/[A-Za-z0-9_.-]+
+        | /mnt/[A-Za-z]
+    )
+    (?:/[^\s`'"<>|;:,)]*)*
+    """,
+    re.VERBOSE,
+)
+
+
 def _redact_local_paths_for_final_answer(text: str) -> str:
     sanitized = str(text or "")
-    sanitized = re.sub(r"/home/user/[^\n`]*", "[local path]", sanitized)
-    sanitized = re.sub(r"/mnt/[^\n`]*", "[local path]", sanitized)
+    sanitized = _FINAL_ANSWER_LOCAL_PATH_RE.sub("[local path]", sanitized)
     return re.sub(r"\s{2,}", " ", sanitized).strip()
 
 
