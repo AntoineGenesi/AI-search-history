@@ -5654,8 +5654,11 @@ def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: d
     if selected_route.get("route_family") != "bounded_no_evidence":
         return False
     no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
-    claim_boundary_non_support = no_evidence.get("candidate_interpretation") == "claim_boundary_non_support"
-    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0 and not claim_boundary_non_support:
+    diagnostic_non_support = no_evidence.get("candidate_interpretation") in {
+        "claim_boundary_non_support",
+        "control_or_generated_echo_non_support",
+    }
+    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0 and not diagnostic_non_support:
         return False
     if compact.get("status") != "no_evidence" and no_evidence.get("needed") is not True:
         return False

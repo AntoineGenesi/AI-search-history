@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -117,6 +118,8 @@ def build_agent_find_payload(
         candidates=candidates,
         no_evidence_mode=no_evidence_mode,
     )
+    if no_evidence_report.get("candidate_interpretation") == "control_or_generated_echo_non_support":
+        status = "no_evidence"
     next_read_rows = next_reads_from_candidates(
         candidates,
         expansion_action_context=expansion_action_context,
@@ -125,6 +128,7 @@ def build_agent_find_payload(
     if no_evidence_report.get("candidate_interpretation") in {
         "weak_context_only",
         "claim_boundary_non_support",
+        "control_or_generated_echo_non_support",
     }:
         next_read_rows = suppress_weak_context_next_reads(
             next_read_rows,
@@ -3342,6 +3346,10 @@ def source_locator_no_evidence_meaning(no_evidence_report: dict[str, Any] | None
                 else "Candidates may exist, but they are query echoes or claim-boundary/non-goal material; "
                 "the stronger asked claim is not supported in the searched scope."
                 if report.get("candidate_interpretation") == "claim_boundary_non_support"
+                else "Candidates may exist, but they are current/session/control echoes, same-run tool output, "
+                "prompt echoes, or generated/eval/report mentions; no completed-task proof was found in the "
+                "searched scope."
+                if report.get("candidate_interpretation") == "control_or_generated_echo_non_support"
                 else "No match survived selected roots, caps, filters, and parser scope."
             ),
             "candidate_interpretation": report.get("candidate_interpretation"),
@@ -6337,6 +6345,14 @@ def build_no_evidence_report(
         )
         if claim_boundary_report:
             return claim_boundary_report
+        control_echo_report = build_control_echo_no_evidence_report(
+            source_plan=source_plan,
+            source_scope=source_scope,
+            search_result=search_result,
+            candidates=list(candidates or []),
+        )
+        if control_echo_report:
+            return control_echo_report
         weak_context_report = build_weak_context_no_evidence_report(
             source_plan=source_plan,
             source_scope=source_scope,
@@ -6517,6 +6533,79 @@ def build_claim_boundary_no_evidence_report(
     }
 
 
+def build_control_echo_no_evidence_report(
+    *,
+    source_plan: dict,
+    source_scope: dict,
+    search_result: dict,
+    candidates: list[CandidateRow],
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    query = source_plan.get("query", {}) if isinstance(source_plan.get("query"), dict) else {}
+    query_text = query_text_from_plan(query)
+    target_task = task_slug_from_text(query_text)
+    if not query_asks_for_bounded_completed_task_evidence(query_text, target_task=target_task):
+        return None
+    proof_ids = [
+        candidate.candidate_id
+        for candidate in candidates
+        if target_task and candidate_claims_completed_task_proof(candidate, target_task)
+    ]
+    if proof_ids:
+        return None
+    rows = [
+        row
+        for row in (
+            control_echo_candidate(candidate, query_text=query_text, target_task=target_task)
+            for candidate in candidates
+        )
+        if row is not None
+    ]
+    if not rows:
+        return None
+    scope_clean = searched_scope_clean_for_scoped_no_evidence(source_scope)
+    return {
+        "needed": True,
+        "answer": "completed_task_proof_not_found_yet",
+        "answer_scope": "not_found_in_searched_scope",
+        "candidate_interpretation": "control_or_generated_echo_non_support",
+        "searched_scope": source_scope["searched_scope"],
+        "excluded_scope": source_scope["excluded_scope"]["rejected_roots"],
+        "excluded_scope_summary": source_scope["excluded_scope"],
+        "not_searched_scope": source_scope["not_searched_scope"],
+        "selected_roots": source_scope["selected_roots"],
+        "private_roots": source_scope["private_roots"],
+        "cap_hit": source_scope["cap_hit"],
+        "deferred_source_count": source_scope["not_searched_scope"]["source_plan"]["sources_deferred_budget"],
+        "retry_guidance": source_scope["not_searched_scope"]["source_plan"]["retry_guidance"],
+        "not_all_history_absence": True,
+        "candidate_rows_found": len(candidates),
+        "weak_candidate_count": len(candidates),
+        "weak_candidates": weak_context_candidates(candidates),
+        "control_or_generated_echo_candidates": rows[:INLINE_CANDIDATE_LIMIT],
+        "sufficient_to_stop_for_searched_scope_only": scope_clean,
+        "read_more_guidance": {
+            "required_before_scoped_no_evidence_answer": False,
+            "actionability": "optional_diagnostic_context",
+            "reason": (
+                "Surfaced candidates are current/session/control echoes, same-run tool output, "
+                "prompt echoes, or generated/eval/report mentions. They do not prove the named "
+                "task was completed, so they are optional diagnostics after a searched-scope "
+                "no-completed-task-proof answer."
+            ),
+        },
+        "warnings": search_result.get("warnings", []),
+        "blind_spots": search_result.get("blind_spots", []),
+        "why_not_confident": (
+            "Candidate rows were found, but the surfaced diagnostic rows were current/control echoes or "
+            "generated/eval/report mentions, and no same-target completed-task proof was found. "
+            "This supports only a searched-scope no-evidence answer; it does not prove all-history "
+            "absence or absence from unsearched, excluded, missing, or budget-deferred locations."
+        ),
+    }
+
+
 def no_evidence_query_term_coverage(source_plan: dict, candidates: list[CandidateRow]) -> dict[str, Any]:
     query = source_plan.get("query", {}) if isinstance(source_plan.get("query"), dict) else {}
     base_terms = [normalize_term_for_coverage(term) for term in query.get("base_terms") or []]
@@ -6591,6 +6680,17 @@ def query_asks_for_searched_scope_evidence(query_text: str) -> bool:
     )
 
 
+def query_asks_for_bounded_completed_task_evidence(query_text: str, *, target_task: str | None) -> bool:
+    lowered = normalize_for_claim_boundary(query_text)
+    return (
+        bool(target_task)
+        and "evidence" in lowered
+        and "completed" in lowered
+        and any(token in lowered for token in ("bounded", "searched scope", "searched-scope", "source scope"))
+        and any(token in lowered for token in ("is there", "whether", "does ", "did "))
+    )
+
+
 def query_text_from_plan(query: dict[str, Any]) -> str:
     return str(
         query.get("text")
@@ -6623,6 +6723,188 @@ def missing_only_scope_or_claim_verb_terms(coverage: dict[str, Any]) -> bool:
         "searched",
         "searched-scope",
     }
+
+
+def control_echo_candidate(
+    candidate: CandidateRow,
+    *,
+    query_text: str,
+    target_task: str | None,
+) -> dict[str, Any] | None:
+    text = normalize_for_claim_boundary(
+        " ".join(
+            [
+                candidate.snippet,
+                " ".join(candidate.reasons),
+                " ".join(candidate.reason_codes),
+                " ".join(candidate.artifacts),
+                str(candidate.path),
+                str(candidate.role or ""),
+            ]
+        )
+    )
+    reasons: list[str] = []
+    if exact_question_echo(text, query_text):
+        reasons.append("query_or_prompt_echo")
+    if current_or_same_run_tool_echo(candidate, text):
+        reasons.append("current_session_or_same_run_tool_output")
+    if generated_eval_or_report_mention(candidate, text):
+        reasons.append("generated_eval_or_report_mention")
+    if assignment_or_control_prompt_echo(text):
+        reasons.append("assignment_or_control_prompt_echo")
+    if target_task and target_task not in text:
+        return None
+    if not reasons:
+        return None
+    return {
+        "candidate_id": candidate.candidate_id,
+        "source_ref": candidate.source_ref,
+        "score": candidate.score,
+        "confidence": candidate.confidence,
+        "matched_terms": candidate.matched_terms,
+        "reason_codes": candidate.reason_codes,
+        "non_support_reasons": sorted(set(reasons)),
+    }
+
+
+def current_or_same_run_tool_echo(candidate: CandidateRow, normalized_text: str) -> bool:
+    role = normalize_for_claim_boundary(candidate.role or "")
+    return role in {
+        "custom tool call",
+        "function call",
+        "function call output",
+        "patch apply end",
+        "patch apply begin",
+        "tool call",
+        "tool output",
+        "tool result",
+    } or any(
+        marker in normalized_text
+        for marker in (
+            "function call output",
+            "same run command output",
+            "same-run command output",
+            "current session",
+            "current run",
+            "same lane",
+            "same-loop",
+            "same loop",
+        )
+    )
+
+
+def assignment_or_control_prompt_echo(normalized_text: str) -> bool:
+    return any(
+        marker in normalized_text
+        for marker in (
+            "you are the isolated implementer",
+            "current assignment",
+            "assignment prompt",
+            "control prompt",
+            "coordinator selects",
+            "do not touch the parent checkout",
+            "work only in this worktree",
+        )
+    )
+
+
+def generated_eval_or_report_mention(candidate: CandidateRow, normalized_text: str) -> bool:
+    joined_artifacts = normalize_for_claim_boundary(" ".join(candidate.artifacts))
+    path = normalize_for_claim_boundary(candidate.path)
+    artifact_text = " ".join([joined_artifacts, path, normalized_text])
+    generated_or_eval = any(
+        marker in artifact_text
+        for marker in (
+            "report",
+            "reports/",
+            "eval",
+            "evaluation",
+            "benchmark",
+            "slice",
+            "no evidence",
+            "no-evidence",
+            "ask execute",
+            "ask-execute",
+        )
+    )
+    return generated_or_eval and not completed_task_proof_text(normalized_text)
+
+
+def task_slug_from_text(text: str) -> str | None:
+    match = re.search(r"\b([a-z]+)[-_ ]?(\d{3,5}[a-z]?)\b", str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return None
+    return f"{match.group(1).lower()}-{match.group(2).lower()}"
+
+
+def candidate_is_completed_task_proof(candidate: CandidateRow, target_task: str) -> bool:
+    target = normalize_for_claim_boundary(target_task)
+    text = normalize_for_claim_boundary(
+        " ".join(
+            [
+                candidate.snippet,
+                " ".join(candidate.artifacts),
+                str(candidate.path),
+            ]
+        )
+    )
+    path = str(candidate.path).lower()
+    artifact_text = " ".join(candidate.artifacts).lower()
+    if target not in text:
+        return False
+    if not completed_task_proof_text_near_target(text, target):
+        return False
+    return any(
+        marker in path or marker in artifact_text
+        for marker in ("tasks/", "codex/state/reviews/", "reviews/", "git", "commit")
+    )
+
+
+def candidate_claims_completed_task_proof(candidate: CandidateRow, target_task: str) -> bool:
+    target = normalize_for_claim_boundary(target_task)
+    text = normalize_for_claim_boundary(
+        " ".join(
+            [
+                candidate.snippet,
+                " ".join(candidate.artifacts),
+                str(candidate.path),
+            ]
+        )
+    )
+    return target in text and completed_task_proof_text_near_target(text, target)
+
+
+def completed_task_proof_text_near_target(normalized_text: str, target: str) -> bool:
+    target_index = normalized_text.find(target)
+    if target_index < 0:
+        return False
+    for marker in COMPLETED_TASK_PROOF_MARKERS:
+        marker_index = normalized_text.find(marker)
+        while marker_index >= 0:
+            if abs(marker_index - target_index) <= 180:
+                return True
+            marker_index = normalized_text.find(marker, marker_index + 1)
+    return False
+
+
+def completed_task_proof_text(normalized_text: str) -> bool:
+    return any(marker in normalized_text for marker in COMPLETED_TASK_PROOF_MARKERS)
+
+
+COMPLETED_TASK_PROOF_MARKERS = (
+    "status active complete",
+    "status: complete",
+    "review verdict verified",
+    "verdict verified",
+    "review verified",
+    "completed task",
+    "task completed",
+    "is complete",
+    "verified and merged",
+    "merged commit",
+    "merge commit",
+    "implementation commit",
+)
 
 
 def claim_boundary_candidate(candidate: CandidateRow, query_text: str) -> dict[str, Any] | None:
