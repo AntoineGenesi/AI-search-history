@@ -156,6 +156,41 @@ def commit_lifecycle(repo: str | Path, ref: str, *, max_commits: int = 5) -> lis
     return rows
 
 
+def merge_commits_for_task(repo: str | Path, task_id: str, *, max_commits: int = 5) -> list[dict]:
+    repo_root = Path(repo).resolve(strict=False)
+    normalized_task = str(task_id or "").strip().upper()
+    if not normalized_task:
+        return []
+    limit = max(1, min(int(max_commits), 10))
+    result = _run_git(
+        repo_root,
+        [
+            "log",
+            "--merges",
+            f"--grep={normalized_task}",
+            f"--max-count={limit}",
+            "--format=%H%x00%cI%x00%an%x00%s",
+            "--all",
+        ],
+    )
+    if result is None or result.returncode != 0:
+        return []
+    rows: list[dict] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\x00", 3)
+        if len(parts) != 4 or not parts[0]:
+            continue
+        rows.append(
+            GitLifecycleCommit(
+                commit=parts[0],
+                commit_time=parts[1],
+                author=parts[2],
+                subject=parts[3],
+            ).to_dict()
+        )
+    return rows
+
+
 def worktree_metadata(repo: str | Path) -> dict | None:
     repo_root = Path(repo).resolve(strict=False)
     top = _run_git(repo_root, ["rev-parse", "--show-toplevel"])
