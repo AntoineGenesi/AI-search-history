@@ -52,6 +52,12 @@ def build_coordinator_context_payload(*, cwd: str | Path, query: str, report_out
     )
     optional_diagnostics = _optional_diagnostics(repo)
     current_state = _current_state(file_texts=file_texts, task_texts=task_texts)
+    active_status = _active_status_front_door_state(
+        file_texts=file_texts,
+        task_texts=task_texts,
+        active_task_handles=active_task_handles,
+        source_files=source_files,
+    )
     why_goals = _why_goals_guiding_principles(file_texts=file_texts, task_texts=task_texts)
     learnings = _learning_rows(learning_texts.get("learnings/INDEX.md", ""))
     failure_modes = _failure_mode_watchlist(
@@ -75,6 +81,7 @@ def build_coordinator_context_payload(*, cwd: str | Path, query: str, report_out
             "vectors_or_indexes_included": False,
             "not_all_history_completeness": True,
         },
+        "active_status_front_door": active_status,
         "current_state": current_state,
         "active_task_handles": active_task_handles,
         "front_door_handles": [
@@ -163,23 +170,30 @@ def _active_task_handles(file_texts: dict[str, str]) -> list[str]:
     combined = "\n".join(_current_front_door_portion(text) for text in file_texts.values())
     handles: list[str] = []
     active_patterns = (
+        r"Active selected product task is\s*\n?`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
         r"active_task:\s*`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
         r"Current active\s+task is\s*`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
+        r"Active selected product task:\s*\n?`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
         r"Active selected task:\s*\n?`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
         r"Active selected task:\s*`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
     )
     for pattern in active_patterns:
-        for match in re.finditer(pattern, combined):
+        match = re.search(pattern, combined, flags=re.IGNORECASE)
+        if match:
             rel = match.group(1)
-            if rel not in handles:
-                handles.append(rel)
-    if not handles:
-        for match in re.finditer(r"`?(tasks/[A-Za-z0-9_.\-/]+\.md)`?", combined):
-            rel = match.group(1)
-            if rel not in handles:
-                handles.append(rel)
+            handles.append(rel)
+            break
+    if handles:
+        match = re.search(r"jsh-(\d{3,4}[a-z]?)", handles[0], flags=re.IGNORECASE)
+        if match:
+            handles.append(f"JSH-{match.group(1).upper()}")
+        return handles[:2]
+    for match in re.finditer(r"`?(tasks/[A-Za-z0-9_.\-/]+\.md)`?", combined):
+        rel = match.group(1)
+        if rel not in handles:
+            handles.append(rel)
     if not any(handle.startswith("JSH-") for handle in handles):
-        for handle in list(handles):
+        for handle in list(handles[:1]):
             match = re.search(r"jsh-(\d{3,4}[a-z]?)", handle, flags=re.IGNORECASE)
             if match:
                 task_handle = f"JSH-{match.group(1).upper()}"
@@ -199,6 +213,7 @@ def _current_front_door_portion(text: str) -> str:
         "Latest closed task:",
         "\n## Closed",
         "\n## Historical",
+        "\nHistorical queue state follows",
         "\nHistorical context",
     ):
         if marker in text:
@@ -271,6 +286,93 @@ def _current_state(*, file_texts: dict[str, str], task_texts: dict[str, str]) ->
         "status": "read_required_front_doors",
         "summary_lines": _extract_snippets({**file_texts, **task_texts}, terms, limit=10),
     }
+
+
+def _active_status_front_door_state(
+    *,
+    file_texts: dict[str, str],
+    task_texts: dict[str, str],
+    active_task_handles: list[str],
+    source_files: list[dict],
+) -> dict:
+    pipeline_text = _current_front_door_portion(file_texts.get("codex/state/pipeline-state.md", ""))
+    task_combined = "\n".join(task_texts.values())
+    combined_front_door = "\n".join(
+        _current_front_door_portion(file_texts.get(path, ""))
+        for path in PRIMARY_CONTEXT_PATHS
+    )
+    combined_all = combined_front_door + "\n" + task_combined
+    active_task_path = next((handle for handle in active_task_handles if handle.startswith("tasks/")), "")
+    active_task_id = _task_id_from_path(active_task_path)
+    fsm_state = _first_regex_group(
+        pipeline_text or combined_front_door,
+        (
+            r"Current FSM state:\s*\n?`?([A-Z0-9_ -]+)`?",
+            r"fsm_state:\s*`?([A-Z0-9_ -]+)`?",
+        ),
+    )
+    current_substate = _first_regex_group(
+        pipeline_text or combined_all,
+        (
+            r"Current FSM state:\s*\n?`?[A-Z0-9_ -]+`?\s*/\s*([^\n.]+)",
+            r"current_substate:\s*([^\n]+)",
+        ),
+    )
+    next_legal_action = _first_regex_group(
+        pipeline_text or combined_front_door,
+        (
+            r"Next allowed transition:\s*\n?`?([A-Z0-9_ -]+)`?",
+            r"next_allowed_transition:\s*`?([A-Z0-9_ -]+)`?",
+            r"Next legal coordinator action:\s*([^\n]+)",
+            r"The next legal move is to ([^\n.]+)",
+        ),
+    )
+    product_bottleneck = _first_regex_group(combined_all, (r"product_bottleneck:\s*([^\n]+)",))
+    source_refs = [
+        {
+            "path": str(item.get("path") or ""),
+            "role": str(item.get("role") or ""),
+            "exists": bool(item.get("exists")),
+        }
+        for item in source_files
+        if str(item.get("role") or "") in {"required_front_door", "active_task"}
+    ]
+    return {
+        "status": "ready" if active_task_path and fsm_state and next_legal_action else "incomplete",
+        "active_task_path": active_task_path,
+        "active_task_id": active_task_id,
+        "fsm_state": _clean_status_value(fsm_state),
+        "current_substate": _clean_status_value(current_substate),
+        "next_legal_action": _clean_status_value(next_legal_action),
+        "product_bottleneck": _safe_snippet(product_bottleneck) if product_bottleneck else "",
+        "currentness_boundary": (
+            "This is local repo front-door state from whitelisted files only; it does not prove "
+            "raw source-session chronology, worker action chronology, all-history completeness, "
+            "upstream remote currentness, or latest release currentness."
+        ),
+        "source_refs": source_refs,
+    }
+
+
+def _task_id_from_path(path: str) -> str:
+    match = re.search(r"jsh-(\d{3,4}[a-z]?)", path, flags=re.IGNORECASE)
+    return f"JSH-{match.group(1).upper()}" if match else ""
+
+
+def _first_regex_group(text: str, patterns: tuple[str, ...]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip("` ")
+    return ""
+
+
+def _clean_status_value(value: str) -> str:
+    value = " ".join(str(value or "").strip().strip("`").split())
+    value = value.rstrip(".")
+    if len(value) > MAX_SNIPPET_CHARS:
+        return value[: MAX_SNIPPET_CHARS - 3].rstrip() + "..."
+    return value
 
 
 def _why_goals_guiding_principles(*, file_texts: dict[str, str], task_texts: dict[str, str]) -> dict:

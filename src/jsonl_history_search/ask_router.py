@@ -22,7 +22,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
 )
 EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES = frozenset({"devlog_failure_analysis"})
 EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
-EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"coordinator_context"})
+EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"active_status_front_door", "coordinator_context"})
 EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
 EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
@@ -219,6 +219,38 @@ COORDINATOR_CONTEXT_ROUTE = AskRoute(
         "package leaves a named gap. This route is a committed-safe current "
         "context/next-read package, not source-window recovery, launch readiness, "
         "all-history completeness, token savings, or a final answer generator."
+    ),
+)
+
+ACTIVE_STATUS_FRONT_DOOR_ROUTE = AskRoute(
+    route_family="active_status_front_door",
+    chosen_route="active-status-front-door / coordinator-context",
+    why_it_applies=(
+        "The wording asks for the active/current repo task, coordinator state, "
+        "or next legal action. Use the repo front-door state files instead of "
+        "raw conversation chronology or semantic-debug diagnostics."
+    ),
+    first_command_template=(
+        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        "--report-output .private/jsonl/ask-execute-active-status-front-door.json"
+    ),
+    read_specialization="references/coordinator-context.md",
+    inspect_after=(
+        "ask_execute.executed_output.active_status_front_door.active_task_path",
+        "ask_execute.executed_output.active_status_front_door.fsm_state",
+        "ask_execute.executed_output.active_status_front_door.next_legal_action",
+        "front-door refs only: codex/state/pipeline-state.md, codex/state/current-context-window.md, TODO.md, and active task file",
+    ),
+    stop_guidance=(
+        "Answer current repo-status questions from inspected front-door files: "
+        "pipeline state, current context window, TODO front door, and the active task. "
+        "Do not use those files as raw source-session chronology, worker action chronology, "
+        "or causal expectation-mismatch proof."
+    ),
+    manual_search_guidance=(
+        "Manual search is follow-up only when the front-door files are missing, "
+        "contradictory, or not this repo. Preserve the boundary between local "
+        "front-door state and unproven upstream/release currentness."
     ),
 )
 
@@ -707,6 +739,12 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_expectation_mismatch_query(normalized):
         return EXPECTATION_MISMATCH_ROUTE
 
+    if _looks_like_coordinator_context_query(normalized):
+        return COORDINATOR_CONTEXT_ROUTE
+
+    if _looks_like_active_status_front_door_query(normalized):
+        return ACTIVE_STATUS_FRONT_DOOR_ROUTE
+
     if _looks_like_latest_status_anchor_query(normalized):
         return ROUTES[5]
 
@@ -745,9 +783,6 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_ticket_currentness(normalized):
         return ROUTES[8]
-
-    if _looks_like_coordinator_context_query(normalized):
-        return COORDINATOR_CONTEXT_ROUTE
 
     if _looks_like_repeated_complaint_or_failure_query(normalized):
         return ROUTES[9]
@@ -1731,6 +1766,49 @@ def _looks_like_coordinator_context_query(normalized: str) -> bool:
     if _has_any(normalized, complaint_mining_terms) and facet_hits < 6:
         return False
     return True
+
+
+def _looks_like_active_status_front_door_query(normalized: str) -> bool:
+    if re.search(r"\bjsh-\d{3,4}[a-z0-9-]*\b", normalized) and "active" not in normalized:
+        return False
+    status_intent = _has_any(
+        normalized,
+        (
+            "active jsonl task",
+            "active task",
+            "active selected product task",
+            "current coordinator state",
+            "current fsm state",
+            "current repo status",
+            "current project status",
+            "current state in this project",
+            "what should happen next",
+            "what should happen next in this project",
+            "next legal action",
+            "next legal move",
+            "what is active",
+            "what is the active",
+        ),
+    )
+    repo_context = _has_any(
+        normalized,
+        (
+            "jsonl",
+            "repo",
+            "repository",
+            "project",
+            "coordinator",
+            "fsm",
+            "task",
+            "front door",
+            "front-door",
+            "pipeline",
+            "todo",
+        ),
+    )
+    if status_intent and repo_context:
+        return True
+    return _has_any(normalized, ("what is the active jsonl task", "what's the active jsonl task"))
 
 
 def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
