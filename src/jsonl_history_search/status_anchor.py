@@ -315,6 +315,7 @@ def status_anchor_report(
     canonical_parent_main_interval = _canonical_parent_main_status_interval(
         query=query,
         codex_home=codex_home,
+        cwd=cwd,
         status_as_of_boundary=status_as_of_boundary,
     )
     prior_request_occurrence = _prior_request_occurrence_recovery(
@@ -1431,6 +1432,7 @@ def _canonical_parent_main_status_interval(
     *,
     query: str,
     codex_home: Path | None,
+    cwd: Path,
     status_as_of_boundary: dict | None,
 ) -> dict:
     if not codex_home or not is_status_question(query) or not (
@@ -1460,7 +1462,14 @@ def _canonical_parent_main_status_interval(
                 for row in _canonical_history_boundary_rows(rows, query=query)[:6]
             ],
         }
-    anchor = _preceding_eligible_history_anchor(rows, boundary, require_parent_main=True)
+    lineage = _parent_thread_lineage_anchor_resolution(
+        rows=rows,
+        boundary=boundary,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
+    structurally_selected = lineage.get("selected_anchor") if lineage.get("status") == "selected" else None
+    anchor = structurally_selected or _preceding_eligible_history_anchor(rows, boundary, require_parent_main=True)
     if anchor is None:
         return {
             "status": "ambiguous",
@@ -1478,18 +1487,37 @@ def _canonical_parent_main_status_interval(
         + "; selected by bounded canonical history fallback before the explicit parent/main status boundary"
     )
     anchor_candidates = _canonical_parent_main_anchor_candidates(rows, boundary)
+    if lineage.get("status") in {"selected", "ambiguous"}:
+        anchor_candidates = _apply_lineage_resolution_to_candidates(anchor_candidates, lineage)
+        if lineage.get("status") == "selected":
+            selected["parent_thread_lineage_anchor"] = True
+            selected["lineage_resolution"] = lineage.get("selected_lineage")
+            selected["rationale"] = (
+                str(selected.get("rationale") or "").rstrip()
+                + "; selected by structural parent/root lineage, cwd, workspace-root, and role/source metadata before ranking"
+            )
     return {
         "status": "selected",
         "kind": "canonical_parent_main_status_interval",
-        "reason": "nearest_preceding_different_thread_canonical_history_human_row_found",
+        "reason": (
+            "structural_parent_thread_lineage_anchor_selected"
+            if lineage.get("status") == "selected"
+            else "nearest_preceding_different_thread_canonical_history_human_row_found"
+        ),
         "context_boundary": "explicit_parent_main_canonical_status_interval",
-        "anchor_reason": "canonical_parent_main_status_interval",
+        "anchor_reason": (
+            "parent_thread_lineage_anchor"
+            if lineage.get("status") == "selected"
+            else "canonical_parent_main_status_interval"
+        ),
         "status_as_of_boundary": _canonical_parent_main_boundary(boundary),
         "selected_anchor": selected,
         "start_anchor": selected,
         "boundary": _occurrence_candidate(boundary),
         "anchor_candidates": anchor_candidates,
-        "rejected_anchor_alternatives": [_occurrence_candidate(boundary)],
+        "rejected_anchor_alternatives": (lineage.get("rejected_anchor_alternatives") or [])
+        + [_occurrence_candidate(boundary)],
+        "parent_thread_lineage_anchor": lineage,
         "answer_target_window": {
             "kind": "canonical_parent_main_status_interval",
             "start_source_ref": selected.get("source_ref"),
@@ -1527,6 +1555,268 @@ def _canonical_parent_main_anchor_candidates(rows: list[dict], boundary: dict, *
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def _parent_thread_lineage_anchor_resolution(
+    *,
+    rows: list[dict],
+    boundary: dict,
+    cwd: Path,
+    codex_home: Path | None,
+    limit: int = 12,
+) -> dict:
+    if codex_home is None:
+        return {"status": "not_applicable", "reason": "missing_codex_home"}
+    boundary_line = int(boundary.get("line") or 0)
+    boundary_threads = set(boundary.get("thread_keys") or [])
+    inspected = []
+    rejected = []
+    eligible = []
+    for row in sorted(
+        (item for item in rows if int(item.get("line") or 0) < boundary_line),
+        key=lambda item: int(item.get("line") or 0),
+        reverse=True,
+    ):
+        if _thread_key_overlap(row, boundary_threads):
+            continue
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            continue
+        candidate = dict(row)
+        lineage = _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        if lineage.get("status") == "no_raw_session_metadata":
+            continue
+        inspected.append(candidate.get("source_ref"))
+        reason = _parent_thread_lineage_rejection_reason(lineage)
+        if reason:
+            rejected.append(_lineage_rejected_anchor(candidate, lineage, reason))
+        else:
+            selected = dict(candidate)
+            selected["parent_thread_lineage_anchor"] = True
+            selected["lineage_resolution"] = lineage
+            eligible.append(selected)
+        if len(inspected) >= limit:
+            break
+    if not inspected:
+        return {"status": "not_applicable", "reason": "no_candidate_raw_session_metadata"}
+    if eligible:
+        selected = eligible[0]
+        return {
+            "status": "selected",
+            "contract": "parent_thread_lineage_anchor",
+            "selected_anchor": selected,
+            "selected_anchor_ref": selected.get("source_ref"),
+            "selected_lineage": selected.get("lineage_resolution"),
+            "eligible_count": len(eligible),
+            "rejected_count": len(rejected),
+            "inspected_count": len(inspected),
+            "rejected_anchor_alternatives": rejected[:8],
+            "selection_policy": (
+                "For explicit parent/main status asks, resolve parent/root lineage from raw session metadata "
+                "before ranking: require a user/root session compatible with --cwd/workspace roots and reject "
+                "unrelated project roots plus worker/reviewer/control child sessions."
+            ),
+        }
+    return {
+        "status": "ambiguous",
+        "contract": "parent_thread_lineage_anchor",
+        "reason": "raw_session_metadata_found_but_no_structurally_valid_parent_thread_anchor",
+        "eligible_count": 0,
+        "rejected_count": len(rejected),
+        "inspected_count": len(inspected),
+        "rejected_anchor_alternatives": rejected[:8],
+        "selection_policy": (
+            "All inspected candidate anchors were rejected by raw session lineage, cwd/workspace-root, "
+            "or role/source metadata."
+        ),
+    }
+
+
+def _apply_lineage_resolution_to_candidates(candidates: list[dict], lineage: dict) -> list[dict]:
+    by_ref = {
+        str(item.get("source_ref") or ""): item
+        for item in lineage.get("rejected_anchor_alternatives") or []
+        if item.get("source_ref")
+    }
+    selected_ref = str(lineage.get("selected_anchor_ref") or "")
+    updated = []
+    for candidate in candidates:
+        ref = str(candidate.get("source_ref") or "")
+        if ref == selected_ref:
+            enriched = dict(candidate)
+            enriched["parent_thread_lineage_anchor"] = True
+            enriched["lineage_resolution"] = lineage.get("selected_lineage")
+            updated.append(enriched)
+            continue
+        rejected = by_ref.get(ref)
+        if rejected:
+            enriched = dict(candidate)
+            enriched.update(
+                {
+                    "decision": "rejected",
+                    "source_scope": "structural_lineage_rejected_parent_main_candidate",
+                    "lineage_resolution": rejected.get("lineage_resolution"),
+                    "lineage_rejection_reason": rejected.get("lineage_rejection_reason"),
+                    "rationale": rejected.get("rationale"),
+                }
+            )
+            updated.append(enriched)
+            continue
+        updated.append(candidate)
+    return updated
+
+
+def _lineage_for_anchor(anchor: dict, *, codex_home: Path, cwd: Path) -> dict:
+    contexts = _session_contexts_for_anchor(anchor, codex_home, role="lineage_candidate")
+    files = []
+    for context in contexts:
+        files.extend(Path(path) for path in context.get("session_files") or [])
+    if not files:
+        return {"status": "no_raw_session_metadata", "reason": "no_session_file_for_candidate"}
+    metas = [_session_lineage_metadata(path, cwd=cwd) for path in files]
+    metas = [meta for meta in metas if meta.get("status") == "ok"]
+    if not metas:
+        return {"status": "no_raw_session_metadata", "reason": "session_files_have_no_session_meta"}
+    primary = metas[0]
+    return {
+        "status": "ok",
+        "session_id_hash": primary.get("session_id_hash"),
+        "raw_thread_id_hash": primary.get("raw_thread_id_hash"),
+        "parent_thread_id_hash": primary.get("parent_thread_id_hash"),
+        "root_thread_id_hash": primary.get("root_thread_id_hash"),
+        "thread_source": primary.get("thread_source"),
+        "agent_role": primary.get("agent_role"),
+        "source_kind": primary.get("source_kind"),
+        "cwd": primary.get("cwd"),
+        "cwd_relation": primary.get("cwd_relation"),
+        "workspace_roots": primary.get("workspace_roots"),
+        "workspace_relation": primary.get("workspace_relation"),
+        "session_file_count": len(metas),
+        "session_source_refs": [meta.get("session_source_ref") for meta in metas if meta.get("session_source_ref")],
+    }
+
+
+def _session_lineage_metadata(path: Path, *, cwd: Path) -> dict:
+    session_meta: Mapping[str, Any] | None = None
+    workspace_roots: list[str] = []
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return {"status": "missing", "reason": "session_file_open_failed"}
+    with handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            if record.get("type") == "session_meta" and isinstance(record.get("payload"), Mapping):
+                session_meta = record.get("payload")
+                continue
+            if record.get("type") == "turn_context" and isinstance(record.get("payload"), Mapping):
+                roots = record.get("payload", {}).get("workspace_roots")
+                if isinstance(roots, list):
+                    workspace_roots.extend(str(root) for root in roots if root)
+            if session_meta is not None and workspace_roots:
+                break
+    if session_meta is None:
+        return {"status": "missing", "reason": "session_meta_missing"}
+    source = session_meta.get("source")
+    source_kind = "cli"
+    if isinstance(source, Mapping) and "subagent" in source:
+        source_kind = "subagent"
+    elif source:
+        source_kind = str(source)
+    session_id = session_meta.get("session_id")
+    raw_thread_id = session_meta.get("id") or session_id
+    parent_thread_id = session_meta.get("parent_thread_id")
+    root_thread_id = parent_thread_id or session_id or raw_thread_id
+    meta_cwd = str(session_meta.get("cwd") or "")
+    cwd_relation = _path_relation(meta_cwd, cwd)
+    workspace_roots = workspace_roots or ([meta_cwd] if meta_cwd else [])
+    workspace_relation = "unknown"
+    if workspace_roots:
+        workspace_relation = (
+            "compatible"
+            if any(_path_relation(root, cwd) != "unrelated" for root in workspace_roots)
+            else "unrelated"
+        )
+    return {
+        "status": "ok",
+        "session_source_ref": str(path),
+        "session_id_hash": _hash_value(session_id),
+        "raw_thread_id_hash": _hash_value(raw_thread_id),
+        "parent_thread_id_hash": _hash_value(parent_thread_id),
+        "root_thread_id_hash": _hash_value(root_thread_id),
+        "thread_source": session_meta.get("thread_source"),
+        "agent_role": session_meta.get("agent_role"),
+        "source_kind": source_kind,
+        "cwd": meta_cwd,
+        "cwd_relation": cwd_relation,
+        "workspace_roots": workspace_roots,
+        "workspace_relation": workspace_relation,
+    }
+
+
+def _path_relation(path_text: str, cwd: Path) -> str:
+    if not path_text:
+        return "unknown"
+    try:
+        left = Path(path_text).expanduser().resolve()
+        right = cwd.expanduser().resolve()
+    except OSError:
+        return "unknown"
+    if left == right:
+        return "same"
+    try:
+        right.relative_to(left)
+        return "candidate_root_contains_cwd"
+    except ValueError:
+        pass
+    try:
+        left.relative_to(right)
+        return "cwd_contains_candidate_root"
+    except ValueError:
+        pass
+    return "unrelated"
+
+
+def _parent_thread_lineage_rejection_reason(lineage: dict) -> str | None:
+    role = str(lineage.get("agent_role") or "").casefold()
+    thread_source = str(lineage.get("thread_source") or "").casefold()
+    source_kind = str(lineage.get("source_kind") or "").casefold()
+    if thread_source in {"subagent", "worker", "reviewer"} or source_kind == "subagent" or role in {
+        "worker",
+        "reviewer",
+        "rereviewer",
+    }:
+        return "child_worker_reviewer_or_control_session"
+    if lineage.get("cwd_relation") == "unrelated" and lineage.get("workspace_relation") == "unrelated":
+        return "unrelated_project_or_workspace_root"
+    if thread_source and thread_source != "user":
+        return "non_user_thread_source_not_parent_thread_anchor"
+    return None
+
+
+def _lineage_rejected_anchor(candidate: dict, lineage: dict, reason: str) -> dict:
+    rationale = str(candidate.get("rationale") or "").rstrip()
+    suffix = f"rejected by parent_thread_lineage_anchor: {reason}"
+    return {
+        "source_ref": candidate.get("source_ref"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "classification": candidate.get("classification"),
+        "decision": "rejected",
+        "rationale": f"{rationale}; {suffix}" if rationale else suffix,
+        "snippet": candidate.get("snippet"),
+        "source_kind": candidate.get("source_kind"),
+        "source_scope": "structural_lineage_rejected_parent_main_candidate",
+        "lineage_rejection_reason": reason,
+        "lineage_resolution": lineage,
+        "openable_source_ref": candidate.get("openable_source_ref"),
+        "openable_target": candidate.get("openable_target"),
+        "target_window_hits": candidate.get("target_window_hits") or [],
+        "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+    }
 
 
 def _canonical_parent_main_fallback_from_interval(interval: dict) -> dict:
@@ -2847,6 +3137,11 @@ def _parent_main_canonical_shortlist_candidates(
 
 
 def _parent_main_high_confidence_refs(candidates: list[dict]) -> set[str]:
+    candidates = [
+        candidate
+        for candidate in candidates
+        if not candidate.get("lineage_rejection_reason") and candidate.get("decision") != "rejected"
+    ]
     if not candidates:
         return set()
     top = candidates[0]
@@ -2900,6 +3195,16 @@ def _parent_main_shortlist_item(
     cwd: Path,
     codex_home: Path | None,
 ) -> dict:
+    lineage = candidate.get("lineage_resolution")
+    lineage_reason = candidate.get("lineage_rejection_reason")
+    if not lineage_reason and codex_home is not None and candidate.get("source_kind") == "codex_sessions":
+        computed_lineage = _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        computed_reason = _parent_thread_lineage_rejection_reason(computed_lineage)
+        if computed_reason:
+            lineage = computed_lineage
+            lineage_reason = computed_reason
+            source_scope = "structural_lineage_rejected_parent_main_candidate"
+            ambiguity_label = computed_reason
     item = {
         "source_ref": candidate.get("source_ref"),
         "source_kind": candidate.get("source_kind"),
@@ -2923,10 +3228,18 @@ def _parent_main_shortlist_item(
             cwd=cwd,
             codex_home=codex_home,
         )
+    if candidate.get("parent_thread_lineage_anchor"):
+        item["parent_thread_lineage_anchor"] = candidate.get("parent_thread_lineage_anchor")
+    if lineage:
+        item["lineage_resolution"] = lineage
+    if lineage_reason:
+        item["lineage_rejection_reason"] = lineage_reason
     return item
 
 
 def _parent_main_candidate_scope(candidate: dict) -> str:
+    if candidate.get("lineage_rejection_reason"):
+        return "structural_lineage_rejected_parent_main_candidate"
     if candidate.get("classification") in {"worker_or_reviewer_prompt", "non_human_boundary_or_tool_context"}:
         return "worker_reviewer_or_current_loop_diagnostic"
     if candidate.get("source_kind") == "codex_history":
@@ -2937,6 +3250,8 @@ def _parent_main_candidate_scope(candidate: dict) -> str:
 
 
 def _parent_main_diagnostic_ambiguity_label(candidate: dict) -> str:
+    if candidate.get("lineage_rejection_reason"):
+        return str(candidate.get("lineage_rejection_reason"))
     classification = candidate.get("classification")
     if classification == "worker_or_reviewer_prompt":
         return "worker_or_reviewer_row_not_parent_main_anchor"
@@ -2967,6 +3282,8 @@ def _shortlist_rejected_anchor_alternatives(shortlist_candidates: list[dict]) ->
                 "openable_source_ref": item.get("openable_source_ref"),
                 "openable_target": item.get("openable_target"),
                 "read_more_command": item.get("read_more_command"),
+                "lineage_rejection_reason": item.get("lineage_rejection_reason"),
+                "lineage_resolution": item.get("lineage_resolution"),
                 "target_window_hits": item.get("target_window_hits") or [],
                 "outside_target_task_ids": item.get("outside_target_task_ids") or [],
             }
