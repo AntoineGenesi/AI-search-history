@@ -1107,7 +1107,6 @@ def looks_like_expectation_mismatch_query(text: str) -> bool:
             "prior instruction",
             "plan was",
             "stop after",
-            "instead of",
         )
     )
     observed = any(
@@ -7463,18 +7462,42 @@ def build_expectation_mismatch_plan(
 
     core_reads = list(core_convo_first_read_plan.get("read") or [])
     core_diagnostics = list(core_convo_first_read_plan.get("diagnostics_after") or [])
-    actionable_reads = core_reads or [
+    candidate_actionable_reads = core_reads or [
         read
         for read in next_reads
         if isinstance(read, dict)
         and core_convo_target_source_role(read) != "diagnostic_or_post_hoc"
     ]
-    diagnostic_reads = core_diagnostics or [
+    candidate_diagnostic_reads = core_diagnostics or [
         read
         for read in next_reads
         if isinstance(read, dict)
         and core_convo_target_source_role(read) == "diagnostic_or_post_hoc"
     ]
+    actionable_reads: list[dict[str, Any]] = []
+    diagnostic_reads: list[dict[str, Any]] = list(candidate_diagnostic_reads)
+    demoted_reads: list[dict[str, Any]] = []
+    for read in candidate_actionable_reads:
+        if not isinstance(read, dict):
+            continue
+        reject_reasons = expectation_mismatch_plan_read_reject_reasons(read, query=query)
+        if reject_reasons:
+            demoted = expectation_mismatch_annotated_read(read, role="diagnostic_or_post_hoc")
+            demoted["expectation_mismatch_demoted_from_actionable"] = True
+            demoted["expectation_mismatch_demotion_reasons"] = reject_reasons
+            demoted["target_source_role"] = "diagnostic_or_post_hoc"
+            demoted["final_support_allowed"] = False
+            demoted["diagnostic_only"] = True
+            demoted["read_more_actionable"] = False
+            demoted["followthrough_actionable"] = False
+            demoted.setdefault(
+                "reason",
+                "demoted expectation-mismatch repair/control/setup or wrong-target source lead",
+            )
+            demoted_reads.append(demoted)
+            diagnostic_reads.append(demoted)
+            continue
+        actionable_reads.append(read)
 
     buckets: dict[str, list[dict[str, Any]]] = {
         role: [] for role in EXPECTATION_MISMATCH_READ_ORDER
@@ -7525,13 +7548,24 @@ def build_expectation_mismatch_plan(
     for role in ("expected_behavior_evidence", "observed_behavior_or_action_proof", "divergence_evidence"):
         read.extend(buckets[role])
     read = core_convo_dedupe_role_reads(read)[:limit]
+    if not read and demoted_reads:
+        read = [expectation_mismatch_missing_role_guidance_read(query=query, demoted_reads=demoted_reads)]
 
     counts = {role: len(buckets[role]) for role in EXPECTATION_MISMATCH_READ_ORDER}
+    clean_read_count = sum(counts[role] for role in EXPECTATION_MISMATCH_READ_ORDER if role != "diagnostic_or_post_hoc")
     return {
         "schema_version": 1,
         "plan_name": "expectation_mismatch_plan",
         "applies": True,
-        "status": "ready" if read or buckets["diagnostic_or_post_hoc"] else "empty",
+        "status": (
+            "ready"
+            if clean_read_count
+            else "missing_clean_actionable_reads"
+            if demoted_reads
+            else "ready"
+            if buckets["diagnostic_or_post_hoc"]
+            else "empty"
+        ),
         "question_family": "expectation_mismatch",
         "read_order": list(EXPECTATION_MISMATCH_READ_ORDER),
         "read": read,
@@ -7542,6 +7576,16 @@ def build_expectation_mismatch_plan(
         "diagnostic_or_post_hoc": buckets["diagnostic_or_post_hoc"],
         "diagnostics_after": buckets["diagnostic_or_post_hoc"],
         "counts": counts,
+        "demoted_actionable_read_count": len(demoted_reads),
+        "missing_clean_facets": (
+            [
+                role
+                for role in ("expected_behavior_evidence", "observed_behavior_or_action_proof", "divergence_evidence")
+                if not buckets[role]
+            ]
+            if demoted_reads
+            else []
+        ),
         "core_convo_first_read_plan": {
             "link": "semantic_debug.core_convo_first_read_plan",
             "status": core_convo_first_read_plan.get("status"),
@@ -7622,6 +7666,137 @@ def expectation_mismatch_read_roles(read: dict[str, Any], *, query: str) -> list
     if core_convo_target_source_role(read) == "legitimate_context":
         roles.append("legitimate_context")
     return dedupe(roles)
+
+
+def expectation_mismatch_plan_read_reject_reasons(read: dict[str, Any], *, query: str) -> list[str]:
+    text = expectation_mismatch_plan_read_text(read)
+    normalized = " ".join(text.casefold().replace("_", " ").split())
+    reasons: list[str] = []
+    required_ids = expectation_mismatch_query_episode_ids(query)
+    read_ids = set(expectation_mismatch_query_episode_ids(text))
+    if required_ids and not required_ids.intersection(read_ids):
+        reasons.append("missing_requested_target_episode:" + ",".join(sorted(required_ids)))
+    wrong_ids = sorted(read_ids - required_ids) if required_ids else []
+    if wrong_ids:
+        reasons.append("mentions_different_episode:" + ",".join(wrong_ids[:4]))
+    echo = setup_echo_classification(text, query=query)
+    if echo.get("is_setup_echo"):
+        reasons.append(f"setup_or_assignment_echo:{echo.get('reason') or 'setup_echo'}")
+    if any(
+        marker in normalized
+        for marker in (
+            "repair prompt",
+            "control prompt",
+            "current assignment",
+            "assignment prompt",
+            "implementer assignment",
+            "reviewer assignment",
+            "read the implementer skill",
+            "setup command",
+            "function call output",
+            "function call",
+            "tool call",
+            "same loop",
+            "same-loop",
+            "current run",
+            "current-run",
+        )
+    ):
+        reasons.append("repair_control_setup_or_current_echo_marker")
+    if read.get("diagnostic_only") is True or read.get("read_more_actionable") is False:
+        reasons.append("diagnostic_or_non_actionable")
+    if read.get("followthrough_actionable") is False:
+        reasons.append("not_followthrough_actionable")
+    if str(read.get("target_source_role") or "") == "diagnostic_or_post_hoc":
+        reasons.append("target_source_role_diagnostic_or_post_hoc")
+    if read.get("final_support_allowed") is False:
+        reasons.append("final_support_not_allowed")
+    return dedupe(reasons)
+
+
+def expectation_mismatch_query_episode_ids(text: str) -> set[str]:
+    return {
+        match.group(0).casefold().replace("_", "-")
+        for match in re.finditer(r"(?<![a-z0-9_.-])jsh-\d{2,}[a-z0-9-]*(?![a-z0-9_.-])", str(text or ""), re.I)
+    }
+
+
+def expectation_mismatch_plan_read_text(read: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for nested in value.values():
+                add(nested)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                add(nested)
+            return
+        parts.append(str(value))
+
+    for key in (
+        "target",
+        "openable_target",
+        "path",
+        "reason",
+        "snippet",
+        "summary",
+        "command",
+        "kind",
+        "target_source_role",
+        "source_ref",
+        "openable_source_ref",
+        "action_proof_source_selection",
+        "record_metadata",
+    ):
+        add(read.get(key))
+    return " ".join(parts)
+
+
+def expectation_mismatch_missing_role_guidance_read(
+    *,
+    query: str,
+    demoted_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    missing = ["expected_behavior_evidence", "observed_behavior_or_action_proof", "divergence_evidence"]
+    targets = [
+        str(item.get("target") or item.get("openable_target") or item.get("path") or "")
+        for item in demoted_reads[:4]
+        if str(item.get("target") or item.get("openable_target") or item.get("path") or "").strip()
+    ]
+    reasons = dedupe(
+        reason
+        for item in demoted_reads
+        for reason in item.get("expectation_mismatch_demotion_reasons") or []
+        if str(reason).strip()
+    )
+    return {
+        "kind": "expectation_mismatch_missing_facet_guidance",
+        "status": "no_clean_actionable_expectation_mismatch_reads",
+        "target": None,
+        "target_source_role": "missing_clean_expectation_mismatch_facets",
+        "expectation_mismatch_role": "missing_required_facets",
+        "missing_facets": missing,
+        "required_target_ids": sorted(expectation_mismatch_query_episode_ids(query)),
+        "diagnostic_only": True,
+        "read_more_actionable": False,
+        "followthrough_actionable": False,
+        "final_support_allowed": False,
+        "demoted_candidate_count": len(demoted_reads),
+        "demoted_candidate_targets": targets,
+        "demotion_reasons": reasons[:8],
+        "reason": (
+            "No clean target historical expected/observed/divergence source refs are available; "
+            "demoted repair/control/setup/current or wrong-target leads."
+        ),
+        "required_next_proof": (
+            "Open clean target historical raw/session/tool evidence for expected_behavior_evidence, "
+            "observed_behavior_or_action_proof, and divergence_evidence before answering."
+        ),
+    }
 
 
 def expectation_mismatch_annotated_read(
