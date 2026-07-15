@@ -62,7 +62,8 @@ IGNORED_BEHAVIOR_DISCOVERY_DIRS = {
 }
 PLUGIN_IGNORED_BEHAVIOR_DISCOVERY_DIRS = {".archive", ".tmp", "archive", "archives", "temp", "tmp"}
 
-SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo"}
+ASSIGNMENT_RETRY_SIGNAL_KIND = "assignment_retry_diagnostic"
+SETUP_SIGNAL_KINDS = {"semantic_wrapup_prompt", "current_session_setup_echo", ASSIGNMENT_RETRY_SIGNAL_KIND}
 SESSION_METADATA_SIGNAL_KINDS = {"environment_context_metadata", "world_state_metadata"}
 NON_SUBSTANTIVE_SIGNAL_KINDS = SETUP_SIGNAL_KINDS | SESSION_METADATA_SIGNAL_KINDS
 READ_ROLE_REQUIRED_PRIMARY_PROOF = "required_primary_proof"
@@ -1494,21 +1495,34 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
     prompt_only_count = len(
         [signal for signal in setup_echo_signals if signal.get("scope_signal_kind") == "semantic_wrapup_prompt"]
     )
-    strategy = (
-        "latest_known_session_prompt_only_fail_closed"
-        if prompt_only_count == len(signals)
-        else "latest_known_session_setup_echo_dominant_fail_closed"
+    assignment_retry_count = len(
+        [signal for signal in setup_echo_signals if signal.get("scope_signal_kind") == ASSIGNMENT_RETRY_SIGNAL_KIND]
     )
-    return {
+    if prompt_only_count == len(signals):
+        strategy = "latest_known_session_prompt_only_fail_closed"
+    elif assignment_retry_count == len(signals):
+        strategy = "latest_known_session_assignment_retry_diagnostic_fail_closed"
+    else:
+        strategy = "latest_known_session_setup_echo_dominant_fail_closed"
+    reason = (
+        "Current-session wording selected the latest known session, but the complaint/failure "
+        "signals in that session are dominated by receiving-agent prompt, benchmark/setup, "
+        "or orchestration echoes rather than parent/user complaint evidence."
+    )
+    if assignment_retry_count == len(signals):
+        reason = (
+            "Current-session wording selected a session whose complaint-looking signals are "
+            "implementation/review-retry assignment text. Assignment/retry text can diagnose "
+            "a narrow route or task boundary, but it is not primary proof for broad "
+            "semanticwrapup failure-mode promotion."
+        )
+    result = {
         "status": "scope_ambiguous",
         "strategy": strategy,
-        "reason": (
-            "Current-session wording selected the latest known session, but the complaint/failure "
-            "signals in that session are dominated by receiving-agent prompt, benchmark/setup, "
-            "or orchestration echoes rather than parent/user complaint evidence."
-        ),
+        "reason": reason,
         "selected_latest_session_status": "setup_echo_dominant_complaint_signals",
         "prompt_only_signal_count": prompt_only_count,
+        "assignment_retry_signal_count": assignment_retry_count,
         "setup_echo_signal_count": len(setup_echo_signals),
         "substantive_signal_count": len(substantive_signals),
         "first_action": (
@@ -1521,6 +1535,12 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
             "artifacts until the parent/user session is anchored."
         ),
     }
+    if assignment_retry_count:
+        result["assignment_retry_proof_boundary"] = (
+            "Implementation/review-retry assignment text is diagnostic context for the narrow assigned "
+            "task or retry, not required primary proof for broad promoted semanticwrapup failure modes."
+        )
+    return result
 
 
 def _explicit_root_setup_echo_only_scope(plan: SourcePlan, signals: list[dict], query: str) -> dict | None:
@@ -1533,22 +1553,42 @@ def _explicit_root_setup_echo_only_scope(plan: SourcePlan, signals: list[dict], 
     ]
     if len(setup_echo_signals) != len(signals):
         return None
-    return {
+    assignment_retry_count = len(
+        [signal for signal in setup_echo_signals if signal.get("scope_signal_kind") == ASSIGNMENT_RETRY_SIGNAL_KIND]
+    )
+    strategy = "explicit_root_setup_echo_only_fail_closed"
+    reason = (
+        "The explicit root contains complaint/failure-looking signals, but they are setup, "
+        "reviewer, worker, or semantic-wrapup prompt echoes rather than source-backed "
+        "current-session user corrections."
+    )
+    if assignment_retry_count == len(signals):
+        strategy = "explicit_root_assignment_retry_diagnostic_fail_closed"
+        reason = (
+            "The explicit root contains complaint/failure-looking implementation or review-retry "
+            "assignment text. That text can be diagnostic for the assigned narrow task, but it is "
+            "not primary proof for broad semanticwrapup failure-mode promotion."
+        )
+    result = {
         "status": "scope_ambiguous",
-        "strategy": "explicit_root_setup_echo_only_fail_closed",
-        "reason": (
-            "The explicit root contains complaint/failure-looking signals, but they are setup, "
-            "reviewer, worker, or semantic-wrapup prompt echoes rather than source-backed "
-            "current-session user corrections."
-        ),
+        "strategy": strategy,
+        "reason": reason,
         "selected_explicit_root_status": "setup_echo_only_complaint_signals",
+        "assignment_retry_signal_count": assignment_retry_count,
         "setup_echo_signal_count": len(setup_echo_signals),
         "substantive_signal_count": 0,
         "first_action": (
             "Inspect the listed selected-session signal refs to confirm they are only setup/reviewer "
-            "echoes, or rerun semantic-wrapup with the parent/user session JSONL."
+            "echoes or assignment/retry diagnostics, or rerun semantic-wrapup with the parent/user "
+            "session JSONL."
         ),
     }
+    if assignment_retry_count:
+        result["assignment_retry_proof_boundary"] = (
+            "Implementation/review-retry assignment text is diagnostic context for the narrow assigned "
+            "task or retry, not required primary proof for broad promoted semanticwrapup failure modes."
+        )
+    return result
 
 
 def _non_substantive_only_signal_scope(signals: list[dict]) -> bool:
@@ -2525,6 +2565,8 @@ def _scope_signal_kind(normalized_text: str, query: str) -> str:
         return "world_state_metadata"
     if _looks_like_semantic_wrapup_prompt(normalized_text, query):
         return "semantic_wrapup_prompt"
+    if _looks_like_assignment_retry_diagnostic_text(normalized_text, query):
+        return ASSIGNMENT_RETRY_SIGNAL_KIND
     echo = setup_echo_classification(normalized_text, query=query)
     if echo["is_setup_echo"]:
         return "current_session_setup_echo"
@@ -2565,6 +2607,74 @@ def _looks_like_semantic_wrapup_prompt(normalized_text: str, query: str) -> bool
     )
     query_embedded = normalized_query and normalized_query in normalized_text
     return semantic_wrapup_marker and current_session_prompt and (lane_prompt_marker or query_embedded)
+
+
+def _looks_like_assignment_retry_diagnostic_text(normalized_text: str, query: str) -> bool:
+    if not _is_current_session_complaint_fix_query(query):
+        return False
+    if setup_echo_classification(query)["explicit_prompt_scaffold_query"]:
+        return False
+    if "genuine correction" in normalized_text and "not a task assignment" in normalized_text:
+        return False
+    assignment_markers = [
+        marker
+        for marker in (
+            "worktree/branch:",
+            "task worktree",
+            "isolated worktree",
+            "product-code edits remain only",
+            "do not revert",
+            "do not merge",
+            "reviewer artifact",
+            "verdict failed",
+            "remaining blocker:",
+            "please implement",
+            "implement a narrow",
+            "required proof:",
+            "regression test",
+            "compileall",
+            "git diff --check",
+            "validate-install",
+            "preserve active-status",
+            "preserve completed-task",
+            "final focused retry",
+            "before split gate",
+        )
+        if marker in normalized_text
+    ]
+    has_retry_failure_marker = any(
+        marker in normalized_text
+        for marker in (
+            "verdict failed",
+            "remaining blocker:",
+            "final focused retry",
+            "before split gate",
+        )
+    )
+    has_assignment_action_marker = any(
+        marker in normalized_text
+        for marker in (
+            "please implement",
+            "implement a narrow",
+            "do not merge",
+            "do not revert",
+            "product-code edits remain only",
+        )
+    )
+    has_worktree_boundary = any(
+        marker in normalized_text
+        for marker in (
+            "worktree/branch:",
+            "task worktree",
+            "isolated worktree",
+            "product-code edits remain only",
+        )
+    )
+    has_structured_assignment_shape = (
+        (has_retry_failure_marker and has_assignment_action_marker)
+        or (has_worktree_boundary and (has_retry_failure_marker or has_assignment_action_marker))
+    )
+    return len(assignment_markers) >= 4 and has_structured_assignment_shape
 
 
 def _is_session_metadata_context(normalized_text: str) -> bool:
