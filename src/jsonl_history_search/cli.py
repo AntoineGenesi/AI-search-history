@@ -3503,6 +3503,15 @@ def _answer_action_contract_from_executed_output(
             route_family=route_family,
             query=query,
         )
+        merge_artifact_handoff = _named_task_merge_provenance_execute_artifact_handoff(
+            query=query,
+            cwd=cwd,
+            route_family=route_family,
+        )
+        raw_worker_chronology_handoff = _raw_worker_chronology_execute_handoff(
+            query=query,
+            route_family=route_family,
+        )
         process_actual_use_plan = (
             compact.get("process_actual_use_final_support_read_plan")
             if route_family == "process_actual_use"
@@ -3544,8 +3553,10 @@ def _answer_action_contract_from_executed_output(
             cwd=cwd,
             route_family=route_family,
             target_proof_available=bool(target_proof_handoff),
-            allow_current_proof_with_target=prefer_named_task_answer,
+            allow_current_proof_with_target=prefer_named_task_answer or bool(merge_artifact_handoff),
         )
+        if raw_worker_chronology_handoff or merge_artifact_handoff:
+            named_task_action_proof = {}
         if (
             target_proof_handoff
             and prefer_named_task_answer
@@ -3559,6 +3570,10 @@ def _answer_action_contract_from_executed_output(
             if route_family == "expectation_mismatch" and expectation_mismatch_plan
             else process_actual_use_required_reads
             if route_family == "process_actual_use" and process_actual_use_required_reads
+            else raw_worker_chronology_handoff.get("read")
+            if raw_worker_chronology_handoff
+            else merge_artifact_handoff.get("read")
+            if merge_artifact_handoff
             else named_task_action_proof.get("read")
             if named_task_action_proof
             else target_proof_handoff.get("required_primary_proof")
@@ -3572,7 +3587,50 @@ def _answer_action_contract_from_executed_output(
             "are limited to bounded_no_evidence routes executed through no-evidence-report."
         )
         source_inspection_boundary = None
-        if named_task_action_proof.get("status") in {
+        if raw_worker_chronology_handoff:
+            answer_status = "not-ready/missing-raw-worker-chronology"
+            promotion_status = "semantic_debug_raw_worker_chronology_gate_fail_closed"
+            promotion_reason = (
+                "The prompt explicitly restricts proof to raw worker chronology; task, review, and git "
+                "artifacts are not sufficient. Recover same-task raw worker/session chronology before answering."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_raw_worker_chronology",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "raw_worker_session_chronology",
+                "missing_roles": raw_worker_chronology_handoff.get("missing_roles") or [],
+                "artifact_proof_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
+        elif merge_artifact_handoff.get("status") == "completed_task_merge_artifact_refs_available":
+            answer_status = "answer-ready-after-source-inspection"
+            promotion_status = "semantic_debug_completed_task_merge_artifact_proof_ready_after_source_inspection"
+            promotion_reason = (
+                "ask --execute semantic-debug found completed-task task/review/git merge proof refs; "
+                "inspect those artifact refs before answering. Boundary: this is artifact provenance, "
+                "not raw worker/session chronology."
+            )
+            source_inspection_boundary = {
+                "decision": "answer_after_source_inspection",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "completed_task_task_review_git_merge_refs",
+                "raw_worker_chronology_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
+        elif merge_artifact_handoff.get("status") == "completed_task_merge_artifact_refs_missing":
+            answer_status = "not-ready/missing-completed-task-merge-artifact-proof"
+            promotion_status = "semantic_debug_completed_task_merge_artifact_proof_missing"
+            promotion_reason = (
+                "A completed-task merge provenance prompt needs same-task task, review, and git merge "
+                "artifact refs; do not answer from unrelated raw/session diagnostics."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_completed_task_merge_artifact_proof",
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "missing_completed_task_task_review_git_merge_refs",
+                "diagnostics_default_final_support": False,
+            }
+        elif named_task_action_proof.get("status") in {
             "current_named_task_proof_refs_available",
             "current_named_task_stopped_episode_proof_refs_available",
         }:
@@ -3716,7 +3774,11 @@ def _answer_action_contract_from_executed_output(
             ),
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (
-                named_task_action_proof.get("only_continue_if")
+                raw_worker_chronology_handoff.get("only_continue_if")
+                if raw_worker_chronology_handoff
+                else merge_artifact_handoff.get("only_continue_if")
+                if merge_artifact_handoff
+                else named_task_action_proof.get("only_continue_if")
                 if named_task_action_proof
                 else None
             )
@@ -3731,12 +3793,33 @@ def _answer_action_contract_from_executed_output(
             contract["source_inspection_boundary"] = source_inspection_boundary
         if target_proof_handoff:
             contract["target_proof_handoff"] = target_proof_handoff
-            if target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch":
+            if (
+                target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch"
+                and not merge_artifact_handoff
+                and not raw_worker_chronology_handoff
+            ):
                 contract["read"] = target_proof_handoff.get("read") or []
             contract["diagnostics_after"] = (
                 target_proof_handoff.get("secondary_context_after_source_inspection")
                 or []
             ) + (target_proof_handoff.get("diagnostics_after") or [])[:4]
+        if merge_artifact_handoff:
+            contract["named_task_merge_provenance_handoff"] = merge_artifact_handoff
+            contract["stop"] = merge_artifact_handoff.get("stop") or contract["stop"]
+            contract["diagnostics_after"] = (
+                merge_artifact_handoff.get("diagnostics_after")
+                or contract.get("diagnostics_after")
+                or []
+            )
+        if raw_worker_chronology_handoff:
+            contract["raw_worker_chronology_handoff"] = raw_worker_chronology_handoff
+            contract["read"] = raw_worker_chronology_handoff.get("read") or []
+            contract["stop"] = raw_worker_chronology_handoff.get("stop") or contract["stop"]
+            contract["diagnostics_after"] = (
+                raw_worker_chronology_handoff.get("diagnostics_after")
+                or contract.get("diagnostics_after")
+                or []
+            )
         if named_task_action_proof:
             contract["named_task_action_proof_handoff"] = named_task_action_proof
             contract["diagnostics_after"] = (
@@ -4842,6 +4925,121 @@ _ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES = frozenset(
 )
 
 
+def _named_task_merge_provenance_execute_artifact_handoff(
+    *,
+    query: str,
+    cwd: str,
+    route_family: str,
+) -> dict:
+    if not _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
+        return {}
+    if _raw_worker_chronology_source_role_wanted(query=query, route_family=route_family):
+        return {}
+    cwd_path = Path(cwd).expanduser().resolve()
+    refs = _completed_task_artifact_support_refs(cwd=cwd_path, query=query, route_family=route_family)
+    if not refs:
+        return {}
+
+    surfaces = {str(ref.get("proof_surface") or "") for ref in refs if isinstance(ref, dict)}
+    missing = [
+        role
+        for role, surface in (
+            ("task_artifact_proof", "task_file"),
+            ("review_artifact_proof", "review_artifact"),
+            ("merge_commit_proof", "merge_commit"),
+        )
+        if surface not in surfaces
+    ]
+    if missing:
+        return {}
+    return {
+        "schema_version": 1,
+        "status": "completed_task_merge_artifact_refs_available",
+        "task_ids": _ask_execute_named_task_ids(query)[:2],
+        "read": refs[:8],
+        "diagnostics_after": [
+            {
+                "kind": "semantic_debug_fallback",
+                "reason": (
+                    "Inspect semantic-debug raw/session diagnostics only after task/review/git artifact "
+                    "proof leaves a named merge-provenance facet missing."
+                ),
+                "link": "semantic_debug.core_convo_first_read_plan",
+            }
+        ],
+        "stop": (
+            "Inspect same-task task/review/git merge artifact refs first; they satisfy completed-task "
+            "merge provenance artifact roles, not raw worker/session chronology."
+        ),
+        "only_continue_if": [
+            "the same-task task artifact, review artifact, and git merge commit do not cover the requested artifact proof",
+            "the user explicitly asks for raw worker/session chronology, which these artifact refs do not satisfy",
+        ],
+        "missing_roles": [],
+        "source_boundary": (
+            "completed task/review/git artifacts can prove merge provenance artifact roles; "
+            "they do not prove raw worker chronology"
+        ),
+    }
+
+
+def _raw_worker_chronology_execute_handoff(*, query: str, route_family: str) -> dict:
+    if not _raw_worker_chronology_source_role_wanted(query=query, route_family=route_family):
+        return {}
+    required_roles = _action_chronology_required_roles(query)
+    if "observed_message_or_command_chronology" not in required_roles:
+        required_roles = ["observed_message_or_command_chronology", *required_roles]
+    required_roles = _unique_preserving_order(required_roles)
+    task_ids = _ask_execute_named_task_ids(query)
+    return {
+        "schema_version": 1,
+        "status": "missing_raw_worker_chronology",
+        "task_ids": task_ids[:2],
+        "required_roles": required_roles,
+        "missing_roles": required_roles,
+        "read": [
+            {
+                "kind": "targeted_fail_closed_boundary",
+                "reason": (
+                    "The query says to use only raw worker chronology. Task files, review artifacts, "
+                    "and git commits are corroborating artifacts only and must not be promoted as sufficient proof."
+                ),
+                "task_ids": task_ids[:2],
+                "required_source_roles": required_roles,
+                "missing_roles": required_roles,
+            }
+        ],
+        "diagnostics_after": [],
+        "stop": (
+            "Fail closed until same-task raw worker/session chronology is opened; name the missing "
+            "source role instead of using task/review/git artifacts as proof."
+        ),
+        "only_continue_if": [
+            "open raw worker/session messages, tool calls, or command output for the same task id",
+            "do not treat task/review/git artifacts as sufficient when the query says raw worker chronology only",
+        ],
+        "source_boundary": (
+            "raw worker chronology requires observed worker/session message, tool-call, or command-output evidence"
+        ),
+    }
+
+
+def _raw_worker_chronology_source_role_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in _ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES:
+        return False
+    if not _ask_execute_named_task_ids(query):
+        return False
+    normalized = str(query or "").casefold()
+    raw_chronology = (
+        "raw worker chronology" in normalized
+        or "worker chronology" in normalized
+        or ("using only raw" in normalized and "chronology" in normalized)
+    )
+    if not raw_chronology:
+        return False
+    return any(term in normalized for term in ("only", "fail closed", "missing source role", "source role is missing"))
+
+
 def _named_task_action_proof_handoff(
     *,
     query: str,
@@ -5900,6 +6098,8 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
     {
         "not-ready/needs-more-proof",
         "not-ready/missing-current-named-task-proof",
+        "not-ready/missing-completed-task-merge-artifact-proof",
+        "not-ready/missing-raw-worker-chronology",
         "inspect_recovery_first",
         "needs_investigation",
     }
@@ -7363,6 +7563,27 @@ def _scoped_no_evidence_current_repo_boundary(*, scoped: dict, cwd: Path) -> str
 
 
 def _next_proof_step_from_action(action: dict) -> object:
+    raw_worker_chronology = action.get("raw_worker_chronology_handoff")
+    if isinstance(raw_worker_chronology, dict) and raw_worker_chronology:
+        required_roles = list(raw_worker_chronology.get("required_roles") or [])
+        missing_roles = list(raw_worker_chronology.get("missing_roles") or required_roles)
+        return {
+            "schema_version": 1,
+            "status": "missing_primary_action_chronology",
+            "covered_roles": [],
+            "missing_roles": missing_roles,
+            "required_roles": required_roles,
+            "corroborating_refs": [],
+            "rejected_refs": [],
+            "summary_lines": [
+                "The execute handoff says raw worker chronology is required; task/review/git artifacts are not enough."
+            ],
+            "required_next_proof": (
+                "Open same-task raw worker/session chronology: worker messages, tool calls, command output, "
+                "or raw transcript rows that prove the requested action."
+            ),
+            "fallback_action_contract_next_step": raw_worker_chronology.get("read") or [],
+        }
     root_handoff = action.get("root_handoff_contract")
     if isinstance(root_handoff, dict) and root_handoff:
         return {
