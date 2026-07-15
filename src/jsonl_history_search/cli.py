@@ -118,6 +118,7 @@ from .real_history_remaining_miss_diagnostic import (
     DEFAULT_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_REMAINING_MISS_AUDIT_REPORT,
 )
 from .real_history_remaining_miss_diagnostic import build_real_history_remaining_miss_diagnostic_payload
+from .repo_source_no_evidence import build_repo_source_no_evidence_payload
 from .real_history_opened_file_progress_diagnostic import (
     DEFAULT_JSH706_BENCHMARK_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_BENCHMARK,
     DEFAULT_JSH706_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_AUDIT,
@@ -1886,6 +1887,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
                     "what-happened-since",
                     "semantic-debug",
                     "no-evidence-report",
+                    "repo-source-no-evidence",
                     "devlog-failure-analysis",
                     "coordinator-context",
                     "semantic-wrapup",
@@ -1924,8 +1926,13 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         executed_payload = _build_semantic_debug_report_output_payload(execution_args)
         output_key = "semantic_debug"
     elif execution_kind == "no-evidence-report":
-        executed_payload = _build_agent_find_report_output_payload(execution_args)
-        output_key = "agent_find"
+        executed_payload = _build_repo_source_no_evidence_report_output_payload(execution_args)
+        if executed_payload is not None:
+            output_key = "repo_source_no_evidence"
+            execution_kind = "repo-source-no-evidence"
+        else:
+            executed_payload = _build_agent_find_report_output_payload(execution_args)
+            output_key = "agent_find"
     elif execution_kind == "coordinator-context":
         executed_payload = _build_coordinator_context_report_output_payload(execution_args)
         output_key = "coordinator_context"
@@ -1937,11 +1944,25 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         output_key = "devlog_failure_analysis"
 
     compact = executed_payload[output_key]
+    argv = _structured_execution_argv(execution_args)
+    if execution_kind == "repo-source-no-evidence":
+        argv = [
+            "jsonl-history-search",
+            "ask",
+            args.query,
+            "--execute",
+            "--cwd",
+            args.cwd,
+            "--format",
+            "json",
+            "--report-output",
+            report_output,
+        ]
     contract["ask_execute"]["execution"].update(
         {
             "status": "executed",
             "command_family": execution_kind,
-            "argv": _structured_execution_argv(execution_args),
+            "argv": argv,
             "report_written": compact.get("report_written"),
             "output_key": output_key,
         }
@@ -3252,6 +3273,23 @@ def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
     return _short_report_written_payload(payload, args.report_output)
 
 
+def _build_repo_source_no_evidence_report_output_payload(args: argparse.Namespace) -> dict | None:
+    if getattr(args, "root", None):
+        return None
+    compact = build_repo_source_no_evidence_payload(
+        query=args.query,
+        cwd=Path(args.cwd).expanduser().resolve(),
+        report_output=args.report_output,
+    )
+    if compact is None:
+        return None
+    Path(args.report_output).expanduser().write_text(
+        render({"repo_source_no_evidence": compact}, "json"),
+        encoding="utf-8",
+    )
+    return {"repo_source_no_evidence": compact}
+
+
 def _short_semantic_debug_report_written_payload(packet: dict, report_output: str) -> dict:
     payload = {
         "semantic_debug": {
@@ -3942,6 +3980,7 @@ def _answer_action_contract_from_executed_output(
             or selected_route.get("manual_search_guidance"),
             "saved_report": compact.get("report_written"),
         }
+    no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
     return {
         "answer_status": "not-ready/needs-more-proof",
         "promotion_status": "unpromoted",
@@ -3954,8 +3993,7 @@ def _answer_action_contract_from_executed_output(
         ),
         "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
         "stop": selected_route.get("stop_guidance"),
-        "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
-        or selected_route.get("manual_search_guidance"),
+        "only_continue_if": no_evidence.get("read_more_policy") or selected_route.get("manual_search_guidance"),
         "saved_report": compact.get("report_written"),
     }
 
@@ -6045,7 +6083,25 @@ def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: d
         "claim_boundary_non_support",
         "control_or_generated_echo_non_support",
     }
-    if _positive_int(selected_route.get("explicit_source_root_count")) <= 0 and not diagnostic_non_support:
+    searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
+    repo_source_committed = (
+        compact.get("scope_mode") == "repo_source_committed"
+        or searched_scope.get("scope_mode") == "repo_source_committed"
+        or "repo_source_committed" in {
+            str(kind)
+            for kind in searched_scope.get("root_kinds", [])
+            if str(kind).strip()
+        }
+        or any(
+            isinstance(root, dict) and root.get("kind") == "repo_source_committed"
+            for root in searched_scope.get("roots") or []
+        )
+    )
+    if (
+        _positive_int(selected_route.get("explicit_source_root_count")) <= 0
+        and not diagnostic_non_support
+        and not repo_source_committed
+    ):
         return False
     if compact.get("status") != "no_evidence" and no_evidence.get("needed") is not True:
         return False
@@ -6058,7 +6114,6 @@ def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: d
     )
     if read_more_policy.get("required_before_scoped_no_evidence_answer") is not False:
         return False
-    searched_scope = compact.get("searched_scope") if isinstance(compact.get("searched_scope"), dict) else {}
     scope_counts = compact.get("scope_counts") if isinstance(compact.get("scope_counts"), dict) else {}
     searched_scope_has_work = (
         _positive_int(searched_scope.get("searched_files")) > 0
@@ -6084,12 +6139,19 @@ def _scoped_no_evidence_contract(compact: dict) -> dict:
     read_more_policy = (
         no_evidence.get("read_more_policy") if isinstance(no_evidence.get("read_more_policy"), dict) else {}
     )
+    root_kinds = _searched_scope_root_kinds(searched_scope)
+    root_privacy_labels = _searched_scope_root_privacy_labels(searched_scope)
     return {
         "answer_scope": no_evidence.get("answer_scope"),
+        "scope_mode": compact.get("scope_mode") or searched_scope.get("scope_mode"),
         "searched_files": searched_scope.get("searched_files"),
         "searched_bytes": searched_scope.get("searched_bytes"),
-        "searched_root_kinds": searched_scope.get("root_kinds", []),
-        "searched_root_privacy_labels": searched_scope.get("root_privacy_labels", []),
+        "searched_root_kinds": root_kinds,
+        "searched_root_privacy_labels": root_privacy_labels,
+        "excluded_roots": (compact.get("excluded_scope") or {}).get("excluded_roots", []),
+        "contamination_policy": compact.get("contamination_policy")
+        or no_evidence.get("contamination_policy"),
+        "command_burden": compact.get("command_burden") or {},
         "selected_root_count": scope_counts.get("selected_root_count"),
         "excluded_root_count": scope_counts.get("excluded_root_count"),
         "missing_root_count": scope_counts.get("missing_root_count"),
@@ -6111,6 +6173,36 @@ def _positive_int(value: object) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _searched_scope_root_kinds(searched_scope: dict) -> list[str]:
+    direct = [str(kind) for kind in searched_scope.get("root_kinds") or [] if str(kind).strip()]
+    if direct:
+        return direct
+    return _unique_preserving_order(
+        [
+            str(root.get("kind") or "")
+            for root in searched_scope.get("roots") or []
+            if isinstance(root, dict) and str(root.get("kind") or "").strip()
+        ]
+    )
+
+
+def _searched_scope_root_privacy_labels(searched_scope: dict) -> list[str]:
+    direct = [
+        str(label)
+        for label in searched_scope.get("root_privacy_labels") or []
+        if str(label).strip()
+    ]
+    if direct:
+        return direct
+    return _unique_preserving_order(
+        [
+            str(root.get("privacy_label") or "")
+            for root in searched_scope.get("roots") or []
+            if isinstance(root, dict) and str(root.get("privacy_label") or "").strip()
+        ]
+    )
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
@@ -6259,9 +6351,15 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
         "schema_version": compact.get("schema_version"),
         "status": compact.get("status"),
         "report_written": compact.get("report_written"),
+        "scope_mode": compact.get("scope_mode"),
         "searched_scope": compact.get("searched_scope"),
+        "excluded_scope": compact.get("excluded_scope"),
         "scope_counts": compact.get("scope_counts"),
         "cap_hit": compact.get("cap_hit"),
+        "contamination_policy": compact.get("contamination_policy"),
+        "command_burden": compact.get("command_burden"),
+        "execution_path": compact.get("execution_path"),
+        "found_evidence": compact.get("found_evidence"),
         "no_evidence": compact.get("no_evidence"),
         "message": compact.get("message"),
     }
@@ -7689,6 +7787,22 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> 
     if root_kind_text:
         text += f" across {root_label} ({root_kind_text})"
     text += "."
+    if scoped.get("scope_mode"):
+        text += f" Scope mode: {scoped.get('scope_mode')}."
+    excluded_roots = [str(item) for item in scoped.get("excluded_roots") or [] if str(item).strip()]
+    if excluded_roots:
+        text += f" Excluded roots: {', '.join(excluded_roots[:8])}."
+    if scoped.get("contamination_policy"):
+        text += f" Contamination policy: {scoped.get('contamination_policy')}."
+    burden = scoped.get("command_burden") if isinstance(scoped.get("command_burden"), dict) else {}
+    if burden:
+        text += (
+            " Command burden: "
+            f"structured_execution_count={burden.get('structured_execution_count')}, "
+            f"read_more_count={burden.get('read_more_count')}, "
+            f"wrong_command_count={burden.get('wrong_command_count')}, "
+            f"fallback_count={burden.get('fallback_count')}."
+        )
     repo_boundary = _scoped_no_evidence_current_repo_boundary(scoped=scoped, cwd=cwd)
     if repo_boundary:
         text += f" {repo_boundary}"
@@ -7706,9 +7820,13 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> 
         {
             "kind": "scoped_no_evidence_contract",
             "answer_scope": scoped.get("answer_scope"),
+            "scope_mode": scoped.get("scope_mode"),
             "searched_files": searched_files,
             "searched_bytes": searched_bytes,
             "searched_root_kinds": root_kinds,
+            "excluded_roots": excluded_roots,
+            "contamination_policy": scoped.get("contamination_policy"),
+            "command_burden": burden,
             "current_repo_docs_tasks_searched": repo_boundary == "",
             "cap_hit": scoped.get("cap_hit"),
             "caps_hit": scoped.get("caps_hit", []),
@@ -7723,6 +7841,8 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> 
         f"cap_hit={scoped.get('cap_hit')}",
         f"read_more_required_before_scoped_no_evidence_answer={scoped.get('read_more_required_before_scoped_no_evidence_answer')}",
     ]
+    if scoped.get("contamination_policy"):
+        answer["proof_summary"].append(f"contamination_policy={scoped.get('contamination_policy')}")
     return {"ask_answer": answer}
 
 
@@ -7730,6 +7850,8 @@ def _scoped_no_evidence_root_label(scoped: dict) -> str:
     privacy_labels = {str(item) for item in scoped.get("searched_root_privacy_labels") or [] if str(item).strip()}
     root_kinds = {str(item) for item in scoped.get("searched_root_kinds") or [] if str(item).strip()}
     transcript_kinds = {"codex_sessions", "codex_history", "claude_projects"}
+    if "repo_source_committed" in root_kinds:
+        return "committed repo source scope"
     if root_kinds and root_kinds <= transcript_kinds:
         return "private transcript roots" if "private_root" in privacy_labels else "transcript roots"
     if "private_root" in privacy_labels:
