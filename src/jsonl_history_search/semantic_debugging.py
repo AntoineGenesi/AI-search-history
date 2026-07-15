@@ -1050,6 +1050,37 @@ def process_actual_use_detected(family: dict[str, Any]) -> bool:
 def looks_like_expectation_mismatch_query(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().replace("?", " ").replace("!", " ").split())
     normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    explicit_mismatch_shape = any(
+        phrase in normalized
+        for phrase in (
+            "expectation mismatch",
+            "expectation-mismatch",
+            "mismatch behind",
+            "mismatch caused",
+        )
+    )
+    if explicit_mismatch_shape and _looks_like_expectation_mismatch_artifact_status_query(normalized):
+        return False
+    if explicit_mismatch_shape and any(
+        phrase in normalized
+        for phrase in (
+            "behind",
+            "caused",
+            "cause",
+            "episode",
+            "situation",
+            "jsh-",
+            "stopped",
+            "not-auditing",
+            "agent",
+            "ai",
+            "assistant",
+            "codex",
+            "diverged",
+            "instead of",
+        )
+    ):
+        return True
     causal_shape = any(
         phrase in normalized
         for phrase in (
@@ -1113,6 +1144,56 @@ def looks_like_expectation_mismatch_query(text: str) -> bool:
         )
     )
     return causal_shape and expectation and observed and divergence
+
+
+def _looks_like_expectation_mismatch_artifact_status_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    explicit = any(
+        phrase in normalized
+        for phrase in (
+            "expectation mismatch",
+            "expectation-mismatch",
+            "mismatch report",
+            "mismatch artifact",
+        )
+    )
+    artifactish = any(
+        phrase in normalized
+        for phrase in (
+            "report",
+            "artifact",
+            "writeup",
+            "write-up",
+            "file",
+            "ticket",
+            "jsh-",
+        )
+    )
+    statusish = any(
+        phrase in normalized
+        for phrase in (
+            "latest status",
+            "status of",
+            "what is the status",
+            "what's the status",
+            "current status",
+            "status update",
+            "latest update",
+            "where does",
+            "where do",
+            "stand",
+            "still current",
+            "is current",
+            "stale",
+            "superseded",
+            "obsolete",
+            "still active",
+            "still open",
+            "closed",
+            "done",
+        )
+    )
+    return explicit and artifactish and statusish
 
 
 def looks_like_process_actual_use_query(text: str) -> bool:
