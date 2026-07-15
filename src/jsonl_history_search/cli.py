@@ -3855,24 +3855,43 @@ def _answer_action_contract_from_executed_output(
             for read in next_reads
             if isinstance(read, dict) and read.get("read_role") == "required_primary_proof"
         ]
+        conditional_required_reads = [
+            read
+            for read in next_reads
+            if isinstance(read, dict) and read.get("read_role") == "conditional_required"
+        ]
+        optional_diagnostic_reads = [
+            read
+            for read in next_reads
+            if isinstance(read, dict) and read.get("read_role") == "optional_diagnostic"
+        ]
         answer_status = (
             "semantic-wrapup-ready-after-required-primary-proof"
             if answer_ready.get("answer_ready") is True
             else "not-ready/needs-more-proof"
         )
+        promotion_reason = (
+            "ask --execute semantic-wrapup is a source-backed evidence handoff, "
+            "not a final answer oracle; inspect required_primary_proof refs first."
+            if required_primary_reads
+            else (
+                "ask --execute semantic-wrapup found no default required_primary_proof refs; "
+                "conditional_required refs are non-default follow-through for named caps, omissions, "
+                "missing facets, or chronology gaps."
+            )
+        )
         return {
             "answer_status": answer_status,
             "promotion_status": "unpromoted_semantic_wrapup_execution",
-            "promotion_reason": (
-                "ask --execute semantic-wrapup is a source-backed evidence handoff, "
-                "not a final answer oracle; inspect required_primary_proof refs first."
-            ),
+            "promotion_reason": promotion_reason,
             "internal_answer_status": compact.get("status"),
-            "read": required_primary_reads or next_reads[:6],
+            "read": required_primary_reads[:6],
+            "conditional_required": conditional_required_reads[:6],
             "then_use": {
                 "failure_modes": "semantic_wrapup.failure_modes",
                 "fix_suggestions": "semantic_wrapup.fix_suggestions",
                 "required_primary_proof": "semantic_wrapup.next_reads[read_role=required_primary_proof]",
+                "conditional_required": "semantic_wrapup.next_reads[read_role=conditional_required]",
                 "answer_ready_contract": "semantic_wrapup.answer_ready_contract",
                 "answer_use_contract": "semantic_wrapup.answer_use_contract",
             },
@@ -3881,17 +3900,13 @@ def _answer_action_contract_from_executed_output(
             "root_handoff_contract": compact.get("root_handoff_contract"),
             "read_role_summary": read_role_summary,
             "source_inspection_boundary": {
-                "inspect_required_primary_proof_before_answer": True,
+                "inspect_required_primary_proof_before_answer": bool(required_primary_reads),
                 "optional_diagnostics_default_actionable": False,
                 "source_use_required": answer_ready.get("source_use_required")
                 or answer_use.get("source_use_required"),
                 "stop_guidance": answer_ready.get("stop_guidance") or answer_use.get("stop_guidance"),
             },
-            "diagnostics_after": [
-                read
-                for read in next_reads
-                if isinstance(read, dict) and read.get("read_role") != "required_primary_proof"
-            ][:5],
+            "diagnostics_after": optional_diagnostic_reads[:5],
             "stop": answer_ready.get("stop_guidance")
             or answer_use.get("stop_guidance")
             or selected_route.get("stop_guidance"),
@@ -4216,12 +4231,7 @@ def _source_followthrough_contract_reads(plan: dict) -> list[dict]:
         for item in plan.get("required_primary_proof") or []
         if isinstance(item, dict)
     ]
-    conditional = [
-        item
-        for item in plan.get("conditional_required") or []
-        if isinstance(item, dict)
-    ]
-    return _dedupe_action_contract_rows(default_required + required + conditional)[:_ASK_ANSWER_MAX_REFS]
+    return _dedupe_action_contract_rows(default_required + required)[:_ASK_ANSWER_MAX_REFS]
 
 
 def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:

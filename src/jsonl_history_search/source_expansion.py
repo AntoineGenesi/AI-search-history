@@ -163,6 +163,14 @@ def build_follow_next_reads_payload(
         expanded_count=counts["expanded_count"],
         reviewed_counts_available=True,
     )
+    diagnostic_only_optional_count = int(packet_info.get("diagnostic_only_optional_count") or 0)
+    diagnostic_only_message = None
+    if not reads and diagnostic_only_optional_count:
+        diagnostic_only_message = (
+            "source_followthrough_plan contains only optional_diagnostic refs; follow-next-reads "
+            "does not expand optional diagnostics by default. Open them only after explicitly "
+            "naming a diagnostic/completeness gap."
+        )
     return {
         "follow_next_reads": {
             **base,
@@ -183,6 +191,8 @@ def build_follow_next_reads_payload(
                 "packet_type": packet_info["packet_type"],
                 "schema_version": packet_info["schema_version"],
                 "candidate_surfaces": packet_info["candidate_surfaces"],
+                "diagnostic_only_optional_count": diagnostic_only_optional_count,
+                "diagnostic_only_message": diagnostic_only_message,
             },
             "selection": {
                 "available_next_read_count": len(reads),
@@ -201,7 +211,9 @@ def build_follow_next_reads_payload(
                     "ordinary_next_read",
                 ],
                 "deduplicated_by": "target_or_source_ref",
+                "diagnostic_only_message": diagnostic_only_message,
             },
+            "diagnostic_only_message": diagnostic_only_message,
             "failed_reads": failed_follow_next_read_summaries(expanded_reads),
             "expanded_reads": expanded_reads,
             "agent_instruction": build_follow_next_reads_agent_instruction(
@@ -799,7 +811,14 @@ def detect_follow_packet(report: Any) -> dict[str, Any]:
                 "packet_type": packet_type,
                 "packet": packet,
                 "schema_version": packet.get("schema_version"),
-                "candidate_surfaces": [surface for surface, reads in surfaces if reads],
+                "candidate_surfaces": [surface for surface, _reads in surfaces],
+                "diagnostic_only_optional_count": (
+                    source_followthrough_plan_optional_diagnostic_count(
+                        packet.get("source_followthrough_plan") or {}
+                    )
+                    if packet_type == "semantic_debug"
+                    else 0
+                ),
             }
     if candidates:
         return {
@@ -815,8 +834,9 @@ def detect_follow_packet(report: Any) -> dict[str, Any]:
 def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[tuple[str, list[Any]]]:
     surfaces: list[tuple[str, list[Any]]] = []
     if packet_type == "semantic_debug":
-        planned_reads = source_followthrough_plan_follow_reads(packet.get("source_followthrough_plan") or {})
-        if planned_reads:
+        source_followthrough_plan = packet.get("source_followthrough_plan")
+        if isinstance(source_followthrough_plan, dict):
+            planned_reads = source_followthrough_plan_follow_reads(source_followthrough_plan)
             surfaces.append(("semantic_debug.source_followthrough_plan", planned_reads))
             return surfaces
         append_next_read_surface(surfaces, "semantic_debug.next_reads", packet)
@@ -857,14 +877,13 @@ def source_followthrough_plan_follow_reads(plan: dict[str, Any]) -> list[dict[st
         for item in list_or_empty(plan.get("conditional_required"))
         if isinstance(item, dict)
     ]
-    optional = [
-        {**item, "_source_followthrough_group": "optional_diagnostic"}
-        for item in list_or_empty(plan.get("optional_diagnostic"))
-        if isinstance(item, dict)
-    ]
-    if required or conditional:
-        return required + conditional
-    return optional
+    return required + conditional
+
+
+def source_followthrough_plan_optional_diagnostic_count(plan: dict[str, Any]) -> int:
+    if not isinstance(plan, dict):
+        return 0
+    return sum(1 for item in list_or_empty(plan.get("optional_diagnostic")) if isinstance(item, dict))
 
 
 def append_next_read_surface(surfaces: list[tuple[str, list[Any]]], label: str, container: Any) -> None:

@@ -525,10 +525,17 @@ def _append_semantic_wrapup_execute_text(lines: list[str], executed: dict, actio
     _append_semantic_wrapup_failure_modes(lines, action.get("failure_modes") or executed.get("failure_modes"))
     _append_semantic_wrapup_fix_suggestions(lines, action.get("fix_suggestions") or executed.get("fix_suggestions"))
     lines.append("- required_primary_proof:")
+    required_primary_proof = executed.get("required_primary_proof")
+    if required_primary_proof is None:
+        required_primary_proof = action.get("read")
     _append_compact_read_contract(
         lines,
-        executed.get("required_primary_proof") or action.get("read"),
+        required_primary_proof,
     )
+    conditional_required = action.get("conditional_required") or executed.get("conditional_required")
+    if conditional_required:
+        lines.append("- conditional_required:")
+        _append_compact_read_contract(lines, conditional_required)
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- diagnostics_after:")
@@ -557,11 +564,18 @@ def _append_semantic_wrapup_execute_markdown(lines: list[str], executed: dict, a
     _append_semantic_wrapup_failure_modes(lines, action.get("failure_modes") or executed.get("failure_modes"))
     _append_semantic_wrapup_fix_suggestions(lines, action.get("fix_suggestions") or executed.get("fix_suggestions"))
     lines.append("- Required primary proof:")
+    required_primary_proof = executed.get("required_primary_proof")
+    if required_primary_proof is None:
+        required_primary_proof = action.get("read")
     _append_compact_read_contract(
         lines,
-        executed.get("required_primary_proof") or action.get("read"),
+        required_primary_proof,
         markdown=True,
     )
+    conditional_required = action.get("conditional_required") or executed.get("conditional_required")
+    if conditional_required:
+        lines.append("- Conditional required:")
+        _append_compact_read_contract(lines, conditional_required, markdown=True)
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- Diagnostics after:")
@@ -2404,6 +2418,8 @@ def render_follow_next_reads_text(payload: dict) -> str:
         f"Usable recovery evidence: {report.get('usable_recovery_evidence_count', 0)}",
         f"Reviewed usable recovery evidence: {report.get('reviewed_usable_recovery_evidence_count', 0)}",
     ]
+    if report.get("diagnostic_only_message"):
+        lines.append(f"Diagnostic-only default skip: {report.get('diagnostic_only_message')}")
     if status_counts:
         lines.append(
             "Reviewed usability statuses: "
