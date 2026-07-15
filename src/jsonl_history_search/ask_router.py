@@ -736,6 +736,11 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_remembered_topic_causal_instruction_query(normalized):
         return ROUTES[6]
 
+    if _looks_like_expectation_mismatch_artifact_status_query(normalized):
+        if _looks_like_expectation_mismatch_artifact_latest_status_query(normalized):
+            return ROUTES[5]
+        return ROUTES[8]
+
     if _looks_like_expectation_mismatch_query(normalized):
         return EXPECTATION_MISMATCH_ROUTE
 
@@ -1527,18 +1532,7 @@ def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
             "mismatch caused",
         ),
     )
-    if explicit_mismatch_shape and _has_any(
-        normalized,
-        (
-            "still current",
-            "is current",
-            "stale",
-            "superseded",
-            "obsolete",
-            "still active",
-            "still open",
-        ),
-    ):
+    if explicit_mismatch_shape and _looks_like_expectation_mismatch_artifact_status_query(normalized):
         return False
     if explicit_mismatch_shape and _has_any(
         normalized,
@@ -1632,6 +1626,76 @@ def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
         _has_any(normalized, expectation_terms)
         and _has_any(normalized, observed_terms)
         and _has_any(normalized, divergence_terms)
+    )
+
+
+def _looks_like_expectation_mismatch_artifact_status_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    if not _has_any(
+        normalized,
+        (
+            "expectation mismatch",
+            "expectation-mismatch",
+            "mismatch report",
+            "mismatch artifact",
+        ),
+    ):
+        return False
+    if not _has_any(
+        normalized,
+        (
+            "report",
+            "artifact",
+            "writeup",
+            "write-up",
+            "file",
+            "ticket",
+            "jsh-",
+        ),
+    ):
+        return False
+    return _has_any(
+        normalized,
+        (
+            "latest status",
+            "status of",
+            "what is the status",
+            "what's the status",
+            "current status",
+            "status update",
+            "latest update",
+            "where does",
+            "where do",
+            "stand",
+            "still current",
+            "is current",
+            "stale",
+            "superseded",
+            "obsolete",
+            "still active",
+            "still open",
+            "closed",
+            "done",
+        ),
+    )
+
+
+def _looks_like_expectation_mismatch_artifact_latest_status_query(normalized: str) -> bool:
+    normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    return _has_any(
+        normalized,
+        (
+            "latest status",
+            "status of",
+            "what is the status",
+            "what's the status",
+            "current status",
+            "status update",
+            "latest update",
+            "where does",
+            "where do",
+            "stand",
+        ),
     )
 
 
