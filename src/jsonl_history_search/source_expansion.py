@@ -815,6 +815,10 @@ def detect_follow_packet(report: Any) -> dict[str, Any]:
 def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[tuple[str, list[Any]]]:
     surfaces: list[tuple[str, list[Any]]] = []
     if packet_type == "semantic_debug":
+        planned_reads = source_followthrough_plan_follow_reads(packet.get("source_followthrough_plan") or {})
+        if planned_reads:
+            surfaces.append(("semantic_debug.source_followthrough_plan", planned_reads))
+            return surfaces
         append_next_read_surface(surfaces, "semantic_debug.next_reads", packet)
         append_next_read_surface(
             surfaces,
@@ -838,6 +842,29 @@ def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[
             packet.get("compact_provenance_handoff") or {},
         )
     return surfaces
+
+
+def source_followthrough_plan_follow_reads(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(plan, dict):
+        return []
+    required = [
+        {**item, "_source_followthrough_group": "required_primary_proof"}
+        for item in list_or_empty(plan.get("required_primary_proof"))
+        if isinstance(item, dict)
+    ]
+    conditional = [
+        {**item, "_source_followthrough_group": "conditional_required"}
+        for item in list_or_empty(plan.get("conditional_required"))
+        if isinstance(item, dict)
+    ]
+    optional = [
+        {**item, "_source_followthrough_group": "optional_diagnostic"}
+        for item in list_or_empty(plan.get("optional_diagnostic"))
+        if isinstance(item, dict)
+    ]
+    if required or conditional:
+        return required + conditional
+    return optional
 
 
 def append_next_read_surface(surfaces: list[tuple[str, list[Any]]], label: str, container: Any) -> None:
@@ -909,13 +936,25 @@ def prioritize_follow_next_reads(reads: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def follow_next_read_priority_key(read: dict[str, Any]) -> tuple[int, int, str]:
+    read_role = str(read.get("read_role") or read.get("_source_followthrough_group") or "")
+    default_actionable = read.get("default_actionable") is True
+    if read_role == "required_primary_proof" and default_actionable:
+        role_tier = 0
+    elif read_role == "required_primary_proof":
+        role_tier = 1
+    elif read_role == "conditional_required":
+        role_tier = 2
+    elif read_role == "optional_diagnostic":
+        role_tier = 9
+    else:
+        role_tier = 4
     recovery_id = str((read.get("omitted_window_recovery") or {}).get("recovery_id") or "")
     if recovery_id.startswith("clr"):
-        tier = 0
+        tier = min(role_tier, 2)
     elif read.get("omitted_window_recovery"):
-        tier = 1
+        tier = min(role_tier, 3)
     else:
-        tier = 2
+        tier = role_tier
     return (tier, 0 if read.get("target") else 1, str(read.get("target") or ""))
 
 

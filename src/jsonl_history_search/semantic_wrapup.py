@@ -699,6 +699,7 @@ def build_semantic_wrapup_payload(
         and not _non_substantive_only_signal_scope(signals),
     )
     read_role_summary = _semantic_read_role_summary(next_reads)
+    source_followthrough_plan = _semantic_source_followthrough_plan(next_reads, read_role_summary)
     answer_ready_contract = _answer_ready_contract(
         status=status,
         failure_modes=failure_modes,
@@ -809,6 +810,7 @@ def build_semantic_wrapup_payload(
             "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
             "read_role_summary": read_role_summary,
+            "source_followthrough_plan": source_followthrough_plan,
             "next_reads": next_reads,
             "privacy": {
                 "raw_text_included": True,
@@ -3413,6 +3415,86 @@ def _semantic_read_role_summary(next_reads: list[dict] | None) -> dict:
             "corroboration/setup/context only. Open conditional_required reads only when proof is missing, "
             "caps or omitted windows block completeness, or the user asks for exhaustive coverage."
         ),
+    }
+
+
+def _semantic_source_followthrough_plan(next_reads: list[dict] | None, read_role_summary: dict) -> dict:
+    reads = [read for read in next_reads or [] if isinstance(read, dict)]
+    required = [
+        {**_semantic_followthrough_read_summary(read), "default_actionable": True}
+        for read in reads
+        if read.get("read_role") == READ_ROLE_REQUIRED_PRIMARY_PROOF
+    ]
+    conditional = [
+        {**_semantic_followthrough_read_summary(read), "default_actionable": False}
+        for read in reads
+        if read.get("read_role") == READ_ROLE_CONDITIONAL_REQUIRED
+    ]
+    optional = [
+        {**_semantic_followthrough_read_summary(read), "default_actionable": False}
+        for read in reads
+        if read.get("read_role") == READ_ROLE_OPTIONAL_DIAGNOSTIC
+    ]
+    default_required = required[:2]
+    required = [
+        {**read, "default_actionable": read.get("target") in {item.get("target") for item in default_required}}
+        for read in required
+    ]
+    return {
+        "schema_version": 1,
+        "plan_name": "first_source_followthrough_plan",
+        "status": (
+            "required_primary_proof_available"
+            if required
+            else "conditional_required_only"
+            if conditional
+            else "optional_diagnostic_only"
+            if optional
+            else "no_source_followthrough_refs"
+        ),
+        "default_read_policy": read_role_summary.get("policy"),
+        "default_required_primary_proof": default_required,
+        "required_primary_proof": required,
+        "conditional_required": conditional,
+        "optional_diagnostic": optional,
+        "stop_condition": (
+            "Stop broad searching once required_primary_proof refs support the returned failure modes "
+            "and fix suggestions; optional_diagnostic reads are not required follow-through."
+        ),
+        "only_continue_if": [
+            "Open conditional_required reads only when caps/omissions block completeness or the user asks for exhaustive coverage.",
+            "Open optional_diagnostic reads only for corroboration, setup/context audit, or uncertainty after required proof is inspected.",
+        ],
+        "counts": {
+            "default_required_primary_proof_count": len(default_required),
+            "required_primary_proof_count": len(required),
+            "conditional_required_count": len(conditional),
+            "optional_diagnostic_count": len(optional),
+        },
+        "links": {"all_source_refs": "semantic_wrapup.next_reads"},
+        "claim_boundaries": {
+            "optional_diagnostics_default_actionable": False,
+            "conditional_reads_default_actionable": False,
+            "all_refs_preserved_in_next_reads": True,
+            "provider_token_savings_claimed": False,
+        },
+    }
+
+
+def _semantic_followthrough_read_summary(read: dict) -> dict:
+    return {
+        key: value
+        for key, value in {
+            "read_role": read.get("read_role"),
+            "target": read.get("target"),
+            "kind": read.get("kind"),
+            "reason": read.get("reason"),
+            "source_ref": read.get("source_ref"),
+            "read_more_actionable": read.get("read_more_actionable"),
+            "diagnostic_only": read.get("diagnostic_only"),
+            "conditional_required": read.get("conditional_required"),
+        }.items()
+        if value not in (None, [], {})
     }
 
 

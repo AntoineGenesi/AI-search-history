@@ -3263,6 +3263,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "candidate_count": len(packet["strongest_candidates"]),
             "event_count": packet["tool_action_proof"]["event_count"],
             "source_locator_handoff": packet["source_locator_handoff"],
+            "source_followthrough_plan": packet.get("source_followthrough_plan"),
             "investigation_state": packet["investigation_state"],
             "answer_ready_handoff": packet["answer_ready_handoff"],
             "agent_instruction": packet["agent_instruction"],
@@ -3470,6 +3471,9 @@ def _answer_action_contract_from_executed_output(
         handoff = compact.get("answer_ready_handoff") or {}
         readiness_summary = compact.get("answer_readiness_summary") or {}
         longitudinal_phase_source_plan = compact.get("longitudinal_phase_source_plan") or {}
+        source_followthrough_plan = compact.get("source_followthrough_plan") or {}
+        source_followthrough_required = _source_followthrough_contract_reads(source_followthrough_plan)
+        source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
         core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
@@ -3540,6 +3544,7 @@ def _answer_action_contract_from_executed_output(
             answer_readiness_summary=readiness_summary,
             answer_ready_handoff=handoff,
             longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+            source_followthrough_plan=source_followthrough_plan,
             selected_route=selected_route,
         )
         if readiness_gate.get("blocked"):
@@ -3755,6 +3760,7 @@ def _answer_action_contract_from_executed_output(
                 else []
             )
             or core_plan.get("read")
+            or source_followthrough_required
             or handoff.get("primary_source_followthrough")
             or compact.get("source_locator_handoff", {}).get("next_reads")
             or compact.get("next_reads")
@@ -3766,6 +3772,7 @@ def _answer_action_contract_from_executed_output(
                 if route_family == "process_actual_use"
                 else core_plan.get("diagnostics_after")
             )
+            or source_followthrough_diagnostics
             or [],
             "diagnostic_policy": (
                 "expectation mismatch diagnostics are default non-actionable until expected/observed/divergence reads leave a named gap"
@@ -3784,11 +3791,20 @@ def _answer_action_contract_from_executed_output(
             )
             or (
                 (handoff.get("primary_source_followthrough") or {}).get("only_continue_if")
+                or source_followthrough_plan.get("only_continue_if")
                 or compact.get("no_evidence", {}).get("read_more_policy")
                 or selected_route.get("manual_search_guidance")
             ),
             "saved_report": compact.get("report_written"),
         }
+        if source_followthrough_plan:
+            contract["source_followthrough_plan"] = {
+                "status": source_followthrough_plan.get("status"),
+                "counts": source_followthrough_plan.get("counts"),
+                "stop_condition": source_followthrough_plan.get("stop_condition"),
+                "default_read_policy": source_followthrough_plan.get("default_read_policy"),
+            }
+            contract["stop"] = source_followthrough_plan.get("stop_condition") or contract["stop"]
         if source_inspection_boundary:
             contract["source_inspection_boundary"] = source_inspection_boundary
         if target_proof_handoff:
@@ -3936,6 +3952,7 @@ def _semantic_debug_readiness_source_plan_gate(
     answer_readiness_summary: dict,
     answer_ready_handoff: dict,
     longitudinal_phase_source_plan: dict,
+    source_followthrough_plan: dict,
     selected_route: dict,
 ) -> dict:
     if route_family not in {"semantic_debug", "provenance", "orchestration_provenance", "action_proof"}:
@@ -3987,6 +4004,7 @@ def _semantic_debug_readiness_source_plan_gate(
     next_reads = _semantic_debug_readiness_gate_next_reads(
         answer_ready_handoff=answer_ready_handoff,
         longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+        source_followthrough_plan=source_followthrough_plan,
     )
     required = _unique_preserving_order(
         [
@@ -4014,11 +4032,13 @@ def _semantic_debug_readiness_source_plan_gate(
             "answer_ready_handoff_decision": answer_ready_handoff.get("decision"),
             "answer_ready_handoff_do_next": answer_ready_handoff.get("do_next"),
             "longitudinal_phase_source_plan_status": longitudinal_phase_source_plan.get("status"),
+            "source_followthrough_plan_status": source_followthrough_plan.get("status"),
+            "source_followthrough_plan_counts": source_followthrough_plan.get("counts"),
             "required_before_answer": required[:8],
         },
         "read": next_reads,
-        "stop": guidance.get("stop_condition") or selected_route.get("stop_guidance"),
-        "only_continue_if": required[:8] or selected_route.get("manual_search_guidance"),
+        "stop": source_followthrough_plan.get("stop_condition") or guidance.get("stop_condition") or selected_route.get("stop_guidance"),
+        "only_continue_if": source_followthrough_plan.get("only_continue_if") or required[:8] or selected_route.get("manual_search_guidance"),
         "saved_report": answer_ready_handoff.get("report_written"),
     }
     if longitudinal_phase_source_plan:
@@ -4160,8 +4180,12 @@ def _semantic_debug_readiness_gate_next_reads(
     *,
     answer_ready_handoff: dict,
     longitudinal_phase_source_plan: dict,
+    source_followthrough_plan: dict | None = None,
 ) -> list[dict]:
     reads: list[dict] = []
+    plan_reads = _source_followthrough_contract_reads(source_followthrough_plan or {})
+    if plan_reads:
+        return plan_reads
     if isinstance(longitudinal_phase_source_plan, dict):
         for key in ("prioritized_recovery_actions", "prioritized_next_reads_before_synthesis"):
             values = longitudinal_phase_source_plan.get(key)
@@ -4177,6 +4201,27 @@ def _semantic_debug_readiness_gate_next_reads(
                 if isinstance(item, dict) and item.get("diagnostic_only") is not True
             )
     return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
+
+
+def _source_followthrough_contract_reads(plan: dict) -> list[dict]:
+    if not isinstance(plan, dict):
+        return []
+    default_required = [
+        item
+        for item in plan.get("default_required_primary_proof") or []
+        if isinstance(item, dict)
+    ]
+    required = [
+        item
+        for item in plan.get("required_primary_proof") or []
+        if isinstance(item, dict)
+    ]
+    conditional = [
+        item
+        for item in plan.get("conditional_required") or []
+        if isinstance(item, dict)
+    ]
+    return _dedupe_action_contract_rows(default_required + required + conditional)[:_ASK_ANSWER_MAX_REFS]
 
 
 def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
@@ -6060,6 +6105,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "process_actual_use_bucket_evidence_bundle": compact.get(
                 "process_actual_use_bucket_evidence_bundle"
             ),
+            "source_followthrough_plan": compact.get("source_followthrough_plan"),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
@@ -13414,7 +13460,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         rendered = render(payload, args.format)
         if args.report_output:
-            Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+            report_path = Path(args.report_output).expanduser()
+            report_format = "json" if report_path.suffix.lower() == ".json" else args.format
+            report_path.write_text(render(payload, report_format), encoding="utf-8")
             packet = payload["semantic_debug"]
             if _semantic_debug_is_scoped_no_evidence(packet):
                 payload = _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)

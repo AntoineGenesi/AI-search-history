@@ -890,6 +890,30 @@ def build_semantic_debug_payload(
         final_answer_contract["evidence_inputs"]["source_locator_next_reads_policy"] = (
             "optional_diagnostics_after_scoped_no_evidence"
         )
+    source_followthrough_plan = build_source_followthrough_plan(
+        next_reads=next_reads,
+        answer_ready_handoff=answer_ready_handoff,
+        action_proof_plan=action_proof_plan,
+        process_actual_use_read_plan=process_actual_use_read_plan,
+        historical_orchestration_plan=historical_orchestration_plan,
+        historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+        longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+        no_evidence=no_evidence,
+        scope_boundary_summary=scope_boundary_summary,
+    )
+    source_followthrough_summary = source_followthrough_plan_summary(source_followthrough_plan)
+    source_locator_handoff["source_followthrough_plan"] = source_followthrough_summary
+    answer_ready_handoff["source_followthrough_plan"] = source_followthrough_summary
+    answer_ready_handoff["links"]["source_followthrough_plan"] = "semantic_debug.source_followthrough_plan"
+    answer_ready_handoff["source_use_summary"]["source_followthrough_plan"] = {
+        "link": "semantic_debug.source_followthrough_plan",
+        "status": source_followthrough_plan.get("status"),
+        "counts": source_followthrough_plan.get("counts"),
+        "optional_diagnostics_default_actionable": False,
+        "conditional_reads_default_actionable": False,
+    }
+    agent_instruction["source_followthrough_plan"] = source_followthrough_summary
+    final_answer_contract["evidence_inputs"]["source_followthrough_plan"] = source_followthrough_summary
     answer_ready_handoff["links"]["investigation_state"] = "semantic_debug.investigation_state"
     answer_ready_handoff["source_use_summary"]["investigation_state"] = {
         "link": "semantic_debug.investigation_state",
@@ -907,6 +931,7 @@ def build_semantic_debug_payload(
         "source_handle_routing": source_handle_routing,
         "source_locator_handoff": source_locator_handoff,
         "scope_boundary_summary": scope_boundary_summary,
+        "source_followthrough_plan": source_followthrough_plan,
         "strongest_candidates": candidates,
         "timeline": timeline,
         "tool_action_proof": tool_proof,
@@ -5909,6 +5934,408 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
         }
         rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
     return rows
+
+
+SOURCE_FOLLOWTHROUGH_DEFAULT_REQUIRED_LIMIT = 2
+
+
+def build_source_followthrough_plan(
+    *,
+    next_reads: list[dict[str, Any]],
+    answer_ready_handoff: dict[str, Any],
+    action_proof_plan: dict[str, Any] | None = None,
+    process_actual_use_read_plan: dict[str, Any] | None = None,
+    historical_orchestration_plan: dict[str, Any] | None = None,
+    historical_orchestration_role_evidence_bundle: dict[str, Any] | None = None,
+    longitudinal_phase_source_plan: dict[str, Any] | None = None,
+    no_evidence: dict[str, Any] | None = None,
+    scope_boundary_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize the first source-followthrough decision across semantic-debug surfaces."""
+    required_candidates: list[dict[str, Any]] = []
+    conditional_candidates: list[dict[str, Any]] = []
+    optional_candidates: list[dict[str, Any]] = []
+    primary_followthrough = (
+        answer_ready_handoff.get("primary_source_followthrough")
+        if isinstance(answer_ready_handoff.get("primary_source_followthrough"), dict)
+        else {}
+    )
+    primary_followthrough_first = bool(primary_followthrough.get("applies"))
+    first_command = (
+        primary_followthrough.get("first_command")
+        if isinstance(primary_followthrough.get("first_command"), dict)
+        else {}
+    )
+    if primary_followthrough_first and first_command.get("target"):
+        required_candidates.extend(
+            _source_followthrough_summaries(
+                [
+                    {
+                        "kind": "primary_source_window_command",
+                        "target": first_command.get("target"),
+                        "reason": first_command.get("purpose")
+                        or primary_followthrough.get("do_first")
+                        or "primary source followthrough command",
+                        "read_more_command": first_command.get("command"),
+                    }
+                ],
+                read_role="required_primary_proof",
+                selection_source="answer_ready_handoff.primary_source_followthrough",
+                reason_fallback="primary source followthrough command",
+            )
+        )
+
+    process_plan = process_actual_use_read_plan or {}
+    required_candidates.extend(
+        _source_followthrough_summaries(
+            process_plan.get("required_primary_raw_final_support_reads") or [],
+            read_role="required_primary_proof",
+            selection_source="process_actual_use_final_support_read_plan",
+            reason_fallback="primary raw process actual-use proof",
+        )
+    )
+    historical_bundle = historical_orchestration_role_evidence_bundle or {}
+    required_candidates.extend(
+        _source_followthrough_summaries(
+            historical_bundle.get("required_role_reads") or [],
+            read_role="required_primary_proof",
+            selection_source="historical_orchestration_role_evidence_bundle",
+            reason_fallback="primary role evidence for orchestration provenance",
+        )
+    )
+    historical_plan = historical_orchestration_plan or {}
+    required_candidates.extend(
+        _source_followthrough_summaries(
+            historical_plan.get("primary_historical_final_support_reads") or [],
+            read_role="required_primary_proof",
+            selection_source="historical_orchestration_provenance_final_support_plan",
+            reason_fallback="primary pre-existing raw orchestration proof",
+        )
+    )
+    conditional_candidates.extend(
+        _source_followthrough_summaries(
+            historical_plan.get("bounded_non_final_required_reads") or [],
+            read_role="conditional_required",
+            selection_source="historical_orchestration_provenance_final_support_plan",
+            reason_fallback="non-final role gap check; open only when primary role proof is missing",
+        )
+    )
+    conditional_candidates.extend(
+        _source_followthrough_summaries(
+            historical_plan.get("missing_role_recovery_refs") or [],
+            read_role="conditional_required",
+            selection_source="historical_orchestration_provenance_final_support_plan",
+            reason_fallback="missing role recovery; open only for fail-closed role gaps",
+        )
+    )
+
+    action_plan = action_proof_plan or {}
+    if not primary_followthrough_first:
+        required_candidates.extend(
+            _source_followthrough_summaries(
+                list(action_plan.get("required_proof_reads") or [])
+                + list(action_plan.get("primary_proof_refs") or []),
+                read_role="required_primary_proof",
+                selection_source="action_proof_plan",
+                reason_fallback="primary action-proof source read",
+            )
+        )
+
+    guidance = answer_ready_handoff.get("source_action_guidance")
+    if isinstance(guidance, dict) and not primary_followthrough_first:
+        required_candidates.extend(
+            _source_followthrough_summaries(
+                guidance.get("required_primary_source_actions") or [],
+                read_role="required_primary_proof",
+                selection_source="answer_ready_handoff.source_action_guidance",
+                reason_fallback="required primary source action before answering",
+            )
+        )
+
+    phase_plan = longitudinal_phase_source_plan or {}
+    conditional_candidates.extend(
+        _source_followthrough_summaries(
+            list(phase_plan.get("prioritized_recovery_actions") or [])
+            + list(phase_plan.get("prioritized_next_reads_before_synthesis") or []),
+            read_role="conditional_required",
+            selection_source="longitudinal_phase_source_plan",
+            reason_fallback="phase/cap recovery; open only when chronology or phase coverage is missing",
+        )
+    )
+
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        role = (
+            "optional_diagnostic"
+            if primary_followthrough_first
+            else source_followthrough_read_role(read, no_evidence=no_evidence or {})
+        )
+        row = _source_followthrough_summary(
+            read,
+            read_role=role,
+            selection_source="semantic_debug.next_reads",
+            reason_fallback=(
+                "optional diagnostic/context read"
+                if role == "optional_diagnostic"
+                else "conditional read for omitted/capped/missing proof"
+                if role == "conditional_required"
+                else "required primary proof read"
+            ),
+        )
+        if not row:
+            continue
+        if role == "optional_diagnostic":
+            optional_candidates.append(row)
+        elif role == "conditional_required":
+            conditional_candidates.append(row)
+        else:
+            required_candidates.append(row)
+
+    required = _dedupe_source_followthrough_reads(required_candidates)
+    conditional = _dedupe_source_followthrough_reads(
+        [row for row in conditional_candidates if _source_followthrough_key(row) not in {_source_followthrough_key(item) for item in required}]
+    )
+    required_keys = {_source_followthrough_key(item) for item in required}
+    conditional_keys = {_source_followthrough_key(item) for item in conditional}
+    optional = _dedupe_source_followthrough_reads(
+        [
+            row
+            for row in optional_candidates
+            if _source_followthrough_key(row) not in required_keys
+            and _source_followthrough_key(row) not in conditional_keys
+        ]
+    )
+    default_required = [
+        {**row, "default_actionable": True}
+        for row in required[:SOURCE_FOLLOWTHROUGH_DEFAULT_REQUIRED_LIMIT]
+    ]
+    default_keys = {_source_followthrough_key(row) for row in default_required}
+    required = [
+        {**row, "default_actionable": _source_followthrough_key(row) in default_keys}
+        for row in required
+    ]
+    conditional = [{**row, "default_actionable": False} for row in conditional]
+    optional = [{**row, "default_actionable": False} for row in optional]
+
+    scoped_no_evidence = bool((no_evidence or {}).get("needed")) and not required
+    stop_condition = source_followthrough_stop_condition(
+        answer_ready_handoff=answer_ready_handoff,
+        required=required,
+        conditional=conditional,
+        optional=optional,
+        scoped_no_evidence=scoped_no_evidence,
+    )
+    only_continue_if = source_followthrough_only_continue_if(
+        answer_ready_handoff=answer_ready_handoff,
+        scope_boundary_summary=scope_boundary_summary or {},
+        conditional=conditional,
+        scoped_no_evidence=scoped_no_evidence,
+    )
+    return {
+        "schema_version": 1,
+        "plan_name": "first_source_followthrough_plan",
+        "status": (
+            "required_primary_proof_available"
+            if required
+            else "conditional_required_only"
+            if conditional
+            else "optional_diagnostic_only"
+            if optional
+            else "no_source_followthrough_refs"
+        ),
+        "default_read_policy": (
+            "Open only the 1-2 default_actionable required_primary_proof reads first. "
+            "Open conditional_required reads only for caps, omissions, missing facets, chronology gaps, "
+            "or exhaustive requests. Optional diagnostics are visible but not default follow-through."
+        ),
+        "default_required_primary_proof": default_required,
+        "required_primary_proof": required,
+        "conditional_required": conditional,
+        "optional_diagnostic": optional,
+        "stop_condition": stop_condition,
+        "only_continue_if": only_continue_if,
+        "counts": {
+            "default_required_primary_proof_count": len(default_required),
+            "required_primary_proof_count": len(required),
+            "conditional_required_count": len(conditional),
+            "optional_diagnostic_count": len(optional),
+        },
+        "links": {
+            "all_source_refs": "semantic_debug.next_reads",
+            "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+            "source_locator_handoff": "semantic_debug.source_locator_handoff",
+        },
+        "claim_boundaries": {
+            "optional_diagnostics_default_actionable": False,
+            "conditional_reads_default_actionable": False,
+            "all_refs_preserved_in_next_reads": True,
+            "provider_token_savings_claimed": False,
+        },
+    }
+
+
+def source_followthrough_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "link": "semantic_debug.source_followthrough_plan",
+        "status": plan.get("status"),
+        "default_read_policy": plan.get("default_read_policy"),
+        "default_required_primary_proof": list(plan.get("default_required_primary_proof") or [])[:2],
+        "counts": plan.get("counts") or {},
+        "stop_condition": plan.get("stop_condition"),
+        "only_continue_if": list(plan.get("only_continue_if") or [])[:4],
+    }
+
+
+def _source_followthrough_summaries(
+    reads: list[Any],
+    *,
+    read_role: str,
+    selection_source: str,
+    reason_fallback: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+        row = _source_followthrough_summary(
+            read,
+            read_role=read_role,
+            selection_source=selection_source,
+            reason_fallback=reason_fallback,
+        )
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _source_followthrough_summary(
+    read: dict[str, Any],
+    *,
+    read_role: str,
+    selection_source: str,
+    reason_fallback: str,
+) -> dict[str, Any]:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    target = read.get("target") or source_ref_target(source_ref)
+    if not target and not source_ref:
+        return {}
+    row = {
+        "read_role": read_role,
+        "target": target,
+        "kind": read.get("kind"),
+        "candidate_id": read.get("candidate_id"),
+        "reason": read.get("reason") or reason_fallback,
+        "selection_source": selection_source,
+        "source_ref": guided_source_ref(source_ref) if source_ref else None,
+        "read_more_actionable": read.get("read_more_actionable", read_role == "required_primary_proof"),
+        "followthrough_actionable": read.get("followthrough_actionable", read_role == "required_primary_proof"),
+        "diagnostic_only": read.get("diagnostic_only") is True or read_role == "optional_diagnostic",
+        "conditional_required": read_role == "conditional_required" or read.get("conditional_required") is True,
+    }
+    for key in (
+        "source_chronology_role",
+        "target_source_role",
+        "actual_use_source_tier",
+        "proof_role",
+        "role",
+    ):
+        if read.get(key) is not None:
+            row[key] = read.get(key)
+    if read.get("omitted_window_recovery"):
+        row["omitted_window_recovery"] = read.get("omitted_window_recovery")
+    return {key: value for key, value in row.items() if value not in (None, [], {})}
+
+
+def source_followthrough_read_role(read: dict[str, Any], *, no_evidence: dict[str, Any]) -> str:
+    explicit_role = str(read.get("read_role") or "")
+    if explicit_role in {"required_primary_proof", "conditional_required", "optional_diagnostic"}:
+        return explicit_role
+    if (
+        read.get("conditional_required") is True
+        or read.get("omitted_window_recovery")
+        or _source_followthrough_text_has_any(read, ("omitted", "cap", "missing facet", "chronology gap", "exhaustive"))
+    ):
+        return "conditional_required"
+    if bool(no_evidence.get("needed")) or not read_is_required_surface_actionable(read):
+        return "optional_diagnostic"
+    if core_convo_read_is_diagnostic_or_post_hoc(read):
+        return "optional_diagnostic"
+    return "required_primary_proof"
+
+
+def source_followthrough_stop_condition(
+    *,
+    answer_ready_handoff: dict[str, Any],
+    required: list[dict[str, Any]],
+    conditional: list[dict[str, Any]],
+    optional: list[dict[str, Any]],
+    scoped_no_evidence: bool,
+) -> str:
+    guidance = answer_ready_handoff.get("source_action_guidance")
+    if isinstance(guidance, dict) and guidance.get("stop_condition"):
+        return str(guidance.get("stop_condition"))
+    followthrough = answer_ready_handoff.get("primary_source_followthrough")
+    if isinstance(followthrough, dict) and followthrough.get("stop_after"):
+        return str(followthrough.get("stop_after"))
+    if scoped_no_evidence:
+        return "Stop broad search and answer scoped no-evidence once searched scope, omissions, and caps are named."
+    if required:
+        return (
+            "Stop after the default required_primary_proof refs support the answer. "
+            "Do not open optional_diagnostic refs unless a named facet remains unsupported."
+        )
+    if conditional:
+        return "Stop after stating the conditional gap and opening only reads needed for caps, omissions, missing facets, or chronology gaps."
+    if optional:
+        return "Stop required read-more; surfaced refs are optional diagnostics only."
+    return "Stop when no source-followthrough refs are available and state the searched-scope boundary."
+
+
+def source_followthrough_only_continue_if(
+    *,
+    answer_ready_handoff: dict[str, Any],
+    scope_boundary_summary: dict[str, Any],
+    conditional: list[dict[str, Any]],
+    scoped_no_evidence: bool,
+) -> list[str]:
+    followthrough = answer_ready_handoff.get("primary_source_followthrough")
+    values: list[str] = []
+    if isinstance(followthrough, dict):
+        values.extend(str(item) for item in list(followthrough.get("only_continue_if") or []) if item)
+    values.extend(str(item) for item in list(answer_ready_handoff.get("do_not_answer_until") or []) if item)
+    if conditional:
+        values.append(
+            "Open conditional_required reads only for caps, omissions, missing facets, chronology gaps, or exhaustive requests."
+        )
+    if scoped_no_evidence:
+        values.append("Continue only if the user needs stronger recall or a broader scope than searched-scope no-evidence.")
+    caps = scope_boundary_summary.get("cap_summary") if isinstance(scope_boundary_summary.get("cap_summary"), dict) else {}
+    if caps.get("hit"):
+        values.append("Continue only if cap-limited or omitted scope affects the claim.")
+    return dedupe(values)[:8]
+
+
+def _source_followthrough_text_has_any(read: dict[str, Any], markers: tuple[str, ...]) -> bool:
+    text = core_convo_read_marker_text(read)
+    return any(marker in text for marker in markers)
+
+
+def _dedupe_source_followthrough_reads(reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for read in reads:
+        key = _source_followthrough_key(read)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(read)
+    return rows
+
+
+def _source_followthrough_key(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return str(read.get("target") or source_ref_target(source_ref) or read.get("candidate_id") or "")
 
 
 def build_source_window_action_proof(

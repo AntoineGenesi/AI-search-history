@@ -1006,6 +1006,107 @@ def _is_compact_multifacet_provenance_followthrough(followthrough: dict) -> bool
     return window.get("reason") == COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON
 
 
+def render_source_followthrough_plan_text(plan: dict, *, command_by_target: dict[str, str] | None = None) -> list[str]:
+    if not plan:
+        return []
+    counts = plan.get("counts") or {}
+    lines = [
+        "First source-followthrough plan:",
+        f"- status: {plan.get('status')}",
+        (
+            "- counts: "
+            f"required_primary_proof={counts.get('required_primary_proof_count', 0)} "
+            f"conditional_required={counts.get('conditional_required_count', 0)} "
+            f"optional_diagnostic={counts.get('optional_diagnostic_count', 0)}"
+        ),
+        f"- policy: {plan.get('default_read_policy')}",
+        "required_primary_proof:",
+    ]
+    required = plan.get("required_primary_proof") or []
+    if required:
+        for read in required[:5]:
+            prefix = "default" if read.get("default_actionable") else "non-default"
+            lines.append(f"- {prefix}: {_source_target(read) or '(no source ref)'}")
+            reason = read.get("reason")
+            if reason:
+                lines.append(f"  reason: {reason}")
+            if read.get("default_actionable"):
+                command = _read_more_command(read, command_by_target)
+                if command:
+                    lines.append(f"  command: {command}")
+    else:
+        lines.append("- none")
+    conditional = plan.get("conditional_required") or []
+    lines.append("conditional_required:")
+    if conditional:
+        for read in conditional[:4]:
+            lines.append(f"- {_source_target(read) or '(no source ref)'}: {read.get('reason') or 'conditional proof recovery'}")
+    else:
+        lines.append("- none")
+    optional = plan.get("optional_diagnostic") or []
+    lines.append("optional_diagnostic:")
+    if optional:
+        lines.append(f"- {len(optional)} diagnostic refs preserved in JSON/report; not default read-more.")
+        lines.append("- diagnostic targets are listed later only under optional diagnostics / next_reads.")
+    else:
+        lines.append("- none")
+    lines.append(f"Stop condition: {plan.get('stop_condition')}")
+    for item in list(plan.get("only_continue_if") or [])[:4]:
+        lines.append(f"Only continue if: {item}")
+    return lines
+
+
+def render_source_followthrough_plan_markdown(plan: dict, *, command_by_target: dict[str, str] | None = None) -> list[str]:
+    if not plan:
+        return []
+    counts = plan.get("counts") or {}
+    lines = [
+        "",
+        "## First Source-Followthrough Plan",
+        "",
+        f"- `status`: `{plan.get('status')}`",
+        (
+            f"- `required_primary_proof`: `{counts.get('required_primary_proof_count', 0)}`; "
+            f"`conditional_required`: `{counts.get('conditional_required_count', 0)}`; "
+            f"`optional_diagnostic`: `{counts.get('optional_diagnostic_count', 0)}`"
+        ),
+        f"- Policy: {plan.get('default_read_policy')}",
+        "",
+        "### required_primary_proof",
+    ]
+    required = plan.get("required_primary_proof") or []
+    if required:
+        for read in required[:5]:
+            prefix = "default" if read.get("default_actionable") else "non-default"
+            lines.append(f"- `{prefix}` `{_source_target(read) or '(no source ref)'}`")
+            if read.get("reason"):
+                lines.append(f"  - Reason: {read.get('reason')}")
+            if read.get("default_actionable"):
+                command = _read_more_command(read, command_by_target)
+                if command:
+                    lines.append(f"  - Command: `{command}`")
+    else:
+        lines.append("- None.")
+    lines.extend(["", "### conditional_required"])
+    conditional = plan.get("conditional_required") or []
+    if conditional:
+        for read in conditional[:4]:
+            lines.append(f"- `{_source_target(read) or '(no source ref)'}`: {read.get('reason') or 'conditional proof recovery'}")
+    else:
+        lines.append("- None.")
+    lines.extend(["", "### optional_diagnostic"])
+    optional = plan.get("optional_diagnostic") or []
+    if optional:
+        lines.append(f"- `{len(optional)}` diagnostic refs preserved in JSON/report; not default read-more.")
+        lines.append("- Diagnostic targets are listed later only under optional diagnostics / `next_reads`.")
+    else:
+        lines.append("- None.")
+    lines.extend(["", "### Stop / Continue", f"- Stop condition: {plan.get('stop_condition')}"])
+    for item in list(plan.get("only_continue_if") or [])[:4]:
+        lines.append(f"- Only continue if: {item}")
+    return lines
+
+
 def _is_jsonl_read_target(target: str | None) -> bool:
     if not target:
         return False
@@ -1663,6 +1764,7 @@ def render_semantic_wrapup_text(payload: dict) -> str:
     diagnostic_reads = [read for read in reads if isinstance(read, dict) and read not in required_reads]
     command_by_target = _read_more_commands_by_target(required_reads)
     read_role_summary = report.get("read_role_summary") or {}
+    source_followthrough_plan = report.get("source_followthrough_plan") or {}
     answer_status = _source_use_answer_status(
         report.get("status"),
         has_required_reads=bool(required_reads),
@@ -1672,8 +1774,9 @@ def render_semantic_wrapup_text(payload: dict) -> str:
         "Semantic wrap-up",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
-        "Required primary proof reads:",
     ]
+    lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
+    lines.append("Required primary proof reads:")
     if required_reads:
         for read in required_reads[:8]:
             _append_text_read(lines, read, command_by_target=command_by_target)
@@ -1927,6 +2030,7 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
     diagnostic_reads = [read for read in reads if isinstance(read, dict) and read not in required_reads]
     command_by_target = _read_more_commands_by_target(required_reads)
     read_role_summary = report.get("read_role_summary") or {}
+    source_followthrough_plan = report.get("source_followthrough_plan") or {}
     answer_status = _source_use_answer_status(
         report.get("status"),
         has_required_reads=bool(required_reads),
@@ -1937,10 +2041,13 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
         "",
         f"**Status:** `{report.get('status')}`",
         f"**Answer status:** `{answer_status}`",
+    ]
+    lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
+    lines.extend([
         "",
         "## Required Primary Proof Reads",
         "",
-    ]
+    ])
     if required_reads:
         for read in required_reads[:8]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
@@ -4228,6 +4335,7 @@ def render_semantic_debug_text(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
+    source_followthrough_plan = report.get("source_followthrough_plan") or {}
     answer_status = (
         "answer-scoped-no-evidence-now"
         if scoped_no_evidence
@@ -4268,6 +4376,7 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
     ]
+    lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_text(orchestration_role_bundle))
@@ -4495,6 +4604,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan") or (
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
+    source_followthrough_plan = report.get("source_followthrough_plan") or {}
     answer_status = (
         "answer-scoped-no-evidence-now"
         if scoped_no_evidence
@@ -4528,6 +4638,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         f"**Status:** {report.get('status')}",
         f"**Answer status:** `{answer_status}`",
     ]
+    lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_markdown(orchestration_role_bundle))
@@ -6111,6 +6222,17 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
             f"embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)} "
             f"diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}"
         )
+    followthrough_plan = handoff.get("source_followthrough_plan") or {}
+    if followthrough_plan:
+        counts = followthrough_plan.get("counts") or {}
+        lines.append(
+            "- source_followthrough_plan: "
+            f"status={followthrough_plan.get('status')} "
+            f"required_primary_proof={counts.get('required_primary_proof_count', 0)} "
+            f"conditional_required={counts.get('conditional_required_count', 0)} "
+            f"optional_diagnostic={counts.get('optional_diagnostic_count', 0)}"
+        )
+        lines.append(f"- source_followthrough_stop: {followthrough_plan.get('stop_condition')}")
     top_candidates = candidate_ordering.get("top_candidates") or []
     for candidate in top_candidates[:5]:
         bits = [
@@ -6122,10 +6244,16 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
             f"reasons={_format_handoff_reason_codes(candidate)}",
         ]
         lines.append(f"- top candidate: {' '.join(bits)}")
-    for item in handoff.get("next_reads", [])[:5]:
-        actionability = "diagnostic-only" if item.get("diagnostic_only") or item.get("read_more_actionable") is False else "actionable"
-        reason = f" reason={item.get('reason')}" if item.get("reason") else ""
-        lines.append(f"- next read ({actionability}): {item.get('kind')} {item.get('target')}{reason}")
+    if followthrough_plan:
+        lines.append("- next_reads: preserved in JSON/report; default open order is semantic_debug.source_followthrough_plan")
+        optional_count = (followthrough_plan.get("counts") or {}).get("optional_diagnostic_count", 0)
+        if optional_count:
+            lines.append(f"- next read (diagnostic-only): {optional_count} refs preserved; targets listed only in JSON next_reads")
+    else:
+        for item in handoff.get("next_reads", [])[:5]:
+            actionability = "diagnostic-only" if item.get("diagnostic_only") or item.get("read_more_actionable") is False else "actionable"
+            reason = f" reason={item.get('reason')}" if item.get("reason") else ""
+            lines.append(f"- next read ({actionability}): {item.get('kind')} {item.get('target')}{reason}")
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_text(
             lines,
@@ -6393,6 +6521,17 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
             f"`embedded_refs_promoted={provenance_policy.get('embedded_source_ref_promoted_count', 0)}`; "
             f"`diagnostic_only_reads={provenance_policy.get('diagnostic_only_next_read_count', 0)}`."
         )
+    followthrough_plan = handoff.get("source_followthrough_plan") or {}
+    if followthrough_plan:
+        counts = followthrough_plan.get("counts") or {}
+        lines.append(
+            "- Source followthrough plan: "
+            f"`status={followthrough_plan.get('status')}`; "
+            f"`required_primary_proof={counts.get('required_primary_proof_count', 0)}`; "
+            f"`conditional_required={counts.get('conditional_required_count', 0)}`; "
+            f"`optional_diagnostic={counts.get('optional_diagnostic_count', 0)}`."
+        )
+        lines.append(f"- Source followthrough stop: {followthrough_plan.get('stop_condition')}")
     top_candidates = candidate_ordering.get("top_candidates") or []
     if top_candidates:
         lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
@@ -6406,8 +6545,10 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(_format_handoff_score(candidate))} | "
                 f"{_escape_markdown_table(_format_handoff_reason_codes(candidate))} |"
             )
-    next_reads = handoff.get("next_reads", [])[:5]
-    if next_reads:
+    next_reads = [] if followthrough_plan else handoff.get("next_reads", [])[:5]
+    if followthrough_plan:
+        lines.append("- `next_reads`: preserved in JSON/report; default open order is `semantic_debug.source_followthrough_plan`.")
+    elif next_reads:
         lines.extend(["", "| Kind | Target | Actionability | Reason |", "| --- | --- | --- | --- |"])
         for item in next_reads:
             actionability = (
