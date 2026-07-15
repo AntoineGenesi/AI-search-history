@@ -70,7 +70,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
-from .gittools import git_root_for, last_change_for_path
+from .gittools import git_root_for, last_change_for_path, merge_commits_for_task
 from .latest_user_messages import build_latest_user_messages_payload, latest_user_messages
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
@@ -4731,6 +4731,10 @@ def _latest_status_target_episode_anchor_gate(*, query: str, action: dict, opene
         refs=opened,
         required_source_role=_target_episode_required_source_role("latest_status"),
     )
+    completed_artifact_status_refs = _completed_task_artifact_status_opened_refs(
+        opened,
+        required_ids=required_ids,
+    )
     if matched_anchor_ids and opened_gate.get("status") == "answer_allowed":
         return {
             "schema_version": 1,
@@ -4738,6 +4742,16 @@ def _latest_status_target_episode_anchor_gate(*, query: str, action: dict, opene
             "status": "answer_allowed",
             "required_target_ids": required_ids,
             "matched_anchor_ids": matched_anchor_ids,
+            "opened_gate": _target_episode_source_role_gate_public_contract(opened_gate),
+        }
+    if completed_artifact_status_refs and opened_gate.get("status") == "answer_allowed":
+        return {
+            "schema_version": 1,
+            "applies": True,
+            "status": "answer_allowed",
+            "required_target_ids": required_ids,
+            "matched_anchor_ids": [],
+            "completed_task_artifact_status": True,
             "opened_gate": _target_episode_source_role_gate_public_contract(opened_gate),
         }
     reasons: list[str] = []
@@ -4777,11 +4791,35 @@ def _latest_status_target_episode_anchor_gate_public_contract(gate: dict) -> dic
         "required_target_ids": list(gate.get("required_target_ids") or []),
         "required_source_role": gate.get("required_source_role"),
         "matched_anchor_ids": list(gate.get("matched_anchor_ids") or []),
+        "completed_task_artifact_status": bool(gate.get("completed_task_artifact_status")),
         "reasons": list(gate.get("reasons") or []),
         "selected_anchor": gate.get("selected_anchor") or {},
         "opened_gate": gate.get("opened_gate") or {},
         "required_next_proof": gate.get("required_next_proof"),
     }
+
+
+def _completed_task_artifact_status_opened_refs(opened: list[dict], *, required_ids: list[str]) -> list[dict]:
+    selected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if not _completed_task_artifact_ref(ref):
+            continue
+        text = _target_episode_ref_match_text(item)
+        if required_ids and not any(task_id in text for task_id in required_ids):
+            continue
+        if str(ref.get("proof_surface") or "") in {
+            "task_file",
+            "review_artifact",
+            "path_last_change_commit",
+            "merge_commit",
+            "post_merge_task_proof",
+            "post_merge_review_proof",
+        }:
+            selected.append(item)
+    return selected
 
 
 _ASK_EXECUTE_NAMED_TASK_PROOF_ROUTE_FAMILIES = frozenset(
@@ -5089,6 +5127,206 @@ def _current_named_task_action_proof_rows(
             boundaries.append(f"{task_id}: path-level commit metadata unavailable for {rel}")
 
     return rows, boundaries
+
+
+_COMPLETED_TASK_ARTIFACT_ROUTE_FAMILIES = frozenset(
+    {"action_proof", "latest_status", "orchestration_provenance", "provenance", "semantic_debug"}
+)
+
+
+def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family: str) -> list[dict]:
+    if route_family not in _COMPLETED_TASK_ARTIFACT_ROUTE_FAMILIES:
+        return []
+    task_ids = _ask_execute_named_task_ids(query)
+    if not task_ids:
+        return []
+    refs: list[dict] = []
+    repo = git_root_for(cwd) or cwd
+    post_merge_wanted = _completed_task_post_merge_artifact_wanted(query=query, route_family=route_family)
+    for task_id in task_ids[:2]:
+        slug = task_id.lower()
+        task_paths = _matching_named_task_artifacts(cwd / "tasks", slug)
+        review_paths = _matching_named_task_artifacts(cwd / "codex" / "state" / "reviews", slug)
+        for path in task_paths[:2]:
+            refs.append(
+                _completed_task_artifact_read(
+                    cwd,
+                    path,
+                    task_id=task_id,
+                    proof_surface="task_file",
+                    reason=f"inspect completed {task_id} task artifact for status/provenance proof",
+                )
+            )
+            if post_merge_wanted:
+                post_merge = _completed_task_post_merge_summary(path, task_id=task_id)
+                if post_merge:
+                    refs.append(
+                        _completed_task_embedded_summary_read(
+                            cwd,
+                            path,
+                            task_id=task_id,
+                            proof_surface="post_merge_task_proof",
+                            reason=f"inspect completed {task_id} task post-merge proof section/handle",
+                            summary=post_merge,
+                        )
+                    )
+        for path in review_paths[:2]:
+            refs.append(
+                _completed_task_artifact_read(
+                    cwd,
+                    path,
+                    task_id=task_id,
+                    proof_surface="review_artifact",
+                    reason=f"inspect completed {task_id} review artifact for verdict/provenance proof",
+                )
+            )
+            if post_merge_wanted:
+                post_merge = _completed_task_post_merge_summary(path, task_id=task_id)
+                if post_merge:
+                    refs.append(
+                        _completed_task_embedded_summary_read(
+                            cwd,
+                            path,
+                            task_id=task_id,
+                            proof_surface="post_merge_review_proof",
+                            reason=f"inspect completed {task_id} review/post-merge verification proof",
+                            summary=post_merge,
+                        )
+                    )
+        for path in [*task_paths[:1], *review_paths[:1]]:
+            change = last_change_for_path(path, repo=repo)
+            if change:
+                refs.append(
+                    {
+                        "kind": "completed_named_task_commit_evidence",
+                        "task_id": task_id,
+                        "proof_surface": "path_last_change_commit",
+                        "target_source_role": "completed_task_artifact",
+                        "final_support_allowed": True,
+                        "target": change.commit,
+                        "commit": change.commit,
+                        "commit_time": change.commit_time,
+                        "subject": change.subject,
+                        "path": change.path,
+                        "reason": f"inspect path-level completed-task commit evidence for {_safe_relative_path(cwd, path)}",
+                        "source_boundary": (
+                            "completed task/review git metadata; valid for artifact status/provenance roles, "
+                            "not raw source-session chronology"
+                        ),
+                    }
+                )
+        for commit in merge_commits_for_task(repo, task_id, max_commits=3):
+            refs.append(
+                {
+                    "kind": "completed_named_task_merge_commit_evidence",
+                    "task_id": task_id,
+                    "proof_surface": "merge_commit",
+                    "target_source_role": "completed_task_artifact",
+                    "final_support_allowed": True,
+                    "target": commit.get("commit"),
+                    "commit": commit.get("commit"),
+                    "commit_time": commit.get("commit_time"),
+                    "subject": commit.get("subject"),
+                    "reason": f"inspect local git merge commit evidence for completed {task_id}",
+                    "source_boundary": (
+                        "local git merge commit metadata; satisfies merge-commit proof only, not raw source-session proof"
+                    ),
+                }
+            )
+    return _dedupe_ask_answer_proof_refs(refs)
+
+
+def _completed_task_post_merge_artifact_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in _COMPLETED_TASK_ARTIFACT_ROUTE_FAMILIES:
+        return False
+    normalized = str(query or "").casefold()
+    return any(marker in normalized for marker in ("post-merge", "post merge", "postmerge"))
+
+
+def _completed_task_artifact_read(
+    cwd: Path,
+    path: Path,
+    *,
+    task_id: str,
+    proof_surface: str,
+    reason: str,
+) -> dict:
+    rel = _safe_relative_path(cwd, path)
+    return {
+        "kind": "completed_named_task_artifact",
+        "task_id": task_id,
+        "proof_surface": proof_surface,
+        "target_source_role": "completed_task_artifact",
+        "final_support_allowed": True,
+        "target": rel,
+        "path": rel,
+        "reason": reason,
+        "source_boundary": (
+            "completed repo artifact; valid for completed-task status/provenance roles, "
+            "not raw source-session or worker chronology proof"
+        ),
+    }
+
+
+def _completed_task_embedded_summary_read(
+    cwd: Path,
+    path: Path,
+    *,
+    task_id: str,
+    proof_surface: str,
+    reason: str,
+    summary: str,
+) -> dict:
+    rel = _safe_relative_path(cwd, path)
+    return {
+        "kind": "completed_named_task_embedded_summary",
+        "task_id": task_id,
+        "proof_surface": proof_surface,
+        "target_source_role": "completed_task_artifact",
+        "proof_role": "post_merge_proof_bundle",
+        "final_support_allowed": True,
+        "target": rel,
+        "path": rel,
+        "summary": summary,
+        "reason": reason,
+        "source_boundary": (
+            "completed task/review post-merge proof text or retained private handle; "
+            "valid for post-merge artifact role without exposing raw private paths"
+        ),
+    }
+
+
+def _completed_task_post_merge_summary(path: Path, *, task_id: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    selected: list[str] = []
+    in_post_merge_section = False
+    section_level = 0
+    for raw in lines:
+        stripped = raw.strip()
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+        if heading:
+            level = len(heading.group(1))
+            title = heading.group(2).strip().casefold()
+            if in_post_merge_section and level <= section_level:
+                in_post_merge_section = False
+            if "post-merge proof" in title or "post merge proof" in title:
+                in_post_merge_section = True
+                section_level = level
+                continue
+        folded = stripped.casefold()
+        if in_post_merge_section or (
+            task_id.casefold() in folded
+            and any(marker in folded for marker in ("post-merge", "post merge", "postmerge"))
+        ):
+            cleaned = stripped.lstrip("-* ").strip()
+            if cleaned:
+                selected.append(cleaned)
+        if len(selected) >= 8:
+            break
+    return _short_join(selected, limit=900)
 
 
 def _current_named_task_stopped_before_implementation_rows(
@@ -5956,6 +6194,13 @@ def _ask_answer_from_execute(
         proof_refs = _dedupe_ask_answer_proof_refs(
             list(work_episode.get("primary_proof_refs") or []) + proof_refs
         )
+    completed_task_refs = _completed_task_artifact_support_refs(
+        cwd=cwd,
+        query=str(report.get("query") or ""),
+        route_family=route_family,
+    )
+    if completed_task_refs:
+        proof_refs = _dedupe_ask_answer_proof_refs(completed_task_refs + proof_refs)
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
     if not usable:
@@ -8074,7 +8319,25 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
                 }
             )
             continue
-        if ref.get("kind") == "current_named_task_commit_evidence":
+        if ref.get("kind") == "completed_named_task_embedded_summary":
+            summary = str(ref.get("summary") or "").strip()
+            opened.append(
+                {
+                    "status": "opened" if summary else "skipped",
+                    "reason": "embedded_completed_task_summary" if summary else "empty_completed_task_summary",
+                    "target": ref.get("target"),
+                    "path": ref.get("path"),
+                    "line": None,
+                    "summary": summary[:_ASK_ANSWER_MAX_FILE_CHARS],
+                    "ref": ref,
+                }
+            )
+            continue
+        if ref.get("kind") in {
+            "current_named_task_commit_evidence",
+            "completed_named_task_commit_evidence",
+            "completed_named_task_merge_commit_evidence",
+        }:
             summary = " ".join(
                 part
                 for part in (
@@ -9109,6 +9372,9 @@ def _action_chronology_opened_source_role(item: dict) -> dict:
         "task_file",
         "review_artifact",
         "path_last_change_commit",
+        "merge_commit",
+        "post_merge_task_proof",
+        "post_merge_review_proof",
         "task_selection_rationale",
         "pipeline_selection_result",
     } or target_role in {"target_historical_artifact", "legitimate_context"}:
@@ -9532,6 +9798,8 @@ def _current_run_final_support_gate(*, query: str, route_family: str, opened: li
 
 def _current_run_final_support_reject_reasons(item: dict, *, query: str) -> list[str]:
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if _completed_task_artifact_ref(ref):
+        return []
     metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     summary = str(item.get("summary") or "")
     text = _current_run_final_support_text(item)
@@ -9565,6 +9833,12 @@ def _current_run_final_support_reject_reasons(item: dict, *, query: str) -> list
     if ref.get("final_support_allowed") is False:
         reasons.append("final_support_not_allowed")
     return _unique_preserving_order(reasons)
+
+
+def _completed_task_artifact_ref(ref: dict) -> bool:
+    kind = str(ref.get("kind") or "")
+    target_role = str(ref.get("target_source_role") or "")
+    return kind.startswith("completed_named_task_") or target_role == "completed_task_artifact"
 
 
 def _current_run_final_support_text(item: dict) -> str:
@@ -10778,6 +11052,13 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         action_chronology_answer = _compose_action_chronology_answer(opened=opened)
         if action_chronology_answer:
             return action_chronology_answer
+    completed_task_answer = _compose_completed_task_artifact_answer(
+        query=query,
+        route_family=route_family,
+        opened=opened,
+    )
+    if completed_task_answer:
+        return completed_task_answer
     if named.get("status") in {
         "current_named_task_proof_refs_available",
         "current_named_task_stopped_episode_proof_refs_available",
@@ -10811,6 +11092,7 @@ def _sanitize_final_answer_prose(text: str) -> str:
     sanitized = sanitized.replace('"payload"', "event payload")
     sanitized = sanitized.replace('"type":"event_msg"', "event message record")
     sanitized = sanitized.replace('"type": "event_msg"', "event message record")
+    sanitized = _redact_local_paths_for_final_answer(sanitized)
     return re.sub(r"\s{2,}", " ", sanitized).strip()
 
 
@@ -11089,6 +11371,186 @@ def _compose_expectation_mismatch_answer(*, opened: list[dict]) -> str | None:
         "observed_behavior_or_action_proof, and divergence_evidence: "
         + " ".join(pieces)
     )
+
+
+def _compose_completed_task_artifact_answer(*, query: str, route_family: str, opened: list[dict]) -> str | None:
+    task_ids = _ask_execute_named_task_ids(query)
+    if not task_ids:
+        return None
+    task_id = task_ids[0]
+    refs = _completed_task_artifact_opened_refs(opened, task_id=task_id)
+    if not refs:
+        return None
+    task_summaries = _completed_task_role_summaries(refs, "task_file", task_id=task_id)
+    review_summaries = _completed_task_role_summaries(refs, "review_artifact", task_id=task_id)
+    path_commit_summaries = _completed_task_role_summaries(refs, "path_last_change_commit", task_id=task_id)
+    merge_commits = _named_task_merge_commit_hashes(refs, task_id=task_id)
+    post_merge_summaries = [
+        _completed_task_clean_summary(str(item.get("summary") or ""), task_id=task_id)
+        for item in refs
+        if str((item.get("ref") or {}).get("proof_surface") or "") in {"post_merge_task_proof", "post_merge_review_proof"}
+    ]
+    post_merge_summaries = [summary for summary in post_merge_summaries if summary]
+
+    if route_family == "latest_status":
+        status_bits = []
+        status = _completed_task_status_label(task_summaries + review_summaries)
+        if status:
+            status_bits.append(status)
+        if review_summaries:
+            status_bits.append("reviewed/verified")
+        if merge_commits:
+            status_bits.append("merged")
+        if post_merge_summaries:
+            status_bits.append("post-merge checked")
+        if not status_bits:
+            status_bits.append("completed-task artifact proof found")
+        proof_bits = []
+        if task_summaries:
+            proof_bits.append(f"task: {_short_join(task_summaries[:1], limit=260)}")
+        if review_summaries:
+            proof_bits.append(f"review: {_short_join(review_summaries[:1], limit=220)}")
+        if merge_commits:
+            proof_bits.append(f"merge commit: {', '.join(commit[:12] for commit in merge_commits[:2])}")
+        if post_merge_summaries:
+            proof_bits.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=220)}")
+        return (
+            f"{task_id} latest completed-task status: {', '.join(_unique_preserving_order(status_bits))}. "
+            f"Proof: {'; '.join(proof_bits)}. "
+            "Boundary: this is task/review/git artifact status proof, not raw source-session chronology."
+        )
+
+    if _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
+        source_sessions = _named_task_source_session_proof_summaries(refs)
+        pieces = []
+        if source_sessions:
+            pieces.append(f"source-session proof: {_short_join(source_sessions[:1], limit=220)}")
+        else:
+            pieces.append("source-session proof: missing/not opened")
+        pieces.append(
+            "task artifact proof: "
+            + (_short_join(task_summaries[:1], limit=240) if task_summaries else "missing/not opened")
+        )
+        pieces.append(
+            "review artifact proof: "
+            + (_short_join(review_summaries[:1], limit=240) if review_summaries else "missing/not opened")
+        )
+        pieces.append(
+            "merge commit proof: "
+            + (", ".join(commit[:12] for commit in merge_commits[:3]) if merge_commits else "missing/not opened")
+        )
+        if post_merge_summaries:
+            pieces.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=240)}")
+        return (
+            f"Completed-task merge/provenance proof for {task_id}: "
+            + "; ".join(pieces)
+            + ". Boundary: task/review/git/post-merge artifacts satisfy only their artifact roles; "
+            "they are not raw source-session proof unless a raw session ref is opened."
+        )
+
+    if _completed_task_artifact_provenance_answer_wanted(query=query, route_family=route_family):
+        proof_bits = []
+        if task_summaries:
+            proof_bits.append(f"task: {_short_join(task_summaries[:1], limit=260)}")
+        if review_summaries:
+            proof_bits.append(f"review: {_short_join(review_summaries[:1], limit=240)}")
+        if path_commit_summaries:
+            proof_bits.append(f"commit evidence: {_short_join(path_commit_summaries[:2], limit=240)}")
+        if merge_commits:
+            proof_bits.append(f"merge commit: {', '.join(commit[:12] for commit in merge_commits[:2])}")
+        if post_merge_summaries:
+            proof_bits.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=220)}")
+        if proof_bits:
+            return (
+                f"Completed-task artifact proof for {task_id}: "
+                + "; ".join(proof_bits)
+                + ". Boundary: this proves recorded task/review/git artifact status/provenance, not raw worker-session chronology."
+            )
+    return None
+
+
+def _completed_task_artifact_provenance_answer_wanted(*, query: str, route_family: str) -> bool:
+    if route_family not in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+        return False
+    normalized = str(query or "").casefold()
+    if _named_task_review_failure_status_answer_wanted(query=query, route_family=route_family):
+        return False
+    if _named_task_selection_rationale_answer_wanted(query=query, route_family=route_family):
+        return False
+    if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
+        return False
+    if re.search(r"\bwhat happened\b", normalized):
+        return False
+    return (
+        "prove" in normalized
+        and any(term in normalized for term in ("task", "review", "commit"))
+        and any(term in normalized for term in ("action", "taken", "provenance", "status"))
+    )
+
+
+def _completed_task_artifact_opened_refs(opened: list[dict], *, task_id: str) -> list[dict]:
+    normalized_task = task_id.casefold()
+    selected: list[dict] = []
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if not _completed_task_artifact_ref(ref):
+            continue
+        text = _target_episode_ref_match_text(item)
+        if normalized_task not in text:
+            continue
+        selected.append(item)
+    return selected
+
+
+def _completed_task_role_summaries(refs: list[dict], proof_surface: str, *, task_id: str) -> list[str]:
+    summaries: list[str] = []
+    for item in refs:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if str(ref.get("proof_surface") or "") != proof_surface:
+            continue
+        summary = _completed_task_clean_summary(str(item.get("summary") or ""), task_id=task_id)
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def _completed_task_clean_summary(summary: str, *, task_id: str) -> str:
+    fragments: list[str] = []
+    for fragment in _summary_fragments([summary]):
+        prose = _named_task_current_proof_prose_fragment(fragment, task_id=task_id)
+        if not prose:
+            continue
+        prose = _redact_local_paths_for_final_answer(prose)
+        if ".private/" in prose:
+            prose = re.sub(r"\.private/[A-Za-z0-9._/-]+", "retained private proof handle", prose)
+        fragments.append(prose)
+    return _short_join(fragments[:4], limit=420)
+
+
+def _completed_task_status_label(summaries: list[str]) -> str:
+    text = " ".join(summaries).casefold()
+    if "post-merge verified" in text:
+        return "post-merge verified"
+    if "closed - merged" in text or "closed/merged" in text:
+        return "closed/merged"
+    if "verified - merged" in text or "reviewed merged" in text:
+        return "verified/merged"
+    if "status: closed" in text:
+        return "closed"
+    if "status: verified" in text:
+        return "verified"
+    if "verdict: verified" in text:
+        return "verified"
+    return ""
+
+
+def _redact_local_paths_for_final_answer(text: str) -> str:
+    sanitized = str(text or "")
+    sanitized = re.sub(r"/home/user/[^\n`]*", "[local path]", sanitized)
+    sanitized = re.sub(r"/mnt/[^\n`]*", "[local path]", sanitized)
+    return re.sub(r"\s{2,}", " ", sanitized).strip()
 
 
 def _compose_latest_status_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
@@ -11584,6 +12046,12 @@ _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES = (
     "merge_commit_proof",
 )
 
+_NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES = (
+    "task_artifact_proof",
+    "review_artifact_proof",
+    "merge_commit_proof",
+)
+
 
 def _named_task_merge_provenance_final_proof_gate(
     *,
@@ -11601,11 +12069,29 @@ def _named_task_merge_provenance_final_proof_gate(
         for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
         if not role_evidence.get(role)
     ]
-    status = "answer_allowed" if not missing else "missing_required_merge_provenance_roles"
+    blocking_missing = [
+        role
+        for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES
+        if not role_evidence.get(role)
+    ]
+    display_missing = list(missing)
+    if (
+        "merge_commit_proof" in blocking_missing
+        and "source_session_proof" in display_missing
+        and _named_task_artifact_merge_claim_present(opened, task_id=task_id)
+    ):
+        display_missing = [role for role in display_missing if role != "merge_commit_proof"]
+    status = "answer_allowed" if not blocking_missing else "missing_required_merge_provenance_roles"
     summary_lines = []
-    if missing:
+    if blocking_missing:
         summary_lines.append(
-            "Named-task merge provenance proof is missing required roles: " + ", ".join(missing) + "."
+            "Named-task merge provenance proof is missing required roles: " + ", ".join(blocking_missing) + "."
+        )
+    elif missing:
+        summary_lines.append(
+            "Named-task merge provenance proof has task/review/merge roles; missing non-fabricated roles: "
+            + ", ".join(display_missing)
+            + "."
         )
     else:
         summary_lines.append(
@@ -11617,7 +12103,8 @@ def _named_task_merge_provenance_final_proof_gate(
         "status": status,
         "task_id": task_id,
         "required_roles": list(_NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES),
-        "missing_roles": missing,
+        "missing_roles": display_missing,
+        "blocking_missing_roles": blocking_missing,
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
@@ -11645,6 +12132,8 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
             continue
         ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
         target = str(item.get("target") or item.get("path") or ref.get("target") or ref.get("path") or "")
+        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+        source_path = str(source_ref.get("path") or "")
         text = " ".join(
             str(value or "")
             for value in (
@@ -11659,7 +12148,18 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         if task_id and _named_task_fragment_mentions_other_task_id(text, task_id):
             continue
         public = _ref_public_summary(item)
-        if ".jsonl" in target.casefold() or "session" in text:
+        source_surface_text = " ".join(
+            str(value or "")
+            for value in (
+                target,
+                source_path,
+                ref.get("kind"),
+                ref.get("proof_surface"),
+                ref.get("target_source_role"),
+                ref.get("proof_role"),
+            )
+        ).casefold()
+        if ".jsonl" in source_surface_text or "session" in source_surface_text:
             evidence["source_session_proof"].append(public)
         if ref.get("proof_surface") == "task_file" or "/tasks/" in f"/{target}".casefold():
             evidence["task_artifact_proof"].append(public)
@@ -11676,6 +12176,39 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
     }
 
 
+def _named_task_artifact_merge_claim_present(opened: list[dict], *, task_id: str) -> bool:
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if str(ref.get("proof_surface") or "") not in {
+            "task_file",
+            "review_artifact",
+            "path_git_log_probe",
+            "post_merge_task_proof",
+            "post_merge_review_proof",
+        }:
+            continue
+        text = " ".join(
+            str(value or "")
+            for value in (
+                item.get("summary"),
+                item.get("target"),
+                ref.get("target"),
+                ref.get("path"),
+                ref.get("reason"),
+            )
+        )
+        if task_id and _named_task_fragment_mentions_other_task_id(text, task_id):
+            continue
+        normalized = text.casefold()
+        if re.search(r"\b[0-9a-f]{7,40}\b", normalized) and any(
+            marker in normalized for marker in ("merge proof", "parent merge commit", "merge commit")
+        ):
+            return True
+    return False
+
+
 def _named_task_merge_provenance_gate_public_contract(gate: dict) -> dict:
     return {
         "schema_version": gate.get("schema_version"),
@@ -11684,6 +12217,7 @@ def _named_task_merge_provenance_gate_public_contract(gate: dict) -> dict:
         "task_id": gate.get("task_id"),
         "required_roles": list(gate.get("required_roles") or []),
         "missing_roles": list(gate.get("missing_roles") or []),
+        "blocking_missing_roles": list(gate.get("blocking_missing_roles") or []),
         "role_evidence": gate.get("role_evidence") or {},
         "required_next_proof": gate.get("required_next_proof"),
         "acceptable_evidence": list(gate.get("acceptable_evidence") or []),
@@ -11734,7 +12268,12 @@ def _named_task_source_session_proof_summaries(opened: list[dict]) -> list[str]:
         ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
         kind = str(ref.get("kind") or "")
         proof_surface = str(ref.get("proof_surface") or "")
-        if ".jsonl" not in target and "session" not in kind and "session" not in proof_surface:
+        target_role = str(ref.get("target_source_role") or "")
+        proof_role = str(ref.get("proof_role") or "")
+        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+        source_path = str(source_ref.get("path") or "").casefold()
+        source_surface_text = " ".join([target, source_path, kind, proof_surface, target_role, proof_role]).casefold()
+        if ".jsonl" not in source_surface_text and "session" not in source_surface_text:
             continue
         summary = str(item.get("summary") or "").strip()
         if summary:
@@ -11745,6 +12284,26 @@ def _named_task_source_session_proof_summaries(opened: list[dict]) -> list[str]:
 def _named_task_merge_commit_hashes(opened: list[dict], *, task_id: str) -> list[str]:
     commits: list[str] = []
     for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        proof_surface = str(ref.get("proof_surface") or "")
+        if proof_surface == "merge_commit":
+            direct_commit = str(ref.get("commit") or item.get("target") or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{7,40}", direct_commit):
+                if direct_commit not in commits:
+                    commits.append(direct_commit)
+                continue
+        target = str(item.get("target") or item.get("path") or ref.get("target") or ref.get("path") or "")
+        raw_session_surface = ".jsonl" in target.casefold() or "session" in " ".join(
+            str(value or "")
+            for value in (
+                ref.get("kind"),
+                ref.get("proof_surface"),
+                ref.get("target_source_role"),
+                ref.get("proof_role"),
+            )
+        ).casefold()
+        if not raw_session_surface:
+            continue
         summary = str(item.get("summary") or "").strip()
         if not summary:
             continue
