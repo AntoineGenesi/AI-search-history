@@ -587,19 +587,23 @@ ROUTES: tuple[AskRoute, ...] = (
         chosen_route="artifact-currentness / worktree cleanup currentness",
         why_it_applies=(
             "The wording asks whether worktrees/checkouts/branches are old, stale, "
-            "current, removable, or prune candidates, so artifact-currentness "
-            "should classify worktree state and private-artifact preservation first."
+            "current, removable, left behind, or cleanup/prune candidates, so "
+            "artifact-currentness should inspect operational cleanup records, "
+            "worktree state, and private-artifact preservation first."
         ),
         first_command_template='jsonl-history-search artifact-currentness "{query}" --cwd "$PWD" --format markdown',
         read_specialization="references/status-currentness.md",
         inspect_after=(
+            "artifact_currentness.worktree_currentness.cleanup_causality.operational_records and debt_status",
             "artifact_currentness.worktree_currentness.classifications",
-            "per-item source_refs and preservation_guidance",
+            "source_role labels for operational_record, git_state, and private_retention_evidence",
+            "per-item source_refs and preservation_guidance after operational records",
             "next_commands for worktree list, status, branch contains, git log grep, targeted rg, and private artifact find",
         ),
         stop_guidance=(
             "Run artifact-currentness before shallow git cleanup conclusions. Stop "
-            "only after source refs and private-artifact preservation requirements are inspected."
+            "only after operational cleanup audit/handoff/execution records, source refs, "
+            "and private-artifact preservation requirements are inspected."
         ),
         manual_search_guidance=(
             "Manual git/rg inspection is follow-up after the route's targeted commands. "
@@ -774,14 +778,14 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_task_review_commit_provenance_query(normalized):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
+    if is_worktree_cleanup_currentness_query(query):
+        return ROUTES[7]
+
     if _looks_like_named_ticket_causal_provenance_query(normalized):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
     if _looks_like_local_artifact_verification_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
-
-    if is_worktree_cleanup_currentness_query(query):
-        return ROUTES[7]
 
     if _has_any(normalized, ("which todo", "which plan", "which task", "actually matters", "is current", "still what")):
         return ROUTES[8]

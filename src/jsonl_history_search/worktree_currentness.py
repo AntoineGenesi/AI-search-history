@@ -9,6 +9,8 @@ CLASSIFICATIONS = (
     "KEEP_ACTIVE",
     "SAFE_TO_PRUNE",
     "PRESERVE_THEN_PRUNE",
+    "PRESERVE_THEN_REMOVE",
+    "PRESERVE_THEN_REMOVE_CANDIDATES",
     "DEBUG_ONLY_NO_MERGE",
     "SUPERSEDED",
     "NEEDS_USER_DECISION",
@@ -31,10 +33,18 @@ WORKTREE_WORDS = (
 CLEANUP_WORDS = (
     "cleanup",
     "clean up",
+    "cleaned up",
+    "clean themselves up",
+    "clean itself up",
+    "not cleaned",
+    "not clean",
     "removed",
     "remove",
     "prune",
     "pruned",
+    "left behind",
+    "left over",
+    "left around",
     "stale",
     "old",
     "obsolete",
@@ -44,6 +54,17 @@ CLEANUP_WORDS = (
     "superseded",
     "delete",
     "deletion",
+)
+CLEANUP_CAUSAL_WORDS = (
+    "why did",
+    "why was",
+    "why were",
+    "what caused",
+    "what made",
+    "left behind",
+    "left over",
+    "not cleaned",
+    "not clean",
 )
 
 EVIDENCE_ROOTS = (
@@ -67,14 +88,36 @@ def is_worktree_cleanup_currentness_query(query: str) -> bool:
 def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
     named = extract_named_worktree_targets(query)
     worktrees = _discover_worktrees(cwd)
-    selected = _select_targets(named, worktrees)
     evidence_files = _discover_evidence_files(cwd)
-    items = [_classify_target(query, cwd, target, evidence_files) for target in selected]
+    cleanup_causality = _cleanup_causality_report(query, cwd, evidence_files, worktrees)
+    if cleanup_causality.get("is_cleanup_causality_query") and not named:
+        selected = _select_cleanup_causality_targets(worktrees, cwd)
+    else:
+        selected = _select_targets(named, worktrees)
+    items = [
+        _classify_target(
+            query,
+            cwd,
+            target,
+            evidence_files,
+            cleanup_causality.get("operational_records") or [],
+        )
+        for target in selected
+    ]
+    cleanup_causality = _finish_cleanup_causality_report(cleanup_causality, items, worktrees, cwd)
     return {
         "status": "ok",
         "intent": "worktree_cleanup_currentness",
         "classifications": items,
         "classification_values": list(CLASSIFICATIONS),
+        "cleanup_causality": cleanup_causality,
+        "source_role_order": [
+            "operational_record",
+            "git_state",
+            "private_retention_evidence",
+            "raw_agent_behavior",
+        ],
+        "source_roles_present": _source_roles_present(cleanup_causality, items),
         "named_targets": named,
         "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
         "next_commands": _general_next_commands(named),
@@ -187,6 +230,24 @@ def _select_targets(named: list[dict], worktrees: list[dict]) -> list[dict]:
     return [dict(item) for item in worktrees]
 
 
+def _select_cleanup_causality_targets(worktrees: list[dict], cwd: Path) -> list[dict]:
+    selected = []
+    for item in worktrees:
+        path = item.get("path")
+        if path:
+            try:
+                if Path(path).resolve() == cwd.resolve():
+                    continue
+            except OSError:
+                pass
+        rel = item.get("relative_path") or ""
+        if rel == ".":
+            continue
+        if rel.startswith("worktrees/"):
+            selected.append(dict(item))
+    return selected
+
+
 def _target_matches_worktree(token: str, worktree: dict) -> bool:
     haystack = " ".join(
         str(worktree.get(key, ""))
@@ -195,11 +256,19 @@ def _target_matches_worktree(token: str, worktree: dict) -> bool:
     return token in haystack or token.replace("-", "_") in haystack or token.replace("_", "-") in haystack
 
 
-def _classify_target(query: str, cwd: Path, target: dict, evidence_files: list[Path]) -> dict:
+def _classify_target(
+    query: str,
+    cwd: Path,
+    target: dict,
+    evidence_files: list[Path],
+    operational_records: list[dict] | None = None,
+) -> dict:
     identifier = _target_identifier(target)
     slug = _target_slug(identifier, target)
     tokens = _target_tokens(query, target, identifier)
     evidence = _scan_evidence(cwd, evidence_files, tokens)
+    if _is_cleanup_causality_query(query):
+        evidence = _dedupe_evidence(evidence + list(operational_records or []))
     status = _worktree_status(target)
     private = _private_artifact_summary(target)
     classification, why, secondary = _classification_from_evidence(target, evidence, status, private)
@@ -222,12 +291,28 @@ def _classify_target(query: str, cwd: Path, target: dict, evidence_files: list[P
     return item
 
 
+def _dedupe_evidence(evidence: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    deduped = []
+    for item in evidence:
+        source_ref = item.get("source_ref")
+        if not source_ref or source_ref in seen:
+            continue
+        seen.add(source_ref)
+        deduped.append(item)
+    return deduped
+
+
 def _classification_from_evidence(target: dict, evidence: list[dict], status: dict, private: dict) -> tuple[str, str, list[str]]:
     text = _normalize(" ".join(item.get("snippet", "") for item in evidence))
     secondary: list[str] = []
     has_worktree = bool(target.get("path"))
     is_dirty = bool(status.get("dirty"))
     has_private = bool(private.get("has_private_artifacts"))
+    if "preserve_then_remove_candidates" in text:
+        secondary.append("PRESERVE_THEN_REMOVE_CANDIDATES")
+    elif "preserve_then_remove" in text:
+        secondary.append("PRESERVE_THEN_REMOVE")
     if any(term in text for term in ("active_task", "active task", "current product task", "keep_active")):
         return "KEEP_ACTIVE", "Current front-door evidence names this target as active.", secondary
     if any(term in text for term in ("debug-only", "debug only", "no-merge", "no merge", "should not be reviewed for product merge")):
@@ -288,6 +373,7 @@ def _scan_evidence(cwd: Path, evidence_files: list[Path], tokens: list[str]) -> 
             matches.append(
                 {
                     "source_ref": f"{rel}:{line_no}",
+                    "source_role": _source_role_for_evidence(rel, line),
                     "relationship": _relationship(line),
                     "snippet": _compact(line),
                 }
@@ -299,6 +385,14 @@ def _scan_evidence(cwd: Path, evidence_files: list[Path], tokens: list[str]) -> 
 
 def _relationship(line: str) -> str:
     normalized = _normalize(line)
+    if "preserve_then_remove_candidates" in normalized:
+        return "report_only_preserve_then_remove_candidates"
+    if "preserve_then_remove" in normalized:
+        return "report_only_preserve_then_remove"
+    if any(term in normalized for term in ("pre-existing", "pre existing", "not audited", "left for later")) and _mentions_worktree_cleanup_subject(normalized):
+        return "handoff_deferred_cleanup"
+    if any(term in normalized for term in ("physical worktrees removed", "worktrees were removed", "worktrees removed", "kept 0", "branch refs retained")):
+        return "cleanup_execution_report"
     if any(term in normalized for term in ("active", "current product task", "active_task")):
         return "active_or_current"
     if any(term in normalized for term in ("debug-only", "debug only", "no-merge", "no merge")):
@@ -310,6 +404,249 @@ def _relationship(line: str) -> str:
     if ".private" in normalized or "preserv" in normalized or "archive" in normalized:
         return "private_preservation"
     return "mention"
+
+
+def _cleanup_causality_report(query: str, cwd: Path, evidence_files: list[Path], worktrees: list[dict]) -> dict:
+    causal = _is_cleanup_causality_query(query)
+    operational_records = _scan_cleanup_operational_records(cwd, evidence_files) if causal else []
+    return {
+        "is_cleanup_causality_query": causal,
+        "debt_status": "unknown",
+        "causal_summary": "",
+        "operational_records": operational_records,
+        "record_count": len(operational_records),
+        "physical_worktree_count": len(worktrees),
+    }
+
+
+def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees: list[dict], cwd: Path) -> dict:
+    if not report.get("is_cleanup_causality_query"):
+        return report
+    records = report.get("operational_records") or []
+    relationships = {item.get("relationship") for item in records}
+    has_execution = "cleanup_execution_report" in relationships
+    has_report_only = bool(
+        {
+            "report_only_preserve_then_remove",
+            "report_only_preserve_then_remove_candidates",
+            "report_only_preserve_then_prune",
+        }
+        & relationships
+    )
+    has_deferred = "handoff_deferred_cleanup" in relationships
+    if has_execution:
+        status = "closed_by_cleanup_execution_report"
+        summary = (
+            "Cleanup debt was closed by a cleanup execution report; earlier report-only "
+            "preserve-then-remove classifications and later not-audited handoffs explain why it had been left open."
+        )
+    elif has_report_only and has_deferred:
+        status = "open_cleanup_debt"
+        summary = (
+            "Cleanup debt is open in the inspected records: an audit classified the old worktrees as "
+            "preserve-then-remove/report-only, then a later handoff deferred them as pre-existing or not audited."
+        )
+    elif has_report_only:
+        status = "open_cleanup_debt"
+        summary = (
+            "Cleanup debt appears open: operational records classify worktrees as preserve-then-remove/report-only, "
+            "but no cleanup execution report was found."
+        )
+    else:
+        status = "unknown"
+        summary = "No decisive cleanup audit, handoff deferral, or cleanup execution record was found in the bounded artifact scan."
+    report.update(
+        {
+            "debt_status": status,
+            "causal_summary": summary,
+            "target_selection_note": (
+                "For an unnamed cleanup-causality question, operational audit/handoff/cleanup records are the main answer. "
+                "The current checkout is not selected as the causal target."
+            ),
+            "git_state": {
+                "source_role": "git_state",
+                "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
+                "classified_targets": [item.get("path") or item.get("identifier") for item in items],
+            },
+        }
+    )
+    return report
+
+
+def _is_cleanup_causality_query(query: str) -> bool:
+    normalized = _normalize(query)
+    return (
+        any(word in normalized for word in WORKTREE_WORDS)
+        and any(word in normalized for word in CLEANUP_WORDS)
+        and any(word in normalized for word in CLEANUP_CAUSAL_WORDS)
+    )
+
+
+def _scan_cleanup_operational_records(cwd: Path, evidence_files: list[Path]) -> list[dict]:
+    matches: list[dict] = []
+    for path in evidence_files:
+        rel = _rel(path, cwd)
+        if not _looks_like_operational_cleanup_path(rel):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line_no, line in enumerate(lines, 1):
+            relationship = _cleanup_operational_relationship(line)
+            if not relationship:
+                continue
+            matches.append(
+                {
+                    "source_ref": f"{rel}:{line_no}",
+                    "source_role": "operational_record",
+                    "relationship": relationship,
+                    "snippet": _compact(line),
+                    "priority": _cleanup_operational_priority(rel, relationship),
+                }
+            )
+    matches.sort(key=lambda item: (item["priority"], item["source_ref"]))
+    return _featured_operational_records(_dedupe_operational_records(matches))
+
+
+def _looks_like_operational_cleanup_path(rel: str) -> bool:
+    lowered = rel.casefold()
+    return (
+        lowered in {"todo.md", "tasks.md", "project.md", "codex-orchestration.md"}
+        or lowered.startswith(("reports/", "codex/state/", "docs/", "tasks/"))
+    )
+
+
+def _cleanup_operational_relationship(line: str) -> str:
+    normalized = _normalize(line)
+    if not any(
+        term in normalized
+        for term in (
+            "worktree",
+            "worktrees",
+            "preserve_then_remove",
+            "preserve_then_prune",
+            "pre-existing",
+            "not audited",
+            "branch refs retained",
+        )
+    ):
+        return ""
+    if "preserve_then_remove_candidates" in normalized:
+        return "report_only_preserve_then_remove_candidates"
+    if "preserve_then_remove" in normalized:
+        return "report_only_preserve_then_remove"
+    if "preserve_then_prune" in normalized:
+        return "report_only_preserve_then_prune"
+    if any(term in normalized for term in ("pre-existing", "pre existing", "not audited", "left older", "left for later")) and _mentions_worktree_cleanup_subject(normalized):
+        return "handoff_deferred_cleanup"
+    if any(
+        term in normalized
+        for term in (
+            "physical worktrees removed",
+            "worktrees were removed",
+            "worktrees removed",
+            "kept 0",
+            "branch refs retained",
+            "git worktree list now shows only",
+        )
+    ):
+        return "cleanup_execution_report"
+    if ".private" in normalized or "private evidence" in normalized or "private-retention" in normalized:
+        return "private_retention_record"
+    if any(term in normalized for term in ("report-only", "report only", "no worktrees or branch refs were removed")):
+        return "report_only_cleanup_audit"
+    return ""
+
+
+def _cleanup_operational_priority(rel: str, relationship: str) -> int:
+    relationship_priority = {
+        "report_only_preserve_then_remove_candidates": 10,
+        "report_only_preserve_then_remove": 11,
+        "report_only_preserve_then_prune": 12,
+        "report_only_cleanup_audit": 13,
+        "handoff_deferred_cleanup": 20,
+        "cleanup_execution_report": 30,
+        "private_retention_record": 40,
+    }.get(relationship, 90)
+    path_bonus = 0
+    lowered = rel.casefold()
+    if lowered.startswith("reports/stale-worktree-cleanup"):
+        path_bonus = -4
+    elif "worktree-subagent-state-audit" in lowered:
+        path_bonus = -3
+    elif "handoff" in lowered:
+        path_bonus = -2
+    elif lowered == "todo.md":
+        path_bonus = 8
+    return relationship_priority + path_bonus
+
+
+def _mentions_worktree_cleanup_subject(normalized: str) -> bool:
+    return any(term in normalized for term in ("worktree", "worktrees", "registered", "older loops", "older-loop", "wrap-up", "closeout"))
+
+
+def _dedupe_operational_records(records: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for record in records:
+        path = record.get("source_ref", "").split(":", 1)[0]
+        key = (path, record.get("relationship", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({key: value for key, value in record.items() if key != "priority"})
+    return deduped
+
+
+def _featured_operational_records(records: list[dict]) -> list[dict]:
+    featured: list[dict] = []
+    for relationship in (
+        "report_only_preserve_then_remove_candidates",
+        "report_only_preserve_then_remove",
+        "report_only_preserve_then_prune",
+        "report_only_cleanup_audit",
+        "handoff_deferred_cleanup",
+        "cleanup_execution_report",
+        "private_retention_record",
+    ):
+        for record in records:
+            if record.get("relationship") == relationship and record not in featured:
+                featured.append(record)
+                break
+    for record in records:
+        if record not in featured:
+            featured.append(record)
+        if len(featured) >= 16:
+            break
+    return featured[:16]
+
+
+def _source_role_for_evidence(rel: str, line: str) -> str:
+    normalized = _normalize(f"{rel} {line}")
+    if ".private" in normalized and rel.startswith(".private/"):
+        return "private_retention_evidence"
+    if rel.endswith(".jsonl") or "/sessions/" in rel:
+        return "raw_agent_behavior"
+    return "operational_record"
+
+
+def _source_roles_present(cleanup_causality: dict, items: list[dict]) -> list[str]:
+    roles: set[str] = set()
+    for record in cleanup_causality.get("operational_records") or []:
+        if record.get("source_role"):
+            roles.add(record["source_role"])
+    if cleanup_causality.get("git_state"):
+        roles.add("git_state")
+    for item in items:
+        for ref in item.get("source_refs") or []:
+            if ref.get("source_role"):
+                roles.add(ref["source_role"])
+        if (item.get("private_artifacts") or {}).get("has_private_artifacts"):
+            roles.add("private_retention_evidence")
+        if (item.get("status") or {}).get("available"):
+            roles.add("git_state")
+    return [role for role in ("operational_record", "git_state", "private_retention_evidence", "raw_agent_behavior") if role in roles]
 
 
 def _worktree_status(target: dict) -> dict:

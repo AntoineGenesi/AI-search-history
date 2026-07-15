@@ -165,6 +165,10 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
         worktree_report = build_worktree_currentness_report(query, cwd)
         elapsed = None if started is None else round(time.monotonic() - started, 6)
         chain = _worktree_evidence_chain(worktree_report)
+        cleanup = worktree_report.get("cleanup_causality") or {}
+        causal_why = cleanup.get("causal_summary") or (
+            "The query combines worktree/checkout/branch identity with cleanup/currentness wording, so the answer target is worktree state rather than a current-plan artifact."
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "ok",
@@ -177,7 +181,7 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
                 "selection_reason": "worktree cleanup/currentness intent; generic artifact selection bypassed",
             },
             "currentness_verdict": "worktree_cleanup_currentness",
-            "why": "The query combines worktree/checkout/branch identity with cleanup/currentness wording, so the answer target is worktree state rather than a current-plan artifact.",
+            "why": causal_why,
             "evidence_chain": chain,
             "status_field_assessment": {
                 "status_fields": [],
@@ -879,10 +883,22 @@ def _worktree_candidates(worktree_report: dict) -> list[dict]:
 
 def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
     chain = []
+    cleanup = worktree_report.get("cleanup_causality") or {}
+    for ref in cleanup.get("operational_records") or []:
+        chain.append(
+            {
+                "evidence_type": "worktree_operational_record",
+                "source_role": ref.get("source_role") or "operational_record",
+                "source_ref": ref.get("source_ref"),
+                "relationship": ref.get("relationship"),
+                "snippet": ref.get("snippet"),
+            }
+        )
     for item in worktree_report.get("classifications") or []:
         chain.append(
             {
                 "evidence_type": "worktree_classification",
+                "source_role": "operational_record",
                 "source_ref": item.get("identifier"),
                 "relationship": item.get("classification"),
                 "snippet": item.get("why"),
@@ -893,6 +909,7 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
             chain.append(
                 {
                     "evidence_type": "git_worktree_status",
+                    "source_role": "git_state",
                     "source_ref": item.get("path") or item.get("identifier"),
                     "relationship": "dirty" if status.get("dirty") else "clean",
                     "snippet": status.get("branch_line") or "git status --short --branch inspected",
@@ -903,6 +920,7 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
             chain.append(
                 {
                     "evidence_type": "worktree_private_artifacts",
+                    "source_role": "private_retention_evidence",
                     "source_ref": f"{item.get('path') or item.get('identifier')}/.private",
                     "relationship": "preserve_before_prune",
                     "snippet": f"{private.get('count', 0)} private artifact paths found",
@@ -912,6 +930,7 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
             chain.append(
                 {
                     "evidence_type": "worktree_source_ref",
+                    "source_role": ref.get("source_role") or "operational_record",
                     "source_ref": ref.get("source_ref"),
                     "relationship": ref.get("relationship"),
                     "snippet": ref.get("snippet"),
@@ -922,14 +941,43 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
 
 def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]:
     reads = []
-    for command in worktree_report.get("next_commands") or []:
-        reads.append({"source_ref": command.get("command"), "reason": f"Run {command.get('kind')} for worktree currentness inspection."})
-    for item in worktree_report.get("classifications") or []:
-        for command in item.get("next_commands", [])[:6]:
-            reads.append({"source_ref": command.get("command"), "reason": f"{item.get('identifier')}: {command.get('kind')}"})
+    cleanup = worktree_report.get("cleanup_causality") or {}
+    for ref in cleanup.get("operational_records") or []:
+        reads.append(
+            {
+                "source_ref": ref.get("source_ref"),
+                "source_role": ref.get("source_role") or "operational_record",
+                "relationship": ref.get("relationship"),
+                "reason": f"Inspect {ref.get('relationship')} operational record before worktree commands.",
+            }
+        )
     for item in chain:
         if item.get("evidence_type") == "worktree_source_ref":
-            reads.append({"source_ref": item.get("source_ref"), "reason": f"Inspect {item.get('relationship')} evidence."})
+            reads.append(
+                {
+                    "source_ref": item.get("source_ref"),
+                    "source_role": item.get("source_role") or "operational_record",
+                    "relationship": item.get("relationship"),
+                    "reason": f"Inspect {item.get('relationship')} evidence.",
+                }
+            )
+    for command in worktree_report.get("next_commands") or []:
+        reads.append(
+            {
+                "source_ref": command.get("command"),
+                "source_role": "git_state" if command.get("kind", "").startswith(("worktree", "git")) else "operational_record",
+                "reason": f"Run {command.get('kind')} for worktree currentness inspection after operational records.",
+            }
+        )
+    for item in worktree_report.get("classifications") or []:
+        for command in item.get("next_commands", [])[:6]:
+            reads.append(
+                {
+                    "source_ref": command.get("command"),
+                    "source_role": "git_state" if command.get("kind", "").startswith(("worktree", "status", "branch", "git")) else "private_retention_evidence",
+                    "reason": f"{item.get('identifier')}: {command.get('kind')}",
+                }
+            )
     return _dedupe_reads(reads)[:18]
 
 

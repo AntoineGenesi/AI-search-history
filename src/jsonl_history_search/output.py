@@ -1271,6 +1271,8 @@ def _source_use_answer_status(report_status: str | None, *, has_required_reads: 
 
 def render_artifact_currentness_text(payload: dict) -> str:
     report = payload["artifact_currentness"]
+    if _is_worktree_cleanup_causality_report(report):
+        return _render_worktree_cleanup_causality_text(report)
     selected = report.get("selected_artifact_or_topic") or {}
     trust = _artifact_trust_label(report.get("currentness_verdict"))
     reads = report.get("next_reads") or []
@@ -1319,6 +1321,20 @@ def render_artifact_currentness_text(payload: dict) -> str:
             lines.append(f"Selected role: {selected.get('role_label')}")
     worktree = report.get("worktree_currentness") or {}
     if worktree:
+        cleanup = worktree.get("cleanup_causality") or {}
+        if cleanup.get("is_cleanup_causality_query"):
+            lines.append("Worktree cleanup causality:")
+            lines.append(f"- debt_status: {cleanup.get('debt_status')}")
+            if cleanup.get("causal_summary"):
+                lines.append(f"- summary: {cleanup.get('causal_summary')}")
+            for ref in cleanup.get("operational_records", [])[:6]:
+                lines.append(
+                    f"- {ref.get('source_role')}: {ref.get('source_ref')} - {ref.get('relationship')} - {ref.get('snippet')}"
+                )
+            if cleanup.get("target_selection_note"):
+                lines.append(f"- target selection: {cleanup.get('target_selection_note')}")
+        if worktree.get("source_roles_present"):
+            lines.append(f"Source roles present: {', '.join(worktree.get('source_roles_present') or [])}")
         lines.append("Worktree currentness:")
         for item in worktree.get("classifications", [])[:12]:
             lines.append(
@@ -1329,7 +1345,8 @@ def render_artifact_currentness_text(payload: dict) -> str:
             if item.get("branch"):
                 lines.append(f"  branch: {item.get('branch')}")
             for ref in item.get("source_refs", [])[:3]:
-                lines.append(f"  evidence: {ref.get('source_ref')} - {ref.get('snippet')}")
+                role = ref.get("source_role") or "operational_record"
+                lines.append(f"  evidence: {role} {ref.get('source_ref')} - {ref.get('snippet')}")
             for command in item.get("next_commands", [])[:5]:
                 lines.append(f"  command: {command.get('command')}")
             if item.get("preservation_guidance"):
@@ -1367,7 +1384,8 @@ def render_artifact_currentness_text(payload: dict) -> str:
     if chain:
         lines.append("Evidence chain:")
         for item in chain[:10]:
-            lines.append(f"- {item.get('source_ref')}: {item.get('relationship')} - {item.get('snippet')}")
+            role = f"{item.get('source_role')} " if item.get("source_role") else ""
+            lines.append(f"- {role}{item.get('source_ref')}: {item.get('relationship')} - {item.get('snippet')}")
     if reads:
         lines.append("Next reads:")
         for read in reads[:8]:
@@ -1379,6 +1397,8 @@ def render_artifact_currentness_text(payload: dict) -> str:
 
 def render_artifact_currentness_markdown(payload: dict) -> str:
     report = payload["artifact_currentness"]
+    if _is_worktree_cleanup_causality_report(report):
+        return _render_worktree_cleanup_causality_markdown(report)
     selected = report.get("selected_artifact_or_topic") or {}
     trust = _artifact_trust_label(report.get("currentness_verdict"))
     reads = report.get("next_reads") or []
@@ -1437,6 +1457,20 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
         lines.append(f"**Selected role:** {selected.get('role_label')}")
     worktree = report.get("worktree_currentness") or {}
     if worktree:
+        cleanup = worktree.get("cleanup_causality") or {}
+        if cleanup.get("is_cleanup_causality_query"):
+            lines.extend(["", "## Worktree Cleanup Causality", ""])
+            lines.append(f"- Debt status: `{cleanup.get('debt_status')}`")
+            if cleanup.get("causal_summary"):
+                lines.append(f"- Summary: {cleanup.get('causal_summary')}")
+            for ref in cleanup.get("operational_records", [])[:6]:
+                lines.append(
+                    f"- `{ref.get('source_role')}` `{ref.get('source_ref')}`: `{ref.get('relationship')}` - {ref.get('snippet')}"
+                )
+            if cleanup.get("target_selection_note"):
+                lines.append(f"- Target selection: {cleanup.get('target_selection_note')}")
+        if worktree.get("source_roles_present"):
+            lines.extend(["", f"**Source roles present:** `{', '.join(worktree.get('source_roles_present') or [])}`"])
         lines.extend(["", "## Worktree Currentness", ""])
         for item in worktree.get("classifications", [])[:12]:
             lines.append(f"- `{item.get('identifier')}`: `{item.get('classification')}` - {item.get('why')}")
@@ -1445,7 +1479,8 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
             if item.get("branch"):
                 lines.append(f"  - Branch: `{item.get('branch')}`")
             for ref in item.get("source_refs", [])[:3]:
-                lines.append(f"  - Evidence `{ref.get('source_ref')}`: {ref.get('snippet')}")
+                role = ref.get("source_role") or "operational_record"
+                lines.append(f"  - Evidence `{role}` `{ref.get('source_ref')}`: {ref.get('snippet')}")
             for command in item.get("next_commands", [])[:5]:
                 lines.append(f"  - Command: `{command.get('command')}`")
             if item.get("preservation_guidance"):
@@ -1481,7 +1516,8 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
     if chain:
         lines.extend(["", "## Evidence Chain", ""])
         for item in chain[:10]:
-            lines.append(f"- `{item.get('source_ref')}`: `{item.get('relationship')}` - {item.get('snippet')}")
+            role = f"`{item.get('source_role')}` " if item.get("source_role") else ""
+            lines.append(f"- {role}`{item.get('source_ref')}`: `{item.get('relationship')}` - {item.get('snippet')}")
     if reads:
         lines.extend(["", "## Next Reads", ""])
         for read in reads[:8]:
@@ -1490,6 +1526,74 @@ def render_artifact_currentness_markdown(payload: dict) -> str:
         lines.extend(["", "## Blind Spots", ""])
         for blind in report["blind_spots"]:
             lines.append(f"- {blind}")
+    return "\n".join(lines)
+
+
+def _is_worktree_cleanup_causality_report(report: dict) -> bool:
+    cleanup = ((report.get("worktree_currentness") or {}).get("cleanup_causality") or {})
+    return bool(cleanup.get("is_cleanup_causality_query"))
+
+
+def _render_worktree_cleanup_causality_text(report: dict) -> str:
+    worktree = report.get("worktree_currentness") or {}
+    cleanup = worktree.get("cleanup_causality") or {}
+    lines = [
+        "Worktree cleanup causality",
+        f"Debt status: {cleanup.get('debt_status')}",
+        f"Summary: {cleanup.get('causal_summary')}",
+        "Operational records:",
+    ]
+    for ref in cleanup.get("operational_records", [])[:6]:
+        lines.append(f"- {ref.get('source_role')} {ref.get('source_ref')}: {ref.get('relationship')} - {ref.get('snippet')}")
+    roles = worktree.get("source_roles_present") or []
+    if "private_retention_evidence" in roles:
+        lines.append(f"Source roles present: {', '.join(roles)}")
+    classifications = worktree.get("classifications") or []
+    if classifications:
+        lines.append("Worktree classifications:")
+        for item in classifications[:8]:
+            lines.append(f"- {item.get('identifier')}: {item.get('classification')} - {item.get('why')}")
+            for command in item.get("next_commands", [])[:3]:
+                lines.append(f"  command: {command.get('command')}")
+    else:
+        lines.append("Worktree classifications: none selected; operational records are the main answer.")
+    if cleanup.get("target_selection_note"):
+        lines.append("Target selection: unnamed causality question; current checkout is not selected as the cause.")
+    if worktree.get("boundary"):
+        lines.append("Boundary: no cleanup execution here; no branch deletion/pruning unless explicitly asked.")
+    return "\n".join(lines)
+
+
+def _render_worktree_cleanup_causality_markdown(report: dict) -> str:
+    worktree = report.get("worktree_currentness") or {}
+    cleanup = worktree.get("cleanup_causality") or {}
+    lines = [
+        "# Worktree Cleanup Causality",
+        "",
+        f"- Debt status: `{cleanup.get('debt_status')}`",
+        f"- Summary: {cleanup.get('causal_summary')}",
+        "",
+        "## Operational Records",
+        "",
+    ]
+    for ref in cleanup.get("operational_records", [])[:6]:
+        lines.append(f"- `{ref.get('source_role')}` `{ref.get('source_ref')}`: `{ref.get('relationship')}` - {ref.get('snippet')}")
+    roles = worktree.get("source_roles_present") or []
+    if "private_retention_evidence" in roles:
+        lines.extend(["", f"**Source roles present:** `{', '.join(roles)}`"])
+    classifications = worktree.get("classifications") or []
+    lines.extend(["", "## Worktree Currentness", ""])
+    if classifications:
+        for item in classifications[:8]:
+            lines.append(f"- `{item.get('identifier')}`: `{item.get('classification')}` - {item.get('why')}")
+            for command in item.get("next_commands", [])[:3]:
+                lines.append(f"  - Command: `{command.get('command')}`")
+    else:
+        lines.append("- No specific physical target selected; operational records are the main answer.")
+    if cleanup.get("target_selection_note"):
+        lines.extend(["", "**Target selection:** unnamed causality question; current checkout is not selected as the cause."])
+    if worktree.get("boundary"):
+        lines.extend(["", "**Boundary:** no cleanup execution here; no branch deletion/pruning unless explicitly asked."])
     return "\n".join(lines)
 
 
