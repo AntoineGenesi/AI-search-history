@@ -3402,16 +3402,31 @@ def _answer_action_contract_from_executed_output(
             "saved_report": compact.get("report_written"),
         }
     if output_key == "coordinator_context":
+        active_status = (
+            compact.get("active_status_front_door")
+            if isinstance(compact.get("active_status_front_door"), dict)
+            else {}
+        )
+        active_status_route = selected_route.get("route_family") == "active_status_front_door"
         return {
-            "answer_status": "context-package-ready-after-next-reads",
+            "answer_status": (
+                "active-status-front-door-ready"
+                if active_status_route and active_status.get("status") == "ready"
+                else "context-package-ready-after-next-reads"
+            ),
             "promotion_status": "committed_safe_context_package",
             "promotion_reason": (
-                "The coordinator-context route is executable and committed-safe, "
-                "but receiving agents should inspect required next reads before "
-                "turning it into a substantive handoff or next action."
+                "The active-status route can answer current repo state from whitelisted front-door files."
+                if active_status_route
+                else (
+                    "The coordinator-context route is executable and committed-safe, "
+                    "but receiving agents should inspect required next reads before "
+                    "turning it into a substantive handoff or next action."
+                )
             ),
             "read": compact.get("required_next_reads") or [],
             "then_use": {
+                "active_status_front_door": active_status,
                 "current_state": compact.get("current_state"),
                 "active_task_handles": compact.get("active_task_handles"),
                 "why_goals_guiding_principles": compact.get("why_goals_guiding_principles"),
@@ -5745,6 +5760,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "status": compact.get("status"),
             "report_written": compact.get("report_written"),
             "source_policy": compact.get("source_policy"),
+            "active_status_front_door": compact.get("active_status_front_door"),
             "current_state": compact.get("current_state"),
             "active_task_handles": compact.get("active_task_handles"),
             "front_door_handles": compact.get("front_door_handles"),
@@ -5873,6 +5889,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "semantic_wrapup",
         "semantic_debug",
         "latest_status",
+        "active_status_front_door",
     }
 )
 _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
@@ -6201,6 +6218,8 @@ def _ask_answer_from_execute(
     )
     if completed_task_refs:
         proof_refs = _dedupe_ask_answer_proof_refs(completed_task_refs + proof_refs)
+    if route_family == "active_status_front_door":
+        proof_refs = _active_status_front_door_proof_refs(action, proof_refs)
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
     if not usable:
@@ -8261,6 +8280,32 @@ def _dedupe_ask_answer_proof_refs(refs: list[dict], *, limit: int = _ASK_ANSWER_
         seen[key] = item
         deduped.append(item)
     return deduped[:limit]
+
+
+def _active_status_front_door_proof_refs(action: dict, refs: list[dict]) -> list[dict]:
+    then_use = action.get("then_use") if isinstance(action.get("then_use"), dict) else {}
+    status = (
+        then_use.get("active_status_front_door")
+        if isinstance(then_use.get("active_status_front_door"), dict)
+        else {}
+    )
+    allowed_paths = {
+        str(item.get("path") or "")
+        for item in status.get("source_refs") or []
+        if isinstance(item, dict)
+        and item.get("exists") is True
+        and str(item.get("role") or "") in {"required_front_door", "active_task"}
+        and str(item.get("path") or "").strip()
+    }
+    if not allowed_paths:
+        return refs
+    return _dedupe_ask_answer_proof_refs(
+        [
+            ref
+            for ref in refs
+            if str(ref.get("path") or ref.get("target") or ref.get("openable_target") or "") in allowed_paths
+        ]
+    )
 
 
 def _merge_work_episode_ref_metadata(existing: dict, incoming: dict) -> None:
@@ -11068,6 +11113,8 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return f"You said this in the opened user-message proof: {_short_join(summaries[:2])}"
     if route_family == "remembered_topic":
         return _compose_remembered_topic_causal_instruction_answer(query=query, opened=opened)
+    if route_family == "active_status_front_door":
+        return _compose_active_status_front_door_answer(action=action, opened=opened)
     if route_family == "latest_status":
         return _compose_latest_status_answer(query=query, action=action, opened=opened)
     if route_family == "semantic_wrapup":
@@ -11167,6 +11214,63 @@ def _compose_remembered_topic_causal_instruction_answer(*, query: str, opened: l
         "and delegate implementation to implementer agents instead of doing the product-code implementation "
         f"itself. Opened proof: {source_summary}"
     )
+
+
+def _compose_active_status_front_door_answer(*, action: dict, opened: list[dict]) -> str | None:
+    then_use = action.get("then_use") if isinstance(action.get("then_use"), dict) else {}
+    status = (
+        then_use.get("active_status_front_door")
+        if isinstance(then_use.get("active_status_front_door"), dict)
+        else {}
+    )
+    if status.get("status") != "ready":
+        return None
+    active_task = str(status.get("active_task_path") or "").strip()
+    required_paths = {
+        "TODO.md",
+        "codex/state/pipeline-state.md",
+        "codex/state/current-context-window.md",
+        active_task,
+    }
+    opened_front_door = [
+        item
+        for item in opened
+        if item.get("status") == "opened"
+        and str((item.get("ref") or {}).get("read_role") or "") == "required_context"
+        and str((item.get("ref") or {}).get("path") or "") in required_paths
+    ]
+    if len(opened_front_door) < 2:
+        return None
+    active_id = str(status.get("active_task_id") or "").strip()
+    fsm_state = str(status.get("fsm_state") or "").strip()
+    substate = str(status.get("current_substate") or "").strip()
+    next_action = str(status.get("next_legal_action") or "").strip()
+    bottleneck = str(status.get("product_bottleneck") or "").strip()
+    currentness = str(status.get("local_currentness") or "").strip()
+    boundary = str(status.get("currentness_boundary") or "").strip()
+    pieces = [
+        "Active repo front-door state:",
+        _active_status_sentence(f"active task {active_id + ' ' if active_id else ''}{active_task}"),
+        _active_status_sentence(f"Current FSM state: {fsm_state}" + (f" / {substate}" if substate else "")),
+        _active_status_sentence(f"Next legal action: {next_action}"),
+    ]
+    if bottleneck:
+        pieces.append(_active_status_sentence(f"Product bottleneck: {bottleneck}"))
+    if currentness:
+        pieces.append(_active_status_sentence(f"Local currentness: {currentness}"))
+    if boundary:
+        pieces.append(f"Boundary: {boundary}")
+    pieces.append(
+        "Refs are repo front-door files only; they are not raw source-session chronology, worker action chronology, or causal expectation-mismatch proof."
+    )
+    return " ".join(pieces)
+
+
+def _active_status_sentence(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    return text if text.endswith((".", "!", "?")) else text + "."
 
 
 def _compose_process_actual_use_answer(*, action: dict, opened: list[dict]) -> str | None:
