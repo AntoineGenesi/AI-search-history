@@ -2614,6 +2614,8 @@ def _looks_like_assignment_retry_diagnostic_text(normalized_text: str, query: st
         return False
     if setup_echo_classification(query)["explicit_prompt_scaffold_query"]:
         return False
+    if "genuine correction" in normalized_text and "not a task assignment" in normalized_text:
+        return False
     assignment_markers = [
         marker
         for marker in (
@@ -2640,26 +2642,23 @@ def _looks_like_assignment_retry_diagnostic_text(normalized_text: str, query: st
         )
         if marker in normalized_text
     ]
-    has_retry_assignment_shape = (
-        any(
-            marker in normalized_text
-            for marker in (
-                "reviewer artifact",
-                "verdict failed",
-                "remaining blocker:",
-                "final focused retry",
-                "before split gate",
-            )
+    has_retry_failure_marker = any(
+        marker in normalized_text
+        for marker in (
+            "verdict failed",
+            "remaining blocker:",
+            "final focused retry",
+            "before split gate",
         )
-        and any(
-            marker in normalized_text
-            for marker in (
-                "please implement",
-                "required proof:",
-                "regression test",
-                "compileall",
-                "validate-install",
-            )
+    )
+    has_assignment_action_marker = any(
+        marker in normalized_text
+        for marker in (
+            "please implement",
+            "implement a narrow",
+            "do not merge",
+            "do not revert",
+            "product-code edits remain only",
         )
     )
     has_worktree_boundary = any(
@@ -2671,7 +2670,11 @@ def _looks_like_assignment_retry_diagnostic_text(normalized_text: str, query: st
             "product-code edits remain only",
         )
     )
-    return len(assignment_markers) >= 4 and (has_retry_assignment_shape or has_worktree_boundary)
+    has_structured_assignment_shape = (
+        (has_retry_failure_marker and has_assignment_action_marker)
+        or (has_worktree_boundary and (has_retry_failure_marker or has_assignment_action_marker))
+    )
+    return len(assignment_markers) >= 4 and has_structured_assignment_shape
 
 
 def _is_session_metadata_context(normalized_text: str) -> bool:
