@@ -450,6 +450,51 @@ FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
             "Only distinct substantial product blockers should become follow-up work.",
         ),
     },
+    {
+        "label": "artifact_source_role_underuse",
+        "terms": (
+            "artifact/source-role",
+            "artifact source-role",
+            "source-role",
+            "source role",
+            "artifact underuse",
+            "artifact under-use",
+            "logs/direct evidence",
+            "logs and direct evidence",
+            "overgeneralizing logs",
+            "overgeneralising logs",
+            "caused by overgeneralizing",
+            "caused by overgeneralising",
+        ),
+        "fix_type": "source-role/evidence-use behavior update",
+        "preferred_path": "docs/agent-facing-tool-contract.md",
+        "preferred_kinds": ("product_contract", "orchestration_rule", "pipeline_state"),
+        "inferred_steps": (
+            "The agent had artifact evidence available but treated logs/direct evidence too narrowly.",
+            "Source role and artifact/currentness surfaces were not represented strongly enough in the answer.",
+            "The evidence-use contract needs clearer artifact/source-role handling before claiming causality.",
+        ),
+    },
+    {
+        "label": "semanticwrapup_dogfood_hardening",
+        "terms": (
+            "test semantic-wrapup",
+            "test semantic wrap-up",
+            "semanticwrapup dogfood",
+            "semantic-wrapup dogfood",
+            "semantic wrap-up dogfood",
+            "create this fix task",
+            "create a task to fix semantic-wrapup",
+        ),
+        "fix_type": "semantic-wrapup output hardening",
+        "preferred_path": "tasks/",
+        "preferred_kinds": ("active_task", "pipeline_state", "task_front_door", "task_files"),
+        "inferred_steps": (
+            "The user asked to dogfood semantic-wrapup on the active long session.",
+            "The run itself exposed prompt echo, cap-readiness, duplicate-signal, and fix-suggestion quality failures.",
+            "The fix should preserve the prompt as diagnostic unless the user explicitly targets semanticwrapup dogfood evidence.",
+        ),
+    },
 )
 
 FRICTION_MARKERS = (
@@ -494,6 +539,8 @@ ISSUE_AXIS_BY_LABEL = {
     "reviewer_proof_claim_boundary": "agent_workflow_issue",
     "product_delta_integration_staleness": "agent_workflow_issue",
     "same_task_repair_boundary": "agent_workflow_issue",
+    "artifact_source_role_underuse": "evidence_handoff_issue",
+    "semanticwrapup_dogfood_hardening": "product_tool_issue",
     "stale_issue_or_ticket_reused": "agent_workflow_issue",
     "task_running_status_update_stall": "agent_workflow_issue",
     "over_conservative_resource_hesitation": "agent_workflow_issue",
@@ -558,6 +605,12 @@ WHY_IT_MATTERS_BY_LABEL = {
     "same_task_repair_boundary": (
         "Fixable review/setup findings should not become unrelated follow-up tasks, but real product blockers must not be hidden."
     ),
+    "artifact_source_role_underuse": (
+        "Artifact/currentness/source-role evidence can be the causal proof; underusing it makes answers drift back to generic log-reading."
+    ),
+    "semanticwrapup_dogfood_hardening": (
+        "Semanticwrapup is a front-door closeout workflow, so its own dogfood failures need visible but prompt-echo-safe handling."
+    ),
 }
 
 
@@ -574,7 +627,8 @@ def build_semantic_wrapup_payload(
 ) -> dict:
     started = time.monotonic()
     scan = scan_records(plan, default_tz=default_tz, mask_context=mask_context)
-    records = scan["records"]
+    raw_records = scan["records"]
+    records, mirror_collapse = _collapse_same_turn_user_mirrors(raw_records)
     signals = _complaint_signals(records, query=query)
     substantive_signals = _substantive_signals(signals)
     setup_echo_signals = [signal for signal in signals if signal.get("scope_signal_kind") in SETUP_SIGNAL_KINDS]
@@ -599,6 +653,7 @@ def build_semantic_wrapup_payload(
         selected_substantive_signals,
         setup_echo_signals,
         scan_warnings=scan["warnings"],
+        mirror_collapse=mirror_collapse,
     )
     ambiguous_prompt_only_scope = _ambiguous_prompt_only_current_session_scope(plan, signals, query)
     explicit_root_setup_echo_scope = _explicit_root_setup_echo_only_scope(plan, signals, query)
@@ -651,7 +706,10 @@ def build_semantic_wrapup_payload(
         next_reads=next_reads,
         read_role_summary=read_role_summary,
         cluster_promotion=cluster_promotion,
+        rolling_window_coverage=rolling_window_coverage,
+        root_handoff_contract=root_handoff_contract,
     )
+    late_signal_handling = _late_signal_handling(records, signals, failure_modes, query, mirror_collapse=mirror_collapse)
     answer_use_contract = _answer_use_contract(
         status,
         scope_resolution,
@@ -668,6 +726,8 @@ def build_semantic_wrapup_payload(
             "summary": {
                 "complaint_signal_count": len(signals),
                 "session_message_count": len(records),
+                "raw_session_message_count": len(raw_records),
+                "same_turn_user_mirror_collapsed_count": mirror_collapse["collapsed_count"],
                 "user_message_count": rolling_window_coverage["session_accounting"]["user_message_count"],
                 "user_complaint_candidate_count": len(signals),
                 "user_complaint_windows_inspected": rolling_window_coverage["window_accounting"]["windows_inspected"],
@@ -727,6 +787,7 @@ def build_semantic_wrapup_payload(
             },
             "user_message_first_evidence": user_message_first_evidence,
             "cluster_promotion": cluster_promotion,
+            "late_signal_handling": late_signal_handling,
             "factual_context": factual_context,
             "rolling_window_coverage": rolling_window_coverage,
             "orchestration_evidence": orchestration_evidence,
@@ -782,6 +843,46 @@ def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
     return "found" if failure_modes else "no_failure_modes_found"
 
 
+def _collapse_same_turn_user_mirrors(records) -> tuple[list, dict]:
+    collapsed = []
+    dropped_refs: list[dict] = []
+    previous = None
+    for item in records:
+        if previous is not None and _is_same_turn_user_mirror(previous, item):
+            row = context_row(item)
+            dropped_refs.append(row.get("source_ref") or {})
+            continue
+        collapsed.append(item)
+        previous = item
+    return collapsed, {
+        "raw_record_count": len(records),
+        "collapsed_record_count": len(collapsed),
+        "collapsed_count": len(dropped_refs),
+        "dropped_mirror_source_refs": dropped_refs,
+        "dropped_mirror_source_refs_returned": dropped_refs[:8],
+        "policy": (
+            "Adjacent same-timestamp user/user_message mirrors with identical normalized text "
+            "are counted once before semantic-wrapup signal, cluster, evidence, and rolling-window accounting."
+        ),
+    }
+
+
+def _is_same_turn_user_mirror(left, right) -> bool:
+    if not (_is_user_like(left.record.role) and _is_user_like(right.record.role)):
+        return False
+    left_role = str(left.record.role or "").casefold()
+    right_role = str(right.record.role or "").casefold()
+    if left_role == right_role:
+        return False
+    if {left_role, right_role} - {"user", "user_message", "human", "human_user"}:
+        return False
+    return (
+        _normalize(left.text) == _normalize(right.text)
+        and (left.timestamp_utc or left.record.raw_timestamp or "") == (right.timestamp_utc or right.record.raw_timestamp or "")
+        and str(left.record.path or "") == str(right.record.path or "")
+    )
+
+
 def _rolling_window_coverage(
     records,
     signals: list[dict],
@@ -789,6 +890,7 @@ def _rolling_window_coverage(
     setup_echo_signals: list[dict],
     *,
     scan_warnings: list[str],
+    mirror_collapse: dict | None = None,
 ) -> dict:
     ref_to_index = {
         (item.record.path, int(item.record.line)): index
@@ -835,7 +937,11 @@ def _rolling_window_coverage(
 
     total_windows = len(substantive_signals)
     inline_omitted = max(0, total_windows - len(windows))
-    scan_cap_warnings = [warning for warning in scan_warnings if "cap" in warning.lower() or "elapsed" in warning.lower()]
+    scan_cap_warnings = [
+        warning
+        for warning in scan_warnings
+        if _is_actual_scan_cap_warning(warning)
+    ]
     cap_changed_conclusion = bool(scan_cap_warnings)
     if inline_omitted:
         cap_changed_conclusion = True
@@ -851,6 +957,9 @@ def _rolling_window_coverage(
         },
         "session_accounting": {
             "session_message_count": len(records),
+            "raw_session_message_count": (mirror_collapse or {}).get("raw_record_count", len(records)),
+            "same_turn_user_mirror_collapsed_count": (mirror_collapse or {}).get("collapsed_count", 0),
+            "same_turn_user_mirror_collapse": mirror_collapse or {},
             "user_message_count": len(user_records),
             "user_complaint_candidate_count": len(signals),
             "substantive_user_complaint_candidate_count": len(substantive_signals),
@@ -902,6 +1011,14 @@ def _assistant_tool_errors(window_records) -> list[dict]:
             }
         )
     return errors
+
+
+def _is_actual_scan_cap_warning(warning: str) -> bool:
+    lowered = str(warning or "").casefold()
+    return (
+        "stopped" in lowered
+        and ("cap" in lowered or "elapsed" in lowered)
+    )
 
 
 def _user_message_first_evidence(records, signals: list[dict]) -> dict:
@@ -1310,6 +1427,8 @@ def _answer_ready_contract(
     next_reads: list[dict],
     read_role_summary: dict | None = None,
     cluster_promotion: dict | None = None,
+    rolling_window_coverage: dict | None = None,
+    root_handoff_contract: dict | None = None,
 ) -> dict:
     if status != "found" or not failure_modes:
         return {
@@ -1332,6 +1451,20 @@ def _answer_ready_contract(
             "cluster_promotion_status": cluster_gate,
         }
     summary = read_role_summary or _semantic_read_role_summary(next_reads)
+    cap_gate = _cap_answer_ready_gate(
+        rolling_window_coverage or {},
+        next_reads,
+        root_handoff_contract=root_handoff_contract,
+    )
+    if not cap_gate["answer_ready"]:
+        return {
+            "answer_ready": False,
+            "decision": "not_answer_ready",
+            "reason": cap_gate["reason"],
+            "cluster_promotion_status": cluster_gate,
+            "read_role_summary": summary,
+            "cap_readiness_gate": cap_gate,
+        }
     return {
         "answer_ready": True,
         "decision": "answer_ready_after_source_inspection",
@@ -1362,6 +1495,60 @@ def _answer_ready_contract(
             "This is an answer-ready failure-mode/fix-suggestion handoff after source inspection; "
             "it does not auto-apply changes or prove broad all-history completeness."
         ),
+    }
+
+
+def _cap_answer_ready_gate(
+    rolling_window_coverage: dict,
+    next_reads: list[dict],
+    *,
+    root_handoff_contract: dict | None = None,
+) -> dict:
+    cap_accounting = rolling_window_coverage.get("cap_accounting") or {}
+    cap_changed = bool(cap_accounting.get("cap_changed_conclusion"))
+    conditional_reads = [
+        read
+        for read in next_reads or []
+        if isinstance(read, dict) and read.get("read_role") == READ_ROLE_CONDITIONAL_REQUIRED
+    ]
+    if not cap_changed:
+        return {
+            "answer_ready": True,
+            "reason": "no cap or omission accounting blocks the returned proof surface",
+            "cap_changed_conclusion": False,
+        }
+    handoff = root_handoff_contract or {}
+    explicit_handoff = bool(handoff.get("recommended_rerun_command") or handoff.get("recommended_root"))
+    bounded_plan = [
+        {
+            "source_ref": read.get("source_ref"),
+            "reason": read.get("reason"),
+            "read_role": read.get("read_role"),
+            "diagnostic_open_policy": read.get("diagnostic_open_policy"),
+        }
+        for read in conditional_reads[:8]
+    ]
+    if explicit_handoff:
+        return {
+            "answer_ready": True,
+            "reason": "cap or omission accounting is visible and an explicit-root handoff is available",
+            "cap_changed_conclusion": True,
+            "explicit_root_handoff": {
+                "status": handoff.get("status"),
+                "recommended_rerun_command": handoff.get("recommended_rerun_command"),
+                "recommended_root": handoff.get("recommended_root"),
+            },
+            "bounded_source_plan": bounded_plan,
+        }
+    return {
+        "answer_ready": False,
+        "reason": (
+            "scan caps, omitted rolling windows, or conditional proof refs may hide required proof; "
+            "rerun with an explicit root or inspect the bounded source plan before treating this as answer-ready"
+        ),
+        "cap_changed_conclusion": True,
+        "bounded_source_plan": bounded_plan,
+        "explicit_root_handoff": None,
     }
 
 
@@ -2159,22 +2346,47 @@ def _active_task_destinations(cwd: Path) -> list[tuple[str, str]]:
         text = state.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    destinations: list[tuple[str, str]] = []
-    targeted_patterns = (
+    match = _current_front_door_active_task(text)
+    if match and (cwd / match).is_file():
+        return [("active_task", match)]
+    return []
+
+
+def _current_front_door_active_task(text: str) -> str | None:
+    current_region = _current_front_door_region(text)
+    if re.search(r"\bno active (?:selected )?(?:product )?task\b", current_region, flags=re.IGNORECASE):
+        return None
+    patterns = (
         r"Active selected product task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
-        r"active_task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
-        r"Recommended next task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
-        r"Recommended next task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+        r"Active selected product task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
+        r"\*\*Active Product Task:\*\*.*?Active selected product task:\s*\n`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
         r"Current task:\s*`?(tasks/[A-Za-z0-9._/\-]+\.md)`?",
     )
-    for pattern in targeted_patterns:
-        for match in re.findall(pattern, text, flags=re.IGNORECASE):
-            if match.lower().endswith("none.md"):
-                continue
-            if (cwd / match).is_file():
-                destinations.append(("active_task", match))
-                return destinations
-    return destinations
+    for pattern in patterns:
+        match = re.search(pattern, current_region, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        candidate = str(match.group(1))
+        if candidate.casefold().endswith("none.md"):
+            continue
+        return candidate
+    return None
+
+
+def _current_front_door_region(text: str) -> str:
+    historical_markers = (
+        "\nPrior superseding update",
+        "\nHistorical queue state follows",
+        "\nHistorical context remains",
+        "\nPrior cleanup:",
+        "\nHistorical ",
+    )
+    cut = len(text)
+    for marker in historical_markers:
+        index = text.find(marker)
+        if index != -1:
+            cut = min(cut, index)
+    return text[:cut]
 
 
 def _iter_existing(cwd: Path, patterns: list[str]) -> list[str]:
@@ -2565,6 +2777,8 @@ def _scope_signal_kind(normalized_text: str, query: str) -> str:
         return "world_state_metadata"
     if _looks_like_semantic_wrapup_prompt(normalized_text, query):
         return "semantic_wrapup_prompt"
+    if _looks_like_semanticwrapup_dogfood_prompt(normalized_text, query):
+        return "semantic_wrapup_prompt"
     if _looks_like_assignment_retry_diagnostic_text(normalized_text, query):
         return ASSIGNMENT_RETRY_SIGNAL_KIND
     echo = setup_echo_classification(normalized_text, query=query)
@@ -2607,6 +2821,38 @@ def _looks_like_semantic_wrapup_prompt(normalized_text: str, query: str) -> bool
     )
     query_embedded = normalized_query and normalized_query in normalized_text
     return semantic_wrapup_marker and current_session_prompt and (lane_prompt_marker or query_embedded)
+
+
+def _looks_like_semanticwrapup_dogfood_prompt(normalized_text: str, query: str) -> bool:
+    if setup_echo_classification(query)["explicit_prompt_scaffold_query"]:
+        return False
+    if setup_echo_classification(normalized_text, query=query)["is_setup_echo"]:
+        return False
+    semantic_wrapup_marker = any(
+        marker in normalized_text
+        for marker in ("semantic-wrapup", "semantic wrap-up", "semantic wrapup", "semanticwrapup", "semantic_wrapup")
+    )
+    dogfood_or_task_marker = any(
+        marker in normalized_text
+        for marker in (
+            "test semantic-wrapup",
+            "test semantic wrap-up",
+            "test semantic wrapup",
+            "semanticwrapup dogfood",
+            "semantic-wrapup dogfood",
+            "semantic wrapup dogfood",
+            "dogfood exposes failures",
+            "create a task to fix semantic-wrapup",
+            "create this fix task",
+            "fix task",
+            "make a task",
+            "turn this into a task",
+            "turn it into a task",
+        )
+    )
+    test_or_run_marker = any(marker in normalized_text for marker in ("test", "run", "dogfood", "try"))
+    task_marker = "task" in normalized_text and "fix" in normalized_text
+    return semantic_wrapup_marker and (dogfood_or_task_marker or (test_or_run_marker and task_marker))
 
 
 def _looks_like_assignment_retry_diagnostic_text(normalized_text: str, query: str) -> bool:
@@ -2801,6 +3047,119 @@ def _cluster_promotion_surface(
     }
 
 
+def _late_signal_handling(
+    records,
+    signals: list[dict],
+    failure_modes: list[dict],
+    query: str,
+    *,
+    mirror_collapse: dict | None = None,
+) -> dict:
+    signal_by_ref = {
+        (str(signal["source_ref"]["path"]), int(signal["source_ref"]["line"])): signal
+        for signal in signals
+        if signal.get("source_ref")
+    }
+    promoted_refs = {
+        (str(item["source_ref"]["path"]), int(item["source_ref"]["line"]))
+        for mode in failure_modes
+        for item in mode.get("evidence") or []
+        if item.get("source_ref")
+    }
+    start_line = max(1, _max_signal_line(signals) - CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW)
+    items: list[dict] = []
+    for record_item in records:
+        if not _is_user_like(record_item.record.role):
+            continue
+        row = context_row(record_item)
+        ref = row.get("source_ref") or {}
+        line = _source_ref_line(ref)
+        if line < start_line:
+            continue
+        normalized = _normalize(record_item.text)
+        if not _is_late_semanticwrapup_or_artifact_signal(normalized):
+            continue
+        key = (str(ref.get("path") or ""), line)
+        signal = signal_by_ref.get(key)
+        source_kind = (signal or {}).get("scope_signal_kind") or _scope_signal_kind(normalized, query)
+        if key in promoted_refs:
+            status = "promoted_failure_mode"
+            reason = "late user-authored signal is included in returned failure-mode evidence"
+        elif source_kind in SETUP_SIGNAL_KINDS:
+            status = "conditional_non_promoted"
+            reason = (
+                "late signal is a semantic-wrapup dogfood/evaluation or assignment prompt; "
+                "kept diagnostic unless the user explicitly targets prompt/dogfood evidence"
+            )
+        elif signal:
+            status = "conditional_non_promoted"
+            reason = (
+                "late source-backed signal was detected but was not returned inline; inspect this ref "
+                "if the promoted failure modes do not cover the late complaint"
+            )
+        else:
+            status = "conditional_non_promoted"
+            reason = "late user message is relevant diagnostic context but did not meet complaint label thresholds"
+        items.append(
+            {
+                "source_ref": ref,
+                "related_mirror_source_refs": _related_collapsed_mirror_refs(ref, mirror_collapse or {}),
+                "timestamp_utc": row.get("timestamp_utc"),
+                "source_role": row.get("role"),
+                "scope_signal_kind": source_kind,
+                "status": status,
+                "reason": reason,
+                "labels": list((signal or {}).get("labels") or []),
+            }
+        )
+    return {
+        "method": (
+            "Late artifact/source-role and semanticwrapup dogfood signals are either promoted as "
+            "failure evidence or listed with explicit conditional/non-promoted reasons."
+        ),
+        "line_window": CURRENT_SESSION_RECENT_SIGNAL_LINE_WINDOW,
+        "returned_count": len(items),
+        "items": items[:12],
+        "items_omitted": max(0, len(items) - 12),
+    }
+
+
+def _is_late_semanticwrapup_or_artifact_signal(normalized: str) -> bool:
+    artifact_terms = (
+        "artifact/source-role",
+        "artifact source-role",
+        "source-role",
+        "source role",
+        "artifact underuse",
+        "artifact under-use",
+        "logs/direct evidence",
+        "logs and direct evidence",
+        "overgeneralizing",
+        "overgeneralising",
+    )
+    semanticwrapup_terms = (
+        "semantic-wrapup",
+        "semantic wrap-up",
+        "semantic wrapup",
+        "semanticwrapup",
+        "test semantic",
+        "dogfood",
+        "create this fix task",
+        "create a task to fix",
+    )
+    return any(term in normalized for term in artifact_terms) or any(term in normalized for term in semanticwrapup_terms)
+
+
+def _related_collapsed_mirror_refs(ref: dict, mirror_collapse: dict) -> list[dict]:
+    path = str(ref.get("path") or "")
+    line = _source_ref_line(ref)
+    related = []
+    for mirror_ref in mirror_collapse.get("dropped_mirror_source_refs") or []:
+        if str(mirror_ref.get("path") or "") == path and _source_ref_line(mirror_ref) in {line - 1, line + 1}:
+            related.append(mirror_ref)
+    return related
+
+
 def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[dict]:
     suggestions = []
     destinations = behavior_system.get("destinations", [])
@@ -2812,6 +3171,8 @@ def _fix_suggestions(failure_modes: list[dict], behavior_system: dict) -> list[d
         suggestions.append(
             {
                 "suggestion_id": f"fix-{index:03d}",
+                "title": mode.get("title") or _title_for(label),
+                "summary": _suggestion_summary(label, destination, mode),
                 "failure_mode": label,
                 "issue_family": label,
                 "issue_axis": _issue_axis(label),
@@ -3300,10 +3661,24 @@ def _destination_rationale(label: str, destination: dict, mode: dict) -> str:
     path = destination.get("path") or "(user decision needed)"
     kind = destination.get("kind") or "unknown"
     evidence_count = mode.get("evidence_count", 0)
+    currentness = {
+        "active_task": "front-door/current pipeline state names this as the active task",
+        "pipeline_state": "front-door pipeline state is the current source of truth for active work",
+        "task_front_door": "task front-door files are current only when they agree with pipeline state",
+        "task_files": "task files are diagnostic or historical unless current front-door state names them",
+    }.get(str(kind), "destination is a detected local behavior surface")
     return (
         f"{path} is suggested because it is a detected {kind} destination and "
-        f"`{label}` has {evidence_count} source-backed complaint/correction signal(s)."
+        f"`{label}` has {evidence_count} source-backed complaint/correction signal(s). "
+        f"Currentness basis: {currentness}."
     )
+
+
+def _suggestion_summary(label: str, destination: dict, mode: dict) -> str:
+    path = destination.get("path") or "(user decision needed)"
+    title = mode.get("title") or _title_for(label)
+    count = mode.get("evidence_count", 0)
+    return f"{title}: inspect {count} source-backed signal(s), then decide whether to update {path}."
 
 
 def _selection_options(index: int) -> list[dict]:

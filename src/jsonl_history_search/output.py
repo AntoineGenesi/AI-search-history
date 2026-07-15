@@ -1694,6 +1694,17 @@ def render_semantic_wrapup_text(payload: dict) -> str:
             lines.append(f"Required next action: {contract.get('required_next_action')}")
         if contract.get("stop_condition"):
             lines.append(f"Contract stop condition: {contract.get('stop_condition')}")
+    answer_ready_contract = report.get("answer_ready_contract") or {}
+    cap_gate = answer_ready_contract.get("cap_readiness_gate") or {}
+    if cap_gate:
+        lines.append(
+            "Answer-ready gate: "
+            f"answer_ready={answer_ready_contract.get('answer_ready')} "
+            f"cap_changed_conclusion={cap_gate.get('cap_changed_conclusion')} "
+            f"reason={cap_gate.get('reason')}"
+        )
+        if cap_gate.get("bounded_source_plan"):
+            lines.append(f"Bounded source plan count: {len(cap_gate.get('bounded_source_plan') or [])}")
     lines.extend([
         "Stop condition: stop once failure modes are supported by inspected required_primary_proof refs; do not auto-apply fixes.",
         "Only continue if: a failure mode lacks source proof, caps/omitted windows block completeness, the behavior-system destination is ambiguous, the user asks for exhaustive diagnostics, or the user selects a fix to implement.",
@@ -1803,6 +1814,23 @@ def render_semantic_wrapup_text(payload: dict) -> str:
                 f"- cluster {cluster.get('label')} candidates={cluster.get('candidate_count')} "
                 f"context_windows={cluster.get('nearby_context_window_count')}"
             )
+    late_signals = report.get("late_signal_handling") or {}
+    if late_signals.get("items"):
+        lines.append(
+            "Late signal handling: "
+            f"{late_signals.get('returned_count', 0)} returned; "
+            "promoted signals are failure proof, conditional_non_promoted signals are visible diagnostics."
+        )
+        for item in late_signals.get("items", [])[:6]:
+            ref = item.get("source_ref") or {}
+            lines.append(
+                f"- {ref.get('path')}:{ref.get('line')} role={item.get('source_role')} "
+                f"status={item.get('status')} kind={item.get('scope_signal_kind')} reason={item.get('reason')}"
+            )
+            related = item.get("related_mirror_source_refs") or []
+            if related:
+                refs = ", ".join(f"{mirror.get('path')}:{mirror.get('line')}" for mirror in related[:3])
+                lines.append(f"  related collapsed mirrors: {refs}")
     factual_context = report.get("factual_context") or {}
     if factual_context.get("entries"):
         lines.append(f"Factual context: {factual_context.get('count', 0)} preserved separately from complaint evidence")
@@ -1939,6 +1967,18 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
             lines.append(f"- Continue only if: {item}")
         if contract.get("setup_echo_boundary"):
             lines.append(f"- Setup-echo boundary: {contract.get('setup_echo_boundary')}")
+    answer_ready_contract = report.get("answer_ready_contract") or {}
+    cap_gate = answer_ready_contract.get("cap_readiness_gate") or {}
+    if cap_gate:
+        lines.extend([
+            "",
+            "## Answer-Ready Gate",
+            "",
+            f"- Answer ready: `{answer_ready_contract.get('answer_ready')}`",
+            f"- Cap changed conclusion: `{cap_gate.get('cap_changed_conclusion')}`",
+            f"- Reason: {cap_gate.get('reason')}",
+            f"- Bounded source plan count: `{len(cap_gate.get('bounded_source_plan') or [])}`",
+        ])
     skill_check = report.get("skill_check_recommendation") or {}
     if skill_check:
         lines.extend([
@@ -2083,6 +2123,27 @@ def render_semantic_wrapup_markdown(payload: dict) -> str:
                 f"- `{cluster.get('label')}` candidates=`{cluster.get('candidate_count')}` "
                 f"context_windows=`{cluster.get('nearby_context_window_count')}`"
             )
+        lines.append("")
+    late_signals = report.get("late_signal_handling") or {}
+    if late_signals.get("items"):
+        lines.extend([
+            "## Late Signal Handling",
+            "",
+            f"- Returned: `{late_signals.get('returned_count', 0)}`",
+            "- Boundary: promoted signals are failure proof; `conditional_non_promoted` signals are visible diagnostics with reasons.",
+            "",
+        ])
+        for item in late_signals.get("items", [])[:8]:
+            ref = item.get("source_ref") or {}
+            lines.append(
+                f"- `{ref.get('path')}:{ref.get('line')}` role=`{item.get('source_role')}` "
+                f"status=`{item.get('status')}` kind=`{item.get('scope_signal_kind')}`"
+            )
+            lines.append(f"  - Reason: {item.get('reason')}")
+            related = item.get("related_mirror_source_refs") or []
+            if related:
+                refs = ", ".join(f"`{mirror.get('path')}:{mirror.get('line')}`" for mirror in related[:3])
+                lines.append(f"  - Related collapsed mirrors: {refs}")
         lines.append("")
     factual_context = report.get("factual_context") or {}
     if factual_context.get("entries"):
