@@ -331,6 +331,12 @@ def status_anchor_report(
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
     )
+    anchor_candidates = _apply_parent_thread_lineage_to_ranked_candidates(
+        query=query,
+        candidates=anchor_candidates,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
     anchor_decision = _select_anchor_with_boundary(
         query=query,
         messages=latest_messages,
@@ -347,6 +353,12 @@ def status_anchor_report(
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
     if selected_anchor:
         selected_anchor.update(_anchor_decision_fields(anchor_decision, selected_anchor))
+        selected_anchor = _enrich_selected_parent_thread_lineage(
+            selected_anchor,
+            anchor_decision=anchor_decision,
+            cwd=cwd,
+            codex_home=codex_home,
+        )
     selected_anchor, anchor_decision = _demote_unproven_parent_main_selected_anchor(
         selected_anchor=selected_anchor,
         anchor_decision=anchor_decision,
@@ -832,6 +844,17 @@ def _select_anchor_with_boundary(
     if prior_request_occurrence.get("status") == "selected":
         occurrence_boundary = prior_request_occurrence.get("status_as_of_boundary") or status_as_of_boundary
         selected = prior_request_occurrence.get("selected_anchor") or {}
+        interval_selected = (canonical_parent_main_interval or {}).get("selected_anchor") or {}
+        if (
+            selected.get("source_ref")
+            and selected.get("source_ref") == interval_selected.get("source_ref")
+            and interval_selected.get("parent_thread_lineage_anchor")
+        ):
+            selected = {
+                **selected,
+                "parent_thread_lineage_anchor": interval_selected.get("parent_thread_lineage_anchor"),
+                "lineage_resolution": interval_selected.get("lineage_resolution"),
+            }
         return _with_rejected_alternatives(
             {
                 **base,
@@ -1798,15 +1821,19 @@ def _parent_thread_lineage_rejection_reason(lineage: dict) -> str | None:
     return None
 
 
-def _lineage_rejected_anchor(candidate: dict, lineage: dict, reason: str) -> dict:
-    rationale = str(candidate.get("rationale") or "").rstrip()
+def _append_rejection_rationale(rationale: Any, reason: str) -> str:
+    prefix = str(rationale or "").rstrip()
     suffix = f"rejected by parent_thread_lineage_anchor: {reason}"
+    return f"{prefix}; {suffix}" if prefix else suffix
+
+
+def _lineage_rejected_anchor(candidate: dict, lineage: dict, reason: str) -> dict:
     return {
         "source_ref": candidate.get("source_ref"),
         "timestamp_utc": candidate.get("timestamp_utc"),
         "classification": candidate.get("classification"),
         "decision": "rejected",
-        "rationale": f"{rationale}; {suffix}" if rationale else suffix,
+        "rationale": _append_rejection_rationale(candidate.get("rationale"), reason),
         "snippet": candidate.get("snippet"),
         "source_kind": candidate.get("source_kind"),
         "source_scope": "structural_lineage_rejected_parent_main_candidate",
@@ -2662,21 +2689,25 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
             "non_human_boundary_or_tool_context",
             "post_status_context",
         }:
-            alternatives.append(
-                {
-                    "source_ref": candidate.get("source_ref"),
-                    "timestamp_utc": candidate.get("timestamp_utc"),
-                    "classification": classification,
-                    "decision": candidate.get("decision"),
-                    "rationale": candidate.get("rationale"),
-                    "snippet": candidate.get("snippet"),
-                    "source_kind": candidate.get("source_kind"),
-                    "openable_source_ref": candidate.get("openable_source_ref"),
-                    "openable_target": candidate.get("openable_target"),
-                    "target_window_hits": candidate.get("target_window_hits") or [],
-                    "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
-                }
-            )
+            alternative = {
+                "source_ref": candidate.get("source_ref"),
+                "timestamp_utc": candidate.get("timestamp_utc"),
+                "classification": classification,
+                "decision": candidate.get("decision"),
+                "rationale": candidate.get("rationale"),
+                "snippet": candidate.get("snippet"),
+                "source_kind": candidate.get("source_kind"),
+                "source_scope": candidate.get("source_scope"),
+                "openable_source_ref": candidate.get("openable_source_ref"),
+                "openable_target": candidate.get("openable_target"),
+                "target_window_hits": candidate.get("target_window_hits") or [],
+                "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
+            }
+            if candidate.get("lineage_rejection_reason"):
+                alternative["lineage_rejection_reason"] = candidate.get("lineage_rejection_reason")
+            if candidate.get("lineage_resolution"):
+                alternative["lineage_resolution"] = candidate.get("lineage_resolution")
+            alternatives.append(alternative)
         if len(alternatives) >= 8:
             break
     return {**decision, "rejected_anchor_alternatives": alternatives}
@@ -3505,6 +3536,67 @@ def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -
     return contexts
 
 
+def _apply_parent_thread_lineage_to_ranked_candidates(
+    *,
+    query: str,
+    candidates: list[dict],
+    cwd: Path,
+    codex_home: Path | None,
+) -> list[dict]:
+    if codex_home is None or not is_status_question(query) or not (
+        _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
+    ):
+        return candidates
+    updated = []
+    for candidate in candidates:
+        if candidate.get("source_kind") != "codex_sessions":
+            updated.append(candidate)
+            continue
+        lineage = candidate.get("lineage_resolution") or _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        reason = candidate.get("lineage_rejection_reason") or _parent_thread_lineage_rejection_reason(lineage)
+        if not reason:
+            updated.append(candidate)
+            continue
+        enriched = dict(candidate)
+        enriched.update(
+            {
+                "decision": "rejected",
+                "source_scope": "structural_lineage_rejected_parent_main_candidate",
+                "lineage_resolution": lineage,
+                "lineage_rejection_reason": reason,
+                "rationale": _append_rejection_rationale(candidate.get("rationale"), reason),
+            }
+        )
+        updated.append(enriched)
+    return updated
+
+
+def _enrich_selected_parent_thread_lineage(
+    selected_anchor: dict,
+    *,
+    anchor_decision: dict,
+    cwd: Path,
+    codex_home: Path | None,
+) -> dict:
+    if codex_home is None or selected_anchor.get("parent_thread_lineage_anchor"):
+        return selected_anchor
+    if anchor_decision.get("anchor_scope") != "parent_thread":
+        return selected_anchor
+    if selected_anchor.get("source_kind") not in {"codex_history", "codex_sessions"}:
+        return selected_anchor
+    lineage = _lineage_for_anchor(selected_anchor, codex_home=codex_home, cwd=cwd)
+    if lineage.get("status") != "ok" or _parent_thread_lineage_rejection_reason(lineage):
+        return selected_anchor
+    enriched = dict(selected_anchor)
+    enriched["parent_thread_lineage_anchor"] = True
+    enriched["lineage_resolution"] = lineage
+    enriched["rationale"] = (
+        str(enriched.get("rationale") or "").rstrip()
+        + "; confirmed by structural parent/root lineage, cwd, workspace-root, and role/source metadata"
+    )
+    return enriched
+
+
 def _session_contexts_for_history_ref(source_ref: str, codex_home: Path, *, role: str) -> list[dict]:
     path = codex_home / "history.jsonl"
     line_number = _line_from_source_ref(source_ref)
@@ -3636,6 +3728,89 @@ def _scan_session_file_after_anchor(
         "spawned_session_call_refs": spawned_refs[:10],
         "next_reads": next_reads,
     }
+
+
+def _selected_anchor_raw_session_reads(
+    selected_anchor: dict,
+    *,
+    cwd: Path,
+    codex_home: Path | None,
+    target_window: dict | None,
+) -> list[dict]:
+    if codex_home is None:
+        return []
+    anchor_timestamp = parse_datetime(str(selected_anchor.get("timestamp_utc") or ""), timezone.utc)
+    if anchor_timestamp is None:
+        return []
+    normalized_anchor = _normalize(str(selected_anchor.get("snippet") or ""))
+    if not normalized_anchor:
+        return []
+    contexts = _dedupe_session_contexts(
+        _session_contexts_for_anchor(selected_anchor, codex_home, role="selected_anchor_raw_row")
+    )
+    for context in contexts:
+        for path_item in context.get("session_files") or []:
+            path = Path(path_item)
+            match = _find_raw_session_anchor_row(path, anchor_timestamp, normalized_anchor)
+            if not match:
+                continue
+            line_number, record = match
+            source_ref = _source_ref_for_path_line(path, line_number, codex_home)
+            target = f"{path}:{line_number}"
+            read = _raw_session_next_read(
+                record,
+                source_ref,
+                target,
+                line_number,
+                path=path,
+                cwd=cwd,
+                codex_home=codex_home,
+                target_window=target_window,
+                reason="Inspect the selected parent-thread raw session user row before answering.",
+            )
+            read.update(
+                {
+                    "source_tier": "required_primary",
+                    "answer_use_required": True,
+                    "selected_anchor_raw_session_row": True,
+                    "history_anchor_source_ref": selected_anchor.get("source_ref"),
+                    "answer_support_role": "selected_parent_thread_raw_user_row",
+                    "snippet": selected_anchor.get("snippet"),
+                }
+            )
+            return [read]
+    return []
+
+
+def _find_raw_session_anchor_row(path: Path, anchor_timestamp, normalized_anchor: str) -> tuple[int, Mapping[str, Any]] | None:
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    anchor_utc = anchor_timestamp.astimezone(timezone.utc)
+    with handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            record_text = _normalize(_record_task_text(record))
+            classification = classify_conversation_record(record)
+            if normalized_anchor in record_text and classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+                return line_number, record
+            timestamp = parse_datetime(
+                record.get("timestamp") or record.get("ts") or record.get("created_at") or record.get("time"),
+                timezone.utc,
+            )
+            if timestamp is None or abs((timestamp.astimezone(timezone.utc) - anchor_utc).total_seconds()) > 1:
+                continue
+            if normalized_anchor in record_text:
+                return line_number, record
+            if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+                return line_number, record
+    return None
 
 
 def _raw_session_next_read(
@@ -4148,6 +4323,15 @@ def _next_reads(
     boundary_read = _prior_request_boundary_read(status_as_of_boundary, cwd=cwd, codex_home=codex_home)
     if boundary_read:
         reads.append(boundary_read)
+    if selected_anchor:
+        reads.extend(
+            _selected_anchor_raw_session_reads(
+                selected_anchor,
+                cwd=cwd,
+                codex_home=codex_home,
+                target_window=target_window,
+            )
+        )
     for read in session_activity.get("next_reads") or []:
         reads.append(
             {
