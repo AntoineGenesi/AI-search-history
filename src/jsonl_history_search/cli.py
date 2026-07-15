@@ -5241,6 +5241,7 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
                     "target": commit.get("commit"),
                     "commit": commit.get("commit"),
                     "commit_time": commit.get("commit_time"),
+                    "author": commit.get("author"),
                     "subject": commit.get("subject"),
                     "reason": f"inspect local git merge commit evidence for completed {task_id}",
                     "source_boundary": (
@@ -6706,6 +6707,7 @@ def _ask_answer_finalization_veto(
     action: dict,
     opened: list[dict],
 ) -> dict:
+    merge_gate_allows_artifact_finalization = False
     if _action_chronology_final_role_gate_wanted(query=query, route_family=route_family):
         chronology_gate = (
             answer.get("source_contract", {}).get("action_chronology_answer_gate")
@@ -6745,8 +6747,30 @@ def _ask_answer_finalization_veto(
                 "next_step": merge_gate,
                 "summary_lines": merge_gate.get("summary_lines") or [],
             }
+        merge_gate_allows_artifact_finalization = True
 
-    if _answer_action_contract_blocks_final_answer(action):
+    action_contract_blocks = _answer_action_contract_blocks_final_answer(action)
+    if (
+        action_contract_blocks
+        and merge_gate_allows_artifact_finalization
+        and _named_task_merge_provenance_artifact_gate_can_override_action_contract(
+            action=action,
+            merge_gate=merge_gate,
+        )
+    ):
+        answer["source_contract"]["named_task_merge_provenance_finalization_override"] = {
+            "schema_version": 1,
+            "status": "completed_task_artifact_gate_overrode_generic_target_source_role_mismatch",
+            "overridden_answer_action_status": action.get("answer_status"),
+            "overridden_promotion_status": action.get("promotion_status"),
+            "boundary": (
+                "task/review/git merge artifacts are final support for completed-task merge provenance; "
+                "raw worker/session chronology remains unproven unless separately opened"
+            ),
+        }
+        action_contract_blocks = False
+
+    if action_contract_blocks:
         return {
             "blocked": True,
             "reason": _answer_action_contract_veto_reason(action),
@@ -6770,6 +6794,38 @@ def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
     if "gate_fail_closed" in promotion_status or promotion_status.endswith("fail_closed"):
         return True
     return False
+
+
+def _named_task_merge_provenance_artifact_gate_can_override_action_contract(
+    *,
+    action: dict,
+    merge_gate: dict,
+) -> bool:
+    if merge_gate.get("status") != "answer_allowed":
+        return False
+    if merge_gate.get("blocking_missing_roles"):
+        return False
+    role_evidence = merge_gate.get("role_evidence") if isinstance(merge_gate.get("role_evidence"), dict) else {}
+    if not all(role_evidence.get(role) for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES):
+        return False
+    answer_status = str(action.get("answer_status") or "").casefold()
+    promotion_status = str(action.get("promotion_status") or "").casefold()
+    generic_target_mismatch = (
+        "target-source-role-mismatch" in answer_status
+        or "target-source-role-mismatch" in promotion_status
+        or "target_episode_source_role_gate_fail_closed" in promotion_status
+    )
+    if not generic_target_mismatch:
+        return False
+    disallowed_failures = (
+        "readiness_source_plan_gate_fail_closed",
+        "expectation_mismatch",
+        "process_actual_use",
+        "semanticwrapup",
+        "current_run",
+        "no_evidence",
+    )
+    return not any(marker in promotion_status for marker in disallowed_failures)
 
 
 def _answer_action_contract_veto_reason(action: dict) -> str:
@@ -11531,6 +11587,7 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
     review_summaries = _completed_task_role_summaries(refs, "review_artifact", task_id=task_id)
     path_commit_summaries = _completed_task_role_summaries(refs, "path_last_change_commit", task_id=task_id)
     merge_commits = _named_task_merge_commit_hashes(refs, task_id=task_id)
+    merge_commit_labels = _named_task_merge_commit_labels(refs, task_id=task_id)
     post_merge_summaries = [
         _completed_task_clean_summary(str(item.get("summary") or ""), task_id=task_id)
         for item in refs
@@ -11583,7 +11640,7 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
         )
         pieces.append(
             "merge commit proof: "
-            + (", ".join(commit[:12] for commit in merge_commits[:3]) if merge_commits else "missing/not opened")
+            + (", ".join(merge_commit_labels[:3]) if merge_commit_labels else "missing/not opened")
         )
         if post_merge_summaries:
             pieces.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=240)}")
@@ -12158,6 +12215,7 @@ def _compose_named_task_merge_provenance_answer(
     task_proof = _named_task_merge_provenance_role_summary(clean_task_summaries)
     review_proof = _named_task_merge_provenance_role_summary(clean_review_summaries)
     merge_commits = _named_task_merge_commit_hashes(opened, task_id=task_id)
+    merge_commit_labels = _named_task_merge_commit_labels(opened, task_id=task_id)
     source_sessions = _named_task_source_session_proof_summaries(opened)
     if not (task_proof or review_proof or merge_commits or source_sessions):
         return None
@@ -12175,7 +12233,7 @@ def _compose_named_task_merge_provenance_answer(
     else:
         pieces.append("review artifact proof: missing/unresolved in the opened proof refs")
     if merge_commits:
-        pieces.append(f"merge commit proof: {', '.join(merge_commits[:3])}")
+        pieces.append(f"merge commit proof: {', '.join(merge_commit_labels[:3])}")
     else:
         pieces.append("merge commit proof: missing/unresolved in the opened proof refs")
     return (
@@ -12463,6 +12521,35 @@ def _named_task_merge_commit_hashes(opened: list[dict], *, task_id: str) -> list
                 if normalized not in commits:
                     commits.append(normalized)
     return commits
+
+
+def _named_task_merge_commit_labels(opened: list[dict], *, task_id: str) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        proof_surface = str(ref.get("proof_surface") or "")
+        if proof_surface != "merge_commit":
+            continue
+        direct_commit = str(ref.get("commit") or item.get("target") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{7,40}", direct_commit):
+            continue
+        if task_id and _named_task_fragment_mentions_other_task_id(_target_episode_ref_match_text(item), task_id):
+            continue
+        if direct_commit in seen:
+            continue
+        seen.add(direct_commit)
+        author = str(ref.get("author") or "").strip()
+        label = direct_commit[:12]
+        if author:
+            label += f" (author: {author})"
+        labels.append(label)
+    for commit in _named_task_merge_commit_hashes(opened, task_id=task_id):
+        if commit in seen:
+            continue
+        seen.add(commit)
+        labels.append(commit[:12])
+    return labels
 
 
 def _named_task_merge_commit_hashes_from_fragment(fragment: str) -> list[str]:
