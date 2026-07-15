@@ -1530,6 +1530,19 @@ def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
     if explicit_mismatch_shape and _has_any(
         normalized,
         (
+            "still current",
+            "is current",
+            "stale",
+            "superseded",
+            "obsolete",
+            "still active",
+            "still open",
+        ),
+    ):
+        return False
+    if explicit_mismatch_shape and _has_any(
+        normalized,
+        (
             "behind",
             "caused",
             "cause",

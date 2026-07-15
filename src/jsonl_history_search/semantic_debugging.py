@@ -1062,6 +1062,19 @@ def looks_like_expectation_mismatch_query(text: str) -> bool:
     if explicit_mismatch_shape and any(
         phrase in normalized
         for phrase in (
+            "still current",
+            "is current",
+            "stale",
+            "superseded",
+            "obsolete",
+            "still active",
+            "still open",
+        )
+    ):
+        return False
+    if explicit_mismatch_shape and any(
+        phrase in normalized
+        for phrase in (
             "behind",
             "caused",
             "cause",
