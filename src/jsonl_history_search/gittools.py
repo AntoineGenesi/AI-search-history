@@ -23,8 +23,12 @@ class GitCommit:
     commit_time: str
     author_time: str
     author: str
+    committer: str
     subject: str
     decorations: str
+    parents: list[str]
+    parent_count: int
+    contained_branches: list[str]
     changed_files: list[dict]
 
     def to_dict(self) -> dict:
@@ -85,23 +89,41 @@ def commit_metadata(repo: str | Path, commit: str) -> GitCommit | None:
     repo_root = Path(repo).resolve(strict=False)
     result = _run_git(
         repo_root,
-        ["show", "-s", "--format=%H%x00%cI%x00%aI%x00%an%x00%s%x00%D", commit],
+        ["show", "-s", "--format=%H%x00%cI%x00%aI%x00%an%x00%cn%x00%s%x00%D%x00%P", commit],
     )
     if result is None or result.returncode != 0:
         return None
     payload = result.stdout.rstrip("\n")
-    parts = payload.split("\x00", 5)
-    if len(parts) != 6 or not parts[0]:
+    parts = payload.split("\x00", 7)
+    if len(parts) != 8 or not parts[0]:
         return None
+    parents = [part for part in parts[7].split() if part]
     return GitCommit(
         commit=parts[0],
         commit_time=parts[1],
         author_time=parts[2],
         author=parts[3],
-        subject=parts[4],
-        decorations=parts[5],
+        committer=parts[4],
+        subject=parts[5],
+        decorations=parts[6],
+        parents=parents,
+        parent_count=len(parents),
+        contained_branches=branches_containing_commit(repo_root, parts[0]),
         changed_files=commit_changed_files(repo_root, parts[0]),
     )
+
+
+def branches_containing_commit(repo: str | Path, commit: str) -> list[str]:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(repo_root, ["branch", "--contains", commit])
+    if result is None or result.returncode != 0:
+        return []
+    branches = []
+    for line in result.stdout.splitlines():
+        branch = line.strip().lstrip("*+ ").strip()
+        if branch:
+            branches.append(branch)
+    return sorted(set(branches))
 
 
 def commit_changed_files(repo: str | Path, commit: str) -> list[dict]:

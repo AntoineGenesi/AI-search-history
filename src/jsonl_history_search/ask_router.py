@@ -1169,6 +1169,8 @@ def _looks_like_task_review_commit_provenance_query(normalized: str) -> bool:
     )
     if not asks_for_proof_or_chronology:
         return False
+    if "who actually merged" in normalized or ("merged" in normalized and "what proves" in normalized):
+        return True
     facet_hits = sum(
         1
         for terms in (

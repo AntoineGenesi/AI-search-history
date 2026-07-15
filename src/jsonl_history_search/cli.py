@@ -70,7 +70,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
-from .gittools import git_root_for, last_change_for_path, merge_commits_for_task
+from .gittools import commit_metadata, git_root_for, last_change_for_path, merge_commits_for_task
 from .latest_user_messages import build_latest_user_messages_payload, latest_user_messages
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
@@ -3611,7 +3611,7 @@ def _answer_action_contract_from_executed_output(
             answer_status = "answer-ready-after-source-inspection"
             promotion_status = "semantic_debug_completed_task_merge_artifact_proof_ready_after_source_inspection"
             promotion_reason = (
-                "ask --execute semantic-debug found completed-task task/review/git merge proof refs; "
+                "ask --execute semantic-debug found completed-task task/review/git integration-or-merge proof refs; "
                 "inspect those artifact refs before answering. Boundary: this is artifact provenance, "
                 "not raw worker/session chronology."
             )
@@ -3626,7 +3626,7 @@ def _answer_action_contract_from_executed_output(
             answer_status = "not-ready/missing-completed-task-merge-artifact-proof"
             promotion_status = "semantic_debug_completed_task_merge_artifact_proof_missing"
             promotion_reason = (
-                "A completed-task merge provenance prompt needs same-task task, review, and git merge "
+                "A completed-task merge provenance prompt needs same-task task, review, and git integration/merge "
                 "artifact refs; do not answer from unrelated raw/session diagnostics."
             )
             source_inspection_boundary = {
@@ -4968,6 +4968,7 @@ def _completed_task_artifact_status_opened_refs(opened: list[dict], *, required_
             "review_artifact",
             "path_last_change_commit",
             "merge_commit",
+            "integration_final_review_commit",
             "post_merge_task_proof",
             "post_merge_review_proof",
         }:
@@ -4996,20 +4997,30 @@ def _named_task_merge_provenance_execute_artifact_handoff(
         return {}
 
     surfaces = {str(ref.get("proof_surface") or "") for ref in refs if isinstance(ref, dict)}
+    has_git_integration_proof = bool(
+        surfaces.intersection({"merge_commit", "integration_final_review_commit"})
+    )
     missing = [
         role
         for role, surface in (
             ("task_artifact_proof", "task_file"),
             ("review_artifact_proof", "review_artifact"),
-            ("merge_commit_proof", "merge_commit"),
         )
         if surface not in surfaces
     ]
+    if not has_git_integration_proof:
+        missing.append("merge_commit_proof")
     if missing:
         return {}
+    git_proof_label = (
+        "true merge commit"
+        if "merge_commit" in surfaces
+        else "single-parent integration/final-review commit"
+    )
     return {
         "schema_version": 1,
         "status": "completed_task_merge_artifact_refs_available",
+        "git_proof_kind": git_proof_label,
         "task_ids": _ask_execute_named_task_ids(query)[:2],
         "read": refs[:8],
         "diagnostics_after": [
@@ -5023,17 +5034,17 @@ def _named_task_merge_provenance_execute_artifact_handoff(
             }
         ],
         "stop": (
-            "Inspect same-task task/review/git merge artifact refs first; they satisfy completed-task "
-            "merge provenance artifact roles, not raw worker/session chronology."
+            "Inspect same-task task/review/git artifact refs first; they satisfy completed-task "
+            f"provenance artifact roles through {git_proof_label}, not raw worker/session chronology."
         ),
         "only_continue_if": [
-            "the same-task task artifact, review artifact, and git merge commit do not cover the requested artifact proof",
+            "the same-task task artifact, review artifact, and git integration/merge proof do not cover the requested artifact proof",
             "the user explicitly asks for raw worker/session chronology, which these artifact refs do not satisfy",
         ],
         "missing_roles": [],
         "source_boundary": (
-            "completed task/review/git artifacts can prove merge provenance artifact roles; "
-            "they do not prove raw worker chronology"
+            "completed task/review/git artifacts can prove completed-task integration provenance artifact roles; "
+            "single-parent integration/final-review commits are not true two-parent merge commits and do not prove raw worker chronology"
         ),
     }
 
@@ -5483,6 +5494,14 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
                         ),
                     }
                 )
+        refs.extend(
+            _completed_task_integration_commit_refs(
+                repo=repo,
+                cwd=cwd,
+                task_id=task_id,
+                artifact_paths=[*task_paths[:2], *review_paths[:2]],
+            )
+        )
         for commit in merge_commits_for_task(repo, task_id, max_commits=3):
             refs.append(
                 {
@@ -5503,6 +5522,120 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
                 }
             )
     return _dedupe_ask_answer_proof_refs(refs)
+
+
+def _completed_task_integration_commit_refs(
+    *,
+    repo: Path,
+    cwd: Path,
+    task_id: str,
+    artifact_paths: list[Path],
+) -> list[dict]:
+    refs: list[dict] = []
+    seen: set[str] = set()
+    artifact_rel_paths = {
+        _safe_relative_path(repo, path)
+        for path in artifact_paths
+        if _safe_relative_path(repo, path)
+    }
+    for path in artifact_paths:
+        for candidate in _completed_task_integration_commit_candidates(path, task_id=task_id):
+            commit = str(candidate.get("commit") or "").lower()
+            if commit in seen:
+                continue
+            metadata = commit_metadata(repo, commit)
+            if metadata is None:
+                continue
+            meta = metadata.to_dict()
+            parent_count = int(meta.get("parent_count") or 0)
+            if parent_count != 1:
+                continue
+            changed_paths = {
+                str(item.get("path") or "")
+                for item in meta.get("changed_files") or []
+                if isinstance(item, dict)
+            }
+            task_token = task_id.casefold()
+            same_task_by_subject = task_token in str(meta.get("subject") or "").casefold()
+            same_task_by_changed_file = bool(artifact_rel_paths.intersection(changed_paths))
+            same_task_by_artifact_line = task_token in str(candidate.get("line_text") or "").casefold()
+            if not (same_task_by_subject or same_task_by_changed_file or same_task_by_artifact_line):
+                continue
+            seen.add(commit)
+            rel = _safe_relative_path(cwd, path)
+            role = str(candidate.get("role") or "integration_commit")
+            refs.append(
+                {
+                    "kind": "completed_named_task_integration_commit_evidence",
+                    "task_id": task_id,
+                    "proof_surface": "integration_final_review_commit",
+                    "target_source_role": "completed_task_artifact",
+                    "proof_role": "single_parent_integration_or_final_review_commit",
+                    "final_support_allowed": True,
+                    "target": meta.get("commit"),
+                    "commit": meta.get("commit"),
+                    "commit_time": meta.get("commit_time"),
+                    "author": meta.get("author"),
+                    "committer": meta.get("committer"),
+                    "subject": meta.get("subject"),
+                    "parents": list(meta.get("parents") or []),
+                    "parent_count": parent_count,
+                    "contained_branches": list(meta.get("contained_branches") or []),
+                    "is_true_merge_commit": False,
+                    "commit_role": role,
+                    "artifact_path": rel,
+                    "reason": (
+                        f"inspect local git single-parent {_completed_task_integration_commit_role_label(role)} proof for completed {task_id}; "
+                        "this is integration/final-review proof, not a true merge commit"
+                    ),
+                    "source_boundary": (
+                        "local git metadata validates a same-task single-parent integration/final-review commit; "
+                        "this does not satisfy raw source-session chronology and must not be called a true merge commit"
+                    ),
+                }
+            )
+    return refs
+
+
+def _completed_task_integration_commit_role_label(role: str) -> str:
+    return {
+        "final_review_commit": "final-review commit",
+        "integration_commit": "integration commit",
+        "finalization_commit": "finalization commit",
+    }.get(str(role or ""), "integration/final-review commit")
+
+
+def _completed_task_integration_commit_candidates(path: Path, *, task_id: str) -> list[dict]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    candidates: list[dict] = []
+    for index, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        normalized = line.casefold()
+        role = ""
+        if "final review commit" in normalized:
+            role = "final_review_commit"
+        elif (
+            ("merged on" in normalized or "integrated on" in normalized or "integration commit" in normalized)
+            and any(marker in normalized for marker in ("master", "main", "parent", "integration"))
+        ):
+            role = "integration_commit"
+        elif "finalization commit" in normalized and task_id.casefold() in normalized:
+            role = "finalization_commit"
+        if not role:
+            continue
+        for match in re.finditer(r"\b[0-9a-f]{7,40}\b", line, flags=re.IGNORECASE):
+            candidates.append(
+                {
+                    "commit": match.group(0).lower(),
+                    "line": index,
+                    "line_text": line,
+                    "role": role,
+                }
+            )
+    return candidates
 
 
 def _completed_task_post_merge_artifact_wanted(*, query: str, route_family: str) -> bool:
@@ -7020,7 +7153,7 @@ def _ask_answer_finalization_veto(
             "overridden_answer_action_status": action.get("answer_status"),
             "overridden_promotion_status": action.get("promotion_status"),
             "boundary": (
-                "task/review/git merge artifacts are final support for completed-task merge provenance; "
+                "task/review/git integration-or-merge artifacts are final support for completed-task provenance; "
                 "raw worker/session chronology remains unproven unless separately opened"
             ),
         }
@@ -7062,7 +7195,10 @@ def _named_task_merge_provenance_artifact_gate_can_override_action_contract(
     if merge_gate.get("blocking_missing_roles"):
         return False
     role_evidence = merge_gate.get("role_evidence") if isinstance(merge_gate.get("role_evidence"), dict) else {}
-    if not all(role_evidence.get(role) for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES):
+    if not all(
+        _named_task_merge_provenance_role_satisfied(role, role_evidence)
+        for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES
+    ):
         return False
     answer_status = str(action.get("answer_status") or "").casefold()
     promotion_status = str(action.get("promotion_status") or "").casefold()
@@ -8757,12 +8893,16 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
             "current_named_task_commit_evidence",
             "completed_named_task_commit_evidence",
             "completed_named_task_merge_commit_evidence",
+            "completed_named_task_integration_commit_evidence",
         }:
             summary = " ".join(
                 part
                 for part in (
                     str(ref.get("commit_time") or ""),
                     str(ref.get("commit") or ref.get("target") or ""),
+                    f"parent_count={ref.get('parent_count')}" if ref.get("parent_count") is not None else "",
+                    f"author={ref.get('author')}" if ref.get("author") else "",
+                    f"committer={ref.get('committer')}" if ref.get("committer") else "",
                     str(ref.get("subject") or ""),
                 )
                 if part
@@ -11442,6 +11582,20 @@ def _ref_public_summary(item: dict) -> dict:
         "expectation_mismatch_role": ref.get("expectation_mismatch_role"),
         "expectation_mismatch_inferred_role": ref.get("expectation_mismatch_inferred_role"),
     }
+    for key in (
+        "commit",
+        "commit_time",
+        "author",
+        "committer",
+        "subject",
+        "parent_count",
+        "parents",
+        "contained_branches",
+        "is_true_merge_commit",
+        "commit_role",
+    ):
+        if key in ref:
+            summary[key] = ref.get(key)
     metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     if metadata:
         summary["record_metadata"] = {
@@ -11865,6 +12019,7 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
     path_commit_summaries = _completed_task_role_summaries(refs, "path_last_change_commit", task_id=task_id)
     merge_commits = _named_task_merge_commit_hashes(refs, task_id=task_id)
     merge_commit_labels = _named_task_merge_commit_labels(refs, task_id=task_id)
+    integration_commit_labels = _named_task_integration_commit_labels(refs, task_id=task_id)
     post_merge_summaries = [
         _completed_task_clean_summary(str(item.get("summary") or ""), task_id=task_id)
         for item in refs
@@ -11881,6 +12036,8 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
             status_bits.append("reviewed/verified")
         if merge_commits:
             status_bits.append("merged")
+        elif integration_commit_labels:
+            status_bits.append("integrated/final-reviewed")
         if post_merge_summaries:
             status_bits.append("post-merge checked")
         if not status_bits:
@@ -11892,6 +12049,8 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
             proof_bits.append(f"review: {_short_join(review_summaries[:1], limit=220)}")
         if merge_commits:
             proof_bits.append(f"merge commit: {', '.join(commit[:12] for commit in merge_commits[:2])}")
+        if integration_commit_labels:
+            proof_bits.append(f"integration/final-review commit: {', '.join(integration_commit_labels[:2])}")
         if post_merge_summaries:
             proof_bits.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=220)}")
         return (
@@ -11919,12 +12078,17 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
             "merge commit proof: "
             + (", ".join(merge_commit_labels[:3]) if merge_commit_labels else "missing/not opened")
         )
+        pieces.append(
+            "integration/final-review commit proof: "
+            + (", ".join(integration_commit_labels[:3]) if integration_commit_labels else "missing/not opened")
+        )
         if post_merge_summaries:
             pieces.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=240)}")
         return (
             f"Completed-task merge/provenance proof for {task_id}: "
             + "; ".join(pieces)
             + ". Boundary: task/review/git/post-merge artifacts satisfy only their artifact roles; "
+            "a single-parent integration/final-review commit is not a true two-parent merge commit; "
             "they are not raw source-session proof unless a raw session ref is opened."
         )
 
@@ -11938,6 +12102,8 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
             proof_bits.append(f"commit evidence: {_short_join(path_commit_summaries[:2], limit=240)}")
         if merge_commits:
             proof_bits.append(f"merge commit: {', '.join(commit[:12] for commit in merge_commits[:2])}")
+        if integration_commit_labels:
+            proof_bits.append(f"integration/final-review commit: {', '.join(integration_commit_labels[:2])}")
         if post_merge_summaries:
             proof_bits.append(f"post-merge proof: {_short_join(post_merge_summaries[:1], limit=220)}")
         if proof_bits:
@@ -12493,8 +12659,9 @@ def _compose_named_task_merge_provenance_answer(
     review_proof = _named_task_merge_provenance_role_summary(clean_review_summaries)
     merge_commits = _named_task_merge_commit_hashes(opened, task_id=task_id)
     merge_commit_labels = _named_task_merge_commit_labels(opened, task_id=task_id)
+    integration_commit_labels = _named_task_integration_commit_labels(opened, task_id=task_id)
     source_sessions = _named_task_source_session_proof_summaries(opened)
-    if not (task_proof or review_proof or merge_commits or source_sessions):
+    if not (task_proof or review_proof or merge_commits or integration_commit_labels or source_sessions):
         return None
     pieces = []
     if source_sessions:
@@ -12513,10 +12680,12 @@ def _compose_named_task_merge_provenance_answer(
         pieces.append(f"merge commit proof: {', '.join(merge_commit_labels[:3])}")
     else:
         pieces.append("merge commit proof: missing/unresolved in the opened proof refs")
+    if integration_commit_labels:
+        pieces.append(f"integration/final-review commit proof: {', '.join(integration_commit_labels[:3])}")
     return (
         f"Current merge provenance proof for {task_id}: "
         + "; ".join(pieces)
-        + ". Boundary: task and review artifacts corroborate task/review roles; only an actual merge commit is used for the merge-commit role."
+        + ". Boundary: task and review artifacts corroborate task/review roles; true merge commits and single-parent integration/final-review commits are separate git proof surfaces."
     )
 
 
@@ -12548,12 +12717,12 @@ def _named_task_merge_provenance_final_proof_gate(
     missing = [
         role
         for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
-        if not role_evidence.get(role)
+        if not _named_task_merge_provenance_role_satisfied(role, role_evidence)
     ]
     blocking_missing = [
         role
         for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES
-        if not role_evidence.get(role)
+        if not _named_task_merge_provenance_role_satisfied(role, role_evidence)
     ]
     display_missing = list(missing)
     if (
@@ -12576,7 +12745,7 @@ def _named_task_merge_provenance_final_proof_gate(
         )
     else:
         summary_lines.append(
-            "Named-task merge provenance proof has source-session, task, review, and merge-commit roles."
+            "Named-task merge provenance proof has source-session, task, review, and git integration/merge roles."
         )
     return {
         "schema_version": 1,
@@ -12589,22 +12758,30 @@ def _named_task_merge_provenance_final_proof_gate(
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
-            "Open same-task source-session, task artifact, review artifact, and actual merge-commit proof "
+            "Open same-task source-session, task artifact, review artifact, and actual merge-commit or "
+            "git-validated single-parent integration/final-review proof "
             f"for {task_id or 'the named task'} before answering merge provenance."
         ),
         "acceptable_evidence": [
             "source-session row or raw transcript reference for the task implementation/review/merge episode",
             "same-task task artifact recording implementation/review/merge state",
             "same-task independent review artifact or review proof",
-            "actual parent merge commit hash or git-derived merge proof, not only closeout/status prose",
+            "actual parent merge commit hash or git-validated single-parent integration/final-review commit proof, not only closeout/status prose",
         ],
     }
+
+
+def _named_task_merge_provenance_role_satisfied(role: str, role_evidence: dict) -> bool:
+    if role != "merge_commit_proof":
+        return bool(role_evidence.get(role))
+    return bool(role_evidence.get("merge_commit_proof") or role_evidence.get("integration_commit_proof"))
 
 
 def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: str) -> dict:
     evidence: dict[str, list[dict]] = {
         role: [] for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
     }
+    evidence["integration_commit_proof"] = []
     for item in opened:
         if item.get("status") != "opened":
             continue
@@ -12650,6 +12827,12 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
             public = dict(public)
             public["merge_commits"] = _named_task_merge_commit_hashes([item], task_id=task_id or "the named task")
             evidence["merge_commit_proof"].append(public)
+        if _named_task_integration_commit_hashes([item], task_id=task_id or "the named task"):
+            public = dict(public)
+            public["integration_commits"] = _named_task_integration_commit_hashes(
+                [item], task_id=task_id or "the named task"
+            )
+            evidence["integration_commit_proof"].append(public)
     return {
         role: values[:_ASK_ANSWER_MAX_REFS]
         for role, values in evidence.items()
@@ -12826,6 +13009,50 @@ def _named_task_merge_commit_labels(opened: list[dict], *, task_id: str) -> list
             continue
         seen.add(commit)
         labels.append(commit[:12])
+    return labels
+
+
+def _named_task_integration_commit_hashes(opened: list[dict], *, task_id: str) -> list[str]:
+    commits: list[str] = []
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if str(ref.get("proof_surface") or "") != "integration_final_review_commit":
+            continue
+        if task_id and _named_task_fragment_mentions_other_task_id(_target_episode_ref_match_text(item), task_id):
+            continue
+        direct_commit = str(ref.get("commit") or item.get("target") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{7,40}", direct_commit) and direct_commit not in commits:
+            commits.append(direct_commit)
+    return commits
+
+
+def _named_task_integration_commit_labels(opened: list[dict], *, task_id: str) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for item in opened:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if str(ref.get("proof_surface") or "") != "integration_final_review_commit":
+            continue
+        direct_commit = str(ref.get("commit") or item.get("target") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{7,40}", direct_commit):
+            continue
+        if task_id and _named_task_fragment_mentions_other_task_id(_target_episode_ref_match_text(item), task_id):
+            continue
+        if direct_commit in seen:
+            continue
+        seen.add(direct_commit)
+        label = f"{direct_commit[:12]} (single-parent"
+        author = str(ref.get("author") or "").strip()
+        committer = str(ref.get("committer") or "").strip()
+        subject = str(ref.get("subject") or "").strip()
+        if author:
+            label += f"; author: {author}"
+        if committer:
+            label += f"; committer: {committer}"
+        if subject:
+            label += f"; subject: {subject}"
+        label += ")"
+        labels.append(label)
     return labels
 
 
