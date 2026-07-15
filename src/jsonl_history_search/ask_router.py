@@ -1518,6 +1518,35 @@ def _substantive_topic_terms(text: str) -> set[str]:
 
 def _looks_like_expectation_mismatch_query(normalized: str) -> bool:
     normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    explicit_mismatch_shape = _has_any(
+        normalized,
+        (
+            "expectation mismatch",
+            "expectation-mismatch",
+            "mismatch behind",
+            "mismatch caused",
+        ),
+    )
+    if explicit_mismatch_shape and _has_any(
+        normalized,
+        (
+            "behind",
+            "caused",
+            "cause",
+            "episode",
+            "situation",
+            "jsh-",
+            "stopped",
+            "not-auditing",
+            "agent",
+            "ai",
+            "assistant",
+            "codex",
+            "diverged",
+            "instead of",
+        ),
+    ):
+        return True
     causal_shape = _has_any(
         normalized,
         (

@@ -1050,6 +1050,35 @@ def process_actual_use_detected(family: dict[str, Any]) -> bool:
 def looks_like_expectation_mismatch_query(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().replace("?", " ").replace("!", " ").split())
     normalized = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    explicit_mismatch_shape = any(
+        phrase in normalized
+        for phrase in (
+            "expectation mismatch",
+            "expectation-mismatch",
+            "mismatch behind",
+            "mismatch caused",
+        )
+    )
+    if explicit_mismatch_shape and any(
+        phrase in normalized
+        for phrase in (
+            "behind",
+            "caused",
+            "cause",
+            "episode",
+            "situation",
+            "jsh-",
+            "stopped",
+            "not-auditing",
+            "agent",
+            "ai",
+            "assistant",
+            "codex",
+            "diverged",
+            "instead of",
+        )
+    ):
+        return True
     causal_shape = any(
         phrase in normalized
         for phrase in (
