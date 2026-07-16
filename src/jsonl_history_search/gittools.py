@@ -113,6 +113,12 @@ def commit_metadata(repo: str | Path, commit: str) -> GitCommit | None:
     )
 
 
+def commit_is_reachable(repo: str | Path, commit: str, *, ref: str = "HEAD") -> bool:
+    repo_root = Path(repo).resolve(strict=False)
+    result = _run_git(repo_root, ["merge-base", "--is-ancestor", commit, ref])
+    return result is not None and result.returncode == 0
+
+
 def branches_containing_commit(repo: str | Path, commit: str) -> list[str]:
     repo_root = Path(repo).resolve(strict=False)
     result = _run_git(repo_root, ["branch", "--contains", commit])

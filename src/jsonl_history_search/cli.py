@@ -70,7 +70,13 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
-from .gittools import commit_metadata, git_root_for, last_change_for_path, merge_commits_for_task
+from .gittools import (
+    commit_is_reachable,
+    commit_metadata,
+    git_root_for,
+    last_change_for_path,
+    merge_commits_for_task,
+)
 from .latest_user_messages import build_latest_user_messages_payload, latest_user_messages
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
@@ -5578,6 +5584,13 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
                             summary=post_merge,
                         )
                     )
+        refs.extend(
+            _completed_task_merge_commit_refs(
+                repo=repo,
+                task_id=task_id,
+                artifact_paths=[*task_paths[:2], *review_paths[:2]],
+            )
+        )
         for path in [*task_paths[:1], *review_paths[:1]]:
             change = last_change_for_path(path, repo=repo)
             if change:
@@ -5608,26 +5621,83 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
                 artifact_paths=[*task_paths[:2], *review_paths[:2]],
             )
         )
-        for commit in merge_commits_for_task(repo, task_id, max_commits=3):
-            refs.append(
-                {
-                    "kind": "completed_named_task_merge_commit_evidence",
-                    "task_id": task_id,
-                    "proof_surface": "merge_commit",
-                    "target_source_role": "completed_task_artifact",
-                    "final_support_allowed": True,
-                    "target": commit.get("commit"),
-                    "commit": commit.get("commit"),
-                    "commit_time": commit.get("commit_time"),
-                    "author": commit.get("author"),
-                    "subject": commit.get("subject"),
-                    "reason": f"inspect local git merge commit evidence for completed {task_id}",
-                    "source_boundary": (
-                        "local git merge commit metadata; satisfies merge-commit proof only, not raw source-session proof"
-                    ),
-                }
-            )
     return _dedupe_ask_answer_proof_refs(refs)
+
+
+def _completed_task_merge_commit_refs(
+    *,
+    repo: Path,
+    task_id: str,
+    artifact_paths: list[Path],
+) -> list[dict]:
+    candidates: list[str] = []
+    for path in artifact_paths:
+        candidates.extend(_completed_task_artifact_merge_commit_candidates(path, task_id=task_id))
+    candidates.extend(
+        str(commit.get("commit") or "")
+        for commit in merge_commits_for_task(repo, task_id, max_commits=3)
+    )
+
+    refs: list[dict] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        metadata = commit_metadata(repo, normalized)
+        if metadata is None or metadata.parent_count < 2:
+            continue
+        if not commit_is_reachable(repo, metadata.commit):
+            continue
+        seen.add(metadata.commit)
+        meta = metadata.to_dict()
+        refs.append(
+            {
+                "kind": "completed_named_task_merge_commit_evidence",
+                "task_id": task_id,
+                "proof_surface": "merge_commit",
+                "target_source_role": "completed_task_artifact",
+                "proof_role": "reachable_true_merge_commit",
+                "final_support_allowed": True,
+                "target": meta.get("commit"),
+                "commit": meta.get("commit"),
+                "commit_time": meta.get("commit_time"),
+                "author": meta.get("author"),
+                "committer": meta.get("committer"),
+                "subject": meta.get("subject"),
+                "parents": list(meta.get("parents") or []),
+                "parent_count": meta.get("parent_count"),
+                "contained_branches": list(meta.get("contained_branches") or []),
+                "is_true_merge_commit": True,
+                "reason": f"inspect reachable local git merge commit evidence for completed {task_id}",
+                "source_boundary": (
+                    "reachable local git commit metadata validates two or more parents; satisfies "
+                    "merge-commit proof only, not raw source-session proof"
+                ),
+            }
+        )
+    return refs
+
+
+def _completed_task_artifact_merge_commit_candidates(path: Path, *, task_id: str) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    task_token = task_id.casefold()
+    candidates: list[str] = []
+    for raw in lines:
+        normalized = raw.casefold()
+        if "merge" not in normalized:
+            continue
+        mentioned_tasks = set(re.findall(r"\bjsh-\d+\b", normalized))
+        if mentioned_tasks and mentioned_tasks != {task_token}:
+            continue
+        candidates.extend(
+            match.group(0).lower()
+            for match in re.finditer(r"\b[0-9a-f]{7,40}\b", raw, flags=re.IGNORECASE)
+        )
+    return candidates
 
 
 def _completed_task_integration_commit_refs(
