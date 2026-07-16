@@ -1,18 +1,35 @@
 ---
 name: jsonl-history-search
-description: Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user says convo; `convo` is a memorable alias for the canonical jsonl-history-search tool. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
+description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, or worktree cleanup causality; named local task-file checks stay local-first. Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user says convo; `convo` is a memorable alias for the canonical jsonl-history-search tool. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
 
 # JSONL History Search
 
+## Activation Gate
+
+For a bare `what happened?` or equivalent ambiguous event prompt with no
+concrete event, time, thread, task, path, commit, history, or source target, stop
+before every tool call. Ask one short clarification about which event or change
+the user means. Use zero JSONL/history commands, Git commands, repo scans,
+TODO/task/state recovery, and filesystem inspection, and do not infer an event
+from the current checkout.
+
+Activate JSONL when the user supplies an explicit history/source anchor, such
+as `what happened since my last message?`, `what happened at X?`, a devlog
+chronology, source provenance, action proof, a remembered instruction, or
+worktree cleanup causality. A named local task-file check is also anchored, but
+inspect that local artifact first and use JSONL only if its history or source
+coverage is missing or disputed.
+
 The skill name and canonical command remain `jsonl-history-search`. `convo` is
 a memorable alias/trigger for the same tool, not a separate product; when the
 Python package is installed, `convo --help` reaches the same CLI surface as
 `jsonl-history-search --help`.
 
-This skill is a router. Load this file first. For natural user questions that
+This skill is a router. Apply the activation gate above before loading routes.
+For natural user questions that
 ask what happened since an explicit prior-message/history anchor, why a topic appeared, whether an agent action occurred,
 which artifact or ticket is current, whether old worktrees can be pruned, or what to
 learn from a session, run `ask` as the
@@ -25,7 +42,8 @@ just created or edited include everything, verify local artifacts first with
 as a targeted backstop for disputed source-window coverage.
 Do not trigger this skill for the bare prompt `what happened?` or an equivalent
 ambiguous event question with no history anchor. Ask one short clarification
-question without using a tool. For local artifact/task-file prompts such as
+question without using a tool, Git, repo scans, TODO/task/state recovery, or
+filesystem inspection. For local artifact/task-file prompts such as
 `what happened with this task file?`, inspect the named local artifact first.
 
 The product contract is agent-assist retrieval: find useful information in
