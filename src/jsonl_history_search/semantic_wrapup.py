@@ -1696,7 +1696,8 @@ def _ambiguous_prompt_only_current_session_scope(plan: SourcePlan, signals: list
     reason = (
         "Current-session wording selected the latest known session, but the complaint/failure "
         "signals in that session are dominated by receiving-agent prompt, benchmark/setup, "
-        "or orchestration echoes rather than parent/user complaint evidence."
+        "or orchestration echoes. Genuine user-correction proof is missing, so these signals "
+        "cannot support promoted failure modes or fixes."
     )
     if assignment_retry_count == len(signals):
         reason = (
