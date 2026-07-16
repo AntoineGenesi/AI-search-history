@@ -6945,14 +6945,22 @@ def _artifact_currentness_companion_status_proof(
     active_markers = ("active", "in progress", "open", "selected")
     terminal = any(re.search(rf"\b{re.escape(marker)}\b", status_value) for marker in terminal_markers)
     active = any(re.search(rf"\b{re.escape(marker)}\b", status_value) for marker in active_markers)
-    negation_prefix = r"(?:not|never|isn't|isnt|no\s+longer)"
-    negated_terminal = any(
-        re.search(rf"\b{negation_prefix}\b.*\b{re.escape(marker)}\b", status_value)
+    positive_terminal = any(
+        re.match(rf"^{re.escape(marker)}\b", status_value)
         for marker in terminal_markers
     )
-    if negated_terminal or terminal == active:
+    negative = bool(
+        re.search(
+            r"\b(?:not|never|cannot|can't|cant|won't|wont|wasn't|wasnt|weren't|werent|isn't|isnt|"
+            r"aren't|arent|hasn't|hasnt|haven't|havent|hadn't|hadnt|doesn't|doesnt|don't|dont|"
+            r"didn't|didnt|shouldn't|shouldnt|wouldn't|wouldnt|couldn't|couldnt|mustn't|mustnt)\b|"
+            r"\bno\s+longer\b",
+            status_value,
+        )
+    )
+    if negative or terminal == active:
         return None, "same_target_status_ambiguous_or_conflicting"
-    if (verdict == "superseded" and not terminal) or (verdict == "current" and not active):
+    if (verdict == "superseded" and not positive_terminal) or (verdict == "current" and not active):
         return None, "same_target_status_conflicting_with_verdict"
     return claims[0], "same_target_status_consistent_with_verdict"
 
