@@ -2087,11 +2087,16 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
 def _is_answer_ready_worktree_cleanup_execute(args: argparse.Namespace, execution_kind: str) -> bool:
     if execution_kind != "artifact-currentness":
         return False
-    from .worktree_currentness import is_answer_ready_worktree_cleanup_causality_query
 
-    return is_answer_ready_worktree_cleanup_causality_query(
+    return _is_answer_ready_worktree_cleanup_query(
         str(getattr(args, "query", "") or "")
     )
+
+
+def _is_answer_ready_worktree_cleanup_query(query: str) -> bool:
+    from .worktree_currentness import is_answer_ready_worktree_cleanup_causality_query
+
+    return is_answer_ready_worktree_cleanup_causality_query(query)
 
 
 def _run_worktree_cleanup_execute_without_report(
@@ -7816,12 +7821,24 @@ def _ask_answer_artifact_currentness(
 ) -> dict | None:
     """Finalize artifact/topic currentness and source-backed cleanup causality."""
     execution = report.get("execution") if isinstance(report.get("execution"), dict) else {}
+    query = str(report.get("query") or "")
     executed_output = (
         report.get("executed_output")
         if isinstance(report.get("executed_output"), dict)
         else {}
     )
     if executed_output.get("detected_intent") == "worktree_cleanup_currentness":
+        if not _is_answer_ready_worktree_cleanup_query(query):
+            return _ask_answer_fail_closed(
+                answer,
+                "worktree cleanup direct answer is scoped to the exact generic cleanup prompt",
+                {
+                    "required_next_proof": (
+                        "target-specific cleanup evidence and a decisive target classification"
+                    ),
+                    "searched_scope": "route-only artifact-currentness evidence",
+                },
+            )
         packet = {
             "detected_intent": "worktree_cleanup_currentness",
             "worktree_currentness": {
@@ -7851,6 +7868,17 @@ def _ask_answer_artifact_currentness(
         )
     packet = saved.get("artifact_currentness") if isinstance(saved, dict) else {}
     if isinstance(packet, dict) and packet.get("detected_intent") == "worktree_cleanup_currentness":
+        if not _is_answer_ready_worktree_cleanup_query(query):
+            return _ask_answer_fail_closed(
+                answer,
+                "worktree cleanup direct answer is scoped to the exact generic cleanup prompt",
+                {
+                    "required_next_proof": (
+                        "target-specific cleanup evidence and a decisive target classification"
+                    ),
+                    "searched_scope": "route-only artifact-currentness evidence",
+                },
+            )
         return _ask_answer_worktree_cleanup_currentness(
             answer,
             packet=packet,
@@ -7859,7 +7887,6 @@ def _ask_answer_artifact_currentness(
         )
     if not isinstance(packet, dict) or packet.get("detected_intent") != "natural_direction_currentness":
         return None
-    query = str(report.get("query") or "")
     selected = packet.get("selected_artifact_or_topic") if isinstance(packet.get("selected_artifact_or_topic"), dict) else {}
     query_ids = _artifact_currentness_named_ids(query)
     selected_identity = " ".join(
