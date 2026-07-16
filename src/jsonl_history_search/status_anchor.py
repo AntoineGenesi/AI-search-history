@@ -327,6 +327,7 @@ def status_anchor_report(
     canonical_parent_main_fallback = _canonical_parent_main_fallback_from_interval(canonical_parent_main_interval)
     anchor_candidates = _rank_anchor_candidates(
         latest_messages,
+        query=query,
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
@@ -385,6 +386,12 @@ def status_anchor_report(
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
+    )
+    selected_anchor, anchor_decision, session_activity = _demote_unqualified_out_of_band_anchor_without_activity(
+        query=query,
+        selected_anchor=selected_anchor,
+        anchor_decision=anchor_decision,
+        session_activity=session_activity,
     )
     artifacts = _collect_work_artifacts(
         cwd,
@@ -452,7 +459,7 @@ def status_anchor_report(
     blind_spots = []
     if not selected_anchor:
         blind_spots.append("No substantive anchor selected from the searched latest-message scope.")
-    if session_activity["status"] != "raw_session_trace_found":
+    if session_activity["status"] not in {"raw_session_trace_found", "partial_raw_session_trace_found"}:
         blind_spots.append("Raw session activity trace was not found; do not answer from commits/repo state alone.")
     if not artifacts["value_items"]:
         blind_spots.append("No known JSH-998 through JSH-1002 task/report/review artifacts were found under --cwd.")
@@ -580,12 +587,13 @@ def is_status_question(query: str) -> bool:
 def _rank_anchor_candidates(
     messages: list[dict],
     *,
+    query: str,
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
 ) -> list[dict]:
     candidates = []
-    status_cutoff = (status_as_of_boundary or {}).get("timestamp_utc") or _status_query_cutoff(messages)
+    status_cutoff = (status_as_of_boundary or {}).get("timestamp_utc") or _status_query_cutoff(query, messages)
     for index, message in enumerate(messages):
         text = str(message.get("snippet") or "")
         timestamp = message.get("timestamp_utc")
@@ -629,10 +637,12 @@ def _rank_anchor_candidates(
     return candidates
 
 
-def _status_query_cutoff(messages: list[dict]) -> str | None:
-    current_status = _current_status_message(messages)
+def _status_query_cutoff(query: str, messages: list[dict]) -> str | None:
+    current_status = _current_status_message(messages, query=query)
     if current_status:
         return str(current_status.get("timestamp_utc") or "") or None
+    if _requires_query_equivalent_status_boundary(query):
+        return None
     for message in messages:
         timestamp = str(message.get("timestamp_utc") or "")
         if (
@@ -647,7 +657,7 @@ def _status_query_cutoff(messages: list[dict]) -> str | None:
 def _status_as_of_boundary_from_messages(query: str, messages: list[dict]) -> dict | None:
     if not is_status_question(query):
         return None
-    status_message = _current_status_message(messages)
+    status_message = _current_status_message(messages, query=query)
     if not status_message:
         return None
     boundary_source = status_message
@@ -939,8 +949,26 @@ def _select_anchor_with_boundary(
     if is_status_question(query):
         prefer_parent = _prefers_parent_main_anchor(query)
         relative_history_first = _relative_status_requires_history_first_anchor(query) and _has_canonical_history_source(messages)
-        status_message = _current_status_message(messages)
+        status_message = _current_status_message(messages, query=query)
         if not status_message and (prefer_parent or relative_history_first):
+            if relative_history_first and not prefer_parent:
+                latest_history_anchor = _latest_eligible_canonical_history_anchor(candidates)
+                if latest_history_anchor:
+                    return _with_rejected_alternatives(
+                        {
+                            **base,
+                            "context_boundary": "out_of_band_plain_latest_human",
+                            "anchor_scope": "current_user_message_chronology",
+                            "anchor_reason": "latest_eligible_canonical_human_before_out_of_band_status_request",
+                            "anchor_ref": latest_history_anchor.get("source_ref"),
+                            "selected_anchor": _selected_with_reason(
+                                latest_history_anchor,
+                                "; selected as the latest eligible canonical human row because no query-equivalent "
+                                "current status boundary was stored",
+                            ),
+                        },
+                        candidates,
+                    )
             return {
                 **base,
                 "context_boundary": (
@@ -2713,12 +2741,17 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
     return {**decision, "rejected_anchor_alternatives": alternatives}
 
 
-def _current_status_message(messages: list[dict]) -> dict | None:
+def _current_status_message(messages: list[dict], *, query: str | None = None) -> dict | None:
     status_messages = [
         (index, message)
         for index, message in enumerate(messages)
         if is_status_question(str(message.get("snippet") or ""))
         and not _is_status_boundary_prompt_noise(message)
+        and (
+            not query
+            or not _requires_query_equivalent_status_boundary(query)
+            or _status_boundary_is_query_equivalent(query, str(message.get("snippet") or ""))
+        )
     ]
     if not status_messages:
         return None
@@ -2739,6 +2772,36 @@ def _current_status_message(messages: list[dict]) -> dict | None:
     current["message_index"] = first_index
     current["thread_keys"] = _message_thread_keys(first_message)
     return current
+
+
+def _requires_query_equivalent_status_boundary(query: str) -> bool:
+    return (
+        _relative_status_requires_history_first_anchor(query)
+        and not _prefers_parent_main_anchor(query)
+        and not _explicit_side_thread_local_status(query)
+    )
+
+
+def _status_boundary_is_query_equivalent(query: str, candidate_text: str) -> bool:
+    normalized_query = _normalize(query).strip(" .?!")
+    normalized_candidate = _normalize(candidate_text).strip(" .?!")
+    if normalized_query and normalized_query == normalized_candidate:
+        return True
+    query_words = re.sub(r"[^a-z0-9]+", " ", normalized_query).split()
+    candidate_words = re.sub(r"[^a-z0-9]+", " ", normalized_candidate).split()
+    return bool(
+        query_words
+        and candidate_words
+        and len(candidate_words) <= len(query_words) + 4
+        and _relative_status_requires_history_first_anchor(candidate_text)
+        and "last" in candidate_words
+        and "message" in candidate_words
+    )
+
+
+def _latest_eligible_canonical_history_anchor(candidates: list[dict]) -> dict | None:
+    chronological = sorted(candidates, key=lambda item: int(item.get("message_index", 0)))
+    return _first_canonical_history_anchor(chronological, set(), parent_only=False)
 
 
 def _is_status_boundary_prompt_noise(message: dict) -> bool:
@@ -3493,6 +3556,67 @@ def _session_activity_trace(
         "missing_logs": missing,
         "summary": summary,
     }
+
+
+def _demote_unqualified_out_of_band_anchor_without_activity(
+    *,
+    query: str,
+    selected_anchor: dict | None,
+    anchor_decision: dict,
+    session_activity: dict,
+) -> tuple[dict | None, dict, dict]:
+    if (
+        not selected_anchor
+        or anchor_decision.get("context_boundary") != "out_of_band_plain_latest_human"
+        or not _requires_query_equivalent_status_boundary(query)
+        or session_activity.get("status") in {"raw_session_trace_found", "partial_raw_session_trace_found"}
+    ):
+        return selected_anchor, anchor_decision, session_activity
+
+    rejected = {
+        "source_ref": selected_anchor.get("source_ref"),
+        "timestamp_utc": selected_anchor.get("timestamp_utc"),
+        "classification": selected_anchor.get("classification"),
+        "decision": "rejected",
+        "rationale": (
+            "latest eligible canonical human candidate had no raw post-anchor activity; "
+            "request an explicit quote or timestamp instead of treating it as a selected anchor"
+        ),
+        "snippet": selected_anchor.get("snippet"),
+        "source_kind": selected_anchor.get("source_kind"),
+        "openable_source_ref": selected_anchor.get("openable_source_ref"),
+        "openable_target": selected_anchor.get("openable_target"),
+        "unqualified_latest_human_activity_required": True,
+    }
+    demoted_decision = {
+        **anchor_decision,
+        "context_boundary": "out_of_band_plain_latest_human_activity_missing",
+        "anchor_scope": "current_user_message_chronology",
+        "anchor_reason": "latest_canonical_human_anchor_has_no_raw_post_anchor_activity",
+        "anchor_ref": None,
+        "selected_anchor": None,
+        "rejected_anchor_alternatives": [
+            rejected,
+            *(anchor_decision.get("rejected_anchor_alternatives") or []),
+        ][:8],
+    }
+    demoted_activity = {
+        **session_activity,
+        "status": "no_selected_anchor",
+        "anchor_timestamp_utc": None,
+        "session_followups": [],
+        "activity_after_anchor": _empty_activity_counts(),
+        "next_reads": [],
+        "missing_logs": [
+            "latest eligible canonical human candidate had no raw post-anchor activity; explicit anchor required"
+        ],
+        "summary": {
+            "session_file_count": 0,
+            "records_after_anchor": 0,
+            "spawned_session_call_count": 0,
+        },
+    }
+    return None, demoted_decision, demoted_activity
 
 
 def _empty_activity_counts() -> dict:
