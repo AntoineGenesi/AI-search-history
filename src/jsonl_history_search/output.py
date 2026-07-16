@@ -322,10 +322,12 @@ def render_ask_router_text(payload: dict) -> str:
     for item in report.get("next_commands", []):
         lines.append(f"- {item.get('purpose')}: {item.get('command')}")
         lines.append(f"  Inspect: {item.get('inspect_next')}")
-    lines.append("Agent command cookbook:")
-    for item in report.get("command_cookbook", [])[:6]:
-        lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
-        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    cookbook = report.get("command_cookbook", [])
+    if cookbook:
+        lines.append("Agent command cookbook:")
+        for item in cookbook[:6]:
+            lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
+            lines.append(f"  Inspect: {item.get('inspect_next')}")
     lines.append("Inspect after:")
     for item in report.get("inspect_after", []):
         lines.append(f"- {item}")

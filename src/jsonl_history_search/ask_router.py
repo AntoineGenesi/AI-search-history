@@ -29,6 +29,10 @@ EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
 EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentness"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
+LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
+NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
+    {NON_HISTORY_CLARIFICATION_ROUTE_FAMILY, LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY}
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class AskRoute:
 
 
 LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
-    route_family="local_artifact_verification",
+    route_family=LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
     chosen_route="local-artifact-verification",
     why_it_applies=(
         "The wording asks what changed in a named local artifact or whether "
@@ -694,14 +698,21 @@ ROUTES: tuple[AskRoute, ...] = (
 def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
     structured_execution_query = route.command_query(query)
-    if route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY:
+    if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
+        if route.route_family == LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY:
+            resolution_guidance = (
+                "No JSONL command resolution is needed for this local-artifact route; "
+                "use its local/Git commands."
+            )
+        else:
+            resolution_guidance = "No JSONL command resolution is needed for this no-tool route."
         command_resolution_payload = {
             "mode": "not_applicable",
             "command_prefix": None,
             "installed_command_available": None,
             "source_checkout_available": None,
             "source_fallback_command": None,
-            "guidance": "No JSONL command resolution is needed for this no-tool route.",
+            "guidance": resolution_guidance,
         }
         cli_prefix = "jsonl-history-search"
     else:
@@ -734,7 +745,7 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             ),
             "command_cookbook": (
                 []
-                if route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY
+                if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES
                 else agent_question_cookbook(cli_prefix=cli_prefix)
             ),
             "read_specialization": route.read_specialization,
