@@ -6807,9 +6807,17 @@ def _ask_answer_artifact_currentness(
         )
 
     chain = [item for item in packet.get("evidence_chain") or [] if isinstance(item, dict)]
+    companion_status, companion_assessment = _artifact_currentness_companion_status_proof(
+        packet,
+        query_ids=query_ids,
+        verdict=verdict,
+    )
     role_candidates = {
         "current_front_door": next((item for item in chain if item.get("evidence_type") == "current_front_door"), None),
-        "artifact_status_claim": next((item for item in chain if item.get("evidence_type") == "artifact_status_field"), None),
+        "artifact_status_claim": next(
+            (item for item in chain if item.get("evidence_type") == "artifact_status_field"),
+            companion_status,
+        ),
         "newer_commit_evidence": next(
             (item for item in chain if item.get("relationship") == "newer_repo_commit_after_artifact"), None
         ),
@@ -6838,7 +6846,11 @@ def _ask_answer_artifact_currentness(
 
     missing_roles = [role for role in role_candidates if role not in opened_roles]
     assessment = packet.get("status_field_assessment") if isinstance(packet.get("status_field_assessment"), dict) else {}
-    if verdict == "superseded" and assessment.get("assessment") != "status_claim_conflicts_with_later_evidence":
+    selected_status_reconciled = (
+        verdict != "superseded"
+        or assessment.get("assessment") == "status_claim_conflicts_with_later_evidence"
+    )
+    if not selected_status_reconciled and companion_assessment != "same_target_status_consistent_with_verdict":
         missing_roles.append("artifact_status_conflict_assessment")
     if missing_roles:
         answer["source_contract"]["artifact_currentness_answer_gate"] = {
@@ -6878,6 +6890,56 @@ def _ask_answer_artifact_currentness(
         "boundary": "selected artifact/report currentness only; no broad release/readiness inference",
     }
     return {"ask_answer": answer}
+
+
+def _artifact_currentness_companion_status_proof(
+    packet: dict,
+    *,
+    query_ids: set[str],
+    verdict: str,
+) -> tuple[dict | None, str]:
+    """Return one consistent status claim from exact same-ID companion artifacts."""
+    if not query_ids:
+        return None, "not_applicable"
+    claims: list[dict] = []
+    for candidate in packet.get("artifact_candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        identity = " ".join(str(candidate.get(field) or "") for field in ("title", "path", "source_ref"))
+        if not query_ids <= _artifact_currentness_named_ids(identity):
+            continue
+        for field in candidate.get("status_fields") or []:
+            if not isinstance(field, dict) or str(field.get("name") or "").casefold() not in {
+                "issue state",
+                "state",
+                "status",
+                "ticket state",
+                "workflow state",
+            }:
+                continue
+            if not field.get("source_ref") or not field.get("value"):
+                continue
+            claims.append(
+                {
+                    "evidence_type": "same_target_companion_status_field",
+                    "relationship": "exact_same_identifier_companion_status",
+                    "source_ref": field["source_ref"],
+                    "snippet": field.get("raw") or f"{field.get('name')}: {field['value']}",
+                    "status_value": str(field["value"]),
+                    "companion_path": candidate.get("path"),
+                }
+            )
+    normalized_values = {re.sub(r"\s+", " ", claim["status_value"].strip().casefold()) for claim in claims}
+    if not claims:
+        return None, "same_target_status_missing"
+    if len(normalized_values) != 1:
+        return None, "same_target_status_conflicting"
+    status_value = next(iter(normalized_values))
+    terminal = any(marker in status_value for marker in ("closed", "complete", "done", "merged", "resolved", "superseded"))
+    active = any(marker in status_value for marker in ("active", "in progress", "open", "selected"))
+    if (verdict == "superseded" and not terminal) or (verdict == "current" and not active):
+        return None, "same_target_status_conflicting_with_verdict"
+    return claims[0], "same_target_status_consistent_with_verdict"
 
 
 def _ask_answer_worktree_cleanup_currentness(
