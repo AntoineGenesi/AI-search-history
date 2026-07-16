@@ -80,7 +80,7 @@ def build_repo_source_no_evidence_payload(
             text = raw.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
             column = line.find(needle)
-            if column < 0 or _question_echo_match(line, needle, column):
+            if column < 0 or _question_echo_match(line, column):
                 continue
             matches.append(
                 {
@@ -300,10 +300,9 @@ def _snippet(line: str, needle: str) -> str:
     return prefix + line[start:end].strip() + suffix
 
 
-def _question_echo_match(line: str, needle: str, column: int) -> bool:
+def _question_echo_match(line: str, column: int) -> bool:
     prefix = line[:column].casefold()
-    suffix = line[column + len(needle) :]
-    return "is there evidence that" in prefix and "?" in suffix
+    return "is there evidence that" in prefix
 
 
 def _safe_relative(cwd: Path, path: Path) -> str:
