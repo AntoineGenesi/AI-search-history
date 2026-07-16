@@ -1978,32 +1978,52 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         report_output=report_output,
         query=route.get("structured_execution_query") or args.query,
     )
-    if execution_kind == "artifact-currentness":
-        executed_payload = _build_artifact_currentness_report_output_payload(execution_args)
-        output_key = "artifact_currentness"
-    elif execution_kind == "what-happened-since":
-        executed_payload = _build_status_anchor_report_output_payload(execution_args)
-        output_key = "status_anchor"
-    elif execution_kind == "semantic-debug":
-        executed_payload = _build_semantic_debug_report_output_payload(execution_args)
-        output_key = "semantic_debug"
-    elif execution_kind == "no-evidence-report":
-        executed_payload = _build_repo_source_no_evidence_report_output_payload(execution_args)
-        if executed_payload is not None:
-            output_key = "repo_source_no_evidence"
-            execution_kind = "repo-source-no-evidence"
+    try:
+        Path(report_output).parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _ask_execute_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+            fallback_command=selected_route.get("first_command"),
+        )
+
+    try:
+        if execution_kind == "artifact-currentness":
+            executed_payload = _build_artifact_currentness_report_output_payload(execution_args)
+            output_key = "artifact_currentness"
+        elif execution_kind == "what-happened-since":
+            executed_payload = _build_status_anchor_report_output_payload(execution_args)
+            output_key = "status_anchor"
+        elif execution_kind == "semantic-debug":
+            executed_payload = _build_semantic_debug_report_output_payload(execution_args)
+            output_key = "semantic_debug"
+        elif execution_kind == "no-evidence-report":
+            executed_payload = _build_repo_source_no_evidence_report_output_payload(execution_args)
+            if executed_payload is not None:
+                output_key = "repo_source_no_evidence"
+                execution_kind = "repo-source-no-evidence"
+            else:
+                executed_payload = _build_agent_find_report_output_payload(execution_args)
+                output_key = "agent_find"
+        elif execution_kind == "coordinator-context":
+            executed_payload = _build_coordinator_context_report_output_payload(execution_args)
+            output_key = "coordinator_context"
+        elif execution_kind == "semantic-wrapup":
+            executed_payload = _build_semantic_wrapup_report_output_payload(execution_args)
+            output_key = "semantic_wrapup"
         else:
-            executed_payload = _build_agent_find_report_output_payload(execution_args)
-            output_key = "agent_find"
-    elif execution_kind == "coordinator-context":
-        executed_payload = _build_coordinator_context_report_output_payload(execution_args)
-        output_key = "coordinator_context"
-    elif execution_kind == "semantic-wrapup":
-        executed_payload = _build_semantic_wrapup_report_output_payload(execution_args)
-        output_key = "semantic_wrapup"
-    else:
-        executed_payload = _build_devlog_failure_analysis_report_output_payload(execution_args)
-        output_key = "devlog_failure_analysis"
+            executed_payload = _build_devlog_failure_analysis_report_output_payload(execution_args)
+            output_key = "devlog_failure_analysis"
+    except OSError as exc:
+        if not _ask_execute_report_output_error(exc, report_output):
+            raise
+        return _ask_execute_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+            fallback_command=selected_route.get("first_command"),
+        )
 
     compact = executed_payload[output_key]
     argv = _structured_execution_argv(execution_args)
@@ -2046,8 +2066,52 @@ def _ask_execute_report_output(args: argparse.Namespace, execution_kind: str) ->
         path = Path(args.report_output).expanduser()
     else:
         path = Path(args.cwd).expanduser().resolve() / ".private" / "jsonl" / f"ask-execute-{execution_kind}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+def _ask_execute_report_output_unavailable(
+    contract: dict,
+    *,
+    execution_kind: str,
+    report_output: str,
+    fallback_command: str | None,
+) -> dict:
+    contract["ask_execute"]["execution"].update(
+        {
+            "status": "report_output_unavailable",
+            "command_family": execution_kind,
+            "argv": [],
+            "report_output": report_output,
+            "report_written": None,
+            "fallback_command": fallback_command,
+            "reason": (
+                "The report destination is not writable. No report handle is available; "
+                "run the selected first command directly."
+            ),
+        }
+    )
+    contract["ask_execute"]["execution_status"] = "report_output_unavailable"
+    contract["ask_execute"]["answer_action_contract"]["promotion_status"] = (
+        "route_only_report_output_unavailable"
+    )
+    return contract
+
+
+def _ask_execute_report_output_error(exc: OSError, report_output: str) -> bool:
+    if not exc.filename:
+        return False
+
+    report_path = _absolute_ask_execute_path(Path(report_output).expanduser())
+    failed_path = _absolute_ask_execute_path(Path(exc.filename).expanduser())
+    if failed_path in {report_path, report_path.parent}:
+        return True
+    return failed_path.parent == report_path.parent and failed_path.name.startswith(
+        f"{report_path.stem}."
+    )
+
+
+def _absolute_ask_execute_path(path: Path) -> Path:
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def _execution_args_from_ask(
