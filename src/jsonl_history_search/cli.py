@@ -2236,6 +2236,26 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         semantic_packet,
         query=args.query,
     )
+    retained_reports = _discover_devlog_retained_primary_reports(
+        Path(args.cwd).expanduser().resolve()
+    )
+    retained_target_reads, retained_diagnostic_reads = _load_devlog_retained_primary_reads(
+        retained_reports,
+        cwd=Path(args.cwd).expanduser().resolve(),
+        query=args.query,
+    )
+    seen_target_reads = {str(read.get("target") or "") for read in target_reads}
+    for read in retained_target_reads:
+        target = str(read.get("target") or "")
+        if target and target not in seen_target_reads:
+            target_reads.append(read)
+            seen_target_reads.add(target)
+    seen_diagnostic_reads = {str(read.get("target") or "") for read in diagnostic_reads}
+    for read in retained_diagnostic_reads:
+        target = str(read.get("target") or "")
+        if target and target not in seen_target_reads and target not in seen_diagnostic_reads:
+            diagnostic_reads.append(read)
+            seen_diagnostic_reads.add(target)
     if not target_reads:
         target_reads = _devlog_committed_safe_packet_fallback_reads(
             repo_artifact_payload["repo_artifact_evidence"],
@@ -2259,6 +2279,7 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
     chronology_source_reach = _build_devlog_chronology_source_reach(
         cwd=Path(args.cwd).expanduser().resolve(),
         target_reads=target_reads,
+        retained_reports=retained_reports,
     )
     compact = {
         "schema_version": 1,
@@ -2403,9 +2424,34 @@ DEVLOG_CHRONOLOGY_ARTIFACT_KEYWORDS = (
     "graveyard",
     "pressure",
 )
+DEVLOG_RETAINED_SEMANTIC_REPORT_RE = re.compile(
+    r"(?P<path>\.private/[A-Za-z0-9_+./-]+/semantic-debug\.json)"
+)
+DEVLOG_PRIMARY_RECOVERY_REPORT_DIR = ".private/jsonl/devlog-chronology"
+DEVLOG_PRIMARY_RECOVERY_QUERIES = {
+    "first_appearance": (
+        "Find the earliest primary raw user or assistant source window from "
+        "2026-04-13T16:00:48Z through 2026-04-17T12:27:59Z that shows where the "
+        "early JSON-search-history coordinator workflow failure first appeared. "
+        "Exclude tasks, reports, reviews, current-run output, prompt echoes, and synthetic fixtures."
+    ),
+    "worsening_process_cause": (
+        "Find primary raw user or assistant source windows from 2026-04-13T16:00:48Z "
+        "through 2026-04-17T12:27:59Z that show Docker, runner, harness, auth, live-send, "
+        "process edits, token waste, or process work making the early JSON-search-history "
+        "coordinator failure worse. Exclude tasks, reports, reviews, current-run output, "
+        "prompt echoes, and synthetic fixtures."
+    ),
+}
+DEVLOG_LATER_CHANGE_GIT_PATH = "docs/harness-graveyard-and-product-path-correction.md"
 
 
-def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]) -> dict:
+def _build_devlog_chronology_source_reach(
+    *,
+    cwd: Path,
+    target_reads: list[dict],
+    retained_reports: list[dict] | None = None,
+) -> dict:
     primary_by_role = {role: [] for role in DEVLOG_CHRONOLOGY_ROLE_ORDER}
     for read in target_reads:
         if not isinstance(read, dict) or read.get("target_source_role") != "target_historical_raw":
@@ -2420,6 +2466,11 @@ def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]
         artifact_by_role[lead["role"]].append(lead)
 
     missing_roles = [role for role in DEVLOG_CHRONOLOGY_ROLE_ORDER if not primary_by_role[role]]
+    retained_reports = list(retained_reports or [])
+    primary_recovery_reads = {
+        role: _devlog_primary_recovery_reads(role, retained_reports=retained_reports)
+        for role in missing_roles
+    }
     copyable_next_reads = []
     for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
         primary_reads = primary_by_role[role]
@@ -2436,19 +2487,7 @@ def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]
                         }
                     )
             continue
-        for lead in artifact_by_role[role][:2]:
-            copyable_next_reads.append(
-                {
-                    "role": role,
-                    "kind": "bounded_artifact_lead",
-                    "command": lead["command"],
-                    "target": lead["target"],
-                    "purpose": (
-                        f"Open the bounded {role} lead, then follow only its cited historical source refs. "
-                        "This artifact is not primary chronology proof."
-                    ),
-                }
-            )
+        copyable_next_reads.extend(primary_recovery_reads[role][:2])
 
     answer_allowed = not missing_roles
     return {
@@ -2463,6 +2502,8 @@ def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]
         "covered_primary_roles": [role for role in DEVLOG_CHRONOLOGY_ROLE_ORDER if primary_by_role[role]],
         "missing_roles": missing_roles,
         "primary_role_reads": primary_by_role,
+        "primary_recovery_reads": primary_recovery_reads,
+        "retained_primary_report_handles": retained_reports,
         "artifact_role_leads": artifact_by_role,
         "dedicated_case_lead": next(
             (lead for lead in artifact_leads if lead.get("path") == DEVLOG_DEDICATED_CASE_PATH),
@@ -2471,13 +2512,147 @@ def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]
         "copyable_next_reads": copyable_next_reads[:6],
         "stop_condition": (
             "Answer only after primary historical reads cover first appearance, worsening process cause, "
-            "and later change. Artifact leads bound the next inspection but do not satisfy a missing primary role."
+            "and later change. Run role-bound primary recovery before consulting secondary artifact leads; "
+            "artifact leads do not satisfy a missing primary role."
         ),
         "claim_boundary": (
             "This package locates first reads. It does not generate devlog prose, prove all-history "
             "completeness, or promote current-run, synthetic, task-assignment, or post-hoc answer artifacts."
         ),
     }
+
+
+def _discover_devlog_retained_primary_reports(cwd: Path) -> list[dict]:
+    reports = []
+    seen = set()
+    for source_artifact in _iter_devlog_chronology_artifact_paths(cwd):
+        path = cwd / source_artifact
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        normalized = text.casefold()
+        if "early coordinator" not in normalized and "first long-running coordinator" not in normalized:
+            continue
+        for match in DEVLOG_RETAINED_SEMANTIC_REPORT_RE.finditer(text):
+            relative_path = match.group("path")
+            if relative_path in seen:
+                continue
+            seen.add(relative_path)
+            reports.append(
+                {
+                    "kind": "retained_primary_semantic_debug_report",
+                    "safe_handle": f"private:{relative_path[len('.private/'):]}",
+                    "relative_path": relative_path,
+                    "source_artifact": source_artifact,
+                    "available": (cwd / relative_path).is_file(),
+                    "source_tier": "primary_recovery_handle",
+                    "raw_text_included": False,
+                }
+            )
+    reports.sort(
+        key=lambda row: (
+            not row["available"],
+            -_devlog_chronology_path_priority(row["source_artifact"]),
+            row["relative_path"],
+        )
+    )
+    return reports[:6]
+
+
+def _load_devlog_retained_primary_reads(
+    retained_reports: list[dict],
+    *,
+    cwd: Path,
+    query: str,
+) -> tuple[list[dict], list[dict]]:
+    target_reads = []
+    diagnostic_reads = []
+    for report in retained_reports:
+        if not report.get("available"):
+            continue
+        try:
+            payload = json.loads((cwd / report["relative_path"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        packet = payload.get("semantic_debug") if isinstance(payload, dict) else None
+        if not isinstance(packet, dict):
+            continue
+        report_targets, report_diagnostics = _partition_devlog_source_window_reads(
+            packet,
+            query=query,
+        )
+        provenance = {
+            "retained_primary_report_handle": report["safe_handle"],
+            "retained_report_source_artifact": report["source_artifact"],
+            "retained_report_recovery": True,
+        }
+        target_reads.extend({**read, **provenance} for read in report_targets)
+        diagnostic_reads.extend({**read, **provenance} for read in report_diagnostics)
+    return target_reads[:12], diagnostic_reads[:12]
+
+
+def _devlog_primary_recovery_reads(role: str, *, retained_reports: list[dict]) -> list[dict]:
+    if role == "later_change":
+        path = DEVLOG_LATER_CHANGE_GIT_PATH
+        return [
+            {
+                "role": role,
+                "kind": "primary_git_history_recovery",
+                "source_handle": f"git:path:{path}",
+                "command": (
+                    f'commit="$(git log --follow --diff-filter=A --format=\'%H\' -- "{path}" | tail -n 1)"; '
+                    f'test -n "$commit" && git show --format=fuller --stat "$commit" -- "{path}"'
+                ),
+                "purpose": (
+                    "Open the introducing commit for the later product-path transition as bounded git proof."
+                ),
+            }
+        ]
+
+    query = DEVLOG_PRIMARY_RECOVERY_QUERIES[role]
+    report_path = f"{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}/{role}-semantic-debug.json"
+    search_command = (
+        f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}" && '
+        f"jsonl-history-search semantic-debug {shlex.quote(query)} --cwd \"$PWD\" "
+        "--max-files 200 --max-bytes 100000000 --max-matches 40 --max-elapsed 20 "
+        "--timezone-offset +10:00 --watchlist process_drift "
+        "--watchlist docker_harness_auth_live_send --watchlist product_vs_process_churn "
+        f'--report-output "$PWD/{report_path}" --format text && '
+        "jsonl-history-search follow-next-reads "
+        f'--from-report "$PWD/{report_path}" --kind recovery --limit 5 --format text'
+    )
+    retained = retained_reports[0] if retained_reports else None
+    if retained:
+        retained_path = retained["relative_path"]
+        command = (
+            f'if test -f "$PWD/{retained_path}"; then '
+            "jsonl-history-search follow-next-reads "
+            f'--from-report "$PWD/{retained_path}" --kind recovery --limit 5 --format text; '
+            f"fi; {search_command}"
+        )
+        source_handle = retained["safe_handle"]
+    else:
+        command = search_command
+        source_handle = f"private:{report_path[len('.private/') :]}"
+    return [
+        {
+            "role": role,
+            "kind": "primary_raw_history_recovery",
+            "source_handle": source_handle,
+            "recovery_output_handle": f"private:{report_path[len('.private/') :]}",
+            "historical_window_utc": {
+                "start": "2026-04-13T16:00:48Z",
+                "end": "2026-04-17T12:27:59Z",
+            },
+            "source_scope": ["codex_sessions", "codex_history", "claude_project_logs"],
+            "command": command,
+            "purpose": (
+                f"Recover bounded primary user/assistant source refs for {role}; "
+                "current-run, synthetic, task-assignment, and post-hoc artifacts remain non-answering."
+            ),
+        }
+    ]
 
 
 def _compact_devlog_chronology_primary_read(read: dict) -> dict:
