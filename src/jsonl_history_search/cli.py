@@ -1981,6 +1981,13 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     try:
         Path(report_output).parent.mkdir(parents=True, exist_ok=True)
     except OSError:
+        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
+            return _run_worktree_cleanup_execute_without_report(
+                contract,
+                execution_args=execution_args,
+                report_output=report_output,
+                cwd=Path(cwd),
+            )
         return _ask_execute_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
@@ -2018,6 +2025,13 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     except OSError as exc:
         if not _ask_execute_report_output_error(exc, report_output):
             raise
+        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
+            return _run_worktree_cleanup_execute_without_report(
+                contract,
+                execution_args=execution_args,
+                report_output=report_output,
+                cwd=Path(cwd),
+            )
         return _ask_execute_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
@@ -2058,7 +2072,123 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         query=args.query,
         cwd=cwd,
     )
+    if (
+        output_key == "artifact_currentness"
+        and compact.get("detected_intent") == "worktree_cleanup_currentness"
+        and (compact.get("worktree_currentness") or {})
+        .get("cleanup_causality", {})
+        .get("is_cleanup_causality_query")
+        and _is_answer_ready_worktree_cleanup_execute(args, execution_kind)
+    ):
+        _attach_worktree_cleanup_answer_handoff(contract, cwd=Path(cwd))
     return contract
+
+
+def _is_answer_ready_worktree_cleanup_execute(args: argparse.Namespace, execution_kind: str) -> bool:
+    if execution_kind != "artifact-currentness":
+        return False
+
+    return _is_answer_ready_worktree_cleanup_query(
+        str(getattr(args, "query", "") or "")
+    )
+
+
+def _is_answer_ready_worktree_cleanup_query(query: str) -> bool:
+    from .worktree_currentness import is_answer_ready_worktree_cleanup_causality_query
+
+    return is_answer_ready_worktree_cleanup_causality_query(query)
+
+
+def _run_worktree_cleanup_execute_without_report(
+    contract: dict,
+    *,
+    execution_args: argparse.Namespace,
+    report_output: str,
+    cwd: Path,
+) -> dict:
+    """Preserve the validated cleanup handoff when only report writing fails."""
+    from .artifact_currentness import build_artifact_currentness_payload
+
+    compact = build_artifact_currentness_payload(execution_args)["artifact_currentness"]
+    compact["report_written"] = None
+    ask_execute = contract["ask_execute"]
+    ask_execute["execution"].update(
+        {
+            "status": "executed",
+            "command_family": "artifact-currentness",
+            "argv": _structured_execution_argv(execution_args),
+            "report_written": None,
+            "report_output": report_output,
+            "report_output_status": "unavailable",
+            "output_key": "artifact_currentness",
+            "reason": (
+                "The optional report destination is not writable; exact cleanup causality "
+                "was finalized from the bounded in-memory packet."
+            ),
+        }
+    )
+    ask_execute["execution_status"] = "executed"
+    ask_execute["executed_output"] = _compact_executed_output_for_ask(
+        output_key="artifact_currentness",
+        compact=compact,
+    )
+    ask_execute["answer_action_contract"] = _answer_action_contract_from_executed_output(
+        output_key="artifact_currentness",
+        compact=compact,
+        selected_route=ask_execute["selected_route"],
+        query=str(getattr(execution_args, "query", "") or ""),
+        cwd=str(cwd),
+    )
+    _attach_worktree_cleanup_answer_handoff(contract, cwd=cwd)
+    return contract
+
+
+def _attach_worktree_cleanup_answer_handoff(contract: dict, *, cwd: Path) -> None:
+    """Finalize validated cleanup causality inside the execute handoff."""
+    finalized = _ask_answer_from_execute(contract, cwd=cwd).get("ask_answer") or {}
+    ask_execute = contract["ask_execute"]
+    ask_execute["answer_handoff"] = {
+        key: finalized.get(key)
+        for key in (
+            "schema_version",
+            "query",
+            "cwd",
+            "answer_status",
+            "answer",
+            "refs_used",
+            "proof_summary",
+            "fail_closed_reason",
+            "next_proof_step",
+            "source_contract",
+        )
+    }
+    ask_execute["answer_handoff"]["receiving_agent_command_contract"] = {
+        "additional_commands_required": (
+            0 if finalized.get("answer_status") == "answered-from-proof" else None
+        ),
+        "source_validation": "completed_in_process",
+        "continue_only_on_fail_closed": True,
+    }
+    if finalized.get("answer_status") != "answered-from-proof":
+        return
+    action = ask_execute["answer_action_contract"]
+    action["answer_status"] = "answered-from-proof"
+    action["promotion_reason"] = (
+        "The cleanup route opened and validated the bounded repo-local operational refs; "
+        "the receiving agent can use answer_handoff directly without another command."
+    )
+    action["validated_read"] = action.get("read") or []
+    action["read"] = []
+    action["stop"] = (
+        "Stop after answer_handoff when answer_status is answered-from-proof; no source reread, "
+        "artifact-currentness rerun, broad search, or cleanup action is needed."
+    )
+    action["only_continue_if"] = (
+        "Continue only if answer_handoff is absent, fail-closed, or explicitly reports rejected refs."
+    )
+    handoff_contract = ask_execute["answer_handoff"].get("source_contract") or {}
+    handoff_contract["built_from"] = "ask_execute.validated_cleanup_answer_handoff"
+    handoff_contract["answer_action_status"] = "answered-from-proof"
 
 
 def _ask_execute_report_output(args: argparse.Namespace, execution_kind: str) -> str:
@@ -4259,6 +4389,34 @@ _ASK_EXECUTE_TASK_ID_MONTH_PREFIXES = {
 }
 
 
+def _cleanup_answer_operational_records(records: list[dict]) -> list[dict]:
+    """Keep one bounded answer-leading ref for each cleanup-causality role."""
+    selected: list[dict] = []
+    relationship_groups = (
+        {
+            "report_only_preserve_then_remove_candidates",
+            "report_only_preserve_then_remove",
+            "report_only_preserve_then_prune",
+            "report_only_cleanup_audit",
+        },
+        {"handoff_deferred_cleanup"},
+        {"cleanup_execution_report"},
+        {"private_retention_record"},
+    )
+    for relationships in relationship_groups:
+        match = next(
+            (
+                item
+                for item in records
+                if isinstance(item, dict) and item.get("relationship") in relationships
+            ),
+            None,
+        )
+        if match is not None:
+            selected.append(match)
+    return selected
+
+
 def _answer_action_contract_from_executed_output(
     *,
     output_key: str,
@@ -4270,7 +4428,9 @@ def _answer_action_contract_from_executed_output(
     if output_key == "artifact_currentness":
         worktree = compact.get("worktree_currentness") or {}
         cleanup = worktree.get("cleanup_causality") or {}
-        operational_records = list(cleanup.get("operational_records") or [])[:8]
+        operational_records = _cleanup_answer_operational_records(
+            cleanup.get("operational_records") or []
+        )
         next_reads = list(compact.get("next_reads") or [])[:8]
         return {
             "answer_status": (
@@ -7266,7 +7426,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "cleanup_causality": {
                 "debt_status": cleanup.get("debt_status"),
                 "causal_summary": cleanup.get("causal_summary"),
-                "operational_records": (cleanup.get("operational_records") or [])[:8],
+                "operational_records": _cleanup_answer_operational_records(
+                    cleanup.get("operational_records") or []
+                ),
                 "git_state": cleanup.get("git_state"),
                 "physical_worktree_count": cleanup.get("physical_worktree_count"),
                 "target_selection_note": cleanup.get("target_selection_note"),
@@ -7278,10 +7440,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "blind_spots": (compact.get("blind_spots") or [])[:5],
             "boundary": worktree.get("boundary"),
             "report_written": compact.get("report_written"),
-            "message": (
-                "Artifact-currentness executed. Inspect cleanup causality operational records first; "
-                "stop when debt status and source refs sufficiently explain the cleanup state."
-            ),
+            "message": "Artifact-currentness executed with a bounded cleanup-causality handoff.",
         }
     if output_key == "status_anchor":
         return {
@@ -7662,6 +7821,36 @@ def _ask_answer_artifact_currentness(
 ) -> dict | None:
     """Finalize artifact/topic currentness and source-backed cleanup causality."""
     execution = report.get("execution") if isinstance(report.get("execution"), dict) else {}
+    query = str(report.get("query") or "")
+    executed_output = (
+        report.get("executed_output")
+        if isinstance(report.get("executed_output"), dict)
+        else {}
+    )
+    if executed_output.get("detected_intent") == "worktree_cleanup_currentness":
+        if not _is_answer_ready_worktree_cleanup_query(query):
+            return _ask_answer_fail_closed(
+                answer,
+                "worktree cleanup direct answer is scoped to the exact generic cleanup prompt",
+                {
+                    "required_next_proof": (
+                        "target-specific cleanup evidence and a decisive target classification"
+                    ),
+                    "searched_scope": "route-only artifact-currentness evidence",
+                },
+            )
+        packet = {
+            "detected_intent": "worktree_cleanup_currentness",
+            "worktree_currentness": {
+                "cleanup_causality": executed_output.get("cleanup_causality") or {},
+            },
+        }
+        return _ask_answer_worktree_cleanup_currentness(
+            answer,
+            packet=packet,
+            action=action,
+            cwd=cwd,
+        )
     report_path = Path(str(execution.get("report_written") or action.get("saved_report") or "")).expanduser()
     if not report_path.is_absolute():
         report_path = cwd / report_path
@@ -7679,6 +7868,17 @@ def _ask_answer_artifact_currentness(
         )
     packet = saved.get("artifact_currentness") if isinstance(saved, dict) else {}
     if isinstance(packet, dict) and packet.get("detected_intent") == "worktree_cleanup_currentness":
+        if not _is_answer_ready_worktree_cleanup_query(query):
+            return _ask_answer_fail_closed(
+                answer,
+                "worktree cleanup direct answer is scoped to the exact generic cleanup prompt",
+                {
+                    "required_next_proof": (
+                        "target-specific cleanup evidence and a decisive target classification"
+                    ),
+                    "searched_scope": "route-only artifact-currentness evidence",
+                },
+            )
         return _ask_answer_worktree_cleanup_currentness(
             answer,
             packet=packet,
@@ -7687,7 +7887,6 @@ def _ask_answer_artifact_currentness(
         )
     if not isinstance(packet, dict) or packet.get("detected_intent") != "natural_direction_currentness":
         return None
-    query = str(report.get("query") or "")
     selected = packet.get("selected_artifact_or_topic") if isinstance(packet.get("selected_artifact_or_topic"), dict) else {}
     query_ids = _artifact_currentness_named_ids(query)
     selected_identity = " ".join(
@@ -8015,8 +8214,10 @@ def _ask_answer_worktree_cleanup_currentness(
         )
     answer["answer_status"] = "answered-from-proof"
     answer["answer"] = (
-        f"{causal_summary} The earlier records show report-only or preserve-then-remove history and "
-        "later handoffs left pre-existing worktrees unaudited; the cleanup execution report closes that debt. "
+        "The worktrees did not clean themselves up because the audit stopped at a report-only "
+        "preserve-then-remove classification: private evidence still had to be retained, and later "
+        "handoffs left the pre-existing worktrees unaudited instead of completing that lifecycle step. "
+        f"{causal_summary} "
         "This is a read-only causality answer and does not authorize or perform cleanup actions."
     )
     answer["refs_used"] = [_ref_public_summary(item) for item in usable]
@@ -8051,6 +8252,24 @@ def _ask_answer_from_execute(
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
     route_family = str(route.get("route_family") or "")
+    handoff = report.get("answer_handoff")
+    if (
+        route_family == "artifact_currentness"
+        and execution.get("status") == "executed"
+        and isinstance(handoff, dict)
+        and handoff.get("answer_status") == "answered-from-proof"
+        and (handoff.get("source_contract") or {})
+        .get("worktree_cleanup_answer_gate", {})
+        .get("status")
+        == "answer_allowed"
+    ):
+        return {
+            "ask_answer": {
+                **handoff,
+                "selected_route": route,
+                "execution": execution,
+            }
+        }
     base = {
         "ask_answer": {
             "schema_version": "ask_answer_proof_followthrough.v1",

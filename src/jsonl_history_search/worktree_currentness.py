@@ -66,6 +66,9 @@ CLEANUP_CAUSAL_WORDS = (
     "not cleaned",
     "not clean",
 )
+ANSWER_READY_CLEANUP_QUERY = (
+    "why did the JSON-search-history worktrees not clean themselves up"
+)
 
 EVIDENCE_ROOTS = (
     "codex/state",
@@ -83,6 +86,15 @@ EVIDENCE_FILES = ("TODO.md", "TASKS.md", "PROJECT.md", "CODEX-ORCHESTRATION.md",
 def is_worktree_cleanup_currentness_query(query: str) -> bool:
     normalized = _normalize(query)
     return any(word in normalized for word in WORKTREE_WORDS) and any(word in normalized for word in CLEANUP_WORDS)
+
+
+def is_worktree_cleanup_causality_query(query: str) -> bool:
+    return _is_cleanup_causality_query(query)
+
+
+def is_answer_ready_worktree_cleanup_causality_query(query: str) -> bool:
+    normalized = _normalize(query).rstrip(".?!")
+    return normalized == _normalize(ANSWER_READY_CLEANUP_QUERY)
 
 
 def build_worktree_currentness_report(query: str, cwd: Path) -> dict:

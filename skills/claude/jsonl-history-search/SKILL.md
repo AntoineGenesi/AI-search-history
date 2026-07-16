@@ -49,7 +49,10 @@ filesystem inspection. For local artifact/task-file prompts such as
 The product contract is agent-assist retrieval: find useful information in
 large, messy JSONL histories, show where it was found, and give the receiving
 agent enough next commands/source refs to inspect deeper and answer. The CLI
-output is not the final answer by itself.
+output is not the final answer by itself for general routes. The exact
+worktree-cleanup causality route is the narrow exception: when `ask --execute` returns an
+`answer_handoff` with `answer_status: answered-from-proof`, use that answer and
+its validated refs directly and stop without another command.
 
 JSONL is a direct local conversation-history tool; JSON fields and reports are
 implementation surfaces, not the product itself.
@@ -100,6 +103,20 @@ directory when that package source exists. This is source-mode recovery, not
 proof that the global console command is installed. If neither path is
 executable, report the installed/source parity gap instead of fumbling through
 unrelated commands.
+
+For `why did the JSON-search-history worktrees not clean themselves up?`, the
+resolution block above is the only domain command needed when its cleanup
+`answer_handoff` is `answered-from-proof`. The tool has already opened and
+validated the bounded repo-local refs. Do not read a route reference, rerun
+`artifact-currentness`, reopen those refs, inspect worktrees, or search broadly;
+answer from the handoff and stop. A missing or fail-closed handoff does not
+authorize cleanup or destructive recovery.
+
+This exact cleanup fast path is fully specified in this first skill section.
+When that is the user's prompt, do not read the remainder of `SKILL.md` after
+this section: run the resolution block, use a validated answer handoff, and
+stop. The expected trajectory is one skill-read command plus one execute
+command, with no external source-read command.
 
 The installed `jsonl_ask_first.py` launcher is the bounded-aware ask-first
 helper. It wraps the canonical `jsonl-history-search ask` command with
@@ -222,7 +239,7 @@ chooses the route family, explains why, prints the exact first command to run,
 names the one specialization/reference to read, says what output fields/source
 refs to inspect after, and gives the stop condition for manual search.
 
-The `ask --execute` output is still not a final answer by itself, but for
+The `ask --execute` output is still not normally a final answer by itself, but for
 allow-listed semantic-debug and bounded no-evidence routes it does run the
 selected JSONL route and returns one compact contract with selected route
 metadata, execution status, compact executed output, promotion status,
@@ -230,6 +247,9 @@ answer/read/stop guidance, and a saved report handle for drill-down. Treat
 semantic-debug `ask --execute` results as unpromoted inspect-before-answer
 handoffs even when the saved full report contains internal answer-readiness
 fields.
+The exact worktree-cleanup causality route is the exception described above:
+its `answered-from-proof` handoff contains internally validated source refs and
+is final-answer-ready without external source rereads.
 
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
@@ -331,7 +351,9 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - Artifact/currentness is for stale/current/superseded direction questions,
   local/exported ticket currentness questions, and worktree cleanup/currentness
   questions, not for every repeated-topic question.
-- For worktree cleanup/currentness, use the `ask` route and the returned
+- For worktree cleanup/currentness, use the `ask` route. For the exact cleanup
+  causality prompt, stop on the validated `answered-from-proof` handoff; for
+  removal/currentness decisions, inspect the returned
   `artifact_currentness.worktree_currentness` classifications before shallow
   `git status` conclusions. Preserve worktree-local `.private` evidence under
   parent `.private/worktree-cleanup-archive/<slug>/` before physical worktree
