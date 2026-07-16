@@ -1871,7 +1871,7 @@ def _render_worktree_cleanup_causality_text(report: dict) -> str:
     else:
         lines.append("Worktree classifications: none selected; operational records are the main answer.")
     if cleanup.get("target_selection_note"):
-        lines.append("Target selection: unnamed causality question; current checkout is not selected as the cause.")
+        lines.append(f"Target selection: {cleanup.get('target_selection_note')}")
     if worktree.get("boundary"):
         lines.append("Boundary: no cleanup execution here; no branch deletion/pruning unless explicitly asked.")
     return "\n".join(lines)
@@ -1904,7 +1904,7 @@ def _render_worktree_cleanup_causality_markdown(report: dict) -> str:
     else:
         lines.append("- No specific physical target selected; operational records are the main answer.")
     if cleanup.get("target_selection_note"):
-        lines.extend(["", "**Target selection:** unnamed causality question; current checkout is not selected as the cause."])
+        lines.extend(["", f"**Target selection:** {cleanup.get('target_selection_note')}"])
     if worktree.get("boundary"):
         lines.extend(["", "**Boundary:** no cleanup execution here; no branch deletion/pruning unless explicitly asked."])
     return "\n".join(lines)

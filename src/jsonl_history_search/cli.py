@@ -4432,6 +4432,30 @@ def _answer_action_contract_from_executed_output(
             cleanup.get("operational_records") or []
         )
         next_reads = list(compact.get("next_reads") or [])[:8]
+        target_binding = cleanup.get("target_binding") or {}
+        if target_binding:
+            return {
+                "answer_status": "not-ready/needs-more-proof",
+                "promotion_status": target_binding.get("status"),
+                "promotion_reason": (
+                    "Named cleanup target identity is preserved. Generic cleanup causality is "
+                    "withheld until target-specific evidence supports a decisive classification."
+                ),
+                "read": next_reads,
+                "then_use": {
+                    "target_binding": target_binding,
+                    "worktree_classifications": (worktree.get("classifications") or [])[:8],
+                },
+                "diagnostics_after": [],
+                "source_role_order": worktree.get("source_role_order"),
+                "source_roles_present": worktree.get("source_roles_present"),
+                "stop": (
+                    "Stop without a cleanup-causality answer when the named target is missing "
+                    "or target-specific evidence remains inconclusive."
+                ),
+                "only_continue_if": target_binding.get("required_next_proof"),
+                "saved_report": compact.get("report_written"),
+            }
         return {
             "answer_status": (
                 "answer-ready-after-source-inspection"
@@ -7432,6 +7456,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "git_state": cleanup.get("git_state"),
                 "physical_worktree_count": cleanup.get("physical_worktree_count"),
                 "target_selection_note": cleanup.get("target_selection_note"),
+                "target_binding": cleanup.get("target_binding"),
             },
             "source_role_order": worktree.get("source_role_order"),
             "source_roles_present": worktree.get("source_roles_present"),

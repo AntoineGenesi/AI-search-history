@@ -20,6 +20,50 @@ CLASSIFICATIONS = (
 ID_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+[A-Z0-9]*)\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w./-])((?:worktrees|task|tasks|tickets|issues|branches)/[A-Za-z0-9._/-]+)")
 BRANCH_RE = re.compile(r"(?<![\w./-])((?:task|feature|bugfix|fix|branches)/[A-Za-z0-9._/-]+)")
+LABELED_TARGET_RE = re.compile(
+    r"\b(?P<kind>branch|task)\b(?:\s*[:=]\s*|\s+)"
+    r"(?:(?:named|called)\b(?:\s*[:=]\s*|\s+))?"
+    r"(?P<quote>[\"'`]?)"
+    r"(?P<value>[A-Za-z0-9][A-Za-z0-9._/-]{0,127})"
+    r"(?P=quote)(?=$|[\s,;:!?)}\]])",
+    re.IGNORECASE,
+)
+LABELED_TARGET_STOPWORDS = {
+    "branch",
+    "branches",
+    "behind",
+    "cleanup",
+    "cleaned",
+    "current",
+    "deletion",
+    "did",
+    "is",
+    "left",
+    "not",
+    "obsolete",
+    "old",
+    "over",
+    "prune",
+    "pruned",
+    "pruning",
+    "ref",
+    "refs",
+    "reference",
+    "references",
+    "remove",
+    "removed",
+    "safe",
+    "stale",
+    "still",
+    "task",
+    "that",
+    "the",
+    "this",
+    "was",
+    "were",
+    "worktree",
+    "worktrees",
+}
 
 WORKTREE_WORDS = (
     "worktree",
@@ -101,7 +145,13 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
     named = extract_named_worktree_targets(query)
     worktrees = _discover_worktrees(cwd)
     evidence_files = _discover_evidence_files(cwd)
-    cleanup_causality = _cleanup_causality_report(query, cwd, evidence_files, worktrees)
+    cleanup_causality = _cleanup_causality_report(
+        query,
+        cwd,
+        evidence_files,
+        worktrees,
+        named_targets=named,
+    )
     if cleanup_causality.get("is_cleanup_causality_query") and not named:
         selected = _select_cleanup_causality_targets(worktrees, cwd)
     else:
@@ -157,6 +207,12 @@ def extract_named_worktree_targets(query: str) -> list[dict]:
     for match in BRANCH_RE.finditer(query):
         value = match.group(1).rstrip(".,;:)")
         _append_unique(targets, seen, {"kind": "branch", "value": value, "token": value.casefold()})
+    for match in LABELED_TARGET_RE.finditer(query):
+        value = match.group("value").rstrip(".,;:)")
+        if value.casefold() in LABELED_TARGET_STOPWORDS:
+            continue
+        kind = match.group("kind").casefold()
+        _append_unique(targets, seen, {"kind": kind, "value": value, "token": value.casefold()})
     return targets
 
 
@@ -228,8 +284,7 @@ def _select_targets(named: list[dict], worktrees: list[dict]) -> list[dict]:
     matched_paths: set[str] = set()
     if named:
         for target in named:
-            token = target["token"]
-            matches = [item for item in worktrees if _target_matches_worktree(token, item)]
+            matches = [item for item in worktrees if _target_matches_worktree(target, item)]
             if matches:
                 for match in matches:
                     copy = dict(match)
@@ -260,12 +315,23 @@ def _select_cleanup_causality_targets(worktrees: list[dict], cwd: Path) -> list[
     return selected
 
 
-def _target_matches_worktree(token: str, worktree: dict) -> bool:
+def _target_matches_worktree(target: dict, worktree: dict) -> bool:
+    if target.get("kind") == "branch":
+        requested = _normalize_branch_ref(target.get("value"))
+        registered = _normalize_branch_ref(worktree.get("branch"))
+        return bool(registered) and requested == registered
+    token = target["token"]
     haystack = " ".join(
         str(worktree.get(key, ""))
         for key in ("path", "relative_path", "branch", "head")
     ).casefold()
     return token in haystack or token.replace("-", "_") in haystack or token.replace("_", "-") in haystack
+
+
+def _normalize_branch_ref(value: object) -> str:
+    branch = str(value or "")
+    prefix = "refs/heads/"
+    return branch[len(prefix) :] if branch.startswith(prefix) else branch
 
 
 def _classify_target(
@@ -418,9 +484,20 @@ def _relationship(line: str) -> str:
     return "mention"
 
 
-def _cleanup_causality_report(query: str, cwd: Path, evidence_files: list[Path], worktrees: list[dict]) -> dict:
+def _cleanup_causality_report(
+    query: str,
+    cwd: Path,
+    evidence_files: list[Path],
+    worktrees: list[dict],
+    *,
+    named_targets: list[dict],
+) -> dict:
     causal = _is_cleanup_causality_query(query)
-    operational_records = _scan_cleanup_operational_records(cwd, evidence_files) if causal else []
+    operational_records = (
+        _scan_cleanup_operational_records(cwd, evidence_files)
+        if causal and not named_targets
+        else []
+    )
     return {
         "is_cleanup_causality_query": causal,
         "debt_status": "unknown",
@@ -428,11 +505,59 @@ def _cleanup_causality_report(query: str, cwd: Path, evidence_files: list[Path],
         "operational_records": operational_records,
         "record_count": len(operational_records),
         "physical_worktree_count": len(worktrees),
+        "named_targets": named_targets,
     }
 
 
 def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees: list[dict], cwd: Path) -> dict:
     if not report.get("is_cleanup_causality_query"):
+        return report
+    named_targets = report.get("named_targets") or []
+    if named_targets:
+        target_values = list(
+            dict.fromkeys(str(target.get("value") or "") for target in named_targets)
+        )
+        bound_targets = [item for item in items if item.get("absolute_path")]
+        binding_status = "target_bound" if bound_targets else "blocked_named_target_missing"
+        summary = (
+            "Named cleanup target identity was preserved. Only target-specific worktree, Git, "
+            "and artifact evidence may support cleanup causality."
+            if bound_targets
+            else (
+                "No matching registered worktree was found for named cleanup target(s): "
+                f"{', '.join(target_values)}. Exact branch/task existence and target-specific "
+                "cleanup evidence remain unproved; generic worktree-cleanup causality was withheld."
+            )
+        )
+        report.update(
+            {
+                "debt_status": "target_specific_proof_required",
+                "causal_summary": summary,
+                "target_binding": {
+                    "status": binding_status,
+                    "requested_targets": named_targets,
+                    "bound_targets": [
+                        item.get("path") or item.get("identifier") for item in bound_targets
+                    ],
+                    "generic_cleanup_causality_withheld": True,
+                    "required_next_proof": (
+                        "exact branch/task existence, target-specific cleanup evidence, and a "
+                        "decisive target classification"
+                    ),
+                },
+                "target_selection_note": (
+                    "Named cleanup target identity is preserved; generic operational cleanup "
+                    "records are not promoted as target-specific causality."
+                ),
+                "git_state": {
+                    "source_role": "git_state",
+                    "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
+                    "classified_targets": [
+                        item.get("path") or item.get("identifier") for item in items
+                    ],
+                },
+            }
+        )
         return report
     records = report.get("operational_records") or []
     relationships = {item.get("relationship") for item in records}
@@ -692,9 +817,33 @@ def _private_artifact_summary(target: dict) -> dict:
 
 def _target_next_commands(identifier: str, target: dict, tokens: list[str], archive_root: str) -> list[dict]:
     path = target.get("path") or "<worktree-path>"
-    branch = target.get("branch") or _branch_from_identifier(identifier) or "<branch>"
+    matched_target = target.get("matched_query_target") or {}
+    branch = target.get("branch") or _branch_from_identifier(identifier)
+    if not branch and matched_target.get("kind") == "branch":
+        branch = str(matched_target.get("value") or "")
+    branch_pattern = branch or f"*{identifier}*"
     head = target.get("head") or "HEAD"
     grep_pattern = "|".join(re.escape(token) for token in tokens[:6]) or re.escape(identifier)
+    if not target.get("path"):
+        return [
+            {"kind": "worktree_list", "command": "git worktree list --porcelain"},
+            {
+                "kind": "branch_list",
+                "command": (
+                    f"git branch --list '{branch_pattern}' --format="
+                    "'%(refname:short) %(objectname:short) %(committerdate:iso8601) %(subject)'"
+                ),
+            },
+            {
+                "kind": "targeted_worktree_match",
+                "command": f"git worktree list --porcelain | rg -n -i '{grep_pattern}'",
+            },
+            {"kind": "git_log_grep", "command": f'git log --all --grep="{identifier}" --oneline --decorate --max-count=20'},
+            {
+                "kind": "targeted_artifact_rg",
+                "command": f'rg -n "{grep_pattern}" codex/state tasks reports reviews TODO.md TASKS.md',
+            },
+        ]
     return [
         {"kind": "worktree_list", "command": "git worktree list --porcelain"},
         {"kind": "status", "command": f'git -C "{path}" status --short --branch'},
