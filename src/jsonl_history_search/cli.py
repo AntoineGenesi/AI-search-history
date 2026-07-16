@@ -218,6 +218,20 @@ def _command_shape_guidance(argv: list[str]) -> str | None:
                 'Example: jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text',
             ]
         )
+    if command == "read-more" and "--lines" in argv:
+        lines_index = argv.index("--lines")
+        try:
+            window_size = int(argv[lines_index + 1])
+        except (IndexError, ValueError):
+            window_size = 2
+        return "\n".join(
+            [
+                "Invalid JSONL command shape: `read-more` does not accept `--lines`.",
+                "Use a bounded window read with `--mode window --before N --after N`.",
+                "Example: jsonl-history-search read-more <source-ref> --mode window "
+                f'--before {window_size} --after {window_size} --cwd "$PWD" --format text',
+            ]
+        )
     return None
 
 
