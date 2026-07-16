@@ -1981,7 +1981,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     try:
         Path(report_output).parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        if _is_worktree_cleanup_execute(args, execution_kind):
+        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
             return _run_worktree_cleanup_execute_without_report(
                 contract,
                 execution_args=execution_args,
@@ -2025,7 +2025,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     except OSError as exc:
         if not _ask_execute_report_output_error(exc, report_output):
             raise
-        if _is_worktree_cleanup_execute(args, execution_kind):
+        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
             return _run_worktree_cleanup_execute_without_report(
                 contract,
                 execution_args=execution_args,
@@ -2078,17 +2078,20 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         and (compact.get("worktree_currentness") or {})
         .get("cleanup_causality", {})
         .get("is_cleanup_causality_query")
+        and _is_answer_ready_worktree_cleanup_execute(args, execution_kind)
     ):
         _attach_worktree_cleanup_answer_handoff(contract, cwd=Path(cwd))
     return contract
 
 
-def _is_worktree_cleanup_execute(args: argparse.Namespace, execution_kind: str) -> bool:
+def _is_answer_ready_worktree_cleanup_execute(args: argparse.Namespace, execution_kind: str) -> bool:
     if execution_kind != "artifact-currentness":
         return False
-    from .worktree_currentness import is_worktree_cleanup_causality_query
+    from .worktree_currentness import is_answer_ready_worktree_cleanup_causality_query
 
-    return is_worktree_cleanup_causality_query(str(getattr(args, "query", "") or ""))
+    return is_answer_ready_worktree_cleanup_causality_query(
+        str(getattr(args, "query", "") or "")
+    )
 
 
 def _run_worktree_cleanup_execute_without_report(
