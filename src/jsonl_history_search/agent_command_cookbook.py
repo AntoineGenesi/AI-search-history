@@ -85,6 +85,28 @@ def agent_question_cookbook() -> list[dict[str, str]]:
 
 
 def ask_next_commands(*, selected_first_command: str, route_family: str) -> list[dict[str, Any]]:
+    if route_family == "non_history_clarification":
+        return []
+
+    if route_family == "local_artifact_verification":
+        return [
+            {
+                "purpose": "inspect local artifact state",
+                "command": selected_first_command,
+                "inspect_next": "changed and untracked files relevant to the user's local target",
+            },
+            {
+                "purpose": "inspect the named local changes",
+                "command": "git diff -- <named-file>",
+                "inspect_next": "the named task, evidence, report, docs, or other artifact before any history lookup",
+            },
+            {
+                "purpose": "inspect the latest committed change when relevant",
+                "command": "git show --stat --oneline HEAD",
+                "inspect_next": "whether the named artifact change is committed and what that commit touched",
+            },
+        ]
+
     if route_family == "storage_retention_forensics":
         return [
             {

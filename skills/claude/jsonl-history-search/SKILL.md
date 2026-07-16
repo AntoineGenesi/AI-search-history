@@ -13,7 +13,7 @@ Python package is installed, `convo --help` reaches the same CLI surface as
 `jsonl-history-search --help`.
 
 This skill is a router. Load this file first. For natural user questions that
-ask what happened, why a topic appeared, whether an agent action occurred,
+ask what happened since an explicit prior-message/history anchor, why a topic appeared, whether an agent action occurred,
 which artifact or ticket is current, whether old worktrees can be pruned, or what to
 learn from a session, run `ask` as the
 first resolver before choosing a route yourself. For explicit operational
@@ -23,6 +23,10 @@ Exception: when the user is asking whether the files/tasks/evidence packet you
 just created or edited include everything, verify local artifacts first with
 `git status`, `git diff`, `git show`, and targeted `sed`/`rg`; use JSONL only
 as a targeted backstop for disputed source-window coverage.
+Do not trigger this skill for the bare prompt `what happened?` or an equivalent
+ambiguous event question with no history anchor. Ask one short clarification
+question without using a tool. For local artifact/task-file prompts such as
+`what happened with this task file?`, inspect the named local artifact first.
 
 The product contract is agent-assist retrieval: find useful information in
 large, messy JSONL histories, show where it was found, and give the receiving
@@ -46,6 +50,22 @@ python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
+
+Use that installed sequence only when `command -v jsonl-history-search`
+succeeds. When the console command is unavailable but the current package
+checkout contains `src/jsonl_history_search/cli.py`, do not try an installed
+helper that cannot import the package and do not inventory the repo to recover.
+Run the source front door directly:
+
+```bash
+PYTHONPATH=src python3 -m jsonl_history_search.cli ask "<user wording>" --cwd "$PWD" --format text
+```
+
+The bundled `jsonl_ask_first.py` also prepends the current checkout's `src`
+directory when that package source exists. This is source-mode recovery, not
+proof that the global console command is installed. If neither path is
+executable, report the installed/source parity gap instead of fumbling through
+unrelated commands.
 
 The installed `jsonl_ask_first.py` launcher is the bounded-aware ask-first
 helper. It wraps the canonical `jsonl-history-search ask` command with
@@ -157,6 +177,8 @@ For immediate artifact-completeness prompts like "are you sure you got
 everything?", "did the task file include X?", "did you save this whole thread as
 evidence?", or "what changed in the files you just created?", do local artifact
 verification first instead of running `ask` or `semantic-debug`.
+For bare prompts like `what happened?`, ask what event or change the user means;
+do not run `ask`, `semantic-debug`, or any other history tool.
 
 The `ask` output is not a final answer and is not evidence retrieval by itself:
 it does not inspect source refs, raw JSONL, tasks, reports, or repo files. It
@@ -200,6 +222,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 
 | User ask shape | Route | Read | First command |
 | --- | --- | --- | --- |
+| "What happened?" with no message, history, thread, time-window, or artifact anchor | Non-history clarification | none | No tool call; ask which event or change the user means. |
 | "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction/preference | `references/remembered-instruction.md` | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format text` |
 | "Why did I say X?" "Why did I mention X?" "What was I talking about with X?" | Remembered topic/provenance | `ask` then `references/remembered-topic.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | `references/latest-status.md` | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
@@ -224,6 +247,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 - "what did I tell you before about release readiness?" -> `references/remembered-instruction.md`
 - "why did I mention the router?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/remembered-topic.md`
 - "what happened since my last message?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/latest-status.md`
+- "what happened?" with no explicit anchor -> no tool call; ask which event or change the user means
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
 - "did the agent read/follow the reviewer skill?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/skill-audit.md`

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -19,7 +20,19 @@ def main(argv: list[str] | None = None) -> int:
         args.append("--auto-execute-bounded-no-evidence")
 
     command = [sys.executable, "-m", "jsonl_history_search.cli", "ask", *args]
-    return subprocess.run(command, check=False).returncode
+    return subprocess.run(command, check=False, env=_source_checkout_env()).returncode
+
+
+def _source_checkout_env() -> dict[str, str]:
+    env = os.environ.copy()
+    source_root = Path.cwd() / "src"
+    if not (source_root / "jsonl_history_search" / "cli.py").is_file():
+        return env
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), existing] if existing else [str(source_root)]
+    )
+    return env
 
 
 def _join_unquoted_query_words(args: list[str]) -> list[str]:

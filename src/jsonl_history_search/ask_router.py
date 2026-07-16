@@ -27,6 +27,7 @@ EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
 EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
 EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentness"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
+NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
 
 
 @dataclass(frozen=True)
@@ -56,9 +57,9 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
     route_family="local_artifact_verification",
     chosen_route="local-artifact-verification",
     why_it_applies=(
-        "The wording asks whether recently edited local artifacts include or "
-        "saved the requested material, so verify the worktree and named files "
-        "before invoking JSONL history search."
+        "The wording asks what changed in a named local artifact or whether "
+        "recently edited files include or saved the requested material, so "
+        "verify the worktree and named files before invoking JSONL history search."
     ),
     first_command_template="git status --short",
     read_specialization="local-artifact-verification",
@@ -78,6 +79,29 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
         "Use bounded local commands first: git status, git diff, git show, and "
         "sed/rg against named files. JSONL is a targeted backstop only for "
         "conversation/source-window coverage gaps."
+    ),
+)
+
+NON_HISTORY_CLARIFICATION_ROUTE = AskRoute(
+    route_family=NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
+    chosen_route="non-history clarification",
+    why_it_applies=(
+        "The wording is a bare event question without a prior-message, "
+        "conversation-history, parent/main-thread, elapsed-window, or named "
+        "artifact anchor. Ask what event or change the user means without "
+        "invoking JSONL/history tooling."
+    ),
+    first_command_template="No tool call; ask which event or change the user means.",
+    read_specialization="none",
+    inspect_after=(),
+    stop_guidance=(
+        "Ask one short clarification question. Do not invoke JSONL, semantic-debug, "
+        "repo search, or another tool unless the user supplies an explicit history "
+        "anchor or a concrete local target."
+    ),
+    manual_search_guidance=(
+        "There is no search step for the bare prompt. Use the user's clarification "
+        "to choose local context, a named artifact, or an explicit history route."
     ),
 )
 
@@ -667,9 +691,12 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
     structured_execution_query = route.command_query(query)
     first_command = route.first_command(query)
-    first_action_category = (
-        "filesystem_inventory" if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY else "route_command"
-    )
+    if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
+        first_action_category = "filesystem_inventory"
+    elif route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY:
+        first_action_category = "no_tool"
+    else:
+        first_action_category = "route_command"
     return {
         "ask_router": {
             "status": "matched",
@@ -685,7 +712,11 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
                 selected_first_command=first_command,
                 route_family=route.route_family,
             ),
-            "command_cookbook": agent_question_cookbook(),
+            "command_cookbook": (
+                []
+                if route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY
+                else agent_question_cookbook()
+            ),
             "read_specialization": route.read_specialization,
             "inspect_after": list(route.inspect_after),
             "stop_guidance": route.stop_guidance,
@@ -798,6 +829,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_repeated_complaint_or_failure_query(normalized):
         return ROUTES[9]
+
+    if _looks_like_generic_non_history_query(normalized):
+        return NON_HISTORY_CLARIFICATION_ROUTE
 
     return AskRoute(
         route_family="semantic_debug",
@@ -1942,6 +1976,9 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
             "did you write",
             "did you save",
             "what changed",
+            "what happened with",
+            "what happened in",
+            "what happened to",
             "files you just",
             "just created",
             "just made",
@@ -1979,7 +2016,6 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
     asks_history = _has_any(
         normalized,
         (
-            "what happened",
             "what did i say",
             "what did i tell",
             "why did i mention",
@@ -2021,6 +2057,15 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
         and not asks_history
         and (artifact_context or explicitly_artifact_first or ambiguous_recent_work_followup)
     )
+
+
+def _looks_like_generic_non_history_query(normalized: str) -> bool:
+    return normalized in {
+        "what happened",
+        "what has happened",
+        "what happened here",
+        "what just happened",
+    }
 
 
 def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
