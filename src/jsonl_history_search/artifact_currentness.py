@@ -278,12 +278,13 @@ def _named_identifiers(text: str) -> list[str]:
 def _named_target_artifacts(named_targets: list[str], artifacts: list[Path], cwd: Path) -> list[Path]:
     if not named_targets:
         return []
-    targets = {target.casefold() for target in named_targets}
+    targets = set(named_targets)
     matched = []
     for path in artifacts:
-        rel = _rel(path, cwd).casefold()
-        heading = str(_first_heading(path, cwd)[1] or "").casefold()
-        if any(target in rel or target in heading for target in targets):
+        rel = _rel(path, cwd)
+        heading = str(_first_heading(path, cwd)[1] or "")
+        artifact_ids = set(_named_identifiers(f"{rel} {heading}"))
+        if targets & artifact_ids:
             matched.append(path)
     return matched
 
