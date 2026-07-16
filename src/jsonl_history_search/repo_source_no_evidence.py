@@ -80,7 +80,7 @@ def build_repo_source_no_evidence_payload(
             text = raw.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
             column = line.find(needle)
-            if column < 0:
+            if column < 0 or _question_echo_match(line, column):
                 continue
             matches.append(
                 {
@@ -224,6 +224,10 @@ def extract_source_scope_needle(query: str) -> str:
     text = str(query or "").strip()
     patterns = (
         r"\bevidence\s+that\s+(.+?)\s+exists?\b",
+        (
+            r"\bevidence\s+that\s+(.+?)\s+in\s+(?:(?:the|this)\s+)?"
+            r"(?:bounded\s+|searched\s+)?(?:repo(?:sitory)?\s+)?source(?:-|\s+)scope\b"
+        ),
         r"\bevidence\s+for\s+(.+?)\s+in\b",
         r"\bcontain(?:ed|s)?\s+(.+?)(?:\?|$|\s+in\b)",
     )
@@ -294,6 +298,11 @@ def _snippet(line: str, needle: str) -> str:
     prefix = "..." if start else ""
     suffix = "..." if end < len(line) else ""
     return prefix + line[start:end].strip() + suffix
+
+
+def _question_echo_match(line: str, column: int) -> bool:
+    prefix = line[:column].casefold()
+    return "is there evidence that" in prefix
 
 
 def _safe_relative(cwd: Path, path: Path) -> str:
