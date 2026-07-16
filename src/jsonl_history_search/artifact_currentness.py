@@ -101,6 +101,7 @@ CLAIM_FIELD_NAMES = {
 }
 HEADING_RE = re.compile(r"^\s{0,3}#{1,3}\s+(.+?)\s*$")
 PATHISH_RE = re.compile(r"(^|[\s`'\"])([./\w-]+/(?:[./\w-]+)|[./\w-]+\.(?:md|txt|rst|json|ya?ml))($|[\s`'\"])", re.IGNORECASE)
+NAMED_IDENTIFIER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,15})-(\d{1,12})(?![A-Za-z0-9])")
 STOP_WORDS = {
     "a",
     "an",
@@ -203,8 +204,22 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
     artifacts = _discover_artifacts(cwd)
     explicit_path = _explicit_path(query, cwd)
     front_door = _current_front_door(cwd)
-    selected = _select_artifact_or_topic(query, cwd, artifacts, explicit_path, front_door)
-    candidates = _rank_candidates(query, cwd, artifacts, selected, front_door)
+    named_targets = _named_identifiers(query)
+    named_artifacts = _named_target_artifacts(named_targets, artifacts, cwd)
+    if named_targets and not explicit_path and not named_artifacts:
+        return _named_target_missing_report(
+            query=query,
+            cwd=cwd,
+            artifacts=artifacts,
+            named_targets=named_targets,
+            front_door=front_door,
+            latest=latest,
+            started=started,
+            detected_intent=detected_intent,
+        )
+    selection_artifacts = named_artifacts or artifacts
+    selected = _select_artifact_or_topic(query, cwd, selection_artifacts, explicit_path, front_door)
+    candidates = _rank_candidates(query, cwd, selection_artifacts, selected, front_door)
     selected_path = selected.get("path")
     status_assessment = _status_field_assessment(selected_path, cwd)
     references = _later_references(query, cwd, artifacts, selected, front_door)
@@ -230,6 +245,11 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
         "detected_intent": detected_intent,
         "artifact_candidates": candidates[:12],
         "selected_artifact_or_topic": selected,
+        "named_target_gate": {
+            "status": "matched" if named_targets else "not_applicable",
+            "named_targets": named_targets,
+            "matching_artifact_count": len(named_artifacts),
+        },
         "currentness_verdict": verdict,
         "why": why,
         "evidence_chain": chain,
@@ -241,6 +261,89 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
             "artifact_count": len(artifacts),
             "reference_count": len(references),
             "latest_jsonl_evidence_count": len(latest_evidence),
+            "elapsed_seconds": elapsed,
+        },
+    }
+
+
+def _named_identifiers(text: str) -> list[str]:
+    return sorted(
+        {
+            f"{match.group(1).upper()}-{match.group(2)}"
+            for match in NAMED_IDENTIFIER_RE.finditer(str(text or ""))
+        }
+    )
+
+
+def _named_target_artifacts(named_targets: list[str], artifacts: list[Path], cwd: Path) -> list[Path]:
+    if not named_targets:
+        return []
+    targets = {target.casefold() for target in named_targets}
+    matched = []
+    for path in artifacts:
+        rel = _rel(path, cwd).casefold()
+        heading = str(_first_heading(path, cwd)[1] or "").casefold()
+        if any(target in rel or target in heading for target in targets):
+            matched.append(path)
+    return matched
+
+
+def _named_target_missing_report(
+    *,
+    query: str,
+    cwd: Path,
+    artifacts: list[Path],
+    named_targets: list[str],
+    front_door: dict,
+    latest: dict,
+    started: float | None,
+    detected_intent: str,
+) -> dict:
+    target_pattern = "|".join(named_targets)
+    proof_command = (
+        "rg -n -i --glob '*.md' --glob '*.txt' --glob '*.rst' --glob '*.json' "
+        f"--glob '*.yaml' --glob '*.yml' {json.dumps(target_pattern)} tasks docs reports reviews codex/state state plans tickets issues"
+    )
+    elapsed = None if started is None else round(time.monotonic() - started, 6)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "blocked_named_target_missing",
+        "query": query,
+        "detected_intent": detected_intent,
+        "artifact_candidates": [],
+        "selected_artifact_or_topic": {
+            "kind": "named_target_missing",
+            "topic": ", ".join(named_targets),
+            "selection_reason": "no artifact path or heading matches an explicit named target; adjacent topical artifacts were not selected",
+        },
+        "named_target_gate": {
+            "status": "blocked_named_target_missing",
+            "named_targets": named_targets,
+            "matching_artifact_count": 0,
+            "required_next_proof": "locate or restore an artifact whose path or heading names the explicit target",
+            "next_proof_command": proof_command,
+        },
+        "currentness_verdict": "unknown",
+        "why": f"No artifact path or heading matched the explicit named target(s): {', '.join(named_targets)}. Adjacent topical artifacts were excluded.",
+        "evidence_chain": [],
+        "status_field_assessment": {
+            "status_fields": [],
+            "claim_present": False,
+            "assessment": "named_target_missing_no_status_claim_used",
+        },
+        "current_front_door": front_door,
+        "next_reads": [
+            {
+                "source_ref": ", ".join(named_targets),
+                "reason": "copyable next proof step for the missing named target",
+                "read_more_command": proof_command,
+            }
+        ],
+        "blind_spots": _blind_spots(latest, {}, None, {}, []),
+        "summary": {
+            "artifact_count": len(artifacts),
+            "reference_count": 0,
+            "latest_jsonl_evidence_count": 0,
             "elapsed_seconds": elapsed,
         },
     }
