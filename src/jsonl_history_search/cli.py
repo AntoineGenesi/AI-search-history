@@ -3069,7 +3069,26 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
         candidate = candidates_by_id.get(str(row.get("candidate_id") or "")) or candidates_by_target.get(
             str(row.get("target") or "")
         )
-        if _devlog_read_is_invalid_default_target_artifact(row, candidate=candidate) and not artifact_audit_requested:
+        prompt_echo = _devlog_source_window_prompt_echo_classification(
+            row,
+            candidate=candidate,
+            query=query,
+        )
+        if prompt_echo.get("is_setup_echo") is True:
+            reason = "assignment_or_control_prompt_echo"
+            row["devlog_target_source_eligibility"] = {
+                "eligible": False,
+                "default_target_allowed": False,
+                "reason": reason,
+                "prompt_echo_reason": prompt_echo.get("reason"),
+            }
+            diagnostic_reads.append(
+                _devlog_demote_source_window_read(
+                    row,
+                    reason=reason,
+                )
+            )
+        elif _devlog_read_is_invalid_default_target_artifact(row, candidate=candidate) and not artifact_audit_requested:
             reason = _devlog_invalid_default_target_artifact_reason(row, candidate=candidate)
             row["devlog_target_source_eligibility"] = {
                 "eligible": False,
@@ -3117,6 +3136,35 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
                     )
                 )
     return target_reads[:8], diagnostic_reads[:8]
+
+
+def _devlog_source_window_prompt_echo_classification(
+    read: dict,
+    *,
+    candidate: dict | None,
+    query: str,
+) -> dict:
+    values = [
+        read.get("summary"),
+        read.get("snippet"),
+        read.get("matched_text"),
+        read.get("text"),
+        read.get("reason"),
+    ]
+    if isinstance(candidate, dict):
+        values.extend(
+            (
+                candidate.get("summary"),
+                candidate.get("snippet"),
+                candidate.get("matched_text"),
+                candidate.get("text"),
+                candidate.get("reason"),
+            )
+        )
+    return setup_echo_classification(
+        " ".join(str(value) for value in values if value not in (None, "")),
+        query=query,
+    )
 
 
 def _devlog_chronology_roles_from_candidate(read: dict, *, candidate: dict | None) -> list[str]:
