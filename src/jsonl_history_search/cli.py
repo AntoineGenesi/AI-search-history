@@ -7095,7 +7095,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
     if output_key == "devlog_failure_analysis":
         chronology_summary = _compact_devlog_chronology_for_stdout(
             compact.get("chronology_source_reach") or {},
-            include_reads=False,
+            include_reads=True,
         )
         return {
             "schema_version": compact.get("schema_version"),
