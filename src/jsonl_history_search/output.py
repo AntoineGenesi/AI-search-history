@@ -2111,7 +2111,7 @@ def render_semantic_wrapup_text(payload: dict) -> str:
     if reads:
         lines.append("Next reads:")
         for read in reads[:8]:
-            _append_text_read(lines, read)
+            _append_text_read(lines, read, command_by_target=command_by_target)
     return "\n".join(lines)
 
 
