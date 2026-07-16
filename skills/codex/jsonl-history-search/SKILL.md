@@ -38,11 +38,27 @@ implementation surfaces, not the product itself.
 
 ## Natural Prompt First Move
 
-For natural history/status/action/currentness/wrap-up prompts, first make sure
-the installed global skill is fresh when this workflow relies on it, then run
-the lightweight front door as the first resolver before loading a route
-specialization, broad `rg`,
-repo recovery, TODO scans, or direct JSONL spelunking:
+For natural history/status/action/currentness/wrap-up prompts, use this single
+installed-or-source command-resolution block as the first shell move. It keeps
+the installed console behavior when available and directly executes the source
+checkout fallback when it is not; do not try `validate-install` or an installed
+helper before this check succeeds:
+
+```bash
+if command -v jsonl-history-search >/dev/null 2>&1; then
+  jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
+elif [ -f src/jsonl_history_search/cli.py ]; then
+  PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
+else
+  printf '%s\n' 'jsonl-history-search is not on PATH and src/jsonl_history_search/cli.py is unavailable in this cwd' >&2
+  exit 127
+fi
+```
+
+This block is the canonical no-fumble first move. It is command resolution,
+not repo inventory or package installation. When the installed branch is
+selected and the workflow depends on global-skill freshness, run the installed
+preflight before later route commands:
 
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
@@ -51,7 +67,7 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text
 ```
 
-Use that installed sequence only when `command -v jsonl-history-search`
+Use that installed sequence only after `command -v jsonl-history-search`
 succeeds. When the console command is unavailable but the current package
 checkout contains `src/jsonl_history_search/cli.py`, do not try an installed
 helper that cannot import the package and do not inventory the repo to recover.
@@ -123,15 +139,17 @@ all-history, or universal-superiority claim.
   did we distinguish persistent coordinator from wait loops?", then answer from
   the reviewed source window and preserve corrections/uncertainty.
 
-Before free-agent or user-facing workflows that rely on the installed global
-Codex skill, run:
+Only when the no-fumble block selected the installed branch and the workflow
+relies on the installed global Codex skill, run this freshness preflight before
+later installed route commands:
 
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
 ```
 
-If the agent preflight says the global skill is stale, refresh it from the
-package checkout before relying on the route instructions:
+If that installed-branch preflight says the global skill is stale, refresh it
+from the package checkout before relying on later installed route instructions.
+Never run this refresh or preflight from the source-checkout branch:
 
 ```bash
 bash install/install_codex_global.sh
@@ -147,10 +165,10 @@ Command-shape contract for the first two shell commands:
   `sed -n '1,220p' .../SKILL.md && rg --files`, and
   `cat .../SKILL.md && rg --files`.
 - After the skill-read command completes for a natural prompt, the next shell
-  command should be the freshness preflight for installed global-skill
-  workflows, then ask-first routing.
+  command should be the installed-or-source command-resolution block above.
 - After the skill-read command completes for an installed global-skill
-  workflow, the next shell command should be
+  workflow where `command -v jsonl-history-search` succeeds, the freshness
+  command should be
   `jsonl-history-search validate-install --codex-home ~/.codex --format text`.
   If it fails, refresh the skill before relying on this route guidance.
 - After the freshness preflight passes, the next shell command should be
@@ -198,8 +216,9 @@ fields.
 After `ask`, read only the named reference and run the printed first command.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
 JSONL directly before `ask` for these natural prompts. If you have just read
-this skill for an installed global-skill natural prompt, the next shell command
-should be `validate-install`; after it passes, run `ask`. Do not insert `pwd`,
+this skill for a natural prompt, run the installed-or-source resolution block.
+When its installed branch applies, run `validate-install` before relying on
+later installed route guidance. Do not insert `pwd`,
 `rg --files`, `find`, `ls`, repo inventories, or setup probes between the skill
 read, freshness preflight, and `ask`.
 
