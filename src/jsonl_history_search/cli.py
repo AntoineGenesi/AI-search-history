@@ -7394,7 +7394,7 @@ def _named_task_merge_provenance_artifact_gate_can_override_action_contract(
     role_evidence = merge_gate.get("role_evidence") if isinstance(merge_gate.get("role_evidence"), dict) else {}
     if not all(
         _named_task_merge_provenance_role_satisfied(role, role_evidence)
-        for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES
+        for role in _NAMED_TASK_MERGE_PROVENANCE_BASE_BLOCKING_ROLES
     ):
         return False
     answer_status = str(action.get("answer_status") or "").casefold()
@@ -12282,9 +12282,12 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
 
     if _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
         source_sessions = _named_task_source_session_proof_summaries(refs)
+        source_session_requested = _named_task_merge_provenance_source_session_wanted(query)
         pieces = []
         if source_sessions:
             pieces.append(f"source-session proof: {_short_join(source_sessions[:1], limit=220)}")
+        elif not source_session_requested and merge_commits:
+            pieces.append("source-session proof: not required for this git merge-actor answer")
         else:
             pieces.append("source-session proof: missing/not opened")
         pieces.append(
@@ -12930,7 +12933,7 @@ _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES = (
     "merge_commit_proof",
 )
 
-_NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES = (
+_NAMED_TASK_MERGE_PROVENANCE_BASE_BLOCKING_ROLES = (
     "task_artifact_proof",
     "review_artifact_proof",
     "merge_commit_proof",
@@ -12948,6 +12951,9 @@ def _named_task_merge_provenance_final_proof_gate(
     task_ids = _ask_execute_named_task_ids(query)
     task_id = str(task_ids[0]).casefold() if task_ids else ""
     role_evidence = _named_task_merge_provenance_role_evidence(opened, task_id=task_id)
+    blocking_roles = list(_NAMED_TASK_MERGE_PROVENANCE_BASE_BLOCKING_ROLES)
+    if _named_task_merge_provenance_source_session_wanted(query):
+        blocking_roles.insert(0, "source_session_proof")
     missing = [
         role
         for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
@@ -12955,16 +12961,10 @@ def _named_task_merge_provenance_final_proof_gate(
     ]
     blocking_missing = [
         role
-        for role in _NAMED_TASK_MERGE_PROVENANCE_BLOCKING_ROLES
+        for role in blocking_roles
         if not _named_task_merge_provenance_role_satisfied(role, role_evidence)
     ]
     display_missing = list(missing)
-    if (
-        "merge_commit_proof" in blocking_missing
-        and "source_session_proof" in display_missing
-        and _named_task_artifact_merge_claim_present(opened, task_id=task_id)
-    ):
-        display_missing = [role for role in display_missing if role != "merge_commit_proof"]
     status = "answer_allowed" if not blocking_missing else "missing_required_merge_provenance_roles"
     summary_lines = []
     if blocking_missing:
@@ -12992,23 +12992,26 @@ def _named_task_merge_provenance_final_proof_gate(
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
-            "Open same-task source-session, task artifact, review artifact, and actual merge-commit or "
-            "git-validated single-parent integration/final-review proof "
+            "Open same-task task artifact, review artifact, and an actual parent merge commit; also open "
+            "same-task source-session proof when the question requests raw/source-session chronology "
             f"for {task_id or 'the named task'} before answering merge provenance."
         ),
         "acceptable_evidence": [
             "source-session row or raw transcript reference for the task implementation/review/merge episode",
             "same-task task artifact recording implementation/review/merge state",
             "same-task independent review artifact or review proof",
-            "actual parent merge commit hash or git-validated single-parent integration/final-review commit proof, not only closeout/status prose",
+            "actual parent merge commit hash for the merge facet; single-parent integration/final-review proof remains a separate closeout surface",
         ],
     }
 
 
 def _named_task_merge_provenance_role_satisfied(role: str, role_evidence: dict) -> bool:
-    if role != "merge_commit_proof":
-        return bool(role_evidence.get(role))
-    return bool(role_evidence.get("merge_commit_proof") or role_evidence.get("integration_commit_proof"))
+    return bool(role_evidence.get(role))
+
+
+def _named_task_merge_provenance_source_session_wanted(query: str) -> bool:
+    normalized = str(query or "").casefold()
+    return any(term in normalized for term in ("source session", "source-session", "raw session", "raw worker"))
 
 
 def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: str) -> dict:
@@ -13072,39 +13075,6 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         for role, values in evidence.items()
         if values
     }
-
-
-def _named_task_artifact_merge_claim_present(opened: list[dict], *, task_id: str) -> bool:
-    for item in opened:
-        if item.get("status") != "opened" or not item.get("summary"):
-            continue
-        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
-        if str(ref.get("proof_surface") or "") not in {
-            "task_file",
-            "review_artifact",
-            "path_git_log_probe",
-            "post_merge_task_proof",
-            "post_merge_review_proof",
-        }:
-            continue
-        text = " ".join(
-            str(value or "")
-            for value in (
-                item.get("summary"),
-                item.get("target"),
-                ref.get("target"),
-                ref.get("path"),
-                ref.get("reason"),
-            )
-        )
-        if task_id and _named_task_fragment_mentions_other_task_id(text, task_id):
-            continue
-        normalized = text.casefold()
-        if re.search(r"\b[0-9a-f]{7,40}\b", normalized) and any(
-            marker in normalized for marker in ("merge proof", "parent merge commit", "merge commit")
-        ):
-            return True
-    return False
 
 
 def _named_task_merge_provenance_gate_public_contract(gate: dict) -> dict:
