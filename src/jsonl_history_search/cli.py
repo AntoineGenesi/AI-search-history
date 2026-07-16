@@ -6688,6 +6688,39 @@ def _ask_answer_artifact_currentness(
     packet = saved.get("artifact_currentness") if isinstance(saved, dict) else {}
     if not isinstance(packet, dict) or packet.get("detected_intent") != "natural_direction_currentness":
         return None
+    query = str(report.get("query") or "")
+    selected = packet.get("selected_artifact_or_topic") if isinstance(packet.get("selected_artifact_or_topic"), dict) else {}
+    query_ids = _artifact_currentness_named_ids(query)
+    selected_identity = " ".join(
+        str(selected.get(field) or "") for field in ("title", "path", "source_ref")
+    )
+    selected_ids = _artifact_currentness_named_ids(selected_identity)
+    missing_target_ids = sorted(query_ids - selected_ids)
+    if missing_target_ids:
+        target_gate = {
+            "status": "blocked_named_target_mismatch",
+            "query_identifiers": sorted(query_ids),
+            "selected_artifact_identifiers": sorted(selected_ids),
+            "missing_target_identifiers": missing_target_ids,
+            "selected_artifact": {
+                "title": selected.get("title"),
+                "path": selected.get("path"),
+                "source_ref": selected.get("source_ref"),
+            },
+            "required_next_proof": (
+                f"artifact-currentness evidence whose selected artifact/topic matches {', '.join(missing_target_ids)}"
+            ),
+            "suggested_command": (
+                f"jsonl-history-search artifact-currentness {shlex.quote(query)} "
+                '--cwd "$PWD" --format text'
+            ),
+        }
+        answer["source_contract"]["artifact_currentness_target_gate"] = target_gate
+        return _ask_answer_fail_closed(
+            answer,
+            "artifact-currentness selected artifact does not match the named query identifier",
+            target_gate,
+        )
     verdict = str(packet.get("currentness_verdict") or "")
     if verdict not in {"current", "superseded"}:
         return _ask_answer_fail_closed(
@@ -6697,7 +6730,6 @@ def _ask_answer_artifact_currentness(
         )
 
     chain = [item for item in packet.get("evidence_chain") or [] if isinstance(item, dict)]
-    selected = packet.get("selected_artifact_or_topic") if isinstance(packet.get("selected_artifact_or_topic"), dict) else {}
     role_candidates = {
         "current_front_door": next((item for item in chain if item.get("evidence_type") == "current_front_door"), None),
         "artifact_status_claim": next((item for item in chain if item.get("evidence_type") == "artifact_status_field"), None),
@@ -6769,6 +6801,13 @@ def _ask_answer_artifact_currentness(
         "boundary": "selected artifact/report currentness only; no broad release/readiness inference",
     }
     return {"ask_answer": answer}
+
+
+def _artifact_currentness_named_ids(text: str) -> set[str]:
+    return {
+        f"{match.group(1).upper()}-{match.group(2)}"
+        for match in _ASK_EXECUTE_TASK_ID_RE.finditer(str(text or ""))
+    }
 
 
 def _ask_answer_from_execute(
