@@ -21,8 +21,11 @@ ID_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+[A-Z0-9]*)\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w./-])((?:worktrees|task|tasks|tickets|issues|branches)/[A-Za-z0-9._/-]+)")
 BRANCH_RE = re.compile(r"(?<![\w./-])((?:task|feature|bugfix|fix|branches)/[A-Za-z0-9._/-]+)")
 LABELED_TARGET_RE = re.compile(
-    r"\b(?P<kind>branch|task)\s+(?:(?:named|called)\s+)?"
-    r"[\"'`]?(?P<value>[A-Za-z0-9][A-Za-z0-9._-]{1,127})[\"'`]?",
+    r"\b(?P<kind>branch|task)\b(?:\s*[:=]\s*|\s+)"
+    r"(?:(?:named|called)\b(?:\s*[:=]\s*|\s+))?"
+    r"(?P<quote>[\"'`]?)"
+    r"(?P<value>[A-Za-z0-9][A-Za-z0-9._/-]{0,127})"
+    r"(?P=quote)(?=$|[\s,;:!?)}\]])",
     re.IGNORECASE,
 )
 LABELED_TARGET_STOPWORDS = {
@@ -206,7 +209,7 @@ def extract_named_worktree_targets(query: str) -> list[dict]:
         _append_unique(targets, seen, {"kind": "branch", "value": value, "token": value.casefold()})
     for match in LABELED_TARGET_RE.finditer(query):
         value = match.group("value").rstrip(".,;:)")
-        if "/" in value or value.casefold() in LABELED_TARGET_STOPWORDS:
+        if value.casefold() in LABELED_TARGET_STOPWORDS:
             continue
         kind = match.group("kind").casefold()
         _append_unique(targets, seen, {"kind": kind, "value": value, "token": value.casefold()})
@@ -281,8 +284,7 @@ def _select_targets(named: list[dict], worktrees: list[dict]) -> list[dict]:
     matched_paths: set[str] = set()
     if named:
         for target in named:
-            token = target["token"]
-            matches = [item for item in worktrees if _target_matches_worktree(token, item)]
+            matches = [item for item in worktrees if _target_matches_worktree(target, item)]
             if matches:
                 for match in matches:
                     copy = dict(match)
@@ -313,12 +315,23 @@ def _select_cleanup_causality_targets(worktrees: list[dict], cwd: Path) -> list[
     return selected
 
 
-def _target_matches_worktree(token: str, worktree: dict) -> bool:
+def _target_matches_worktree(target: dict, worktree: dict) -> bool:
+    if target.get("kind") == "branch":
+        requested = _normalize_branch_ref(target.get("value"))
+        registered = _normalize_branch_ref(worktree.get("branch"))
+        return bool(registered) and requested == registered
+    token = target["token"]
     haystack = " ".join(
         str(worktree.get(key, ""))
         for key in ("path", "relative_path", "branch", "head")
     ).casefold()
     return token in haystack or token.replace("-", "_") in haystack or token.replace("_", "-") in haystack
+
+
+def _normalize_branch_ref(value: object) -> str:
+    branch = str(value or "")
+    prefix = "refs/heads/"
+    return branch[len(prefix) :] if branch.startswith(prefix) else branch
 
 
 def _classify_target(
