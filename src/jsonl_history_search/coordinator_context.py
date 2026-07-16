@@ -167,7 +167,7 @@ def _source_role(rel: str) -> str:
     return "project_context"
 
 
-def _active_task_candidates(texts: tuple[str, ...]) -> list[str]:
+def _active_task_candidates(texts: tuple[str, ...], *, include_any_task_paths: bool = True) -> list[str]:
     combined = "\n".join(_current_front_door_portion(text) for text in texts)
     handles: list[str] = []
     active_patterns = (
@@ -185,6 +185,8 @@ def _active_task_candidates(texts: tuple[str, ...]) -> list[str]:
                 handles.append(rel)
     if handles:
         return handles
+    if not include_any_task_paths:
+        return []
     for match in re.finditer(r"`?(tasks/[A-Za-z0-9_.\-/]+\.md)`?", combined):
         rel = match.group(1)
         if rel not in handles:
@@ -216,7 +218,7 @@ def _reconcile_active_task(*, repo: Path, file_texts: dict[str, str]) -> tuple[l
     )
     authority_reason = "pipeline_current_product_task"
     if not authoritative_paths:
-        pipeline_candidates = _active_task_candidates((pipeline_text,))
+        pipeline_candidates = _active_task_candidates((pipeline_text,), include_any_task_paths=False)
         if len(pipeline_candidates) == 1:
             authoritative_paths = pipeline_candidates
             authority_reason = "pipeline_active_task_legacy"
@@ -277,6 +279,8 @@ def _active_task_resolution(
 
 def _current_front_door_portion(text: str) -> str:
     for marker in (
+        "**Latest Closed Product Task:**",
+        "Latest Closed Product Task:",
         "Latest closed selected task:",
         "Latest closed task:",
         "\n## Closed",
