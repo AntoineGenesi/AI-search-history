@@ -6467,6 +6467,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
 _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
     {
         "action_proof",
+        "artifact_currentness",
         "bounded_no_evidence",
         "expectation_mismatch",
         "orchestration_provenance",
@@ -6660,6 +6661,116 @@ def _remembered_user_wording_latest_recovery_config(args: argparse.Namespace) ->
     }
 
 
+def _ask_answer_artifact_currentness(
+    answer: dict,
+    *,
+    report: dict,
+    action: dict,
+    cwd: Path,
+) -> dict | None:
+    """Finalize only ordinary artifact/topic currentness verdicts, not cleanup causality."""
+    execution = report.get("execution") if isinstance(report.get("execution"), dict) else {}
+    report_path = Path(str(execution.get("report_written") or action.get("saved_report") or "")).expanduser()
+    if not report_path.is_absolute():
+        report_path = cwd / report_path
+    try:
+        saved = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _ask_answer_fail_closed(
+            answer,
+            "artifact-currentness saved proof report could not be inspected",
+            {
+                "required_next_proof": "readable artifact-currentness report with current front-door, artifact-status, and newer-commit proof",
+                "report": str(report_path),
+                "inspection_error": str(exc),
+            },
+        )
+    packet = saved.get("artifact_currentness") if isinstance(saved, dict) else {}
+    if not isinstance(packet, dict) or packet.get("detected_intent") != "natural_direction_currentness":
+        return None
+    verdict = str(packet.get("currentness_verdict") or "")
+    if verdict not in {"current", "superseded"}:
+        return _ask_answer_fail_closed(
+            answer,
+            "artifact-currentness verdict is missing or conflicting",
+            {"required_next_proof": "one unambiguous current or superseded verdict", "observed_verdict": verdict or None},
+        )
+
+    chain = [item for item in packet.get("evidence_chain") or [] if isinstance(item, dict)]
+    selected = packet.get("selected_artifact_or_topic") if isinstance(packet.get("selected_artifact_or_topic"), dict) else {}
+    role_candidates = {
+        "current_front_door": next((item for item in chain if item.get("evidence_type") == "current_front_door"), None),
+        "artifact_status_claim": next((item for item in chain if item.get("evidence_type") == "artifact_status_field"), None),
+        "newer_commit_evidence": next(
+            (item for item in chain if item.get("relationship") == "newer_repo_commit_after_artifact"), None
+        ),
+    }
+    opened_roles: dict[str, dict] = {}
+    for role in ("current_front_door", "artifact_status_claim"):
+        candidate = role_candidates[role]
+        if not candidate or not candidate.get("source_ref"):
+            continue
+        opened = _open_ask_answer_proof_refs(
+            [{"kind": "artifact_currentness_proof", "target": candidate["source_ref"], "currentness_source_role": role}],
+            cwd=cwd,
+        )
+        if opened and opened[0].get("status") == "opened" and opened[0].get("summary"):
+            opened_roles[role] = opened[0]
+    commit_candidate = role_candidates["newer_commit_evidence"]
+    repo = git_root_for(cwd)
+    commit = commit_metadata(repo, str(commit_candidate.get("source_ref"))) if repo and commit_candidate else None
+    if commit is not None:
+        opened_roles["newer_commit_evidence"] = {
+            "status": "opened",
+            "target": commit.commit,
+            "summary": f"{commit.commit_time} {commit.commit[:12]} {commit.subject}",
+            "ref": {**commit_candidate, "currentness_source_role": "newer_commit_evidence"},
+        }
+
+    missing_roles = [role for role in role_candidates if role not in opened_roles]
+    assessment = packet.get("status_field_assessment") if isinstance(packet.get("status_field_assessment"), dict) else {}
+    if verdict == "superseded" and assessment.get("assessment") != "status_claim_conflicts_with_later_evidence":
+        missing_roles.append("artifact_status_conflict_assessment")
+    if missing_roles:
+        answer["source_contract"]["artifact_currentness_answer_gate"] = {
+            "status": "blocked_missing_or_conflicting_currentness_proof",
+            "required_roles": list(role_candidates),
+            "opened_roles": list(opened_roles),
+            "missing_roles": missing_roles,
+        }
+        answer["proof_summary"] = [item["summary"] for item in opened_roles.values()]
+        return _ask_answer_fail_closed(
+            answer,
+            "artifact-currentness required proof roles are missing, conflicting, or not inspectable",
+            answer["source_contract"]["artifact_currentness_answer_gate"],
+        )
+
+    artifact_label = str(selected.get("title") or selected.get("path") or "the selected artifact/report")
+    current_ref = opened_roles["current_front_door"]["target"]
+    status_ref = opened_roles["artifact_status_claim"]["target"]
+    commit_ref = opened_roles["newer_commit_evidence"]["target"]
+    conclusion = "is not the current source of truth; it is superseded" if verdict == "superseded" else "is current"
+    answer["answer_status"] = "answered-from-proof"
+    answer["answer"] = (
+        f"{artifact_label} {conclusion}. Current front-door/current-state evidence: {current_ref}. "
+        f"The artifact status field at {status_ref} is a claim, not authority. "
+        f"Newer repository history was inspected at commit {commit_ref[:12]}. "
+        "This answers only the selected artifact/report currentness question; it does not establish broad release or readiness status."
+    )
+    answer["refs_used"] = [_ref_public_summary(item) for item in opened_roles.values()]
+    answer["proof_summary"] = [
+        f"{role}: {opened_roles[role]['summary']}" for role in role_candidates
+    ]
+    answer["source_contract"]["artifact_currentness_answer_gate"] = {
+        "status": "answer_allowed",
+        "verdict": verdict,
+        "required_roles": list(role_candidates),
+        "opened_roles": list(opened_roles),
+        "boundary": "selected artifact/report currentness only; no broad release/readiness inference",
+    }
+    return {"ask_answer": answer}
+
+
 def _ask_answer_from_execute(
     execute_payload: dict,
     *,
@@ -6707,6 +6818,10 @@ def _ask_answer_from_execute(
             f"route family {route_family or '(unknown)'} is not supported by ask --answer MVP",
             route.get("stop_guidance") or route.get("manual_search_guidance"),
         )
+    if route_family == "artifact_currentness":
+        currentness_answer = _ask_answer_artifact_currentness(answer, report=report, action=action, cwd=cwd)
+        if currentness_answer is not None:
+            return currentness_answer
     if route_family == "remembered_topic" and not _remembered_topic_causal_instruction_answer_wanted(
         query=str(report.get("query") or ""),
         route_family=route_family,
