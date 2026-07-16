@@ -5,7 +5,7 @@ import json
 import re
 import shlex
 import sys
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
@@ -153,7 +153,7 @@ from .source_expansion import ExpansionRequest, build_follow_next_reads_payload,
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
 from .status_anchor import DEFAULT_STATUS_QUERY, build_status_anchor_payload
 from .structural_hybrid import search_structural_hybrid_budgeted
-from .timeutil import parse_now, timezone_from_args
+from .timeutil import parse_datetime, parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
 from .workflow_repeat import build_workflow_repeat_payload
 from .masking import MASK_MODES, MaskContext
@@ -1725,6 +1725,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timezone-offset", default="+00:00")
     parser.add_argument("--now", default=None)
     parser.add_argument(
+        "--since",
+        default=None,
+        help="Inclusive ISO-8601 start timestamp for an explicit record search window; requires --until.",
+    )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="Exclusive ISO-8601 end timestamp for an explicit record search window; requires --since.",
+    )
+    parser.add_argument(
         "--allow-arbitrary-root",
         action="store_true",
         help=(
@@ -1784,7 +1794,15 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         hard_cap_files=args.hard_cap_files,
         hard_cap_bytes=args.hard_cap_bytes,
     )
-    intent = infer_query(args.query, now=now, role=args.role)
+    explicit_window_start, explicit_window_end = _explicit_search_window_from_args(args, tz)
+    intent = infer_query(
+        args.query,
+        now=now,
+        role=args.role,
+        date_window_start=explicit_window_start,
+        date_window_end=explicit_window_end,
+        date_reason="explicit_cli_window" if explicit_window_start is not None else None,
+    )
     current_session_only = (
         getattr(args, "command", None) == "semantic-wrapup"
         and not args.root
@@ -1821,6 +1839,25 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
             RedactionContext.from_path(redaction_path),
         )
     return source_plan, intent, plan
+
+
+def _explicit_search_window_from_args(
+    args: argparse.Namespace,
+    default_tz,
+) -> tuple[datetime | None, datetime | None]:
+    since_raw = getattr(args, "since", None)
+    until_raw = getattr(args, "until", None)
+    if bool(since_raw) != bool(until_raw):
+        raise SystemExit("--since and --until must be provided together")
+    if not since_raw:
+        return None, None
+    start = parse_datetime(since_raw, default_tz)
+    end = parse_datetime(until_raw, default_tz)
+    if start is None or end is None:
+        raise SystemExit("--since and --until must be valid ISO-8601 timestamps")
+    if end <= start:
+        raise SystemExit("--until must be later than --since")
+    return start, end
 
 
 def current_session_wording(query: str) -> bool:
@@ -2131,6 +2168,10 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--hard-cap-files", str(args.hard_cap_files)])
     if getattr(args, "hard_cap_bytes", None) is not None:
         argv.extend(["--hard-cap-bytes", str(args.hard_cap_bytes)])
+    if getattr(args, "since", None):
+        argv.extend(["--since", str(args.since)])
+    if getattr(args, "until", None):
+        argv.extend(["--until", str(args.until)])
     argv.extend(["--report-output", args.report_output])
     return argv
 
@@ -2213,6 +2254,7 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         mask_context=_mask_context_from_args(args),
         configuration_warnings=_configuration_warnings(source_plan),
     )
+    _demote_devlog_generic_repo_recovery(semantic_payload)
     semantic_report.write_text(render(semantic_payload, "json"), encoding="utf-8")
     semantic_packet = semantic_payload["semantic_debug"]
 
@@ -2293,8 +2335,8 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         },
         "source_read_order": [
             "chronology_source_reach.copyable_next_reads",
-            "core_convo_first_read_plan",
             "target_historical_source_window_reads",
+            "core_convo_first_read_plan",
             "repo_phase_category_evidence",
             "diagnostic_source_window_reads",
         ],
@@ -2310,6 +2352,18 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
                 "diagnostic-only unless the user explicitly asks to audit current output, "
                 "the current route, the current lane, or a prior answer/report"
             ),
+        },
+        "generic_recovery_policy": {
+            "primary_recovery_surface": "chronology_source_reach.copyable_next_reads",
+            "broad_repo_missing_role_actions": "demoted_to_secondary_context_only",
+            "repo_artifact_roots_are_primary_raw_recovery": False,
+        },
+        "output_contract": {
+            "stdout": "ask prints the selected format and is not suppressed by report-output",
+            "report_output_format": "json",
+            "report_output": str(Path(args.report_output).expanduser()),
+            "linked_report_format": "json",
+            "jq_rule": "Run jq only against .json report paths; --format text output is terminal text.",
         },
         "repo_phase_category_evidence": repo_phase_category_evidence,
         "failure_analysis": {
@@ -2346,6 +2400,43 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         encoding="utf-8",
     )
     return {"devlog_failure_analysis": compact}
+
+
+DEVLOG_BROAD_REPO_RECOVERY_TARGETS = {
+    ".",
+    "tasks reports codex/state/reviews",
+    "tasks reports codex/state",
+}
+
+
+def _demote_devlog_generic_repo_recovery(value: object) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _demote_devlog_generic_repo_recovery(item)
+        return
+    if not isinstance(value, dict):
+        return
+    if (
+        value.get("kind") == "missing_role_recovery_command"
+        and str(value.get("target") or "") in DEVLOG_BROAD_REPO_RECOVERY_TARGETS
+    ):
+        value.update(
+            {
+                "diagnostic_only": True,
+                "default_actionable": False,
+                "final_support_allowed": False,
+                "followthrough_actionable": False,
+                "read_more_actionable": False,
+                "source_tier": "legitimate_pre_existing_secondary_context",
+                "demotion_reason": "devlog_primary_roles_require_bounded_april_raw_history",
+                "recovery_instruction": (
+                    "Secondary context only. Do not run this broad repo search for a missing April primary role; "
+                    "use chronology_source_reach.copyable_next_reads."
+                ),
+            }
+        )
+    for child in value.values():
+        _demote_devlog_generic_repo_recovery(child)
 
 
 DEVLOG_REPO_ARTIFACT_PREFIXES = (
@@ -2428,6 +2519,21 @@ DEVLOG_RETAINED_SEMANTIC_REPORT_RE = re.compile(
     r"(?P<path>\.private/[A-Za-z0-9_+./-]+/semantic-debug\.json)"
 )
 DEVLOG_PRIMARY_RECOVERY_REPORT_DIR = ".private/jsonl/devlog-chronology"
+DEVLOG_PRIMARY_WINDOW_START_UTC = "2026-04-13T16:00:48.508Z"
+# Exclusive bound that includes JSH-896's last observed event at 12:27:59.905Z.
+DEVLOG_PRIMARY_WINDOW_END_UTC = "2026-04-17T12:28:00Z"
+DEVLOG_CODEX_APRIL_ROOTS = (
+    "$HOME/.codex/sessions/2026/04/13",
+    "$HOME/.codex/sessions/2026/04/14",
+    "$HOME/.codex/sessions/2026/04/15",
+    "$HOME/.codex/sessions/2026/04/16",
+    "$HOME/.codex/sessions/2026/04/17",
+    "$HOME/.codex/history.jsonl",
+)
+DEVLOG_CLAUDE_MTIME_START = "2026-04-13 16:00:48 UTC"
+DEVLOG_CLAUDE_MTIME_END = "2026-04-17 12:28:00 UTC"
+DEVLOG_PRIMARY_RECOVERY_MAX_FILES = 250
+DEVLOG_PRIMARY_RECOVERY_MAX_BYTES = 175_000_000
 DEVLOG_PRIMARY_RECOVERY_QUERIES = {
     "first_appearance": (
         "Find the earliest primary raw user or assistant source window from "
@@ -2468,7 +2574,7 @@ def _build_devlog_chronology_source_reach(
     missing_roles = [role for role in DEVLOG_CHRONOLOGY_ROLE_ORDER if not primary_by_role[role]]
     retained_reports = list(retained_reports or [])
     primary_recovery_reads = {
-        role: _devlog_primary_recovery_reads(role, retained_reports=retained_reports)
+        role: _devlog_primary_recovery_reads(role)
         for role in missing_roles
     }
     copyable_next_reads = []
@@ -2592,7 +2698,7 @@ def _load_devlog_retained_primary_reads(
     return target_reads[:12], diagnostic_reads[:12]
 
 
-def _devlog_primary_recovery_reads(role: str, *, retained_reports: list[dict]) -> list[dict]:
+def _devlog_primary_recovery_reads(role: str) -> list[dict]:
     if role == "later_change":
         path = DEVLOG_LATER_CHANGE_GIT_PATH
         return [
@@ -2610,49 +2716,96 @@ def _devlog_primary_recovery_reads(role: str, *, retained_reports: list[dict]) -
             }
         ]
 
+    return [
+        _devlog_provider_primary_recovery_read(role, provider="codex"),
+        _devlog_provider_primary_recovery_read(role, provider="claude"),
+    ]
+
+
+def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
     query = DEVLOG_PRIMARY_RECOVERY_QUERIES[role]
-    report_path = f"{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}/{role}-semantic-debug.json"
-    search_command = (
-        f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}" && '
-        f"jsonl-history-search semantic-debug {shlex.quote(query)} --cwd \"$PWD\" "
-        "--max-files 200 --max-bytes 100000000 --max-matches 40 --max-elapsed 20 "
-        "--timezone-offset +10:00 --watchlist process_drift "
+    report_path = f"{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}/{role}-{provider}-semantic-debug.json"
+    common_flags = (
+        f"--allow-arbitrary-root --hard-cap-files {DEVLOG_PRIMARY_RECOVERY_MAX_FILES} "
+        f"--hard-cap-bytes {DEVLOG_PRIMARY_RECOVERY_MAX_BYTES} "
+        f"--max-files {DEVLOG_PRIMARY_RECOVERY_MAX_FILES} "
+        f"--max-bytes {DEVLOG_PRIMARY_RECOVERY_MAX_BYTES} "
+        f"--max-matches {DEVLOG_PRIMARY_RECOVERY_MAX_FILES} --max-elapsed 45 "
+        f"--since {DEVLOG_PRIMARY_WINDOW_START_UTC} --until {DEVLOG_PRIMARY_WINDOW_END_UTC} "
+        "--timezone-offset +00:00 --watchlist process_drift "
         "--watchlist docker_harness_auth_live_send --watchlist product_vs_process_churn "
+    )
+    if provider == "codex":
+        root_flags = " ".join(f'--root "{root}"' for root in DEVLOG_CODEX_APRIL_ROOTS)
+        preamble = f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
+        source_scope = ["codex_sessions_april_13_17", "codex_history"]
+        root_contract = {
+            "provider": "codex",
+            "roots": list(DEVLOG_CODEX_APRIL_ROOTS),
+            "scope_boundary": "April 13-17 Codex session buckets plus Codex history only",
+        }
+    else:
+        root_flags = '"${CLAUDE_ROOT_ARGS[@]}"'
+        preamble = (
+            "CLAUDE_ROOT_ARGS=() && "
+            "while IFS= read -r -d '' path; do CLAUDE_ROOT_ARGS+=(--root \"$path\"); done "
+            f'< <(find "$HOME/.claude/projects" -type f -name \'*.jsonl\' '
+            f"-newermt {shlex.quote(DEVLOG_CLAUDE_MTIME_START)} "
+            f"! -newermt {shlex.quote(DEVLOG_CLAUDE_MTIME_END)} -print0) && "
+            'test "${#CLAUDE_ROOT_ARGS[@]}" -gt 0 || { '
+            "printf 'No Claude project-log files in the bounded April window; primary role remains missing.\\n' >&2; "
+            'exit 2; } && '
+            f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
+        )
+        source_scope = ["claude_project_logs_april_mtime_candidates"]
+        root_contract = {
+            "provider": "claude",
+            "root_discovery": "individual Claude project JSONL files whose mtime overlaps the JSH-896 window",
+            "mtime_window": {
+                "start": DEVLOG_CLAUDE_MTIME_START,
+                "end": DEVLOG_CLAUDE_MTIME_END,
+            },
+            "scope_boundary": (
+                "bounded April-mtime Claude project logs only, with exact record timestamps enforced by --since/--until; "
+                "fail closed if no candidate files exist"
+            ),
+        }
+    command = (
+        f"{preamble} && jsonl-history-search semantic-debug {shlex.quote(query)} --cwd \"$PWD\" "
+        f"{root_flags} {common_flags}"
         f'--report-output "$PWD/{report_path}" --format text && '
         "jsonl-history-search follow-next-reads "
         f'--from-report "$PWD/{report_path}" --kind recovery --limit 5 --format text'
     )
-    retained = retained_reports[0] if retained_reports else None
-    if retained:
-        retained_path = retained["relative_path"]
-        command = (
-            f'if test -f "$PWD/{retained_path}"; then '
-            "jsonl-history-search follow-next-reads "
-            f'--from-report "$PWD/{retained_path}" --kind recovery --limit 5 --format text; '
-            f"fi; {search_command}"
-        )
-        source_handle = retained["safe_handle"]
-    else:
-        command = search_command
-        source_handle = f"private:{report_path[len('.private/') :]}"
-    return [
-        {
-            "role": role,
-            "kind": "primary_raw_history_recovery",
-            "source_handle": source_handle,
-            "recovery_output_handle": f"private:{report_path[len('.private/') :]}",
-            "historical_window_utc": {
-                "start": "2026-04-13T16:00:48Z",
-                "end": "2026-04-17T12:27:59Z",
-            },
-            "source_scope": ["codex_sessions", "codex_history", "claude_project_logs"],
-            "command": command,
-            "purpose": (
-                f"Recover bounded primary user/assistant source refs for {role}; "
-                "current-run, synthetic, task-assignment, and post-hoc artifacts remain non-answering."
+    return {
+        "role": role,
+        "kind": "primary_raw_history_recovery",
+        "provider": provider,
+        "source_handle": f"private:{report_path[len('.private/') :]}",
+        "recovery_output_handle": f"private:{report_path[len('.private/') :]}",
+        "historical_window_utc": {
+            "start": DEVLOG_PRIMARY_WINDOW_START_UTC,
+            "end": DEVLOG_PRIMARY_WINDOW_END_UTC,
+            "filter_contract": "inclusive --since and exclusive --until record filter",
+        },
+        "source_scope": source_scope,
+        "root_contract": root_contract,
+        "output_contract": {
+            "stdout_format": "text",
+            "stdout_use": "readable compact semantic-debug handoff followed by bounded recovery reads",
+            "report_output_format": "json",
+            "report_output_path": f"$PWD/{report_path}",
+            "report_output_rule": (
+                "The .json report-output suffix writes a JSON sidecar; --format text controls stdout only. "
+                "Run jq only against the JSON sidecar, not terminal text."
             ),
-        }
-    ]
+        },
+        "command": command,
+        "purpose": (
+            f"Recover bounded primary user/assistant source refs for {role} from {provider} raw history; "
+            "current-run, synthetic, task-assignment, post-hoc, and repo-artifact rows remain non-answering."
+        ),
+    }
 
 
 def _compact_devlog_chronology_primary_read(read: dict) -> dict:
@@ -3999,6 +4152,7 @@ def _answer_action_contract_from_executed_output(
         chronology_source_reach = compact.get("chronology_source_reach") or {}
         repo_evidence = compact.get("repo_phase_category_evidence") or {}
         failure_analysis = compact.get("failure_analysis") or {}
+        copyable_reads = chronology_source_reach.get("copyable_next_reads") or []
         return {
             "answer_status": chronology_source_reach.get("answer_status")
             or "fail_closed_missing_chronology_roles",
@@ -4007,17 +4161,24 @@ def _answer_action_contract_from_executed_output(
                 "The devlog/failure-analysis route is a source-reach package, not final prose; "
                 "open role-complete target historical source-window reads before answering."
             ),
-            "core_convo_first_read_plan": core_plan,
-            "chronology_source_reach": chronology_source_reach,
-            "read": chronology_source_reach.get("copyable_next_reads")
-            or core_plan.get("read")
-            or target_reads,
+            "core_convo_first_read_plan": _compact_devlog_core_plan_for_stdout(core_plan),
+            "chronology_source_reach": _compact_devlog_chronology_for_stdout(
+                chronology_source_reach,
+                include_reads=False,
+            ),
+            "read": copyable_reads or core_plan.get("read") or target_reads,
             "then_use": {
-                "failure_analysis_devlog_brief": failure_analysis.get("devlog_brief"),
-                "repo_phase_category_evidence": repo_evidence,
+                "failure_analysis": _compact_devlog_failure_analysis_for_stdout(failure_analysis),
+                "repo_phase_category_evidence": _compact_devlog_repo_evidence_for_stdout(repo_evidence),
             },
-            "diagnostics_after": core_plan.get("diagnostics_after")
-            or list(compact.get("diagnostic_source_window_reads") or []),
+            "diagnostics_after": {
+                "count": len(
+                    core_plan.get("diagnostics_after")
+                    or list(compact.get("diagnostic_source_window_reads") or [])
+                ),
+                "default_actionable": False,
+                "source": "report_output diagnostic_source_window_reads",
+            },
             "diagnostic_policy": compact.get("diagnostic_policy"),
             "stop": selected_route.get("stop_guidance"),
             "only_continue_if": (compact.get("answer_contract") or {}).get("only_continue_if")
@@ -6789,6 +6950,67 @@ def _searched_scope_root_privacy_labels(searched_scope: dict) -> list[str]:
     )
 
 
+def _compact_devlog_chronology_for_stdout(chronology: dict, *, include_reads: bool = True) -> dict:
+    primary_role_reads = chronology.get("primary_role_reads") or {}
+    artifact_role_leads = chronology.get("artifact_role_leads") or {}
+    compact = {
+        "status": chronology.get("status"),
+        "answer_status": chronology.get("answer_status"),
+        "answer_allowed": chronology.get("answer_allowed"),
+        "required_roles": chronology.get("required_roles"),
+        "covered_primary_roles": chronology.get("covered_primary_roles"),
+        "missing_roles": chronology.get("missing_roles"),
+        "primary_role_read_counts": {
+            role: len(reads or []) for role, reads in primary_role_reads.items()
+        },
+        "artifact_role_lead_counts": {
+            role: len(reads or []) for role, reads in artifact_role_leads.items()
+        },
+        "copyable_next_read_count": len(chronology.get("copyable_next_reads") or []),
+        "retained_primary_report_handles": chronology.get("retained_primary_report_handles"),
+        "stop_condition": chronology.get("stop_condition"),
+        "claim_boundary": chronology.get("claim_boundary"),
+    }
+    if include_reads:
+        compact["copyable_next_reads"] = chronology.get("copyable_next_reads") or []
+    return compact
+
+
+def _compact_devlog_core_plan_for_stdout(core_plan: dict) -> dict:
+    reads = list(core_plan.get("read") or [])
+    return {
+        "plan_name": core_plan.get("plan_name"),
+        "target_source_role_order": core_plan.get("target_source_role_order"),
+        "role_counts": core_plan.get("role_counts"),
+        "read_count": len(reads),
+        "first_read_role": reads[0].get("target_source_role") if reads else None,
+        "diagnostic_count": len(core_plan.get("diagnostics_after") or []),
+        "secondary_context_only_after_chronology_recovery": True,
+    }
+
+
+def _compact_devlog_repo_evidence_for_stdout(repo_evidence: dict) -> dict:
+    return {
+        "status": repo_evidence.get("status"),
+        "row_count": repo_evidence.get("row_count"),
+        "category_ids": repo_evidence.get("category_ids"),
+        "source_policy": repo_evidence.get("source_policy"),
+        "use": "secondary context only; full rows are in report_output",
+    }
+
+
+def _compact_devlog_failure_analysis_for_stdout(failure_analysis: dict) -> dict:
+    devlog_brief = failure_analysis.get("devlog_brief") or {}
+    story_summary = failure_analysis.get("story_phase_summary") or {}
+    return {
+        "status": failure_analysis.get("status"),
+        "report_written": failure_analysis.get("report_written"),
+        "devlog_brief_status": devlog_brief.get("status"),
+        "story_phase_status": story_summary.get("status"),
+        "use": "secondary synthesis after primary role reads; full packet is in the linked report",
+    }
+
+
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
     if output_key == "artifact_currentness":
         worktree = compact.get("worktree_currentness") or {}
@@ -6871,23 +7093,34 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "message": compact.get("message"),
         }
     if output_key == "devlog_failure_analysis":
+        chronology_summary = _compact_devlog_chronology_for_stdout(
+            compact.get("chronology_source_reach") or {},
+            include_reads=False,
+        )
         return {
             "schema_version": compact.get("schema_version"),
             "status": compact.get("status"),
             "report_written": compact.get("report_written"),
             "linked_reports": compact.get("linked_reports"),
             "source_read_order": compact.get("source_read_order"),
-            "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
-            "chronology_source_reach": compact.get("chronology_source_reach"),
-            "target_historical_source_window_reads": compact.get("target_historical_source_window_reads", [])[:5],
+            "core_convo_first_read_plan": _compact_devlog_core_plan_for_stdout(
+                compact.get("core_convo_first_read_plan") or {}
+            ),
+            "chronology_source_reach": chronology_summary,
+            "target_historical_source_window_reads": compact.get("target_historical_source_window_reads", [])[:3],
             "target_historical_source_window_read_count": compact.get(
                 "target_historical_source_window_read_count"
             ),
-            "repo_phase_category_evidence": compact.get("repo_phase_category_evidence"),
-            "failure_analysis": compact.get("failure_analysis"),
-            "diagnostic_source_window_reads": compact.get("diagnostic_source_window_reads", [])[:5],
+            "repo_phase_category_evidence": _compact_devlog_repo_evidence_for_stdout(
+                compact.get("repo_phase_category_evidence") or {}
+            ),
+            "failure_analysis": _compact_devlog_failure_analysis_for_stdout(
+                compact.get("failure_analysis") or {}
+            ),
             "diagnostic_source_window_read_count": compact.get("diagnostic_source_window_read_count"),
             "diagnostic_policy": compact.get("diagnostic_policy"),
+            "generic_recovery_policy": compact.get("generic_recovery_policy"),
+            "output_contract": compact.get("output_contract"),
             "privacy_flags": compact.get("privacy_flags"),
             "message": (
                 "Full devlog/failure-analysis source-reach package written to report_output; "

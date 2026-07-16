@@ -178,13 +178,27 @@ class QueryIntent:
         }
 
 
-def infer_query(query: str, *, now: datetime, role: str | None = None) -> QueryIntent:
+def infer_query(
+    query: str,
+    *,
+    now: datetime,
+    role: str | None = None,
+    date_window_start: datetime | None = None,
+    date_window_end: datetime | None = None,
+    date_reason: str | None = None,
+) -> QueryIntent:
     normalized = " ".join(query.lower().split())
     inferred_role = role or infer_role(normalized)
     role_filter_explicit = role is not None
-    start, end, reason = infer_date_window(normalized, now)
+    inferred_start, inferred_end, inferred_reason = infer_date_window(normalized, now)
+    start = date_window_start if date_window_start is not None else inferred_start
+    end = date_window_end if date_window_end is not None else inferred_end
+    reason = date_reason if date_window_start is not None and date_window_end is not None else inferred_reason
     temporal_question_reason = infer_temporal_question(normalized)
-    date_window_filter = infer_date_window_filter(normalized, reason)
+    date_window_filter = bool(date_window_start is not None and date_window_end is not None) or infer_date_window_filter(
+        normalized,
+        reason,
+    )
     artifact_hints = infer_artifacts(normalized)
     base_terms = infer_terms(normalized, artifact_hints)
     expanded = expand_query_terms(

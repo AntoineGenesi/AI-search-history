@@ -410,6 +410,14 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append("Only continue if:")
         _append_compact_read_contract(lines, only_continue)
     executed = report.get("executed_output") or {}
+    if route.get("route_family") == "devlog_failure_analysis":
+        output_contract = executed.get("output_contract") or {}
+        if output_contract:
+            lines.append(
+                "Output contract: stdout is readable text; report-output and linked reports are "
+                f"{output_contract.get('report_output_format') or 'JSON'} sidecars."
+            )
+            lines.append(f"jq rule: {output_contract.get('jq_rule')}")
     if executed.get("status"):
         lines.append(f"Executed output status: {executed.get('status')}")
     if executed.get("message"):
