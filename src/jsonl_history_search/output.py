@@ -886,10 +886,25 @@ def _append_compact_read_contract(lines: list[str], value: object, *, markdown: 
                 reason = item.get("reason") or item.get("purpose")
                 rendered = command or target or source_target or reason or str(item)
                 lines.append(f"{bullet}{rendered}")
+                inspection_command = _ask_execute_source_inspection_command(item)
+                if inspection_command:
+                    lines.append(f"  read-more: {inspection_command}")
             else:
                 lines.append(f"{bullet}{item}")
         return
     lines.append(f"{bullet}{value}")
+
+
+def _ask_execute_source_inspection_command(item: dict) -> str | None:
+    if _read_marked_diagnostic_or_nonactionable(item):
+        return None
+    target = _source_target(item)
+    if not _is_jsonl_read_target(target):
+        return None
+    return (
+        f"jsonl-history-search read-more {shlex.quote(target)} "
+        '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+    )
 
 
 def render_ask_router_markdown(payload: dict) -> str:
