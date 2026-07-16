@@ -1072,6 +1072,20 @@ def _read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
     return commands
 
 
+def _bounded_text_read_more_commands_by_target(reads: list[dict]) -> dict[str, str]:
+    commands: dict[str, str] = {}
+    for read in reads:
+        if _read_marked_diagnostic_or_nonactionable(read):
+            continue
+        target = _source_target(read)
+        if target and _is_jsonl_read_target(target) and target not in commands:
+            commands[target] = (
+                f"jsonl-history-search read-more {shlex.quote(target)} "
+                '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+            )
+    return commands
+
+
 COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON = (
     "reviewed_source_multifacet_provenance_window_covers_task_review_branch_commit_and_notes"
 )
@@ -1841,7 +1855,7 @@ def render_semantic_wrapup_text(payload: dict) -> str:
     reads = report.get("next_reads") or []
     required_reads = _required_surface_reads(reads)
     diagnostic_reads = [read for read in reads if isinstance(read, dict) and read not in required_reads]
-    command_by_target = _read_more_commands_by_target(required_reads)
+    command_by_target = _bounded_text_read_more_commands_by_target(required_reads)
     read_role_summary = report.get("read_role_summary") or {}
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
     answer_status = _source_use_answer_status(
