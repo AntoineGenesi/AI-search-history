@@ -2212,6 +2212,15 @@ def _ask_execute_report_output_unavailable(
             execution_kind=execution_kind,
             report_output=report_output,
         )
+    if execution_kind == "semantic-debug":
+        provenance = _provenance_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+            fallback_command=fallback_command,
+        )
+        if provenance:
+            return provenance
     contract["ask_execute"]["execution"].update(
         {
             "status": "report_output_unavailable",
@@ -2230,6 +2239,67 @@ def _ask_execute_report_output_unavailable(
     contract["ask_execute"]["answer_action_contract"]["promotion_status"] = (
         "route_only_report_output_unavailable"
     )
+    return contract
+
+
+def _provenance_report_output_unavailable(
+    contract: dict,
+    *,
+    execution_kind: str,
+    report_output: str,
+    fallback_command: str | None,
+) -> dict:
+    ask_execute = contract["ask_execute"]
+    selected_route = ask_execute.get("selected_route") or {}
+    query = str(ask_execute.get("query") or "")
+    route_family = str(selected_route.get("route_family") or "")
+    if not _named_task_merge_provenance_source_session_wanted(query):
+        return {}
+    handoff = _named_task_merge_provenance_execute_artifact_handoff(
+        query=query,
+        cwd=str(ask_execute.get("cwd") or "."),
+        route_family=route_family,
+    )
+    if handoff.get("status") != "completed_task_merge_artifact_refs_available_source_session_missing":
+        return {}
+
+    ask_execute["execution"].update(
+        {
+            "status": "report_output_unavailable",
+            "command_family": execution_kind,
+            "argv": [],
+            "report_output": report_output,
+            "report_written": None,
+            "fallback_command": fallback_command,
+            "reason": (
+                "The report destination is not writable. Same-task task/review/merge evidence is still "
+                "available as partial proof, but no raw source-session evidence was opened by this route."
+            ),
+        }
+    )
+    ask_execute["execution_status"] = "report_output_unavailable"
+    ask_execute["answer_action_contract"] = {
+        "answer_status": "not-ready/missing-source-session-proof",
+        "promotion_status": "completed_task_merge_only_partial_source_session_unopened",
+        "promotion_reason": (
+            "The report-unavailable path preserves validated task/review/true-merge leads as partial "
+            "evidence. Source-session proof remains blocked until a role-valid raw/session source is opened."
+        ),
+        "read": handoff.get("read") or [],
+        "named_task_merge_provenance_handoff": handoff,
+        "source_inspection_boundary": {
+            "decision": "report_merge_only_partial_and_recover_source_session",
+            "answer_allowed": False,
+            "inspect_required_primary_proof_before_answer": True,
+            "required_primary_proof_source": "same_task_opened_raw_source_session",
+            "missing_roles": ["source_session_proof"],
+            "unopened_private_handles_are_leads_only": True,
+            "report_output_unavailable_is_product_defect": False,
+        },
+        "stop": handoff.get("stop"),
+        "only_continue_if": handoff.get("only_continue_if"),
+        "saved_report": None,
+    }
     return contract
 
 
@@ -4750,6 +4820,26 @@ def _answer_action_contract_from_executed_output(
                 "artifact_proof_default_final_support": False,
                 "diagnostics_default_final_support": False,
             }
+        elif (
+            merge_artifact_handoff.get("status")
+            == "completed_task_merge_artifact_refs_available_source_session_missing"
+        ):
+            answer_status = "not-ready/missing-source-session-proof"
+            promotion_status = "semantic_debug_completed_task_merge_only_partial_source_session_unopened"
+            promotion_reason = (
+                "ask --execute semantic-debug found completed-task task/review/true-merge evidence, but the "
+                "explicitly requested source-session facet is still missing. Report merge-only partial evidence "
+                "and do not promote artifact prose or unopened private handles as source-session proof."
+            )
+            source_inspection_boundary = {
+                "decision": "report_merge_only_partial_and_recover_source_session",
+                "answer_allowed": False,
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "same_task_opened_raw_source_session",
+                "missing_roles": ["source_session_proof"],
+                "unopened_private_handles_are_leads_only": True,
+                "diagnostics_default_final_support": False,
+            }
         elif merge_artifact_handoff.get("status") == "completed_task_merge_artifact_refs_available":
             answer_status = "answer-ready-after-source-inspection"
             promotion_status = "semantic_debug_completed_task_merge_artifact_proof_ready_after_source_inspection"
@@ -6160,9 +6250,21 @@ def _named_task_merge_provenance_execute_artifact_handoff(
         if "merge_commit" in surfaces
         else "single-parent integration/final-review commit"
     )
+    source_session_requested = _named_task_merge_provenance_source_session_wanted(query)
+    missing_roles = ["source_session_proof"] if source_session_requested else []
+    status = (
+        "completed_task_merge_artifact_refs_available_source_session_missing"
+        if source_session_requested
+        else "completed_task_merge_artifact_refs_available"
+    )
+    available_roles = ["task_artifact_proof", "review_artifact_proof"]
+    if "merge_commit" in surfaces:
+        available_roles.append("merge_commit_proof")
+    else:
+        available_roles.append("integration_commit_proof")
     return {
         "schema_version": 1,
-        "status": "completed_task_merge_artifact_refs_available",
+        "status": status,
         "git_proof_kind": git_proof_label,
         "task_ids": _ask_execute_named_task_ids(query)[:2],
         "read": refs[:8],
@@ -6176,18 +6278,31 @@ def _named_task_merge_provenance_execute_artifact_handoff(
                 "link": "semantic_debug.core_convo_first_read_plan",
             }
         ],
-        "stop": (
-            "Inspect same-task task/review/git artifact refs first; they satisfy completed-task "
-            f"provenance artifact roles through {git_proof_label}, not raw worker/session chronology."
-        ),
         "only_continue_if": [
             "the same-task task artifact, review artifact, and git integration/merge proof do not cover the requested artifact proof",
-            "the user explicitly asks for raw worker/session chronology, which these artifact refs do not satisfy",
+            "open role-valid same-task raw/session evidence before claiming source-session proof; unopened private handles in artifact prose are leads only",
         ],
-        "missing_roles": [],
+        "answer_allowed": not source_session_requested,
+        "available_roles": available_roles,
+        "missing_roles": missing_roles,
+        "blocking_missing_roles": missing_roles,
+        "partial_evidence_status": (
+            "merge_only_partial_evidence" if source_session_requested else "artifact_proof_available"
+        ),
         "source_boundary": (
             "completed task/review/git artifacts can prove completed-task integration provenance artifact roles; "
-            "single-parent integration/final-review commits are not true two-parent merge commits and do not prove raw worker chronology"
+            "single-parent integration/final-review commits are not true two-parent merge commits, and artifact "
+            "prose or unopened private handles do not prove raw source-session chronology"
+        ),
+        "stop": (
+            "Report the task/review/git merge evidence as partial proof, but fail closed on source-session proof "
+            "until a role-valid raw/session source is opened. Missing or unavailable private history is a proof "
+            "availability boundary, not itself a product defect."
+            if source_session_requested
+            else (
+                "Inspect same-task task/review/git artifact refs first; they satisfy completed-task "
+                f"provenance artifact roles through {git_proof_label}, not raw worker/session chronology."
+            )
         ),
     }
 
@@ -14599,6 +14714,18 @@ def _named_task_merge_provenance_final_proof_gate(
         summary_lines.append(
             "Named-task merge provenance proof is missing required roles: " + ", ".join(blocking_missing) + "."
         )
+        merge_commits = _unique_preserving_order(
+            str(commit)
+            for item in role_evidence.get("merge_commit_proof") or []
+            for commit in item.get("merge_commits") or [item.get("commit") or item.get("target")]
+            if str(commit or "").strip()
+        )
+        if merge_commits:
+            summary_lines.append(
+                "Merge facet partial proof retained: reachable true merge commit "
+                + ", ".join(commit[:12] for commit in merge_commits[:2])
+                + "; this does not satisfy source-session proof."
+            )
     elif missing:
         summary_lines.append(
             "Named-task merge provenance proof has task/review/merge roles; missing non-fabricated roles: "
@@ -14620,9 +14747,14 @@ def _named_task_merge_provenance_final_proof_gate(
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
-            "Open same-task task artifact, review artifact, and an actual parent merge commit; also open "
-            "same-task source-session proof when the question requests raw/source-session chronology "
-            f"for {task_id or 'the named task'} before answering merge provenance."
+            "Open a role-valid same-task raw JSONL/session ref before claiming source-session proof; "
+            "an unopened private handle in task or review prose is only a lead."
+            if blocking_missing == ["source_session_proof"]
+            else (
+                "Open same-task task artifact, review artifact, and an actual parent merge commit; also open "
+                "same-task source-session proof when the question requests raw/source-session chronology "
+                f"for {task_id or 'the named task'} before answering merge provenance."
+            )
         ),
         "acceptable_evidence": [
             "source-session row or raw transcript reference for the task implementation/review/merge episode",
@@ -14655,8 +14787,6 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
             continue
         ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
         target = str(item.get("target") or item.get("path") or ref.get("target") or ref.get("path") or "")
-        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
-        source_path = str(source_ref.get("path") or "")
         text = " ".join(
             str(value or "")
             for value in (
@@ -14671,18 +14801,7 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         if task_id and _named_task_fragment_mentions_other_task_id(text, task_id):
             continue
         public = _ref_public_summary(item)
-        source_surface_text = " ".join(
-            str(value or "")
-            for value in (
-                target,
-                source_path,
-                ref.get("kind"),
-                ref.get("proof_surface"),
-                ref.get("target_source_role"),
-                ref.get("proof_role"),
-            )
-        ).casefold()
-        if ".jsonl" in source_surface_text or "session" in source_surface_text:
+        if _opened_named_task_source_session_proof(item):
             evidence["source_session_proof"].append(public)
         if ref.get("proof_surface") == "task_file" or "/tasks/" in f"/{target}".casefold():
             evidence["task_artifact_proof"].append(public)
@@ -14715,6 +14834,7 @@ def _named_task_merge_provenance_gate_public_contract(gate: dict) -> dict:
         "missing_roles": list(gate.get("missing_roles") or []),
         "blocking_missing_roles": list(gate.get("blocking_missing_roles") or []),
         "role_evidence": gate.get("role_evidence") or {},
+        "summary_lines": list(gate.get("summary_lines") or []),
         "required_next_proof": gate.get("required_next_proof"),
         "acceptable_evidence": list(gate.get("acceptable_evidence") or []),
     }
@@ -14760,21 +14880,48 @@ def _named_task_merge_provenance_role_summary(summaries: list[str]) -> str:
 def _named_task_source_session_proof_summaries(opened: list[dict]) -> list[str]:
     summaries: list[str] = []
     for item in opened:
-        target = str(item.get("target") or item.get("path") or "").casefold()
-        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
-        kind = str(ref.get("kind") or "")
-        proof_surface = str(ref.get("proof_surface") or "")
-        target_role = str(ref.get("target_source_role") or "")
-        proof_role = str(ref.get("proof_role") or "")
-        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
-        source_path = str(source_ref.get("path") or "").casefold()
-        source_surface_text = " ".join([target, source_path, kind, proof_surface, target_role, proof_role]).casefold()
-        if ".jsonl" not in source_surface_text and "session" not in source_surface_text:
+        if not _opened_named_task_source_session_proof(item):
             continue
         summary = str(item.get("summary") or "").strip()
         if summary:
             summaries.append(summary)
     return summaries
+
+
+_NAMED_TASK_SOURCE_SESSION_ROLES = frozenset(
+    {"target_historical_raw", "raw_worker_chronology", "source_session_proof"}
+)
+_NAMED_TASK_SOURCE_SESSION_KINDS = frozenset(
+    {
+        "jsonl_source_ref",
+        "tool_event_source_ref",
+        "primary_source_window",
+        "source_window",
+    }
+)
+
+
+def _opened_named_task_source_session_proof(item: dict) -> bool:
+    if item.get("status") != "opened" or not str(item.get("summary") or "").strip():
+        return False
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if ref.get("final_support_allowed") is False or ref.get("diagnostic_only") is True:
+        return False
+    target_role = str(ref.get("target_source_role") or "")
+    if target_role not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return False
+    kind = str(ref.get("kind") or "")
+    source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+    source_path = str(
+        source_ref.get("path")
+        or item.get("path")
+        or item.get("target")
+        or ref.get("path")
+        or ref.get("target")
+        or ""
+    ).casefold()
+    raw_file_surface = bool(re.search(r"\.(?:jsonl|json)(?::\d+)?$", source_path))
+    return raw_file_surface and (kind in _NAMED_TASK_SOURCE_SESSION_KINDS or source_path.endswith(".jsonl"))
 
 
 def _named_task_merge_commit_hashes(opened: list[dict], *, task_id: str) -> list[str]:
@@ -14788,17 +14935,7 @@ def _named_task_merge_commit_hashes(opened: list[dict], *, task_id: str) -> list
                 if direct_commit not in commits:
                     commits.append(direct_commit)
                 continue
-        target = str(item.get("target") or item.get("path") or ref.get("target") or ref.get("path") or "")
-        raw_session_surface = ".jsonl" in target.casefold() or "session" in " ".join(
-            str(value or "")
-            for value in (
-                ref.get("kind"),
-                ref.get("proof_surface"),
-                ref.get("target_source_role"),
-                ref.get("proof_role"),
-            )
-        ).casefold()
-        if not raw_session_surface:
+        if not _opened_named_task_source_session_proof(item):
             continue
         summary = str(item.get("summary") or "").strip()
         if not summary:
