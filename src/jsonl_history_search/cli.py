@@ -9087,13 +9087,25 @@ def _ask_answer_finalization_veto(
             merge_gate=merge_gate,
         )
     ):
+        source_session_proof_reconciled = (
+            str(action.get("answer_status") or "").casefold()
+            == "not-ready/missing-source-session-proof"
+            and str(action.get("promotion_status") or "").casefold()
+            == "semantic_debug_completed_task_merge_only_partial_source_session_unopened"
+        )
         answer["source_contract"]["named_task_merge_provenance_finalization_override"] = {
             "schema_version": 1,
-            "status": "completed_task_artifact_gate_overrode_generic_target_source_role_mismatch",
+            "status": (
+                "opened_source_session_proof_overrode_stale_missing_source_session_contract"
+                if source_session_proof_reconciled
+                else "completed_task_artifact_gate_overrode_generic_target_source_role_mismatch"
+            ),
             "overridden_answer_action_status": action.get("answer_status"),
             "overridden_promotion_status": action.get("promotion_status"),
             "boundary": (
-                "task/review/git integration-or-merge artifacts are final support for completed-task provenance; "
+                "the final provenance gate opened role-valid same-task source-session, task, review, and merge proof"
+                if source_session_proof_reconciled
+                else "task/review/git integration-or-merge artifacts are final support for completed-task provenance; "
                 "raw worker/session chronology remains unproven unless separately opened"
             ),
         }
@@ -9142,6 +9154,16 @@ def _named_task_merge_provenance_artifact_gate_can_override_action_contract(
         return False
     answer_status = str(action.get("answer_status") or "").casefold()
     promotion_status = str(action.get("promotion_status") or "").casefold()
+    stale_missing_source_session = (
+        answer_status == "not-ready/missing-source-session-proof"
+        and promotion_status
+        == "semantic_debug_completed_task_merge_only_partial_source_session_unopened"
+    )
+    if stale_missing_source_session:
+        return _named_task_merge_provenance_role_satisfied(
+            "source_session_proof",
+            role_evidence,
+        )
     generic_target_mismatch = (
         "target-source-role-mismatch" in answer_status
         or "target-source-role-mismatch" in promotion_status
