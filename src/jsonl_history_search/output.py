@@ -403,6 +403,9 @@ def render_ask_execute_text(payload: dict) -> str:
     ]
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
+    if execution.get("status") == "report_output_unavailable":
+        lines.append(f"Report output unavailable: {execution.get('reason')}")
+        lines.append(f"Fallback command: {execution.get('fallback_command')}")
     if execution.get("status") == "unsupported_route":
         lines.append(f"Unsupported route: {execution.get('reason')}")
         lines.append(f"Stop condition: {route.get('stop_guidance')}")
@@ -500,6 +503,9 @@ def render_ask_execute_markdown(payload: dict) -> str:
     ]
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
+    if execution.get("status") == "report_output_unavailable":
+        lines.append(f"- Report output unavailable: {execution.get('reason')}")
+        lines.append(f"- Fallback command: `{execution.get('fallback_command')}`")
     lines.extend(
         [
             "",
