@@ -32,7 +32,7 @@ MAX_SNIPPET_CHARS = 220
 def build_coordinator_context_payload(*, cwd: str | Path, query: str, report_output: str | Path | None = None) -> dict:
     repo = Path(cwd).expanduser().resolve()
     file_texts = _read_context_files(repo)
-    active_task_handles = _active_task_handles(file_texts)
+    active_task_handles, active_task_reconciliation = _reconcile_active_task(repo=repo, file_texts=file_texts)
     active_task_paths = tuple(handle for handle in active_task_handles if handle.startswith("tasks/"))
     task_texts = _read_specific_paths(repo, active_task_paths)
     learning_texts = _read_specific_paths(repo, ("learnings/INDEX.md",))
@@ -84,6 +84,7 @@ def build_coordinator_context_payload(*, cwd: str | Path, query: str, report_out
         "active_status_front_door": active_status,
         "current_state": current_state,
         "active_task_handles": active_task_handles,
+        "active_task_reconciliation": active_task_reconciliation,
         "front_door_handles": [
             "TODO.md",
             "codex/state/pipeline-state.md",
@@ -166,8 +167,8 @@ def _source_role(rel: str) -> str:
     return "project_context"
 
 
-def _active_task_handles(file_texts: dict[str, str]) -> list[str]:
-    combined = "\n".join(_current_front_door_portion(text) for text in file_texts.values())
+def _active_task_candidates(texts: tuple[str, ...]) -> list[str]:
+    combined = "\n".join(_current_front_door_portion(text) for text in texts)
     handles: list[str] = []
     active_patterns = (
         r"Active selected product task is\s*\n?`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
@@ -178,33 +179,100 @@ def _active_task_handles(file_texts: dict[str, str]) -> list[str]:
         r"Active selected task:\s*`(tasks/[A-Za-z0-9_.\-/]+\.md)`",
     )
     for pattern in active_patterns:
-        match = re.search(pattern, combined, flags=re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, combined, flags=re.IGNORECASE):
             rel = match.group(1)
-            handles.append(rel)
-            break
+            if rel not in handles:
+                handles.append(rel)
     if handles:
-        match = re.search(r"jsh-(\d{3,4}[a-z]?)", handles[0], flags=re.IGNORECASE)
-        if match:
-            handles.append(f"JSH-{match.group(1).upper()}")
-        return handles[:2]
+        return handles
     for match in re.finditer(r"`?(tasks/[A-Za-z0-9_.\-/]+\.md)`?", combined):
         rel = match.group(1)
         if rel not in handles:
             handles.append(rel)
-    if not any(handle.startswith("JSH-") for handle in handles):
-        for handle in list(handles[:1]):
-            match = re.search(r"jsh-(\d{3,4}[a-z]?)", handle, flags=re.IGNORECASE)
-            if match:
-                task_handle = f"JSH-{match.group(1).upper()}"
-                if task_handle not in handles:
-                    handles.append(task_handle)
-    if not handles:
-        for match in re.finditer(r"\bJSH-\d{3,4}[a-z0-9-]*\b", combined, flags=re.IGNORECASE):
-            handle = match.group(0).upper()
-            if handle not in handles:
-                handles.append(handle)
     return handles[:12]
+
+
+def _reconcile_active_task(*, repo: Path, file_texts: dict[str, str]) -> tuple[list[str], dict]:
+    pipeline_rel = "codex/state/pipeline-state.md"
+    pipeline_path = repo / pipeline_rel
+    pipeline_text = file_texts.get(pipeline_rel)
+    candidate_paths = _active_task_candidates(
+        tuple(file_texts.get(rel, "") for rel in ("TODO.md", "codex/state/current-context-window.md"))
+    )
+
+    if pipeline_text is None:
+        reason = "pipeline_state_unreadable" if pipeline_path.is_file() else "pipeline_state_missing"
+        return [], _active_task_resolution(status="unresolved", reason=reason, candidates=candidate_paths)
+
+    authoritative_paths = list(
+        dict.fromkeys(
+            match.group(1)
+            for match in re.finditer(
+                r"^\*\*Current Product Task:\*\*\s*`(tasks/[A-Za-z0-9_.\-/]+\.md)`\s*$",
+                _current_front_door_portion(pipeline_text),
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        )
+    )
+    authority_reason = "pipeline_current_product_task"
+    if not authoritative_paths:
+        pipeline_candidates = _active_task_candidates((pipeline_text,))
+        if len(pipeline_candidates) == 1:
+            authoritative_paths = pipeline_candidates
+            authority_reason = "pipeline_active_task_legacy"
+    if len(authoritative_paths) != 1:
+        reason = "authoritative_task_missing" if not authoritative_paths else "authoritative_task_ambiguous"
+        return [], _active_task_resolution(
+            status="unresolved",
+            reason=reason,
+            candidates=candidate_paths,
+            authoritative_paths=authoritative_paths,
+        )
+
+    authoritative_path = authoritative_paths[0]
+    if not _allowed_context_path(authoritative_path) or not (repo / authoritative_path).is_file():
+        return [], _active_task_resolution(
+            status="unresolved",
+            reason="authoritative_task_file_missing",
+            candidates=candidate_paths,
+            authoritative_paths=authoritative_paths,
+        )
+
+    stale_candidates = [path for path in candidate_paths if path != authoritative_path]
+    task_id = _task_id_from_path(authoritative_path)
+    handles = [authoritative_path]
+    if task_id:
+        handles.append(task_id)
+    return handles, _active_task_resolution(
+        status="resolved",
+        reason=authority_reason,
+        candidates=candidate_paths,
+        authoritative_paths=authoritative_paths,
+        stale_candidates=stale_candidates,
+    )
+
+
+def _active_task_resolution(
+    *,
+    status: str,
+    reason: str,
+    candidates: list[str],
+    authoritative_paths: list[str] | None = None,
+    stale_candidates: list[str] | None = None,
+) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "authoritative_source": "codex/state/pipeline-state.md",
+        "authoritative_task_path": (authoritative_paths or [""])[0],
+        "candidate_task_paths": candidates,
+        "conflicting_candidate_paths": stale_candidates or [],
+        "conflict_policy": (
+            "Pipeline Current Product Task is authoritative when exact and readable; conflicting "
+            "TODO/current-context candidates are supporting historical context only. Without safe "
+            "pipeline authority, no active task is promoted."
+        ),
+    }
 
 
 def _current_front_door_portion(text: str) -> str:
