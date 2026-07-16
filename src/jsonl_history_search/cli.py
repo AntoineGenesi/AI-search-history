@@ -6928,6 +6928,31 @@ def _ask_answer_worktree_cleanup_currentness(
         if not resolved.is_file():
             rejected.append({"source_ref": source_ref, "reason": "unreadable_repo_ref"})
             continue
+        if line < 1:
+            rejected.append(
+                {
+                    "source_ref": source_ref,
+                    "reason": "invalid_line_number",
+                    "requested_line": line,
+                }
+            )
+            continue
+        try:
+            with resolved.open(encoding="utf-8", errors="replace") as handle:
+                line_count = sum(1 for _ in handle)
+        except OSError:
+            rejected.append({"source_ref": source_ref, "reason": "unreadable_repo_ref"})
+            continue
+        if line > line_count:
+            rejected.append(
+                {
+                    "source_ref": source_ref,
+                    "reason": "line_out_of_range",
+                    "requested_line": line,
+                    "available_line_count": line_count,
+                }
+            )
+            continue
         normalized.append(
             {
                 **item,
