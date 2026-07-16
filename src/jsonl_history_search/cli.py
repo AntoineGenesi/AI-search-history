@@ -6901,12 +6901,18 @@ def _artifact_currentness_companion_status_proof(
     """Return one consistent status claim from exact same-ID companion artifacts."""
     if not query_ids:
         return None, "not_applicable"
+    query_namespaces = {identifier.rsplit("-", 1)[0] for identifier in query_ids}
     claims: list[dict] = []
     for candidate in packet.get("artifact_candidates") or []:
         if not isinstance(candidate, dict):
             continue
         identity = " ".join(str(candidate.get(field) or "") for field in ("title", "path", "source_ref"))
-        if not query_ids <= _artifact_currentness_named_ids(identity):
+        candidate_ids = {
+            identifier
+            for identifier in _artifact_currentness_named_ids(identity)
+            if identifier.rsplit("-", 1)[0] in query_namespaces
+        }
+        if query_ids != candidate_ids:
             continue
         for field in candidate.get("status_fields") or []:
             if not isinstance(field, dict) or str(field.get("name") or "").casefold() not in {
@@ -6935,8 +6941,16 @@ def _artifact_currentness_companion_status_proof(
     if len(normalized_values) != 1:
         return None, "same_target_status_conflicting"
     status_value = next(iter(normalized_values))
-    terminal = any(marker in status_value for marker in ("closed", "complete", "done", "merged", "resolved", "superseded"))
-    active = any(marker in status_value for marker in ("active", "in progress", "open", "selected"))
+    terminal_markers = ("closed", "complete", "completed", "done", "merged", "resolved", "superseded")
+    active_markers = ("active", "in progress", "open", "selected")
+    terminal = any(re.search(rf"\b{re.escape(marker)}\b", status_value) for marker in terminal_markers)
+    active = any(re.search(rf"\b{re.escape(marker)}\b", status_value) for marker in active_markers)
+    negated_terminal = any(
+        re.search(rf"\b(?:not|never|isn't|isnt)\s+{re.escape(marker)}\b", status_value)
+        for marker in terminal_markers
+    )
+    if negated_terminal or terminal == active:
+        return None, "same_target_status_ambiguous_or_conflicting"
     if (verdict == "superseded" and not terminal) or (verdict == "current" and not active):
         return None, "same_target_status_conflicting_with_verdict"
     return claims[0], "same_target_status_consistent_with_verdict"
