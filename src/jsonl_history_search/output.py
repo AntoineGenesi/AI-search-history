@@ -403,6 +403,8 @@ def render_ask_execute_text(payload: dict) -> str:
     ]
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
+    if execution.get("report_output_status") == "unavailable":
+        lines.append(f"Report output unavailable: {execution.get('reason')}")
     if execution.get("status") == "report_output_unavailable":
         lines.append(f"Report output unavailable: {execution.get('reason')}")
         lines.append(f"Fallback command: {execution.get('fallback_command')}")
@@ -419,6 +421,7 @@ def render_ask_execute_text(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
+    _append_answer_handoff_text(lines, report.get("answer_handoff"))
     _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
     lines.append("Read/action contract:")
     _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
@@ -503,6 +506,8 @@ def render_ask_execute_markdown(payload: dict) -> str:
     ]
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
+    if execution.get("report_output_status") == "unavailable":
+        lines.append(f"- Report output unavailable: {execution.get('reason')}")
     if execution.get("status") == "report_output_unavailable":
         lines.append(f"- Report output unavailable: {execution.get('reason')}")
         lines.append(f"- Fallback command: `{execution.get('fallback_command')}`")
@@ -518,6 +523,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
+    _append_answer_handoff_markdown(lines, report.get("answer_handoff"))
     _append_scoped_no_evidence_contract(
         lines,
         action,
@@ -541,6 +547,44 @@ def render_ask_execute_markdown(payload: dict) -> str:
     if route.get("route_family") == "artifact_currentness":
         _append_artifact_currentness_execute_markdown(lines, report.get("executed_output") or {})
     return "\n".join(lines)
+
+
+def _append_answer_handoff_text(lines: list[str], handoff: object) -> None:
+    if not isinstance(handoff, dict):
+        return
+    lines.extend(
+        [
+            "Answer handoff:",
+            f"- status: {handoff.get('answer_status')}",
+        ]
+    )
+    if handoff.get("answer"):
+        lines.append(f"- answer: {handoff.get('answer')}")
+    refs = handoff.get("refs_used") or []
+    if refs:
+        lines.append("- validated refs:")
+        for item in refs[:4]:
+            lines.append(f"  - {item.get('target')}")
+
+
+def _append_answer_handoff_markdown(lines: list[str], handoff: object) -> None:
+    if not isinstance(handoff, dict):
+        return
+    lines.extend(
+        [
+            "",
+            "## Answer Handoff",
+            "",
+            f"- Status: `{handoff.get('answer_status')}`",
+        ]
+    )
+    if handoff.get("answer"):
+        lines.extend(["", str(handoff.get("answer"))])
+    refs = handoff.get("refs_used") or []
+    if refs:
+        lines.extend(["", "Validated refs:"])
+        for item in refs[:4]:
+            lines.append(f"- `{item.get('target')}`")
 
 
 def _append_artifact_currentness_execute_text(lines: list[str], executed: dict) -> None:

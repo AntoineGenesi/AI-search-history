@@ -85,6 +85,10 @@ def is_worktree_cleanup_currentness_query(query: str) -> bool:
     return any(word in normalized for word in WORKTREE_WORDS) and any(word in normalized for word in CLEANUP_WORDS)
 
 
+def is_worktree_cleanup_causality_query(query: str) -> bool:
+    return _is_cleanup_causality_query(query)
+
+
 def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
     named = extract_named_worktree_targets(query)
     worktrees = _discover_worktrees(cwd)
