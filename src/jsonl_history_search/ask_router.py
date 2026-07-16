@@ -190,6 +190,7 @@ DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
     ),
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
+        "ask_execute.executed_output.chronology_source_reach required roles, exact missing roles, and copyable next reads",
         "ask_execute.executed_output.target_historical_source_window_reads before diagnostic reads",
         "ask_execute.executed_output.failure_analysis.devlog_brief and linked failure-analysis report",
         "ask_execute.executed_output.repo_phase_category_evidence safe repo-phase/category packet",
@@ -197,7 +198,9 @@ DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
     ),
     stop_guidance=(
         "Run ask --execute for the devlog/failure-analysis package before broad "
-        "repo archaeology. Open target_historical_source_window_reads first, then "
+        "repo archaeology. Inspect chronology_source_reach first and open its "
+        "role-bound copyable next reads; answer only when primary history covers "
+        "first appearance, worsening process cause, and later change. Then "
         "use the linked failure_analysis.devlog_brief and safe repo-phase/category "
         "evidence as boundaries. Treat current/adjacent/same-loop diagnostics as "
         "non-actionable by default unless the user explicitly asks to audit the "
@@ -791,14 +794,14 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_latest_status_anchor_query(normalized):
         return ROUTES[5]
 
+    if _looks_like_devlog_failure_analysis_query(normalized):
+        return DEVLOG_FAILURE_ANALYSIS_ROUTE
+
     if _looks_like_orchestration_provenance_query(normalized):
         return ROUTES[4]
 
     if _looks_like_action_proof_query(normalized):
         return ROUTES[2]
-
-    if _looks_like_devlog_failure_analysis_query(normalized):
-        return DEVLOG_FAILURE_ANALYSIS_ROUTE
 
     if _looks_like_recency_only_user_wording_query(normalized):
         return LATEST_USER_MESSAGES_ROUTE
@@ -1330,7 +1333,53 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
             "evidence",
         ),
     )
-    return asks_for_story and asks_for_failure and asks_about_agent_work and asks_for_dates_or_examples
+    long_form_story = asks_for_story and asks_for_failure and asks_about_agent_work and asks_for_dates_or_examples
+    chronology_story = (
+        asks_for_failure
+        and asks_about_agent_work
+        and _has_any(
+            normalized,
+            (
+                "first appear",
+                "first showed",
+                "first show",
+                "first started",
+                "where it began",
+                "where did it begin",
+                "when it began",
+                "when did it begin",
+                "breakdown started",
+                "failure started",
+                "failure began",
+            ),
+        )
+        and _has_any(
+            normalized,
+            (
+                "made it worse",
+                "got worse",
+                "worsened",
+                "compounded",
+                "amplified",
+                "aggravated",
+            ),
+        )
+        and _has_any(
+            normalized,
+            (
+                "changed later",
+                "what changed",
+                "changed afterward",
+                "changed afterwards",
+                "change afterward",
+                "change afterwards",
+                "fixed later",
+                "shifted later",
+                "later shift",
+            ),
+        )
+    )
+    return long_form_story or chronology_story
 
 
 def _looks_like_explicit_current_or_prior_answer_audit(normalized: str) -> bool:

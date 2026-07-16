@@ -2256,6 +2256,10 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         + core_convo_first_read_plan["role_groups"]["target_historical_artifact"]
     )[:8]
     diagnostic_reads = core_convo_first_read_plan["role_groups"]["diagnostic_or_post_hoc"][:8]
+    chronology_source_reach = _build_devlog_chronology_source_reach(
+        cwd=Path(args.cwd).expanduser().resolve(),
+        target_reads=target_reads,
+    )
     compact = {
         "schema_version": 1,
         "status": semantic_packet.get("status"),
@@ -2267,6 +2271,7 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
             "repo_artifact_evidence": str(repo_report),
         },
         "source_read_order": [
+            "chronology_source_reach.copyable_next_reads",
             "core_convo_first_read_plan",
             "target_historical_source_window_reads",
             "repo_phase_category_evidence",
@@ -2275,6 +2280,7 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
         "core_convo_first_read_plan": core_convo_first_read_plan,
         "target_historical_source_window_reads": target_reads,
         "target_historical_source_window_read_count": len(target_reads),
+        "chronology_source_reach": chronology_source_reach,
         "diagnostic_source_window_reads": diagnostic_reads,
         "diagnostic_source_window_read_count": len(diagnostic_reads),
         "diagnostic_policy": {
@@ -2294,8 +2300,9 @@ def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespac
             ),
         },
         "answer_contract": {
-            "answer_status": "inspect_target_history_before_answer",
+            "answer_status": chronology_source_reach["answer_status"],
             "required_read_order": [
+                "chronology_source_reach.copyable_next_reads",
                 "target_historical_source_window_reads",
                 "failure_analysis.devlog_brief",
                 "repo_phase_category_evidence",
@@ -2347,6 +2354,233 @@ DEVLOG_SAFE_TERM_CATEGORY_MAP = {
     "source-window": ("historical_source_reach", "historical_source_window"),
     "devlog": ("devlog_story_map", "story_reconstruction"),
 }
+DEVLOG_CHRONOLOGY_ROLE_ORDER = (
+    "first_appearance",
+    "worsening_process_cause",
+    "later_change",
+)
+DEVLOG_CHRONOLOGY_ROLE_TERMS = {
+    "first_appearance": (
+        "first long-running coordinator",
+        "first appear",
+        "first started",
+        "failure began",
+        "period started",
+        "2026-04-13",
+        "2026-04-14",
+    ),
+    "worsening_process_cause": (
+        "doing the process instead of the work",
+        "doing process work instead",
+        "process churn",
+        "process drift",
+        "docker",
+        "harness",
+        "live-send",
+        "live send",
+        "token waste",
+        "token burn",
+    ),
+    "later_change": (
+        "what changed later",
+        "moving back toward product",
+        "product behavior changes",
+        "product path correction",
+        "harness graveyard",
+        "active product path",
+        "paused, stale, or suspect",
+    ),
+}
+DEVLOG_DEDICATED_CASE_PATH = "docs/devlog-agentic-workflow-failure-analysis-test-cases.md"
+DEVLOG_CHRONOLOGY_ARTIFACT_PREFIX_LIMIT = 120
+DEVLOG_CHRONOLOGY_ARTIFACT_KEYWORDS = (
+    "coordinator",
+    "devlog",
+    "failure",
+    "workflow",
+    "product-path",
+    "product_path",
+    "graveyard",
+    "pressure",
+)
+
+
+def _build_devlog_chronology_source_reach(*, cwd: Path, target_reads: list[dict]) -> dict:
+    primary_by_role = {role: [] for role in DEVLOG_CHRONOLOGY_ROLE_ORDER}
+    for read in target_reads:
+        if not isinstance(read, dict) or read.get("target_source_role") != "target_historical_raw":
+            continue
+        for role in list(read.get("devlog_chronology_roles") or []):
+            if role in primary_by_role:
+                primary_by_role[role].append(_compact_devlog_chronology_primary_read(read))
+
+    artifact_leads = _devlog_chronology_artifact_leads(cwd)
+    artifact_by_role = {role: [] for role in DEVLOG_CHRONOLOGY_ROLE_ORDER}
+    for lead in artifact_leads:
+        artifact_by_role[lead["role"]].append(lead)
+
+    missing_roles = [role for role in DEVLOG_CHRONOLOGY_ROLE_ORDER if not primary_by_role[role]]
+    copyable_next_reads = []
+    for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
+        primary_reads = primary_by_role[role]
+        if primary_reads:
+            for read in primary_reads[:2]:
+                if read.get("command"):
+                    copyable_next_reads.append(
+                        {
+                            "role": role,
+                            "kind": "primary_source_window",
+                            "command": read["command"],
+                            "target": read.get("target"),
+                            "purpose": f"Open primary historical evidence for {role}.",
+                        }
+                    )
+            continue
+        for lead in artifact_by_role[role][:2]:
+            copyable_next_reads.append(
+                {
+                    "role": role,
+                    "kind": "bounded_artifact_lead",
+                    "command": lead["command"],
+                    "target": lead["target"],
+                    "purpose": (
+                        f"Open the bounded {role} lead, then follow only its cited historical source refs. "
+                        "This artifact is not primary chronology proof."
+                    ),
+                }
+            )
+
+    answer_allowed = not missing_roles
+    return {
+        "status": "primary_role_package_ready" if answer_allowed else "fail_closed_missing_primary_roles",
+        "answer_status": (
+            "inspect_role_complete_target_history_before_answer"
+            if answer_allowed
+            else "fail_closed_missing_chronology_roles"
+        ),
+        "answer_allowed": answer_allowed,
+        "required_roles": list(DEVLOG_CHRONOLOGY_ROLE_ORDER),
+        "covered_primary_roles": [role for role in DEVLOG_CHRONOLOGY_ROLE_ORDER if primary_by_role[role]],
+        "missing_roles": missing_roles,
+        "primary_role_reads": primary_by_role,
+        "artifact_role_leads": artifact_by_role,
+        "dedicated_case_lead": next(
+            (lead for lead in artifact_leads if lead.get("path") == DEVLOG_DEDICATED_CASE_PATH),
+            None,
+        ),
+        "copyable_next_reads": copyable_next_reads[:6],
+        "stop_condition": (
+            "Answer only after primary historical reads cover first appearance, worsening process cause, "
+            "and later change. Artifact leads bound the next inspection but do not satisfy a missing primary role."
+        ),
+        "claim_boundary": (
+            "This package locates first reads. It does not generate devlog prose, prove all-history "
+            "completeness, or promote current-run, synthetic, task-assignment, or post-hoc answer artifacts."
+        ),
+    }
+
+
+def _compact_devlog_chronology_primary_read(read: dict) -> dict:
+    target = str(read.get("target") or "")
+    return {
+        "target": target or None,
+        "source_ref": read.get("source_ref"),
+        "timestamp_utc": read.get("timestamp_utc"),
+        "record_role": (read.get("devlog_target_source_eligibility") or {}).get("record_role"),
+        "command": _devlog_source_window_command(target) if target else None,
+        "final_support_candidate": bool(read.get("final_support_candidate")),
+    }
+
+
+def _devlog_source_window_command(target: str) -> str:
+    escaped = target.replace('"', '\\"')
+    return (
+        f'jsonl-history-search read-more "{escaped}" --mode window --before 3 --after 3 '
+        '--cwd "$PWD" --format text'
+    )
+
+
+def _devlog_chronology_artifact_leads(cwd: Path) -> list[dict]:
+    candidates = []
+    artifact_paths = _iter_devlog_chronology_artifact_paths(cwd)
+    line_cache = {}
+    for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
+        terms = DEVLOG_CHRONOLOGY_ROLE_TERMS[role]
+        for rel_text in artifact_paths:
+            path = cwd / rel_text
+            if rel_text not in line_cache:
+                try:
+                    line_cache[rel_text] = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    line_cache[rel_text] = []
+            lines = line_cache[rel_text]
+            matched_lines = [
+                (index, line.casefold())
+                for index, line in enumerate(lines, 1)
+                if any(term in line.casefold() for term in terms)
+            ]
+            line_number = matched_lines[0][0] if matched_lines else None
+            if line_number is None:
+                continue
+            start = max(1, line_number - 3)
+            end = min(len(lines), line_number + 3)
+            matched_terms = {term for _index, line in matched_lines for term in terms if term in line}
+            path_priority = _devlog_chronology_path_priority(rel_text)
+            candidates.append(
+                (
+                    len(matched_terms) * 10 + path_priority,
+                    {
+                        "role": role,
+                        "kind": "repo_artifact_chronology_lead",
+                        "path": rel_text,
+                        "line": line_number,
+                        "target": f"{rel_text}:{line_number}",
+                        "command": f'sed -n \'{start},{end}p\' "$PWD/{rel_text}"',
+                        "source_tier": "legitimate_pre_existing_secondary_context",
+                        "final_support_allowed": False,
+                        "readable": True,
+                        "boundary": "artifact lead only; follow cited primary historical source refs before answering",
+                    },
+                )
+            )
+    leads = []
+    for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
+        role_candidates = [item for item in candidates if item[1]["role"] == role]
+        role_candidates.sort(key=lambda item: (-item[0], item[1]["path"], item[1]["line"]))
+        leads.extend(item[1] for item in role_candidates[:3])
+    return leads
+
+
+def _iter_devlog_chronology_artifact_paths(cwd: Path) -> list[str]:
+    selected = []
+    for prefix in DEVLOG_REPO_ARTIFACT_PREFIXES:
+        root = cwd / prefix
+        if not root.exists():
+            continue
+        paths = []
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix not in DEVLOG_REPO_ARTIFACT_SUFFIXES:
+                continue
+            try:
+                rel_text = path.relative_to(cwd).as_posix()
+            except ValueError:
+                continue
+            if ".private/" in rel_text:
+                continue
+            paths.append(rel_text)
+        paths.sort(key=lambda rel_text: (-_devlog_chronology_path_priority(rel_text), rel_text))
+        selected.extend(paths[:DEVLOG_CHRONOLOGY_ARTIFACT_PREFIX_LIMIT])
+    if (cwd / DEVLOG_DEDICATED_CASE_PATH).is_file() and DEVLOG_DEDICATED_CASE_PATH not in selected:
+        selected.insert(0, DEVLOG_DEDICATED_CASE_PATH)
+    return selected
+
+
+def _devlog_chronology_path_priority(rel_text: str) -> int:
+    normalized = rel_text.casefold()
+    score = sum(1 for keyword in DEVLOG_CHRONOLOGY_ARTIFACT_KEYWORDS if keyword in normalized)
+    if normalized == DEVLOG_DEDICATED_CASE_PATH:
+        score += 20
+    return score
 
 
 def _build_devlog_repo_artifact_evidence_packet(*, cwd: Path, query: str) -> dict:
@@ -2531,6 +2765,10 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
             eligibility = _devlog_default_target_source_eligibility(row, candidate=candidate)
             if eligibility.get("eligible") is True:
                 row = _devlog_mark_real_source_target_read(row, eligibility=eligibility)
+                row["devlog_chronology_roles"] = _devlog_chronology_roles_from_candidate(
+                    row,
+                    candidate=candidate,
+                )
                 row["final_support_candidate"] = True
                 target_reads.append(row)
             elif artifact_audit_requested:
@@ -2551,6 +2789,33 @@ def _partition_devlog_source_window_reads(packet: dict, *, query: str) -> tuple[
                     )
                 )
     return target_reads[:8], diagnostic_reads[:8]
+
+
+def _devlog_chronology_roles_from_candidate(read: dict, *, candidate: dict | None) -> list[str]:
+    values = [
+        read.get("reason"),
+        read.get("summary"),
+        read.get("snippet"),
+        read.get("matched_text"),
+    ]
+    if isinstance(candidate, dict):
+        values.extend(
+            (
+                candidate.get("reason"),
+                candidate.get("summary"),
+                candidate.get("snippet"),
+                candidate.get("matched_text"),
+                candidate.get("text"),
+            )
+        )
+    text = " ".join(str(value) for value in values if value not in (None, "")).casefold()
+    if not text:
+        return []
+    return [
+        role
+        for role in DEVLOG_CHRONOLOGY_ROLE_ORDER
+        if any(term in text for term in DEVLOG_CHRONOLOGY_ROLE_TERMS[role])
+    ]
 
 
 def _devlog_candidate_lookup_record(item: dict, *, source: str) -> dict:
@@ -3556,17 +3821,22 @@ def _answer_action_contract_from_executed_output(
     if output_key == "devlog_failure_analysis":
         target_reads = list(compact.get("target_historical_source_window_reads") or [])
         core_plan = compact.get("core_convo_first_read_plan") or {}
+        chronology_source_reach = compact.get("chronology_source_reach") or {}
         repo_evidence = compact.get("repo_phase_category_evidence") or {}
         failure_analysis = compact.get("failure_analysis") or {}
         return {
-            "answer_status": "inspect_target_history_before_answer",
+            "answer_status": chronology_source_reach.get("answer_status")
+            or "fail_closed_missing_chronology_roles",
             "promotion_status": "unpromoted_devlog_failure_analysis_source_reach_package",
             "promotion_reason": (
                 "The devlog/failure-analysis route is a source-reach package, not final prose; "
-                "open target historical source-window reads before answering."
+                "open role-complete target historical source-window reads before answering."
             ),
             "core_convo_first_read_plan": core_plan,
-            "read": core_plan.get("read") or target_reads,
+            "chronology_source_reach": chronology_source_reach,
+            "read": chronology_source_reach.get("copyable_next_reads")
+            or core_plan.get("read")
+            or target_reads,
             "then_use": {
                 "failure_analysis_devlog_brief": failure_analysis.get("devlog_brief"),
                 "repo_phase_category_evidence": repo_evidence,
@@ -6433,6 +6703,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "linked_reports": compact.get("linked_reports"),
             "source_read_order": compact.get("source_read_order"),
             "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
+            "chronology_source_reach": compact.get("chronology_source_reach"),
             "target_historical_source_window_reads": compact.get("target_historical_source_window_reads", [])[:5],
             "target_historical_source_window_read_count": compact.get(
                 "target_historical_source_window_read_count"
@@ -6445,7 +6716,8 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "privacy_flags": compact.get("privacy_flags"),
             "message": (
                 "Full devlog/failure-analysis source-reach package written to report_output; "
-                "open target historical source-window reads before current/adjacent diagnostics."
+                "open chronology_source_reach copyable next reads and role-complete target history "
+                "before current/adjacent diagnostics."
             ),
         }
     if output_key == "semantic_wrapup":
