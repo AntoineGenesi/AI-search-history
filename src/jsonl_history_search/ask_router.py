@@ -25,6 +25,7 @@ EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES = frozenset({"bounded_no_evidence"})
 EXECUTABLE_COORDINATOR_CONTEXT_ROUTE_FAMILIES = frozenset({"active_status_front_door", "coordinator_context"})
 EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES = frozenset({"latest_status"})
 EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
+EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentness"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 
 
@@ -698,6 +699,8 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
 
 
 def execution_kind_for_route_family(route_family: str) -> str | None:
+    if route_family in EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES:
+        return "artifact-currentness"
     if route_family in EXECUTABLE_LATEST_STATUS_ROUTE_FAMILIES:
         return "what-happened-since"
     if route_family in EXECUTABLE_DEVLOG_FAILURE_ANALYSIS_ROUTE_FAMILIES:

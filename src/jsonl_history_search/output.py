@@ -418,6 +418,8 @@ def render_ask_execute_text(payload: dict) -> str:
         _append_semantic_wrapup_execute_text(lines, executed, action)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_text(lines, executed, action)
+    if route.get("route_family") == "artifact_currentness":
+        _append_artifact_currentness_execute_text(lines, executed)
     return "\n".join(lines)
 
 
@@ -500,7 +502,55 @@ def render_ask_execute_markdown(payload: dict) -> str:
         _append_semantic_wrapup_execute_markdown(lines, report.get("executed_output") or {}, action)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_markdown(lines, report.get("executed_output") or {}, action)
+    if route.get("route_family") == "artifact_currentness":
+        _append_artifact_currentness_execute_markdown(lines, report.get("executed_output") or {})
     return "\n".join(lines)
+
+
+def _append_artifact_currentness_execute_text(lines: list[str], executed: dict) -> None:
+    cleanup = executed.get("cleanup_causality") or {}
+    lines.append("Worktree cleanup causality:")
+    lines.append(f"- debt_status: {cleanup.get('debt_status')}")
+    lines.append(f"- summary: {cleanup.get('causal_summary')}")
+    for record in cleanup.get("operational_records") or []:
+        lines.append(
+            f"- {record.get('source_role')}: {record.get('source_ref')} - "
+            f"{record.get('relationship')}"
+        )
+    roles = executed.get("source_roles_present") or []
+    if roles:
+        lines.append(f"- source_roles_present: {', '.join(roles)}")
+    for item in executed.get("worktree_classifications") or []:
+        lines.append(
+            f"- worktree: {item.get('identifier')} {item.get('classification')} "
+            f"path={item.get('path')}"
+        )
+
+
+def _append_artifact_currentness_execute_markdown(lines: list[str], executed: dict) -> None:
+    cleanup = executed.get("cleanup_causality") or {}
+    lines.extend(
+        [
+            "",
+            "## Worktree Cleanup Causality",
+            "",
+            f"- Debt status: `{cleanup.get('debt_status')}`",
+            f"- Summary: {cleanup.get('causal_summary')}",
+        ]
+    )
+    for record in cleanup.get("operational_records") or []:
+        lines.append(
+            f"- `{record.get('source_role')}` `{record.get('source_ref')}`: "
+            f"{record.get('relationship')}"
+        )
+    roles = executed.get("source_roles_present") or []
+    if roles:
+        lines.append(f"- Source roles present: `{', '.join(roles)}`")
+    for item in executed.get("worktree_classifications") or []:
+        lines.append(
+            f"- Worktree `{item.get('identifier')}`: `{item.get('classification')}` "
+            f"(`{item.get('path')}`)"
+        )
 
 
 def _append_semantic_wrapup_execute_text(lines: list[str], executed: dict, action: dict) -> None:

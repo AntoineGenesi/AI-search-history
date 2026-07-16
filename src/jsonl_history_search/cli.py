@@ -1884,6 +1884,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
                 "status": "unsupported_route",
                 "route_family": route.get("route_family"),
                 "allowlist": [
+                    "artifact-currentness",
                     "what-happened-since",
                     "semantic-debug",
                     "no-evidence-report",
@@ -1919,7 +1920,10 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         report_output=report_output,
         query=route.get("structured_execution_query") or args.query,
     )
-    if execution_kind == "what-happened-since":
+    if execution_kind == "artifact-currentness":
+        executed_payload = _build_artifact_currentness_report_output_payload(execution_args)
+        output_key = "artifact_currentness"
+    elif execution_kind == "what-happened-since":
         executed_payload = _build_status_anchor_report_output_payload(execution_args)
         output_key = "status_anchor"
     elif execution_kind == "semantic-debug":
@@ -2004,6 +2008,8 @@ def _execution_args_from_ask(
             "report_output": report_output,
         }
     )
+    if command == "artifact-currentness":
+        values["artifact_or_query"] = values["query"]
     return argparse.Namespace(**values)
 
 
@@ -2135,6 +2141,16 @@ def _build_status_anchor_report_output_payload(args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
     return {"status_anchor": compact}
+
+
+def _build_artifact_currentness_report_output_payload(args: argparse.Namespace) -> dict:
+    from .artifact_currentness import build_artifact_currentness_payload
+
+    payload = build_artifact_currentness_payload(args)
+    compact = payload["artifact_currentness"]
+    compact["report_written"] = args.report_output
+    Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+    return {"artifact_currentness": compact}
 
 
 def _build_semantic_wrapup_report_output_payload(args: argparse.Namespace) -> dict:
@@ -3398,6 +3414,44 @@ def _answer_action_contract_from_executed_output(
     query: str = "",
     cwd: str = ".",
 ) -> dict:
+    if output_key == "artifact_currentness":
+        worktree = compact.get("worktree_currentness") or {}
+        cleanup = worktree.get("cleanup_causality") or {}
+        operational_records = list(cleanup.get("operational_records") or [])[:8]
+        next_reads = list(compact.get("next_reads") or [])[:8]
+        return {
+            "answer_status": (
+                "answer-ready-after-source-inspection"
+                if compact.get("status") == "ok" and cleanup.get("debt_status")
+                else "not-ready/needs-more-proof"
+            ),
+            "promotion_status": cleanup.get("debt_status") or compact.get("status"),
+            "promotion_reason": (
+                "Operational cleanup records and git state are the answer-leading evidence for "
+                "worktree cleanup currentness; inspect those refs before using the causal summary."
+            ),
+            "read": operational_records or next_reads,
+            "then_use": {
+                "cleanup_causality": {
+                    "debt_status": cleanup.get("debt_status"),
+                    "causal_summary": cleanup.get("causal_summary"),
+                },
+                "source_roles_present": worktree.get("source_roles_present"),
+                "worktree_classifications": (worktree.get("classifications") or [])[:8],
+            },
+            "diagnostics_after": next_reads if operational_records else [],
+            "source_role_order": worktree.get("source_role_order"),
+            "source_roles_present": worktree.get("source_roles_present"),
+            "stop": (
+                "Stop after the operational records are inspected when debt_status and their "
+                "source refs sufficiently explain why cleanup remained open or how it closed."
+            ),
+            "only_continue_if": (
+                "Continue only if the operational records conflict, debt_status is missing, "
+                "or a selected worktree still needs classification evidence."
+            ),
+            "saved_report": compact.get("report_written"),
+        }
     if output_key == "status_anchor":
         source_tiers = compact.get("source_tiers") or {}
         answer_readiness = compact.get("answer_readiness") or {}
@@ -6206,6 +6260,37 @@ def _searched_scope_root_privacy_labels(searched_scope: dict) -> list[str]:
 
 
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
+    if output_key == "artifact_currentness":
+        worktree = compact.get("worktree_currentness") or {}
+        cleanup = worktree.get("cleanup_causality") or {}
+        return {
+            "schema_version": compact.get("schema_version"),
+            "status": compact.get("status"),
+            "query": compact.get("query"),
+            "detected_intent": compact.get("detected_intent"),
+            "currentness_verdict": compact.get("currentness_verdict"),
+            "why": compact.get("why"),
+            "selected_artifact_or_topic": compact.get("selected_artifact_or_topic"),
+            "cleanup_causality": {
+                "debt_status": cleanup.get("debt_status"),
+                "causal_summary": cleanup.get("causal_summary"),
+                "operational_records": (cleanup.get("operational_records") or [])[:8],
+                "git_state": cleanup.get("git_state"),
+                "physical_worktree_count": cleanup.get("physical_worktree_count"),
+                "target_selection_note": cleanup.get("target_selection_note"),
+            },
+            "source_role_order": worktree.get("source_role_order"),
+            "source_roles_present": worktree.get("source_roles_present"),
+            "worktree_classifications": (worktree.get("classifications") or [])[:8],
+            "next_reads": (compact.get("next_reads") or [])[:8],
+            "blind_spots": (compact.get("blind_spots") or [])[:5],
+            "boundary": worktree.get("boundary"),
+            "report_written": compact.get("report_written"),
+            "message": (
+                "Artifact-currentness executed. Inspect cleanup causality operational records first; "
+                "stop when debt status and source refs sufficiently explain the cleanup state."
+            ),
+        }
     if output_key == "status_anchor":
         return {
             "schema_version": compact.get("schema_version"),
