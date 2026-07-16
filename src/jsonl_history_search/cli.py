@@ -6738,7 +6738,7 @@ def _ask_answer_artifact_currentness(
     action: dict,
     cwd: Path,
 ) -> dict | None:
-    """Finalize only ordinary artifact/topic currentness verdicts, not cleanup causality."""
+    """Finalize artifact/topic currentness and source-backed cleanup causality."""
     execution = report.get("execution") if isinstance(report.get("execution"), dict) else {}
     report_path = Path(str(execution.get("report_written") or action.get("saved_report") or "")).expanduser()
     if not report_path.is_absolute():
@@ -6756,6 +6756,13 @@ def _ask_answer_artifact_currentness(
             },
         )
     packet = saved.get("artifact_currentness") if isinstance(saved, dict) else {}
+    if isinstance(packet, dict) and packet.get("detected_intent") == "worktree_cleanup_currentness":
+        return _ask_answer_worktree_cleanup_currentness(
+            answer,
+            packet=packet,
+            action=action,
+            cwd=cwd,
+        )
     if not isinstance(packet, dict) or packet.get("detected_intent") != "natural_direction_currentness":
         return None
     query = str(report.get("query") or "")
@@ -6869,6 +6876,127 @@ def _ask_answer_artifact_currentness(
         "required_roles": list(role_candidates),
         "opened_roles": list(opened_roles),
         "boundary": "selected artifact/report currentness only; no broad release/readiness inference",
+    }
+    return {"ask_answer": answer}
+
+
+def _ask_answer_worktree_cleanup_currentness(
+    answer: dict,
+    *,
+    packet: dict,
+    action: dict,
+    cwd: Path,
+) -> dict:
+    worktree = (
+        packet.get("worktree_currentness")
+        if isinstance(packet.get("worktree_currentness"), dict)
+        else {}
+    )
+    cleanup = (
+        worktree.get("cleanup_causality")
+        if isinstance(worktree.get("cleanup_causality"), dict)
+        else {}
+    )
+    debt_status = str(cleanup.get("debt_status") or "")
+    action_reads = action.get("read") if isinstance(action.get("read"), list) else []
+    normalized: list[dict] = []
+    rejected: list[dict] = []
+    repo_root = cwd.resolve()
+    for item in action_reads:
+        if not isinstance(item, dict) or item.get("source_role") != "operational_record":
+            rejected.append(
+                {
+                    "source_ref": item.get("source_ref") if isinstance(item, dict) else None,
+                    "reason": "invalid_source_role",
+                }
+            )
+            continue
+        source_ref = str(item.get("source_ref") or "").strip()
+        target, line = _split_ref_target(source_ref)
+        if not target or line is None:
+            rejected.append({"source_ref": source_ref or None, "reason": "malformed_repo_ref"})
+            continue
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(repo_root)
+        except (OSError, ValueError):
+            rejected.append({"source_ref": source_ref, "reason": "non_local_repo_ref"})
+            continue
+        if not resolved.is_file():
+            rejected.append({"source_ref": source_ref, "reason": "unreadable_repo_ref"})
+            continue
+        normalized.append(
+            {
+                **item,
+                "kind": "artifact_currentness_operational_record",
+                "target": f"{resolved}:{line}",
+                "target_source_role": "operational_record",
+            }
+        )
+
+    opened = _open_ask_answer_proof_refs(normalized, cwd=cwd)
+    usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
+    relationships = {str(item.get("relationship") or "") for item in normalized}
+    has_prior_debt = bool(
+        relationships
+        & {
+            "report_only_preserve_then_remove_candidates",
+            "report_only_preserve_then_remove",
+            "report_only_preserve_then_prune",
+            "report_only_cleanup_audit",
+            "handoff_deferred_cleanup",
+        }
+    )
+    has_execution_closure = "cleanup_execution_report" in relationships
+    if (
+        rejected
+        or len(usable) != len(normalized)
+        or not usable
+        or debt_status != "closed_by_cleanup_execution_report"
+        or not has_prior_debt
+        or not has_execution_closure
+    ):
+        gate = {
+            "status": "blocked_missing_or_unreadable_worktree_cleanup_proof",
+            "required_source_role": "operational_record",
+            "required_relationships": ["report_only_or_deferred_cleanup", "cleanup_execution_report"],
+            "debt_status": debt_status or None,
+            "opened_ref_count": len(usable),
+            "rejected_refs": rejected,
+        }
+        answer["source_contract"]["worktree_cleanup_answer_gate"] = gate
+        return _ask_answer_fail_closed(
+            answer,
+            "worktree cleanup operational proof refs are missing, unreadable, non-local, or incomplete",
+            gate,
+        )
+
+    causal_summary = str(cleanup.get("causal_summary") or "").strip()
+    if not causal_summary:
+        return _ask_answer_fail_closed(
+            answer,
+            "worktree cleanup causal summary is missing from the inspected proof contract",
+            {"required_next_proof": "cleanup causality summary backed by opened operational records"},
+        )
+    answer["answer_status"] = "answered-from-proof"
+    answer["answer"] = (
+        f"{causal_summary} The earlier records show report-only or preserve-then-remove history and "
+        "later handoffs left pre-existing worktrees unaudited; the cleanup execution report closes that debt. "
+        "This is a read-only causality answer and does not authorize or perform cleanup actions."
+    )
+    answer["refs_used"] = [_ref_public_summary(item) for item in usable]
+    answer["proof_summary"] = [
+        f"{item['ref'].get('relationship')}: {item['summary']}" for item in usable
+    ]
+    answer["source_contract"]["worktree_cleanup_answer_gate"] = {
+        "status": "answer_allowed",
+        "debt_status": debt_status,
+        "opened_ref_count": len(usable),
+        "relationships": sorted(relationships),
+        "boundary": "read-only cleanup causality; no cleanup, branch deletion, worktree removal, or storage action",
     }
     return {"ask_answer": answer}
 
