@@ -6947,10 +6947,7 @@ def _artifact_currentness_companion_status_proof(
     active = any(re.search(rf"\b{re.escape(marker)}\b", status_value) for marker in active_markers)
     negation_prefix = r"(?:not|never|isn't|isnt|no\s+longer)"
     negated_terminal = any(
-        re.search(
-            rf"\b{negation_prefix}(?:\s+[\w'-]+){{0,3}}\s+{re.escape(marker)}\b",
-            status_value,
-        )
+        re.search(rf"\b{negation_prefix}\b.*\b{re.escape(marker)}\b", status_value)
         for marker in terminal_markers
     )
     if negated_terminal or terminal == active:
