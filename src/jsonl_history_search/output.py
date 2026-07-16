@@ -297,6 +297,7 @@ def render(payload: dict, output_format: str) -> str:
 
 def render_ask_router_text(payload: dict) -> str:
     report = payload["ask_router"]
+    resolution = report.get("command_resolution") or {}
     lines = [
         "Ask Route",
         "Answer status: not-ready/needs-more-proof",
@@ -308,15 +309,25 @@ def render_ask_router_text(payload: dict) -> str:
         f"Chosen route: {report.get('chosen_route')}",
         f"Why: {report.get('why_it_applies')}",
         f"Read: {report.get('read_specialization')}",
-        "Next commands:",
     ]
+    if resolution.get("mode") != "not_applicable":
+        lines.extend(
+            [
+                f"Command resolution: {resolution.get('mode')}",
+                f"Source fallback: {resolution.get('source_fallback_command') or '(not available from this cwd)'}",
+                f"Command guidance: {resolution.get('guidance')}",
+            ]
+        )
+    lines.append("Next commands:")
     for item in report.get("next_commands", []):
         lines.append(f"- {item.get('purpose')}: {item.get('command')}")
         lines.append(f"  Inspect: {item.get('inspect_next')}")
-    lines.append("Agent command cookbook:")
-    for item in report.get("command_cookbook", [])[:6]:
-        lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
-        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    cookbook = report.get("command_cookbook", [])
+    if cookbook:
+        lines.append("Agent command cookbook:")
+        for item in cookbook[:6]:
+            lines.append(f"- {item.get('question_family')}: {item.get('first_command')}")
+            lines.append(f"  Inspect: {item.get('inspect_next')}")
     lines.append("Inspect after:")
     for item in report.get("inspect_after", []):
         lines.append(f"- {item}")
@@ -376,6 +387,8 @@ def render_ask_answer_text(payload: dict) -> str:
 def render_ask_execute_text(payload: dict) -> str:
     report = payload["ask_execute"]
     route = report.get("selected_route") or {}
+    resolution = route.get("command_resolution") or {}
+    cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
     lines = [
@@ -386,6 +399,7 @@ def render_ask_execute_text(payload: dict) -> str:
         f"Execution status: {execution.get('status')}",
         f"Command family: {execution.get('command_family') or '(unsupported)'}",
         f"First command: {route.get('first_command')}",
+        f"Command resolution: {resolution.get('mode') or 'unresolved'}",
     ]
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
@@ -404,11 +418,11 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
     _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
     lines.append("Read/action contract:")
-    _append_compact_read_contract(lines, action.get("read"))
+    _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
     only_continue = action.get("only_continue_if")
     if only_continue:
         lines.append("Only continue if:")
-        _append_compact_read_contract(lines, only_continue)
+        _append_compact_read_contract(lines, only_continue, cli_prefix=cli_prefix)
     executed = report.get("executed_output") or {}
     if route.get("route_family") == "devlog_failure_analysis":
         output_contract = executed.get("output_contract") or {}
@@ -423,7 +437,7 @@ def render_ask_execute_text(payload: dict) -> str:
     if executed.get("message"):
         lines.append(f"Executed output: {executed.get('message')}")
     if route.get("route_family") == "semantic_wrapup":
-        _append_semantic_wrapup_execute_text(lines, executed, action)
+        _append_semantic_wrapup_execute_text(lines, executed, action, cli_prefix=cli_prefix)
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_text(lines, executed, action)
     if route.get("route_family") == "artifact_currentness":
@@ -469,6 +483,8 @@ def render_ask_answer_markdown(payload: dict) -> str:
 def render_ask_execute_markdown(payload: dict) -> str:
     report = payload["ask_execute"]
     route = report.get("selected_route") or {}
+    resolution = route.get("command_resolution") or {}
+    cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
     lines = [
@@ -480,6 +496,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
         f"- Execution status: `{execution.get('status')}`",
         f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
         f"- First command: `{route.get('first_command')}`",
+        f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`",
     ]
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
@@ -505,9 +522,14 @@ def render_ask_execute_markdown(payload: dict) -> str:
         lines.append(f"- Unsupported route: {execution.get('reason')}")
     else:
         lines.append("- Read/action:")
-        _append_compact_read_contract(lines, action.get("read"), markdown=True)
+        _append_compact_read_contract(lines, action.get("read"), markdown=True, cli_prefix=cli_prefix)
     if route.get("route_family") == "semantic_wrapup":
-        _append_semantic_wrapup_execute_markdown(lines, report.get("executed_output") or {}, action)
+        _append_semantic_wrapup_execute_markdown(
+            lines,
+            report.get("executed_output") or {},
+            action,
+            cli_prefix=cli_prefix,
+        )
     if route.get("route_family") == "coordinator_context":
         _append_coordinator_context_markdown(lines, report.get("executed_output") or {}, action)
     if route.get("route_family") == "artifact_currentness":
@@ -561,7 +583,13 @@ def _append_artifact_currentness_execute_markdown(lines: list[str], executed: di
         )
 
 
-def _append_semantic_wrapup_execute_text(lines: list[str], executed: dict, action: dict) -> None:
+def _append_semantic_wrapup_execute_text(
+    lines: list[str],
+    executed: dict,
+    action: dict,
+    *,
+    cli_prefix: str = "jsonl-history-search",
+) -> None:
     lines.append("Semantic-wrapup evidence handoff:")
     lines.append(f"- saved_report: {action.get('saved_report') or executed.get('report_written')}")
     boundary = action.get("source_inspection_boundary") or executed.get("source_inspection_boundary") or {}
@@ -589,18 +617,25 @@ def _append_semantic_wrapup_execute_text(lines: list[str], executed: dict, actio
     _append_compact_read_contract(
         lines,
         required_primary_proof,
+        cli_prefix=cli_prefix,
     )
     conditional_required = action.get("conditional_required") or executed.get("conditional_required")
     if conditional_required:
         lines.append("- conditional_required:")
-        _append_compact_read_contract(lines, conditional_required)
+        _append_compact_read_contract(lines, conditional_required, cli_prefix=cli_prefix)
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- diagnostics_after:")
-        _append_compact_read_contract(lines, diagnostics)
+        _append_compact_read_contract(lines, diagnostics, cli_prefix=cli_prefix)
 
 
-def _append_semantic_wrapup_execute_markdown(lines: list[str], executed: dict, action: dict) -> None:
+def _append_semantic_wrapup_execute_markdown(
+    lines: list[str],
+    executed: dict,
+    action: dict,
+    *,
+    cli_prefix: str = "jsonl-history-search",
+) -> None:
     lines.extend(["", "## Semantic-Wrapup Evidence Handoff", ""])
     lines.append(f"- Saved report: `{action.get('saved_report') or executed.get('report_written')}`")
     boundary = action.get("source_inspection_boundary") or executed.get("source_inspection_boundary") or {}
@@ -629,15 +664,16 @@ def _append_semantic_wrapup_execute_markdown(lines: list[str], executed: dict, a
         lines,
         required_primary_proof,
         markdown=True,
+        cli_prefix=cli_prefix,
     )
     conditional_required = action.get("conditional_required") or executed.get("conditional_required")
     if conditional_required:
         lines.append("- Conditional required:")
-        _append_compact_read_contract(lines, conditional_required, markdown=True)
+        _append_compact_read_contract(lines, conditional_required, markdown=True, cli_prefix=cli_prefix)
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- Diagnostics after:")
-        _append_compact_read_contract(lines, diagnostics, markdown=True)
+        _append_compact_read_contract(lines, diagnostics, markdown=True, cli_prefix=cli_prefix)
 
 
 def _append_semantic_wrapup_failure_modes(lines: list[str], modes: object) -> None:
@@ -865,7 +901,13 @@ def _append_scoped_no_evidence_contract(
     )
 
 
-def _append_compact_read_contract(lines: list[str], value: object, *, markdown: bool = False) -> None:
+def _append_compact_read_contract(
+    lines: list[str],
+    value: object,
+    *,
+    markdown: bool = False,
+    cli_prefix: str = "jsonl-history-search",
+) -> None:
     bullet = "- " if markdown else "- "
     if not value:
         lines.append(f"{bullet}none")
@@ -875,7 +917,7 @@ def _append_compact_read_contract(lines: list[str], value: object, *, markdown: 
         if isinstance(command, dict):
             command = command.get("command")
         if command:
-            lines.append(f"{bullet}{command}")
+            lines.append(f"{bullet}{_with_cli_prefix(str(command), cli_prefix)}")
             return
         appended = False
         for key in ("decision", "actionability", "required_before_scoped_no_evidence_answer"):
@@ -892,9 +934,9 @@ def _append_compact_read_contract(lines: list[str], value: object, *, markdown: 
                 target = item.get("target")
                 source_target = _source_target(item)
                 reason = item.get("reason") or item.get("purpose")
-                rendered = command or target or source_target or reason or str(item)
+                rendered = _with_cli_prefix(str(command), cli_prefix) if command else target or source_target or reason or str(item)
                 lines.append(f"{bullet}{rendered}")
-                inspection_command = _ask_execute_source_inspection_command(item)
+                inspection_command = _ask_execute_source_inspection_command(item, cli_prefix=cli_prefix)
                 if inspection_command:
                     lines.append(f"  read-more: {inspection_command}")
             else:
@@ -903,20 +945,31 @@ def _append_compact_read_contract(lines: list[str], value: object, *, markdown: 
     lines.append(f"{bullet}{value}")
 
 
-def _ask_execute_source_inspection_command(item: dict) -> str | None:
+def _ask_execute_source_inspection_command(
+    item: dict,
+    *,
+    cli_prefix: str = "jsonl-history-search",
+) -> str | None:
     if _read_marked_diagnostic_or_nonactionable(item):
         return None
     target = _source_target(item)
     if not _is_jsonl_read_target(target):
         return None
     return (
-        f"jsonl-history-search read-more {shlex.quote(target)} "
+        f"{cli_prefix} read-more {shlex.quote(target)} "
         '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
     )
 
 
+def _with_cli_prefix(command: str, cli_prefix: str) -> str:
+    if command.startswith("jsonl-history-search "):
+        return f"{cli_prefix}{command[len('jsonl-history-search'):]}"
+    return command
+
+
 def render_ask_router_markdown(payload: dict) -> str:
     report = payload["ask_router"]
+    resolution = report.get("command_resolution") or {}
     lines = [
         "# JSONL Ask Route",
         "",
@@ -930,17 +983,25 @@ def render_ask_router_markdown(payload: dict) -> str:
         f"- Chosen route: `{report.get('chosen_route')}`",
         f"- Why: {report.get('why_it_applies')}",
         f"- Read: `{report.get('read_specialization')}`",
-        "",
-        "## Next Commands",
-        "",
     ]
+    if resolution.get("mode") != "not_applicable":
+        lines.extend(
+            [
+                f"- Command resolution: `{resolution.get('mode')}`",
+                f"- Source fallback: `{resolution.get('source_fallback_command') or '(not available from this cwd)'}`",
+                f"- Command guidance: {resolution.get('guidance')}",
+            ]
+        )
+    lines.extend(["", "## Next Commands", ""])
     for item in report.get("next_commands", []):
         lines.append(f"- **{item.get('purpose')}**: `{item.get('command')}`")
         lines.append(f"  Inspect: {item.get('inspect_next')}")
-    lines.extend(["", "## Agent Command Cookbook", ""])
-    for item in report.get("command_cookbook", [])[:6]:
-        lines.append(f"- **{item.get('question_family')}**: `{item.get('first_command')}`")
-        lines.append(f"  Inspect: {item.get('inspect_next')}")
+    cookbook = report.get("command_cookbook") or []
+    if cookbook:
+        lines.extend(["", "## Agent Command Cookbook", ""])
+        for item in cookbook[:6]:
+            lines.append(f"- **{item.get('question_family')}**: `{item.get('first_command')}`")
+            lines.append(f"  Inspect: {item.get('inspect_next')}")
     lines.extend(["", "## Inspect After", ""])
     for item in report.get("inspect_after", []):
         lines.append(f"- `{item}`")

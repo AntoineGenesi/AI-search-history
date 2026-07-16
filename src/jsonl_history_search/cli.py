@@ -1923,6 +1923,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "first_action_category": route.get("first_action_category"),
         "why_it_applies": route.get("why_it_applies"),
         "structured_execution_query": route.get("structured_execution_query"),
+        "command_resolution": route.get("command_resolution"),
         "first_command": route.get("first_command"),
         "explicit_source_root_count": len(getattr(args, "root", []) or []),
         "read_specialization": route.get("read_specialization"),

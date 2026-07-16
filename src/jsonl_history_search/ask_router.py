@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .agent_command_cookbook import agent_question_cookbook, ask_next_commands
+from .command_resolution import resolve_command
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
 
@@ -28,6 +29,10 @@ EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES = frozenset({"semantic_wrapup"})
 EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentness"})
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
+LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
+NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
+    {NON_HISTORY_CLARIFICATION_ROUTE_FAMILY, LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY}
+)
 
 
 @dataclass(frozen=True)
@@ -46,15 +51,15 @@ class AskRoute:
             return _semantic_wrapup_first_command_query(query)
         return query
 
-    def first_command(self, query: str) -> str:
+    def first_command(self, query: str, *, cli: str = "jsonl-history-search") -> str:
         command_query = self.command_query(query)
         escaped = command_query.replace('"', '\\"')
         skill = _skill_name_from_query(query)
-        return self.first_command_template.format(query=escaped, skill=skill)
+        return self.first_command_template.format(query=escaped, skill=skill, cli=cli)
 
 
 LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
-    route_family="local_artifact_verification",
+    route_family=LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
     chosen_route="local-artifact-verification",
     why_it_applies=(
         "The wording asks what changed in a named local artifact or whether "
@@ -115,7 +120,7 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "instead of becoming a generic semantic-debug question."
     ),
     first_command_template=(
-        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" '
+        '{cli} ask --execute "{query}" --cwd "$PWD" '
         "--report-output .private/jsonl/ask-execute-no-evidence-report.json --format text"
     ),
     read_specialization="references/no-evidence.md",
@@ -150,7 +155,7 @@ TASK_REVIEW_COMMIT_PROVENANCE_ROUTE = AskRoute(
         "Use semantic-debug provenance/source refs before artifact-currentness or "
         "repo status anchoring."
     ),
-    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.source_locator_handoff.next_reads",
@@ -185,7 +190,7 @@ DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
         "before current/adjacent diagnostics."
     ),
     first_command_template=(
-        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-devlog-source-reach.json"
     ),
     read_specialization="references/semantic-debugging.md",
@@ -225,7 +230,7 @@ COORDINATOR_CONTEXT_ROUTE = AskRoute(
         "before generic semantic-wrapup complaint mining."
     ),
     first_command_template=(
-        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-coordinator-context.json"
     ),
     read_specialization="references/coordinator-context.md",
@@ -259,7 +264,7 @@ ACTIVE_STATUS_FRONT_DOOR_ROUTE = AskRoute(
         "raw conversation chronology or semantic-debug diagnostics."
     ),
     first_command_template=(
-        'jsonl-history-search ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-active-status-front-door.json"
     ),
     read_specialization="references/coordinator-context.md",
@@ -327,7 +332,7 @@ EXPECTATION_MISMATCH_ROUTE = AskRoute(
         "semantic-debug so expectation evidence, observed/action-proof "
         "evidence, and the divergence point are inspected before diagnostics."
     ),
-    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.expectation_mismatch_plan.expected_behavior_evidence",
@@ -358,7 +363,7 @@ REMEMBERED_USER_WORDING_ROUTE = AskRoute(
         "semantic-debug so source refs prove user-authored wording instead "
         "of assistant, tool, environment, task, report, or prompt echoes."
     ),
-    first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --role user --format text',
+    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --role user --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.question_family / query_plan detected_intents includes when_user_said",
@@ -390,7 +395,7 @@ LATEST_USER_MESSAGES_ROUTE = AskRoute(
         "or wording, without a topic or status window. Use deterministic "
         "latest-user lookup before semantic search."
     ),
-    first_command_template='jsonl-history-search latest-user-messages --cwd "$PWD" --limit 1 --format text',
+    first_command_template='{cli} latest-user-messages --cwd "$PWD" --limit 1 --format text',
     read_specialization="latest-user-messages command",
     inspect_after=(
         "latest_user_messages.messages[0].timestamp_utc, text, source_ref, and openable_target",
@@ -421,7 +426,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "followed, skipped, or misapplied, so route to the focused skill "
             "audit/check surface instead of semantic-wrapup frustration mining."
         ),
-        first_command_template='jsonl-history-search skill-check "{skill}" --cwd "$PWD" --format text',
+        first_command_template='{cli} skill-check "{skill}" --cwd "$PWD" --format text',
         read_specialization="references/skill-audit.md",
         inspect_after=(
             "skill_audit.usage_instances",
@@ -449,7 +454,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "or source-window-only boundary, so route directly to semantic-debug "
             "source refs before artifact currentness or broad repo search."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.answer_ready_handoff.primary_source_followthrough",
@@ -478,7 +483,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "action, so the first evidence should be tool/action proof from "
             "conversation logs."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/action-proof.md",
         inspect_after=(
             "semantic_debug.source_window_action_proof",
@@ -503,7 +508,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "Route to semantic-debug so raw session timing and behavior-change "
             "evidence are primary."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.question_family.primary == process_actual_use",
@@ -534,7 +539,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "Use semantic-debug source refs rather than status anchoring to the "
             "current run."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff.next_reads",
@@ -561,7 +566,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "recent anchor, or across an explicit task status/handoff window, "
             "so use the status-anchor route before repo recovery."
         ),
-        first_command_template='jsonl-history-search what-happened-since "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} what-happened-since "{query}" --cwd "$PWD" --format text',
         read_specialization="references/latest-status.md",
         inspect_after=(
             "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
@@ -594,7 +599,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks why a topic was mentioned, which is provenance for "
             "a remembered topic rather than a currentness decision."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/remembered-topic.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff",
@@ -619,7 +624,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "artifact-currentness should inspect operational cleanup records, "
             "worktree state, and private-artifact preservation first."
         ),
-        first_command_template='jsonl-history-search artifact-currentness "{query}" --cwd "$PWD" --format markdown',
+        first_command_template='{cli} artifact-currentness "{query}" --cwd "$PWD" --format markdown',
         read_specialization="references/status-currentness.md",
         inspect_after=(
             "artifact_currentness.worktree_currentness.cleanup_causality.operational_records and debt_status",
@@ -645,7 +650,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks which TODO/plan/ticket/artifact matters or is current, so "
             "the currentness route should resolve stale versus active evidence and treat status fields as claims."
         ),
-        first_command_template='jsonl-history-search artifact-currentness "{query}" --cwd "$PWD" --format markdown',
+        first_command_template='{cli} artifact-currentness "{query}" --cwd "$PWD" --format markdown',
         read_specialization="references/status-currentness.md",
         inspect_after=(
             "artifact_currentness.currentness_verdict",
@@ -668,7 +673,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks for repeated complaints, recurring failure modes, "
             "or user corrections, so use the semantic wrap-up failure-mining route."
         ),
-        first_command_template='jsonl-history-search semantic-wrapup "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-wrapup "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-wrapup.md",
         inspect_after=(
             "semantic_wrapup.failure_modes",
@@ -693,7 +698,28 @@ ROUTES: tuple[AskRoute, ...] = (
 def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     route = classify_ask_route(query)
     structured_execution_query = route.command_query(query)
-    first_command = route.first_command(query)
+    if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
+        if route.route_family == LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY:
+            resolution_guidance = (
+                "No JSONL command resolution is needed for this local-artifact route; "
+                "use its local/Git commands."
+            )
+        else:
+            resolution_guidance = "No JSONL command resolution is needed for this no-tool route."
+        command_resolution_payload = {
+            "mode": "not_applicable",
+            "command_prefix": None,
+            "installed_command_available": None,
+            "source_checkout_available": None,
+            "source_fallback_command": None,
+            "guidance": resolution_guidance,
+        }
+        cli_prefix = "jsonl-history-search"
+    else:
+        command_resolution = resolve_command(cwd)
+        command_resolution_payload = command_resolution.as_dict()
+        cli_prefix = command_resolution.command_prefix
+    first_command = route.first_command(query, cli=cli_prefix)
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
         first_action_category = "filesystem_inventory"
     elif route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY:
@@ -710,15 +736,17 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "first_action_category": first_action_category,
             "why_it_applies": route.why_it_applies,
             "structured_execution_query": structured_execution_query,
+            "command_resolution": command_resolution_payload,
             "first_command": first_command,
             "next_commands": ask_next_commands(
                 selected_first_command=first_command,
                 route_family=route.route_family,
+                cli_prefix=cli_prefix,
             ),
             "command_cookbook": (
                 []
-                if route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY
-                else agent_question_cookbook()
+                if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES
+                else agent_question_cookbook(cli_prefix=cli_prefix)
             ),
             "read_specialization": route.read_specialization,
             "inspect_after": list(route.inspect_after),
@@ -843,7 +871,7 @@ def classify_ask_route(query: str) -> AskRoute:
             "The wording looks like a natural conversation-history or provenance "
             "question, but it did not match a narrower front-door route."
         ),
-        first_command_template='jsonl-history-search semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff primary raw/session/tool source refs from the first semantic-debug run",

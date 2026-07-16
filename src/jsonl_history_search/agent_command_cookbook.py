@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 
-def agent_question_cookbook() -> list[dict[str, str]]:
-    return [
+def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list[dict[str, str]]:
+    cookbook = [
         {
             "id": "parent_anchor_status",
             "question_family": "What happened since my last message?",
@@ -82,9 +82,17 @@ def agent_question_cookbook() -> list[dict[str, str]]:
             ),
         },
     ]
+    for entry in cookbook:
+        entry["first_command"] = _with_cli_prefix(entry["first_command"], cli_prefix)
+    return cookbook
 
 
-def ask_next_commands(*, selected_first_command: str, route_family: str) -> list[dict[str, Any]]:
+def ask_next_commands(
+    *,
+    selected_first_command: str,
+    route_family: str,
+    cli_prefix: str = "jsonl-history-search",
+) -> list[dict[str, Any]]:
     if route_family == "non_history_clarification":
         return []
 
@@ -142,7 +150,7 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
             ),
         }
     ]
-    for entry in agent_question_cookbook():
+    for entry in agent_question_cookbook(cli_prefix=cli_prefix):
         if _entry_applies_to_route(entry, route_family):
             commands.append(
                 {
@@ -174,7 +182,7 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
             {
                 "purpose": "open required semantic-wrapup proof ref only",
                 "command": (
-                    'jsonl-history-search read-more <required_primary_proof source-ref> '
+                    f'{cli_prefix} read-more <required_primary_proof source-ref> '
                     '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
                 ),
                 "inspect_next": (
@@ -188,7 +196,7 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
             {
                 "purpose": "open exact source ref returned by the route",
                 "command": (
-                    'jsonl-history-search read-more <source-ref> '
+                    f'{cli_prefix} read-more <source-ref> '
                     '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
                 ),
                 "inspect_next": (
@@ -199,6 +207,12 @@ def ask_next_commands(*, selected_first_command: str, route_family: str) -> list
             }
         )
     return commands
+
+
+def _with_cli_prefix(command: str, cli_prefix: str) -> str:
+    if command.startswith("jsonl-history-search "):
+        return f"{cli_prefix}{command[len('jsonl-history-search'):]}"
+    return command
 
 
 def _entry_applies_to_route(entry: dict[str, str], route_family: str) -> bool:
