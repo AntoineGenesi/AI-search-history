@@ -2076,6 +2076,12 @@ def _ask_execute_report_output_unavailable(
     report_output: str,
     fallback_command: str | None,
 ) -> dict:
+    if execution_kind == "devlog-failure-analysis":
+        return _devlog_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+        )
     contract["ask_execute"]["execution"].update(
         {
             "status": "report_output_unavailable",
@@ -2094,6 +2100,76 @@ def _ask_execute_report_output_unavailable(
     contract["ask_execute"]["answer_action_contract"]["promotion_status"] = (
         "route_only_report_output_unavailable"
     )
+    return contract
+
+
+def _devlog_report_output_unavailable(
+    contract: dict,
+    *,
+    execution_kind: str,
+    report_output: str,
+) -> dict:
+    ask_execute = contract["ask_execute"]
+    selected_route = ask_execute.get("selected_route") or {}
+    command_resolution = selected_route.get("command_resolution") or {}
+    cli_prefix = command_resolution.get("command_prefix") or "jsonl-history-search"
+    direct_reads = []
+    for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
+        direct_reads.extend(
+            _devlog_primary_recovery_reads(
+                role,
+                write_report=False,
+                cli_prefix=cli_prefix,
+            )[:2]
+        )
+
+    stop_condition = (
+        "Answer only after primary historical reads cover first appearance, worsening process cause, "
+        "and later change. Run the role-bound stdout-only recovery commands before consulting "
+        "secondary artifact leads; artifacts do not satisfy a missing primary role."
+    )
+    fallback_command = direct_reads[0]["command"] if direct_reads else None
+    ask_execute["execution"].update(
+        {
+            "status": "report_output_unavailable",
+            "command_family": execution_kind,
+            "argv": [],
+            "report_output": report_output,
+            "report_written": None,
+            "fallback_command": fallback_command,
+            "fallback_commands": direct_reads,
+            "reason": (
+                "The report destination is not writable. No report handle is available; "
+                "run the direct stdout-only chronology recovery commands below."
+            ),
+        }
+    )
+    ask_execute["execution_status"] = "report_output_unavailable"
+    ask_execute["answer_action_contract"] = {
+        "answer_status": "fail_closed_missing_chronology_roles",
+        "promotion_status": "route_only_report_output_unavailable",
+        "promotion_reason": (
+            "The writable devlog package is unavailable. These direct commands only recover "
+            "primary chronology sources; they do not make the answer ready by themselves."
+        ),
+        "chronology_source_reach": {
+            "status": "fail_closed_missing_primary_roles",
+            "answer_status": "fail_closed_missing_chronology_roles",
+            "answer_allowed": False,
+            "required_roles": list(DEVLOG_CHRONOLOGY_ROLE_ORDER),
+            "covered_primary_roles": [],
+            "missing_roles": list(DEVLOG_CHRONOLOGY_ROLE_ORDER),
+            "copyable_next_read_count": len(direct_reads),
+            "stop_condition": stop_condition,
+        },
+        "read": direct_reads,
+        "stop": stop_condition,
+        "only_continue_if": (
+            "A required chronology role remains missing after running the bounded primary-history "
+            "recovery commands; fail closed instead of broad repo or report archaeology."
+        ),
+        "saved_report": None,
+    }
     return contract
 
 
@@ -2763,7 +2839,12 @@ def _load_devlog_retained_primary_reads(
     return target_reads[:12], diagnostic_reads[:12]
 
 
-def _devlog_primary_recovery_reads(role: str) -> list[dict]:
+def _devlog_primary_recovery_reads(
+    role: str,
+    *,
+    write_report: bool = True,
+    cli_prefix: str = "jsonl-history-search",
+) -> list[dict]:
     if role == "later_change":
         path = DEVLOG_LATER_CHANGE_GIT_PATH
         return [
@@ -2782,12 +2863,28 @@ def _devlog_primary_recovery_reads(role: str) -> list[dict]:
         ]
 
     return [
-        _devlog_provider_primary_recovery_read(role, provider="codex"),
-        _devlog_provider_primary_recovery_read(role, provider="claude"),
+        _devlog_provider_primary_recovery_read(
+            role,
+            provider="codex",
+            write_report=write_report,
+            cli_prefix=cli_prefix,
+        ),
+        _devlog_provider_primary_recovery_read(
+            role,
+            provider="claude",
+            write_report=write_report,
+            cli_prefix=cli_prefix,
+        ),
     ]
 
 
-def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
+def _devlog_provider_primary_recovery_read(
+    role: str,
+    *,
+    provider: str,
+    write_report: bool = True,
+    cli_prefix: str = "jsonl-history-search",
+) -> dict:
     query = DEVLOG_PRIMARY_RECOVERY_QUERIES[role]
     report_path = f"{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}/{role}-{provider}-semantic-debug.json"
     common_flags = (
@@ -2802,7 +2899,11 @@ def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
     )
     if provider == "codex":
         root_flags = " ".join(f'--root "{root}"' for root in DEVLOG_CODEX_APRIL_ROOTS)
-        preamble = f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
+        preamble = (
+            f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
+            if write_report
+            else ""
+        )
         source_scope = ["codex_sessions_april_13_17", "codex_history"]
         root_contract = {
             "provider": "codex",
@@ -2819,9 +2920,10 @@ def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
             f"! -newermt {shlex.quote(DEVLOG_CLAUDE_MTIME_END)} -print0) && "
             'test "${#CLAUDE_ROOT_ARGS[@]}" -gt 0 || { '
             "printf 'No Claude project-log files in the bounded April window; primary role remains missing.\\n' >&2; "
-            'exit 2; } && '
-            f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
+            'exit 2; }'
         )
+        if write_report:
+            preamble += f' && mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
         source_scope = ["claude_project_logs_april_mtime_candidates"]
         root_contract = {
             "provider": "claude",
@@ -2835,27 +2937,21 @@ def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
                 "fail closed if no candidate files exist"
             ),
         }
-    command = (
-        f"{preamble} && jsonl-history-search semantic-debug {shlex.quote(query)} --cwd \"$PWD\" "
+    command = f"{preamble} && " if preamble else ""
+    command += (
+        f"{cli_prefix} semantic-debug {shlex.quote(query)} --cwd \"$PWD\" "
         f"{root_flags} {common_flags}"
-        f'--report-output "$PWD/{report_path}" --format text && '
-        "jsonl-history-search follow-next-reads "
-        f'--from-report "$PWD/{report_path}" --kind recovery --limit 5 --format text'
     )
-    return {
-        "role": role,
-        "kind": "primary_raw_history_recovery",
-        "provider": provider,
-        "source_handle": f"private:{report_path[len('.private/') :]}",
-        "recovery_output_handle": f"private:{report_path[len('.private/') :]}",
-        "historical_window_utc": {
-            "start": DEVLOG_PRIMARY_WINDOW_START_UTC,
-            "end": DEVLOG_PRIMARY_WINDOW_END_UTC,
-            "filter_contract": "inclusive --since and exclusive --until record filter",
-        },
-        "source_scope": source_scope,
-        "root_contract": root_contract,
-        "output_contract": {
+    if write_report:
+        command += (
+            f'--report-output "$PWD/{report_path}" --format text && '
+            f"{cli_prefix} follow-next-reads "
+            f'--from-report "$PWD/{report_path}" --kind recovery --limit 5 --format text'
+        )
+    else:
+        command += "--format text"
+    output_contract = (
+        {
             "stdout_format": "text",
             "stdout_use": "readable compact semantic-debug handoff followed by bounded recovery reads",
             "report_output_format": "json",
@@ -2864,7 +2960,38 @@ def _devlog_provider_primary_recovery_read(role: str, *, provider: str) -> dict:
                 "The .json report-output suffix writes a JSON sidecar; --format text controls stdout only. "
                 "Run jq only against the JSON sidecar, not terminal text."
             ),
+        }
+        if write_report
+        else {
+            "stdout_format": "text",
+            "stdout_use": "direct bounded semantic-debug source reach",
+            "report_output_format": None,
+            "report_output_path": None,
+            "report_output_rule": "No report output is requested or written by this recovery command.",
+        }
+    )
+    return {
+        "role": role,
+        "kind": (
+            "primary_raw_history_recovery"
+            if write_report
+            else "primary_raw_history_recovery_stdout"
+        ),
+        "provider": provider,
+        "source_handle": (
+            f"private:{report_path[len('.private/') :]}" if write_report else None
+        ),
+        "recovery_output_handle": (
+            f"private:{report_path[len('.private/') :]}" if write_report else None
+        ),
+        "historical_window_utc": {
+            "start": DEVLOG_PRIMARY_WINDOW_START_UTC,
+            "end": DEVLOG_PRIMARY_WINDOW_END_UTC,
+            "filter_contract": "inclusive --since and exclusive --until record filter",
         },
+        "source_scope": source_scope,
+        "root_contract": root_contract,
+        "output_contract": output_contract,
         "command": command,
         "purpose": (
             f"Recover bounded primary user/assistant source refs for {role} from {provider} raw history; "
