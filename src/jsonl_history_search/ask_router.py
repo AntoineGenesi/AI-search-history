@@ -567,7 +567,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "so use the status-anchor route before repo recovery."
         ),
         first_command_template='{cli} what-happened-since "{query}" --cwd "$PWD" --format text',
-        read_specialization="references/latest-status.md",
+        read_specialization="none; latest-status guidance is self-contained in the status command output",
         inspect_after=(
             "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
             "status_anchor.parent_main_anchor_shortlist, anchor_candidates, and selected_anchor",

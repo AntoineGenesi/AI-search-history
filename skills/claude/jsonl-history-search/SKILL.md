@@ -252,6 +252,11 @@ its `answered-from-proof` handoff contains internally validated source refs and
 is final-answer-ready without external source rereads.
 
 After `ask`, read only the named reference and run the printed first command.
+Latest-status is self-contained: do not open or search for a route reference.
+Run its printed `what-happened-since` command directly. If that command reports
+no selected anchor and no required primary refs, fail closed and ask for the
+prior message wording or timestamp; do not probe skill files, repo state, or
+diagnostic refs.
 Do not open route references, run broad `rg`, scan TODO/repo files, or inspect
 JSONL directly before `ask` for these natural prompts. If you have just read
 this skill for a natural prompt, run the installed-or-source resolution block.
@@ -283,7 +288,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 | "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction/preference | `references/remembered-instruction.md` | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format text` |
 | "Why did I say X?" "Why did I mention X?" "What was I talking about with X?" | Remembered topic/provenance | `ask` then `references/remembered-topic.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | `references/latest-status.md` | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
-| "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask` then `references/latest-status.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask`; no route-reference read | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Turn the early coordinator experiment into a devlog segment." "Reconstruct the arc with dates and concrete examples of Docker/runner/harness/auth/live-send/workflow drift." | Devlog/failure-analysis historical source reach | `ask --execute`, then `references/semantic-debugging.md` if a source-field needs interpretation | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text` |
