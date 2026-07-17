@@ -113,6 +113,39 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
     ),
 )
 
+NAMED_TASK_LOCAL_ROUTE = AskRoute(
+    route_family=LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
+    chosen_route="named-task-local / bounded-current-git-verification",
+    why_it_applies=(
+        "The caller declared local evidence for an explicit tasks/...md target. "
+        "Use bounded current Git, that task file, its canonical review, and exact "
+        "ancestry only."
+    ),
+    first_command_template=(
+        "git status --short --branch && "
+        "git log -1 --decorate --oneline --parents HEAD"
+    ),
+    read_specialization="local-artifact-verification",
+    inspect_after=(
+        "current HEAD, branch/detached state, and HEAD parents from the first command",
+        "the one named tasks/...md file",
+        "the matching codex/state/reviews/<task-basename>.md file when it exists",
+        "git branch --contains and git merge-base --is-ancestor for exact commits named by those two files",
+    ),
+    stop_guidance=(
+        "Stop after current HEAD/parents, the named task, its canonical review, "
+        "and exact commit ancestry answer the status/currentness question. Do not "
+        "run JSONL, broad or recursive rg/find, alternate review globs, TODO or "
+        "pipeline/state sweeps, report scans, whole-repo archaeology, tests, or "
+        "implementation review. Current Git ancestry overrides stale status prose."
+    ),
+    manual_search_guidance=(
+        "Use only target-bound git status/log/branch --contains/merge-base checks "
+        "plus bounded reads of the named task and canonical review. If those do "
+        "not prove merge/reachability, report that bounded uncertainty and stop."
+    ),
+)
+
 NAMED_TASK_CONVERSATION_HISTORY_ROUTE = AskRoute(
     route_family="semantic_debug",
     chosen_route="named-task-conversation-history / semantic-debug",
@@ -933,7 +966,7 @@ def classify_ask_route(
 
     if _EXPLICIT_TASK_PATH_RE.search(normalized):
         if evidence_source == "local":
-            return LOCAL_ARTIFACT_VERIFICATION_ROUTE
+            return NAMED_TASK_LOCAL_ROUTE
         if evidence_source == "conversation-history":
             return NAMED_TASK_CONVERSATION_HISTORY_ROUTE
         return NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE

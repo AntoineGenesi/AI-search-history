@@ -28,7 +28,11 @@ evidence-source decision before running any resolver or evidence command:
 
 - Declare `local` when the user asks about the current checkout, Git ancestry,
   branch reachability, merge/currentness, or contents/status of the named task
-  or review artifact.
+  or review artifact. After the resolver, use only current HEAD/parents, the
+  named task, its canonical `codex/state/reviews/<task-basename>.md` review, and
+  exact commit ancestry. Do not run recursive `rg`/`find`, TODO or pipeline/state
+  sweeps, report scans, tests, or implementation review; stop when those bounded
+  sources answer the question.
 - Declare `conversation-history` when the user explicitly asks for prior AI
   conversation, JSONL records, what the user or agent previously said, or raw
   source-session/tool-event evidence.
@@ -61,17 +65,15 @@ filesystem inspection. For a prompt that names an explicit `tasks/...md` path,
 use the declaration handshake above. Prompts that mention a task without an
 explicit path continue through the ordinary router.
 
-For a named local task status/currentness question, reconcile current Git
-before interpreting status prose. Inspect branch or detached state and the
-current `HEAD` parents, then use target-bound `git log`, `git branch --contains`,
-and `git merge-base --is-ancestor` checks to determine whether the task's
-reviewed branch work is reachable or merged. Current Git proof takes precedence
-over contradictory task, report, review, TODO, or pipeline status text. Do not
-call work active, pending-review, unmerged, incomplete, or not finished from
-stale secondary prose after Git proves the reviewed work is reachable or
-merged. If Git does not provide merge or reachability proof, stay cautious and
-do not infer that it merged. Keep this workflow local; do not invoke broad
-JSONL history unless source coverage is explicitly missing or disputed.
+For a declared local named-task status/currentness question, reconcile current
+Git before interpreting status prose. Inspect branch or detached state and the
+current `HEAD` parents, then read only the named task and matching canonical
+review. Use target-bound `git branch --contains` and
+`git merge-base --is-ancestor` for exact commits named there. Current Git proof
+takes precedence over contradictory status text. Do not run recursive `rg` or
+`find`, alternate review globs, TODO or pipeline/state sweeps, report scans,
+tests, implementation review, or JSONL. If this bounded proof does not establish
+merge or reachability, state that uncertainty and stop.
 
 The product contract is agent-assist retrieval: find useful information in
 large, messy JSONL histories, show where it was found, and give the receiving
