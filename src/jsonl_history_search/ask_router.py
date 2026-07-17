@@ -313,15 +313,20 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
     read_specialization="references/storage-retention.md",
     inspect_after=(
         "filesystem_inventory: bounded local size inventory (depth 2, top 40), then a top-40 file inventory for a named large subtree",
-        "retention_policy_join: inspect the small explicit policy/front-door set before searching artifact trees",
+        "generic_retention_policy: read the retention gate, reviewed ledger, state-file policy, and latest authorized outcome in one bounded command",
+        "named_handle_policy_join: only if the generic policy leaves one selected inventory handle unclassified",
         "artifact_join: use fixed-string target handles and hard output caps to map a named subtree to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",
         "retention_classification: required for current tests/examples, useful retained evidence, claim-critical raw traces, recomputable/cache, stale candidate, or unknown follow-up",
         "targeted_jsonl_follow_up: only for unresolved creator/history gaps after inventory and repo artifacts, with explicit roots/caps and searched-scope caveats",
         "echo_demotion: recent command-output echoes are diagnostics unless they contain primary creation or actual-use evidence",
     ),
     stop_guidance=(
-        "Start with the bounded depth-2/top-40 inventory, then use the emitted "
-        "target-specific retention-policy and producer/consumer joins. Do not run "
+        "Start with the bounded depth-2/top-40 inventory, then run the emitted "
+        "generic_retention_policy command. For generic .private location, lifetime, "
+        "or retention questions, answer from that current policy chain and stop; do "
+        "not serially inspect older tasks, reports, reviews, TODO, or state. Use named "
+        "handle policy and producer/consumer joins only when one selected inventory "
+        "handle remains unclassified. Do not run "
         "uncapped recursive rg, rg --files -uu, or broad repo file dumps. Do not "
         "run storage cleanup, deletion, archiving, moves, "
         "VHDX compaction, branch pruning, or claim/release copy from this route. "
@@ -329,8 +334,10 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
         "survives local inventory and artifact joins."
     ),
     manual_search_guidance=(
-        "Use the emitted non-destructive, depth/row-capped du/find inventory and "
-        "fixed-string rg joins for one named subtree/task handle at a time. If a "
+        "Use the emitted non-destructive inventory and generic policy command first. "
+        "Do not recover generic retention policy through historical archaeology. Use "
+        "fixed-string rg joins for one named subtree/task handle only if that handle "
+        "remains unclassified after the policy read. If a "
         "specific subtree still lacks creator or usage evidence, run a narrowly "
         "scoped semantic-debug query for that subtree/task handle; preserve cap, "
         "root, and searched-scope caveats. Demote recent ask/command-output "
