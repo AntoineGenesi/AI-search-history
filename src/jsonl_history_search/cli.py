@@ -2267,7 +2267,6 @@ def _ask_execute_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
             report_output=report_output,
-            fallback_command=fallback_command,
         )
         if provenance:
             return provenance
@@ -2341,7 +2340,6 @@ def _provenance_report_output_unavailable(
     *,
     execution_kind: str,
     report_output: str,
-    fallback_command: str | None,
 ) -> dict:
     ask_execute = contract["ask_execute"]
     selected_route = ask_execute.get("selected_route") or {}
@@ -2358,6 +2356,19 @@ def _provenance_report_output_unavailable(
     if handoff.get("status") != "completed_task_merge_artifact_refs_available_source_session_missing":
         return {}
 
+    retained_actions = [
+        item
+        for item in handoff.get("retained_source_reads") or []
+        if isinstance(item, dict) and item.get("command")
+    ]
+    bounded_first_command = (
+        str(retained_actions[0]["command"])
+        if retained_actions
+        else None
+    )
+    selected_route["first_command"] = bounded_first_command
+    selected_route["next_commands"] = retained_actions
+
     ask_execute["execution"].update(
         {
             "status": "report_output_unavailable",
@@ -2365,7 +2376,8 @@ def _provenance_report_output_unavailable(
             "argv": [],
             "report_output": report_output,
             "report_written": None,
-            "fallback_command": fallback_command,
+            "fallback_command": bounded_first_command,
+            "fallback_commands": retained_actions,
             "reason": (
                 "The report destination is not writable. Same-task task/review/merge evidence is still "
                 "available as partial proof, but no raw source-session evidence was opened by this route."
@@ -2390,6 +2402,20 @@ def _provenance_report_output_unavailable(
             "missing_roles": ["source_session_proof"],
             "unopened_private_handles_are_leads_only": True,
             "report_output_unavailable_is_product_defect": False,
+        },
+        "missing_source_session_stop_contract": {
+            "schema_version": 1,
+            "contract_kind": "missing-source-session-stop",
+            "status": "not-ready/missing-source-session-proof",
+            "answer_allowed": False,
+            "missing_roles": ["source_session_proof"],
+            "bounded_retained_source_actions": retained_actions,
+            "generic_semantic_debug_allowed": False,
+            "stop": handoff.get("stop"),
+            "unblock": (
+                "Open a role-valid same-task raw JSONL/session ref through a bounded retained-source action; "
+                "task, review, scratch, report, and summary artifacts cannot unblock this facet."
+            ),
         },
         "stop": handoff.get("stop"),
         "only_continue_if": handoff.get("only_continue_if"),
@@ -9291,6 +9317,18 @@ def _ask_answer_from_execute(
     }
     answer = base["ask_answer"]
 
+    missing_source_session = _ask_answer_missing_source_session_next_step(action)
+    if execution.get("status") != "executed" and missing_source_session:
+        answer["source_contract"]["missing_source_session_stop_contract"] = missing_source_session
+        return _ask_answer_fail_closed(
+            answer,
+            (
+                "source-session proof is missing; task, review, and Git facts remain separate partial proof "
+                "and cannot replace an opened role-valid raw/session source"
+            ),
+            missing_source_session,
+        )
+
     if execution.get("status") != "executed":
         return _ask_answer_fail_closed(
             answer,
@@ -10649,6 +10687,46 @@ def _next_proof_step_from_action(action: dict) -> object:
     if reads:
         return reads
     return action.get("only_continue_if") or action.get("stop")
+
+
+def _ask_answer_missing_source_session_next_step(action: dict) -> dict:
+    if action.get("answer_status") != "not-ready/missing-source-session-proof":
+        return {}
+    contract = (
+        action.get("missing_source_session_stop_contract")
+        if isinstance(action.get("missing_source_session_stop_contract"), dict)
+        else {}
+    )
+    handoff = (
+        action.get("named_task_merge_provenance_handoff")
+        if isinstance(action.get("named_task_merge_provenance_handoff"), dict)
+        else {}
+    )
+    bounded_actions = [
+        item
+        for item in (
+            contract.get("bounded_retained_source_actions")
+            or handoff.get("retained_source_reads")
+            or []
+        )
+        if isinstance(item, dict) and item.get("command")
+    ]
+    stop = contract.get("stop") or action.get("stop")
+    return {
+        "schema_version": 1,
+        "contract_kind": "missing-source-session-stop",
+        "status": "not-ready/missing-source-session-proof",
+        "answer_allowed": False,
+        "missing_roles": ["source_session_proof"],
+        "bounded_retained_source_actions": bounded_actions,
+        "generic_semantic_debug_allowed": False,
+        "stop": stop,
+        "unblock": contract.get("unblock")
+        or (
+            "Open a role-valid same-task raw JSONL/session ref through a bounded retained-source action; "
+            "task, review, scratch, report, and summary artifacts cannot unblock this facet."
+        ),
+    }
 
 
 def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_family: str) -> bool:
