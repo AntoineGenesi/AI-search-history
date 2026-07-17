@@ -493,7 +493,8 @@ def render_ask_execute_text(payload: dict) -> str:
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
     _append_answer_handoff_text(lines, report.get("answer_handoff"))
-    _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
+    if not _append_remembered_user_missing_evidence_contract(lines, action):
+        _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
     lines.append("Read/action contract:")
     _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
     only_continue = action.get("only_continue_if")
@@ -595,12 +596,13 @@ def render_ask_execute_markdown(payload: dict) -> str:
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
     _append_answer_handoff_markdown(lines, report.get("answer_handoff"))
-    _append_scoped_no_evidence_contract(
-        lines,
-        action,
-        report.get("executed_output") or {},
-        markdown=True,
-    )
+    if not _append_remembered_user_missing_evidence_contract(lines, action, markdown=True):
+        _append_scoped_no_evidence_contract(
+            lines,
+            action,
+            report.get("executed_output") or {},
+            markdown=True,
+        )
     if execution.get("status") == "unsupported_route":
         lines.append(f"- Unsupported route: {execution.get('reason')}")
         handoff = route.get("answer_ready_handoff") or {}
@@ -1036,6 +1038,83 @@ def _append_scoped_no_evidence_contract(
             f"- saved_report: {contract.get('saved_report') or action.get('saved_report')}",
         ]
     )
+
+
+def _append_remembered_user_missing_evidence_contract(
+    lines: list[str],
+    action: dict,
+    *,
+    markdown: bool = False,
+) -> bool:
+    contract = action.get("missing_evidence_stop_contract")
+    if not isinstance(contract, dict):
+        return False
+    checked = (
+        contract.get("bounded_evidence_checked")
+        if isinstance(contract.get("bounded_evidence_checked"), dict)
+        else {}
+    )
+    checked_kinds = _root_scope_kinds(checked.get("roots"))
+    searched_kinds = _root_scope_kinds(checked.get("searched_roots"))
+    missing_kinds = _root_scope_kinds(checked.get("missing_roots"))
+    searched_files = int(checked.get("searched_files") or 0)
+    searched_bytes = int(checked.get("searched_bytes") or 0)
+    selected_count = int(checked.get("selected_root_count") or 0)
+    searched_count = int(checked.get("searched_root_count") or 0)
+    excluded_count = int(checked.get("excluded_root_count") or 0)
+    missing_count = int(checked.get("missing_root_count") or 0)
+    if markdown:
+        lines.extend(
+            [
+                "",
+                "## Remembered-User Missing-Evidence Scope",
+                "",
+                f"- Searched primary history: files=`{searched_files}`, bytes=`{searched_bytes}`",
+                f"- Checked root kinds: `{', '.join(checked_kinds) or 'none'}`",
+                f"- Searched root kinds: `{', '.join(searched_kinds) or 'none'}`",
+                f"- Missing root kinds: `{', '.join(missing_kinds) or 'none'}`",
+                (
+                    f"- Root counts: selected=`{selected_count}`, searched=`{searched_count}`, "
+                    f"excluded=`{excluded_count}`, missing=`{missing_count}`"
+                ),
+                f"- Broad repo search allowed: `{str(bool(contract.get('broad_repo_search_allowed'))).lower()}`",
+                (
+                    "- Secondary substitution allowed: "
+                    f"`{str(bool(contract.get('secondary_substitution_allowed'))).lower()}`"
+                ),
+            ]
+        )
+        return True
+    lines.extend(
+        [
+            "Remembered-user missing-evidence scope:",
+            f"- searched_primary_history: searched_files={searched_files} searched_bytes={searched_bytes}",
+            f"- checked_root_kinds: {', '.join(checked_kinds) or 'none'}",
+            f"- searched_root_kinds: {', '.join(searched_kinds) or 'none'}",
+            f"- missing_root_kinds: {', '.join(missing_kinds) or 'none'}",
+            (
+                f"- root_counts: selected={selected_count} searched={searched_count} "
+                f"excluded={excluded_count} missing={missing_count}"
+            ),
+            f"- broad_repo_search_allowed: {str(bool(contract.get('broad_repo_search_allowed'))).lower()}",
+            (
+                "- secondary_substitution_allowed: "
+                f"{str(bool(contract.get('secondary_substitution_allowed'))).lower()}"
+            ),
+        ]
+    )
+    return True
+
+
+def _root_scope_kinds(rows: object) -> list[str]:
+    kinds: list[str] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "").strip()
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    return kinds
 
 
 def _append_compact_read_contract(

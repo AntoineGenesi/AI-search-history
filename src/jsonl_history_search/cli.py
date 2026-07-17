@@ -4873,6 +4873,11 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
         if isinstance(compact.get("searched_scope"), dict)
         else {}
     )
+    scope_counts = (
+        compact.get("scope_counts")
+        if isinstance(compact.get("scope_counts"), dict)
+        else {}
+    )
     if status not in {"no_evidence", "not_found_in_searched_scope"} and not no_evidence:
         return {}
 
@@ -4893,8 +4898,13 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
             "bounded_evidence_checked": {
                 "searched_files": int(searched_scope.get("searched_files") or 0),
                 "searched_bytes": int(searched_scope.get("searched_bytes") or 0),
-                "roots": searched_scope.get("roots") or [],
+                "roots": searched_scope.get("checked_roots") or [],
+                "searched_roots": searched_scope.get("searched_roots") or [],
                 "missing_roots": searched_scope.get("missing_roots") or [],
+                "selected_root_count": int(scope_counts.get("selected_root_count") or 0),
+                "searched_root_count": len(searched_scope.get("searched_roots") or []),
+                "excluded_root_count": int(scope_counts.get("excluded_root_count") or 0),
+                "missing_root_count": int(scope_counts.get("missing_root_count") or 0),
             },
             "excluded_as_user_statement_proof": [
                 "TODO files",
@@ -8530,6 +8540,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
+            "searched_scope": compact.get("searched_scope"),
+            "scope_counts": compact.get("scope_counts"),
+            "cap_hit": compact.get("cap_hit"),
             "no_evidence": compact.get("no_evidence"),
             "message": compact.get("message"),
         }
@@ -17279,18 +17292,60 @@ def _no_evidence_searched_scope_summary(
     searched_bytes: int | None = None,
 ) -> dict:
     searched = no_evidence.get("searched_scope") if isinstance(no_evidence.get("searched_scope"), dict) else {}
+    not_searched = (
+        no_evidence.get("not_searched_scope")
+        if isinstance(no_evidence.get("not_searched_scope"), dict)
+        else {}
+    )
     files = searched.get("searched_files") if searched_files is None else searched_files
     bytes_ = searched.get("searched_bytes") if searched_bytes is None else searched_bytes
-    roots = [root for root in searched.get("roots") or [] if isinstance(root, dict)]
+    searched_roots = _compact_no_evidence_root_rows(searched.get("roots") or [])
+    missing_roots = _compact_no_evidence_root_rows(
+        no_evidence.get("missing_scope")
+        if isinstance(no_evidence.get("missing_scope"), list)
+        else not_searched.get("missing_roots") or []
+    )
+    checked_roots = _dedupe_compact_no_evidence_root_rows(searched_roots + missing_roots)
     return {
         "searched_files": int(files or 0),
         "searched_bytes": int(bytes_ or 0),
         "result_meaning": searched.get("result_meaning"),
-        "root_kinds": _unique_preserving_order([str(root.get("kind") or "") for root in roots]),
+        "checked_roots": checked_roots,
+        "searched_roots": searched_roots,
+        "missing_roots": missing_roots,
+        "root_kinds": _unique_preserving_order([str(root.get("kind") or "") for root in checked_roots]),
         "root_privacy_labels": _unique_preserving_order(
-            [str(root.get("privacy_label") or "") for root in roots]
+            [str(root.get("privacy_label") or "") for root in checked_roots]
         ),
     }
+
+
+def _compact_no_evidence_root_rows(rows: object) -> list[dict]:
+    compact: list[dict] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        compact.append(
+            {
+                "kind": row.get("kind"),
+                "scope_label": row.get("scope_label"),
+                "privacy_label": row.get("privacy_label"),
+                "reason": row.get("reason"),
+            }
+        )
+    return compact
+
+
+def _dedupe_compact_no_evidence_root_rows(rows: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[tuple[object, object, object]] = set()
+    for row in rows:
+        key = (row.get("kind"), row.get("scope_label"), row.get("privacy_label"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def _no_evidence_scope_counts(no_evidence: dict) -> dict:
@@ -17299,7 +17354,22 @@ def _no_evidence_scope_counts(no_evidence: dict) -> dict:
     if isinstance(selected_roots, list):
         selected_count = len(selected_roots)
     else:
-        selected_count = len(searched.get("roots") or [])
+        not_searched = (
+            no_evidence.get("not_searched_scope")
+            if isinstance(no_evidence.get("not_searched_scope"), dict)
+            else {}
+        )
+        missing_roots = (
+            no_evidence.get("missing_scope")
+            if isinstance(no_evidence.get("missing_scope"), list)
+            else not_searched.get("missing_roots") or []
+        )
+        selected_count = len(
+            _dedupe_compact_no_evidence_root_rows(
+                _compact_no_evidence_root_rows(searched.get("roots") or [])
+                + _compact_no_evidence_root_rows(missing_roots)
+            )
+        )
 
     excluded_summary = (
         no_evidence.get("excluded_scope_summary")
