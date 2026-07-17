@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import sys
@@ -2008,6 +2009,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             execution_kind=execution_kind,
             report_output=report_output,
             fallback_command=selected_route.get("first_command"),
+            execution_args=execution_args,
         )
 
     try:
@@ -2052,6 +2054,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             execution_kind=execution_kind,
             report_output=report_output,
             fallback_command=selected_route.get("first_command"),
+            execution_args=execution_args,
         )
 
     compact = executed_payload[output_key]
@@ -2220,12 +2223,14 @@ def _ask_execute_report_output_unavailable(
     execution_kind: str,
     report_output: str,
     fallback_command: str | None,
+    execution_args: argparse.Namespace | None = None,
 ) -> dict:
     if execution_kind == "devlog-failure-analysis":
         return _devlog_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
             report_output=report_output,
+            execution_args=execution_args,
         )
     if execution_kind == "semantic-debug":
         provenance = _provenance_report_output_unavailable(
@@ -2324,11 +2329,67 @@ def _devlog_report_output_unavailable(
     *,
     execution_kind: str,
     report_output: str,
+    execution_args: argparse.Namespace | None = None,
 ) -> dict:
     ask_execute = contract["ask_execute"]
     selected_route = ask_execute.get("selected_route") or {}
     command_resolution = selected_route.get("command_resolution") or {}
     cli_prefix = command_resolution.get("command_prefix") or "jsonl-history-search"
+    history_roots = _devlog_history_root_preflight(execution_args)
+    if not history_roots["any_primary_history_available"]:
+        missing_roles = list(DEVLOG_CHRONOLOGY_ROLE_ORDER)
+        stop_condition = (
+            "Stop now: no real Codex or Claude primary history root is available. Do not run the "
+            "later Git read, repository searches, task/review/report archaeology, or same-loop answer-key "
+            "searches. Exact missing roles: first_appearance, worsening_process_cause, later_change. "
+            "Keep all chronology roles missing until a real history root is supplied."
+        )
+        chronology = {
+            "status": "fail_closed_primary_history_roots_unavailable",
+            "answer_status": "fail_closed_missing_chronology_roles",
+            "answer_allowed": False,
+            "required_roles": missing_roles,
+            "covered_primary_roles": [],
+            "missing_roles": missing_roles,
+            "primary_history_blocked_roles": ["first_appearance", "worsening_process_cause"],
+            "deferred_until_primary_history": ["later_change"],
+            "history_root_preflight": history_roots,
+            "copyable_next_read_count": 0,
+            "stop_condition": stop_condition,
+        }
+        ask_execute["execution"].update(
+            {
+                "status": "report_output_unavailable",
+                "command_family": execution_kind,
+                "argv": [],
+                "report_output": report_output,
+                "report_written": None,
+                "fallback_command": None,
+                "fallback_commands": [],
+                "reason": (
+                    "The report destination is not writable and the configured runtime homes contain no "
+                    "real primary history. The route fails closed without executable artifact fallback."
+                ),
+            }
+        )
+        ask_execute["execution_status"] = "report_output_unavailable"
+        ask_execute["answer_action_contract"] = {
+            "answer_status": "fail_closed_missing_chronology_roles",
+            "promotion_status": "primary_history_roots_unavailable",
+            "promotion_reason": (
+                "Isolated runtime homes are not history roots. Supply a real root through "
+                "JSONL_HISTORY_CODEX_HOME or JSONL_HISTORY_CLAUDE_HOME, then rerun the front door."
+            ),
+            "chronology_source_reach": chronology,
+            "read": [],
+            "stop": stop_condition,
+            "only_continue_if": (
+                "A real Codex or Claude history root is explicitly supplied; rerun ask --execute rather "
+                "than searching repository artifacts."
+            ),
+            "saved_report": None,
+        }
+        return contract
     direct_reads = []
     for role in DEVLOG_CHRONOLOGY_ROLE_ORDER:
         direct_reads.extend(
@@ -2592,6 +2653,98 @@ def _build_semantic_wrapup_report_output_payload(args: argparse.Namespace) -> di
 
 
 def _build_devlog_failure_analysis_report_output_payload(args: argparse.Namespace) -> dict:
+    history_roots = _devlog_history_root_preflight(args)
+    if not history_roots["any_primary_history_available"]:
+        missing_roles = list(DEVLOG_CHRONOLOGY_ROLE_ORDER)
+        stop_condition = (
+            "Stop now: no real Codex or Claude primary history root is available. Do not run repository "
+            "searches, task/review/report archaeology, later Git recovery, or same-loop answer-key searches. "
+            "Exact missing roles: first_appearance, worsening_process_cause, later_change."
+        )
+        chronology_source_reach = {
+            "status": "fail_closed_primary_history_roots_unavailable",
+            "answer_status": "fail_closed_missing_chronology_roles",
+            "answer_allowed": False,
+            "required_roles": missing_roles,
+            "covered_primary_roles": [],
+            "missing_roles": missing_roles,
+            "primary_history_blocked_roles": ["first_appearance", "worsening_process_cause"],
+            "deferred_until_primary_history": ["later_change"],
+            "history_root_preflight": history_roots,
+            "primary_role_reads": {role: [] for role in DEVLOG_CHRONOLOGY_ROLE_ORDER},
+            "primary_recovery_reads": {},
+            "retained_primary_report_handles": [],
+            "artifact_role_leads": {role: [] for role in DEVLOG_CHRONOLOGY_ROLE_ORDER},
+            "dedicated_case_lead": None,
+            "copyable_next_reads": [],
+            "stop_condition": stop_condition,
+            "claim_boundary": (
+                "No primary history was available, so no repository artifact or generated output was "
+                "promoted as chronology support."
+            ),
+        }
+        compact = {
+            "schema_version": 1,
+            "status": "primary_history_roots_unavailable",
+            "query": args.query,
+            "report_written": str(Path(args.report_output).expanduser()),
+            "linked_reports": {},
+            "source_read_order": ["chronology_source_reach.copyable_next_reads"],
+            "core_convo_first_read_plan": {
+                "read": [],
+                "diagnostics_after": [],
+                "role_groups": {},
+            },
+            "target_historical_source_window_reads": [],
+            "target_historical_source_window_read_count": 0,
+            "chronology_source_reach": chronology_source_reach,
+            "diagnostic_source_window_reads": [],
+            "diagnostic_source_window_read_count": 0,
+            "diagnostic_policy": {
+                "current_adjacent_same_loop_refs_are_default_final_support": False,
+                "actionability": "disabled while primary history roots are unavailable",
+            },
+            "generic_recovery_policy": {
+                "primary_recovery_surface": "chronology_source_reach.copyable_next_reads",
+                "broad_repo_missing_role_actions": "disabled",
+                "repo_artifact_roots_are_primary_raw_recovery": False,
+            },
+            "output_contract": {
+                "stdout": "ask prints the selected format and is not suppressed by report-output",
+                "report_output_format": "json",
+                "report_output": str(Path(args.report_output).expanduser()),
+                "linked_report_format": None,
+                "jq_rule": "The main .json report is the only sidecar for this fail-closed result.",
+            },
+            "repo_phase_category_evidence": {},
+            "failure_analysis": {
+                "status": "not_run_primary_history_roots_unavailable",
+                "report_written": None,
+                "devlog_brief": None,
+                "story_phase_summary": None,
+            },
+            "answer_contract": {
+                "answer_status": "fail_closed_missing_chronology_roles",
+                "required_read_order": [],
+                "only_continue_if": (
+                    "A real history root is supplied, then the same ask --execute front door is rerun."
+                ),
+                "stop_condition": stop_condition,
+            },
+            "privacy_flags": {
+                "raw_private_transcript_text_included": False,
+                "raw_private_session_ids_included": False,
+                "absolute_private_paths_committed": False,
+                "vectors_or_indexes_included": False,
+                "repo_artifact_evidence_is_committed_safe_metadata_only": False,
+            },
+        }
+        Path(args.report_output).expanduser().write_text(
+            render({"devlog_failure_analysis": compact}, "json"),
+            encoding="utf-8",
+        )
+        return {"devlog_failure_analysis": compact}
+
     semantic_report = _ask_execute_sidecar_path(args.report_output, "semantic-debug")
     repo_report = _ask_execute_sidecar_path(args.report_output, "repo-artifact-evidence")
     failure_report = _ask_execute_sidecar_path(args.report_output, "failure-analysis")
@@ -2786,9 +2939,11 @@ def _demote_devlog_generic_repo_recovery(value: object) -> None:
                 "read_more_actionable": False,
                 "source_tier": "legitimate_pre_existing_secondary_context",
                 "demotion_reason": "devlog_primary_roles_require_bounded_april_raw_history",
+                "command": None,
+                "executable_guidance_removed": True,
                 "recovery_instruction": (
-                    "Secondary context only. Do not run this broad repo search for a missing April primary role; "
-                    "use chronology_source_reach.copyable_next_reads."
+                    "Secondary context only. Broad recursive repository recovery is disabled for this route; "
+                    "use chronology_source_reach.copyable_next_reads and fail closed if its role remains missing."
                 ),
             }
         )
@@ -2879,13 +3034,13 @@ DEVLOG_PRIMARY_RECOVERY_REPORT_DIR = ".private/jsonl/devlog-chronology"
 DEVLOG_PRIMARY_WINDOW_START_UTC = "2026-04-13T16:00:48.508Z"
 # Exclusive bound that includes JSH-896's last observed event at 12:27:59.905Z.
 DEVLOG_PRIMARY_WINDOW_END_UTC = "2026-04-17T12:28:00Z"
-DEVLOG_CODEX_APRIL_ROOTS = (
-    "$HOME/.codex/sessions/2026/04/13",
-    "$HOME/.codex/sessions/2026/04/14",
-    "$HOME/.codex/sessions/2026/04/15",
-    "$HOME/.codex/sessions/2026/04/16",
-    "$HOME/.codex/sessions/2026/04/17",
-    "$HOME/.codex/history.jsonl",
+DEVLOG_CODEX_APRIL_RELATIVE_ROOTS = (
+    "sessions/2026/04/13",
+    "sessions/2026/04/14",
+    "sessions/2026/04/15",
+    "sessions/2026/04/16",
+    "sessions/2026/04/17",
+    "history.jsonl",
 )
 DEVLOG_CLAUDE_MTIME_START = "2026-04-13 16:00:48 UTC"
 DEVLOG_CLAUDE_MTIME_END = "2026-04-17 12:28:00 UTC"
@@ -2907,6 +3062,88 @@ DEVLOG_PRIMARY_RECOVERY_QUERIES = {
     ),
 }
 DEVLOG_LATER_CHANGE_GIT_PATH = "docs/harness-graveyard-and-product-path-correction.md"
+
+
+def _devlog_history_root_preflight(args: argparse.Namespace | None) -> dict:
+    explicit_roots = [
+        Path(str(root)).expanduser()
+        for root in list(getattr(args, "root", None) or [])
+    ]
+    explicit_available = any(root.exists() for root in explicit_roots)
+
+    codex_override = os.environ.get("JSONL_HISTORY_CODEX_HOME")
+    codex_arg = getattr(args, "codex_home", None) if args is not None else None
+    codex_runtime = os.environ.get("CODEX_HOME")
+    codex_home = Path(
+        codex_override or codex_arg or codex_runtime or (Path.home() / ".codex")
+    ).expanduser()
+    codex_available = (codex_home / "history.jsonl").is_file() or any(
+        (codex_home / relative).exists()
+        for relative in DEVLOG_CODEX_APRIL_RELATIVE_ROOTS[:-1]
+    )
+
+    claude_override = os.environ.get("JSONL_HISTORY_CLAUDE_HOME")
+    claude_arg = getattr(args, "claude_home", None) if args is not None else None
+    claude_runtime = os.environ.get("CLAUDE_HOME")
+    claude_home = Path(
+        claude_override or claude_arg or claude_runtime or (Path.home() / ".claude")
+    ).expanduser()
+    claude_projects = claude_home / "projects"
+    claude_available = _bounded_tree_has_jsonl(claude_projects)
+
+    return {
+        "status": (
+            "primary_history_available"
+            if explicit_available or codex_available or claude_available
+            else "primary_history_roots_unavailable"
+        ),
+        "any_primary_history_available": explicit_available or codex_available or claude_available,
+        "explicit_root_available": explicit_available,
+        "codex": {
+            "available": codex_available,
+            "configured_by": (
+                "JSONL_HISTORY_CODEX_HOME"
+                if codex_override
+                else "--codex-home"
+                if codex_arg
+                else "CODEX_HOME"
+                if codex_runtime
+                else "$HOME/.codex"
+            ),
+            "isolated_runtime_home_is_history_root": codex_available,
+        },
+        "claude": {
+            "available": claude_available,
+            "configured_by": (
+                "JSONL_HISTORY_CLAUDE_HOME"
+                if claude_override
+                else "--claude-home"
+                if claude_arg
+                else "CLAUDE_HOME"
+                if claude_runtime
+                else "$HOME/.claude"
+            ),
+            "isolated_runtime_home_is_history_root": claude_available,
+        },
+        "override_contract": (
+            "Use JSONL_HISTORY_CODEX_HOME or JSONL_HISTORY_CLAUDE_HOME only for a real history root; "
+            "otherwise fail closed without repository fallback."
+        ),
+    }
+
+
+def _bounded_tree_has_jsonl(root: Path, *, max_directories: int = 200) -> bool:
+    if not root.is_dir():
+        return False
+    visited = 0
+    for _directory, directories, files in os.walk(root):
+        visited += 1
+        if any(name.endswith(".jsonl") for name in files):
+            return True
+        if visited >= max_directories:
+            directories[:] = []
+            break
+    return False
 
 
 def _build_devlog_chronology_source_reach(
@@ -3114,28 +3351,46 @@ def _devlog_provider_primary_recovery_read(
         "--watchlist docker_harness_auth_live_send --watchlist product_vs_process_churn "
     )
     if provider == "codex":
-        root_flags = " ".join(f'--root "{root}"' for root in DEVLOG_CODEX_APRIL_ROOTS)
+        root_flags = '"${CODEX_ROOT_ARGS[@]}"'
+        relative_roots = " ".join(shlex.quote(root) for root in DEVLOG_CODEX_APRIL_RELATIVE_ROOTS)
         preamble = (
-            f'mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
-            if write_report
-            else ""
+            'CODEX_HISTORY_HOME="${JSONL_HISTORY_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" && '
+            'CODEX_ROOT_ARGS=() && '
+            f"for relative in {relative_roots}; do path=\"$CODEX_HISTORY_HOME/$relative\"; "
+            'test -e "$path" && CODEX_ROOT_ARGS+=(--root "$path"); done && '
+            'test "${#CODEX_ROOT_ARGS[@]}" -gt 0 || { '
+            f"printf 'Missing primary history root for role {role} (provider codex): %s has no bounded history inputs; "
+            "an isolated runtime home is not a real history root. Set JSONL_HISTORY_CODEX_HOME.\\n' "
+            '"$CODEX_HISTORY_HOME" >&2; exit 2; }'
         )
+        if write_report:
+            preamble += f' && mkdir -p "$PWD/{DEVLOG_PRIMARY_RECOVERY_REPORT_DIR}"'
         source_scope = ["codex_sessions_april_13_17", "codex_history"]
         root_contract = {
             "provider": "codex",
-            "roots": list(DEVLOG_CODEX_APRIL_ROOTS),
+            "history_home_precedence": ["JSONL_HISTORY_CODEX_HOME", "CODEX_HOME", "$HOME/.codex"],
+            "relative_roots": list(DEVLOG_CODEX_APRIL_RELATIVE_ROOTS),
             "scope_boundary": "April 13-17 Codex session buckets plus Codex history only",
+            "runtime_home_boundary": (
+                "An isolated runtime CODEX_HOME is not treated as real history unless it contains a bounded input; "
+                "set JSONL_HISTORY_CODEX_HOME to the real history root or fail closed with this role missing."
+            ),
         }
     else:
         root_flags = '"${CLAUDE_ROOT_ARGS[@]}"'
         preamble = (
+            'CLAUDE_HISTORY_HOME="${JSONL_HISTORY_CLAUDE_HOME:-${CLAUDE_HOME:-$HOME/.claude}}" && '
+            'test -d "$CLAUDE_HISTORY_HOME/projects" || { '
+            f"printf 'Missing primary history root for role {role} (provider claude): %s/projects is unavailable; "
+            "an isolated runtime home is not a real history root. Set JSONL_HISTORY_CLAUDE_HOME.\\n' "
+            '"$CLAUDE_HISTORY_HOME" >&2; exit 2; } && '
             "CLAUDE_ROOT_ARGS=() && "
             "while IFS= read -r -d '' path; do CLAUDE_ROOT_ARGS+=(--root \"$path\"); done "
-            f'< <(find "$HOME/.claude/projects" -type f -name \'*.jsonl\' '
+            f'< <(find "$CLAUDE_HISTORY_HOME/projects" -type f -name \'*.jsonl\' '
             f"-newermt {shlex.quote(DEVLOG_CLAUDE_MTIME_START)} "
             f"! -newermt {shlex.quote(DEVLOG_CLAUDE_MTIME_END)} -print0) && "
             'test "${#CLAUDE_ROOT_ARGS[@]}" -gt 0 || { '
-            "printf 'No Claude project-log files in the bounded April window; primary role remains missing.\\n' >&2; "
+            f"printf 'Missing primary history root for role {role} (provider claude): no project logs in the bounded April window.\\n' >&2; "
             'exit 2; }'
         )
         if write_report:
@@ -3143,6 +3398,7 @@ def _devlog_provider_primary_recovery_read(
         source_scope = ["claude_project_logs_april_mtime_candidates"]
         root_contract = {
             "provider": "claude",
+            "history_home_precedence": ["JSONL_HISTORY_CLAUDE_HOME", "CLAUDE_HOME", "$HOME/.claude"],
             "root_discovery": "individual Claude project JSONL files whose mtime overlaps the JSH-896 window",
             "mtime_window": {
                 "start": DEVLOG_CLAUDE_MTIME_START,
@@ -3151,6 +3407,10 @@ def _devlog_provider_primary_recovery_read(
             "scope_boundary": (
                 "bounded April-mtime Claude project logs only, with exact record timestamps enforced by --since/--until; "
                 "fail closed if no candidate files exist"
+            ),
+            "runtime_home_boundary": (
+                "An isolated runtime CLAUDE_HOME is not treated as real history unless projects contains a bounded input; "
+                "set JSONL_HISTORY_CLAUDE_HOME to the real history root or fail closed with this role missing."
             ),
         }
     command = f"{preamble} && " if preamble else ""
@@ -3207,6 +3467,7 @@ def _devlog_provider_primary_recovery_read(
         },
         "source_scope": source_scope,
         "root_contract": root_contract,
+        "missing_role_on_unavailable": role,
         "output_contract": output_contract,
         "command": command,
         "purpose": (

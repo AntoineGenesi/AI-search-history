@@ -1351,6 +1351,10 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
     failure_terms = (
         "failure",
         "failure mode",
+        "got stuck",
+        "became stuck",
+        "bogged down",
+        "lost in",
         "drift",
         "drifting",
         "pulled into",
@@ -1362,6 +1366,17 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
         "concrete examples",
         "separate what you can prove",
         "plausible interpretation",
+    )
+    recovery_terms = (
+        "returning to product",
+        "returned to product",
+        "return to product",
+        "back to product",
+        "back toward product",
+        "back towards product",
+        "shifted to product",
+        "started prioritizing product",
+        "resumed product",
     )
     agent_work_terms = (
         "coordinator",
@@ -1393,7 +1408,13 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
             "evidence",
         ),
     )
-    long_form_story = asks_for_story and asks_for_failure and asks_about_agent_work and asks_for_dates_or_examples
+    asks_for_recovery = _has_any(normalized, recovery_terms)
+    long_form_story = (
+        asks_for_story
+        and asks_for_failure
+        and asks_about_agent_work
+        and (asks_for_dates_or_examples or asks_for_recovery)
+    )
     chronology_story = (
         asks_for_failure
         and asks_about_agent_work
