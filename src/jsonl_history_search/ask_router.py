@@ -651,18 +651,18 @@ ROUTES: tuple[AskRoute, ...] = (
         inspect_after=(
             "artifact_currentness.worktree_currentness.cleanup_causality.operational_records and debt_status",
             "artifact_currentness.worktree_currentness.classifications",
-            "source_role labels for operational_record, git_state, and private_retention_evidence",
-            "per-item source_refs and preservation_guidance after operational records",
-            "next_commands for worktree list, status, branch contains, git log grep, targeted rg, and private artifact find",
+            "causal_source_role order for report_only_audit, deferred_handoff, cleanup_learning_policy, and cleanup_execution",
+            "for a missing named target, only target_binding plus exact worktree/branch Git proof",
+            "per-item source_refs and preservation guidance only after a named target is bound",
         ),
         stop_guidance=(
             "Run artifact-currentness before shallow git cleanup conclusions. Stop "
-            "only after operational cleanup audit/handoff/execution records, source refs, "
-            "and private-artifact preservation requirements are inspected."
+            "after the original cleanup role chain is sufficient; for a missing named target, "
+            "stop after exact current Git absence without generic cleanup or fixture archaeology."
         ),
         manual_search_guidance=(
-            "Manual git/rg inspection is follow-up after the route's targeted commands. "
-            "Do not treat worktree cleanup as branch ref pruning."
+            "Manual inspection is follow-up only when the route reports a real source-role gap. "
+            "Do not treat worktree cleanup as branch ref pruning or use adjacent fixtures as target proof."
         ),
     ),
     AskRoute(

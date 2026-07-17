@@ -150,7 +150,8 @@ proof that the global console command is installed. If neither path is
 executable, report the installed/source parity gap instead of fumbling through
 unrelated commands.
 
-For `why did the JSON-search-history worktrees not clean themselves up?`, the
+For the exact wordings `why did the worktrees not clean themselves up?` and
+`why did the JSON-search-history worktrees not clean themselves up?`, the
 resolution block above is the only domain command needed when its cleanup
 `answer_handoff` is `answered-from-proof`. The tool has already opened and
 validated the bounded repo-local refs. Do not read a route reference, rerun
@@ -159,10 +160,19 @@ answer from the handoff and stop. A missing or fail-closed handoff does not
 authorize cleanup or destructive recovery.
 
 This exact cleanup fast path is fully specified in this first skill section.
-When that is the user's prompt, do not read the remainder of `SKILL.md` after
+When either exact wording is the user's prompt, do not read the remainder of `SKILL.md` after
 this section: run the resolution block, use a validated answer handoff, and
 stop. The expected trajectory is one skill-read command plus one execute
 command, with no external source-read command.
+
+For a named cleanup target, use the same resolution block once. When its
+`target_binding.status` is `blocked_named_target_missing`, do not rerun
+`artifact-currentness`; run only the listed target-bound Git reads. If the
+worktree list and exact branch list remain empty for that target, stop and say
+only that current Git proves absence and no target-specific cleanup cause can
+be established. Do not add branch variants, `git show-ref`, Git-log searches,
+`rg`, reports, tasks, reviews, tests, scripts, validators, fixtures, or answer
+keys, and do not claim the target was not cleaned because it is absent now.
 
 The installed `jsonl_ask_first.py` launcher is the bounded-aware ask-first
 helper. It wraps the canonical `jsonl-history-search ask` command with
