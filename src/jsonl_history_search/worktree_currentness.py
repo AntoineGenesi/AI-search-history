@@ -726,6 +726,7 @@ def _cleanup_operational_relationship(rel: str, line: str) -> str:
         lowered.startswith("docs/")
         and "worktree" in lowered
         and any(term in lowered for term in ("learning", "fsm"))
+        and not line.lstrip().startswith("#")
         and any(term in normalized for term in ("preserve_then_remove", "preserve-then-remove", "handoff_clean", "survivor reason"))
     ):
         return "cleanup_learning_policy"
