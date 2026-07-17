@@ -14046,7 +14046,7 @@ def _compose_completed_task_artifact_answer(*, query: str, route_family: str, op
         )
 
     if _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
-        source_sessions = _named_task_source_session_proof_summaries(refs)
+        source_sessions = _named_task_source_session_proof_summaries(opened)
         source_session_requested = _named_task_merge_provenance_source_session_wanted(query)
         pieces = []
         if source_sessions:
