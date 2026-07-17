@@ -51,6 +51,10 @@ repair?`, use this staged answer protocol:
    have been opened. These artifacts can explain chronology, merges, review
    verdicts, and task state, but they do not replace primary source evidence for
    what the user, agent, tool, or session actually did or said.
+   If a retained read returns `missing-source-session-stop`, do not open task,
+   review, scratch, report, or summary artifacts to recover that facet. Report
+   independently proved Git/task/review facts separately and leave the
+   source-session facet missing until role-valid raw/session proof is opened.
 4. Treat post-hoc answer-key artifacts, current-run/same-loop echoes,
    prior-final summaries, adjudication material, and reports created after the
    target work as diagnostics unless the user explicitly asks to audit that

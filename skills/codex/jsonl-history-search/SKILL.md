@@ -434,6 +434,12 @@ installed-or-source block above first and use its selected command prefix.
   search or open TODO/task/report/review/project guidance as substitute proof.
   Continue only if the user supplies a quote, timestamp, or session anchor, or
   a real Codex/Claude primary history root becomes available.
+- For completed-task provenance that requests a source session, an unavailable
+  `retained-source-read` result with `missing-source-session-stop` is terminal
+  for that checked handle. Keep independently verified Git/task/review facts as
+  separate facets, but do not open or use task, review, scratch, report, or
+  summary artifacts to replace source-session proof. The source-session facet
+  remains missing until a role-valid same-task raw JSONL/session ref is opened.
 - Artifact/currentness is for stale/current/superseded direction questions,
   local/exported ticket currentness questions, and worktree cleanup/currentness
   questions, not for every repeated-topic question.
