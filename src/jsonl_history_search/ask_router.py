@@ -66,23 +66,32 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
         "recently edited files include or saved the requested material, so "
         "verify the worktree and named files before invoking JSONL history search."
     ),
-    first_command_template="git status --short",
+    first_command_template=(
+        "git status --short --branch && "
+        "git log -1 --decorate --oneline --parents HEAD"
+    ),
     read_specialization="local-artifact-verification",
     inspect_after=(
-        "git status --short for changed/untracked files",
+        "current HEAD, branch/detached state, and HEAD parents from the first command",
         "git diff or git show for just-created/edited artifacts",
         "targeted sed/rg against named task, evidence, TODO, report, or docs files",
+        "target-bound git log/branch --contains/merge-base ancestry proof for named task status claims",
         "targeted raw JSONL/source-window reads only if artifact source coverage is missing or disputed",
     ),
     stop_guidance=(
-        "Start with local artifact verification. Answer from the inspected task/"
-        "evidence/TODO/report files when they resolve completeness. Do not run "
+        "Start with local artifact verification. For named task status/currentness, "
+        "current HEAD, merge parents, branch reachability, and reviewed-branch ancestry "
+        "override contradictory task/evidence/TODO/report/pipeline status prose. Never "
+        "assert active, pending-review, unmerged, incomplete, or not-finished from stale "
+        "secondary prose after Git proves the reviewed work is reachable or merged; when "
+        "Git does not prove reachability or merge, stay cautious and do not invent it. Do not run "
         "broad ask/semantic-debug unless the user explicitly asks about prior "
         "conversation history or a cited source window is missing/disputed."
     ),
     manual_search_guidance=(
-        "Use bounded local commands first: git status, git diff, git show, and "
-        "sed/rg against named files. JSONL is a targeted backstop only for "
+        "Use bounded local commands first: git status, git log, git branch --contains, "
+        "git merge-base --is-ancestor, git diff, git show, and sed/rg against named "
+        "files. JSONL is a targeted backstop only for "
         "conversation/source-window coverage gaps."
     ),
 )
@@ -789,6 +798,9 @@ def classify_ask_route(query: str) -> AskRoute:
 
     if _looks_like_bounded_no_evidence_query(normalized):
         return BOUNDED_NO_EVIDENCE_ROUTE
+
+    if _looks_like_explicit_named_local_task_artifact_query(normalized):
+        return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
     if _looks_like_storage_retention_forensics_query(normalized):
         return STORAGE_RETENTION_FORENSICS_ROUTE
@@ -2133,6 +2145,13 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
         local_verification
         and not asks_history
         and (artifact_context or explicitly_artifact_first or ambiguous_recent_work_followup)
+    )
+
+
+def _looks_like_explicit_named_local_task_artifact_query(normalized: str) -> bool:
+    return bool(
+        re.search(r"(?:^|\s)(?:\./)?tasks/[a-z0-9._/-]+\.md\b", normalized)
+        and _looks_like_local_artifact_verification_query(normalized)
     )
 
 
