@@ -460,6 +460,11 @@ def render_ask_execute_text(payload: dict) -> str:
     if execution.get("status") == "unsupported_route":
         lines.append(f"Unsupported route: {execution.get('reason')}")
         lines.append(f"Stop condition: {route.get('stop_guidance')}")
+        if route.get("next_commands"):
+            lines.append("Bounded next commands:")
+            for item in route["next_commands"]:
+                lines.append(f"- {item.get('purpose')}: {item.get('command')}")
+                lines.append(f"  Inspect: {item.get('inspect_next')}")
         return "\n".join(lines)
     lines.extend(
         [
@@ -581,6 +586,11 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if execution.get("status") == "unsupported_route":
         lines.append(f"- Unsupported route: {execution.get('reason')}")
+        if route.get("next_commands"):
+            lines.extend(["", "## Bounded Next Commands", ""])
+            for item in route["next_commands"]:
+                lines.append(f"- **{item.get('purpose')}**: `{item.get('command')}`")
+                lines.append(f"  Inspect: {item.get('inspect_next')}")
     else:
         lines.append("- Read/action:")
         _append_compact_read_contract(lines, action.get("read"), markdown=True, cli_prefix=cli_prefix)

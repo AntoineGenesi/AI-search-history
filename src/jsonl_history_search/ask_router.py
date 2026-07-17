@@ -309,26 +309,35 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
         "evidence starts with disk layout and committed repo artifact joins, not "
         "recent conversation transcript echoes."
     ),
-    first_command_template="du -sh .private .private/* 2>/dev/null",
+    first_command_template="du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40",
     read_specialization="references/storage-retention.md",
     inspect_after=(
-        "filesystem_inventory: local size inventory, largest subtrees, top files, and file-type/extension summary",
-        "artifact_join: map large subtree/task handles to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",
+        "filesystem_inventory: bounded local size inventory (depth 2, top 40), then a top-40 file inventory for a named large subtree",
+        "generic_retention_policy: read the retention gate, reviewed ledger, state-file policy, and latest authorized outcome in one bounded command",
+        "named_handle_policy_join: only if the generic policy leaves one selected inventory handle unclassified",
+        "artifact_join: use fixed-string target handles and hard output caps to map a named subtree to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",
         "retention_classification: required for current tests/examples, useful retained evidence, claim-critical raw traces, recomputable/cache, stale candidate, or unknown follow-up",
         "targeted_jsonl_follow_up: only for unresolved creator/history gaps after inventory and repo artifacts, with explicit roots/caps and searched-scope caveats",
         "echo_demotion: recent command-output echoes are diagnostics unless they contain primary creation or actual-use evidence",
     ),
     stop_guidance=(
-        "Start with filesystem inventory and top-file/type summaries, then join "
-        "large subtree handles to committed tasks/reports/reviews/scripts/tests/"
-        "pipeline state. Do not run storage cleanup, deletion, archiving, moves, "
+        "Start with the bounded depth-2/top-40 inventory, then run the emitted "
+        "generic_retention_policy command. For generic .private location, lifetime, "
+        "or retention questions, answer from that current policy chain and stop; do "
+        "not serially inspect older tasks, reports, reviews, TODO, or state. Use named "
+        "handle policy and producer/consumer joins only when one selected inventory "
+        "handle remains unclassified. Do not run "
+        "uncapped recursive rg, rg --files -uu, or broad repo file dumps. Do not "
+        "run storage cleanup, deletion, archiving, moves, "
         "VHDX compaction, branch pruning, or claim/release copy from this route. "
         "Use JSONL conversation search only after a named creator/history gap "
         "survives local inventory and artifact joins."
     ),
     manual_search_guidance=(
-        "Use non-destructive local commands such as du/find/stat and targeted rg "
-        "over tasks, reports, reviews, scripts, tests, and codex/state. If a "
+        "Use the emitted non-destructive inventory and generic policy command first. "
+        "Do not recover generic retention policy through historical archaeology. Use "
+        "fixed-string rg joins for one named subtree/task handle only if that handle "
+        "remains unclassified after the policy read. If a "
         "specific subtree still lacks creator or usage evidence, run a narrowly "
         "scoped semantic-debug query for that subtree/task handle; preserve cap, "
         "root, and searched-scope caveats. Demote recent ask/command-output "
