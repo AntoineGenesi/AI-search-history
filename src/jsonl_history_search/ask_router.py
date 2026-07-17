@@ -850,6 +850,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_latest_status_anchor_query(normalized):
         return ROUTES[5]
 
+    if _looks_like_current_local_scope_query(normalized):
+        return ROUTES[8]
+
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
 
@@ -1461,6 +1464,50 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
         )
     )
     return long_form_story or chronology_story
+
+
+def _looks_like_current_local_scope_query(normalized: str) -> bool:
+    if _has_any(
+        normalized,
+        (
+            "conversation history",
+            "prior conversation",
+            "source session",
+            "source proof",
+            "historical source",
+            "history.jsonl",
+            "provenance",
+        ),
+    ):
+        return False
+    current_scope = _has_any(
+        normalized,
+        (
+            "this current",
+            "current local",
+            "current checkout",
+            "this checkout",
+            "current workspace",
+            "this workspace",
+            "current repo",
+            "current repository",
+            "this repo",
+            "this repository",
+        ),
+    )
+    local_target = _has_any(
+        normalized,
+        (
+            "file",
+            "artifact",
+            "task",
+            "checkout",
+            "workspace",
+            "repo",
+            "repository",
+        ),
+    )
+    return current_scope and local_target
 
 
 def _looks_like_explicit_current_or_prior_answer_audit(normalized: str) -> bool:
