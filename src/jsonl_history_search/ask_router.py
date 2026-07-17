@@ -9,6 +9,7 @@ from .agent_command_cookbook import (
     STORAGE_ROOT_INVENTORY_COMMAND,
     agent_question_cookbook,
     ask_next_commands,
+    named_task_local_next_commands,
     storage_cleanup_requested,
     storage_optional_deeper_reads,
 )
@@ -851,6 +852,8 @@ def build_ask_router_payload(
         command_resolution_payload = command_resolution.as_dict()
         cli_prefix = command_resolution.command_prefix
     first_command = route.first_command(query, cli=cli_prefix)
+    explicit_task_match = _EXPLICIT_TASK_PATH_RE.search(query.lower())
+    named_task_path = explicit_task_match.group(0) if explicit_task_match else ""
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
         first_action_category = "filesystem_inventory"
     elif route.route_family in {
@@ -896,6 +899,20 @@ def build_ask_router_payload(
             "cleanup_request_status": "explicit" if cleanup_requested else "not_requested",
         }
         optional_deeper_reads = storage_optional_deeper_reads(cli_prefix=cli_prefix)
+    if route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY:
+        next_commands = []
+    elif route is NAMED_TASK_LOCAL_ROUTE:
+        next_commands = named_task_local_next_commands(
+            selected_first_command=first_command,
+            task_path=named_task_path,
+        )
+    else:
+        next_commands = ask_next_commands(
+            selected_first_command=first_command,
+            route_family=route.route_family,
+            cli_prefix=cli_prefix,
+            query=query,
+        )
     return {
         "ask_router": {
             "status": "matched",
@@ -910,16 +927,7 @@ def build_ask_router_payload(
             "structured_execution_query": structured_execution_query,
             "command_resolution": command_resolution_payload,
             "first_command": first_command,
-            "next_commands": (
-                []
-                if route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY
-                else ask_next_commands(
-                    selected_first_command=first_command,
-                    route_family=route.route_family,
-                    cli_prefix=cli_prefix,
-                    query=query,
-                )
-            ),
+            "next_commands": next_commands,
             "answer_ready_handoff": answer_ready_handoff,
             "optional_deeper_reads": optional_deeper_reads,
             "command_cookbook": (
