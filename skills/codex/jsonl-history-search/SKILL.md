@@ -208,12 +208,18 @@ unsupported execution response prints the bounded route commands. For asks like 
 `.private` 23GB?", "what created these large private files?", "who uses them?",
 or "what must be retained for examples/tests/claims?", run `ask` first to get
 the route contract, then follow the labeled checkout-local/parent-retained
-filesystem inventory and repo artifact join plan before any JSONL conversation
-mining. The emitted top-N commands use bounded in-memory selection without
-external `sort` or writable temporary storage. Run the emitted
-`generic_retention_policy` command immediately after inventory. For generic
-location/lifetime questions, answer from that current chain and stop without
-serial historical report/task/state probing. This route is non-destructive:
+filesystem inventory. The emitted top-N root command uses bounded in-memory selection without
+external `sort` or writable temporary storage. Run the
+emitted `generic_retention_policy` command immediately after inventory. For a
+broad storage question, answer from those two reads with root size, dominant
+path classes, representative handles, class-level creation/use attribution,
+retention status, and explicit uncertainty for any exact producer not proven;
+then stop. Do not scan every bucket or require producer/consumer joins before a
+broad answer. When the prompt did not ask for cleanup, do not turn retention
+policy into advice about reclaiming space or changing, removing, relocating,
+archiving, or compacting stored artifacts. Deeper joins are optional only for
+one explicit named-handle request or one unresolved facet that would materially
+change the answer. This route is non-destructive:
 do not delete, archive, move, compact VHDX files, prune branches, or perform
 cleanup from this guidance. JSONL is a targeted follow-up only for unresolved
 creator/history gaps after inventory and committed artifacts have been checked.

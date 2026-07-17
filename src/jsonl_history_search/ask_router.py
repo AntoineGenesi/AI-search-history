@@ -4,7 +4,13 @@ from dataclasses import dataclass
 import re
 import shlex
 
-from .agent_command_cookbook import STORAGE_ROOT_INVENTORY_COMMAND, agent_question_cookbook, ask_next_commands
+from .agent_command_cookbook import (
+    STORAGE_ROOT_INVENTORY_COMMAND,
+    agent_question_cookbook,
+    ask_next_commands,
+    storage_cleanup_requested,
+    storage_optional_deeper_reads,
+)
 from .command_resolution import resolve_command
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
@@ -312,21 +318,21 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
     first_command_template=STORAGE_ROOT_INVENTORY_COMMAND,
     read_specialization="references/storage-retention.md",
     inspect_after=(
-        "filesystem_inventory: bounded checkout-local and parent-retained size inventory (depth 2, top 40), then a read-only-safe top-40 file inventory for a named large subtree",
+        "filesystem_inventory: bounded checkout-local and parent-retained size inventory (depth 2, top 40) with dominant storage classes and representative subtree handles",
         "generic_retention_policy: read the retention gate, reviewed ledger, state-file policy, and latest authorized outcome in one bounded command",
-        "named_handle_policy_join: only if the generic policy leaves one selected inventory handle unclassified",
-        "artifact_join: use fixed-string target handles and hard output caps to map a named subtree to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",
-        "retention_classification: required for current tests/examples, useful retained evidence, claim-critical raw traces, recomputable/cache, stale candidate, or unknown follow-up",
-        "targeted_jsonl_follow_up: only for unresolved creator/history gaps after inventory and repo artifacts, with explicit roots/caps and searched-scope caveats",
+        "answer_ready_stop: answer the broad question from root sizes, dominant path classes, representative handles, and generic policy; mark exact creator identity unknown when it is not established",
+        "optional_named_handle_join: only for one specific unresolved facet or an explicit user request, never once per inventory bucket",
         "echo_demotion: recent command-output echoes are diagnostics unless they contain primary creation or actual-use evidence",
     ),
     stop_guidance=(
-        "Start with the bounded depth-2/top-40 inventory, then run the emitted "
-        "generic_retention_policy command. For generic .private location, lifetime, "
-        "or retention questions, answer from that current policy chain and stop; do "
-        "not serially inspect older tasks, reports, reviews, TODO, or state. Use named "
-        "handle policy and producer/consumer joins only when one selected inventory "
-        "handle remains unclassified. Do not run "
+        "Run only the bounded depth-2/top-40 root inventory and emitted "
+        "generic_retention_policy command for a broad .private question. Then answer "
+        "with total/root size, dominant storage classes, representative handles, their "
+        "policy-backed retention status, and explicit uncertainty for any unverified exact "
+        "creator. Stop: do not scan each bucket, serially inspect older artifacts, or "
+        "require exact producer/consumer provenance for a class-level broad answer. Use "
+        "one named-handle or producer/consumer join only for a specific unresolved facet "
+        "material to the answer or when the user explicitly asks for that handle. Do not run "
         "uncapped recursive rg, rg --files -uu, or broad repo file dumps. Do not "
         "run storage cleanup, deletion, archiving, moves, "
         "VHDX compaction, branch pruning, or claim/release copy from this route. "
@@ -334,10 +340,10 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
         "survives local inventory and artifact joins."
     ),
     manual_search_guidance=(
-        "Use the emitted non-destructive inventory and generic policy command first. "
-        "Do not recover generic retention policy through historical archaeology. Use "
-        "fixed-string rg joins for one named subtree/task handle only if that handle "
-        "remains unclassified after the policy read. If a "
+        "Deeper reads are optional, not default next reads. Do not recover generic "
+        "retention policy through historical archaeology. Use a fixed-string rg join "
+        "for one named subtree/task handle only when the user requested that exact facet "
+        "or its unresolved classification would materially change the broad answer. If a "
         "specific subtree still lacks creator or usage evidence, run a narrowly "
         "scoped semantic-debug query for that subtree/task handle; preserve cap, "
         "root, and searched-scope caveats. Demote recent ask/command-output "
@@ -748,6 +754,42 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
         first_action_category = "no_tool"
     else:
         first_action_category = "route_command"
+    cleanup_requested = (
+        route.route_family == STORAGE_RETENTION_ROUTE_FAMILY
+        and storage_cleanup_requested(query)
+    )
+    answer_ready_handoff = None
+    optional_deeper_reads: list[dict] = []
+    if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
+        answer_ready_handoff = {
+            "answer_status": "answer-after-bounded-inventory-and-policy",
+            "required_evidence": ["filesystem_inventory", "generic_retention_policy"],
+            "answer_facets": [
+                "total and parent-retained root size",
+                "dominant storage classes and representative subtree handles",
+                "class-level creation/use attribution supported by paths and policy",
+                "policy-backed retention status and explicit exact-producer uncertainty",
+            ],
+            "stop": (
+                "After the two required reads, answer the broad question and stop. Exact creator/consumer "
+                "identity may remain explicitly unknown; that alone does not require per-bucket joins."
+            ),
+            "only_continue_if": (
+                "The user explicitly asks about one named handle/producer/consumer/exact artifact, or one "
+                "specific unresolved facet would materially change the broad answer."
+            ),
+            "answer_boundary": (
+                "Cleanup was explicitly requested; discuss policy without performing or authorizing mutation."
+                if cleanup_requested
+                else (
+                    "The prompt did not request cleanup. Describe retained classes, size contributors, creation/use "
+                    "at class level, and retention requirements only. Do not recommend reclaiming space or changing, "
+                    "removing, relocating, archiving, or compacting stored artifacts."
+                )
+            ),
+            "cleanup_request_status": "explicit" if cleanup_requested else "not_requested",
+        }
+        optional_deeper_reads = storage_optional_deeper_reads(cli_prefix=cli_prefix)
     return {
         "ask_router": {
             "status": "matched",
@@ -764,7 +806,10 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
                 selected_first_command=first_command,
                 route_family=route.route_family,
                 cli_prefix=cli_prefix,
+                query=query,
             ),
+            "answer_ready_handoff": answer_ready_handoff,
+            "optional_deeper_reads": optional_deeper_reads,
             "command_cookbook": (
                 []
                 if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES

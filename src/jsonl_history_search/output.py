@@ -367,6 +367,17 @@ def render_ask_router_text(payload: dict) -> str:
                 f"Command guidance: {resolution.get('guidance')}",
             ]
         )
+    handoff = report.get("answer_ready_handoff") or {}
+    if handoff:
+        lines.extend(
+            [
+                f"Answer-ready after: {', '.join(handoff.get('required_evidence', []))}",
+                f"Answer facets: {'; '.join(handoff.get('answer_facets', []))}",
+                f"Required-read stop: {handoff.get('stop')}",
+                f"Answer boundary: {handoff.get('answer_boundary')}",
+                f"Optional deeper reads only if: {handoff.get('only_continue_if')}",
+            ]
+        )
     lines.append("Next commands:")
     for item in report.get("next_commands", []):
         lines.append(f"- {item.get('purpose')}: {item.get('command')}")
@@ -460,6 +471,12 @@ def render_ask_execute_text(payload: dict) -> str:
     if execution.get("status") == "unsupported_route":
         lines.append(f"Unsupported route: {execution.get('reason')}")
         lines.append(f"Stop condition: {route.get('stop_guidance')}")
+        handoff = route.get("answer_ready_handoff") or {}
+        if handoff:
+            lines.append(f"Answer-ready after: {', '.join(handoff.get('required_evidence', []))}")
+            lines.append(f"Required-read stop: {handoff.get('stop')}")
+            lines.append(f"Answer boundary: {handoff.get('answer_boundary')}")
+            lines.append(f"Optional deeper reads only if: {handoff.get('only_continue_if')}")
         if route.get("next_commands"):
             lines.append("Bounded next commands:")
             for item in route["next_commands"]:
@@ -586,6 +603,16 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if execution.get("status") == "unsupported_route":
         lines.append(f"- Unsupported route: {execution.get('reason')}")
+        handoff = route.get("answer_ready_handoff") or {}
+        if handoff:
+            lines.extend(
+                [
+                    f"- Answer-ready after: {', '.join(handoff.get('required_evidence', []))}",
+                    f"- Required-read stop: {handoff.get('stop')}",
+                    f"- Answer boundary: {handoff.get('answer_boundary')}",
+                    f"- Optional deeper reads only if: {handoff.get('only_continue_if')}",
+                ]
+            )
         if route.get("next_commands"):
             lines.extend(["", "## Bounded Next Commands", ""])
             for item in route["next_commands"]:
@@ -1100,6 +1127,20 @@ def render_ask_router_markdown(payload: dict) -> str:
                 f"- Command resolution: `{resolution.get('mode')}`",
                 f"- Source fallback: `{resolution.get('source_fallback_command') or '(not available from this cwd)'}`",
                 f"- Command guidance: {resolution.get('guidance')}",
+            ]
+        )
+    handoff = report.get("answer_ready_handoff") or {}
+    if handoff:
+        lines.extend(
+            [
+                "",
+                "## Answer-Ready Stop",
+                "",
+                f"- Required evidence: {', '.join(handoff.get('required_evidence', []))}",
+                f"- Answer facets: {'; '.join(handoff.get('answer_facets', []))}",
+                f"- Stop: {handoff.get('stop')}",
+                f"- Answer boundary: {handoff.get('answer_boundary')}",
+                f"- Optional deeper reads only if: {handoff.get('only_continue_if')}",
             ]
         )
     lines.extend(["", "## Next Commands", ""])

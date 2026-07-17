@@ -13,21 +13,27 @@ This route is guidance for evidence order, not a cleanup command.
    `.private` ancestor for a receiving clone nested in retained evidence;
    otherwise derive the parent from Git's common directory for a linked
    worktree. Measure each distinct root with explicit depth and row caps, then
-   select one large subtree from the top 40 before listing its top 40 files.
+   retain the top 40 as dominant storage classes and representative subtree
+   handles. Do not list top files for every subtree.
 2. `generic_retention_policy`: read the current retention gate, reviewed
    ledger, state-file policy, and latest authorized outcome in one bounded
-   command. For a generic question about where retained sessions live or how
-   long they are kept, answer from this chain and stop.
-3. `artifact_join`: only when the generic policy leaves one selected large
-   subtree or task handle unclassified, join it to committed repo
+   command.
+3. `answer_ready_stop`: for a broad storage question, answer from inventory
+   plus policy with total/root size, dominant path classes, representative
+   handles, class-level creation/use attribution, and retention status. Mark an
+   unverified exact producer/consumer as unknown and stop; that uncertainty
+   does not require per-bucket joins.
+4. `artifact_join`: optional only when the user explicitly asks about one
+   named handle or one unresolved facet would materially change the broad
+   answer. Join that one handle to committed repo
    artifacts: tasks/reports/reviews/scripts/tests/pipeline state. Prefer
    current task files, reports, review artifacts, scripts, tests, and
    `codex/state/pipeline-state.md` before conversation mining.
-4. `retention_classification`: classify each large handle as required for
+5. `retention_classification`: classify each large handle as required for
    current tests/examples, useful retained evidence, claim-critical raw trace,
    recomputable/cache, stale candidate for a future explicit cleanup task, or
    unknown follow-up.
-5. `targeted_jsonl_follow_up`: use JSONL conversation search only for a named
+6. `targeted_jsonl_follow_up`: use JSONL conversation search only for a named
    unresolved creator/history gap after inventory and artifact joins. Keep the
    query scoped to a specific subtree/task handle and preserve roots, caps,
    searched-scope limits, and uncertainty.
@@ -60,20 +66,29 @@ find <selected-large-subtree-path> -xdev -type f -printf '%s\t%p\n' 2>/dev/null 
 ```
 
 Both commands keep only 40 rows in Python memory and do not use external
-`sort` or writable temporary storage. Replace the selected-subtree placeholder
-with one path printed by the labeled inventory.
+`sort` or writable temporary storage. The first root inventory is required.
+The selected-subtree top-file command is optional only when the user asks for
+exact files or one named subtree needs a representative file.
 
 Read generic policy directly after inventory:
 
 ```bash
-for f in reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md reports/jsh-1245-private-retention-ledger.md reports/jsh-1246-state5-sqlite-retention-policy.md reports/jsh-1257-private-storage-cleanup-executed.md; do printf '\n--- %s ---\n' "$f"; nl -ba "$f" | sed -n '1,28p'; done
+printf '\n--- retention gate ---\n'; nl -ba reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md | sed -n '8,20p'; printf '\n--- retention ledger method ---\n'; nl -ba reports/jsh-1245-private-retention-ledger.md | sed -n '13,20p'; printf '\n--- retained lane evidence contract ---\n'; nl -ba reports/jsh-1246-state5-sqlite-retention-policy.md | sed -n '13,24p'
 ```
 
-For generic `.private` location, lifetime, or policy questions, stop after that
-read; it already includes citation-ready line numbers. Do not reopen those
-policy files or serially inspect older tasks, reports, reviews, TODO, or state.
-Only when one selected inventory handle remains unclassified, join that handle
-to bounded policy and producer/consumer results:
+For every broad `.private` size/creation/use/retention question, answer after
+that read; it already includes citation-ready line numbers. State root totals,
+dominant path classes, representative handles, class-level creation/use
+attribution, retention status, and any exact producer uncertainty. Do not reopen those
+policy files, scan each bucket, or serially inspect older tasks, reports,
+reviews, TODO, or state. Only for an explicit named-handle request or one
+specific unresolved facet material to the answer, join that one handle to
+bounded policy and producer/consumer results:
+
+The broad policy excerpt is intentionally retention-only. If the user did not
+ask for cleanup, do not turn it into advice about reclaiming space or changing,
+removing, relocating, archiving, or compacting stored artifacts. Cleanup-policy
+and prior cleanup-execution reports are outside the broad answer path.
 
 ```bash
 rg -n -F --max-count 20 '<large-subtree-or-task-handle>' codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md learnings/INDEX.md 2>/dev/null | head -n 80
