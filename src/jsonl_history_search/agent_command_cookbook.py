@@ -65,7 +65,7 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             "id": "storage_retention_forensics",
             "question_family": "Why is .private large, who created/uses it, and what must be retained?",
             "route": "storage-retention-forensics / filesystem-inventory-first",
-            "first_command": "du -sh .private .private/* 2>/dev/null",
+            "first_command": "du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40",
             "inspect_next": (
                 "filesystem_inventory first, then artifact_join over tasks/reports/reviews/scripts/tests/"
                 "codex state, then targeted JSONL only for unresolved creator/history gaps"
@@ -120,12 +120,36 @@ def ask_next_commands(
             {
                 "purpose": "filesystem_inventory",
                 "command": selected_first_command,
-                "inspect_next": "local size inventory, largest subtrees, top files, and file-type/extension summary",
+                "inspect_next": "bounded depth-2 size inventory; select one large subtree handle before continuing",
             },
             {
-                "purpose": "artifact_join",
-                "command": "rg -n \"<large-subtree-or-task-handle>\" tasks reports reviews scripts tests codex/state",
-                "inspect_next": "map each large subtree to committed task/report/review/script/test/pipeline-state use or retention evidence",
+                "purpose": "target_top_files",
+                "command": (
+                    "find .private/<large-subtree> -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null "
+                    "| sort -nr | head -n 40"
+                ),
+                "inspect_next": "top 40 files inside the one selected subtree; do not enumerate the whole repo",
+            },
+            {
+                "purpose": "retention_policy_join",
+                "command": (
+                    "rg -n -F --max-count 20 '<large-subtree-or-task-handle>' "
+                    "codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md "
+                    "learnings/INDEX.md 2>/dev/null | head -n 80"
+                ),
+                "inspect_next": "explicit front-door and retention-policy references for the selected handle",
+            },
+            {
+                "purpose": "producer_consumer_join",
+                "command": (
+                    "rg -n -F --max-count 20 --glob '*.md' --glob '*.py' --glob '*.sh' "
+                    "'<large-subtree-or-task-handle>' tasks reports codex/state/reviews scripts tests "
+                    "2>/dev/null | head -n 120"
+                ),
+                "inspect_next": (
+                    "bounded task/report/review/script/test producer or consumer references for the selected handle; "
+                    "repeat only for another named top-40 handle"
+                ),
             },
             {
                 "purpose": "targeted_jsonl_follow_up_only_if_gap_remains",

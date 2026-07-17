@@ -8,9 +8,9 @@ This route is guidance for evidence order, not a cleanup command.
 
 ## Evidence Order
 
-1. `filesystem_inventory`: measure local disk layout first. Start with
-   non-destructive size inventory, largest subtrees, top files, and file-type or
-   extension summaries.
+1. `filesystem_inventory`: measure local disk layout first with explicit depth
+   and row caps. Select one large subtree from the top 40 before listing its top
+   40 files.
 2. `artifact_join`: join large subtree or task handles to committed repo
    artifacts: tasks/reports/reviews/scripts/tests/pipeline state. Prefer
    current task files, reports, review artifacts, scripts, tests, and
@@ -40,16 +40,23 @@ review, and claim-preservation checks.
 
 ## Typical Commands
 
+Never use uncapped recursive `rg`, `rg --files -uu`, or a broad repo file dump
+for this route. Replace each placeholder with one handle selected by the bounded
+inventory; do not search for the literal placeholder.
+
 Run inventory first:
 
 ```bash
-du -sh .private .private/* 2>/dev/null
+du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40
+find .private/<large-subtree> -xdev -type f -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n 40
 ```
 
-Then join large handles to committed artifacts:
+Inspect the small retention-policy/front-door set, then join one selected handle
+to bounded producer/consumer artifact results:
 
 ```bash
-rg -n "<large-subtree-or-task-handle>" tasks reports reviews scripts tests codex/state
+rg -n -F --max-count 20 '<large-subtree-or-task-handle>' codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md learnings/INDEX.md 2>/dev/null | head -n 80
+rg -n -F --max-count 20 --glob '*.md' --glob '*.py' --glob '*.sh' '<large-subtree-or-task-handle>' tasks reports codex/state/reviews scripts tests 2>/dev/null | head -n 120
 ```
 
 Only if a creator/history gap remains:

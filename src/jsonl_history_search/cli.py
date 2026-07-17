@@ -1939,6 +1939,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "structured_execution_query": route.get("structured_execution_query"),
         "command_resolution": route.get("command_resolution"),
         "first_command": route.get("first_command"),
+        "next_commands": route.get("next_commands", []),
         "explicit_source_root_count": len(getattr(args, "root", []) or []),
         "read_specialization": route.get("read_specialization"),
         "inspect_after": route.get("inspect_after", []),
