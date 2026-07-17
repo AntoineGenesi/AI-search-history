@@ -6802,7 +6802,28 @@ _PRIVATE_HANDLE_PATTERN = re.compile(
     r"private:(?P<path>[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*/?)"
 )
 _RETAINED_SOURCE_REJECTED_NAME_PARTS = frozenset(
-    {"answer", "final", "report", "review", "rubric", "expected", "adjudication", "summary", "scratch", "result"}
+    {
+        "adjudication",
+        "adjudications",
+        "answer",
+        "answers",
+        "expected",
+        "expecteds",
+        "final",
+        "finals",
+        "report",
+        "reports",
+        "result",
+        "results",
+        "review",
+        "reviews",
+        "rubric",
+        "rubrics",
+        "scratch",
+        "scratches",
+        "summaries",
+        "summary",
+    }
 )
 _RETAINED_SOURCE_MAX_REFS = 4
 _RETAINED_HANDLE_ARTIFACT_MAX_CHARS = 64 * 1024
@@ -6861,9 +6882,18 @@ def _retained_handle_matches_task(handle: str, *, task_id: str) -> bool:
     return first_segment == task_token or first_segment.startswith(f"{task_token}-")
 
 
-def _retained_source_candidate_paths(root: Path, *, max_files: int) -> list[Path]:
+def _retained_source_candidate_paths(
+    root: Path,
+    *,
+    retained_task_root: Path,
+    max_files: int,
+) -> list[Path]:
     if root.is_file():
-        return [root] if _retained_source_candidate_allowed(root) else []
+        return (
+            [root]
+            if _retained_source_candidate_allowed(root, retained_task_root=retained_task_root)
+            else []
+        )
     if not root.is_dir():
         return []
     candidates: list[Path] = []
@@ -6881,18 +6911,30 @@ def _retained_source_candidate_paths(root: Path, *, max_files: int) -> list[Path
                 continue
             if child.is_dir() and len(directories) < 32:
                 directories.append(child)
-            elif child.is_file() and _retained_source_candidate_allowed(child):
+            elif child.is_file() and _retained_source_candidate_allowed(
+                child,
+                retained_task_root=retained_task_root,
+            ):
                 candidates.append(child)
                 if len(candidates) >= max_files:
                     return candidates
     return candidates
 
 
-def _retained_source_candidate_allowed(path: Path) -> bool:
+def _retained_source_candidate_allowed(path: Path, *, retained_task_root: Path) -> bool:
     if path.suffix.casefold() not in {".jsonl", ".json"}:
         return False
-    name_parts = set(re.split(r"[^a-z0-9]+", path.name.casefold()))
-    return not name_parts.intersection(_RETAINED_SOURCE_REJECTED_NAME_PARTS)
+    try:
+        relative = path.relative_to(retained_task_root)
+    except ValueError:
+        return False
+    path_tokens = {
+        token
+        for component in relative.parts
+        for token in re.split(r"[^a-z0-9]+", component.casefold())
+        if token
+    }
+    return not path_tokens.intersection(_RETAINED_SOURCE_REJECTED_NAME_PARTS)
 
 
 def _retained_source_record(raw: str, *, fallback: str) -> tuple[dict, str] | None:
@@ -7006,7 +7048,12 @@ def build_retained_source_read_payload(
     if retained_root != private_root and private_root not in retained_root.parents:
         report["reason"] = "private_handle_escaped_retained_root"
         return {"retained_source_read": report}
-    candidates = _retained_source_candidate_paths(retained_root, max_files=limits["max_files"])
+    retained_task_root = (private_root / relative.split("/", 1)[0]).resolve()
+    candidates = _retained_source_candidate_paths(
+        retained_root,
+        retained_task_root=retained_task_root,
+        max_files=limits["max_files"],
+    )
     if not candidates:
         report["reason"] = "retained_handle_unavailable_or_no_raw_candidates"
         return {"retained_source_read": report}
