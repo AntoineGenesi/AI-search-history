@@ -317,6 +317,21 @@ def render_retained_source_read_text(payload: dict) -> str:
         lines.append("- none")
     for ref in refs:
         lines.append(f"- {ref.get('target')}: {ref.get('summary')}")
+    stop = report.get("missing_source_session_stop_contract") or {}
+    if stop:
+        policy = stop.get("secondary_artifact_policy") or {}
+        lines.extend(
+            [
+                f"Source-session facet: {stop.get('status')}",
+                f"Source-session answer allowed: {str(bool(stop.get('answer_allowed'))).lower()}",
+                "Summary artifact policy: "
+                + ", ".join(f"{name}={value}" for name, value in policy.items()),
+                "Preserved separate fact facets: "
+                + ", ".join(stop.get("preserved_fact_facets") or []),
+                f"Stop: {stop.get('stop')}",
+                f"Unblock: {stop.get('unblock')}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -341,6 +356,24 @@ def render_retained_source_read_markdown(payload: dict) -> str:
         lines.append("- none")
     for ref in refs:
         lines.append(f"- `{ref.get('target')}`: {ref.get('summary')}")
+    stop = report.get("missing_source_session_stop_contract") or {}
+    if stop:
+        policy = stop.get("secondary_artifact_policy") or {}
+        lines.extend(
+            [
+                "",
+                "## Missing Source-Session Stop",
+                "",
+                f"- Status: `{stop.get('status')}`",
+                f"- Source-session answer allowed: `{str(bool(stop.get('answer_allowed'))).lower()}`",
+                "- Summary artifact policy: "
+                + ", ".join(f"`{name}={value}`" for name, value in policy.items()),
+                "- Preserved separate fact facets: "
+                + ", ".join(f"`{item}`" for item in stop.get("preserved_fact_facets") or []),
+                f"- Stop: {stop.get('stop')}",
+                f"- Unblock: {stop.get('unblock')}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -451,6 +484,12 @@ def render_ask_execute_text(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    first_command = route.get("first_command")
+    if (
+        execution.get("status") == "report_output_unavailable"
+        and action.get("answer_status") == "not-ready/missing-source-session-proof"
+    ):
+        first_command = "(not needed; run only the retained-source-read actions below)"
     lines = [
         "Ask Execute",
         f"Query: {report.get('query')}",
@@ -458,7 +497,7 @@ def render_ask_execute_text(payload: dict) -> str:
         f"Route family: {route.get('route_family')}",
         f"Execution status: {execution.get('status')}",
         f"Command family: {execution.get('command_family') or '(unsupported)'}",
-        f"First command: {route.get('first_command')}",
+        f"First command: {first_command}",
         f"Command resolution: {resolution.get('mode') or 'unresolved'}",
     ]
     if execution.get("report_written"):
@@ -467,7 +506,8 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append(f"Report output unavailable: {execution.get('reason')}")
     if execution.get("status") == "report_output_unavailable":
         lines.append(f"Report output unavailable: {execution.get('reason')}")
-        lines.append(f"Fallback command: {execution.get('fallback_command')}")
+        if execution.get("fallback_command") and first_command == route.get("first_command"):
+            lines.append(f"Fallback command: {execution.get('fallback_command')}")
     if execution.get("status") == "unsupported_route":
         lines.append(f"Unsupported route: {execution.get('reason')}")
         lines.append(f"Stop condition: {route.get('stop_guidance')}")
@@ -565,6 +605,12 @@ def render_ask_execute_markdown(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    first_command = route.get("first_command")
+    if (
+        execution.get("status") == "report_output_unavailable"
+        and action.get("answer_status") == "not-ready/missing-source-session-proof"
+    ):
+        first_command = "(not needed; run only the retained-source-read actions below)"
     lines = [
         "# JSONL Ask Execute",
         "",
@@ -573,7 +619,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
         f"- Route family: `{route.get('route_family')}`",
         f"- Execution status: `{execution.get('status')}`",
         f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
-        f"- First command: `{route.get('first_command')}`",
+        f"- First command: `{first_command}`",
         f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`",
     ]
     if execution.get("report_written"):
@@ -582,7 +628,8 @@ def render_ask_execute_markdown(payload: dict) -> str:
         lines.append(f"- Report output unavailable: {execution.get('reason')}")
     if execution.get("status") == "report_output_unavailable":
         lines.append(f"- Report output unavailable: {execution.get('reason')}")
-        lines.append(f"- Fallback command: `{execution.get('fallback_command')}`")
+        if execution.get("fallback_command") and first_command == route.get("first_command"):
+            lines.append(f"- Fallback command: `{execution.get('fallback_command')}`")
     lines.extend(
         [
             "",

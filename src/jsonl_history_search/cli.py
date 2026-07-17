@@ -7469,6 +7469,38 @@ def _retained_source_record_score(*, metadata: dict, summary: str, task_id: str)
     return score
 
 
+def _retained_source_missing_session_payload(report: dict, *, reason: str) -> dict:
+    report["reason"] = reason
+    report["missing_source_session_stop_contract"] = {
+        "schema_version": 1,
+        "contract_kind": "missing-source-session-stop",
+        "status": "fail-closed/missing-source-session-proof",
+        "facet": "source_session_proof",
+        "answer_allowed": False,
+        "terminal_for_checked_handle": True,
+        "opened_role_valid_refs": 0,
+        "secondary_artifact_policy": {
+            surface: "lead_or_post_hoc_context_only_not_source_session_proof"
+            for surface in ("task", "review", "scratch", "report", "summary")
+        },
+        "preserved_fact_facets": [
+            "independently_verified_git_facts",
+            "task_artifact_facts",
+            "review_artifact_facts",
+        ],
+        "stop": (
+            "Stop source-session recovery for this checked handle. Do not open or use task, review, "
+            "scratch, report, or summary artifacts to replace the missing source-session proof. "
+            "Report only independently verified Git/task/review facts as separate facets."
+        ),
+        "unblock": (
+            "Make this retained handle available with a role-valid same-task raw JSONL/session record, "
+            "or provide and open another role-valid same-task raw/session source."
+        ),
+    }
+    return {"retained_source_read": report}
+
+
 def build_retained_source_read_payload(
     *,
     handle: str,
@@ -7493,15 +7525,19 @@ def build_retained_source_read_payload(
         "proof_boundary": "unopened or unavailable private handles are leads only, never source-session proof",
     }
     if not re.fullmatch(r"JSH-\d+", task_id) or not _retained_handle_matches_task(handle, task_id=task_id):
-        report["reason"] = "invalid_or_cross_task_private_handle"
-        return {"retained_source_read": report}
+        return _retained_source_missing_session_payload(
+            report,
+            reason="invalid_or_cross_task_private_handle",
+        )
 
     relative = _PRIVATE_HANDLE_PATTERN.fullmatch(handle).group("path").rstrip("/")
     private_root = (cwd / ".private").resolve()
     retained_root = (private_root / relative).resolve()
     if retained_root != private_root and private_root not in retained_root.parents:
-        report["reason"] = "private_handle_escaped_retained_root"
-        return {"retained_source_read": report}
+        return _retained_source_missing_session_payload(
+            report,
+            reason="private_handle_escaped_retained_root",
+        )
     retained_task_root = (private_root / relative.split("/", 1)[0]).resolve()
     candidates = _retained_source_candidate_paths(
         retained_root,
@@ -7509,8 +7545,10 @@ def build_retained_source_read_payload(
         max_files=limits["max_files"],
     )
     if not candidates:
-        report["reason"] = "retained_handle_unavailable_or_no_raw_candidates"
-        return {"retained_source_read": report}
+        return _retained_source_missing_session_payload(
+            report,
+            reason="retained_handle_unavailable_or_no_raw_candidates",
+        )
 
     bytes_read = 0
     candidate_files_opened = 0
@@ -7571,7 +7609,10 @@ def build_retained_source_read_payload(
         report["status"] = "opened_role_valid_source_session_proof"
         report["reason"] = "bounded_same_task_raw_source_session_evidence_opened"
     else:
-        report["reason"] = "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+        return _retained_source_missing_session_payload(
+            report,
+            reason="raw_candidates_opened_but_no_role_valid_same_task_record_found",
+        )
     return {"retained_source_read": report}
 
 
