@@ -95,9 +95,9 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             "route": "storage-retention-forensics / filesystem-inventory-first",
             "first_command": STORAGE_ROOT_INVENTORY_COMMAND,
             "inspect_next": (
-                "checkout-local versus parent-retained filesystem_inventory first, then artifact_join over "
-                "tasks/reports/reviews/scripts/tests/codex state, then targeted JSONL only for unresolved "
-                "creator/history gaps"
+                "checkout-local versus parent-retained filesystem_inventory, then generic retention policy; "
+                "answer the broad question and stop, with one named-handle join only for an explicit or "
+                "materially unresolved facet"
             ),
         },
         {
@@ -114,6 +114,58 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
     for entry in cookbook:
         entry["first_command"] = _with_cli_prefix(entry["first_command"], cli_prefix)
     return cookbook
+
+
+def storage_optional_deeper_reads(*, cli_prefix: str = "jsonl-history-search") -> list[dict[str, Any]]:
+    """Return storage drill-downs that are not required for a broad answer."""
+    return [
+        {
+            "purpose": "target_top_files",
+            "command": (
+                "find <selected-large-subtree-path> -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null "
+                f"| {_BOUNDED_TOP_N_FILTER}"
+            ),
+            "inspect_next": (
+                "only when the user asks for exact files or one inventory subtree needs a representative file; "
+                "do not enumerate the whole repo"
+            ),
+        },
+        {
+            "purpose": "named_handle_policy_join",
+            "command": (
+                "rg -n -F --max-count 20 '<large-subtree-or-task-handle>' "
+                "codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md "
+                "learnings/INDEX.md 2>/dev/null | head -n 80"
+            ),
+            "inspect_next": (
+                "only for one named handle when the user requests its exact policy or the broad answer would "
+                "otherwise contain a material unresolved policy facet"
+            ),
+        },
+        {
+            "purpose": "producer_consumer_join",
+            "command": (
+                "rg -n -F --max-count 20 --glob '*.md' --glob '*.py' --glob '*.sh' "
+                "'<large-subtree-or-task-handle>' tasks reports codex/state/reviews scripts tests "
+                "2>/dev/null | head -n 120"
+            ),
+            "inspect_next": (
+                "bounded producer or consumer references for one explicitly requested facet; "
+                "never run this once per inventory bucket"
+            ),
+        },
+        {
+            "purpose": "targeted_jsonl_follow_up_only_if_gap_remains",
+            "command": (
+                f'{cli_prefix} semantic-debug "who created or used <specific subtree/task handle>?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "only after a specific requested creator/history facet remains unresolved; keep roots, caps, "
+                "searched-scope caveats, and echo demotion explicit"
+            ),
+        },
+    ]
 
 
 def ask_next_commands(
@@ -165,52 +217,8 @@ def ask_next_commands(
                 ),
                 "inspect_next": (
                     "generic parent .private location/retention gate, reviewed ledger, state-file policy, and latest "
-                    "authorized outcome with citation-ready line numbers; stop here for generic where/how-long questions"
-                ),
-            },
-            {
-                "purpose": "target_top_files",
-                "command": (
-                    "find <selected-large-subtree-path> -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null "
-                    f"| {_BOUNDED_TOP_N_FILTER}"
-                ),
-                "inspect_next": (
-                    "read-only-safe top 40 files inside the one selected subtree; do not enumerate the whole repo"
-                ),
-            },
-            {
-                "purpose": "named_handle_policy_join",
-                "command": (
-                    "rg -n -F --max-count 20 '<large-subtree-or-task-handle>' "
-                    "codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md "
-                    "learnings/INDEX.md 2>/dev/null | head -n 80"
-                ),
-                "inspect_next": (
-                    "only when the generic policy leaves one selected handle unclassified; inspect explicit "
-                    "front-door and retention-policy references for that handle"
-                ),
-            },
-            {
-                "purpose": "producer_consumer_join",
-                "command": (
-                    "rg -n -F --max-count 20 --glob '*.md' --glob '*.py' --glob '*.sh' "
-                    "'<large-subtree-or-task-handle>' tasks reports codex/state/reviews scripts tests "
-                    "2>/dev/null | head -n 120"
-                ),
-                "inspect_next": (
-                    "bounded task/report/review/script/test producer or consumer references for the selected handle; "
-                    "repeat only for another named top-40 handle"
-                ),
-            },
-            {
-                "purpose": "targeted_jsonl_follow_up_only_if_gap_remains",
-                "command": (
-                    'jsonl-history-search semantic-debug "who created or used <specific subtree/task handle>?" '
-                    '--cwd "$PWD" --format text'
-                ),
-                "inspect_next": (
-                    "run only after inventory/artifact joins leave a named creator/history gap; keep roots, caps, "
-                    "searched-scope caveats, and echo demotion explicit"
+                    "authorized outcome with citation-ready line numbers; combine this with the root inventory, "
+                    "answer the broad storage question, and stop"
                 ),
             },
         ]

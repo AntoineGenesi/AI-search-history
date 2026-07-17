@@ -1941,12 +1941,28 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "command_resolution": route.get("command_resolution"),
         "first_command": route.get("first_command"),
         "next_commands": route.get("next_commands", []),
+        "answer_ready_handoff": route.get("answer_ready_handoff"),
+        "optional_deeper_reads": route.get("optional_deeper_reads", []),
         "explicit_source_root_count": len(getattr(args, "root", []) or []),
         "read_specialization": route.get("read_specialization"),
         "inspect_after": route.get("inspect_after", []),
         "stop_guidance": route.get("stop_guidance"),
         "manual_search_guidance": route.get("manual_search_guidance"),
     }
+    storage_handoff = route.get("answer_ready_handoff") or {}
+    answer_action_contract = {
+        "answer_status": "not-ready/needs-more-proof",
+        "read": route.get("inspect_after", []),
+        "stop": route.get("stop_guidance"),
+        "only_continue_if": route.get("manual_search_guidance"),
+    }
+    if route.get("route_family") == "storage_retention_forensics":
+        answer_action_contract = {
+            "answer_status": storage_handoff.get("answer_status"),
+            "read": route.get("next_commands", []),
+            "stop": storage_handoff.get("stop"),
+            "only_continue_if": storage_handoff.get("only_continue_if"),
+        }
     contract = {
         "ask_execute": {
             "schema_version": "ask_execute_route_fusion.v1",
@@ -1973,12 +1989,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
                 "safety": "router first_command strings are not shell-executed; only structured allow-listed JSONL routes run.",
             },
             "executed_output": None,
-            "answer_action_contract": {
-                "answer_status": "not-ready/needs-more-proof",
-                "read": route.get("inspect_after", []),
-                "stop": route.get("stop_guidance"),
-                "only_continue_if": route.get("manual_search_guidance"),
-            },
+            "answer_action_contract": answer_action_contract,
         }
     }
     if execution_kind is None:
