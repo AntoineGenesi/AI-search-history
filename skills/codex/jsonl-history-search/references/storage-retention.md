@@ -8,9 +8,12 @@ This route is guidance for evidence order, not a cleanup command.
 
 ## Evidence Order
 
-1. `filesystem_inventory`: measure local disk layout first with explicit depth
-   and row caps. Select one large subtree from the top 40 before listing its top
-   40 files.
+1. `filesystem_inventory`: distinguish the receiving checkout's `.private`
+   from the durable parent retained-evidence root. Prefer an enclosing
+   `.private` ancestor for a receiving clone nested in retained evidence;
+   otherwise derive the parent from Git's common directory for a linked
+   worktree. Measure each distinct root with explicit depth and row caps, then
+   select one large subtree from the top 40 before listing its top 40 files.
 2. `generic_retention_policy`: read the current retention gate, reviewed
    ledger, state-file policy, and latest authorized outcome in one bounded
    command. For a generic question about where retained sessions live or how
@@ -52,9 +55,13 @@ inventory; do not search for the literal placeholder.
 Run inventory first:
 
 ```bash
-du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40
-find .private/<large-subtree> -xdev -type f -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n 40
+repo_root=$(git rev-parse --show-toplevel) && common_private=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.private && enclosing_private=$(python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]).resolve(); print(next((str(parent) for parent in p.parents if parent.name==".private"),""))' "$repo_root") && if [ -n "$enclosing_private" ]; then parent_private=$enclosing_private; else parent_private=$common_private; fi; for root in "$repo_root/.private" "$parent_private"; do [ -d "$root" ] || continue; if [ "$root" = "$repo_root/.private" ] && [ "$root" = "$parent_private" ]; then label=checkout-and-parent-retained; elif [ "$root" = "$repo_root/.private" ]; then label=checkout-local; else label=parent-retained; fi; printf '\n[%s] %s\n' "$label" "$root"; du -x -d 2 -B1 "$root" 2>/dev/null | python3 -c 'import heapq,sys; rows=((int(size), path.rstrip("\n")) for line in sys.stdin for size,path in [line.split("\t",1)]); [print(str(size)+"\t"+path) for size,path in heapq.nlargest(40,rows)]'; if [ "$repo_root/.private" = "$parent_private" ]; then break; fi; done; :
+find <selected-large-subtree-path> -xdev -type f -printf '%s\t%p\n' 2>/dev/null | python3 -c 'import heapq,sys; rows=((int(size), path.rstrip("\n")) for line in sys.stdin for size,path in [line.split("\t",1)]); [print(str(size)+"\t"+path) for size,path in heapq.nlargest(40,rows)]'
 ```
+
+Both commands keep only 40 rows in Python memory and do not use external
+`sort` or writable temporary storage. Replace the selected-subtree placeholder
+with one path printed by the labeled inventory.
 
 Read generic policy directly after inventory:
 
