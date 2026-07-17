@@ -41,6 +41,18 @@ question without using a tool, Git, repo scans, TODO/task/state recovery, or
 filesystem inspection. For local artifact/task-file prompts such as
 `what happened with this task file?`, inspect the named local artifact first.
 
+For a named local task status/currentness question, reconcile current Git
+before interpreting status prose. Inspect branch or detached state and the
+current `HEAD` parents, then use target-bound `git log`, `git branch --contains`,
+and `git merge-base --is-ancestor` checks to determine whether the task's
+reviewed branch work is reachable or merged. Current Git proof takes precedence
+over contradictory task, report, review, TODO, or pipeline status text. Do not
+call work active, pending-review, unmerged, incomplete, or not finished from
+stale secondary prose after Git proves the reviewed work is reachable or
+merged. If Git does not provide merge or reachability proof, stay cautious and
+do not infer that it merged. Keep this workflow local; do not invoke broad
+JSONL history unless source coverage is explicitly missing or disputed.
+
 The product contract is agent-assist retrieval: find useful information in
 large, messy JSONL histories, show where it was found, and give the receiving
 agent enough next commands/source refs to inspect deeper and answer. The CLI
