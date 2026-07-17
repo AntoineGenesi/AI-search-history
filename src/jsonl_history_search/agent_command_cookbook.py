@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -29,6 +30,36 @@ STORAGE_ROOT_INVENTORY_COMMAND = (
     'if [ "$repo_root/.private" = "$parent_private" ]; then break; fi; '
     'done; :'
 )
+
+STORAGE_RETENTION_ONLY_POLICY_COMMAND = (
+    "printf '\\n--- retention gate ---\\n'; "
+    "nl -ba reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md | sed -n '8,20p'; "
+    "printf '\\n--- retention ledger method ---\\n'; "
+    "nl -ba reports/jsh-1245-private-retention-ledger.md | sed -n '13,20p'; "
+    "printf '\\n--- retained lane evidence contract ---\\n'; "
+    "nl -ba reports/jsh-1246-state5-sqlite-retention-policy.md | sed -n '13,24p'"
+)
+
+STORAGE_EXPLICIT_CLEANUP_POLICY_COMMAND = (
+    "for f in reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md "
+    "reports/jsh-1245-private-retention-ledger.md "
+    "reports/jsh-1246-state5-sqlite-retention-policy.md "
+    "reports/jsh-1257-private-storage-cleanup-executed.md; do "
+    "printf '\\n--- %s ---\\n' \"$f\"; nl -ba \"$f\" | sed -n '1,28p'; done"
+)
+
+
+def storage_cleanup_requested(query: str) -> bool:
+    normalized = " ".join(query.lower().replace("_", " ").split())
+    return bool(
+        re.search(
+            r"\b(delete|deleted|deleting|deletion|cleanup|archive|archived|archiving|move|moved|moving|"
+            r"compact|compacted|compacting|compaction|prune|pruned|pruning|remove|removed|removing|"
+            r"removal|relocate|relocated|relocating|relocation|reclaim|reclaimed|reclaiming|reclamation)\b|"
+            r"\bclean\s+up\b",
+            normalized,
+        )
+    )
 
 
 def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list[dict[str, str]]:
@@ -173,6 +204,7 @@ def ask_next_commands(
     selected_first_command: str,
     route_family: str,
     cli_prefix: str = "jsonl-history-search",
+    query: str = "",
 ) -> list[dict[str, Any]]:
     if route_family == "non_history_clarification":
         return []
@@ -197,28 +229,36 @@ def ask_next_commands(
         ]
 
     if route_family == "storage_retention_forensics":
+        cleanup_requested = storage_cleanup_requested(query)
+        policy_command = (
+            STORAGE_EXPLICIT_CLEANUP_POLICY_COMMAND
+            if cleanup_requested
+            else STORAGE_RETENTION_ONLY_POLICY_COMMAND
+        )
         return [
             {
                 "purpose": "filesystem_inventory",
                 "command": selected_first_command,
                 "inspect_next": (
                     "bounded depth-2 size inventory for distinct checkout-local and parent-retained roots; "
-                    "select one large subtree handle before continuing"
+                    "use the top rows as dominant classes and representative handles; do not open a subtree "
+                    "for a broad answer"
                 ),
             },
             {
                 "purpose": "generic_retention_policy",
-                "command": (
-                    "for f in reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md "
-                    "reports/jsh-1245-private-retention-ledger.md "
-                    "reports/jsh-1246-state5-sqlite-retention-policy.md "
-                    "reports/jsh-1257-private-storage-cleanup-executed.md; do "
-                    "printf '\\n--- %s ---\\n' \"$f\"; nl -ba \"$f\" | sed -n '1,28p'; done"
-                ),
+                "command": policy_command,
                 "inspect_next": (
-                    "generic parent .private location/retention gate, reviewed ledger, state-file policy, and latest "
-                    "authorized outcome with citation-ready line numbers; combine this with the root inventory, "
-                    "answer the broad storage question, and stop"
+                    (
+                        "explicitly requested cleanup policy and latest authorized outcome with citation-ready "
+                        "line numbers; do not perform any mutation"
+                    )
+                    if cleanup_requested
+                    else (
+                        "retention-only parent .private location, artifact-use method, and lane evidence contract "
+                        "with citation-ready line numbers; describe retained classes and requirements, do not turn "
+                        "this evidence into space-reclamation advice, then stop"
+                    )
                 ),
             },
         ]

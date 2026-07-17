@@ -8,6 +8,7 @@ from .agent_command_cookbook import (
     STORAGE_ROOT_INVENTORY_COMMAND,
     agent_question_cookbook,
     ask_next_commands,
+    storage_cleanup_requested,
     storage_optional_deeper_reads,
 )
 from .command_resolution import resolve_command
@@ -753,6 +754,10 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
         first_action_category = "no_tool"
     else:
         first_action_category = "route_command"
+    cleanup_requested = (
+        route.route_family == STORAGE_RETENTION_ROUTE_FAMILY
+        and storage_cleanup_requested(query)
+    )
     answer_ready_handoff = None
     optional_deeper_reads: list[dict] = []
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
@@ -773,6 +778,16 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
                 "The user explicitly asks about one named handle/producer/consumer/exact artifact, or one "
                 "specific unresolved facet would materially change the broad answer."
             ),
+            "answer_boundary": (
+                "Cleanup was explicitly requested; discuss policy without performing or authorizing mutation."
+                if cleanup_requested
+                else (
+                    "The prompt did not request cleanup. Describe retained classes, size contributors, creation/use "
+                    "at class level, and retention requirements only. Do not recommend reclaiming space or changing, "
+                    "removing, relocating, archiving, or compacting stored artifacts."
+                )
+            ),
+            "cleanup_request_status": "explicit" if cleanup_requested else "not_requested",
         }
         optional_deeper_reads = storage_optional_deeper_reads(cli_prefix=cli_prefix)
     return {
@@ -791,6 +806,7 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
                 selected_first_command=first_command,
                 route_family=route.route_family,
                 cli_prefix=cli_prefix,
+                query=query,
             ),
             "answer_ready_handoff": answer_ready_handoff,
             "optional_deeper_reads": optional_deeper_reads,

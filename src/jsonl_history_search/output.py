@@ -374,6 +374,7 @@ def render_ask_router_text(payload: dict) -> str:
                 f"Answer-ready after: {', '.join(handoff.get('required_evidence', []))}",
                 f"Answer facets: {'; '.join(handoff.get('answer_facets', []))}",
                 f"Required-read stop: {handoff.get('stop')}",
+                f"Answer boundary: {handoff.get('answer_boundary')}",
                 f"Optional deeper reads only if: {handoff.get('only_continue_if')}",
             ]
         )
@@ -474,6 +475,7 @@ def render_ask_execute_text(payload: dict) -> str:
         if handoff:
             lines.append(f"Answer-ready after: {', '.join(handoff.get('required_evidence', []))}")
             lines.append(f"Required-read stop: {handoff.get('stop')}")
+            lines.append(f"Answer boundary: {handoff.get('answer_boundary')}")
             lines.append(f"Optional deeper reads only if: {handoff.get('only_continue_if')}")
         if route.get("next_commands"):
             lines.append("Bounded next commands:")
@@ -607,6 +609,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
                 [
                     f"- Answer-ready after: {', '.join(handoff.get('required_evidence', []))}",
                     f"- Required-read stop: {handoff.get('stop')}",
+                    f"- Answer boundary: {handoff.get('answer_boundary')}",
                     f"- Optional deeper reads only if: {handoff.get('only_continue_if')}",
                 ]
             )
@@ -1136,6 +1139,7 @@ def render_ask_router_markdown(payload: dict) -> str:
                 f"- Required evidence: {', '.join(handoff.get('required_evidence', []))}",
                 f"- Answer facets: {'; '.join(handoff.get('answer_facets', []))}",
                 f"- Stop: {handoff.get('stop')}",
+                f"- Answer boundary: {handoff.get('answer_boundary')}",
                 f"- Optional deeper reads only if: {handoff.get('only_continue_if')}",
             ]
         )

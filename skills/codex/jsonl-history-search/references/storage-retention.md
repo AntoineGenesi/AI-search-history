@@ -73,7 +73,7 @@ exact files or one named subtree needs a representative file.
 Read generic policy directly after inventory:
 
 ```bash
-for f in reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md reports/jsh-1245-private-retention-ledger.md reports/jsh-1246-state5-sqlite-retention-policy.md reports/jsh-1257-private-storage-cleanup-executed.md; do printf '\n--- %s ---\n' "$f"; nl -ba "$f" | sed -n '1,28p'; done
+printf '\n--- retention gate ---\n'; nl -ba reports/jsh-067-private-artifact-retention-and-worktree-cleanup-gate.md | sed -n '8,20p'; printf '\n--- retention ledger method ---\n'; nl -ba reports/jsh-1245-private-retention-ledger.md | sed -n '13,20p'; printf '\n--- retained lane evidence contract ---\n'; nl -ba reports/jsh-1246-state5-sqlite-retention-policy.md | sed -n '13,24p'
 ```
 
 For every broad `.private` size/creation/use/retention question, answer after
@@ -84,6 +84,11 @@ policy files, scan each bucket, or serially inspect older tasks, reports,
 reviews, TODO, or state. Only for an explicit named-handle request or one
 specific unresolved facet material to the answer, join that one handle to
 bounded policy and producer/consumer results:
+
+The broad policy excerpt is intentionally retention-only. If the user did not
+ask for cleanup, do not turn it into advice about reclaiming space or changing,
+removing, relocating, archiving, or compacting stored artifacts. Cleanup-policy
+and prior cleanup-execution reports are outside the broad answer path.
 
 ```bash
 rg -n -F --max-count 20 '<large-subtree-or-task-handle>' codex/state/pipeline-state.md TODO.md PROJECT.md CODEX-ORCHESTRATION.md learnings/INDEX.md 2>/dev/null | head -n 80
