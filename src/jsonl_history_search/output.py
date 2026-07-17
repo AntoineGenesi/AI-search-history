@@ -653,8 +653,9 @@ def _append_artifact_currentness_execute_text(lines: list[str], executed: dict) 
     lines.append(f"- summary: {cleanup.get('causal_summary')}")
     for record in cleanup.get("operational_records") or []:
         lines.append(
-            f"- {record.get('source_role')}: {record.get('source_ref')} - "
-            f"{record.get('relationship')}"
+            f"- {record.get('causal_source_role') or record.get('source_role')}: "
+            f"{record.get('source_ref')} - {record.get('relationship')} "
+            f"[{record.get('source_authority') or 'unclassified'}]"
         )
     roles = executed.get("source_roles_present") or []
     if roles:
@@ -679,8 +680,8 @@ def _append_artifact_currentness_execute_markdown(lines: list[str], executed: di
     )
     for record in cleanup.get("operational_records") or []:
         lines.append(
-            f"- `{record.get('source_role')}` `{record.get('source_ref')}`: "
-            f"{record.get('relationship')}"
+            f"- `{record.get('causal_source_role') or record.get('source_role')}` `{record.get('source_ref')}`: "
+            f"{record.get('relationship')} [`{record.get('source_authority') or 'unclassified'}`]"
         )
     roles = executed.get("source_roles_present") or []
     if roles:
@@ -1701,7 +1702,8 @@ def render_artifact_currentness_text(payload: dict) -> str:
                 lines.append(f"- summary: {cleanup.get('causal_summary')}")
             for ref in cleanup.get("operational_records", [])[:6]:
                 lines.append(
-                    f"- {ref.get('source_role')}: {ref.get('source_ref')} - {ref.get('relationship')} - {ref.get('snippet')}"
+                    f"- {ref.get('causal_source_role') or ref.get('source_role')}: {ref.get('source_ref')} - "
+                    f"{ref.get('relationship')} [{ref.get('source_authority') or 'unclassified'}] - {ref.get('snippet')}"
                 )
             if cleanup.get("target_selection_note"):
                 lines.append(f"- target selection: {cleanup.get('target_selection_note')}")
@@ -1916,7 +1918,10 @@ def _render_worktree_cleanup_causality_text(report: dict) -> str:
         "Operational records:",
     ]
     for ref in cleanup.get("operational_records", [])[:6]:
-        lines.append(f"- {ref.get('source_role')} {ref.get('source_ref')}: {ref.get('relationship')} - {ref.get('snippet')}")
+        lines.append(
+            f"- {ref.get('causal_source_role') or ref.get('source_role')} {ref.get('source_ref')}: "
+            f"{ref.get('relationship')} [{ref.get('source_authority') or 'unclassified'}] - {ref.get('snippet')}"
+        )
     roles = worktree.get("source_roles_present") or []
     if "private_retention_evidence" in roles:
         lines.append(f"Source roles present: {', '.join(roles)}")
@@ -1949,7 +1954,10 @@ def _render_worktree_cleanup_causality_markdown(report: dict) -> str:
         "",
     ]
     for ref in cleanup.get("operational_records", [])[:6]:
-        lines.append(f"- `{ref.get('source_role')}` `{ref.get('source_ref')}`: `{ref.get('relationship')}` - {ref.get('snippet')}")
+        lines.append(
+            f"- `{ref.get('causal_source_role') or ref.get('source_role')}` `{ref.get('source_ref')}`: "
+            f"`{ref.get('relationship')}` [`{ref.get('source_authority') or 'unclassified'}`] - {ref.get('snippet')}"
+        )
     roles = worktree.get("source_roles_present") or []
     if "private_retention_evidence" in roles:
         lines.extend(["", f"**Source roles present:** `{', '.join(roles)}`"])

@@ -1997,7 +1997,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     try:
         Path(report_output).parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
+        if _is_worktree_cleanup_causality_execute(args, execution_kind):
             return _run_worktree_cleanup_execute_without_report(
                 contract,
                 execution_args=execution_args,
@@ -2042,7 +2042,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     except OSError as exc:
         if not _ask_execute_report_output_error(exc, report_output):
             raise
-        if _is_answer_ready_worktree_cleanup_execute(args, execution_kind):
+        if _is_worktree_cleanup_causality_execute(args, execution_kind):
             return _run_worktree_cleanup_execute_without_report(
                 contract,
                 execution_args=execution_args,
@@ -2111,6 +2111,14 @@ def _is_answer_ready_worktree_cleanup_execute(args: argparse.Namespace, executio
     )
 
 
+def _is_worktree_cleanup_causality_execute(args: argparse.Namespace, execution_kind: str) -> bool:
+    if execution_kind != "artifact-currentness":
+        return False
+    from .worktree_currentness import is_worktree_cleanup_causality_query
+
+    return is_worktree_cleanup_causality_query(str(getattr(args, "query", "") or ""))
+
+
 def _is_answer_ready_worktree_cleanup_query(query: str) -> bool:
     from .worktree_currentness import is_answer_ready_worktree_cleanup_causality_query
 
@@ -2124,7 +2132,7 @@ def _run_worktree_cleanup_execute_without_report(
     report_output: str,
     cwd: Path,
 ) -> dict:
-    """Preserve the validated cleanup handoff when only report writing fails."""
+    """Preserve bounded cleanup routing when only optional report writing fails."""
     from .artifact_currentness import build_artifact_currentness_payload
 
     compact = build_artifact_currentness_payload(execution_args)["artifact_currentness"]
@@ -2140,8 +2148,8 @@ def _run_worktree_cleanup_execute_without_report(
             "report_output_status": "unavailable",
             "output_key": "artifact_currentness",
             "reason": (
-                "The optional report destination is not writable; exact cleanup causality "
-                "was finalized from the bounded in-memory packet."
+                "The optional report destination is not writable; cleanup causality was "
+                "finalized from the bounded in-memory packet."
             ),
         }
     )
@@ -2157,7 +2165,10 @@ def _run_worktree_cleanup_execute_without_report(
         query=str(getattr(execution_args, "query", "") or ""),
         cwd=str(cwd),
     )
-    _attach_worktree_cleanup_answer_handoff(contract, cwd=cwd)
+    if _is_answer_ready_worktree_cleanup_query(
+        str(getattr(execution_args, "query", "") or "")
+    ):
+        _attach_worktree_cleanup_answer_handoff(contract, cwd=cwd)
     return contract
 
 
@@ -4739,23 +4750,19 @@ _ASK_EXECUTE_TASK_ID_MONTH_PREFIXES = {
 def _cleanup_answer_operational_records(records: list[dict]) -> list[dict]:
     """Keep one bounded answer-leading ref for each cleanup-causality role."""
     selected: list[dict] = []
-    relationship_groups = (
-        {
-            "report_only_preserve_then_remove_candidates",
-            "report_only_preserve_then_remove",
-            "report_only_preserve_then_prune",
-            "report_only_cleanup_audit",
-        },
-        {"handoff_deferred_cleanup"},
-        {"cleanup_execution_report"},
-        {"private_retention_record"},
+    causal_roles = (
+        "report_only_audit",
+        "deferred_handoff",
+        "cleanup_learning_policy",
+        "cleanup_execution",
+        "private_retention",
     )
-    for relationships in relationship_groups:
+    for causal_role in causal_roles:
         match = next(
             (
                 item
                 for item in records
-                if isinstance(item, dict) and item.get("relationship") in relationships
+                if isinstance(item, dict) and item.get("causal_source_role") == causal_role
             ),
             None,
         )
@@ -4781,6 +4788,7 @@ def _answer_action_contract_from_executed_output(
         next_reads = list(compact.get("next_reads") or [])[:8]
         target_binding = cleanup.get("target_binding") or {}
         if target_binding:
+            missing_target = target_binding.get("status") == "blocked_named_target_missing"
             return {
                 "answer_status": "not-ready/needs-more-proof",
                 "promotion_status": target_binding.get("status"),
@@ -4794,13 +4802,28 @@ def _answer_action_contract_from_executed_output(
                     "worktree_classifications": (worktree.get("classifications") or [])[:8],
                 },
                 "diagnostics_after": [],
+                "excluded_evidence": (
+                    [
+                        "generic cleanup causality",
+                        "task/report/review archaeology",
+                        "tests, scripts, validators, fixtures, and answer keys",
+                    ]
+                    if missing_target
+                    else []
+                ),
                 "source_role_order": worktree.get("source_role_order"),
                 "source_roles_present": worktree.get("source_roles_present"),
                 "stop": (
-                    "Stop without a cleanup-causality answer when the named target is missing "
-                    "or target-specific evidence remains inconclusive."
+                    "After the listed exact Git checks, stop with current target absence and no "
+                    "cleanup-causality answer; absence does not prove why cleanup did or did not happen."
+                    if missing_target
+                    else "Stop without a cleanup-causality answer when target-specific evidence remains inconclusive."
                 ),
-                "only_continue_if": target_binding.get("required_next_proof"),
+                "only_continue_if": (
+                    "Continue only if the listed exact Git checks find the named target."
+                    if missing_target
+                    else target_binding.get("required_next_proof")
+                ),
                 "saved_report": compact.get("report_written"),
             }
         return {
@@ -8186,6 +8209,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "target_selection_note": cleanup.get("target_selection_note"),
                 "target_binding": cleanup.get("target_binding"),
             },
+            "cleanup_causal_role_order": worktree.get("cleanup_causal_role_order"),
             "source_role_order": worktree.get("source_role_order"),
             "source_roles_present": worktree.get("source_roles_present"),
             "worktree_classifications": (worktree.get("classifications") or [])[:8],
@@ -8970,6 +8994,8 @@ def _ask_answer_worktree_cleanup_currentness(
         "The worktrees did not clean themselves up because the audit stopped at a report-only "
         "preserve-then-remove classification: private evidence still had to be retained, and later "
         "handoffs left the pre-existing worktrees unaudited instead of completing that lifecycle step. "
+        "The cleanup policy required preserved evidence to be followed by physical worktree removal "
+        "while retaining branch refs, so those refs were not the blocker. "
         f"{causal_summary} "
         "This is a read-only causality answer and does not authorize or perform cleanup actions."
     )
@@ -8982,6 +9008,11 @@ def _ask_answer_worktree_cleanup_currentness(
         "debt_status": debt_status,
         "opened_ref_count": len(usable),
         "relationships": sorted(relationships),
+        "causal_source_roles": [
+            str(item.get("causal_source_role"))
+            for item in normalized
+            if item.get("causal_source_role")
+        ],
         "boundary": "read-only cleanup causality; no cleanup, branch deletion, worktree removal, or storage action",
     }
     return {"ask_answer": answer}

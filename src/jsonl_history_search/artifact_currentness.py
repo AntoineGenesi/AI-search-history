@@ -1046,6 +1046,20 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
 def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]:
     reads = []
     cleanup = worktree_report.get("cleanup_causality") or {}
+    target_binding = cleanup.get("target_binding") or {}
+    if target_binding.get("status") == "blocked_named_target_missing":
+        for command in worktree_report.get("next_commands") or []:
+            reads.append(
+                {
+                    "source_ref": command.get("command"),
+                    "source_role": "git_state",
+                    "reason": (
+                        f"Run target-bound {command.get('kind')} proof, then stop if the exact "
+                        "named target remains absent."
+                    ),
+                }
+            )
+        return _dedupe_reads(reads)
     for ref in cleanup.get("operational_records") or []:
         reads.append(
             {

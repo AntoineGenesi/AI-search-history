@@ -110,8 +110,17 @@ CLEANUP_CAUSAL_WORDS = (
     "not cleaned",
     "not clean",
 )
-ANSWER_READY_CLEANUP_QUERY = (
-    "why did the JSON-search-history worktrees not clean themselves up"
+ANSWER_READY_CLEANUP_QUERIES = (
+    "why did the JSON-search-history worktrees not clean themselves up",
+    "why did the worktrees not clean themselves up",
+)
+
+CLEANUP_CAUSAL_ROLE_ORDER = (
+    "report_only_audit",
+    "deferred_handoff",
+    "cleanup_learning_policy",
+    "cleanup_execution",
+    "private_retention",
 )
 
 EVIDENCE_ROOTS = (
@@ -138,7 +147,7 @@ def is_worktree_cleanup_causality_query(query: str) -> bool:
 
 def is_answer_ready_worktree_cleanup_causality_query(query: str) -> bool:
     normalized = _normalize(query).rstrip(".?!")
-    return normalized == _normalize(ANSWER_READY_CLEANUP_QUERY)
+    return normalized in {_normalize(item) for item in ANSWER_READY_CLEANUP_QUERIES}
 
 
 def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
@@ -173,6 +182,7 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         "classifications": items,
         "classification_values": list(CLASSIFICATIONS),
         "cleanup_causality": cleanup_causality,
+        "cleanup_causal_role_order": list(CLEANUP_CAUSAL_ROLE_ORDER),
         "source_role_order": [
             "operational_record",
             "git_state",
@@ -182,7 +192,13 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         "source_roles_present": _source_roles_present(cleanup_causality, items),
         "named_targets": named,
         "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
-        "next_commands": _general_next_commands(named),
+        "next_commands": _general_next_commands(
+            named,
+            exact_git_only=(
+                (cleanup_causality.get("target_binding") or {}).get("status")
+                == "blocked_named_target_missing"
+            ),
+        ),
         "preservation_policy": (
             "If a worktree-local .private directory contains evidence, copy or archive it under "
             "the parent checkout .private/worktree-cleanup-archive/<slug>/ before any physical "
@@ -198,22 +214,34 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
 def extract_named_worktree_targets(query: str) -> list[dict]:
     targets: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for match in ID_RE.finditer(query):
-        value = match.group(1)
-        _append_unique(targets, seen, {"kind": "id", "value": value.upper(), "token": value.casefold()})
-    for match in PATH_RE.finditer(query):
-        value = match.group(1).rstrip(".,;:)")
-        _append_unique(targets, seen, {"kind": "path", "value": value, "token": value.casefold()})
-    for match in BRANCH_RE.finditer(query):
-        value = match.group(1).rstrip(".,;:)")
-        _append_unique(targets, seen, {"kind": "branch", "value": value, "token": value.casefold()})
+    labeled_spans: list[tuple[int, int]] = []
     for match in LABELED_TARGET_RE.finditer(query):
         value = match.group("value").rstrip(".,;:)")
         if value.casefold() in LABELED_TARGET_STOPWORDS:
             continue
         kind = match.group("kind").casefold()
         _append_unique(targets, seen, {"kind": kind, "value": value, "token": value.casefold()})
+        labeled_spans.append(match.span())
+    for match in ID_RE.finditer(query):
+        if _inside_labeled_target(match.span(), labeled_spans):
+            continue
+        value = match.group(1)
+        _append_unique(targets, seen, {"kind": "id", "value": value.upper(), "token": value.casefold()})
+    for match in PATH_RE.finditer(query):
+        if _inside_labeled_target(match.span(), labeled_spans):
+            continue
+        value = match.group(1).rstrip(".,;:)")
+        _append_unique(targets, seen, {"kind": "path", "value": value, "token": value.casefold()})
+    for match in BRANCH_RE.finditer(query):
+        if _inside_labeled_target(match.span(), labeled_spans):
+            continue
+        value = match.group(1).rstrip(".,;:)")
+        _append_unique(targets, seen, {"kind": "branch", "value": value, "token": value.casefold()})
     return targets
+
+
+def _inside_labeled_target(span: tuple[int, int], labeled_spans: list[tuple[int, int]]) -> bool:
+    return any(start <= span[0] and span[1] <= end for start, end in labeled_spans)
 
 
 def _append_unique(items: list[dict], seen: set[tuple[str, str]], item: dict) -> None:
@@ -344,7 +372,12 @@ def _classify_target(
     identifier = _target_identifier(target)
     slug = _target_slug(identifier, target)
     tokens = _target_tokens(query, target, identifier)
-    evidence = _scan_evidence(cwd, evidence_files, tokens)
+    named_missing_cleanup_target = bool(
+        _is_cleanup_causality_query(query)
+        and target.get("matched_query_target")
+        and not target.get("path")
+    )
+    evidence = [] if named_missing_cleanup_target else _scan_evidence(cwd, evidence_files, tokens)
     if _is_cleanup_causality_query(query):
         evidence = _dedupe_evidence(evidence + list(operational_records or []))
     status = _worktree_status(target)
@@ -363,7 +396,13 @@ def _classify_target(
         "status": status,
         "private_artifacts": private,
         "source_refs": evidence[:8],
-        "next_commands": _target_next_commands(identifier, target, tokens, archive_root),
+        "next_commands": _target_next_commands(
+            identifier,
+            target,
+            tokens,
+            archive_root,
+            exact_git_only=named_missing_cleanup_target,
+        ),
         "preservation_guidance": _preservation_guidance(target, private, archive_root),
     }
     return item
@@ -630,19 +669,29 @@ def _scan_cleanup_operational_records(cwd: Path, evidence_files: list[Path]) -> 
         except OSError:
             continue
         for line_no, line in enumerate(lines, 1):
-            relationship = _cleanup_operational_relationship(line)
+            relationship = _cleanup_operational_relationship(rel, line)
             if not relationship:
                 continue
+            causal_source_role = _cleanup_causal_source_role(rel, relationship)
             matches.append(
                 {
                     "source_ref": f"{rel}:{line_no}",
                     "source_role": "operational_record",
+                    "causal_source_role": causal_source_role,
+                    "source_authority": _cleanup_source_authority(rel, causal_source_role),
                     "relationship": relationship,
                     "snippet": _compact(line),
-                    "priority": _cleanup_operational_priority(rel, relationship),
                 }
             )
-    matches.sort(key=lambda item: (item["priority"], item["source_ref"]))
+    role_order = {role: index for index, role in enumerate(CLEANUP_CAUSAL_ROLE_ORDER)}
+    matches.sort(
+        key=lambda item: (
+            role_order.get(item["causal_source_role"], len(role_order)),
+            0 if item["source_authority"] == "original_role_source" else 1,
+            _cleanup_relationship_rank(item["relationship"]),
+            item["source_ref"],
+        )
+    )
     return _featured_operational_records(_dedupe_operational_records(matches))
 
 
@@ -654,7 +703,7 @@ def _looks_like_operational_cleanup_path(rel: str) -> bool:
     )
 
 
-def _cleanup_operational_relationship(line: str) -> str:
+def _cleanup_operational_relationship(rel: str, line: str) -> str:
     normalized = _normalize(line)
     if not any(
         term in normalized
@@ -662,13 +711,24 @@ def _cleanup_operational_relationship(line: str) -> str:
             "worktree",
             "worktrees",
             "preserve_then_remove",
+            "preserve-then-remove",
             "preserve_then_prune",
             "pre-existing",
             "not audited",
             "branch refs retained",
+            "handoff_clean",
+            "survivor reason",
         )
     ):
         return ""
+    lowered = rel.casefold()
+    if (
+        lowered.startswith("docs/")
+        and "worktree" in lowered
+        and any(term in lowered for term in ("learning", "fsm"))
+        and any(term in normalized for term in ("preserve_then_remove", "preserve-then-remove", "handoff_clean", "survivor reason"))
+    ):
+        return "cleanup_learning_policy"
     if "preserve_then_remove_candidates" in normalized:
         return "report_only_preserve_then_remove_candidates"
     if "preserve_then_remove" in normalized:
@@ -696,27 +756,44 @@ def _cleanup_operational_relationship(line: str) -> str:
     return ""
 
 
-def _cleanup_operational_priority(rel: str, relationship: str) -> int:
-    relationship_priority = {
-        "report_only_preserve_then_remove_candidates": 10,
-        "report_only_preserve_then_remove": 11,
-        "report_only_preserve_then_prune": 12,
-        "report_only_cleanup_audit": 13,
-        "handoff_deferred_cleanup": 20,
-        "cleanup_execution_report": 30,
-        "private_retention_record": 40,
-    }.get(relationship, 90)
-    path_bonus = 0
+def _cleanup_causal_source_role(rel: str, relationship: str) -> str:
+    if relationship.startswith("report_only_"):
+        return "report_only_audit"
+    if relationship == "handoff_deferred_cleanup":
+        return "deferred_handoff"
+    if relationship == "cleanup_learning_policy":
+        return "cleanup_learning_policy"
+    if relationship == "cleanup_execution_report":
+        return "cleanup_execution"
+    if relationship == "private_retention_record":
+        return "private_retention"
+    return "other_cleanup_context"
+
+
+def _cleanup_relationship_rank(relationship: str) -> int:
+    return {
+        "report_only_preserve_then_remove_candidates": 0,
+        "report_only_preserve_then_remove": 1,
+        "report_only_preserve_then_prune": 2,
+        "report_only_cleanup_audit": 3,
+    }.get(relationship, 0)
+
+
+def _cleanup_source_authority(rel: str, causal_source_role: str) -> str:
     lowered = rel.casefold()
-    if lowered.startswith("reports/stale-worktree-cleanup"):
-        path_bonus = -4
-    elif "worktree-subagent-state-audit" in lowered:
-        path_bonus = -3
-    elif "handoff" in lowered:
-        path_bonus = -2
-    elif lowered == "todo.md":
-        path_bonus = 8
-    return relationship_priority + path_bonus
+    original = (
+        causal_source_role == "report_only_audit"
+        and lowered.startswith("reports/")
+        and "audit" in lowered
+        and not any(term in lowered for term in ("causal-and-method", "comparison", "summary"))
+    ) or (
+        causal_source_role == "deferred_handoff" and lowered.startswith("codex/state/handoff")
+    ) or (
+        causal_source_role == "cleanup_learning_policy" and lowered.startswith("docs/")
+    ) or (
+        causal_source_role == "cleanup_execution" and lowered.startswith("reports/stale-worktree-cleanup")
+    )
+    return "original_role_source" if original else "consolidated_or_derived_context"
 
 
 def _mentions_worktree_cleanup_subject(normalized: str) -> bool:
@@ -732,23 +809,15 @@ def _dedupe_operational_records(records: list[dict]) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        deduped.append({key: value for key, value in record.items() if key != "priority"})
+        deduped.append(record)
     return deduped
 
 
 def _featured_operational_records(records: list[dict]) -> list[dict]:
     featured: list[dict] = []
-    for relationship in (
-        "report_only_preserve_then_remove_candidates",
-        "report_only_preserve_then_remove",
-        "report_only_preserve_then_prune",
-        "report_only_cleanup_audit",
-        "handoff_deferred_cleanup",
-        "cleanup_execution_report",
-        "private_retention_record",
-    ):
+    for causal_source_role in CLEANUP_CAUSAL_ROLE_ORDER:
         for record in records:
-            if record.get("relationship") == relationship and record not in featured:
+            if record.get("causal_source_role") == causal_source_role and record not in featured:
                 featured.append(record)
                 break
     for record in records:
@@ -815,7 +884,14 @@ def _private_artifact_summary(target: dict) -> dict:
     return {"has_private_artifacts": bool(paths) or root.is_dir(), "paths": paths, "count": len(paths)}
 
 
-def _target_next_commands(identifier: str, target: dict, tokens: list[str], archive_root: str) -> list[dict]:
+def _target_next_commands(
+    identifier: str,
+    target: dict,
+    tokens: list[str],
+    archive_root: str,
+    *,
+    exact_git_only: bool = False,
+) -> list[dict]:
     path = target.get("path") or "<worktree-path>"
     matched_target = target.get("matched_query_target") or {}
     branch = target.get("branch") or _branch_from_identifier(identifier)
@@ -825,6 +901,8 @@ def _target_next_commands(identifier: str, target: dict, tokens: list[str], arch
     head = target.get("head") or "HEAD"
     grep_pattern = "|".join(re.escape(token) for token in tokens[:6]) or re.escape(identifier)
     if not target.get("path"):
+        if exact_git_only:
+            return _missing_target_git_commands(target.get("matched_query_target") or {}, branch_pattern)
         return [
             {"kind": "worktree_list", "command": "git worktree list --porcelain"},
             {
@@ -860,12 +938,33 @@ def _target_next_commands(identifier: str, target: dict, tokens: list[str], arch
     ]
 
 
-def _general_next_commands(named: list[dict]) -> list[dict]:
+def _general_next_commands(named: list[dict], *, exact_git_only: bool = False) -> list[dict]:
+    if named and exact_git_only:
+        target = named[0]
+        return _missing_target_git_commands(target, str(target.get("value") or ""))
     target = "|".join(re.escape(item["value"]) for item in named[:8]) or "<ticket-or-worktree-id>"
     return [
         {"kind": "worktree_list", "command": "git worktree list --porcelain"},
         {"kind": "targeted_artifact_rg", "command": f'rg -n "{target}" codex/state tasks reports reviews TODO.md TASKS.md'},
         {"kind": "git_log_grep", "command": f'git log --all --grep="{target}" --oneline --decorate --max-count=40'},
+    ]
+
+
+def _missing_target_git_commands(target: dict, branch_pattern: str) -> list[dict]:
+    value = str(target.get("value") or branch_pattern)
+    if target.get("kind") == "branch":
+        pattern = value
+    else:
+        pattern = f"*{value}*"
+    return [
+        {"kind": "worktree_list", "command": "git worktree list --porcelain"},
+        {
+            "kind": "branch_list",
+            "command": (
+                f"git branch --list '{pattern}' --format="
+                "'%(refname:short) %(objectname:short) %(committerdate:iso8601) %(subject)'"
+            ),
+        },
     ]
 
 
