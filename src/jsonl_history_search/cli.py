@@ -2255,6 +2255,14 @@ def _ask_execute_report_output_unavailable(
             execution_args=execution_args,
         )
     if execution_kind == "semantic-debug":
+        remembered = _remembered_user_wording_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+            execution_args=execution_args,
+        )
+        if remembered:
+            return remembered
         provenance = _provenance_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
@@ -2280,6 +2288,50 @@ def _ask_execute_report_output_unavailable(
     contract["ask_execute"]["execution_status"] = "report_output_unavailable"
     contract["ask_execute"]["answer_action_contract"]["promotion_status"] = (
         "route_only_report_output_unavailable"
+    )
+    return contract
+
+
+def _remembered_user_wording_report_output_unavailable(
+    contract: dict,
+    *,
+    execution_kind: str,
+    report_output: str,
+    execution_args: argparse.Namespace | None,
+) -> dict:
+    ask_execute = contract["ask_execute"]
+    selected_route = ask_execute.get("selected_route") or {}
+    if selected_route.get("route_family") != "remembered_user_wording" or execution_args is None:
+        return {}
+
+    compact_payload = _build_semantic_debug_in_memory_payload(execution_args)
+    compact = compact_payload["semantic_debug"]
+    ask_execute["execution"].update(
+        {
+            "status": "executed_in_memory_report_output_unavailable",
+            "command_family": execution_kind,
+            "argv": _structured_execution_argv(execution_args),
+            "report_output": report_output,
+            "report_written": None,
+            "output_key": "semantic_debug",
+            "fallback_command": None,
+            "reason": (
+                "The optional report destination is not writable; remembered-user primary-history "
+                "proof was still attempted in memory, so no manual fallback command is needed."
+            ),
+        }
+    )
+    ask_execute["execution_status"] = "executed_in_memory_report_output_unavailable"
+    ask_execute["executed_output"] = _compact_executed_output_for_ask(
+        output_key="semantic_debug",
+        compact=compact,
+    )
+    ask_execute["answer_action_contract"] = _answer_action_contract_from_executed_output(
+        output_key="semantic_debug",
+        compact=compact,
+        selected_route=selected_route,
+        query=str(ask_execute.get("query") or ""),
+        cwd=str(ask_execute.get("cwd") or "."),
     )
     return contract
 
@@ -4599,6 +4651,35 @@ def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dic
     return _short_semantic_debug_report_written_payload(packet, args.report_output)
 
 
+def _build_semantic_debug_in_memory_payload(args: argparse.Namespace) -> dict:
+    source_plan, intent, plan = payload_from_args(args)
+    payload = build_semantic_debug_payload(
+        args,
+        source_plan=source_plan,
+        intent=intent,
+        plan=plan,
+        default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+        mask_context=_mask_context_from_args(args),
+        configuration_warnings=_configuration_warnings(source_plan),
+    )
+    packet = payload["semantic_debug"]
+    if _semantic_debug_is_scoped_no_evidence(packet):
+        compact = _short_semantic_debug_no_evidence_report_written_payload(
+            packet,
+            args.report_output,
+        )["semantic_debug"]
+    else:
+        compact = _short_semantic_debug_report_written_payload(
+            packet,
+            args.report_output,
+        )["semantic_debug"]
+    compact["report_written"] = None
+    compact["message"] = (
+        "Semantic-debug completed in memory because the optional report destination was unavailable."
+    )
+    return {"semantic_debug": compact}
+
+
 def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
     source_plan, intent, plan = payload_from_args(args)
     mask_context = _mask_context_from_args(args)
@@ -4780,6 +4861,77 @@ def _cleanup_answer_operational_records(records: list[dict]) -> list[dict]:
         if match is not None:
             selected.append(match)
     return selected
+
+
+def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_family: str) -> dict:
+    if route_family != "remembered_user_wording":
+        return {}
+    status = str(compact.get("status") or "")
+    no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+    searched_scope = (
+        compact.get("searched_scope")
+        if isinstance(compact.get("searched_scope"), dict)
+        else {}
+    )
+    scope_counts = (
+        compact.get("scope_counts")
+        if isinstance(compact.get("scope_counts"), dict)
+        else {}
+    )
+    if status not in {"no_evidence", "not_found_in_searched_scope"} and not no_evidence:
+        return {}
+
+    return {
+        "answer_status": "fail-closed/missing-primary-user-history",
+        "promotion_status": "remembered_user_wording_primary_history_unavailable",
+        "promotion_reason": (
+            "The bounded user-role history attempt produced no user-authored source ref. "
+            "The receiving agent must report that proof gap instead of substituting project artifacts."
+        ),
+        "read": [],
+        "diagnostics_after": [],
+        "searched_scope": searched_scope,
+        "no_evidence": no_evidence,
+        "missing_evidence_stop_contract": {
+            "answer_allowed": False,
+            "missing_primary_evidence": "user-authored Codex/Claude history message with source ref or timestamp",
+            "bounded_evidence_checked": {
+                "searched_files": int(searched_scope.get("searched_files") or 0),
+                "searched_bytes": int(searched_scope.get("searched_bytes") or 0),
+                "roots": searched_scope.get("checked_roots") or [],
+                "searched_roots": searched_scope.get("searched_roots") or [],
+                "missing_roots": searched_scope.get("missing_roots") or [],
+                "selected_root_count": int(scope_counts.get("selected_root_count") or 0),
+                "searched_root_count": len(searched_scope.get("searched_roots") or []),
+                "excluded_root_count": int(scope_counts.get("excluded_root_count") or 0),
+                "missing_root_count": int(scope_counts.get("missing_root_count") or 0),
+            },
+            "excluded_as_user_statement_proof": [
+                "TODO files",
+                "task files",
+                "reports and reviews",
+                "project guidance and current-state documents",
+                "assistant, tool, environment, and current-prompt echoes",
+            ],
+            "unblockers": [
+                "a user-provided quote or approximate wording",
+                "a user-provided timestamp or session anchor",
+                "an available primary Codex or Claude history root",
+            ],
+            "broad_repo_search_allowed": False,
+            "secondary_substitution_allowed": False,
+        },
+        "stop": (
+            "Stop now and answer that the original user-authored statement was not found in the bounded "
+            "available primary history. Do not run broad recursive repo search or open TODO/task/report/"
+            "review/project guidance as substitute proof of what the user said."
+        ),
+        "only_continue_if": (
+            "Continue only if the user supplies a quote/timestamp/session anchor or a real primary "
+            "Codex/Claude history root becomes available."
+        ),
+        "saved_report": compact.get("report_written"),
+    }
 
 
 def _answer_action_contract_from_executed_output(
@@ -5025,6 +5177,12 @@ def _answer_action_contract_from_executed_output(
             or compact.get("status")
         )
         route_family = str(selected_route.get("route_family") or "")
+        remembered_missing = _remembered_user_wording_missing_evidence_contract(
+            compact=compact,
+            route_family=route_family,
+        )
+        if remembered_missing:
+            return remembered_missing
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
         target_proof_handoff = _semantic_debug_target_proof_handoff(
             compact=compact,
@@ -8382,6 +8540,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
+            "searched_scope": compact.get("searched_scope"),
+            "scope_counts": compact.get("scope_counts"),
+            "cap_hit": compact.get("cap_hit"),
             "no_evidence": compact.get("no_evidence"),
             "message": compact.get("message"),
         }
@@ -17131,18 +17292,60 @@ def _no_evidence_searched_scope_summary(
     searched_bytes: int | None = None,
 ) -> dict:
     searched = no_evidence.get("searched_scope") if isinstance(no_evidence.get("searched_scope"), dict) else {}
+    not_searched = (
+        no_evidence.get("not_searched_scope")
+        if isinstance(no_evidence.get("not_searched_scope"), dict)
+        else {}
+    )
     files = searched.get("searched_files") if searched_files is None else searched_files
     bytes_ = searched.get("searched_bytes") if searched_bytes is None else searched_bytes
-    roots = [root for root in searched.get("roots") or [] if isinstance(root, dict)]
+    searched_roots = _compact_no_evidence_root_rows(searched.get("roots") or [])
+    missing_roots = _compact_no_evidence_root_rows(
+        no_evidence.get("missing_scope")
+        if isinstance(no_evidence.get("missing_scope"), list)
+        else not_searched.get("missing_roots") or []
+    )
+    checked_roots = _dedupe_compact_no_evidence_root_rows(searched_roots + missing_roots)
     return {
         "searched_files": int(files or 0),
         "searched_bytes": int(bytes_ or 0),
         "result_meaning": searched.get("result_meaning"),
-        "root_kinds": _unique_preserving_order([str(root.get("kind") or "") for root in roots]),
+        "checked_roots": checked_roots,
+        "searched_roots": searched_roots,
+        "missing_roots": missing_roots,
+        "root_kinds": _unique_preserving_order([str(root.get("kind") or "") for root in checked_roots]),
         "root_privacy_labels": _unique_preserving_order(
-            [str(root.get("privacy_label") or "") for root in roots]
+            [str(root.get("privacy_label") or "") for root in checked_roots]
         ),
     }
+
+
+def _compact_no_evidence_root_rows(rows: object) -> list[dict]:
+    compact: list[dict] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        compact.append(
+            {
+                "kind": row.get("kind"),
+                "scope_label": row.get("scope_label"),
+                "privacy_label": row.get("privacy_label"),
+                "reason": row.get("reason"),
+            }
+        )
+    return compact
+
+
+def _dedupe_compact_no_evidence_root_rows(rows: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[tuple[object, object, object]] = set()
+    for row in rows:
+        key = (row.get("kind"), row.get("scope_label"), row.get("privacy_label"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def _no_evidence_scope_counts(no_evidence: dict) -> dict:
@@ -17151,7 +17354,22 @@ def _no_evidence_scope_counts(no_evidence: dict) -> dict:
     if isinstance(selected_roots, list):
         selected_count = len(selected_roots)
     else:
-        selected_count = len(searched.get("roots") or [])
+        not_searched = (
+            no_evidence.get("not_searched_scope")
+            if isinstance(no_evidence.get("not_searched_scope"), dict)
+            else {}
+        )
+        missing_roots = (
+            no_evidence.get("missing_scope")
+            if isinstance(no_evidence.get("missing_scope"), list)
+            else not_searched.get("missing_roots") or []
+        )
+        selected_count = len(
+            _dedupe_compact_no_evidence_root_rows(
+                _compact_no_evidence_root_rows(searched.get("roots") or [])
+                + _compact_no_evidence_root_rows(missing_roots)
+            )
+        )
 
     excluded_summary = (
         no_evidence.get("excluded_scope_summary")

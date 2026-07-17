@@ -427,6 +427,13 @@ installed-or-source block above first and use its selected command prefix.
 - A plain "why did I say/mention X?" question is remembered-topic/provenance,
   not artifact/currentness, unless the wording implies plan/TODO/ticket/status
   conflict.
+- For remembered-user wording such as "what did I tell you before about X?",
+  a `fail-closed/missing-primary-user-history` result is terminal. Answer that
+  the original user-authored statement was not found in the bounded available
+  primary history and name the checked scope. Do not run broad recursive repo
+  search or open TODO/task/report/review/project guidance as substitute proof.
+  Continue only if the user supplies a quote, timestamp, or session anchor, or
+  a real Codex/Claude primary history root becomes available.
 - Artifact/currentness is for stale/current/superseded direction questions,
   local/exported ticket currentness questions, and worktree cleanup/currentness
   questions, not for every repeated-topic question.
@@ -501,7 +508,9 @@ tool.
 2. `~/.codex/history.jsonl`.
 3. `~/.claude/projects/**/*.jsonl`.
 4. Project `.claude/` state, task/review files, `work/research`, `reports`,
-   and repo docs.
+   and repo docs only for project-guidance questions. This step is forbidden as
+   proof of what the user personally said after remembered-user primary history
+   fails closed.
 
 Do not start with normal repo `rg` alone for history questions. Inside a JSONL
 shortlist, raw `rg` is fine before parsing nearby JSON objects.
