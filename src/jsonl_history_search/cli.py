@@ -6,6 +6,7 @@ import re
 import shlex
 import sys
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
@@ -1695,6 +1696,19 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         default=None,
         help="Optional path where the sanitized candidate discovery report should be written.",
     )
+    retained_source = subparsers.add_parser(
+        "retained-source-read",
+        description=(
+            "Open a bounded raw source-session candidate under cwd/.private from an exact "
+            "same-task private: handle. Unopened or unavailable handles remain leads only."
+        ),
+    )
+    retained_source.add_argument("handle", help="Exact private:<same-task>/... retained evidence handle.")
+    retained_source.add_argument("--task", required=True, help="Named JSH task that the retained handle must match.")
+    retained_source.add_argument("--cwd", default=".")
+    retained_source.add_argument("--format", choices=("text", "json", "markdown"), default="text")
+    retained_source.add_argument("--max-files", type=int, default=8)
+    retained_source.add_argument("--max-bytes", type=int, default=256 * 1024)
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     validate.add_argument(
@@ -2259,6 +2273,7 @@ def _provenance_report_output_unavailable(
         query=query,
         cwd=str(ask_execute.get("cwd") or "."),
         route_family=route_family,
+        cli_prefix=(selected_route.get("command_resolution") or {}).get("command_prefix"),
     )
     if handoff.get("status") != "completed_task_merge_artifact_refs_available_source_session_missing":
         return {}
@@ -4724,6 +4739,7 @@ def _answer_action_contract_from_executed_output(
             query=query,
             cwd=cwd,
             route_family=route_family,
+            cli_prefix=(selected_route.get("command_resolution") or {}).get("command_prefix"),
         )
         raw_worker_chronology_handoff = _raw_worker_chronology_execute_handoff(
             query=query,
@@ -6219,6 +6235,7 @@ def _named_task_merge_provenance_execute_artifact_handoff(
     query: str,
     cwd: str,
     route_family: str,
+    cli_prefix: str | None = None,
 ) -> dict:
     if not _named_task_merge_provenance_answer_wanted(query=query, route_family=route_family):
         return {}
@@ -6251,6 +6268,16 @@ def _named_task_merge_provenance_execute_artifact_handoff(
         else "single-parent integration/final-review commit"
     )
     source_session_requested = _named_task_merge_provenance_source_session_wanted(query)
+    retained_source_reads = (
+        _completed_task_retained_source_reads(
+            cwd=cwd_path,
+            refs=refs,
+            task_ids=_ask_execute_named_task_ids(query)[:2],
+            cli_prefix=cli_prefix or "jsonl-history-search",
+        )
+        if source_session_requested
+        else []
+    )
     missing_roles = ["source_session_proof"] if source_session_requested else []
     status = (
         "completed_task_merge_artifact_refs_available_source_session_missing"
@@ -6267,7 +6294,8 @@ def _named_task_merge_provenance_execute_artifact_handoff(
         "status": status,
         "git_proof_kind": git_proof_label,
         "task_ids": _ask_execute_named_task_ids(query)[:2],
-        "read": refs[:8],
+        "read": [*retained_source_reads, *refs[:8]],
+        "retained_source_reads": retained_source_reads,
         "diagnostics_after": [
             {
                 "kind": "semantic_debug_fallback",
@@ -6768,6 +6796,329 @@ def _completed_task_artifact_support_refs(*, cwd: Path, query: str, route_family
             )
         )
     return _dedupe_ask_answer_proof_refs(refs)
+
+
+_PRIVATE_HANDLE_PATTERN = re.compile(
+    r"private:(?P<path>[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*/?)"
+)
+_RETAINED_SOURCE_REJECTED_NAME_PARTS = frozenset(
+    {
+        "adjudication",
+        "adjudications",
+        "answer",
+        "answers",
+        "expected",
+        "expecteds",
+        "final",
+        "finals",
+        "report",
+        "reports",
+        "result",
+        "results",
+        "review",
+        "reviews",
+        "rubric",
+        "rubrics",
+        "scratch",
+        "scratches",
+        "summaries",
+        "summary",
+    }
+)
+_RETAINED_SOURCE_MAX_REFS = 4
+_RETAINED_HANDLE_ARTIFACT_MAX_CHARS = 64 * 1024
+
+
+def _completed_task_retained_source_reads(
+    *,
+    cwd: Path,
+    refs: list[dict],
+    task_ids: list[str],
+    cli_prefix: str,
+) -> list[dict]:
+    handles: list[tuple[str, str]] = []
+    for ref in refs[:8]:
+        if str(ref.get("proof_surface") or "") not in {"task_file", "review_artifact"}:
+            continue
+        target = str(ref.get("path") or ref.get("target") or "")
+        path = Path(target)
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:_RETAINED_HANDLE_ARTIFACT_MAX_CHARS]
+        except OSError:
+            continue
+        task_id = str(ref.get("task_id") or "").upper()
+        if task_id not in task_ids:
+            continue
+        for match in _PRIVATE_HANDLE_PATTERN.finditer(text):
+            handle = f"private:{match.group('path')}"
+            if _retained_handle_matches_task(handle, task_id=task_id) and (task_id, handle) not in handles:
+                handles.append((task_id, handle))
+    return [
+        {
+            "kind": "bounded_retained_source_session_read",
+            "task_id": task_id,
+            "handle": handle,
+            "command": (
+                f"{cli_prefix} retained-source-read {shlex.quote(handle)} "
+                f"--task {shlex.quote(task_id)} --cwd \"$PWD\" --format text"
+            ),
+            "reason": "open a bounded same-task retained raw/session lead before claiming source-session proof",
+            "target_source_role": "source_session_lead",
+            "final_support_allowed": False,
+            "source_boundary": "the command must open role-valid raw evidence; this unopened handle remains a lead only",
+        }
+        for task_id, handle in handles[:2]
+    ]
+
+
+def _retained_handle_matches_task(handle: str, *, task_id: str) -> bool:
+    match = _PRIVATE_HANDLE_PATTERN.fullmatch(str(handle or ""))
+    if not match:
+        return False
+    first_segment = match.group("path").rstrip("/").split("/", 1)[0].casefold()
+    task_token = str(task_id or "").casefold()
+    return first_segment == task_token or first_segment.startswith(f"{task_token}-")
+
+
+def _retained_source_candidate_paths(
+    root: Path,
+    *,
+    retained_task_root: Path,
+    max_files: int,
+) -> list[Path]:
+    if root.is_file():
+        return (
+            [root]
+            if _retained_source_candidate_allowed(root, retained_task_root=retained_task_root)
+            else []
+        )
+    if not root.is_dir():
+        return []
+    candidates: list[Path] = []
+    directories = [root]
+    directory_index = 0
+    while directory_index < len(directories) and directory_index < 32:
+        directory = directories[directory_index]
+        directory_index += 1
+        try:
+            children = sorted(islice(directory.iterdir(), 64), key=lambda item: item.name.casefold())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_symlink():
+                continue
+            if child.is_dir() and len(directories) < 32:
+                directories.append(child)
+            elif child.is_file() and _retained_source_candidate_allowed(
+                child,
+                retained_task_root=retained_task_root,
+            ):
+                candidates.append(child)
+                if len(candidates) >= max_files:
+                    return candidates
+    return candidates
+
+
+def _retained_source_candidate_allowed(path: Path, *, retained_task_root: Path) -> bool:
+    if path.suffix.casefold() not in {".jsonl", ".json"}:
+        return False
+    try:
+        relative = path.relative_to(retained_task_root)
+    except ValueError:
+        return False
+    path_tokens = {
+        token
+        for component in relative.parts
+        for token in re.split(r"[^a-z0-9]+", component.casefold())
+        if token
+    }
+    return not path_tokens.intersection(_RETAINED_SOURCE_REJECTED_NAME_PARTS)
+
+
+def _retained_source_record(raw: str, *, fallback: str) -> tuple[dict, str] | None:
+    metadata = _ask_answer_jsonl_record_metadata(raw)
+    summary = _summarize_jsonl_or_text_line(raw, fallback=fallback)
+    if metadata and summary and (
+        metadata.get("conversation_label") != "unknown" or metadata.get("top_role")
+    ):
+        return metadata, summary
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    top_type = str(row.get("type") or "")
+    if top_type == "thread.started" and str(row.get("thread_id") or "").strip():
+        return (
+            {
+                "top_type": top_type,
+                "conversation_label": "source_session_metadata",
+                "conversation_confidence": "high",
+                "is_user_authored": False,
+            },
+            f"source session {row['thread_id']}",
+        )
+    item = row.get("item") if isinstance(row.get("item"), dict) else {}
+    item_type = str(item.get("type") or "")
+    if top_type != "item.completed" or item_type not in {"agent_message", "command_execution"}:
+        return None
+    if item_type == "agent_message":
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return None
+        label = "assistant_message"
+        summary = f"assistant: {text[:_ASK_ANSWER_MAX_LINE_CHARS]}"
+    else:
+        command = str(item.get("command") or "").strip()
+        output = str(item.get("aggregated_output") or "").strip()
+        if not command and not output:
+            return None
+        label = "tool_action_output"
+        summary = _short_join(
+            [
+                f"tool call: {command[:_ASK_ANSWER_MAX_LINE_CHARS]}" if command else "",
+                f"tool output: {output[:_ASK_ANSWER_MAX_LINE_CHARS]}" if output else "",
+            ],
+            limit=_ASK_ANSWER_MAX_LINE_CHARS,
+        )
+    return (
+        {
+            "top_type": top_type,
+            "item_type": item_type,
+            "conversation_label": label,
+            "conversation_confidence": "high",
+            "is_user_authored": False,
+        },
+        summary,
+    )
+
+
+def _retained_source_record_score(*, metadata: dict, summary: str, task_id: str) -> int:
+    label = str(metadata.get("conversation_label") or "")
+    normalized = summary.casefold()
+    if label == "source_session_metadata":
+        return 10_000
+    score = 300 if label == "tool_action_output" else 250
+    if task_id.casefold() in normalized:
+        score += 500
+    if "ask --execute" in normalized:
+        score += 400
+    if any(marker in normalized for marker in ("report_output_unavailable", "read-only", "read only")):
+        score += 300
+    if any(marker in normalized for marker in ("verification", "verified", "pytest", "git diff --check")):
+        score += 150
+    if "skill.md" in normalized or "skills/jsonl-history-search" in normalized:
+        score -= 700
+    return score
+
+
+def build_retained_source_read_payload(
+    *,
+    handle: str,
+    task_id: str,
+    cwd: Path,
+    max_files: int,
+    max_bytes: int,
+) -> dict:
+    task_id = str(task_id or "").upper()
+    limits = {
+        "max_files": max(1, min(int(max_files), 16)),
+        "max_bytes": max(1024, min(int(max_bytes), 1024 * 1024)),
+        "max_refs": _RETAINED_SOURCE_MAX_REFS,
+    }
+    report = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "task_id": task_id,
+        "handle": handle,
+        "opened_refs": [],
+        "limits": limits,
+        "proof_boundary": "unopened or unavailable private handles are leads only, never source-session proof",
+    }
+    if not re.fullmatch(r"JSH-\d+", task_id) or not _retained_handle_matches_task(handle, task_id=task_id):
+        report["reason"] = "invalid_or_cross_task_private_handle"
+        return {"retained_source_read": report}
+
+    relative = _PRIVATE_HANDLE_PATTERN.fullmatch(handle).group("path").rstrip("/")
+    private_root = (cwd / ".private").resolve()
+    retained_root = (private_root / relative).resolve()
+    if retained_root != private_root and private_root not in retained_root.parents:
+        report["reason"] = "private_handle_escaped_retained_root"
+        return {"retained_source_read": report}
+    retained_task_root = (private_root / relative.split("/", 1)[0]).resolve()
+    candidates = _retained_source_candidate_paths(
+        retained_root,
+        retained_task_root=retained_task_root,
+        max_files=limits["max_files"],
+    )
+    if not candidates:
+        report["reason"] = "retained_handle_unavailable_or_no_raw_candidates"
+        return {"retained_source_read": report}
+
+    bytes_read = 0
+    candidate_files_opened = 0
+    candidate_refs: list[dict] = []
+    for path in candidates:
+        remaining = limits["max_bytes"] - bytes_read
+        if remaining <= 0:
+            break
+        try:
+            with path.open("rb") as handle_stream:
+                raw_content = handle_stream.read(remaining)
+        except OSError:
+            continue
+        candidate_files_opened += 1
+        bytes_read += len(raw_content)
+        content = raw_content.decode("utf-8", errors="replace")
+        for line_number, raw in enumerate(content.splitlines()[:256], start=1):
+            record = _retained_source_record(raw, fallback=f"{path.name}:{line_number}")
+            if not record:
+                continue
+            metadata, summary = record
+            rel = _safe_relative_path(cwd, path)
+            candidate_refs.append(
+                {
+                    "kind": "jsonl_source_ref",
+                    "target": f"{rel}:{line_number}",
+                    "source_ref": {"path": rel, "line": line_number},
+                    "target_source_role": "source_session_proof",
+                    "final_support_allowed": True,
+                    "summary": summary,
+                    "record_metadata": metadata,
+                    "_retained_source_score": _retained_source_record_score(
+                        metadata=metadata,
+                        summary=summary,
+                        task_id=task_id,
+                    ),
+                }
+            )
+            if len(candidate_refs) >= 64:
+                break
+        if len(candidate_refs) >= 64:
+            break
+    candidate_refs.sort(
+        key=lambda ref: (
+            -int(ref.get("_retained_source_score") or 0),
+            str(ref.get("target") or ""),
+        )
+    )
+    opened_refs = []
+    for ref in candidate_refs[: limits["max_refs"]]:
+        public = dict(ref)
+        public.pop("_retained_source_score", None)
+        opened_refs.append(public)
+    report["candidate_files_opened"] = candidate_files_opened
+    report["bytes_read"] = bytes_read
+    report["opened_refs"] = opened_refs
+    if opened_refs:
+        report["status"] = "opened_role_valid_source_session_proof"
+        report["reason"] = "bounded_same_task_raw_source_session_evidence_opened"
+    else:
+        report["reason"] = "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+    return {"retained_source_read": report}
 
 
 def _completed_task_merge_commit_refs(
@@ -15546,6 +15897,16 @@ def main(argv: list[str] | None = None) -> int:
             if auto_execute_bounded and not args.execute:
                 args = _args_with_bounded_auto_execute_prompt_scope(args)
             payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)
+        print(render(payload, args.format))
+        return 0
+    if args.command == "retained-source-read":
+        payload = build_retained_source_read_payload(
+            handle=args.handle,
+            task_id=args.task,
+            cwd=Path(args.cwd).expanduser().resolve(),
+            max_files=args.max_files,
+            max_bytes=args.max_bytes,
+        )
         print(render(payload, args.format))
         return 0
     if args.command == "validate-install":

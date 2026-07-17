@@ -24,6 +24,8 @@ def render_json(payload: dict) -> str:
 
 
 def render_text(payload: dict) -> str:
+    if "retained_source_read" in payload:
+        return render_retained_source_read_text(payload)
     if "ask_answer" in payload:
         return render_ask_answer_text(payload)
     if "ask_execute" in payload:
@@ -171,6 +173,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if "retained_source_read" in payload:
+        return render_retained_source_read_markdown(payload)
     if "ask_answer" in payload:
         return render_ask_answer_markdown(payload)
     if "ask_execute" in payload:
@@ -293,6 +297,51 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_retained_source_read_text(payload: dict) -> str:
+    report = payload["retained_source_read"]
+    lines = [
+        "Retained Source Read",
+        f"Status: {report.get('status')}",
+        f"Task: {report.get('task_id')}",
+        f"Handle: {report.get('handle')}",
+        f"Reason: {report.get('reason')}",
+        f"Proof boundary: {report.get('proof_boundary')}",
+        f"Candidate files opened: {report.get('candidate_files_opened', 0)}",
+        f"Bytes read: {report.get('bytes_read', 0)}",
+        "Opened role-valid source-session refs:",
+    ]
+    refs = report.get("opened_refs") or []
+    if not refs:
+        lines.append("- none")
+    for ref in refs:
+        lines.append(f"- {ref.get('target')}: {ref.get('summary')}")
+    return "\n".join(lines)
+
+
+def render_retained_source_read_markdown(payload: dict) -> str:
+    report = payload["retained_source_read"]
+    lines = [
+        "# Retained Source Read",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Task: `{report.get('task_id')}`",
+        f"- Handle: `{report.get('handle')}`",
+        f"- Reason: `{report.get('reason')}`",
+        f"- Proof boundary: {report.get('proof_boundary')}",
+        f"- Candidate files opened: `{report.get('candidate_files_opened', 0)}`",
+        f"- Bytes read: `{report.get('bytes_read', 0)}`",
+        "",
+        "## Opened Role-Valid Source-Session Refs",
+        "",
+    ]
+    refs = report.get("opened_refs") or []
+    if not refs:
+        lines.append("- none")
+    for ref in refs:
+        lines.append(f"- `{ref.get('target')}`: {ref.get('summary')}")
+    return "\n".join(lines)
 
 
 def render_ask_router_text(payload: dict) -> str:
