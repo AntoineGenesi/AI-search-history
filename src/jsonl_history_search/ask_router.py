@@ -403,14 +403,17 @@ REMEMBERED_USER_WORDING_ROUTE = AskRoute(
         "Run semantic-debug with --role user before broad manual search. Do not "
         "claim what the user said, asked, told, or requested until inspected "
         "source refs show user-authored text with timestamps/source handles; "
-        "assistant, tool, environment, task, report, and current prompt echoes "
-        "are diagnostics only."
+        "assistant, tool, environment, task, report, TODO, review, project-guidance, "
+        "and current prompt echoes are diagnostics only and cannot substitute for that proof. If bounded "
+        "primary user history is unavailable or yields no user-authored ref, stop "
+        "with missing evidence instead of searching the repository."
     ),
     manual_search_guidance=(
-        "Manual rg/read-more is follow-up only after the route leaves a named "
-        "user-wording gap. Prefer user-role raw message refs, timestamped "
-        "source-window reads, and mirror-deduped Codex history/session records "
-        "over assistant summaries, task files, reports, or echoed prompts."
+        "Continue only when the user supplies a quote/timestamp or a real primary "
+        "Codex/Claude history root becomes available. Do not run broad recursive "
+        "repo search, TODO/task/report/review archaeology, or project-guidance "
+        "substitution for a question about what the user personally said; assistant "
+        "summaries, task files, reports, reviews, and echoed prompts remain non-proof."
     ),
 )
 
