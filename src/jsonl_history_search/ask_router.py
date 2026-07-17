@@ -802,6 +802,9 @@ def classify_ask_route(query: str) -> AskRoute:
     if _looks_like_explicit_named_local_task_artifact_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
+    if _looks_like_explicit_named_task_provenance_query(normalized):
+        return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
+
     if _looks_like_storage_retention_forensics_query(normalized):
         return STORAGE_RETENTION_FORENSICS_ROUTE
 
@@ -852,7 +855,10 @@ def classify_ask_route(query: str) -> AskRoute:
     if _has_any(normalized, ("why did i mention", "why did i say", "what was i talking about", "why was i talking about")):
         return ROUTES[6]
 
-    if _looks_like_task_review_commit_provenance_query(normalized):
+    if (
+        not _looks_like_explicit_named_task_prior_conversation_query(normalized)
+        and _looks_like_task_review_commit_provenance_query(normalized)
+    ):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
     if is_worktree_cleanup_currentness_query(query):
@@ -1028,7 +1034,8 @@ def _looks_like_action_proof_query(normalized: str) -> bool:
 
 
 def _looks_like_storage_retention_forensics_query(normalized: str) -> bool:
-    compact = " ".join(re.sub(r"[_/.,;:()]+", " ", normalized).split())
+    intent_text = _replace_explicit_task_paths_with_identifiers(normalized)
+    compact = " ".join(re.sub(r"[_/.,;:()]+", " ", intent_text).split())
     storage_subject_terms = (
         ".private",
         " private ",
@@ -2149,9 +2156,49 @@ def _looks_like_local_artifact_verification_query(normalized: str) -> bool:
 
 
 def _looks_like_explicit_named_local_task_artifact_query(normalized: str) -> bool:
+    if not _EXPLICIT_TASK_PATH_RE.search(normalized):
+        return False
+    intent_text = _replace_explicit_task_paths_with_identifiers(normalized)
     return bool(
-        re.search(r"(?:^|\s)(?:\./)?tasks/[a-z0-9._/-]+\.md\b", normalized)
-        and _looks_like_local_artifact_verification_query(normalized)
+        _looks_like_local_artifact_verification_query(normalized)
+        and not _looks_like_task_review_commit_provenance_query(intent_text)
+    )
+
+
+_EXPLICIT_TASK_PATH_RE = re.compile(
+    r"(?:^|\s)(?:\./)?tasks/[a-z0-9._/-]+\.md\b"
+)
+
+
+def _replace_explicit_task_paths_with_identifiers(normalized: str) -> str:
+    def replacement(match: re.Match) -> str:
+        task_id = re.search(r"\b[a-z]{2,}-\d+\b", match.group(0))
+        return f" {task_id.group(0) if task_id else 'named-task'}"
+
+    return " ".join(_EXPLICIT_TASK_PATH_RE.sub(replacement, normalized).split())
+
+
+def _looks_like_explicit_named_task_prior_conversation_query(normalized: str) -> bool:
+    return bool(
+        _EXPLICIT_TASK_PATH_RE.search(normalized)
+        and _has_any(
+            normalized,
+            (
+                "prior conversation",
+                "conversation history",
+                "before in the chat",
+            ),
+        )
+    )
+
+
+def _looks_like_explicit_named_task_provenance_query(normalized: str) -> bool:
+    return bool(
+        _EXPLICIT_TASK_PATH_RE.search(normalized)
+        and not _looks_like_explicit_named_task_prior_conversation_query(normalized)
+        and _looks_like_task_review_commit_provenance_query(
+            _replace_explicit_task_paths_with_identifiers(normalized)
+        )
     )
 
 
