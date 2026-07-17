@@ -3,6 +3,34 @@ from __future__ import annotations
 from typing import Any
 
 
+_BOUNDED_TOP_N_FILTER = (
+    "python3 -c 'import heapq,sys; "
+    'rows=((int(size), path.rstrip("\\n")) for line in sys.stdin '
+    'for size,path in [line.split("\\t",1)]); '
+    '[print(str(size)+"\\t"+path) for size,path in heapq.nlargest(40,rows)]\''
+)
+
+STORAGE_ROOT_INVENTORY_COMMAND = (
+    'repo_root=$(git rev-parse --show-toplevel) && '
+    'common_private=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.private && '
+    'enclosing_private=$(python3 -c \'from pathlib import Path; import sys; '
+    'p=Path(sys.argv[1]).resolve(); '
+    'print(next((str(parent) for parent in p.parents if parent.name==".private"),""))\' "$repo_root") && '
+    'if [ -n "$enclosing_private" ]; then parent_private=$enclosing_private; '
+    'else parent_private=$common_private; fi; '
+    'for root in "$repo_root/.private" "$parent_private"; do '
+    '[ -d "$root" ] || continue; '
+    'if [ "$root" = "$repo_root/.private" ] && [ "$root" = "$parent_private" ]; then '
+    'label=checkout-and-parent-retained; '
+    'elif [ "$root" = "$repo_root/.private" ]; then label=checkout-local; '
+    'else label=parent-retained; fi; '
+    'printf \'\\n[%s] %s\\n\' "$label" "$root"; '
+    f'du -x -d 2 -B1 "$root" 2>/dev/null | {_BOUNDED_TOP_N_FILTER}; '
+    'if [ "$repo_root/.private" = "$parent_private" ]; then break; fi; '
+    'done; :'
+)
+
+
 def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list[dict[str, str]]:
     cookbook = [
         {
@@ -65,10 +93,11 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             "id": "storage_retention_forensics",
             "question_family": "Why is .private large, who created/uses it, and what must be retained?",
             "route": "storage-retention-forensics / filesystem-inventory-first",
-            "first_command": "du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40",
+            "first_command": STORAGE_ROOT_INVENTORY_COMMAND,
             "inspect_next": (
-                "filesystem_inventory first, then artifact_join over tasks/reports/reviews/scripts/tests/"
-                "codex state, then targeted JSONL only for unresolved creator/history gaps"
+                "checkout-local versus parent-retained filesystem_inventory first, then artifact_join over "
+                "tasks/reports/reviews/scripts/tests/codex state, then targeted JSONL only for unresolved "
+                "creator/history gaps"
             ),
         },
         {
@@ -120,7 +149,10 @@ def ask_next_commands(
             {
                 "purpose": "filesystem_inventory",
                 "command": selected_first_command,
-                "inspect_next": "bounded depth-2 size inventory; select one large subtree handle before continuing",
+                "inspect_next": (
+                    "bounded depth-2 size inventory for distinct checkout-local and parent-retained roots; "
+                    "select one large subtree handle before continuing"
+                ),
             },
             {
                 "purpose": "generic_retention_policy",
@@ -139,10 +171,12 @@ def ask_next_commands(
             {
                 "purpose": "target_top_files",
                 "command": (
-                    "find .private/<large-subtree> -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null "
-                    "| sort -nr | head -n 40"
+                    "find <selected-large-subtree-path> -xdev -type f -printf '%s\\t%p\\n' 2>/dev/null "
+                    f"| {_BOUNDED_TOP_N_FILTER}"
                 ),
-                "inspect_next": "top 40 files inside the one selected subtree; do not enumerate the whole repo",
+                "inspect_next": (
+                    "read-only-safe top 40 files inside the one selected subtree; do not enumerate the whole repo"
+                ),
             },
             {
                 "purpose": "named_handle_policy_join",

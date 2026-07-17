@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 import shlex
 
-from .agent_command_cookbook import agent_question_cookbook, ask_next_commands
+from .agent_command_cookbook import STORAGE_ROOT_INVENTORY_COMMAND, agent_question_cookbook, ask_next_commands
 from .command_resolution import resolve_command
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
@@ -309,10 +309,10 @@ STORAGE_RETENTION_FORENSICS_ROUTE = AskRoute(
         "evidence starts with disk layout and committed repo artifact joins, not "
         "recent conversation transcript echoes."
     ),
-    first_command_template="du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40",
+    first_command_template=STORAGE_ROOT_INVENTORY_COMMAND,
     read_specialization="references/storage-retention.md",
     inspect_after=(
-        "filesystem_inventory: bounded local size inventory (depth 2, top 40), then a top-40 file inventory for a named large subtree",
+        "filesystem_inventory: bounded checkout-local and parent-retained size inventory (depth 2, top 40), then a read-only-safe top-40 file inventory for a named large subtree",
         "generic_retention_policy: read the retention gate, reviewed ledger, state-file policy, and latest authorized outcome in one bounded command",
         "named_handle_policy_join: only if the generic policy leaves one selected inventory handle unclassified",
         "artifact_join: use fixed-string target handles and hard output caps to map a named subtree to tasks, reports, reviews, scripts, tests, and codex/state/pipeline-state.md",

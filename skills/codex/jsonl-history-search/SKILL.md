@@ -193,8 +193,10 @@ installed-or-source `ask --execute` block above for these natural asks; the
 unsupported execution response prints the bounded route commands. For asks like "why is
 `.private` 23GB?", "what created these large private files?", "who uses them?",
 or "what must be retained for examples/tests/claims?", run `ask` first to get
-the route contract, then follow the local filesystem inventory and repo artifact
-join plan before any JSONL conversation mining. Run the emitted
+the route contract, then follow the labeled checkout-local/parent-retained
+filesystem inventory and repo artifact join plan before any JSONL conversation
+mining. The emitted top-N commands use bounded in-memory selection without
+external `sort` or writable temporary storage. Run the emitted
 `generic_retention_policy` command immediately after inventory. For generic
 location/lifetime questions, answer from that current chain and stop without
 serial historical report/task/state probing. This route is non-destructive:
@@ -346,7 +348,7 @@ installed-or-source block above first and use its selected command prefix.
 | "Gather the current coordinator context for the receiving agent: plans, handoff documents, TODO, pipeline state, active tasks, goals, guiding principles, learnings, and failure modes to watch." | Coordinator context/current-state package | `ask --execute`, then `references/coordinator-context.md` | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-coordinator-context.json --format text` |
 | "Why did this happen?" "Which conversation/task/review/commit explains this?" | Semantic debugging/provenance | `ask` then `references/semantic-debugging.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Is there evidence that X was discussed in this bounded/source scope?" "Did the searched scope contain X?" "Prove there is no evidence of X in this selected root." | Bounded no-evidence/searched-scope absence | helper auto-executes bounded no-evidence, then `references/no-evidence.md` only if a scope/cap field needs interpretation | `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"` |
-| "Why is `.private` 23GB?" "What created these large private files?" "Who uses them?" "What must be retained for examples/tests/claims?" | Storage-retention forensics | `ask --execute` then `references/storage-retention.md` | `du -x -d 2 -B1 .private 2>/dev/null \| sort -nr \| head -n 40` |
+| "Why is `.private` 23GB?" "What created these large private files?" "Who uses them?" "What must be retained for examples/tests/claims?" | Storage-retention forensics | `ask --execute` then `references/storage-retention.md` | Run the emitted labeled checkout-local/parent-retained bounded inventory. |
 | "Are you sure you got everything?" "Did the task file include X?" "Did you save this whole thread as evidence?" "What changed in the files you just created?" | Local artifact verification | local files/git first | `git status --short`, then `git diff`/`git show` and targeted `sed`/`rg` against named files |
 | Default misses, weak/no evidence, or the agent keeps searching | Retrieval escalation | `references/retrieval-escalation.md` | Retry the same command with `--retrieval-mode fielded-bm25`; reserve `rrf-fusion` for high-recall hard cases. |
 | "Which plan is current?" "Is this still what we're doing?" "Which TODO matters?" "Is ticket ABC-42 still current?" "Why are there multiple next-task files?" | Artifact/currentness | `ask` then `references/status-currentness.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
@@ -367,7 +369,7 @@ installed-or-source block above first and use its selected command prefix.
 - "turn the early coordinator experiment into a devlog segment" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text`; open `target_historical_source_window_reads` before current/adjacent diagnostics, then use `failure_analysis.devlog_brief` and safe repo-phase/category evidence.
 - "gather the current coordinator context for the receiving agent: plans, handoff documents, TODO, pipeline state, active tasks, goals, guiding principles, learnings, and failure modes to watch" -> `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-coordinator-context.json --format text`; open `required_next_reads` before answering or handing work to another agent.
 - "is there evidence that X was discussed in this bounded source scope?" -> `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`; the helper auto-executes only bounded no-evidence and, if promoted, you can answer from the scoped no-evidence contract without a manual rerun/read-more.
-- "why is .private 23GB?" -> use the installed-or-source `ask --execute` block, then `references/storage-retention.md`; run `du -x -d 2 -B1 .private 2>/dev/null | sort -nr | head -n 40`, then the emitted `generic_retention_policy` command. Stop there for generic location/lifetime policy; use named-handle joins only for an unclassified selected handle. Never use uncapped recursive `rg`, `rg --files -uu`, or a broad repo dump for this route; use JSONL only for unresolved named creator/history gaps.
+- "why is .private 23GB?" -> use the installed-or-source `ask --execute` block, then `references/storage-retention.md`; run the emitted labeled checkout-local/parent-retained inventory, then the emitted `generic_retention_policy` command. The inventory and selected-subtree top-N commands use bounded Python `heapq`, not external `sort` or writable temporary storage. Stop there for generic location/lifetime policy; use named-handle joins only for an unclassified selected handle. Never use uncapped recursive `rg`, `rg --files -uu`, or a broad repo dump for this route; use JSONL only for unresolved named creator/history gaps.
 - "which plan is current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "which TODO actually matters?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
 - "is ticket ABC-42 still current?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/status-currentness.md`
@@ -417,7 +419,9 @@ installed-or-source block above first and use its selected command prefix.
   branch ref pruning.
 - For storage-retention forensics, use `ask` to select the
   `storage_retention_forensics` route, then start with non-destructive
-  filesystem inventory and artifact joins. Do not run cleanup, deletion,
+  labeled checkout-local/parent-retained filesystem inventory and artifact
+  joins. Use the bounded in-memory top-N commands; do not introduce an external
+  `sort` or temporary-file dependency. Do not run cleanup, deletion,
   archive, move, VHDX compaction, or branch-pruning commands from this route.
   JSONL conversation history is only a targeted follow-up for a specific
   unresolved creator/history gap, with caps and searched-scope caveats.
