@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, or worktree cleanup causality; named local task-file checks stay local-first. Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. Trigger even when the user says convo; `convo` is a memorable alias for the canonical jsonl-history-search tool. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For installed global-skill workflows, run validate-install before ask-first routing.
+description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, or worktree cleanup causality; named local task-file checks stay local-first. Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. User wording that says convo also triggers this skill, but it does not select an executable command. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For natural history prompts, run the installed-or-source resolution block before any console command or installed validation.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
@@ -22,11 +22,6 @@ chronology, source provenance, action proof, a remembered instruction, or
 worktree cleanup causality. A named local task-file check is also anchored, but
 inspect that local artifact first and use JSONL only if its history or source
 coverage is missing or disputed.
-
-The skill name and canonical command remain `jsonl-history-search`. `convo` is
-a memorable alias/trigger for the same tool, not a separate product; when the
-Python package is installed, `convo --help` reaches the same CLI surface as
-`jsonl-history-search --help`.
 
 This skill is a router. Apply the activation gate above before loading routes.
 For natural user questions that
@@ -97,6 +92,20 @@ Run the source front door directly:
 ```bash
 PYTHONPATH=src python3 -m jsonl_history_search.cli ask "<user wording>" --cwd "$PWD" --format text
 ```
+
+The skill name and canonical installed command remain `jsonl-history-search`.
+Only after the installed branch above is selected, treat `convo` as the
+installed package alias/trigger for the same tool, not a separate product. Its
+optional helper validation is also availability-gated:
+
+```bash
+if command -v convo >/dev/null 2>&1; then
+  convo --help
+fi
+```
+
+Do not run `convo`, `convo --help`, or a bare canonical console command before
+the installed-or-source block selects an executable mode.
 
 The bundled `jsonl_ask_first.py` also prepends the current checkout's `src`
 directory when that package source exists. This is source-mode recovery, not
@@ -282,13 +291,17 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 
 ## Route Table
 
+The canonical console spellings below are installed-mode route templates, not
+first-move availability probes. For every natural prompt, run the
+installed-or-source block above first and use its selected command prefix.
+
 | User ask shape | Route | Read | First command |
 | --- | --- | --- | --- |
 | "What happened?" with no message, history, thread, time-window, or artifact anchor | Non-history clarification | none | No tool call; ask which event or change the user means. |
 | "What did I tell you before?" "Find my previous instruction/preference/feedback." | Remembered instruction/preference | `references/remembered-instruction.md` | `jsonl-history-search semantic-debug "what did I tell you before about <topic>" --cwd "$PWD" --format text` |
 | "Why did I say X?" "Why did I mention X?" "What was I talking about with X?" | Remembered topic/provenance | `ask` then `references/remembered-topic.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "What did I just say?" "Find my last message." "Recent messages." | Latest user wording | no route-reference read | `jsonl-history-search latest-user-messages --format json --max-matches 10` |
-| "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask`; no route-reference read | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
+| "Since my last message." "What happened while I was away?" "What changed after I told you to keep working?" | Status anchor/value summary | `ask`; no route-reference read | Run the installed-or-source block above with the exact user wording, then run its printed `what-happened-since` command. |
 | "Did the agent actually run/edit/test/review X?" "Did it overwrite those edits?" | Action-proof/source inspection | `ask` then `references/action-proof.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Did the agent use/read/follow the reviewer/product-fsm skill?" "Was a named skill missed or misapplied?" | Named skill compliance | `ask` then `references/skill-audit.md` | `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text` |
 | "Turn the early coordinator experiment into a devlog segment." "Reconstruct the arc with dates and concrete examples of Docker/runner/harness/auth/live-send/workflow drift." | Devlog/failure-analysis historical source reach | `ask --execute`, then `references/semantic-debugging.md` if a source-field needs interpretation | `jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --report-output .private/jsonl/ask-execute-devlog-source-reach.json --format text` |
@@ -308,7 +321,7 @@ broad-artifact/prompt-echo failure mode this skill is meant to prevent.
 
 - "what did I tell you before about release readiness?" -> `references/remembered-instruction.md`
 - "why did I mention the router?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/remembered-topic.md`
-- "what happened since my last message?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then run the printed `what-happened-since` command directly; do not read or search for a route reference. If it reports no selected anchor and no required primary refs, fail closed and ask for the prior message wording or timestamp.
+- "what happened since my last message?" -> run the installed-or-source block above with the exact user wording as the first product command, then run the printed `what-happened-since` command directly; do not read or search for a route reference. If it reports no selected anchor and no required primary refs, fail closed and ask for the prior message wording or timestamp.
 - "what happened?" with no explicit anchor -> no tool call; ask which event or change the user means
 - "are you sure you got everything?" after just creating task/evidence files -> `git status --short`, then inspect `git diff`/named files before JSONL
 - "did the agent overwrite those edits?" -> `jsonl-history-search ask "<user wording>" --cwd "$PWD" --format text`, then `references/action-proof.md`
