@@ -2166,7 +2166,7 @@ def _looks_like_explicit_named_local_task_artifact_query(normalized: str) -> boo
 
 
 _EXPLICIT_TASK_PATH_RE = re.compile(
-    r"(?:^|\s)(?:\./)?tasks/[a-z0-9._/-]+\.md\b"
+    r"(?<![a-z0-9._/-])(?:\./)?tasks/[a-z0-9._/-]+\.md\b"
 )
 
 
