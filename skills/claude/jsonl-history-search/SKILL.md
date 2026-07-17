@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, worktree cleanup causality, or questions about where retained source sessions/private evidence are stored and how long they are kept. Explicit history/provenance/prior-conversation/source-proof wording overrides task-path local-first handling and must run the installed-or-source `ask` resolver before task/Git reads; only genuine local file, artifact, workspace, checkout, or task status/currentness checks, including a named local task-file, stay local-first. Use JSONL for AI conversation mining across local Codex and Claude logs when the user asks to find prior things they said, debug past agent behavior, audit prior work, recover conversation history, resolve stale/current artifacts, or build semantic-debugging evidence. User wording that says convo also triggers this skill, but it does not select an executable command. Trigger even when the user does not name JSONL if the request depends on prior AI conversation history. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For natural history or storage-retention prompts, run the installed-or-source resolution block before any console command or installed validation.
+description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, worktree cleanup causality, or questions about where retained source sessions/private evidence are stored and how long they are kept. For every prompt containing an explicit `tasks/...md` path or named local task-file, declare the evidence source rather than inferring it from nouns or word order: use `ask --evidence-source local` for current checkout/Git/task evidence, use `ask --evidence-source conversation-history` for prior conversation/JSONL evidence, and ask one zero-tool clarification when the user's intended source is unresolved. Use JSONL for AI conversation mining across local Codex and Claude logs when the request depends on prior AI conversation history. User wording that says convo also triggers this skill, but it does not select an executable command. When this skill is triggered, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For natural history or storage-retention prompts, run the installed-or-source resolution block before any console command or installed validation.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
@@ -19,27 +19,28 @@ from the current checkout.
 Activate JSONL when the user supplies an explicit history/source anchor, such
 as `what happened since my last message?`, `what happened at X?`, a devlog
 chronology, source provenance, action proof, a remembered instruction, or
-worktree cleanup causality. Also activate the storage-retention route for
-questions about where retained source sessions/private evidence are stored or
-how long they are kept. Explicit history/provenance intent takes precedence
-over the presence of a task path: wording such as `history`, `provenance`,
-`source session`, `merge proof`, `previously decided`, `prior conversation`, or
-`source proof` must run the installed-or-source `ask` resolver before any local
-task, report, state, or Git read. This includes questions such as `which source
-session and merge prove the work in \`tasks/example.md\`?` and `what did we
-previously decide about "tasks/example.md"?`.
+worktree cleanup causality. A named local task-file uses the typed handshake
+below. Also activate the
+storage-retention route for retained source-session/private-evidence questions.
 
-A named task path is local-first only when the question is genuinely about the
-local artifact's status or currentness, for example `what happened with
-tasks/example.md?` or `is tasks/example.md merged/current?`, without explicit
-history, provenance, prior-conversation, or source-proof intent. In that case,
-inspect current Git and the local artifact first and use JSONL only if history
-or source coverage is explicitly missing or disputed. Do not treat the mere
-presence of `tasks/...` as a reason to bypass `ask`.
-The named local task-file case is one example, not a limit: explicit current
-local file, artifact, workspace, repository, or checkout status/currentness
-wording also stays local-first unless the user explicitly asks for history,
-prior conversation, provenance, or source proof.
+For every prompt containing an explicit `tasks/...md` path, make a typed
+evidence-source decision before running any resolver or evidence command:
+
+- Declare `local` when the user asks about the current checkout, Git ancestry,
+  branch reachability, merge/currentness, or contents/status of the named task
+  or review artifact.
+- Declare `conversation-history` when the user explicitly asks for prior AI
+  conversation, JSONL records, what the user or agent previously said, or raw
+  source-session/tool-event evidence.
+- When the intended evidence source is unresolved, ask whether the user wants
+  local Git/task evidence or conversation-history evidence. Use zero tools: no
+  `ask`, Git, JSONL, repo search, TODO/task/state scan, or filesystem read.
+
+Do not infer named-task evidence scope from source nouns, relation verbs, word
+order, or neighboring component tokens. A component name may contain words
+associated with history or proof while the request still asks for local Git;
+local-status wording also cannot override a declared history request. The
+explicit declaration owns this boundary.
 
 This skill is a router. Apply the activation gate above before loading routes.
 For natural user questions that
@@ -56,9 +57,9 @@ as a targeted backstop for disputed source-window coverage.
 Do not trigger this skill for the bare prompt `what happened?` or an equivalent
 ambiguous event question with no history anchor. Ask one short clarification
 question without using a tool, Git, repo scans, TODO/task/state recovery, or
-filesystem inspection. For local artifact/task-file status prompts such as
-`what happened with this task file?`, inspect the named local artifact first
-only when none of the explicit history/provenance intents above is present.
+filesystem inspection. For a prompt that names an explicit `tasks/...md` path,
+use the declaration handshake above. Prompts that mention a task without an
+explicit path continue through the ordinary router.
 
 For a named local task status/currentness question, reconcile current Git
 before interpreting status prose. Inspect branch or detached state and the
@@ -85,11 +86,29 @@ implementation surfaces, not the product itself.
 
 ## Natural Prompt First Move
 
-Before local task/Git inspection, run the installed-or-source block below for
-any explicit history/provenance/source-session/merge-proof/previous-decision/
-prior-conversation/source-proof question, even when its target is a quoted,
-backticked, or plain task path. The local-first task-status exception does not
-override these explicit intents.
+For a resolved named-task request, put the declaration in the first resolver
+command. Use route-only `ask` for `local`; use `ask --execute` for
+`conversation-history` so JSONL is the first domain route. Preserve the user's
+wording as one quoted argument.
+
+```bash
+if command -v jsonl-history-search >/dev/null 2>&1; then
+  jsonl-history-search ask "<user wording>" --evidence-source local --cwd "$PWD" --format text
+elif [ -f src/jsonl_history_search/cli.py ]; then
+  PYTHONPATH=src python3 -m jsonl_history_search.cli ask "<user wording>" --evidence-source local --cwd "$PWD" --format text
+else
+  printf '%s\n' 'jsonl-history-search is not on PATH and src/jsonl_history_search/cli.py is unavailable in this cwd' >&2
+  exit 127
+fi
+```
+
+For a declared conversation-history request, use the matching installed or
+source-mode line:
+
+```bash
+jsonl-history-search ask --execute "<user wording>" --evidence-source conversation-history --cwd "$PWD" --format text
+PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --evidence-source conversation-history --cwd "$PWD" --format text
+```
 
 For natural history/status/action/currentness/wrap-up prompts, use this single
 installed-or-source command-resolution block as the first shell move. It keeps

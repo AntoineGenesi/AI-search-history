@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import shlex
+from typing import Literal
 
 from .agent_command_cookbook import (
     STORAGE_ROOT_INVENTORY_COMMAND,
@@ -37,9 +38,15 @@ EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentnes
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
 LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
+NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY = "named_task_evidence_source_required"
 NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
-    {NON_HISTORY_CLARIFICATION_ROUTE_FAMILY, LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY}
+    {
+        NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
+        LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
+        NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+    }
 )
+EvidenceSource = Literal["local", "conversation-history"]
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,56 @@ LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
         "git merge-base --is-ancestor, git diff, git show, and sed/rg against named "
         "files. JSONL is a targeted backstop only for "
         "conversation/source-window coverage gaps."
+    ),
+)
+
+NAMED_TASK_CONVERSATION_HISTORY_ROUTE = AskRoute(
+    route_family="semantic_debug",
+    chosen_route="named-task-conversation-history / semantic-debug",
+    why_it_applies=(
+        "The caller declared conversation-history as the evidence source for "
+        "this named task. Use JSONL semantic debugging before local task, Git, "
+        "review, TODO, or state evidence."
+    ),
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.source_locator_handoff primary raw/session/tool source refs",
+        "top primary source refs opened with read-more before local task/review/Git evidence",
+        "local task, review, branch, commit, TODO, or state evidence only as secondary context",
+    ),
+    stop_guidance=(
+        "Open and use the promoted primary JSONL source refs before consulting "
+        "local task, review, branch, commit, TODO, or state evidence. Preserve "
+        "the declared conversation-history scope even when the prompt also uses "
+        "local-status words."
+    ),
+    manual_search_guidance=(
+        "Use targeted local evidence only after primary conversation-history "
+        "refs have been opened, and only for a named remaining secondary facet."
+    ),
+)
+
+NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE = AskRoute(
+    route_family=NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+    chosen_route="named-task evidence-source clarification",
+    why_it_applies=(
+        "The prompt names an explicit tasks/...md target but does not declare "
+        "whether the requested evidence is local or conversation history."
+    ),
+    first_command_template=(
+        "No tool call; ask whether the named task should be checked from local "
+        "Git/task evidence or conversation history."
+    ),
+    read_specialization="none",
+    inspect_after=(),
+    stop_guidance=(
+        "Ask one short clarification. After the user answers, rerun ask with "
+        "--evidence-source local or --evidence-source conversation-history. "
+        "Do not run Git, JSONL, repo search, TODO/task/state scans, or filesystem inspection first."
+    ),
+    manual_search_guidance=(
+        "There is no search step until the evidence source is declared."
     ),
 )
 
@@ -726,14 +783,24 @@ ROUTES: tuple[AskRoute, ...] = (
 )
 
 
-def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
-    route = classify_ask_route(query)
+def build_ask_router_payload(
+    query: str,
+    cwd: str = ".",
+    *,
+    evidence_source: EvidenceSource | None = None,
+) -> dict:
+    route = classify_ask_route(query, evidence_source=evidence_source)
+    named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(query)
     if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
         if route.route_family == LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY:
             resolution_guidance = (
                 "No JSONL command resolution is needed for this local-artifact route; "
                 "use its local/Git commands."
+            )
+        elif route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY:
+            resolution_guidance = (
+                "No command resolution is allowed until the named-task evidence source is declared."
             )
         else:
             resolution_guidance = "No JSONL command resolution is needed for this no-tool route."
@@ -753,7 +820,10 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
     first_command = route.first_command(query, cli=cli_prefix)
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
         first_action_category = "filesystem_inventory"
-    elif route.route_family == NON_HISTORY_CLARIFICATION_ROUTE_FAMILY:
+    elif route.route_family in {
+        NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
+        NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+    }:
         first_action_category = "no_tool"
     else:
         first_action_category = "route_command"
@@ -798,6 +868,8 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "status": "matched",
             "query": query,
             "cwd": cwd,
+            "evidence_source": evidence_source,
+            "evidence_source_applies": named_task_target,
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
             "first_action_category": first_action_category,
@@ -805,11 +877,15 @@ def build_ask_router_payload(query: str, cwd: str = ".") -> dict:
             "structured_execution_query": structured_execution_query,
             "command_resolution": command_resolution_payload,
             "first_command": first_command,
-            "next_commands": ask_next_commands(
-                selected_first_command=first_command,
-                route_family=route.route_family,
-                cli_prefix=cli_prefix,
-                query=query,
+            "next_commands": (
+                []
+                if route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY
+                else ask_next_commands(
+                    selected_first_command=first_command,
+                    route_family=route.route_family,
+                    cli_prefix=cli_prefix,
+                    query=query,
+                )
             ),
             "answer_ready_handoff": answer_ready_handoff,
             "optional_deeper_reads": optional_deeper_reads,
@@ -848,8 +924,19 @@ def execution_kind_for_route_family(route_family: str) -> str | None:
     return None
 
 
-def classify_ask_route(query: str) -> AskRoute:
+def classify_ask_route(
+    query: str,
+    *,
+    evidence_source: EvidenceSource | None = None,
+) -> AskRoute:
     normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
+
+    if _EXPLICIT_TASK_PATH_RE.search(normalized):
+        if evidence_source == "local":
+            return LOCAL_ARTIFACT_VERIFICATION_ROUTE
+        if evidence_source == "conversation-history":
+            return NAMED_TASK_CONVERSATION_HISTORY_ROUTE
+        return NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE
 
     if _looks_like_skill_compliance_query(normalized):
         return ROUTES[0]
@@ -2297,6 +2384,10 @@ def _looks_like_explicit_named_local_task_artifact_query(normalized: str) -> boo
 _EXPLICIT_TASK_PATH_RE = re.compile(
     r"(?<![a-z0-9._/-])(?:\./)?tasks/[a-z0-9._/-]+\.md\b"
 )
+
+
+def _has_explicit_task_path(query: str) -> bool:
+    return bool(_EXPLICIT_TASK_PATH_RE.search(query.lower()))
 
 
 def _replace_explicit_task_paths_with_identifiers(normalized: str) -> str:
