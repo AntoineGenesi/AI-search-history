@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import shlex
 
 from .agent_command_cookbook import agent_question_cookbook, ask_next_commands
 from .command_resolution import resolve_command
@@ -53,9 +54,12 @@ class AskRoute:
 
     def first_command(self, query: str, *, cli: str = "jsonl-history-search") -> str:
         command_query = self.command_query(query)
-        escaped = command_query.replace('"', '\\"')
         skill = _skill_name_from_query(query)
-        return self.first_command_template.format(query=escaped, skill=skill, cli=cli)
+        return self.first_command_template.format(
+            query=shlex.quote(command_query),
+            skill=shlex.quote(skill),
+            cli=cli,
+        )
 
 
 LOCAL_ARTIFACT_VERIFICATION_ROUTE = AskRoute(
@@ -129,7 +133,7 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "instead of becoming a generic semantic-debug question."
     ),
     first_command_template=(
-        '{cli} ask --execute "{query}" --cwd "$PWD" '
+        '{cli} ask --execute {query} --cwd "$PWD" '
         "--report-output .private/jsonl/ask-execute-no-evidence-report.json --format text"
     ),
     read_specialization="references/no-evidence.md",
@@ -164,7 +168,7 @@ TASK_REVIEW_COMMIT_PROVENANCE_ROUTE = AskRoute(
         "Use semantic-debug provenance/source refs before artifact-currentness or "
         "repo status anchoring."
     ),
-    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.source_locator_handoff.next_reads",
@@ -199,7 +203,7 @@ DEVLOG_FAILURE_ANALYSIS_ROUTE = AskRoute(
         "before current/adjacent diagnostics."
     ),
     first_command_template=(
-        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute {query} --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-devlog-source-reach.json"
     ),
     read_specialization="references/semantic-debugging.md",
@@ -239,7 +243,7 @@ COORDINATOR_CONTEXT_ROUTE = AskRoute(
         "before generic semantic-wrapup complaint mining."
     ),
     first_command_template=(
-        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute {query} --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-coordinator-context.json"
     ),
     read_specialization="references/coordinator-context.md",
@@ -273,7 +277,7 @@ ACTIVE_STATUS_FRONT_DOOR_ROUTE = AskRoute(
         "raw conversation chronology or semantic-debug diagnostics."
     ),
     first_command_template=(
-        '{cli} ask --execute "{query}" --cwd "$PWD" --format text '
+        '{cli} ask --execute {query} --cwd "$PWD" --format text '
         "--report-output .private/jsonl/ask-execute-active-status-front-door.json"
     ),
     read_specialization="references/coordinator-context.md",
@@ -341,7 +345,7 @@ EXPECTATION_MISMATCH_ROUTE = AskRoute(
         "semantic-debug so expectation evidence, observed/action-proof "
         "evidence, and the divergence point are inspected before diagnostics."
     ),
-    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.expectation_mismatch_plan.expected_behavior_evidence",
@@ -372,7 +376,7 @@ REMEMBERED_USER_WORDING_ROUTE = AskRoute(
         "semantic-debug so source refs prove user-authored wording instead "
         "of assistant, tool, environment, task, report, or prompt echoes."
     ),
-    first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --role user --format text',
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --role user --format text',
     read_specialization="references/semantic-debugging.md",
     inspect_after=(
         "semantic_debug.question_family / query_plan detected_intents includes when_user_said",
@@ -435,7 +439,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "followed, skipped, or misapplied, so route to the focused skill "
             "audit/check surface instead of semantic-wrapup frustration mining."
         ),
-        first_command_template='{cli} skill-check "{skill}" --cwd "$PWD" --format text',
+        first_command_template='{cli} skill-check {skill} --cwd "$PWD" --format text',
         read_specialization="references/skill-audit.md",
         inspect_after=(
             "skill_audit.usage_instances",
@@ -463,7 +467,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "or source-window-only boundary, so route directly to semantic-debug "
             "source refs before artifact currentness or broad repo search."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.answer_ready_handoff.primary_source_followthrough",
@@ -492,7 +496,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "action, so the first evidence should be tool/action proof from "
             "conversation logs."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/action-proof.md",
         inspect_after=(
             "semantic_debug.source_window_action_proof",
@@ -517,7 +521,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "Route to semantic-debug so raw session timing and behavior-change "
             "evidence are primary."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.question_family.primary == process_actual_use",
@@ -548,7 +552,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "Use semantic-debug source refs rather than status anchoring to the "
             "current run."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff.next_reads",
@@ -575,7 +579,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "recent anchor, or across an explicit task status/handoff window, "
             "so use the status-anchor route before repo recovery."
         ),
-        first_command_template='{cli} what-happened-since "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} what-happened-since {query} --cwd "$PWD" --format text',
         read_specialization="none; latest-status guidance is self-contained in the status command output",
         inspect_after=(
             "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
@@ -608,7 +612,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks why a topic was mentioned, which is provenance for "
             "a remembered topic rather than a currentness decision."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/remembered-topic.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff",
@@ -633,7 +637,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "artifact-currentness should inspect operational cleanup records, "
             "worktree state, and private-artifact preservation first."
         ),
-        first_command_template='{cli} artifact-currentness "{query}" --cwd "$PWD" --format markdown',
+        first_command_template='{cli} artifact-currentness {query} --cwd "$PWD" --format markdown',
         read_specialization="references/status-currentness.md",
         inspect_after=(
             "artifact_currentness.worktree_currentness.cleanup_causality.operational_records and debt_status",
@@ -659,7 +663,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks which TODO/plan/ticket/artifact matters or is current, so "
             "the currentness route should resolve stale versus active evidence and treat status fields as claims."
         ),
-        first_command_template='{cli} artifact-currentness "{query}" --cwd "$PWD" --format markdown',
+        first_command_template='{cli} artifact-currentness {query} --cwd "$PWD" --format markdown',
         read_specialization="references/status-currentness.md",
         inspect_after=(
             "artifact_currentness.currentness_verdict",
@@ -682,7 +686,7 @@ ROUTES: tuple[AskRoute, ...] = (
             "The wording asks for repeated complaints, recurring failure modes, "
             "or user corrections, so use the semantic wrap-up failure-mining route."
         ),
-        first_command_template='{cli} semantic-wrapup "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-wrapup {query} --cwd "$PWD" --format text',
         read_specialization="references/semantic-wrapup.md",
         inspect_after=(
             "semantic_wrapup.failure_modes",
@@ -889,7 +893,7 @@ def classify_ask_route(query: str) -> AskRoute:
             "The wording looks like a natural conversation-history or provenance "
             "question, but it did not match a narrower front-door route."
         ),
-        first_command_template='{cli} semantic-debug "{query}" --cwd "$PWD" --format text',
+        first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
         read_specialization="references/semantic-debugging.md",
         inspect_after=(
             "semantic_debug.source_locator_handoff primary raw/session/tool source refs from the first semantic-debug run",
