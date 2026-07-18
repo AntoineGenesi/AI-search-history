@@ -805,7 +805,8 @@ def _select_anchor_with_boundary(
                 **base,
                 "context_boundary": "explicit_parent_thread_side_boundary",
                 "anchor_scope": "parent_thread",
-                "anchor_reason": "raw_side_session_parent_thread_id_matched_parent_history_session",
+                "anchor_reason": interval.get("anchor_reason")
+                or "raw_side_session_parent_thread_id_matched_parent_history_session",
                 "anchor_ref": selected.get("source_ref"),
                 "status_ref": (interval_boundary or {}).get("source_ref"),
                 "status_as_of_boundary": interval_boundary,
@@ -1606,6 +1607,9 @@ def _canonical_parent_main_status_interval(
         rows,
         boundary,
         required_parent_thread_id_hash=lineage.get("parent_thread_id_hash") if require_side_parent_boundary else None,
+        required_parent_session_identifier=(
+            lineage.get("selected_session_identifier") if require_side_parent_boundary else None
+        ),
     )
     if lineage.get("status") in {"selected", "ambiguous"}:
         anchor_candidates = _apply_lineage_resolution_to_candidates(anchor_candidates, lineage)
@@ -1620,13 +1624,13 @@ def _canonical_parent_main_status_interval(
         "status": "selected",
         "kind": "canonical_parent_main_status_interval",
         "reason": (
-            "structural_parent_thread_lineage_anchor_selected"
+            (lineage.get("reason") or "structural_parent_thread_lineage_anchor_selected")
             if lineage.get("status") == "selected"
             else "nearest_preceding_different_thread_canonical_history_human_row_found"
         ),
         "context_boundary": "explicit_parent_main_canonical_status_interval",
         "anchor_reason": (
-            "parent_thread_lineage_anchor"
+            (lineage.get("reason") or "parent_thread_lineage_anchor")
             if lineage.get("status") == "selected"
             else "canonical_parent_main_status_interval"
         ),
@@ -1666,6 +1670,7 @@ def _canonical_parent_main_anchor_candidates(
     *,
     limit: int = 8,
     required_parent_thread_id_hash: str | None = None,
+    required_parent_session_identifier: str | None = None,
 ) -> list[dict]:
     boundary_line = int(boundary.get("line") or 0)
     boundary_threads = set(boundary.get("thread_keys") or [])
@@ -1678,6 +1683,8 @@ def _canonical_parent_main_anchor_candidates(
         if required_parent_thread_id_hash and row.get("source_identifier") != (
             f"history-session-{required_parent_thread_id_hash}"
         ):
+            continue
+        if required_parent_session_identifier and row.get("source_identifier") != required_parent_session_identifier:
             continue
         if _thread_key_overlap(row, boundary_threads):
             continue
@@ -1703,25 +1710,26 @@ def _parent_thread_side_boundary_resolution(
         return {"status": "ambiguous", "reason": "missing_codex_home_for_side_boundary_proof"}
     boundary_lineage = _lineage_for_anchor(boundary, codex_home=codex_home, cwd=cwd)
     if boundary_lineage.get("status") != "ok":
-        return {
-            "status": "ambiguous",
-            "contract": "parent_thread_side_boundary",
-            "reason": "raw_side_session_metadata_not_found",
-            "boundary_source_ref": boundary.get("source_ref"),
-        }
+        return _recover_parent_thread_side_boundary_without_direct_edge(
+            rows=rows,
+            boundary=boundary,
+            cwd=cwd,
+            codex_home=codex_home,
+            side_lineage=boundary_lineage,
+        )
     parent_thread_id_hash = boundary_lineage.get("parent_thread_id_hash")
     boundary_thread_hashes = {
         boundary_lineage.get("session_id_hash"),
         boundary_lineage.get("raw_thread_id_hash"),
     } - {None}
     if not parent_thread_id_hash or parent_thread_id_hash in boundary_thread_hashes:
-        return {
-            "status": "ambiguous",
-            "contract": "parent_thread_side_boundary",
-            "reason": "raw_side_session_has_no_distinct_parent_thread_id",
-            "boundary_source_ref": boundary.get("source_ref"),
-            "side_lineage": boundary_lineage,
-        }
+        return _recover_parent_thread_side_boundary_without_direct_edge(
+            rows=rows,
+            boundary=boundary,
+            cwd=cwd,
+            codex_home=codex_home,
+            side_lineage=boundary_lineage,
+        )
     if boundary_lineage.get("cwd_relation") == "unrelated" and boundary_lineage.get("workspace_relation") == "unrelated":
         return {
             "status": "ambiguous",
@@ -1791,6 +1799,161 @@ def _parent_thread_side_boundary_resolution(
         "side_lineage": boundary_lineage,
         "parent_thread_id_hash": parent_thread_id_hash,
         "rejected_anchor_alternatives": rejected[:8],
+    }
+
+
+def _recover_parent_thread_side_boundary_without_direct_edge(
+    *,
+    rows: list[dict],
+    boundary: dict,
+    cwd: Path,
+    codex_home: Path,
+    side_lineage: dict,
+) -> dict:
+    boundary_line = int(boundary.get("line") or 0)
+    boundary_identifier = str(boundary.get("source_identifier") or "")
+    if (
+        not boundary_line
+        or boundary.get("source_kind") != "codex_history"
+        or not _requires_raw_parent_thread_boundary(str(boundary.get("snippet") or ""))
+        or not is_status_question(str(boundary.get("snippet") or ""))
+    ):
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "canonical_side_thread_ask_not_proven_for_no_edge_recovery",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+        }
+
+    prior_rows = sorted(
+        (row for row in rows if int(row.get("line") or 0) < boundary_line),
+        key=lambda row: (str(row.get("timestamp_utc") or ""), int(row.get("line") or 0)),
+        reverse=True,
+    )
+    side_session_identifiers = {
+        str(row.get("source_identifier") or "")
+        for row in prior_rows
+        if is_status_question(str(row.get("snippet") or ""))
+        and _requires_raw_parent_thread_boundary(str(row.get("snippet") or ""))
+    } - {""}
+
+    eligible_sessions = []
+    rejected = []
+    inspected_sessions: set[str] = set()
+    latest_eligible_timestamp: str | None = None
+    for candidate in prior_rows:
+        candidate_timestamp = str(candidate.get("timestamp_utc") or "")
+        if latest_eligible_timestamp is not None and candidate_timestamp < latest_eligible_timestamp:
+            break
+        identifier = str(candidate.get("source_identifier") or "")
+        if (
+            not identifier
+            or identifier == boundary_identifier
+            or identifier in inspected_sessions
+            or _is_never_anchor(candidate)
+            or not _is_eligible_anchor(candidate)
+        ):
+            continue
+        inspected_sessions.add(identifier)
+        if identifier in side_session_identifiers:
+            rejected.append(
+                _lineage_rejected_anchor(
+                    candidate,
+                    {"status": "canonical_side_thread_status_session"},
+                    "prior_side_thread_status_session_not_parent_main",
+                )
+            )
+            continue
+        lineage = _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        if lineage.get("status") != "ok":
+            rejected.append(
+                _lineage_rejected_anchor(candidate, lineage, "candidate_session_metadata_not_found")
+            )
+            continue
+        rejection = _parent_thread_lineage_rejection_reason(lineage)
+        if rejection:
+            rejected.append(_lineage_rejected_anchor(candidate, lineage, rejection))
+            continue
+        selected = dict(candidate)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["side_parent_boundary_anchor"] = True
+        selected["deterministic_parent_session_recovery_anchor"] = True
+        selected["lineage_resolution"] = lineage
+        selected["rationale"] = (
+            str(selected.get("rationale") or "").rstrip()
+            + "; selected as the latest canonical human row in a raw user/root session compatible "
+            "with the requested workspace after side/status and unrelated sessions were rejected"
+        )
+        eligible_sessions.append(selected)
+        latest_eligible_timestamp = candidate_timestamp
+
+    if not eligible_sessions:
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "no_workspace_compatible_parent_session_candidate_without_direct_edge",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+            "rejected_anchor_alternatives": rejected[:8],
+        }
+
+    eligible_sessions.sort(
+        key=lambda candidate: (
+            str(candidate.get("timestamp_utc") or ""),
+            int(candidate.get("line") or 0),
+        ),
+        reverse=True,
+    )
+    latest_timestamp = str(eligible_sessions[0].get("timestamp_utc") or "")
+    latest_sessions = [
+        candidate
+        for candidate in eligible_sessions
+        if str(candidate.get("timestamp_utc") or "") == latest_timestamp
+    ]
+    if len(latest_sessions) != 1:
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "multiple_equally_latest_workspace_compatible_parent_sessions_without_direct_edge",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+            "eligible_parent_session_count": len(latest_sessions),
+            "rejected_anchor_alternatives": [
+                {
+                    **_lineage_rejected_anchor(
+                        candidate,
+                        candidate.get("lineage_resolution") or {},
+                        "equally_latest_parent_session_candidate",
+                    ),
+                    "decision": "ambiguous",
+                }
+                for candidate in latest_sessions[:8]
+            ]
+            + rejected[: max(0, 8 - len(latest_sessions))],
+        }
+
+    selected = latest_sessions[0]
+    selected_identifier = str(selected.get("source_identifier") or "")
+    return {
+        "status": "selected",
+        "contract": "parent_thread_side_boundary",
+        "reason": "unique_latest_workspace_compatible_parent_session_recovered_without_direct_edge",
+        "selection_mode": "canonical_history_session_chronology_recovery",
+        "boundary_source_ref": boundary.get("source_ref"),
+        "selected_anchor": selected,
+        "selected_anchor_ref": selected.get("source_ref"),
+        "selected_lineage": selected.get("lineage_resolution"),
+        "selected_session_identifier": selected_identifier,
+        "side_lineage": side_lineage,
+        "direct_parent_thread_id_available": False,
+        "eligible_parent_session_count": 1,
+        "rejected_anchor_alternatives": rejected[:8],
+        "selection_policy": (
+            "When the exact canonical parent-thread ask has no direct parent edge, select only the uniquely "
+            "latest eligible canonical human row whose raw session is a user/root session compatible with "
+            "--cwd/workspace roots; reject side/status, child/control, unrelated, and equally latest sessions."
+        ),
     }
 
 
@@ -3675,13 +3838,25 @@ def _literal_parent_thread_contract_anchor(canonical_parent_main_interval: dict)
     selected = canonical_parent_main_interval.get("selected_anchor") or {}
     selected_ref = str(selected.get("source_ref") or "")
     parent_thread_id_hash = str(side_boundary.get("parent_thread_id_hash") or "")
+    recovered_identifier = str(side_boundary.get("selected_session_identifier") or "")
+    recovered_without_edge = (
+        side_boundary.get("selection_mode") == "canonical_history_session_chronology_recovery"
+        and selected.get("deterministic_parent_session_recovery_anchor")
+        and recovered_identifier
+        and selected.get("source_identifier") == recovered_identifier
+    )
     if (
         side_boundary.get("status") != "selected"
         or not selected.get("side_parent_boundary_anchor")
         or not selected_ref
         or selected_ref != side_boundary.get("selected_anchor_ref")
-        or not parent_thread_id_hash
-        or selected.get("source_identifier") != f"history-session-{parent_thread_id_hash}"
+        or not (
+            recovered_without_edge
+            or (
+                parent_thread_id_hash
+                and selected.get("source_identifier") == f"history-session-{parent_thread_id_hash}"
+            )
+        )
     ):
         return None
     return selected
