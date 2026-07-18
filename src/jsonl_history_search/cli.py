@@ -7600,6 +7600,9 @@ def build_retained_source_read_payload(
 
     bytes_read = 0
     candidate_files_opened = 0
+    post_hoc_echo_records_rejected = 0
+    source_session_metadata_records_seen = 0
+    substantive_source_paths: set[str] = set()
     candidate_refs: list[dict] = []
     for path in candidates:
         remaining = limits["max_bytes"] - bytes_read
@@ -7619,26 +7622,50 @@ def build_retained_source_read_payload(
                 continue
             metadata, summary = record
             rel = _safe_relative_path(cwd, path)
-            candidate_refs.append(
-                {
-                    "kind": "jsonl_source_ref",
-                    "target": f"{rel}:{line_number}",
-                    "source_ref": {"path": rel, "line": line_number},
-                    "target_source_role": "source_session_proof",
-                    "final_support_allowed": True,
-                    "summary": summary,
-                    "record_metadata": metadata,
-                    "_retained_source_score": _retained_source_record_score(
-                        metadata=metadata,
-                        summary=summary,
-                        task_id=task_id,
-                    ),
-                }
-            )
+            ref = {
+                "kind": "jsonl_source_ref",
+                "target": f"{rel}:{line_number}",
+                "source_ref": {"path": rel, "line": line_number},
+                "target_source_role": "source_session_proof",
+                "final_support_allowed": True,
+                "summary": summary,
+                "record_metadata": metadata,
+                "_retained_source_score": _retained_source_record_score(
+                    metadata=metadata,
+                    summary=summary,
+                    task_id=task_id,
+                ),
+            }
+            opened_item = {
+                "status": "opened",
+                "target": ref["target"],
+                "path": rel,
+                "summary": summary,
+                "record_metadata": metadata,
+                "ref": ref,
+            }
+            if _named_task_source_session_post_hoc_echo_reason(opened_item) is not None:
+                post_hoc_echo_records_rejected += 1
+                continue
+            if metadata.get("conversation_label") == "source_session_metadata":
+                source_session_metadata_records_seen += 1
+                candidate_refs.append(ref)
+                continue
+            if not _opened_named_task_source_session_proof(opened_item):
+                continue
+            substantive_source_paths.add(rel)
+            candidate_refs.append(ref)
             if len(candidate_refs) >= 64:
                 break
         if len(candidate_refs) >= 64:
             break
+    candidate_refs = [
+        ref
+        for ref in candidate_refs
+        if str((ref.get("record_metadata") or {}).get("conversation_label") or "")
+        != "source_session_metadata"
+        or str((ref.get("source_ref") or {}).get("path") or "") in substantive_source_paths
+    ]
     candidate_refs.sort(
         key=lambda ref: (
             -int(ref.get("_retained_source_score") or 0),
@@ -7652,6 +7679,8 @@ def build_retained_source_read_payload(
         opened_refs.append(public)
     report["candidate_files_opened"] = candidate_files_opened
     report["bytes_read"] = bytes_read
+    report["post_hoc_echo_records_rejected"] = post_hoc_echo_records_rejected
+    report["source_session_metadata_records_seen"] = source_session_metadata_records_seen
     report["opened_refs"] = opened_refs
     if opened_refs:
         report["status"] = "opened_role_valid_source_session_proof"
@@ -7659,7 +7688,11 @@ def build_retained_source_read_payload(
     else:
         return _retained_source_missing_session_payload(
             report,
-            reason="raw_candidates_opened_but_no_role_valid_same_task_record_found",
+            reason=(
+                "raw_candidates_opened_but_only_post_hoc_echo_records_found"
+                if post_hoc_echo_records_rejected
+                else "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+            ),
         )
     return {"retained_source_read": report}
 
@@ -15728,8 +15761,8 @@ def _named_task_merge_provenance_final_proof_gate(
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
-            "Open a role-valid same-task raw JSONL/session ref before claiming source-session proof; "
-            "an unopened private handle in task or review prose is only a lead."
+            "Open a role-valid same-task original-chronology raw JSONL/session ref before claiming "
+            "source-session proof; an unopened private handle or later answer/report echo is only a lead."
             if blocking_missing == ["source_session_proof"]
             else (
                 "Open same-task task artifact, review artifact, and an actual parent merge commit; also open "
@@ -15738,7 +15771,7 @@ def _named_task_merge_provenance_final_proof_gate(
             )
         ),
         "acceptable_evidence": [
-            "source-session row or raw transcript reference for the task implementation/review/merge episode",
+            "original source-session row or raw transcript reference for the task implementation/review/merge episode, not a later answer/report echo",
             "same-task task artifact recording implementation/review/merge state",
             "same-task independent review artifact or review proof",
             "actual parent merge commit hash for the merge facet; single-parent integration/final-review proof remains a separate closeout surface",
@@ -15760,6 +15793,7 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         role: [] for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
     }
     evidence["integration_commit_proof"] = []
+    evidence["source_session_diagnostic_context"] = []
     for item in opened:
         if item.get("status") != "opened":
             continue
@@ -15784,6 +15818,12 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         public = _ref_public_summary(item)
         if _opened_named_task_source_session_proof(item):
             evidence["source_session_proof"].append(public)
+        elif (reason := _named_task_source_session_post_hoc_echo_reason(item)) is not None:
+            diagnostic = dict(public)
+            diagnostic["final_support_allowed"] = False
+            diagnostic["diagnostic_only"] = True
+            diagnostic["source_session_demotion_reason"] = reason
+            evidence["source_session_diagnostic_context"].append(diagnostic)
         if ref.get("proof_surface") == "task_file" or "/tasks/" in f"/{target}".casefold():
             evidence["task_artifact_proof"].append(public)
         if ref.get("proof_surface") == "review_artifact" or "codex/state/reviews" in target.casefold():
@@ -15882,11 +15922,102 @@ _NAMED_TASK_SOURCE_SESSION_KINDS = frozenset(
 )
 
 
+def _named_task_source_session_post_hoc_echo_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    selection = (
+        ref.get("historical_provenance_selection")
+        if isinstance(ref.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if ref.get("diagnostic_only") is True or selection.get("diagnostic_only") is True:
+        return "explicit_diagnostic_source_ref"
+    source_role = str(selection.get("source_chronology_role") or "").casefold()
+    if "diagnostic" in source_role or "post_hoc" in source_role or "post-hoc" in source_role:
+        return "diagnostic_or_post_hoc_chronology_role"
+
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "").casefold()).strip()
+    if not summary:
+        return None
+    explicit_echo_markers = (
+        "answer-key",
+        "answer key",
+        "prior final answer",
+        "previous final answer",
+        "prior answer says",
+        "previous answer says",
+        "retained-source-read output",
+        "retained source read output",
+        "retained_source_read output",
+        "eval answer",
+        "evaluation answer",
+        "post-hoc report",
+        "post hoc report",
+        "post-hoc review",
+        "post hoc review",
+        "post-hoc task summary",
+        "post hoc task summary",
+        "post-hoc summary",
+        "post hoc summary",
+        "eval report says",
+        "evaluation report says",
+        "review summary says",
+        "task summary says",
+        "report summary says",
+        "review artifact says",
+        "task artifact says",
+        "report artifact says",
+        "prior report says",
+        "previous report says",
+        "current merge provenance proof for",
+        "completed-task merge/provenance proof for",
+        "named-task merge provenance proof is",
+    )
+    if any(marker in summary for marker in explicit_echo_markers):
+        return "post_hoc_answer_report_or_retained_read_echo"
+
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    compact_summary = summary.replace(" ", "")
+    output_record = (
+        metadata.get("conversation_label") == "tool_action_output"
+        or str(metadata.get("payload_type") or "") in {"function_call_output", "custom_tool_call_output"}
+        or '"type":"function_call_output"' in compact_summary
+        or '"type":"custom_tool_call_output"' in compact_summary
+    )
+    if output_record and any(
+        marker in summary
+        for marker in (
+            "tool output: # review ",
+            "tool output: # jsh-",
+            "tool output: ## progress log",
+            "tool output: verdict: verified",
+            "tool output: status: closed - merged",
+            "tool output: status: closed - integrated",
+            "# review ",
+            "## progress log",
+            "verdict: verified",
+            "status: closed - merged",
+            "status: closed - integrated",
+            "retained source read",
+            "source-session proof:",
+            "implementation evidence",
+        )
+    ):
+        return "post_hoc_task_review_or_report_tool_output"
+    return None
+
+
 def _opened_named_task_source_session_proof(item: dict) -> bool:
     if item.get("status") != "opened" or not str(item.get("summary") or "").strip():
         return False
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
     if ref.get("final_support_allowed") is False or ref.get("diagnostic_only") is True:
+        return False
+    if _named_task_source_session_post_hoc_echo_reason(item) is not None:
+        return False
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata.get("conversation_label") == "source_session_metadata":
         return False
     target_role = str(ref.get("target_source_role") or "")
     if target_role not in _NAMED_TASK_SOURCE_SESSION_ROLES:
