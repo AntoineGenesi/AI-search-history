@@ -782,6 +782,41 @@ def _select_anchor_with_boundary(
             "status_question",
         ],
     }
+    if _requires_raw_parent_thread_boundary(query):
+        interval = canonical_parent_main_interval or {"status": "not_applicable"}
+        selected = _literal_parent_thread_contract_anchor(interval)
+        interval_boundary = interval.get("status_as_of_boundary") or status_as_of_boundary
+        if selected is None:
+            return {
+                **base,
+                "context_boundary": interval.get("context_boundary")
+                or "explicit_parent_thread_side_boundary_missing",
+                "anchor_scope": "parent_thread",
+                "anchor_reason": interval.get("anchor_reason")
+                or "raw_parent_thread_side_boundary_not_proven",
+                "status_ref": (interval_boundary or {}).get("source_ref"),
+                "status_as_of_boundary": interval_boundary,
+                "selected_anchor": None,
+                "canonical_parent_main_status_interval": interval,
+                "rejected_anchor_alternatives": interval.get("rejected_anchor_alternatives") or [],
+            }
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "explicit_parent_thread_side_boundary",
+                "anchor_scope": "parent_thread",
+                "anchor_reason": "raw_side_session_parent_thread_id_matched_parent_history_session",
+                "anchor_ref": selected.get("source_ref"),
+                "status_ref": (interval_boundary or {}).get("source_ref"),
+                "status_as_of_boundary": interval_boundary,
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected exclusively by the raw side-to-parent boundary contract",
+                ),
+                "canonical_parent_main_status_interval": interval,
+            },
+            candidates,
+        )
     by_ref = {candidate.get("source_ref"): candidate for candidate in candidates}
     user_chronology = _current_user_message_chronology_decision(
         query=query,
@@ -3304,11 +3339,17 @@ def _apply_parent_main_anchor_shortlist_contract(
     )
     high_confidence_refs = _parent_main_high_confidence_refs(canonical_candidates)
     selected_ref = str((selected_anchor or {}).get("source_ref") or "")
+    literal_parent_contract_anchor = _literal_parent_thread_contract_anchor(canonical_parent_main_interval)
+    literal_parent_contract_selected = not _requires_raw_parent_thread_boundary(query) or bool(
+        literal_parent_contract_anchor
+        and selected_ref == literal_parent_contract_anchor.get("source_ref")
+    )
     unique_selected = (
         bool(selected_anchor)
         and _is_proven_parent_main_history_anchor(selected_anchor)
         and selected_ref in high_confidence_refs
         and len(high_confidence_refs) == 1
+        and literal_parent_contract_selected
     )
     diagnostic_candidates = _parent_main_diagnostic_shortlist_candidates(
         anchor_candidates=anchor_candidates,
@@ -3625,6 +3666,25 @@ def _is_proven_parent_main_history_anchor(anchor: dict) -> bool:
         if mirror.get("source_kind") == "codex_history" and mirror_ref.startswith("codex_history:history.jsonl:"):
             return True
     return False
+
+
+def _literal_parent_thread_contract_anchor(canonical_parent_main_interval: dict) -> dict | None:
+    if canonical_parent_main_interval.get("status") != "selected":
+        return None
+    side_boundary = canonical_parent_main_interval.get("parent_thread_side_boundary") or {}
+    selected = canonical_parent_main_interval.get("selected_anchor") or {}
+    selected_ref = str(selected.get("source_ref") or "")
+    parent_thread_id_hash = str(side_boundary.get("parent_thread_id_hash") or "")
+    if (
+        side_boundary.get("status") != "selected"
+        or not selected.get("side_parent_boundary_anchor")
+        or not selected_ref
+        or selected_ref != side_boundary.get("selected_anchor_ref")
+        or not parent_thread_id_hash
+        or selected.get("source_identifier") != f"history-session-{parent_thread_id_hash}"
+    ):
+        return None
+    return selected
 
 
 def _rejected_unproven_parent_main_selected_anchor(anchor: dict) -> dict:
