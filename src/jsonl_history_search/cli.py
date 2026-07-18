@@ -16040,6 +16040,10 @@ _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES = frozenset(
     {"rg", "grep", "sed", "cat", "find", "ls", "head", "tail", "jq"}
 )
 _NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS = frozenset({"show", "log", "status"})
+_NAMED_TASK_SOURCE_SESSION_SHELL_SEPARATORS = frozenset({"&&", ";", "||", "|"})
+_NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES = frozenset(
+    {"cd", "export", "source", ".", "pwd", "true", ":", "unset", "set", "umask", "pushd", "popd"}
+)
 
 
 def _named_task_source_session_command_text(call_text: str) -> str:
@@ -16066,11 +16070,21 @@ def _named_task_source_session_command_text(call_text: str) -> str:
     return normalized
 
 
-def _named_task_source_session_unwrapped_command_argv(command: str) -> list[str]:
+def _named_task_source_session_shell_tokens(command: str) -> list[str]:
     try:
-        argv = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
         return []
+
+
+def _named_task_source_session_unwrapped_command_details(
+    command: str,
+) -> tuple[list[str], bool]:
+    argv = _named_task_source_session_shell_tokens(command)
+    shell_wrapped = False
     while argv:
         executable = os.path.basename(argv[0])
         if executable == "env":
@@ -16088,29 +16102,40 @@ def _named_task_source_session_unwrapped_command_argv(command: str) -> list[str]
         if executable in {"bash", "sh", "zsh"}:
             for index, token in enumerate(argv[1:], start=1):
                 if token.startswith("-") and "c" in token[1:] and index + 1 < len(argv):
-                    try:
-                        argv = shlex.split(argv[index + 1])
-                    except ValueError:
-                        return []
+                    argv = _named_task_source_session_shell_tokens(argv[index + 1])
+                    shell_wrapped = True
                     break
             else:
-                return argv
+                return argv, shell_wrapped
             continue
-        return argv
-    return []
+        return argv, shell_wrapped
+    return [], shell_wrapped
 
 
-def _named_task_source_session_read_only_command(call_text: str) -> bool:
-    argv = _named_task_source_session_unwrapped_command_argv(
-        _named_task_source_session_command_text(call_text)
-    )
-    if not argv:
-        return False
-    executable = os.path.basename(argv[0])
-    if executable in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES:
-        return True
-    if executable != "git":
-        return False
+def _named_task_source_session_command_segments(
+    argv: list[str],
+) -> tuple[list[list[str]], list[str], bool]:
+    segments: list[list[str]] = []
+    separators: list[str] = []
+    current: list[str] = []
+    for token in argv:
+        if token in _NAMED_TASK_SOURCE_SESSION_SHELL_SEPARATORS:
+            if not current:
+                return [], [], False
+            segments.append(current)
+            separators.append(token)
+            current = []
+            continue
+        if token and set(token).issubset({";", "&", "|"}):
+            return [], [], False
+        current.append(token)
+    if not current:
+        return [], [], False
+    segments.append(current)
+    return segments, separators, True
+
+
+def _named_task_source_session_git_subcommand(argv: list[str]) -> str:
     index = 1
     options_with_values = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
     while index < len(argv):
@@ -16121,8 +16146,83 @@ def _named_task_source_session_read_only_command(call_text: str) -> bool:
         if token.startswith("-"):
             index += 1
             continue
-        return token in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS
-    return False
+        return token
+    return ""
+
+
+def _named_task_source_session_reader_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    executable = os.path.basename(argv[0])
+    if executable in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES:
+        return True
+    return (
+        executable == "git"
+        and _named_task_source_session_git_subcommand(argv)
+        in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS
+    )
+
+
+def _named_task_source_session_action_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    executable = os.path.basename(argv[0])
+    if executable in {"pytest", "compileall", "py_compile", "apply_patch"}:
+        return True
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+        try:
+            module_index = argv.index("-m") + 1
+        except (ValueError, IndexError):
+            return False
+        if module_index >= len(argv):
+            return False
+        module = argv[module_index]
+        if module in {"pytest", "compileall", "py_compile"}:
+            return True
+        return (
+            module == "jsonl_history_search.cli"
+            and module_index + 1 < len(argv)
+            and argv[module_index + 1] in {"ask", "what-happened-since"}
+        )
+    if executable == "git":
+        subcommand = _named_task_source_session_git_subcommand(argv)
+        return subcommand in {"commit", "apply"} or (subcommand == "diff" and "--check" in argv)
+    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] in {
+        "ask",
+        "what-happened-since",
+    }
+
+
+def _named_task_source_session_command_structure(call_text: str) -> str:
+    command = _named_task_source_session_command_text(call_text)
+    argv, shell_wrapped = _named_task_source_session_unwrapped_command_details(command)
+    if not argv:
+        return (
+            "ambiguous_compound"
+            if re.search(r"(?:^|\s)(?:bash|sh|zsh)\b|[;&|]", command)
+            else "unavailable"
+        )
+    segments, separators, valid = _named_task_source_session_command_segments(argv)
+    if not valid:
+        return "ambiguous_compound"
+    if any(_named_task_source_session_reader_argv(segment) for segment in segments):
+        return "read_only"
+    compound = bool(separators)
+    if shell_wrapped or compound:
+        if any(separator in {"|", "||"} for separator in separators):
+            return "ambiguous_compound"
+        action_count = sum(_named_task_source_session_action_argv(segment) for segment in segments)
+        safely_reducible = all(
+            _named_task_source_session_action_argv(segment)
+            or os.path.basename(segment[0]) in _NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES
+            for segment in segments
+        )
+        return "affirmative_action" if safely_reducible and action_count == 1 else "ambiguous_compound"
+    return "affirmative_action" if _named_task_source_session_action_argv(segments[0]) else "simple_other"
+
+
+def _named_task_source_session_read_only_command(call_text: str) -> bool:
+    return _named_task_source_session_command_structure(call_text) == "read_only"
 
 
 def _named_task_source_session_original_chronology_reason(item: dict) -> str | None:
@@ -16152,8 +16252,14 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
     )
     if structured_tool_record:
         call_text, separator, output_text = summary.partition("tool output:")
-        if _named_task_source_session_read_only_command(call_text):
+        call_text = call_text.rstrip()
+        if separator and call_text.endswith("|"):
+            call_text = call_text[:-1].rstrip()
+        command_structure = _named_task_source_session_command_structure(call_text)
+        if command_structure in {"read_only", "ambiguous_compound"}:
             return None
+        if command_structure == "affirmative_action":
+            return "structured_change_verification_or_runtime_command"
         if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
             return "structured_change_verification_or_runtime_command"
         result_text = output_text if separator else summary
