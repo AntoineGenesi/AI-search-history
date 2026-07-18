@@ -268,6 +268,15 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     ask.add_argument("query", help="User wording to classify into a JSONL first route.")
     add_common_args(ask)
     ask.add_argument(
+        "--evidence-source",
+        choices=("local", "conversation-history"),
+        default=None,
+        help=(
+            "Required for prompts naming tasks/...md: local selects bounded Git/task "
+            "evidence; conversation-history selects JSONL semantic debugging."
+        ),
+    )
+    ask.add_argument(
         "--execute",
         action="store_true",
         help=(
@@ -1935,6 +1944,8 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     selected_route = {
         "chosen_route": route.get("chosen_route"),
         "route_family": route.get("route_family"),
+        "evidence_source": route.get("evidence_source"),
+        "evidence_source_applies": route.get("evidence_source_applies"),
         "first_action_category": route.get("first_action_category"),
         "why_it_applies": route.get("why_it_applies"),
         "structured_execution_query": route.get("structured_execution_query"),
@@ -16470,7 +16481,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
         cwd = str(Path(args.cwd).expanduser().resolve())
-        payload = build_ask_router_payload(args.query, cwd=cwd)
+        payload = build_ask_router_payload(
+            args.query,
+            cwd=cwd,
+            evidence_source=args.evidence_source,
+        )
         auto_execute_bounded = (
             args.auto_execute_bounded_no_evidence
             and payload["ask_router"].get("route_family") == "bounded_no_evidence"

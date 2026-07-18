@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any
 
 
@@ -330,6 +331,49 @@ def ask_next_commands(
             }
         )
     return commands
+
+
+def named_task_local_next_commands(
+    *,
+    selected_first_command: str,
+    task_path: str,
+) -> list[dict[str, Any]]:
+    task_basename = task_path.rsplit("/", 1)[-1]
+    review_path = f"codex/state/reviews/{task_basename}"
+    quoted_task = shlex.quote(task_path)
+    quoted_review = shlex.quote(review_path)
+    return [
+        {
+            "purpose": "inspect current HEAD and parents",
+            "command": selected_first_command,
+            "inspect_next": "current branch or detached state, HEAD, and direct HEAD parents only",
+        },
+        {
+            "purpose": "read the named task",
+            "command": f"sed -n '1,320p' -- {quoted_task}",
+            "inspect_next": "status and exact commit identifiers stated by this named task only",
+        },
+        {
+            "purpose": "read the canonical review when present",
+            "command": (
+                f"if [ -f {quoted_review} ]; then sed -n '1,320p' -- {quoted_review}; "
+                "else printf '%s\\n' 'canonical review is absent'; fi"
+            ),
+            "inspect_next": "verdict and exact reviewed or merge commit identifiers from this canonical review only",
+        },
+        {
+            "purpose": "verify exact target-bound ancestry",
+            "command": (
+                "commit=EXACT_COMMIT_FROM_NAMED_TASK_OR_CANONICAL_REVIEW; "
+                'git branch --contains "$commit" && '
+                'git merge-base --is-ancestor "$commit" HEAD'
+            ),
+            "inspect_next": (
+                "replace the token with one exact commit read from the named task or canonical review; "
+                "repeat only for another exact governing commit from those same files"
+            ),
+        },
+    ]
 
 
 def _with_cli_prefix(command: str, cli_prefix: str) -> str:
