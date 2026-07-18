@@ -318,11 +318,11 @@ jsonl-history-search validate-install --codex-home ~/.codex --format text
 ```
 
 If that installed-branch preflight says the global skill is stale, refresh it
-from the package checkout before relying on later installed route instructions.
+through the installed Python CLI before relying on later route instructions.
 Never run this refresh or preflight from the source-checkout branch:
 
 ```bash
-bash install/install_codex_global.sh
+jsonl-history-search install-codex-skill
 ```
 
 Command-shape contract for the first two shell commands:
@@ -478,7 +478,7 @@ installed-or-source block above first and use its selected command prefix.
   the installed global skill, run
   `jsonl-history-search validate-install --codex-home ~/.codex --format text`
   after reading this skill and before ask-first routing. If it fails, refresh
-  with `bash install/install_codex_global.sh` before relying on this route
+  with `jsonl-history-search install-codex-skill` before relying on this route
   guidance.
 - Then run
   `python3 "$HOME/.codex/skills/jsonl-history-search/scripts/jsonl_ask_first.py" "<user wording>"`

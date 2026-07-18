@@ -6451,6 +6451,16 @@ def render_install_validation_text(payload: dict) -> str:
     ]
     if validation.get("codex_home"):
         lines.append(f"Codex home: {validation['codex_home']}")
+    preflight = validation.get("agent_preflight") or {}
+    layers = preflight.get("install_layers") or {}
+    if layers:
+        cli_layer = layers.get("python_cli") or {}
+        skill_layer = layers.get("codex_skill") or {}
+        lines.append("Install layers:")
+        lines.append(f"- Python CLI (required): {cli_layer.get('status', 'unknown')}")
+        lines.append(f"  Install: {cli_layer.get('install_command')}")
+        lines.append(f"- Codex skill (optional): {skill_layer.get('status', 'unknown')}")
+        lines.append(f"  Install: {skill_layer.get('install_command')}")
     currentness = validation.get("currentness") or {}
     if currentness:
         local = currentness.get("local_install_freshness") or {}
@@ -6485,7 +6495,6 @@ def render_install_validation_text(payload: dict) -> str:
             f"{currentness.get('upstream_latest_release_currentness', 'unproven')}"
         )
         lines.append(f"- Currentness claim boundary: {currentness.get('claim_boundary')}")
-    preflight = validation.get("agent_preflight") or {}
     if preflight:
         lines.append("Agent preflight:")
         lines.append(f"- Global skill freshness: {preflight.get('global_skill_freshness', 'unknown')}")
@@ -6529,6 +6538,22 @@ def render_install_validation_markdown(payload: dict) -> str:
         f"**Package root:** `{validation.get('package_root')}`",
         f"**Read-only:** {validation.get('read_only')}",
     ]
+    preflight = validation.get("agent_preflight") or {}
+    layers = preflight.get("install_layers") or {}
+    if layers:
+        cli_layer = layers.get("python_cli") or {}
+        skill_layer = layers.get("codex_skill") or {}
+        lines.extend(
+            [
+                "",
+                "## Install Layers",
+                "",
+                f"- Python CLI (required): `{cli_layer.get('status', 'unknown')}`",
+                f"  Install: `{cli_layer.get('install_command')}`",
+                f"- Codex skill (optional): `{skill_layer.get('status', 'unknown')}`",
+                f"  Install: `{skill_layer.get('install_command')}`",
+            ]
+        )
     currentness = validation.get("currentness") or {}
     if currentness:
         local = currentness.get("local_install_freshness") or {}
@@ -6580,7 +6605,6 @@ def render_install_validation_markdown(payload: dict) -> str:
     if suggestions:
         lines.extend(["", "## Recovery Suggestions", ""])
         lines.extend(f"- {item}" for item in suggestions)
-    preflight = validation.get("agent_preflight") or {}
     if preflight:
         lines.extend(
             [
