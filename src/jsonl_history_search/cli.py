@@ -7517,6 +7517,15 @@ def _retained_source_record_score(*, metadata: dict, summary: str, task_id: str)
     return score
 
 
+def _retained_source_tool_record_kind(metadata: dict) -> str | None:
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    if payload_type in {"function_call", "custom_tool_call"}:
+        return "call"
+    if payload_type in {"function_call_output", "custom_tool_call_output"}:
+        return "output"
+    return None
+
+
 def _retained_source_missing_session_payload(report: dict, *, reason: str) -> dict:
     report["reason"] = reason
     report["missing_source_session_stop_contract"] = {
@@ -7602,6 +7611,7 @@ def build_retained_source_read_payload(
     candidate_files_opened = 0
     post_hoc_echo_records_rejected = 0
     ambiguous_source_session_records_rejected = 0
+    source_session_outputs_rejected_without_affirmative_call = 0
     source_session_metadata_records_seen = 0
     substantive_source_paths: set[str] = set()
     candidate_refs: list[dict] = []
@@ -7617,6 +7627,7 @@ def build_retained_source_read_payload(
         candidate_files_opened += 1
         bytes_read += len(raw_content)
         content = raw_content.decode("utf-8", errors="replace")
+        source_records: list[dict] = []
         for line_number, raw in enumerate(content.splitlines()[:256], start=1):
             record = _retained_source_record(raw, fallback=f"{path.name}:{line_number}")
             if not record:
@@ -7645,6 +7656,42 @@ def build_retained_source_read_payload(
                 "record_metadata": metadata,
                 "ref": ref,
             }
+            source_records.append(
+                {
+                    "metadata": metadata,
+                    "ref": ref,
+                    "opened_item": opened_item,
+                }
+            )
+
+        affirmative_call_reasons: dict[str, str] = {}
+        rejected_call_ids: set[str] = set()
+        for source_record in source_records:
+            metadata = source_record["metadata"]
+            if _retained_source_tool_record_kind(metadata) != "call":
+                continue
+            call_id = str(metadata.get("tool_call_correlation_id") or "").strip()
+            if not call_id:
+                continue
+            opened_item = source_record["opened_item"]
+            original_reason = None
+            if _named_task_source_session_post_hoc_echo_reason(opened_item) is not None:
+                rejected_call_ids.add(call_id)
+            else:
+                original_reason = _named_task_source_session_original_chronology_reason(
+                    opened_item
+                )
+            if original_reason is None:
+                rejected_call_ids.add(call_id)
+                affirmative_call_reasons.pop(call_id, None)
+                continue
+            if call_id not in rejected_call_ids:
+                affirmative_call_reasons[call_id] = original_reason
+
+        for source_record in source_records:
+            metadata = source_record["metadata"]
+            ref = source_record["ref"]
+            opened_item = source_record["opened_item"]
             if _named_task_source_session_post_hoc_echo_reason(opened_item) is not None:
                 post_hoc_echo_records_rejected += 1
                 continue
@@ -7652,6 +7699,18 @@ def build_retained_source_read_payload(
                 source_session_metadata_records_seen += 1
                 candidate_refs.append(ref)
                 continue
+            if _retained_source_tool_record_kind(metadata) == "output":
+                call_id = str(metadata.get("tool_call_correlation_id") or "").strip()
+                associated_reason = (
+                    affirmative_call_reasons.get(call_id)
+                    if call_id and call_id not in rejected_call_ids
+                    else None
+                )
+                if associated_reason is None:
+                    source_session_outputs_rejected_without_affirmative_call += 1
+                    ambiguous_source_session_records_rejected += 1
+                    continue
+                metadata["associated_call_original_chronology_reason"] = associated_reason
             original_reason = _named_task_source_session_original_chronology_reason(opened_item)
             if original_reason is None:
                 ambiguous_source_session_records_rejected += 1
@@ -7687,6 +7746,9 @@ def build_retained_source_read_payload(
     report["bytes_read"] = bytes_read
     report["post_hoc_echo_records_rejected"] = post_hoc_echo_records_rejected
     report["ambiguous_source_session_records_rejected"] = ambiguous_source_session_records_rejected
+    report["source_session_outputs_rejected_without_affirmative_call"] = (
+        source_session_outputs_rejected_without_affirmative_call
+    )
     report["source_session_metadata_records_seen"] = source_session_metadata_records_seen
     report["opened_refs"] = opened_refs
     if opened_refs:
@@ -13805,7 +13867,17 @@ def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
     if not isinstance(row, dict):
         return None
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    item = row.get("item") if isinstance(row.get("item"), dict) else {}
     message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    tool_call_correlation_id = None
+    for key in ("call_id", "callId", "item_id", "itemId", "id"):
+        for container in (payload, item, message, row):
+            value = str(container.get(key) or "").strip()
+            if value:
+                tool_call_correlation_id = value
+                break
+        if tool_call_correlation_id:
+            break
     classification = classify_conversation_record(row)
     simple_top_level_user_text = (
         classification.label == "unknown"
@@ -13820,7 +13892,9 @@ def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
         "top_role": row.get("role"),
         "payload_type": payload.get("type"),
         "payload_role": payload.get("role"),
+        "item_type": item.get("type"),
         "message_role": message.get("role"),
+        "tool_call_correlation_id": tool_call_correlation_id,
         "conversation_label": classification.label,
         "conversation_confidence": classification.confidence,
         "conversation_reasons": list(classification.reasons),
@@ -16363,8 +16437,16 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
                 "execution status:",
             )
         )
-        if has_execution_result and clear_output_record:
-            return "structured_tool_execution_result"
+        associated_call_reason = str(
+            metadata.get("associated_call_original_chronology_reason") or ""
+        )
+        if (
+            has_execution_result
+            and clear_output_record
+            and associated_call_reason
+            == "structured_change_verification_or_runtime_command"
+        ):
+            return "structured_tool_execution_result_with_affirmative_call"
         return None
     return None
 
