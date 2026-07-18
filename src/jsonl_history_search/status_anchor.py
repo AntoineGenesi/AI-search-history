@@ -1870,7 +1870,7 @@ def _recover_parent_thread_side_boundary_without_direct_edge(
                 _lineage_rejected_anchor(candidate, lineage, "candidate_session_metadata_not_found")
             )
             continue
-        rejection = _parent_thread_lineage_rejection_reason(lineage)
+        rejection = _no_edge_parent_candidate_rejection_reason(lineage)
         if rejection:
             rejected.append(_lineage_rejected_anchor(candidate, lineage, rejection))
             continue
@@ -2220,6 +2220,20 @@ def _parent_thread_lineage_rejection_reason(lineage: dict) -> str | None:
         return "unrelated_project_or_workspace_root"
     if thread_source and thread_source != "user":
         return "non_user_thread_source_not_parent_thread_anchor"
+    return None
+
+
+def _no_edge_parent_candidate_rejection_reason(lineage: dict) -> str | None:
+    rejection = _parent_thread_lineage_rejection_reason(lineage)
+    if rejection:
+        return rejection
+    parent_thread_id_hash = str(lineage.get("parent_thread_id_hash") or "")
+    candidate_thread_hashes = {
+        str(lineage.get("session_id_hash") or ""),
+        str(lineage.get("raw_thread_id_hash") or ""),
+    } - {""}
+    if parent_thread_id_hash and parent_thread_id_hash not in candidate_thread_hashes:
+        return "candidate_session_has_distinct_parent_thread_id"
     return None
 
 
