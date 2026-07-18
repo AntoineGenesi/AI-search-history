@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Bare ambiguous event prompts such as `what happened?` are not history requests; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. Latest-status activation is configurable: implicit/default mode activates for natural prior-message wording such as `what happened since my last message?`; a user/project instruction selecting explicit-only mode requires a leading `convo` and otherwise uses zero tools. A prompt that only names a `tasks/...md` path and generically asks what happened, asks to be told about it, asks to check it, or asks whether it is okay is also unresolved: do not read this skill or call any tool; ask whether the user wants local Git/task evidence or conversation-history evidence. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, worktree cleanup causality, or questions about where retained source sessions/private evidence are stored and how long they are kept. For every prompt containing an explicit `tasks/...md` path or named local task-file, declare the evidence source rather than inferring it from nouns or word order: use `ask --evidence-source local` for explicit current checkout/Git/task evidence, use `ask --evidence-source conversation-history` for explicit prior conversation/JSONL evidence, and ask one zero-tool clarification when the user's intended source is unresolved. Use JSONL for AI conversation mining across local Codex and Claude logs when the request depends on prior AI conversation history. User wording that says convo also triggers this skill, but it does not select an executable command. When this skill is triggered after these terminal clarification gates, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For natural history or storage-retention prompts, run the installed-or-source resolution block before any console command or installed validation.
+description: Bare ambiguous event prompts such as `what happened?` are not history requests. In implicit/default activation mode, `what has happened since my last message in the parent thread?` and the narrow prior-message/main-thread/parent-thread family automatically trigger this skill even when the user does not say JSONL or convo. Read this skill, then invoke the installed-or-source `ask` front door before synthesizing from visible context, Git, TODO, task/report files, or repo state. Bare `what happened?`, `what changed in this task file?`, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history do not trigger conversation-history recovery; ask one short clarification and use zero tools, including no JSONL/history, Git, repo/TODO/task/state scans, or filesystem inspection. A prompt that only names a `tasks/...md` path and generically asks what happened, asks to be told about it, asks to check it, or asks whether it is okay is unresolved: do not read this skill or call any tool; ask whether the user wants local Git/task evidence or conversation-history evidence. Latest-status activation is configurable: a user/project instruction selecting explicit-only mode requires a leading `convo` and otherwise uses zero tools. Activate this skill for explicit history/source targets such as `what happened since my last message?`, `what happened at X?`, devlog chronology, source provenance, action proof, remembered instructions, worktree cleanup causality, or questions about where retained source sessions/private evidence are stored and how long they are kept. For every prompt containing an explicit `tasks/...md` path or named local task-file, declare the evidence source rather than inferring it from nouns or word order: use `ask --evidence-source local` for explicit current checkout/Git/task evidence, use `ask --evidence-source conversation-history` for explicit prior conversation/JSONL evidence, and ask one zero-tool clarification when the user's intended source is unresolved. Use JSONL for AI conversation mining across local Codex and Claude logs when the request depends on prior AI conversation history. User wording that says convo also triggers this skill, but it does not select an executable command. When this skill is triggered after these terminal clarification gates, read this skill as a standalone command; do not chain that read with pwd, rg --files, find, ls, repo inventories, or setup probes. For natural history or storage-retention prompts, run the installed-or-source resolution block before any console command or installed validation.
 metadata:
   short-description: Mine AI conversation JSONL
 ---
@@ -13,7 +13,11 @@ Latest-status activation has two modes:
 
 - `implicit` is the default, including contributor's default environment. Natural
   prior-message wording such as `what has happened since my last message?`
-  activates this skill without requiring `convo`.
+  activates this skill without requiring `convo`. In particular, the exact
+  phrase `what has happened since my last message in the parent thread?` is an
+  automatic trigger, as are the narrow variants `what happened since my last
+  message in the parent thread?` and `what happened since my last message in
+  the main thread?`.
 - `explicit-only` is selected by a user/project instruction stating `JSONL
   activation mode: explicit-only`. In that mode, natural latest-status wording
   without a leading `convo` does not activate this skill and uses zero tools.
@@ -27,6 +31,12 @@ prove the parent relationship from raw side-session metadata and canonical
 `history.jsonl`, or fail closed without a factual status answer. Side-thread
 questions/corrections, visible context, and task/report artifacts are never
 substitute anchors.
+
+This trigger is intentionally narrow. It does not include bare `what happened?`,
+`what changed in this task file?`, local repo/task/artifact status prompts, or
+generic questions not anchored to prior conversation history. Do not
+load JSONL for those non-trigger cases unless the user separately declares a
+conversation-history source.
 
 For a bare `what happened?` or equivalent ambiguous event prompt with no
 concrete event, time, thread, task, path, commit, history, or source target, stop
@@ -72,11 +82,14 @@ local-status wording also cannot override a declared history request. The
 explicit declaration owns this boundary.
 
 This skill is a router. Apply the activation gate above before loading routes.
-For natural user questions that
-ask what happened since an explicit prior-message/history anchor, why a topic appeared, whether an agent action occurred,
+The exact parent-thread phrase follows this router contract. For natural user
+questions that ask what happened since an explicit prior-message/history anchor, why a topic appeared, whether an agent action occurred,
 which artifact or ticket is current, whether old worktrees can be pruned, or what to
 learn from a session, run `ask` as the
-first resolver before choosing a route yourself. For explicit operational
+first resolver before choosing a route yourself. For the exact parent-thread
+phrase, do not synthesize an answer from Git, TODO, task/report files, inherited
+summaries, repo state, or visible context until the front door has inspected
+raw conversation evidence. For explicit operational
 lookups that are not natural route-choice questions, choose the narrowest route
 and read only the referenced specialization needed for the user's question.
 Exception: when the user is asking whether the files/tasks/evidence packet you
@@ -158,6 +171,13 @@ This block is the canonical no-fumble first move. It is command resolution,
 not repo inventory or package installation. When the installed branch is
 selected and the workflow depends on global-skill freshness, run the installed
 preflight before later route commands:
+
+In a source checkout where `command -v jsonl-history-search` does not succeed,
+the first useful command must be the source branch's
+`PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute ...`. The
+`command -v` check is non-executing resolution: do not first call `convo`,
+`convo --help`, `jsonl-history-search`, or `jsonl-history-search --help` and
+wait for those commands to fail.
 
 ```bash
 jsonl-history-search validate-install --codex-home ~/.codex --format text
