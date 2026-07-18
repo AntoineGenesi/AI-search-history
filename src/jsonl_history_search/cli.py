@@ -7601,6 +7601,7 @@ def build_retained_source_read_payload(
     bytes_read = 0
     candidate_files_opened = 0
     post_hoc_echo_records_rejected = 0
+    ambiguous_source_session_records_rejected = 0
     source_session_metadata_records_seen = 0
     substantive_source_paths: set[str] = set()
     candidate_refs: list[dict] = []
@@ -7651,6 +7652,11 @@ def build_retained_source_read_payload(
                 source_session_metadata_records_seen += 1
                 candidate_refs.append(ref)
                 continue
+            original_reason = _named_task_source_session_original_chronology_reason(opened_item)
+            if original_reason is None:
+                ambiguous_source_session_records_rejected += 1
+                continue
+            ref["source_session_original_chronology_reason"] = original_reason
             if not _opened_named_task_source_session_proof(opened_item):
                 continue
             substantive_source_paths.add(rel)
@@ -7680,6 +7686,7 @@ def build_retained_source_read_payload(
     report["candidate_files_opened"] = candidate_files_opened
     report["bytes_read"] = bytes_read
     report["post_hoc_echo_records_rejected"] = post_hoc_echo_records_rejected
+    report["ambiguous_source_session_records_rejected"] = ambiguous_source_session_records_rejected
     report["source_session_metadata_records_seen"] = source_session_metadata_records_seen
     report["opened_refs"] = opened_refs
     if opened_refs:
@@ -7689,9 +7696,13 @@ def build_retained_source_read_payload(
         return _retained_source_missing_session_payload(
             report,
             reason=(
-                "raw_candidates_opened_but_only_post_hoc_echo_records_found"
-                if post_hoc_echo_records_rejected
-                else "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+                "raw_candidates_opened_but_no_original_chronology_records_found"
+                if ambiguous_source_session_records_rejected
+                else (
+                    "raw_candidates_opened_but_only_post_hoc_echo_records_found"
+                    if post_hoc_echo_records_rejected
+                    else "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+                )
             ),
         )
     return {"retained_source_read": report}
@@ -15817,8 +15828,11 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
             continue
         public = _ref_public_summary(item)
         if _opened_named_task_source_session_proof(item):
+            public["source_session_original_chronology_reason"] = (
+                _named_task_source_session_original_chronology_reason(item)
+            )
             evidence["source_session_proof"].append(public)
-        elif (reason := _named_task_source_session_post_hoc_echo_reason(item)) is not None:
+        elif (reason := _named_task_source_session_rejection_reason(item)) is not None:
             diagnostic = dict(public)
             diagnostic["final_support_allowed"] = False
             diagnostic["diagnostic_only"] = True
@@ -16008,6 +16022,89 @@ def _named_task_source_session_post_hoc_echo_reason(item: dict) -> str | None:
     return None
 
 
+_NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS = (
+    "apply_patch",
+    "git apply",
+    "git commit",
+    "pytest",
+    "compileall",
+    "py_compile",
+    "git diff --check",
+    "jsonl-history-search ask",
+    "jsonl_history_search.cli ask",
+    "jsonl-history-search what-happened-since",
+    "jsonl_history_search.cli what-happened-since",
+)
+
+_NAMED_TASK_SOURCE_SESSION_READ_ONLY_COMMAND_RE = re.compile(
+    r"\b(?:rg|grep|sed|cat|find|ls|head|tail|jq)\b|\bgit\s+(?:show|log|status)\b"
+)
+
+
+def _named_task_source_session_original_chronology_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    if _named_task_source_session_post_hoc_echo_reason(item) is not None:
+        return None
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata.get("conversation_label") == "source_session_metadata":
+        return None
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "").casefold()).strip()
+    if not summary:
+        return None
+
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    item_type = str(metadata.get("item_type") or "").casefold()
+    conversation_label = str(metadata.get("conversation_label") or "").casefold()
+    structured_tool_record = (
+        item_type == "command_execution"
+        or conversation_label == "tool_action_output"
+        or payload_type
+        in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}
+        or summary.startswith("tool call:")
+        or summary.startswith("tool output:")
+        or '"type":"command_execution"' in summary.replace(" ", "")
+    )
+    if structured_tool_record:
+        call_text, separator, output_text = summary.partition("tool output:")
+        if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
+            return "structured_change_verification_or_runtime_command"
+        if _NAMED_TASK_SOURCE_SESSION_READ_ONLY_COMMAND_RE.search(call_text):
+            return None
+        result_text = output_text if separator else summary
+        has_execution_result = any(
+            marker in result_text
+            for marker in (
+                "report_output_unavailable",
+                "process exited with code 0",
+                '"exit_code":0',
+                '"exit_code": 0',
+                "tests passed",
+                "test passed",
+                " passed in ",
+                "answer status:",
+                "execution status:",
+            )
+        )
+        if has_execution_result:
+            return "structured_tool_execution_result"
+        return None
+    return None
+
+
+def _named_task_source_session_rejection_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    post_hoc_reason = _named_task_source_session_post_hoc_echo_reason(item)
+    if post_hoc_reason is not None:
+        return post_hoc_reason
+    if _named_task_source_session_original_chronology_reason(item) is None:
+        return "ambiguous_raw_record_without_original_chronology_signal"
+    return None
+
+
 def _opened_named_task_source_session_proof(item: dict) -> bool:
     if item.get("status") != "opened" or not str(item.get("summary") or "").strip():
         return False
@@ -16016,8 +16113,7 @@ def _opened_named_task_source_session_proof(item: dict) -> bool:
         return False
     if _named_task_source_session_post_hoc_echo_reason(item) is not None:
         return False
-    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
-    if metadata.get("conversation_label") == "source_session_metadata":
+    if _named_task_source_session_original_chronology_reason(item) is None:
         return False
     target_role = str(ref.get("target_source_role") or "")
     if target_role not in _NAMED_TASK_SOURCE_SESSION_ROLES:
