@@ -305,7 +305,7 @@ FAILURE_PATTERNS: tuple[dict[str, Any], ...] = (
         "label": "raw_local_evidence_boundary",
         "terms": ("privacy", "raw local", "conversation logs", "raw traces", "source paths", "line ranges"),
         "fix_type": "skill/router/reference update",
-        "preferred_path": "skills/codex/jsonl-history-search/references/local-evidence.md",
+        "preferred_path": "skills/internal/jsonl-history-search/references/local-evidence.md",
         "preferred_kinds": ("skill_reference", "project_rule", "product_contract"),
         "inferred_steps": (
             "Public-safe privacy posture leaks into local product diagnosis.",
