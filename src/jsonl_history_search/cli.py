@@ -16036,9 +16036,93 @@ _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS = (
     "jsonl_history_search.cli what-happened-since",
 )
 
-_NAMED_TASK_SOURCE_SESSION_READ_ONLY_COMMAND_RE = re.compile(
-    r"\b(?:rg|grep|sed|cat|find|ls|head|tail|jq)\b|\bgit\s+(?:show|log|status)\b"
+_NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES = frozenset(
+    {"rg", "grep", "sed", "cat", "find", "ls", "head", "tail", "jq"}
 )
+_NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS = frozenset({"show", "log", "status"})
+
+
+def _named_task_source_session_command_text(call_text: str) -> str:
+    normalized = str(call_text or "").strip()
+    marker_index = normalized.find("tool call:")
+    if marker_index >= 0:
+        return normalized[marker_index + len("tool call:") :].strip()
+    match = re.search(r"(?:^|\s)tool call [^:]+:\s*(.*)$", normalized)
+    if match:
+        payload = match.group(1).strip()
+        try:
+            decoded = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return payload
+        if isinstance(decoded, dict):
+            return str(decoded.get("cmd") or decoded.get("command") or "").strip()
+        return str(decoded).strip() if isinstance(decoded, str) else payload
+    match = re.search(r'"(?:command|cmd)"\s*:\s*("(?:\\.|[^"\\])*")', normalized)
+    if match:
+        try:
+            return str(json.loads(match.group(1))).strip()
+        except (json.JSONDecodeError, TypeError):
+            return ""
+    return normalized
+
+
+def _named_task_source_session_unwrapped_command_argv(command: str) -> list[str]:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return []
+    while argv:
+        executable = os.path.basename(argv[0])
+        if executable == "env":
+            index = 1
+            while index < len(argv) and (argv[index].startswith("-") or "=" in argv[index]):
+                index += 1
+            argv = argv[index:]
+            continue
+        if executable in {"command", "exec", "sudo"}:
+            index = 1
+            while index < len(argv) and argv[index].startswith("-"):
+                index += 1
+            argv = argv[index:]
+            continue
+        if executable in {"bash", "sh", "zsh"}:
+            for index, token in enumerate(argv[1:], start=1):
+                if token.startswith("-") and "c" in token[1:] and index + 1 < len(argv):
+                    try:
+                        argv = shlex.split(argv[index + 1])
+                    except ValueError:
+                        return []
+                    break
+            else:
+                return argv
+            continue
+        return argv
+    return []
+
+
+def _named_task_source_session_read_only_command(call_text: str) -> bool:
+    argv = _named_task_source_session_unwrapped_command_argv(
+        _named_task_source_session_command_text(call_text)
+    )
+    if not argv:
+        return False
+    executable = os.path.basename(argv[0])
+    if executable in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES:
+        return True
+    if executable != "git":
+        return False
+    index = 1
+    options_with_values = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
+    while index < len(argv):
+        token = argv[index]
+        if token in options_with_values:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS
+    return False
 
 
 def _named_task_source_session_original_chronology_reason(item: dict) -> str | None:
@@ -16068,7 +16152,7 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
     )
     if structured_tool_record:
         call_text, separator, output_text = summary.partition("tool output:")
-        if _NAMED_TASK_SOURCE_SESSION_READ_ONLY_COMMAND_RE.search(call_text):
+        if _named_task_source_session_read_only_command(call_text):
             return None
         if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
             return "structured_change_verification_or_runtime_command"
