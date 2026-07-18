@@ -7517,6 +7517,15 @@ def _retained_source_record_score(*, metadata: dict, summary: str, task_id: str)
     return score
 
 
+def _retained_source_tool_record_kind(metadata: dict) -> str | None:
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    if payload_type in {"function_call", "custom_tool_call"}:
+        return "call"
+    if payload_type in {"function_call_output", "custom_tool_call_output"}:
+        return "output"
+    return None
+
+
 def _retained_source_missing_session_payload(report: dict, *, reason: str) -> dict:
     report["reason"] = reason
     report["missing_source_session_stop_contract"] = {
@@ -7600,6 +7609,11 @@ def build_retained_source_read_payload(
 
     bytes_read = 0
     candidate_files_opened = 0
+    post_hoc_echo_records_rejected = 0
+    ambiguous_source_session_records_rejected = 0
+    source_session_outputs_rejected_without_affirmative_call = 0
+    source_session_metadata_records_seen = 0
+    substantive_source_paths: set[str] = set()
     candidate_refs: list[dict] = []
     for path in candidates:
         remaining = limits["max_bytes"] - bytes_read
@@ -7613,32 +7627,110 @@ def build_retained_source_read_payload(
         candidate_files_opened += 1
         bytes_read += len(raw_content)
         content = raw_content.decode("utf-8", errors="replace")
+        source_records: list[dict] = []
         for line_number, raw in enumerate(content.splitlines()[:256], start=1):
             record = _retained_source_record(raw, fallback=f"{path.name}:{line_number}")
             if not record:
                 continue
             metadata, summary = record
             rel = _safe_relative_path(cwd, path)
-            candidate_refs.append(
+            ref = {
+                "kind": "jsonl_source_ref",
+                "target": f"{rel}:{line_number}",
+                "source_ref": {"path": rel, "line": line_number},
+                "target_source_role": "source_session_proof",
+                "final_support_allowed": True,
+                "summary": summary,
+                "record_metadata": metadata,
+                "_retained_source_score": _retained_source_record_score(
+                    metadata=metadata,
+                    summary=summary,
+                    task_id=task_id,
+                ),
+            }
+            opened_item = {
+                "status": "opened",
+                "target": ref["target"],
+                "path": rel,
+                "summary": summary,
+                "record_metadata": metadata,
+                "ref": ref,
+            }
+            source_records.append(
                 {
-                    "kind": "jsonl_source_ref",
-                    "target": f"{rel}:{line_number}",
-                    "source_ref": {"path": rel, "line": line_number},
-                    "target_source_role": "source_session_proof",
-                    "final_support_allowed": True,
-                    "summary": summary,
-                    "record_metadata": metadata,
-                    "_retained_source_score": _retained_source_record_score(
-                        metadata=metadata,
-                        summary=summary,
-                        task_id=task_id,
-                    ),
+                    "metadata": metadata,
+                    "ref": ref,
+                    "opened_item": opened_item,
                 }
             )
+
+        affirmative_call_reasons: dict[str, str] = {}
+        rejected_call_ids: set[str] = set()
+        for source_record in source_records:
+            metadata = source_record["metadata"]
+            if _retained_source_tool_record_kind(metadata) != "call":
+                continue
+            call_id = str(metadata.get("tool_call_correlation_id") or "").strip()
+            if not call_id:
+                continue
+            opened_item = source_record["opened_item"]
+            original_reason = None
+            if _named_task_source_session_post_hoc_echo_reason(opened_item) is not None:
+                rejected_call_ids.add(call_id)
+            else:
+                original_reason = _named_task_source_session_original_chronology_reason(
+                    opened_item
+                )
+            if original_reason is None:
+                rejected_call_ids.add(call_id)
+                affirmative_call_reasons.pop(call_id, None)
+                continue
+            if call_id not in rejected_call_ids:
+                affirmative_call_reasons[call_id] = original_reason
+
+        for source_record in source_records:
+            metadata = source_record["metadata"]
+            ref = source_record["ref"]
+            opened_item = source_record["opened_item"]
+            if _named_task_source_session_post_hoc_echo_reason(opened_item) is not None:
+                post_hoc_echo_records_rejected += 1
+                continue
+            if metadata.get("conversation_label") == "source_session_metadata":
+                source_session_metadata_records_seen += 1
+                candidate_refs.append(ref)
+                continue
+            if _retained_source_tool_record_kind(metadata) == "output":
+                call_id = str(metadata.get("tool_call_correlation_id") or "").strip()
+                associated_reason = (
+                    affirmative_call_reasons.get(call_id)
+                    if call_id and call_id not in rejected_call_ids
+                    else None
+                )
+                if associated_reason is None:
+                    source_session_outputs_rejected_without_affirmative_call += 1
+                    ambiguous_source_session_records_rejected += 1
+                    continue
+                metadata["associated_call_original_chronology_reason"] = associated_reason
+            original_reason = _named_task_source_session_original_chronology_reason(opened_item)
+            if original_reason is None:
+                ambiguous_source_session_records_rejected += 1
+                continue
+            ref["source_session_original_chronology_reason"] = original_reason
+            if not _opened_named_task_source_session_proof(opened_item):
+                continue
+            substantive_source_paths.add(rel)
+            candidate_refs.append(ref)
             if len(candidate_refs) >= 64:
                 break
         if len(candidate_refs) >= 64:
             break
+    candidate_refs = [
+        ref
+        for ref in candidate_refs
+        if str((ref.get("record_metadata") or {}).get("conversation_label") or "")
+        != "source_session_metadata"
+        or str((ref.get("source_ref") or {}).get("path") or "") in substantive_source_paths
+    ]
     candidate_refs.sort(
         key=lambda ref: (
             -int(ref.get("_retained_source_score") or 0),
@@ -7652,6 +7744,12 @@ def build_retained_source_read_payload(
         opened_refs.append(public)
     report["candidate_files_opened"] = candidate_files_opened
     report["bytes_read"] = bytes_read
+    report["post_hoc_echo_records_rejected"] = post_hoc_echo_records_rejected
+    report["ambiguous_source_session_records_rejected"] = ambiguous_source_session_records_rejected
+    report["source_session_outputs_rejected_without_affirmative_call"] = (
+        source_session_outputs_rejected_without_affirmative_call
+    )
+    report["source_session_metadata_records_seen"] = source_session_metadata_records_seen
     report["opened_refs"] = opened_refs
     if opened_refs:
         report["status"] = "opened_role_valid_source_session_proof"
@@ -7659,7 +7757,15 @@ def build_retained_source_read_payload(
     else:
         return _retained_source_missing_session_payload(
             report,
-            reason="raw_candidates_opened_but_no_role_valid_same_task_record_found",
+            reason=(
+                "raw_candidates_opened_but_no_original_chronology_records_found"
+                if ambiguous_source_session_records_rejected
+                else (
+                    "raw_candidates_opened_but_only_post_hoc_echo_records_found"
+                    if post_hoc_echo_records_rejected
+                    else "raw_candidates_opened_but_no_role_valid_same_task_record_found"
+                )
+            ),
         )
     return {"retained_source_read": report}
 
@@ -13761,7 +13867,17 @@ def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
     if not isinstance(row, dict):
         return None
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    item = row.get("item") if isinstance(row.get("item"), dict) else {}
     message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    tool_call_correlation_id = None
+    for key in ("call_id", "callId", "item_id", "itemId", "id"):
+        for container in (payload, item, message, row):
+            value = str(container.get(key) or "").strip()
+            if value:
+                tool_call_correlation_id = value
+                break
+        if tool_call_correlation_id:
+            break
     classification = classify_conversation_record(row)
     simple_top_level_user_text = (
         classification.label == "unknown"
@@ -13776,7 +13892,9 @@ def _ask_answer_jsonl_record_metadata(raw: str) -> dict | None:
         "top_role": row.get("role"),
         "payload_type": payload.get("type"),
         "payload_role": payload.get("role"),
+        "item_type": item.get("type"),
         "message_role": message.get("role"),
+        "tool_call_correlation_id": tool_call_correlation_id,
         "conversation_label": classification.label,
         "conversation_confidence": classification.confidence,
         "conversation_reasons": list(classification.reasons),
@@ -15728,8 +15846,8 @@ def _named_task_merge_provenance_final_proof_gate(
         "role_evidence": role_evidence,
         "summary_lines": summary_lines,
         "required_next_proof": (
-            "Open a role-valid same-task raw JSONL/session ref before claiming source-session proof; "
-            "an unopened private handle in task or review prose is only a lead."
+            "Open a role-valid same-task original-chronology raw JSONL/session ref before claiming "
+            "source-session proof; an unopened private handle or later answer/report echo is only a lead."
             if blocking_missing == ["source_session_proof"]
             else (
                 "Open same-task task artifact, review artifact, and an actual parent merge commit; also open "
@@ -15738,7 +15856,7 @@ def _named_task_merge_provenance_final_proof_gate(
             )
         ),
         "acceptable_evidence": [
-            "source-session row or raw transcript reference for the task implementation/review/merge episode",
+            "original source-session row or raw transcript reference for the task implementation/review/merge episode, not a later answer/report echo",
             "same-task task artifact recording implementation/review/merge state",
             "same-task independent review artifact or review proof",
             "actual parent merge commit hash for the merge facet; single-parent integration/final-review proof remains a separate closeout surface",
@@ -15760,6 +15878,7 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
         role: [] for role in _NAMED_TASK_MERGE_PROVENANCE_REQUIRED_ROLES
     }
     evidence["integration_commit_proof"] = []
+    evidence["source_session_diagnostic_context"] = []
     for item in opened:
         if item.get("status") != "opened":
             continue
@@ -15783,7 +15902,16 @@ def _named_task_merge_provenance_role_evidence(opened: list[dict], *, task_id: s
             continue
         public = _ref_public_summary(item)
         if _opened_named_task_source_session_proof(item):
+            public["source_session_original_chronology_reason"] = (
+                _named_task_source_session_original_chronology_reason(item)
+            )
             evidence["source_session_proof"].append(public)
+        elif (reason := _named_task_source_session_rejection_reason(item)) is not None:
+            diagnostic = dict(public)
+            diagnostic["final_support_allowed"] = False
+            diagnostic["diagnostic_only"] = True
+            diagnostic["source_session_demotion_reason"] = reason
+            evidence["source_session_diagnostic_context"].append(diagnostic)
         if ref.get("proof_surface") == "task_file" or "/tasks/" in f"/{target}".casefold():
             evidence["task_artifact_proof"].append(public)
         if ref.get("proof_surface") == "review_artifact" or "codex/state/reviews" in target.casefold():
@@ -15882,11 +16010,468 @@ _NAMED_TASK_SOURCE_SESSION_KINDS = frozenset(
 )
 
 
+def _named_task_source_session_post_hoc_echo_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    selection = (
+        ref.get("historical_provenance_selection")
+        if isinstance(ref.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    if ref.get("diagnostic_only") is True or selection.get("diagnostic_only") is True:
+        return "explicit_diagnostic_source_ref"
+    source_role = str(selection.get("source_chronology_role") or "").casefold()
+    if "diagnostic" in source_role or "post_hoc" in source_role or "post-hoc" in source_role:
+        return "diagnostic_or_post_hoc_chronology_role"
+
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "").casefold()).strip()
+    if not summary:
+        return None
+    explicit_echo_markers = (
+        "answer-key",
+        "answer key",
+        "prior final answer",
+        "previous final answer",
+        "prior answer says",
+        "previous answer says",
+        "retained-source-read output",
+        "retained source read output",
+        "retained_source_read output",
+        "eval answer",
+        "evaluation answer",
+        "post-hoc report",
+        "post hoc report",
+        "post-hoc review",
+        "post hoc review",
+        "post-hoc task summary",
+        "post hoc task summary",
+        "post-hoc summary",
+        "post hoc summary",
+        "eval report says",
+        "evaluation report says",
+        "review summary says",
+        "task summary says",
+        "report summary says",
+        "review artifact says",
+        "task artifact says",
+        "report artifact says",
+        "prior report says",
+        "previous report says",
+        "current merge provenance proof for",
+        "completed-task merge/provenance proof for",
+        "named-task merge provenance proof is",
+    )
+    if any(marker in summary for marker in explicit_echo_markers):
+        return "post_hoc_answer_report_or_retained_read_echo"
+
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    compact_summary = summary.replace(" ", "")
+    output_record = (
+        metadata.get("conversation_label") == "tool_action_output"
+        or str(metadata.get("payload_type") or "") in {"function_call_output", "custom_tool_call_output"}
+        or '"type":"function_call_output"' in compact_summary
+        or '"type":"custom_tool_call_output"' in compact_summary
+    )
+    if output_record and any(
+        marker in summary
+        for marker in (
+            "tool output: # review ",
+            "tool output: # jsh-",
+            "tool output: ## progress log",
+            "tool output: verdict: verified",
+            "tool output: status: closed - merged",
+            "tool output: status: closed - integrated",
+            "# review ",
+            "## progress log",
+            "verdict: verified",
+            "status: closed - merged",
+            "status: closed - integrated",
+            "retained source read",
+            "source-session proof:",
+            "implementation evidence",
+        )
+    ):
+        return "post_hoc_task_review_or_report_tool_output"
+    return None
+
+
+_NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES = frozenset(
+    {"rg", "grep", "sed", "cat", "find", "ls", "head", "tail", "jq"}
+)
+_NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS = frozenset({"show", "log", "status"})
+_NAMED_TASK_SOURCE_SESSION_SHELL_SEPARATORS = frozenset({"&&", ";", "||", "|"})
+_NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES = frozenset(
+    {"cd", "export", "source", ".", "pwd", "true", ":", "unset", "set", "umask", "pushd", "popd"}
+)
+_NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
+
+
+def _named_task_source_session_command_text(call_text: str) -> str:
+    normalized = str(call_text or "").strip()
+    marker_index = normalized.find("tool call:")
+    if marker_index >= 0:
+        return normalized[marker_index + len("tool call:") :].strip()
+    match = re.search(r"(?:^|\s)tool call [^:]+:\s*(.*)$", normalized)
+    if match:
+        payload = match.group(1).strip()
+        try:
+            decoded = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return payload
+        if isinstance(decoded, dict):
+            return str(decoded.get("cmd") or decoded.get("command") or "").strip()
+        return str(decoded).strip() if isinstance(decoded, str) else payload
+    match = re.search(r'"(?:command|cmd)"\s*:\s*("(?:\\.|[^"\\])*")', normalized)
+    if match:
+        try:
+            return str(json.loads(match.group(1))).strip()
+        except (json.JSONDecodeError, TypeError):
+            return ""
+    return normalized
+
+
+def _named_task_source_session_shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def _named_task_source_session_effective_argv(argv: list[str]) -> list[str]:
+    argv = list(argv)
+    while argv and _NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(argv[0]):
+        argv = argv[1:]
+    while argv:
+        executable = os.path.basename(argv[0])
+        if executable == "env":
+            index = 1
+            while index < len(argv):
+                token = argv[index]
+                if token == "--":
+                    index += 1
+                    break
+                if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                    index += 1
+                    continue
+                if token in {"-u", "--unset"}:
+                    if index + 1 >= len(argv):
+                        return []
+                    index += 2
+                    continue
+                if token.startswith("--unset="):
+                    index += 1
+                    continue
+                break
+            argv = argv[index:]
+        elif executable in {"command", "exec", "sudo"}:
+            if len(argv) > 1 and argv[1] == "--":
+                argv = argv[2:]
+            elif len(argv) > 1 and argv[1].startswith("-"):
+                return []
+            else:
+                argv = argv[1:]
+        elif executable == "time":
+            index = 1
+            while index < len(argv) and argv[index] in {"-p", "--portability"}:
+                index += 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            argv = argv[index:]
+        elif executable == "nice":
+            index = 1
+            if index < len(argv) and argv[index] == "-n":
+                if index + 1 >= len(argv):
+                    return []
+                index += 2
+            elif index < len(argv) and (
+                re.fullmatch(r"-\d+", argv[index]) or argv[index].startswith("--adjustment=")
+            ):
+                index += 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            argv = argv[index:]
+        elif executable == "timeout":
+            index = 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            if index >= len(argv):
+                return []
+            argv = argv[index + 1 :]
+        elif executable == "stdbuf":
+            index = 1
+            while index < len(argv) and argv[index].startswith("-"):
+                token = argv[index]
+                if token in {"-i", "-o", "-e"}:
+                    if index + 1 >= len(argv):
+                        return []
+                    index += 2
+                    continue
+                if re.fullmatch(r"-[ioe].+", token) or re.fullmatch(
+                    r"--(?:input|output|error)=.+", token
+                ):
+                    index += 1
+                    continue
+                return []
+            argv = argv[index:]
+        else:
+            return argv
+        while argv and _NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(argv[0]):
+            argv = argv[1:]
+    return []
+
+
+def _named_task_source_session_unwrapped_command_details(
+    command: str,
+) -> tuple[list[str], bool]:
+    argv = _named_task_source_session_shell_tokens(command)
+    shell_wrapped = False
+    while argv:
+        argv = _named_task_source_session_effective_argv(argv)
+        if not argv:
+            return [], shell_wrapped
+        executable = os.path.basename(argv[0])
+        if executable in {"bash", "sh", "zsh"}:
+            for index, token in enumerate(argv[1:], start=1):
+                if token.startswith("-") and "c" in token[1:] and index + 1 < len(argv):
+                    argv = _named_task_source_session_shell_tokens(argv[index + 1])
+                    shell_wrapped = True
+                    break
+            else:
+                return argv, shell_wrapped
+            continue
+        return argv, shell_wrapped
+    return [], shell_wrapped
+
+
+def _named_task_source_session_command_segments(
+    argv: list[str],
+) -> tuple[list[list[str]], list[str], bool]:
+    segments: list[list[str]] = []
+    separators: list[str] = []
+    current: list[str] = []
+    for token in argv:
+        if token in _NAMED_TASK_SOURCE_SESSION_SHELL_SEPARATORS:
+            if not current:
+                return [], [], False
+            segments.append(current)
+            separators.append(token)
+            current = []
+            continue
+        if token and set(token).issubset({";", "&", "|"}):
+            return [], [], False
+        current.append(token)
+    if not current:
+        return [], [], False
+    segments.append(current)
+    return segments, separators, True
+
+
+def _named_task_source_session_git_subcommand(argv: list[str]) -> str:
+    index = 1
+    options_with_values = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
+    while index < len(argv):
+        token = argv[index]
+        if token in options_with_values:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return ""
+
+
+def _named_task_source_session_reader_argv(argv: list[str]) -> bool:
+    argv = _named_task_source_session_effective_argv(argv)
+    if not argv:
+        return False
+    executable = os.path.basename(argv[0])
+    if executable in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES:
+        return True
+    return (
+        executable == "git"
+        and _named_task_source_session_git_subcommand(argv)
+        in _NAMED_TASK_SOURCE_SESSION_READ_ONLY_GIT_SUBCOMMANDS
+    )
+
+
+def _named_task_source_session_action_argv(argv: list[str]) -> bool:
+    argv = _named_task_source_session_effective_argv(argv)
+    if not argv:
+        return False
+    executable = os.path.basename(argv[0])
+    if executable in {"pytest", "compileall", "py_compile", "apply_patch"}:
+        return True
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+        try:
+            module_index = argv.index("-m") + 1
+        except (ValueError, IndexError):
+            return False
+        if module_index >= len(argv):
+            return False
+        module = argv[module_index]
+        if module in {"pytest", "compileall", "py_compile"}:
+            return True
+        return (
+            module == "jsonl_history_search.cli"
+            and module_index + 1 < len(argv)
+            and argv[module_index + 1] in {"ask", "what-happened-since"}
+        )
+    if executable == "git":
+        subcommand = _named_task_source_session_git_subcommand(argv)
+        return subcommand in {"commit", "apply"} or (subcommand == "diff" and "--check" in argv)
+    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] in {
+        "ask",
+        "what-happened-since",
+    }
+
+
+def _named_task_source_session_setup_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if all(_NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(token) for token in argv):
+        return True
+    effective = _named_task_source_session_effective_argv(argv)
+    return bool(
+        effective
+        and os.path.basename(effective[0]) in _NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES
+    )
+
+
+def _named_task_source_session_command_structure(call_text: str) -> str:
+    command = _named_task_source_session_command_text(call_text)
+    argv, shell_wrapped = _named_task_source_session_unwrapped_command_details(command)
+    if not argv:
+        return (
+            "ambiguous_compound"
+            if re.search(r"(?:^|\s)(?:bash|sh|zsh)\b|[;&|]", command)
+            else "unavailable"
+        )
+    segments, separators, valid = _named_task_source_session_command_segments(argv)
+    if not valid:
+        return "ambiguous_compound"
+    if any(_named_task_source_session_reader_argv(segment) for segment in segments):
+        return "read_only"
+    compound = bool(separators)
+    if shell_wrapped or compound:
+        if any(separator in {"|", "||"} for separator in separators):
+            return "ambiguous_compound"
+        action_count = sum(_named_task_source_session_action_argv(segment) for segment in segments)
+        safely_reducible = all(
+            _named_task_source_session_action_argv(segment)
+            or _named_task_source_session_setup_argv(segment)
+            for segment in segments
+        )
+        return "affirmative_action" if safely_reducible and action_count == 1 else "ambiguous_compound"
+    return "affirmative_action" if _named_task_source_session_action_argv(segments[0]) else "simple_other"
+
+
+def _named_task_source_session_read_only_command(call_text: str) -> bool:
+    return _named_task_source_session_command_structure(call_text) == "read_only"
+
+
+def _named_task_source_session_original_chronology_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    if _named_task_source_session_post_hoc_echo_reason(item) is not None:
+        return None
+    metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+    if metadata.get("conversation_label") == "source_session_metadata":
+        return None
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "").casefold()).strip()
+    if not summary:
+        return None
+
+    payload_type = str(metadata.get("payload_type") or "").casefold()
+    item_type = str(metadata.get("item_type") or "").casefold()
+    conversation_label = str(metadata.get("conversation_label") or "").casefold()
+    structured_tool_record = (
+        item_type == "command_execution"
+        or conversation_label == "tool_action_output"
+        or payload_type
+        in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}
+        or summary.startswith("tool call:")
+        or summary.startswith("tool output:")
+        or '"type":"command_execution"' in summary.replace(" ", "")
+    )
+    if structured_tool_record:
+        call_text, separator, output_text = summary.partition("tool output:")
+        call_text = call_text.rstrip()
+        if separator and call_text.endswith("|"):
+            call_text = call_text[:-1].rstrip()
+        command_structure = _named_task_source_session_command_structure(call_text)
+        output_record = payload_type in {"function_call_output", "custom_tool_call_output"} or (
+            item_type != "command_execution"
+            and bool(re.search(r"(?:^|\s)tool output:\s*", summary))
+        )
+        clear_output_record = output_record and "tool call" not in call_text
+        if command_structure in {"read_only", "ambiguous_compound"}:
+            return None
+        if command_structure == "simple_other" and not clear_output_record:
+            return None
+        if command_structure == "affirmative_action":
+            return "structured_change_verification_or_runtime_command"
+        result_text = output_text if separator else summary
+        has_execution_result = any(
+            marker in result_text
+            for marker in (
+                "report_output_unavailable",
+                "process exited with code 0",
+                '"exit_code":0',
+                '"exit_code": 0',
+                "tests passed",
+                "test passed",
+                " passed in ",
+                "answer status:",
+                "execution status:",
+            )
+        )
+        associated_call_reason = str(
+            metadata.get("associated_call_original_chronology_reason") or ""
+        )
+        if (
+            has_execution_result
+            and clear_output_record
+            and associated_call_reason
+            == "structured_change_verification_or_runtime_command"
+        ):
+            return "structured_tool_execution_result_with_affirmative_call"
+        return None
+    return None
+
+
+def _named_task_source_session_rejection_reason(item: dict) -> str | None:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    if str(ref.get("target_source_role") or "") not in _NAMED_TASK_SOURCE_SESSION_ROLES:
+        return None
+    post_hoc_reason = _named_task_source_session_post_hoc_echo_reason(item)
+    if post_hoc_reason is not None:
+        return post_hoc_reason
+    if _named_task_source_session_original_chronology_reason(item) is None:
+        return "ambiguous_raw_record_without_original_chronology_signal"
+    return None
+
+
 def _opened_named_task_source_session_proof(item: dict) -> bool:
     if item.get("status") != "opened" or not str(item.get("summary") or "").strip():
         return False
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
     if ref.get("final_support_allowed") is False or ref.get("diagnostic_only") is True:
+        return False
+    if _named_task_source_session_post_hoc_echo_reason(item) is not None:
+        return False
+    if _named_task_source_session_original_chronology_reason(item) is None:
         return False
     target_role = str(ref.get("target_source_role") or "")
     if target_role not in _NAMED_TASK_SOURCE_SESSION_ROLES:
