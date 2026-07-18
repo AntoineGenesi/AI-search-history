@@ -277,6 +277,16 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         ),
     )
     ask.add_argument(
+        "--activation-mode",
+        choices=("implicit", "explicit-only"),
+        default=os.environ.get("JSONL_HISTORY_SEARCH_ACTIVATION_MODE", "implicit"),
+        help=(
+            "Latest-status trigger mode. implicit (default) routes natural prior-message wording; "
+            "explicit-only requires a leading `convo`. The environment variable "
+            "JSONL_HISTORY_SEARCH_ACTIVATION_MODE sets the default."
+        ),
+    )
+    ask.add_argument(
         "--execute",
         action="store_true",
         help=(
@@ -5093,6 +5103,7 @@ def _answer_action_contract_from_executed_output(
             },
             "clarification_request": compact.get("clarification_request"),
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
+            "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "follow_through_plan": compact.get("follow_through_plan"),
             "evidence_modes": (compact.get("evidence_contract") or {}).get("source_modes"),
             "source_role_labels": (compact.get("evidence_contract") or {}).get("source_role_labels"),
@@ -8475,6 +8486,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "summary": compact.get("summary"),
             "selected_anchor": compact.get("selected_anchor"),
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
+            "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "answer_readiness": compact.get("answer_readiness"),
             "source_tiers": {
                 "tier_order": (compact.get("source_tiers") or {}).get("tier_order"),
@@ -9323,6 +9335,7 @@ def _ask_answer_from_execute(
                 "answer_action_status": action.get("answer_status"),
                 "promotion_status": action.get("promotion_status"),
                 "saved_report": action.get("saved_report") or execution.get("report_written"),
+                "parent_thread_side_boundary": action.get("parent_thread_side_boundary"),
             },
         }
     }
@@ -16485,6 +16498,7 @@ def main(argv: list[str] | None = None) -> int:
             args.query,
             cwd=cwd,
             evidence_source=args.evidence_source,
+            activation_mode=args.activation_mode,
         )
         auto_execute_bounded = (
             args.auto_execute_bounded_no_evidence

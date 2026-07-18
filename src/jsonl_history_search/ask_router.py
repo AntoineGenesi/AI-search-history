@@ -40,14 +40,17 @@ STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
 LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
 NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY = "named_task_evidence_source_required"
+EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY = "explicit_history_trigger_required"
 NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
     {
         NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
         LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
         NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+        EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
     }
 )
 EvidenceSource = Literal["local", "conversation-history"]
+ActivationMode = Literal["implicit", "explicit-only"]
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,23 @@ NON_HISTORY_CLARIFICATION_ROUTE = AskRoute(
         "There is no search step for the bare prompt. Use the user's clarification "
         "to choose local context, a named artifact, or an explicit history route."
     ),
+)
+
+EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE = AskRoute(
+    route_family=EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
+    chosen_route="explicit history trigger required",
+    why_it_applies=(
+        "Latest-status implicit activation is disabled. Prefix the same request "
+        "with `convo` to select conversation-history routing."
+    ),
+    first_command_template="No tool call; ask the user to prefix the history request with `convo`.",
+    read_specialization="none",
+    inspect_after=(),
+    stop_guidance=(
+        "Use zero tools in explicit-only mode until the user supplies an explicit `convo` trigger. "
+        "Do not run JSONL, Git, repo search, task/state scans, or filesystem inspection."
+    ),
+    manual_search_guidance="There is no search step until the explicit `convo` trigger is present.",
 )
 
 BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
@@ -822,8 +842,14 @@ def build_ask_router_payload(
     cwd: str = ".",
     *,
     evidence_source: EvidenceSource | None = None,
+    activation_mode: ActivationMode = "implicit",
 ) -> dict:
-    route = classify_ask_route(query, evidence_source=evidence_source)
+    route = classify_ask_route(
+        query,
+        evidence_source=evidence_source,
+        activation_mode=activation_mode,
+    )
+    explicit_convo_trigger = _explicit_convo_trigger_query(query) is not None
     named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(query)
     if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
@@ -835,6 +861,10 @@ def build_ask_router_payload(
         elif route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY:
             resolution_guidance = (
                 "No command resolution is allowed until the named-task evidence source is declared."
+            )
+        elif route.route_family == EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY:
+            resolution_guidance = (
+                "No command resolution is allowed until explicit-only mode receives a leading `convo` trigger."
             )
         else:
             resolution_guidance = "No JSONL command resolution is needed for this no-tool route."
@@ -859,6 +889,7 @@ def build_ask_router_payload(
     elif route.route_family in {
         NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
         NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+        EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
     }:
         first_action_category = "no_tool"
     else:
@@ -899,7 +930,10 @@ def build_ask_router_payload(
             "cleanup_request_status": "explicit" if cleanup_requested else "not_requested",
         }
         optional_deeper_reads = storage_optional_deeper_reads(cli_prefix=cli_prefix)
-    if route.route_family == NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY:
+    if route.route_family in {
+        NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
+        EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
+    }:
         next_commands = []
     elif route is NAMED_TASK_LOCAL_ROUTE:
         next_commands = named_task_local_next_commands(
@@ -920,6 +954,8 @@ def build_ask_router_payload(
             "cwd": cwd,
             "evidence_source": evidence_source,
             "evidence_source_applies": named_task_target,
+            "activation_mode": activation_mode,
+            "explicit_convo_trigger": explicit_convo_trigger,
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
             "first_action_category": first_action_category,
@@ -969,8 +1005,11 @@ def classify_ask_route(
     query: str,
     *,
     evidence_source: EvidenceSource | None = None,
+    activation_mode: ActivationMode = "implicit",
 ) -> AskRoute:
-    normalized = " ".join(query.lower().replace("?", " ").replace("!", " ").split())
+    explicit_query = _explicit_convo_trigger_query(query)
+    classification_query = explicit_query if explicit_query is not None else query
+    normalized = " ".join(classification_query.lower().replace("?", " ").replace("!", " ").split())
 
     if _EXPLICIT_TASK_PATH_RE.search(normalized):
         if evidence_source == "local":
@@ -1024,6 +1063,8 @@ def classify_ask_route(
         return ACTIVE_STATUS_FRONT_DOOR_ROUTE
 
     if _looks_like_latest_status_anchor_query(normalized):
+        if activation_mode == "explicit-only" and explicit_query is None:
+            return EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE
         return ROUTES[5]
 
     if _looks_like_current_local_scope_query(normalized):
@@ -1108,6 +1149,14 @@ def classify_ask_route(
             "no-evidence or a named missing-primary-source blocker."
         ),
     )
+
+
+def _explicit_convo_trigger_query(query: str) -> str | None:
+    match = re.match(r"^\s*convo(?:\s*:\s*|\s+)(?P<query>.+?)\s*$", query, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    explicit_query = match.group("query").strip()
+    return explicit_query or None
 
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
