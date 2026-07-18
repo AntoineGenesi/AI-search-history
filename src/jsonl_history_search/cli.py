@@ -16068,10 +16068,10 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
     )
     if structured_tool_record:
         call_text, separator, output_text = summary.partition("tool output:")
-        if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
-            return "structured_change_verification_or_runtime_command"
         if _NAMED_TASK_SOURCE_SESSION_READ_ONLY_COMMAND_RE.search(call_text):
             return None
+        if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
+            return "structured_change_verification_or_runtime_command"
         result_text = output_text if separator else summary
         has_execution_result = any(
             marker in result_text
