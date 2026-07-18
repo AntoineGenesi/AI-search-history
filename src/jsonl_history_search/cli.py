@@ -16022,20 +16022,6 @@ def _named_task_source_session_post_hoc_echo_reason(item: dict) -> str | None:
     return None
 
 
-_NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS = (
-    "apply_patch",
-    "git apply",
-    "git commit",
-    "pytest",
-    "compileall",
-    "py_compile",
-    "git diff --check",
-    "jsonl-history-search ask",
-    "jsonl_history_search.cli ask",
-    "jsonl-history-search what-happened-since",
-    "jsonl_history_search.cli what-happened-since",
-)
-
 _NAMED_TASK_SOURCE_SESSION_READ_ONLY_EXECUTABLES = frozenset(
     {"rg", "grep", "sed", "cat", "find", "ls", "head", "tail", "jq"}
 )
@@ -16044,6 +16030,7 @@ _NAMED_TASK_SOURCE_SESSION_SHELL_SEPARATORS = frozenset({"&&", ";", "||", "|"})
 _NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES = frozenset(
     {"cd", "export", "source", ".", "pwd", "true", ":", "unset", "set", "umask", "pushd", "popd"}
 )
+_NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 
 
 def _named_task_source_session_command_text(call_text: str) -> str:
@@ -16080,25 +16067,105 @@ def _named_task_source_session_shell_tokens(command: str) -> list[str]:
         return []
 
 
+def _named_task_source_session_effective_argv(argv: list[str]) -> list[str]:
+    argv = list(argv)
+    while argv and _NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(argv[0]):
+        argv = argv[1:]
+    while argv:
+        executable = os.path.basename(argv[0])
+        if executable == "env":
+            index = 1
+            while index < len(argv):
+                token = argv[index]
+                if token == "--":
+                    index += 1
+                    break
+                if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                    index += 1
+                    continue
+                if token in {"-u", "--unset"}:
+                    if index + 1 >= len(argv):
+                        return []
+                    index += 2
+                    continue
+                if token.startswith("--unset="):
+                    index += 1
+                    continue
+                break
+            argv = argv[index:]
+        elif executable in {"command", "exec", "sudo"}:
+            if len(argv) > 1 and argv[1] == "--":
+                argv = argv[2:]
+            elif len(argv) > 1 and argv[1].startswith("-"):
+                return []
+            else:
+                argv = argv[1:]
+        elif executable == "time":
+            index = 1
+            while index < len(argv) and argv[index] in {"-p", "--portability"}:
+                index += 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            argv = argv[index:]
+        elif executable == "nice":
+            index = 1
+            if index < len(argv) and argv[index] == "-n":
+                if index + 1 >= len(argv):
+                    return []
+                index += 2
+            elif index < len(argv) and (
+                re.fullmatch(r"-\d+", argv[index]) or argv[index].startswith("--adjustment=")
+            ):
+                index += 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            argv = argv[index:]
+        elif executable == "timeout":
+            index = 1
+            if index < len(argv) and argv[index] == "--":
+                index += 1
+            elif index < len(argv) and argv[index].startswith("-"):
+                return []
+            if index >= len(argv):
+                return []
+            argv = argv[index + 1 :]
+        elif executable == "stdbuf":
+            index = 1
+            while index < len(argv) and argv[index].startswith("-"):
+                token = argv[index]
+                if token in {"-i", "-o", "-e"}:
+                    if index + 1 >= len(argv):
+                        return []
+                    index += 2
+                    continue
+                if re.fullmatch(r"-[ioe].+", token) or re.fullmatch(
+                    r"--(?:input|output|error)=.+", token
+                ):
+                    index += 1
+                    continue
+                return []
+            argv = argv[index:]
+        else:
+            return argv
+        while argv and _NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(argv[0]):
+            argv = argv[1:]
+    return []
+
+
 def _named_task_source_session_unwrapped_command_details(
     command: str,
 ) -> tuple[list[str], bool]:
     argv = _named_task_source_session_shell_tokens(command)
     shell_wrapped = False
     while argv:
+        argv = _named_task_source_session_effective_argv(argv)
+        if not argv:
+            return [], shell_wrapped
         executable = os.path.basename(argv[0])
-        if executable == "env":
-            index = 1
-            while index < len(argv) and (argv[index].startswith("-") or "=" in argv[index]):
-                index += 1
-            argv = argv[index:]
-            continue
-        if executable in {"command", "exec", "sudo"}:
-            index = 1
-            while index < len(argv) and argv[index].startswith("-"):
-                index += 1
-            argv = argv[index:]
-            continue
         if executable in {"bash", "sh", "zsh"}:
             for index, token in enumerate(argv[1:], start=1):
                 if token.startswith("-") and "c" in token[1:] and index + 1 < len(argv):
@@ -16151,6 +16218,7 @@ def _named_task_source_session_git_subcommand(argv: list[str]) -> str:
 
 
 def _named_task_source_session_reader_argv(argv: list[str]) -> bool:
+    argv = _named_task_source_session_effective_argv(argv)
     if not argv:
         return False
     executable = os.path.basename(argv[0])
@@ -16164,6 +16232,7 @@ def _named_task_source_session_reader_argv(argv: list[str]) -> bool:
 
 
 def _named_task_source_session_action_argv(argv: list[str]) -> bool:
+    argv = _named_task_source_session_effective_argv(argv)
     if not argv:
         return False
     executable = os.path.basename(argv[0])
@@ -16193,6 +16262,18 @@ def _named_task_source_session_action_argv(argv: list[str]) -> bool:
     }
 
 
+def _named_task_source_session_setup_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if all(_NAMED_TASK_SOURCE_SESSION_ASSIGNMENT_RE.fullmatch(token) for token in argv):
+        return True
+    effective = _named_task_source_session_effective_argv(argv)
+    return bool(
+        effective
+        and os.path.basename(effective[0]) in _NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES
+    )
+
+
 def _named_task_source_session_command_structure(call_text: str) -> str:
     command = _named_task_source_session_command_text(call_text)
     argv, shell_wrapped = _named_task_source_session_unwrapped_command_details(command)
@@ -16214,7 +16295,7 @@ def _named_task_source_session_command_structure(call_text: str) -> str:
         action_count = sum(_named_task_source_session_action_argv(segment) for segment in segments)
         safely_reducible = all(
             _named_task_source_session_action_argv(segment)
-            or os.path.basename(segment[0]) in _NAMED_TASK_SOURCE_SESSION_SETUP_EXECUTABLES
+            or _named_task_source_session_setup_argv(segment)
             for segment in segments
         )
         return "affirmative_action" if safely_reducible and action_count == 1 else "ambiguous_compound"
@@ -16256,11 +16337,16 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
         if separator and call_text.endswith("|"):
             call_text = call_text[:-1].rstrip()
         command_structure = _named_task_source_session_command_structure(call_text)
+        output_record = payload_type in {"function_call_output", "custom_tool_call_output"} or (
+            item_type != "command_execution"
+            and bool(re.search(r"(?:^|\s)tool output:\s*", summary))
+        )
+        clear_output_record = output_record and "tool call" not in call_text
         if command_structure in {"read_only", "ambiguous_compound"}:
             return None
+        if command_structure == "simple_other" and not clear_output_record:
+            return None
         if command_structure == "affirmative_action":
-            return "structured_change_verification_or_runtime_command"
-        if any(marker in call_text for marker in _NAMED_TASK_SOURCE_SESSION_ACTION_COMMAND_MARKERS):
             return "structured_change_verification_or_runtime_command"
         result_text = output_text if separator else summary
         has_execution_result = any(
@@ -16277,7 +16363,7 @@ def _named_task_source_session_original_chronology_reason(item: dict) -> str | N
                 "execution status:",
             )
         )
-        if has_execution_result:
+        if has_execution_result and clear_output_record:
             return "structured_tool_execution_result"
         return None
     return None
