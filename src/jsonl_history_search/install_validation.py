@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_command_cookbook import agent_question_cookbook
+from .codex_skill_install import CodexSkillAssets, resolve_codex_skill_assets
 from .sources import Limits, build_source_plan
 
 
@@ -49,19 +50,30 @@ def validate_install(
 ) -> dict[str, Any]:
     root = (package_root or default_package_root()).expanduser().resolve()
     source_checkout = _is_source_checkout(root)
+    try:
+        skill_assets = resolve_codex_skill_assets(root)
+    except FileNotFoundError:
+        skill_assets = None
     checks = [
         _check_cli_import(),
         _check_console_script(root),
         _check_convo_console_alias(root),
-        _check_package_skill(root, source_checkout=source_checkout),
-        _check_package_helpers(root, source_checkout=source_checkout),
+        _check_package_skill(root, source_checkout=source_checkout, assets=skill_assets),
+        _check_package_helpers(root, source_checkout=source_checkout, assets=skill_assets),
         _check_package_helper_behavior(root, source_checkout=source_checkout),
         _check_package_ask_first_launcher_behavior(root, source_checkout=source_checkout),
         _check_safe_root_rejection(root),
     ]
     checks.extend(_check_redaction_and_fixture_search())
     if codex_home is not None:
-        checks.extend(_check_global_codex_install(codex_home.expanduser(), root, source_checkout=source_checkout))
+        checks.extend(
+            _check_global_codex_install(
+                codex_home.expanduser(),
+                root,
+                source_checkout=source_checkout,
+                assets=skill_assets,
+            )
+        )
     checks.extend(_check_install_currentness(root, source_checkout=source_checkout))
 
     counts = _status_counts(checks)
@@ -93,6 +105,20 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
     else:
         stale_or_missing = [check.id for check in global_checks if check.status == "fail"]
         freshness_status = "pass" if not stale_or_missing else "fail"
+    by_id = {check.id: check for check in checks}
+    cli_statuses = [by_id[check_id].status for check_id in ("cli_import", "console_script", "console_alias_convo")]
+    if "fail" in cli_statuses:
+        cli_status = "missing_or_broken"
+    elif "warn" in cli_statuses:
+        cli_status = "source_mode_only"
+    else:
+        cli_status = "installed"
+    if codex_home is None:
+        skill_status = "not_checked"
+    elif freshness_status == "pass":
+        skill_status = "installed"
+    else:
+        skill_status = "missing_or_stale"
     return {
         "purpose": (
             "Run before free-agent or user-facing JSONL workflows that rely on "
@@ -101,7 +127,21 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
         "global_skill_freshness": freshness_status,
         "must_refresh_global_skill": freshness_status == "fail",
         "stale_or_missing_global_checks": stale_or_missing,
-        "refresh_command": "bash install/install_codex_global.sh",
+        "install_layers": {
+            "python_cli": {
+                "status": cli_status,
+                "required": True,
+                "install_command": "pipx install jsonl-history-search",
+                "detail": "The Python package provides the jsonl-history-search and convo commands.",
+            },
+            "codex_skill": {
+                "status": skill_status,
+                "required": False,
+                "install_command": "jsonl-history-search install-codex-skill",
+                "detail": "The optional Codex skill adds agent routing guidance; it does not provide the CLI.",
+            },
+        },
+        "refresh_command": "jsonl-history-search install-codex-skill",
         "validate_global_command": (
             "jsonl-history-search validate-install --codex-home ~/.codex --format text"
         ),
@@ -563,7 +603,12 @@ def _pyproject_declares_console_script(package_root: Path, command: str = "jsonl
     return f'{command} = "jsonl_history_search.cli:main"' in text
 
 
-def _check_package_skill(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+def _check_package_skill(
+    package_root: Path,
+    *,
+    source_checkout: bool = True,
+    assets: CodexSkillAssets | None = None,
+) -> ValidationCheck:
     path = package_root / "skills" / "codex" / "jsonl-history-search" / "SKILL.md"
     if path.is_file():
         return ValidationCheck(
@@ -573,18 +618,25 @@ def _check_package_skill(package_root: Path, *, source_checkout: bool = True) ->
             detail="Package Codex skill file is present.",
             paths=[str(path)],
         )
+    if not source_checkout and assets is not None:
+        return ValidationCheck(
+            id="package_skill",
+            name="Packaged Codex skill assets",
+            status="pass",
+            detail="Optional Codex skill assets are bundled with the installed Python package.",
+            paths=[str(assets.skill)],
+            metadata={"source_checkout": False, "asset_source": assets.source},
+        )
     if not source_checkout:
         return ValidationCheck(
             id="package_skill",
             name="Package Codex skill file",
             status="warn",
             detail=(
-                "Package Codex skill file is not present in the installed Python environment. "
-                "This is expected for wheel installs; run from a source checkout to use "
-                "`install/install_codex_global.sh`."
+                "Optional Codex skill assets are missing from the installed Python package."
             ),
             paths=[str(path)],
-            recovery=["Use a source checkout for optional global Codex skill installation."],
+            recovery=["Reinstall the Python package before running `jsonl-history-search install-codex-skill`."],
             metadata={"source_checkout": False},
         )
     return ValidationCheck(
@@ -597,7 +649,12 @@ def _check_package_skill(package_root: Path, *, source_checkout: bool = True) ->
     )
 
 
-def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
+def _check_package_helpers(
+    package_root: Path,
+    *,
+    source_checkout: bool = True,
+    assets: CodexSkillAssets | None = None,
+) -> ValidationCheck:
     helpers = [
         package_root / "scripts" / "search_jsonl_history.py",
         package_root / "scripts" / "jsonl_ask_first.py",
@@ -612,6 +669,15 @@ def _check_package_helpers(package_root: Path, *, source_checkout: bool = True) 
             status="pass",
             detail="Package helper scripts are present and executable.",
             paths=[str(path) for path in helpers],
+        )
+    if not source_checkout and assets is not None:
+        return ValidationCheck(
+            id="package_helpers",
+            name="Packaged Codex skill helpers",
+            status="pass",
+            detail="Optional Codex skill helper assets are bundled with the installed Python package.",
+            paths=[str(assets.search_helper), str(assets.ask_first_helper)],
+            metadata={"source_checkout": False, "asset_source": assets.source},
         )
     if not source_checkout:
         return ValidationCheck(
@@ -1041,21 +1107,28 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
         return checks
 
 
-def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_checkout: bool = True) -> list[ValidationCheck]:
+def _check_global_codex_install(
+    codex_home: Path,
+    package_root: Path,
+    *,
+    source_checkout: bool = True,
+    assets: CodexSkillAssets | None = None,
+) -> list[ValidationCheck]:
     skill_root = codex_home / "skills" / "jsonl-history-search"
     skill = skill_root / "SKILL.md"
     references = skill_root / "references"
     helper = skill_root / "scripts" / "search_jsonl_history.py"
     ask_first_launcher = skill_root / "scripts" / "jsonl_ask_first.py"
-    package_skill_root = package_root / "skills" / "codex" / "jsonl-history-search"
-    package_skill = package_skill_root / "SKILL.md"
-    package_references = package_skill_root / "references"
-    package_helper = package_root / "scripts" / "search_jsonl_history.py"
-    package_ask_first_launcher = package_root / "scripts" / "jsonl_ask_first.py"
+    package_skill_root = assets.root if assets is not None else package_root / "skills" / "codex" / "jsonl-history-search"
+    package_skill = assets.skill if assets is not None else package_skill_root / "SKILL.md"
+    package_references = assets.references if assets is not None else package_skill_root / "references"
+    package_helper = assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py"
+    package_ask_first_launcher = assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py"
+    compare_packaged = assets is not None or source_checkout
     checks: list[ValidationCheck] = []
     checks.append(_check_global_backup_skill_dirs(codex_home))
     if skill.is_file():
-        checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, source_checkout=source_checkout))
+        checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, compare_packaged=compare_packaged))
     else:
         checks.append(
             ValidationCheck(
@@ -1064,7 +1137,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 status="fail",
                 detail="Global Codex skill file is missing at the provided --codex-home.",
                 paths=[str(skill)],
-                recovery=["Run `bash install/install_codex_global.sh` from the package root, or copy the skill file manually."],
+                recovery=["Run `jsonl-history-search install-codex-skill`."],
             )
         )
     if references.is_dir():
@@ -1074,7 +1147,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 "Global Codex skill references",
                 references,
                 package_references,
-                source_checkout=source_checkout,
+                compare_packaged=compare_packaged,
             )
         )
     else:
@@ -1085,11 +1158,11 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 status="fail",
                 detail="Global Codex skill references folder is missing at the provided --codex-home.",
                 paths=[str(references)],
-                recovery=["Run `bash install/install_codex_global.sh` from the package root to install the routed references folder."],
+                recovery=["Run `jsonl-history-search install-codex-skill` to install the routed references folder."],
             )
         )
     if helper.is_file() and os.access(helper, os.X_OK):
-        checks.append(_global_copy_check("global_helper", "Global Codex helper script", helper, package_helper, source_checkout=source_checkout))
+        checks.append(_global_copy_check("global_helper", "Global Codex helper script", helper, package_helper, compare_packaged=compare_packaged))
     else:
         checks.append(
             ValidationCheck(
@@ -1098,7 +1171,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 status="fail",
                 detail="Global Codex helper is missing or not executable at the provided --codex-home.",
                 paths=[str(helper)],
-                recovery=["Copy `scripts/search_jsonl_history.py` into the skill scripts folder and run `chmod +x` on it."],
+                recovery=["Run `jsonl-history-search install-codex-skill` to install the helper scripts."],
             )
         )
     if ask_first_launcher.is_file() and os.access(ask_first_launcher, os.X_OK):
@@ -1108,7 +1181,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 "Global Codex ask-first launcher",
                 ask_first_launcher,
                 package_ask_first_launcher,
-                source_checkout=source_checkout,
+                compare_packaged=compare_packaged,
             )
         )
     else:
@@ -1119,7 +1192,7 @@ def _check_global_codex_install(codex_home: Path, package_root: Path, *, source_
                 status="fail",
                 detail="Global Codex ask-first launcher is missing or not executable at the provided --codex-home.",
                 paths=[str(ask_first_launcher)],
-                recovery=["Copy `scripts/jsonl_ask_first.py` into the skill scripts folder and run `chmod +x` on it."],
+                recovery=["Run `jsonl-history-search install-codex-skill` to install the helper scripts."],
             )
         )
     return checks
@@ -1181,17 +1254,17 @@ def _global_copy_check(
     installed: Path,
     packaged: Path,
     *,
-    source_checkout: bool,
+    compare_packaged: bool,
 ) -> ValidationCheck:
     paths = [str(installed)]
-    if not source_checkout or not packaged.is_file():
+    if not compare_packaged or not packaged.is_file():
         return ValidationCheck(
             id=check_id,
             name=name,
             status="pass",
             detail=f"{name} is present.",
             paths=paths,
-            metadata={"source_checkout": source_checkout},
+            metadata={"package_reference_available": compare_packaged},
         )
 
     paths.append(str(packaged))
@@ -1207,7 +1280,7 @@ def _global_copy_check(
             id=check_id,
             name=name,
             status="pass",
-            detail=f"{name} matches the package checkout copy.",
+            detail=f"{name} matches the bundled package copy.",
             paths=paths,
             metadata=metadata,
         )
@@ -1215,9 +1288,9 @@ def _global_copy_check(
         id=check_id,
         name=name,
         status="fail",
-        detail=f"{name} is installed but stale relative to the package checkout copy.",
+        detail=f"{name} is installed but stale relative to the bundled package copy.",
         paths=paths,
-        recovery=["Run `bash install/install_codex_global.sh` from the package root to refresh the global Codex skill/helper."],
+        recovery=["Run `jsonl-history-search install-codex-skill` to refresh the optional Codex skill."],
         metadata=metadata,
     )
 
@@ -1228,17 +1301,17 @@ def _global_tree_check(
     installed: Path,
     packaged: Path,
     *,
-    source_checkout: bool,
+    compare_packaged: bool,
 ) -> ValidationCheck:
     paths = [str(installed)]
-    if not source_checkout or not packaged.is_dir():
+    if not compare_packaged or not packaged.is_dir():
         return ValidationCheck(
             id=check_id,
             name=name,
             status="pass",
             detail=f"{name} folder is present.",
             paths=paths,
-            metadata={"source_checkout": source_checkout},
+            metadata={"package_reference_available": compare_packaged},
         )
 
     paths.append(str(packaged))
@@ -1254,7 +1327,7 @@ def _global_tree_check(
             id=check_id,
             name=name,
             status="pass",
-            detail=f"{name} folder matches the package checkout copy.",
+            detail=f"{name} folder matches the bundled package copy.",
             paths=paths,
             metadata=metadata,
         )
@@ -1262,9 +1335,9 @@ def _global_tree_check(
         id=check_id,
         name=name,
         status="fail",
-        detail=f"{name} folder is installed but stale relative to the package checkout copy.",
+        detail=f"{name} folder is installed but stale relative to the bundled package copy.",
         paths=paths,
-        recovery=["Run `bash install/install_codex_global.sh` from the package root to refresh the global Codex skill references."],
+        recovery=["Run `jsonl-history-search install-codex-skill` to refresh the optional Codex skill references."],
         metadata=metadata,
     )
 

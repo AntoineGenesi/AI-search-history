@@ -18,6 +18,11 @@ convo = "jsonl_history_search.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.data-files]
+"share/jsonl-history-search/codex-skill" = ["skills/codex/jsonl-history-search/SKILL.md"]
+"share/jsonl-history-search/codex-skill/references" = ["skills/codex/jsonl-history-search/references/*.md"]
+"share/jsonl-history-search/codex-skill/scripts" = ["scripts/search_jsonl_history.py", "scripts/jsonl_ask_first.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

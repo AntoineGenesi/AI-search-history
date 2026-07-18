@@ -4,20 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/jsonl-history-search"
 
-mkdir -p "$SKILL_DIR/scripts"
-cp -a "$ROOT/skills/codex/jsonl-history-search/SKILL.md" "$SKILL_DIR/SKILL.md"
-if [ -d "$ROOT/skills/codex/jsonl-history-search/references" ]; then
-  rm -rf "$SKILL_DIR/references"
-  cp -a "$ROOT/skills/codex/jsonl-history-search/references" "$SKILL_DIR/references"
-fi
-cp -a "$ROOT/scripts/search_jsonl_history.py" "$SKILL_DIR/scripts/search_jsonl_history.py"
-chmod +x "$SKILL_DIR/scripts/search_jsonl_history.py"
-cp -a "$ROOT/scripts/jsonl_ask_first.py" "$SKILL_DIR/scripts/jsonl_ask_first.py"
-chmod +x "$SKILL_DIR/scripts/jsonl_ask_first.py"
+echo "SKILL-ONLY INSTALLER: this does not install the Python CLI."
+echo "It will not create the jsonl-history-search or convo console commands."
+echo "Install the CLI first with pipx, then prefer: jsonl-history-search install-codex-skill"
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m jsonl_history_search.cli \
+  install-codex-skill --codex-home "${CODEX_HOME:-$HOME/.codex}" --format text
 
-echo "Installed Codex JSONL history search skill to: $SKILL_DIR"
-echo "This installed only the Codex skill/helper copy, not the Python package."
-echo "Install the Python CLI separately with: python3 -m venv .venv && . .venv/bin/activate && python -m pip install -e ."
 echo "Validate with:"
 echo "  env -u PYTHONPATH jsonl-history-search validate-install --codex-home \"${CODEX_HOME:-$HOME/.codex}\" --format text"
 echo "  env -u PYTHONPATH convo --help"

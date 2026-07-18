@@ -32,6 +32,7 @@ from .agent_loop_cost import (
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .ask_router import build_ask_router_payload, execution_kind_for_route_family
 from .capability_diagnostic import build_capability_diagnostic
+from .codex_skill_install import default_codex_home, install_codex_skill, render_codex_skill_install
 from .compact_handoff_usefulness import (
     DEFAULT_ANSWER_USE_FIXTURE as DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE,
     DEFAULT_FIXTURE as DEFAULT_COMPACT_HANDOFF_USEFULNESS_FIXTURE,
@@ -166,6 +167,7 @@ LOCAL_EVIDENCE_MODES = ("public", "internal")
 
 PUBLIC_HELP_EPILOG = """\
 Launch-facing commands:
+  install-codex-skill    Install the optional Codex skill after installing the Python CLI.
   validate-install        Check that the package/console script can run.
   diagnose-capabilities  Report installed core and optional capabilities.
   ask                    Route a natural-language prompt to the first JSONL command.
@@ -1729,6 +1731,19 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     retained_source.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     retained_source.add_argument("--max-files", type=int, default=8)
     retained_source.add_argument("--max-bytes", type=int, default=256 * 1024)
+    install_skill = subparsers.add_parser(
+        "install-codex-skill",
+        description=(
+            "Install the optional Codex skill/helper files. This command does not "
+            "install the Python package or copy conversation logs."
+        ),
+    )
+    install_skill.add_argument(
+        "--codex-home",
+        default=None,
+        help="Codex home to update; defaults to CODEX_HOME or ~/.codex.",
+    )
+    install_skill.add_argument("--format", choices=("text", "json"), default="text")
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     validate.add_argument(
@@ -17106,6 +17121,15 @@ def main(argv: list[str] | None = None) -> int:
             max_bytes=args.max_bytes,
         )
         print(render(payload, args.format))
+        return 0
+    if args.command == "install-codex-skill":
+        codex_home = Path(args.codex_home).expanduser() if args.codex_home else default_codex_home()
+        try:
+            payload = install_codex_skill(codex_home=codex_home)
+        except (FileNotFoundError, OSError) as exc:
+            print(f"Codex skill install failed: {exc}", file=sys.stderr)
+            return 1
+        print(render_codex_skill_install(payload, args.format))
         return 0
     if args.command == "validate-install":
         payload = validate_install(
