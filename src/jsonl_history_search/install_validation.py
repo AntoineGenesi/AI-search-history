@@ -766,6 +766,16 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
         env=env,
     )
     route_stdout = route_result.stdout
+    installed_first_command = "First command: jsonl-history-search semantic-debug"
+    source_first_command = (
+        "First command: PYTHONPATH=src python3 -m jsonl_history_search.cli semantic-debug"
+    )
+    if installed_first_command in route_stdout:
+        first_command_mode = "installed_console"
+    elif source_first_command in route_stdout:
+        first_command_mode = "source_checkout"
+    else:
+        first_command_mode = "unresolved"
     bounded_payload: dict[str, Any] = {}
     bounded_returncode: int | None = None
     bounded_stderr = ""
@@ -819,7 +829,7 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
     ok = (
         route_result.returncode == 0
         and "Ask Route" in route_stdout
-        and "First command: jsonl-history-search semantic-debug" in route_stdout
+        and first_command_mode in {"installed_console", "source_checkout"}
         and "--cwd \"$PWD\"" in route_stdout
         and "--format text" in route_stdout
         and "Read: references/remembered-topic.md" in route_stdout
@@ -844,7 +854,8 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
             "route_returncode": route_result.returncode,
             "bounded_returncode": bounded_returncode,
             "stdout_contains_ask_route": "Ask Route" in route_stdout,
-            "stdout_contains_first_command": "First command: jsonl-history-search semantic-debug" in route_stdout,
+            "stdout_contains_first_command": first_command_mode != "unresolved",
+            "first_command_mode": first_command_mode,
             "non_bounded_route_only": "Ask Execute" not in route_stdout,
             "bounded_execution_status": bounded_payload.get("execution_status"),
             "bounded_command_family": bounded_payload.get("execution", {}).get("command_family"),
