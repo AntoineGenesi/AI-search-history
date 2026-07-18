@@ -1717,6 +1717,14 @@ def _parent_thread_side_boundary_resolution(
             codex_home=codex_home,
             side_lineage=boundary_lineage,
         )
+    if boundary_lineage.get("cwd_relation") == "unrelated" and boundary_lineage.get("workspace_relation") == "unrelated":
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "raw_side_session_is_outside_requested_workspace",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": boundary_lineage,
+        }
     parent_thread_id_hash = boundary_lineage.get("parent_thread_id_hash")
     boundary_thread_hashes = {
         boundary_lineage.get("session_id_hash"),
@@ -1730,15 +1738,6 @@ def _parent_thread_side_boundary_resolution(
             codex_home=codex_home,
             side_lineage=boundary_lineage,
         )
-    if boundary_lineage.get("cwd_relation") == "unrelated" and boundary_lineage.get("workspace_relation") == "unrelated":
-        return {
-            "status": "ambiguous",
-            "contract": "parent_thread_side_boundary",
-            "reason": "raw_side_session_is_outside_requested_workspace",
-            "boundary_source_ref": boundary.get("source_ref"),
-            "side_lineage": boundary_lineage,
-        }
-
     boundary_line = int(boundary.get("line") or 0)
     parent_identifier = f"history-session-{parent_thread_id_hash}"
     parent_rows = [
