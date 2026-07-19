@@ -1445,6 +1445,187 @@ def _is_compact_multifacet_provenance_followthrough(followthrough: dict) -> bool
     return window.get("reason") == COMPACT_MULTIFACET_PROVENANCE_FOLLOWTHROUGH_REASON
 
 
+def _direct_provenance_evidence_complete(report: dict) -> bool:
+    ledger = report.get("provenance_direct_evidence_facet_ledger")
+    if not isinstance(ledger, dict):
+        ledger = ((report.get("answer_ready_handoff") or {}).get("provenance_direct_evidence_facet_ledger") or {})
+    return bool(isinstance(ledger, dict) and ledger.get("applies") and ledger.get("evidence_complete"))
+
+
+def _bounded_projection_value(value: object, limit: int = 600) -> str:
+    text = str(value if value is not None else "")
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 18)]}... [value capped]"
+
+
+def _cap_utf8_projection(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    suffix = "\n[projection capped at configured UTF-8 byte budget]"
+    suffix_bytes = suffix.encode("utf-8")
+    prefix = encoded[: max(0, limit - len(suffix_bytes))].decode("utf-8", errors="ignore")
+    return prefix + suffix
+
+
+def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) -> str | None:
+    handoff = report.get("provenance_complete_proof_handoff")
+    if not isinstance(handoff, dict) or not handoff.get("applies"):
+        return None
+
+    complete = bool(handoff.get("active"))
+    title = "Provenance Complete Proof" if complete else "Provenance Direct Proof Incomplete"
+    lines = [f"# {title}" if markdown else title]
+    if markdown:
+        lines.extend(
+            [
+                "",
+                f"- **State:** `{handoff.get('state')}`",
+                f"- **Answer status:** `{handoff.get('answer_status')}`",
+                f"- **Stop instruction:** {_bounded_projection_value(handoff.get('stop_instruction'))}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"State: {handoff.get('state')}",
+                f"Answer status: {handoff.get('answer_status')}",
+                f"STOP: {_bounded_projection_value(handoff.get('stop_instruction'))}",
+            ]
+        )
+
+    required = ", ".join(handoff.get("required_facets") or []) or "none"
+    covered = ", ".join(handoff.get("covered_direct_facets") or []) or "none"
+    missing = ", ".join(handoff.get("missing_required_facets") or []) or "none"
+    if markdown:
+        lines.extend(
+            [
+                f"- **Required facets:** `{required}`",
+                f"- **Covered by correlated direct evidence:** `{covered}`",
+                f"- **Missing facets:** `{missing}`",
+                "",
+                "## Selected Direct Reads",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"Required facets: {required}",
+                f"Covered by correlated direct evidence: {covered}",
+                f"Missing facets: {missing}",
+                "Selected direct reads:",
+            ]
+        )
+    selected_reads = list(handoff.get("selected_direct_reads") or [])[:4]
+    if not selected_reads:
+        lines.append("- none")
+    for index, read in enumerate(selected_reads, start=1):
+        target = _bounded_projection_value(read.get("target"), 1_200)
+        facets = ", ".join(read.get("covered_facets") or []) or "none"
+        command = _bounded_projection_value(read.get("command"), 2_000)
+        output_ref = source_ref_target(read.get("output_source_ref") or {})
+        if markdown:
+            lines.extend(
+                [
+                    f"{index}. `{target}`",
+                    f"   - Facets: `{facets}`",
+                    f"   - Correlated output ref: `{_bounded_projection_value(output_ref, 1_200)}`",
+                    f"   - Bounded command: `{command}`",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"{index}. ref: {target}",
+                    f"   facets: {facets}",
+                    f"   correlated output ref: {_bounded_projection_value(output_ref, 1_200)}",
+                    f"   bounded command: {command}",
+                ]
+            )
+
+    continuations = list(handoff.get("continuation_commands") or [])[:1]
+    if not complete:
+        heading = "## Single Bounded Missing-Facet Continuation" if markdown else "Single bounded missing-facet continuation:"
+        lines.extend(["", heading, ""] if markdown else [heading])
+        if not continuations:
+            lines.append("- unavailable; state the unsupported facets and stop")
+        for continuation in continuations:
+            facets = ", ".join(continuation.get("missing_facets") or []) or "unspecified"
+            command = _bounded_projection_value(continuation.get("command"), 2_000)
+            lines.append(f"- Missing facets `{facets}`: `{command}`" if markdown else f"- missing facets {facets}: {command}")
+
+    boundaries = handoff.get("searched_scope_boundaries") or {}
+    searched = boundaries.get("searched_scope") or {}
+    not_searched = boundaries.get("not_searched_scope") or {}
+    excluded = boundaries.get("excluded_scope") or {}
+    caps = boundaries.get("caps") or {}
+    heading = "## Searched-Scope Boundary" if markdown else "Searched-scope boundary:"
+    lines.extend(["", heading, ""] if markdown else [heading])
+    boundary_rows = [
+        (
+            "searched",
+            f"roots={searched.get('searched_root_count', 0)}/{searched.get('selected_root_count', 0)} "
+            f"files={searched.get('searched_files', 0)} bytes={searched.get('searched_bytes', 0)} "
+            f"meaning={_bounded_projection_value(searched.get('result_meaning'))}",
+        ),
+        (
+            "not searched/excluded",
+            f"outside_selected_roots={_bounded_projection_value(not_searched.get('outside_selected_roots'))} "
+            f"missing_roots={not_searched.get('missing_root_count', 0)} "
+            f"deferred_files={not_searched.get('source_plan_deferred_files', 0)} "
+            f"pruned_files={not_searched.get('source_plan_pruned_files', 0)} "
+            f"rejected_roots={excluded.get('rejected_root_count', 0)}",
+        ),
+        (
+            "caps",
+            f"status={caps.get('status')} hit={caps.get('hit', False)} "
+            f"caps_hit={','.join(caps.get('caps_hit') or []) or 'none'}",
+        ),
+        ("claim boundary", _bounded_projection_value(boundaries.get("claim_boundary"), 1_000)),
+    ]
+    for label, value in boundary_rows:
+        lines.append(f"- **{label}:** {value}" if markdown else f"- {label}: {value}")
+
+    suppression = handoff.get("suppression_counts") or {}
+    heading = "## Suppressed Continuation Surface" if markdown else "Suppressed continuation surface:"
+    lines.extend(["", heading, ""] if markdown else [heading])
+    for key in (
+        "assistant_recap_targets",
+        "report_writing_targets",
+        "compacted_summary_targets",
+        "specification_context_targets",
+        "optional_diagnostics_preserved_non_actionable",
+        "secondary_executable_targets_exposed",
+        "generic_continuation_commands_exposed",
+    ):
+        lines.append(f"- `{key}`: `{suppression.get(key, 0)}`" if markdown else f"- {key}: {suppression.get(key, 0)}")
+    lines.append(
+        "- Diagnostics remain in structured/debug data and are non-actionable."
+        if markdown
+        else "Diagnostics remain in structured/debug data and are non-actionable."
+    )
+    if complete:
+        lines.append(
+            "- **Answer now from the selected direct evidence and stop.**"
+            if markdown
+            else "ANSWER NOW from the selected direct evidence and stop."
+        )
+    return _cap_utf8_projection("\n".join(lines), int(handoff.get("output_budget_bytes") or 12_288))
+
+
+def _source_followthrough_direct_evidence_complete(plan: dict) -> bool:
+    if not plan:
+        return False
+    counts = plan.get("counts") or {}
+    return (
+        counts.get("required_primary_proof_count", 0) > 0
+        and counts.get("conditional_required_count", 0) == 0
+        and "selected correlated direct-event reads" in str(plan.get("stop_condition") or "")
+    )
+
+
 def render_source_followthrough_plan_text(plan: dict, *, command_by_target: dict[str, str] | None = None) -> list[str]:
     if not plan:
         return []
@@ -4757,6 +4938,9 @@ def render_scope_boundary_summary_markdown(summary: dict) -> list[str]:
 
 def render_semantic_debug_text(payload: dict) -> str:
     report = payload["semantic_debug"]
+    direct_projection = _render_provenance_direct_proof_projection(report, markdown=False)
+    if direct_projection is not None:
+        return direct_projection
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
@@ -4772,6 +4956,7 @@ def render_semantic_debug_text(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
     followthrough = handoff.get("primary_source_followthrough") or {}
+    direct_evidence_complete = _direct_provenance_evidence_complete(report)
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = (
         []
@@ -4801,6 +4986,11 @@ def render_semantic_debug_text(payload: dict) -> str:
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
+    followthrough_required_reads = list(
+        source_followthrough_plan.get("default_required_primary_proof")
+        or source_followthrough_plan.get("required_primary_proof")
+        or []
+    )
     orchestration_role_bundle = (
         report.get("historical_orchestration_role_evidence_bundle")
         or handoff.get("historical_orchestration_role_evidence_bundle")
@@ -4837,6 +5027,9 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
         if source_action_guidance.get("diagnostic_policy"):
             lines.append(f"- diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
+    elif direct_evidence_complete and followthrough_required_reads:
+        for read in followthrough_required_reads[:2]:
+            _append_text_read(lines, read, command_by_target=command_by_target)
     elif process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
         for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
             _append_text_read(lines, read, command_by_target=command_by_target)
@@ -5013,8 +5206,18 @@ def render_semantic_debug_text(payload: dict) -> str:
         elif followthrough.get("applies"):
             lines.append("Fallback next reads (only if the primary source window leaves a named facet missing):")
             lines.append("- executable fallback commands suppressed in text output; use JSON next_reads only after a named facet gap")
-            for item in report.get("next_reads", [])[:8]:
-                _append_text_read_summary(lines, item)
+            if direct_evidence_complete:
+                secondary_count = sum(
+                    1
+                    for item in report.get("next_reads", []) or []
+                    if isinstance(item, dict) and item.get("secondary_context_role")
+                )
+                lines.append(
+                    f"- secondary recap/summary/specification targets suppressed after complete direct evidence: {secondary_count}"
+                )
+            else:
+                for item in report.get("next_reads", [])[:8]:
+                    _append_text_read_summary(lines, item)
         else:
             lines.append("Next reads:")
             for item in report.get("next_reads", [])[:8]:
@@ -5026,6 +5229,9 @@ def render_semantic_debug_text(payload: dict) -> str:
 
 def render_semantic_debug_markdown(payload: dict) -> str:
     report = payload["semantic_debug"]
+    direct_projection = _render_provenance_direct_proof_projection(report, markdown=True)
+    if direct_projection is not None:
+        return direct_projection
     family = report.get("question_family", {})
     tradeoffs = report.get("token_byte_tradeoffs", {})
     action_proof_plan = report.get("action_proof_plan") or {}
@@ -5041,6 +5247,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     command_by_target = _read_more_commands_by_target(next_reads_for_required_surfaces)
     readiness = report.get("answer_readiness") or {}
     followthrough = handoff.get("primary_source_followthrough") or {}
+    direct_evidence_complete = _direct_provenance_evidence_complete(report)
     suppress_action_required_reads = _is_compact_multifacet_provenance_followthrough(followthrough)
     required_reads = (
         []
@@ -5070,6 +5277,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         or "Stop when inspected source refs support the answer within the searched-scope boundaries."
     )
     primary_command = (followthrough.get("first_command") or {}).get("command") if followthrough.get("applies") else None
+    followthrough_required_reads = list(
+        source_followthrough_plan.get("default_required_primary_proof")
+        or source_followthrough_plan.get("required_primary_proof")
+        or []
+    )
     orchestration_role_bundle = (
         report.get("historical_orchestration_role_evidence_bundle")
         or handoff.get("historical_orchestration_role_evidence_bundle")
@@ -5097,6 +5309,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
         if source_action_guidance.get("diagnostic_policy"):
             lines.append(f"- Diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
+    elif direct_evidence_complete and followthrough_required_reads:
+        for read in followthrough_required_reads[:2]:
+            _append_markdown_read(lines, read, command_by_target=command_by_target)
     elif process_read_plan and process_read_plan.get("required_primary_raw_final_support_reads"):
         for read in process_read_plan.get("required_primary_raw_final_support_reads", [])[:4]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
@@ -5319,8 +5534,18 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.append(
             "- Executable fallback commands suppressed in Markdown output; use JSON `next_reads` only after a named facet gap."
         )
-        for item in report.get("next_reads", [])[:8]:
-            _append_markdown_read_summary(lines, item)
+        if direct_evidence_complete:
+            secondary_count = sum(
+                1
+                for item in report.get("next_reads", []) or []
+                if isinstance(item, dict) and item.get("secondary_context_role")
+            )
+            lines.append(
+                f"- Secondary recap/summary/specification targets suppressed after complete direct evidence: `{secondary_count}`."
+            )
+        else:
+            for item in report.get("next_reads", [])[:8]:
+                _append_markdown_read_summary(lines, item)
     else:
         for item in report.get("next_reads", [])[:8]:
             _append_markdown_read(lines, item, command_by_target=command_by_target)
@@ -6722,16 +6947,21 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
         )
         lines.append(f"- source_followthrough_stop: {followthrough_plan.get('stop_condition')}")
     top_candidates = candidate_ordering.get("top_candidates") or []
-    for candidate in top_candidates[:5]:
-        bits = [
-            f"id={candidate.get('candidate_id') or ''}",
-            f"source={_format_handoff_source_ref(candidate)}",
-            f"confidence={candidate.get('confidence') or ''}",
-            f"stage={candidate.get('stage') or ''}",
-            f"score={_format_handoff_score(candidate)}",
-            f"reasons={_format_handoff_reason_codes(candidate)}",
-        ]
-        lines.append(f"- top candidate: {' '.join(bits)}")
+    if top_candidates and _source_followthrough_direct_evidence_complete(followthrough_plan):
+        lines.append(
+            f"- top candidates: {len(top_candidates[:5])} diagnostic candidates suppressed after complete direct evidence"
+        )
+    else:
+        for candidate in top_candidates[:5]:
+            bits = [
+                f"id={candidate.get('candidate_id') or ''}",
+                f"source={_format_handoff_source_ref(candidate)}",
+                f"confidence={candidate.get('confidence') or ''}",
+                f"stage={candidate.get('stage') or ''}",
+                f"score={_format_handoff_score(candidate)}",
+                f"reasons={_format_handoff_reason_codes(candidate)}",
+            ]
+            lines.append(f"- top candidate: {' '.join(bits)}")
     if followthrough_plan:
         lines.append("- next_reads: preserved in JSON/report; default open order is semantic_debug.source_followthrough_plan")
         optional_count = (followthrough_plan.get("counts") or {}).get("optional_diagnostic_count", 0)
@@ -7021,7 +7251,9 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
         )
         lines.append(f"- Source followthrough stop: {followthrough_plan.get('stop_condition')}")
     top_candidates = candidate_ordering.get("top_candidates") or []
-    if top_candidates:
+    if top_candidates and _source_followthrough_direct_evidence_complete(followthrough_plan):
+        lines.append(f"- Top candidates: `{len(top_candidates[:5])}` diagnostic candidates suppressed after complete direct evidence.")
+    elif top_candidates:
         lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
         for candidate in top_candidates[:5]:
             lines.append(

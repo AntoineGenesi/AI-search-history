@@ -29,6 +29,13 @@ from .agent_contract import (
 )
 from .answer_source_discipline import answer_source_discipline_summary, build_answer_source_discipline
 from .claims import classify_claim_action, parse_review_verdict
+from .conversation_records import (
+    ASSISTANT_OR_AGENT_MESSAGE,
+    COMPACTED_HISTORY_SUMMARY,
+    HUMAN_AUTHORED_USER_MESSAGE,
+    classify_conversation_record,
+    extract_human_ask,
+)
 from .forensics import build_forensics_payload
 from .prompt_echo import clearly_intends_current_session, setup_echo_classification
 from .query import infer_query
@@ -368,6 +375,23 @@ def build_semantic_debug_payload(
             audit_plan.get("checkpoint_plan", []),
             source_handle_routing,
         )
+    provenance_direct_evidence_facet_ledger = build_provenance_direct_evidence_facet_ledger(
+        query=agent_find["query"]["original"],
+        family=family,
+        candidates=source_selection_candidates,
+        tool_proof=tool_proof,
+    )
+    if provenance_direct_evidence_facet_ledger.get("applies"):
+        next_reads = apply_provenance_direct_evidence_ledger_to_reads(
+            list(source_locator_handoff.get("next_reads") or next_reads),
+            provenance_direct_evidence_facet_ledger,
+        )
+        source_locator_handoff["next_reads"] = next_reads
+        source_locator_handoff["provenance_direct_evidence_facet_ledger"] = (
+            public_provenance_direct_evidence_facet_ledger(
+                provenance_direct_evidence_facet_ledger
+            )
+        )
     historical_orchestration_plan = build_historical_orchestration_provenance_final_support_plan(
         list(source_locator_handoff.get("next_reads") or next_reads),
         candidates=source_selection_candidates,
@@ -666,6 +690,25 @@ def build_semantic_debug_payload(
         action_proof_plan=action_proof_plan,
         scope_boundary_summary=scope_boundary_summary,
     )
+    if provenance_direct_evidence_facet_ledger.get("applies"):
+        direct_ledger_summary = public_provenance_direct_evidence_facet_ledger(
+            provenance_direct_evidence_facet_ledger
+        )
+        answer_ready_handoff["provenance_direct_evidence_facet_ledger"] = direct_ledger_summary
+        answer_ready_handoff["links"]["provenance_direct_evidence_facet_ledger"] = (
+            "semantic_debug.provenance_direct_evidence_facet_ledger"
+        )
+        answer_ready_handoff["source_use_summary"]["provenance_direct_evidence_facet_ledger"] = {
+            "status": direct_ledger_summary.get("status"),
+            "evidence_complete": direct_ledger_summary.get("evidence_complete"),
+            "required_facets": direct_ledger_summary.get("required_facets"),
+            "covered_direct_facets": direct_ledger_summary.get("covered_direct_facets"),
+            "missing_required_facets": direct_ledger_summary.get("missing_required_facets"),
+            "selected_primary_read_count": direct_ledger_summary.get("selected_primary_read_count"),
+            "missing_facet_continuation_count": direct_ledger_summary.get(
+                "missing_facet_continuation_count"
+            ),
+        }
     answer_ready_handoff["core_convo_first_read_plan"] = core_convo_first_read_plan
     answer_ready_handoff["links"]["core_convo_first_read_plan"] = "semantic_debug.core_convo_first_read_plan"
     answer_ready_handoff["source_use_summary"]["core_convo_first_read_plan"] = {
@@ -900,6 +943,7 @@ def build_semantic_debug_payload(
         longitudinal_phase_source_plan=longitudinal_phase_source_plan,
         no_evidence=no_evidence,
         scope_boundary_summary=scope_boundary_summary,
+        provenance_direct_evidence_facet_ledger=provenance_direct_evidence_facet_ledger,
     )
     source_followthrough_summary = source_followthrough_plan_summary(source_followthrough_plan)
     source_locator_handoff["source_followthrough_plan"] = source_followthrough_summary
@@ -920,6 +964,37 @@ def build_semantic_debug_payload(
         "status": investigation_state.get("status"),
         "recommended_next_step": investigation_state.get("answer_readiness", {}).get("recommended_next_step"),
     }
+    provenance_complete_proof_handoff = build_provenance_complete_proof_handoff(
+        ledger=provenance_direct_evidence_facet_ledger,
+        next_reads=next_reads,
+        scope_boundary_summary=scope_boundary_summary,
+    )
+    if provenance_complete_proof_handoff:
+        source_locator_handoff["provenance_complete_proof_handoff"] = (
+            provenance_complete_proof_handoff
+        )
+        answer_ready_handoff["provenance_complete_proof_handoff"] = (
+            provenance_complete_proof_handoff
+        )
+        answer_ready_handoff["links"]["provenance_complete_proof_handoff"] = (
+            "semantic_debug.provenance_complete_proof_handoff"
+        )
+        if provenance_complete_proof_handoff.get("active"):
+            answer_ready_handoff["decision"] = "answer_after_selected_direct_reads"
+            answer_ready_handoff["do_next"] = (
+                "Open only the selected direct reads, then answer from those correlated events."
+            )
+            agent_instruction["decision"] = "selected_direct_reads_then_answer"
+            agent_instruction["required_next_action"] = (
+                "Run only provenance_complete_proof_handoff.selected_direct_reads, then answer."
+            )
+            agent_instruction["commands"] = [
+                read["command"]
+                for read in provenance_complete_proof_handoff.get("selected_direct_reads", [])
+            ]
+            agent_instruction["stop_condition"] = provenance_complete_proof_handoff.get(
+                "stop_instruction"
+            )
     packet = {
         "schema_version": SCHEMA_VERSION,
         "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
@@ -932,6 +1007,10 @@ def build_semantic_debug_payload(
         "source_locator_handoff": source_locator_handoff,
         "scope_boundary_summary": scope_boundary_summary,
         "source_followthrough_plan": source_followthrough_plan,
+        "provenance_direct_evidence_facet_ledger": public_provenance_direct_evidence_facet_ledger(
+            provenance_direct_evidence_facet_ledger
+        ),
+        "provenance_complete_proof_handoff": provenance_complete_proof_handoff,
         "strongest_candidates": candidates,
         "timeline": timeline,
         "tool_action_proof": tool_proof,
@@ -5618,6 +5697,22 @@ ANSWER_READY_HANDOFF_READ_CAP = 5
 ANSWER_READY_HANDOFF_COMMAND_CAP = 3
 ACTION_PROOF_BUCKET_RECORD_CAP = 8
 ACTION_PROOF_TEXT_LIMIT = 220
+PROVENANCE_DIRECT_EVIDENCE_READ_CAP = 4
+PROVENANCE_DIRECT_EVIDENCE_REF_CAP = 3
+PROVENANCE_COMPLETE_PROOF_OUTPUT_MAX_BYTES = 12_288
+PROVENANCE_COMPLETE_PROOF_READ_BEFORE = 0
+PROVENANCE_COMPLETE_PROOF_READ_AFTER = 1
+PROVENANCE_COMPLETE_PROOF_READ_MAX_RECORDS = 2
+PROVENANCE_COMPLETE_PROOF_COMPACT_TEXT_LIMIT = 2_400
+PROVENANCE_DIRECT_EVIDENCE_FACETS = (
+    "implementation_change",
+    "test",
+    "validation_safety",
+    "commit",
+    "install",
+    "limitation",
+    "runtime",
+)
 
 
 def build_answer_ready_handoff(
@@ -5930,6 +6025,10 @@ def bounded_answer_ready_next_reads(next_reads: list[dict[str, Any]]) -> list[di
             "source_ref": guided_source_ref(read.get("source_ref") or {}) if isinstance(read.get("source_ref"), dict) else None,
             "read_more_actionable": read.get("read_more_actionable", True),
             "followthrough_actionable": read.get("followthrough_actionable", True),
+            "direct_evidence_facets": list(read.get("direct_evidence_facets") or []),
+            "provenance_direct_evidence": read.get("provenance_direct_evidence")
+            if isinstance(read.get("provenance_direct_evidence"), dict)
+            else None,
             "action": guidance,
         }
         rows.append({key: value for key, value in row.items() if value not in (None, [], {})})
@@ -5950,6 +6049,7 @@ def build_source_followthrough_plan(
     longitudinal_phase_source_plan: dict[str, Any] | None = None,
     no_evidence: dict[str, Any] | None = None,
     scope_boundary_summary: dict[str, Any] | None = None,
+    provenance_direct_evidence_facet_ledger: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize the first source-followthrough decision across semantic-debug surfaces."""
     required_candidates: list[dict[str, Any]] = []
@@ -5966,6 +6066,13 @@ def build_source_followthrough_plan(
         if isinstance(primary_followthrough.get("first_command"), dict)
         else {}
     )
+    direct_ledger = provenance_direct_evidence_facet_ledger or {}
+    direct_evidence_complete = bool(direct_ledger.get("applies") and direct_ledger.get("evidence_complete"))
+    direct_selected_targets = {
+        str(read.get("target") or "")
+        for read in list(direct_ledger.get("selected_primary_reads") or [])
+        if isinstance(read, dict) and read.get("target")
+    }
     if primary_followthrough_first and first_command.get("target"):
         required_candidates.extend(
             _source_followthrough_summaries(
@@ -5977,6 +6084,8 @@ def build_source_followthrough_plan(
                         or primary_followthrough.get("do_first")
                         or "primary source followthrough command",
                         "read_more_command": first_command.get("command"),
+                        "direct_evidence_facets": list(first_command.get("direct_evidence_facets") or []),
+                        "provenance_direct_evidence": first_command.get("provenance_direct_evidence"),
                     }
                 ],
                 read_role="required_primary_proof",
@@ -6066,11 +6175,13 @@ def build_source_followthrough_plan(
     for read in next_reads:
         if not isinstance(read, dict):
             continue
-        role = (
-            "optional_diagnostic"
-            if primary_followthrough_first
-            else source_followthrough_read_role(read, no_evidence=no_evidence or {})
-        )
+        target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+        if direct_evidence_complete and target in direct_selected_targets:
+            role = "required_primary_proof"
+        elif primary_followthrough_first:
+            role = "optional_diagnostic"
+        else:
+            role = source_followthrough_read_role(read, no_evidence=no_evidence or {})
         row = _source_followthrough_summary(
             read,
             read_role=role,
@@ -6125,6 +6236,7 @@ def build_source_followthrough_plan(
         conditional=conditional,
         optional=optional,
         scoped_no_evidence=scoped_no_evidence,
+        provenance_direct_evidence_facet_ledger=provenance_direct_evidence_facet_ledger or {},
     )
     only_continue_if = source_followthrough_only_continue_if(
         answer_ready_handoff=answer_ready_handoff,
@@ -6239,6 +6351,9 @@ def _source_followthrough_summary(
         "actual_use_source_tier",
         "proof_role",
         "role",
+        "direct_evidence_facets",
+        "provenance_direct_evidence",
+        "secondary_context_role",
     ):
         if read.get(key) is not None:
             row[key] = read.get(key)
@@ -6271,7 +6386,20 @@ def source_followthrough_stop_condition(
     conditional: list[dict[str, Any]],
     optional: list[dict[str, Any]],
     scoped_no_evidence: bool,
+    provenance_direct_evidence_facet_ledger: dict[str, Any] | None = None,
 ) -> str:
+    direct_ledger = provenance_direct_evidence_facet_ledger or {}
+    if direct_ledger.get("applies") and direct_ledger.get("evidence_complete"):
+        return (
+            "Stop after the selected correlated direct-event reads support every required facet. "
+            "Do not open assistant recaps, report-writing events, or compacted summaries as required primary proof."
+        )
+    if direct_ledger.get("applies") and direct_ledger.get("missing_required_facets"):
+        missing = ", ".join(direct_ledger.get("missing_required_facets") or [])
+        return (
+            f"Open at most one bounded continuation for missing direct facets: {missing}. "
+            "Then state any remaining gaps; do not continue through recap or summary windows."
+        )
     guidance = answer_ready_handoff.get("source_action_guidance")
     if isinstance(guidance, dict) and guidance.get("stop_condition"):
         return str(guidance.get("stop_condition"))
@@ -6336,6 +6464,942 @@ def _dedupe_source_followthrough_reads(reads: list[dict[str, Any]]) -> list[dict
 def _source_followthrough_key(read: dict[str, Any]) -> str:
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     return str(read.get("target") or source_ref_target(source_ref) or read.get("candidate_id") or "")
+
+
+def provenance_direct_evidence_ledger_wanted(query: str, family: dict[str, Any]) -> bool:
+    supported = set(family.get("detected_supported") or [])
+    if family.get("primary") != "claimed_action" and "claimed_action" not in supported:
+        return False
+    text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    source_session_cues = (
+        "earlier conversation",
+        "earlier session",
+        "prior session",
+        "previous session",
+        "looking back",
+        "source session",
+        "source-session",
+        "what did the agent",
+        "what did you change",
+    )
+    return any(cue in text for cue in source_session_cues)
+
+
+def requested_provenance_direct_evidence_facets(query: str) -> list[str]:
+    text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    requested: list[str] = []
+    facet_terms = {
+        "implementation_change": (
+            "change",
+            "changed",
+            "implement",
+            "implementation",
+            "onboarding",
+            "what did the agent",
+        ),
+        "test": ("test", "tested", "verify", "verified", "verification", "check", "checked"),
+        "validation_safety": (
+            "validate",
+            "validated",
+            "validation",
+            "verify",
+            "verified",
+            "verification",
+            "safety",
+            "privacy",
+            "audit",
+            "check",
+            "checked",
+        ),
+        "commit": ("commit", "committed", "merge", "sha"),
+        "install": ("install", "installer", "self-serve", "self serve", "onboarding", "setup"),
+        "limitation": ("limit", "limitation", "constraint", "failed", "failure", "blocked", "403"),
+        "runtime": ("runtime", "smoke", "live run", "actual run", "ran", "execute", "executed"),
+    }
+    for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS:
+        if any(term in text for term in facet_terms[facet]):
+            requested.append(facet)
+    return requested
+
+
+def build_provenance_direct_evidence_facet_ledger(
+    *,
+    query: str,
+    family: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+) -> dict[str, Any]:
+    if not provenance_direct_evidence_ledger_wanted(query, family):
+        return {"schema_version": 1, "applies": False, "reason": "not_a_source_session_claimed_action_query"}
+
+    required_facets = requested_provenance_direct_evidence_facets(query)
+    source_paths = action_proof_candidate_paths(candidates, tool_proof)
+    direct_events: list[dict[str, Any]] = []
+    intent_refs: list[dict[str, Any]] = []
+    secondary_refs: list[dict[str, Any]] = []
+    source_roles_by_target: dict[str, str] = {}
+    for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
+        scan = provenance_direct_events_for_path(path, query=query)
+        direct_events.extend(scan["direct_events"])
+        intent_refs.extend(scan["original_user_intent_refs"])
+        secondary_refs.extend(scan["secondary_context_refs"])
+        source_roles_by_target.update(scan["source_roles_by_target"])
+
+    direct_events = dedupe_provenance_direct_events(direct_events)
+    facet_rows = []
+    covered_facets = []
+    for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS:
+        matching = [event for event in direct_events if facet in set(event.get("facets") or [])]
+        if matching:
+            covered_facets.append(facet)
+        facet_rows.append(
+            {
+                "facet": facet,
+                "required": facet in required_facets,
+                "status": "covered_by_correlated_direct_event" if matching else "not_covered",
+                "direct_event_count": len(matching),
+                "evidence_refs": [
+                    provenance_direct_event_ref(event)
+                    for event in matching[:PROVENANCE_DIRECT_EVIDENCE_REF_CAP]
+                ],
+            }
+        )
+    missing_facets = [facet for facet in required_facets if facet not in covered_facets]
+    selected_events = select_provenance_direct_events(
+        direct_events,
+        required_facets=required_facets,
+    )
+    selected_reads = [provenance_direct_event_read(event) for event in selected_events]
+    continuation = provenance_missing_facet_continuation(
+        missing_facets=missing_facets,
+        direct_events=direct_events,
+        candidates=candidates,
+    )
+    evidence_complete = bool(required_facets) and not missing_facets
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "evidence_complete" if evidence_complete else "missing_direct_evidence_facets",
+        "required_facets": required_facets,
+        "covered_direct_facets": covered_facets,
+        "missing_required_facets": missing_facets,
+        "evidence_complete": evidence_complete,
+        "facets": facet_rows,
+        "selected_primary_reads": selected_reads,
+        "selected_primary_read_count": len(selected_reads),
+        "missing_facet_continuations": [continuation] if continuation else [],
+        "missing_facet_continuation_count": 1 if continuation else 0,
+        "original_user_intent": {
+            "status": "present" if intent_refs else "not_present_in_direct_records",
+            "source_refs": dedupe_dicts(intent_refs)[:PROVENANCE_DIRECT_EVIDENCE_REF_CAP],
+            "counts_as_direct_action_proof": False,
+        },
+        "secondary_context": {
+            "assistant_recap_count": sum(
+                1 for row in secondary_refs if row.get("context_role") == "assistant_recap"
+            ),
+            "report_writing_event_count": sum(
+                1 for row in secondary_refs if row.get("context_role") == "report_writing_event"
+            ),
+            "compacted_summary_count": sum(
+                1 for row in secondary_refs if row.get("context_role") == "compacted_summary"
+            ),
+            "source_refs": dedupe_dicts(secondary_refs)[:8],
+            "counts_as_direct_action_proof": False,
+        },
+        "stop_contract": {
+            "status": "stop_after_selected_direct_reads" if evidence_complete else "one_bounded_continuation",
+            "required_recap_or_summary_reads": 0,
+            "maximum_missing_facet_continuations": 1,
+            "continue_only_for_missing_facets": missing_facets,
+        },
+        "claim_boundaries": {
+            "original_user_intent_counts_as_direct_action_evidence": False,
+            "assistant_final_or_task_complete_recap_counts_as_direct_action_evidence": False,
+            "report_writing_call_or_output_counts_as_direct_action_evidence": False,
+            "compacted_summary_counts_as_direct_action_evidence": False,
+            "direct_coverage_requires_correlated_call_and_output": True,
+            "target_id_or_record_role_alone_satisfies_coverage": False,
+        },
+        "_source_roles_by_target": source_roles_by_target,
+        "_direct_events": direct_events,
+    }
+
+
+def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, Any]:
+    direct_events: list[dict[str, Any]] = []
+    original_user_intent_refs: list[dict[str, Any]] = []
+    secondary_context_refs: list[dict[str, Any]] = []
+    source_roles_by_target: dict[str, str] = {}
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    session_intent_by_id: dict[str, str] = {}
+    try:
+        records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+    except (AdapterReadError, OSError, ValueError):
+        records = []
+    for record in records:
+        source_ref = {"path": str(path), "line": int(record.line), "session": path.stem}
+        target = source_ref_target(source_ref)
+        classification = classify_conversation_record(record)
+        raw = record.raw if isinstance(record.raw, dict) else {}
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+        payload_type = str(payload.get("type") or raw.get("type") or "").casefold()
+        text = provenance_record_text(record, payload)
+
+        if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+            original_user_intent_refs.append(
+                {"source_ref": guided_source_ref(source_ref), "intent_source_role": "direct_human_message"}
+            )
+            source_roles_by_target[target] = "original_user_intent"
+            continue
+        if classification.label == COMPACTED_HISTORY_SUMMARY:
+            embedded_intent = provenance_compacted_human_intent(payload)
+            if embedded_intent:
+                original_user_intent_refs.append(
+                    {
+                        "source_ref": guided_source_ref(source_ref),
+                        "intent_source_role": "human_intent_inside_compacted_history",
+                    }
+                )
+            secondary_context_refs.append(
+                {"source_ref": guided_source_ref(source_ref), "context_role": "compacted_summary"}
+            )
+            source_roles_by_target[target] = "compacted_summary"
+            continue
+        if classification.label == ASSISTANT_OR_AGENT_MESSAGE or payload_type in {
+            "agent_message",
+            "task_complete",
+        }:
+            secondary_context_refs.append(
+                {"source_ref": guided_source_ref(source_ref), "context_role": "assistant_recap"}
+            )
+            source_roles_by_target[target] = "assistant_recap"
+            continue
+
+        if payload_type in {"function_call", "tool_call", "custom_tool_call"}:
+            call_id = str(payload.get("call_id") or payload.get("id") or f"line-{record.line}")
+            calls_by_id[call_id] = {
+                "call_id": call_id,
+                "tool_name": str(payload.get("name") or payload.get("tool_name") or payload.get("tool") or ""),
+                "text": text,
+                "source_ref": source_ref,
+                "target": target,
+            }
+            continue
+        if payload_type not in {"function_call_output", "tool_output", "custom_tool_call_output", "tool_result"}:
+            continue
+        call_id = str(payload.get("call_id") or "")
+        call = calls_by_id.get(call_id)
+        if not call:
+            continue
+        output_session_id = provenance_tool_session_id(text)
+        if output_session_id and provenance_direct_action_intent_facets(call["text"]):
+            session_intent_by_id[output_session_id] = call["text"]
+        if provenance_report_or_recap_tool_activity(call["tool_name"], call["text"]):
+            for ref in (call["source_ref"], source_ref):
+                ref_target = source_ref_target(ref)
+                source_roles_by_target[ref_target] = "report_writing_event"
+                secondary_context_refs.append(
+                    {"source_ref": guided_source_ref(ref), "context_role": "report_writing_event"}
+                )
+            continue
+        if provenance_structural_context_read_command(call["text"]):
+            for ref in (call["source_ref"], source_ref):
+                ref_target = source_ref_target(ref)
+                source_roles_by_target[ref_target] = "specification_context_read"
+                secondary_context_refs.append(
+                    {"source_ref": guided_source_ref(ref), "context_role": "specification_context_read"}
+                )
+            continue
+        call_session_id = provenance_tool_session_id(call["text"])
+        effective_call_text = call["text"]
+        if call_session_id and call_session_id in session_intent_by_id:
+            effective_call_text = f"{session_intent_by_id[call_session_id]} {call['text']}"
+        facets = provenance_direct_event_facets(effective_call_text, text)
+        if not facets:
+            continue
+        query_overlap = len(action_proof_query_terms(query) & set(ACTION_PROOF_TEXT_RE.findall(
+            f"{call['text']} {text}".casefold()
+        )))
+        event = {
+            "event_id": f"direct-{path.name}-{call['source_ref']['line']}-{source_ref['line']}",
+            "event_kind": "correlated_direct_tool_call_and_output",
+            "tool_name": call["tool_name"],
+            "source_ref": guided_source_ref(call["source_ref"]),
+            "output_source_ref": guided_source_ref(source_ref),
+            "target": call["target"],
+            "facets": facets,
+            "query_term_overlap_count": query_overlap,
+            "correlated_output": True,
+            "correlated_session_command": bool(call_session_id and call_session_id in session_intent_by_id),
+            "primary_action_proof": True,
+        }
+        direct_events.append(event)
+        source_roles_by_target[call["target"]] = "direct_tool_call"
+        source_roles_by_target[target] = "direct_tool_output"
+    return {
+        "direct_events": direct_events,
+        "original_user_intent_refs": original_user_intent_refs,
+        "secondary_context_refs": secondary_context_refs,
+        "source_roles_by_target": source_roles_by_target,
+    }
+
+
+def provenance_record_text(record: Any, payload: dict[str, Any]) -> str:
+    text = str(getattr(record, "text", "") or "")
+    if text:
+        return text
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def provenance_compacted_human_intent(payload: dict[str, Any]) -> bool:
+    replacement = payload.get("replacement_history")
+    if not isinstance(replacement, list):
+        return False
+    return any(extract_human_ask(item).ask_text for item in replacement if isinstance(item, dict))
+
+
+def provenance_report_or_recap_tool_activity(tool_name: str, call_text: str) -> bool:
+    text = f"{tool_name} {call_text}".casefold().replace("\\", "/")
+    if any(marker in text for marker in ("tools.update_plan", "update_plan", "task_complete")):
+        return True
+    artifact_scope = any(
+        marker in text
+        for marker in ("reports/", "codex/state/reviews/", "retention-manifest", "progress log", "task tail")
+    )
+    artifact_operation = any(
+        marker in text
+        for marker in (
+            "apply_patch",
+            "write_text",
+            "report-output",
+            "cat reports/",
+            "tail -",
+            "rg -n",
+            "sed -n",
+            "retention manifest",
+        )
+    )
+    substantive_direct_action = any(
+        marker in text
+        for marker in (
+            "pytest",
+            "unittest",
+            "compileall",
+            "git diff",
+            "git status",
+            "git commit",
+            "pip install",
+            "pipx install",
+            "install/preflight",
+            "install_codex",
+            "install_claude",
+            "privacy scan",
+            "credential",
+            "src/jsonl_history_search/",
+            "tests/",
+        )
+    )
+    return artifact_scope and artifact_operation and not substantive_direct_action
+
+
+def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str]:
+    call = re.sub(r"\s+", " ", str(call_text or "").casefold())
+    output = re.sub(r"\s+", " ", str(output_text or "").casefold())
+    if provenance_structural_context_read_command(call):
+        return []
+
+    allowed = provenance_direct_action_intent_facets(call)
+    facets: list[str] = []
+
+    implementation_result_markers = (
+        "done!",
+        "successfully",
+        "updated",
+        "diff --git",
+        "files changed",
+        "insertions(+)",
+        "deletions(-)",
+    )
+    if "implementation_change" in allowed and any(marker in output for marker in implementation_result_markers):
+        facets.append("implementation_change")
+
+    test_result_markers = (
+        " tests passed",
+        " passed in ",
+        " passed,",
+        "passed;",
+        " ok",
+        "\nok",
+    )
+    if "test" in allowed and any(marker in output for marker in test_result_markers):
+        facets.append("test")
+
+    validation_result_markers = (
+        " pass",
+        "pass;",
+        "passed",
+        "clean",
+        "working tree clean",
+        "nothing to commit",
+        "no issues",
+        "no secrets",
+        "no credentials",
+        "sha256",
+        "sha-256",
+    )
+    if "validation_safety" in allowed and any(marker in output for marker in validation_result_markers):
+        facets.append("validation_safety")
+
+    if "commit" in allowed and (
+        any(marker in output for marker in ("create mode 100", "commit created", "files changed"))
+        or re.search(r"\bcommit\s+[0-9a-f]{7,40}\b", output)
+        or re.search(r"\[[^\]]+\s+[0-9a-f]{7,40}\]\s+", output)
+        or re.search(r"^[0-9a-f]{7,40}\s+", output)
+    ):
+        facets.append("commit")
+
+    install_result_markers = (
+        "successfully installed",
+        "installed wheel",
+        "installed skill",
+        "installed entrypoint",
+        "validate-install",
+        "validation passed",
+        " pass",
+        "ready",
+    )
+    if "install" in allowed and any(marker in output for marker in install_result_markers):
+        facets.append("install")
+
+    limitation_result_markers = (
+        "http 403",
+        "status 403",
+        "forbidden",
+        "pipx is not installed",
+        "pipx not installed",
+        "not available in this environment",
+        "could not be exercised",
+        "expected limitation",
+        "known limitation",
+    )
+    if "limitation" in allowed and any(marker in output for marker in limitation_result_markers):
+        facets.append("limitation")
+
+    runtime_result_markers = (
+        "isolated smoke",
+        "runtime smoke",
+        "install smoke",
+        "usage:",
+        "version",
+        "installed entrypoint",
+        "entrypoint ready",
+        "smoke pass",
+        "smoke recorded",
+    )
+    if "runtime" in allowed and any(marker in output for marker in runtime_result_markers):
+        facets.append("runtime")
+    return [facet for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS if facet in facets]
+
+
+def provenance_tool_session_id(text: str) -> str | None:
+    match = re.search(r"\bsession_id\b\\?[\"']?\s*[:=]\s*([0-9]+)", str(text or ""))
+    return match.group(1) if match else None
+
+
+def provenance_structural_context_read_command(call: str) -> bool:
+    """True when the call is gathering task/spec/report text, not proving action."""
+    read_markers = (
+        " sed -n ",
+        " cat ",
+        " rg ",
+        " grep ",
+        " find ",
+        " head ",
+        " tail ",
+        " nl -",
+        " wc -",
+        " less ",
+        " jq ",
+    )
+    spec_markers = (
+        "tasks/",
+        "task.md",
+        "project.md",
+        "codex-orchestration.md",
+        "todo.md",
+        "pipeline-state.md",
+        "reports/",
+        "codex/state/reviews/",
+        "scratch",
+        "progress log",
+    )
+    direct_action_markers = (
+        "apply_patch",
+        "edit_file",
+        "write_file",
+        "python -m pytest",
+        "python3 -m pytest",
+        "pytest ",
+        "unittest",
+        "compileall",
+        "diff --check",
+        "privacy scan",
+        "privacy-scan",
+        "secret scan",
+        "credential scan",
+        "pip install",
+        "pipx install",
+        "install-agent-skill",
+        "install_codex_global.sh",
+        "install_claude_global.sh",
+        "jsonl-history-search validate-install",
+        "git commit",
+        "runtime smoke",
+        "install smoke",
+        "isolated smoke",
+    )
+    padded = f" {call} "
+    return (
+        any(marker in padded for marker in read_markers)
+        and any(marker in call for marker in spec_markers)
+        and not any(marker in call for marker in direct_action_markers)
+    )
+
+
+def provenance_direct_action_intent_facets(call: str) -> set[str]:
+    facets: set[str] = set()
+    if any(
+        marker in call
+        for marker in (
+            "apply_patch",
+            "edit_file",
+            "write_file",
+            "git diff --",
+            "diff --git",
+        )
+    ) and "diff --check" not in call:
+        facets.add("implementation_change")
+    if any(marker in call for marker in ("pytest ", "pytest\"", "python -m pytest", "python3 -m pytest", "unittest")):
+        facets.add("test")
+    if any(
+        marker in call
+        for marker in (
+            "compileall",
+            "diff --check",
+            "git status",
+            "privacy scan",
+            "privacy-scan",
+            "credential",
+            "secret scan",
+            "sha256",
+            "sha-256",
+            "shellcheck",
+            "bash -n",
+            "audit",
+        )
+    ):
+        facets.add("validation_safety")
+    if any(marker in call for marker in ("git commit ", "git commit -", "git show", "git log", "git rev-parse")):
+        facets.add("commit")
+    if any(
+        marker in call
+        for marker in (
+            "pip install",
+            "pipx install",
+            "bash install/preflight",
+            "./install/preflight",
+            "install_codex_global.sh",
+            "install_claude_global.sh",
+            "install-agent-skill",
+            "jsonl-history-search validate-install",
+            "isolated install",
+            "skill installer",
+        )
+    ):
+        facets.add("install")
+    if any(
+        marker in call
+        for marker in (
+            "claude --version",
+            "codex --version",
+            "pipx ",
+            "jsonl-history-search validate-install",
+            "runtime smoke",
+            "install smoke",
+            "isolated smoke",
+        )
+    ):
+        facets.add("limitation")
+        facets.add("runtime")
+    if any(
+        marker in call
+        for marker in (
+            "jsonl-history-search --help",
+            "jsonl-history-search validate-install",
+            "codex --version",
+            "claude --version",
+            "installed entrypoint",
+            "runtime smoke",
+            "install smoke",
+            "isolated smoke",
+        )
+    ):
+        facets.add("runtime")
+    return facets
+
+
+def dedupe_provenance_direct_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        key = str(event.get("event_id") or event.get("target") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(event)
+    return result
+
+
+def provenance_direct_event_ref(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_id": event.get("event_id"),
+        "source_ref": event.get("source_ref"),
+        "output_source_ref": event.get("output_source_ref"),
+        "facets": list(event.get("facets") or []),
+        "correlated_output": bool(event.get("correlated_output")),
+    }
+
+
+def select_provenance_direct_events(
+    events: list[dict[str, Any]],
+    *,
+    required_facets: list[str],
+) -> list[dict[str, Any]]:
+    uncovered = set(required_facets)
+    selected: list[dict[str, Any]] = []
+    while uncovered and len(selected) < PROVENANCE_DIRECT_EVIDENCE_READ_CAP:
+        best = None
+        best_key = (0, 0, 0, 0)
+        for event in events:
+            if event in selected:
+                continue
+            event_facets = set(event.get("facets") or [])
+            covers = event_facets & uncovered
+            key = (
+                len(covers),
+                int(event.get("query_term_overlap_count", 0) or 0),
+                len(event_facets),
+                -int((event.get("source_ref") or {}).get("line") or 0),
+            )
+            if key > best_key:
+                best = event
+                best_key = key
+        if best is None or best_key[0] == 0:
+            break
+        selected.append(best)
+        uncovered -= set(best.get("facets") or [])
+    return selected
+
+
+def provenance_direct_event_read(event: dict[str, Any]) -> dict[str, Any]:
+    source_ref = dict(event.get("source_ref") or {})
+    return {
+        "kind": "tool_event_source_ref",
+        "target": source_ref_target(source_ref),
+        "source_ref": source_ref,
+        "reason": "open correlated direct source-session tool call/output evidence",
+        "read_role": "required_primary_proof",
+        "read_more_actionable": True,
+        "followthrough_actionable": True,
+        "diagnostic_only": False,
+        "direct_evidence_facets": list(event.get("facets") or []),
+        "provenance_direct_evidence": provenance_direct_event_ref(event),
+        "action_proof_source_selection": {
+            "schema_version": 1,
+            "selection_reason": "correlated_direct_source_session_event",
+            "source_window_verification_required": True,
+            "claim_boundary": "direct_call_and_correlated_output_support_only_classified_facets",
+        },
+        "historical_provenance_selection": {
+            "schema_version": 1,
+            "source_chronology_role": "target_historical_raw_direct_event_source_ref",
+            "final_support_allowed": True,
+            "read_more_actionable": True,
+            "followthrough_actionable": True,
+            "diagnostic_only": False,
+            "raw_text_included": False,
+        },
+    }
+
+
+def provenance_missing_facet_continuation(
+    *,
+    missing_facets: list[str],
+    direct_events: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not missing_facets:
+        return None
+    source_ref = {}
+    if direct_events:
+        source_ref = dict((direct_events[0].get("source_ref") or {}))
+    if not source_ref:
+        for candidate in candidates:
+            if isinstance(candidate.get("source_ref"), dict) and candidate["source_ref"].get("path"):
+                source_ref = dict(candidate["source_ref"])
+                break
+    target = source_ref_target(source_ref) if source_ref else None
+    if not target:
+        return None
+    command = provenance_bounded_direct_read_command(target)
+    return {
+        "kind": "jsonl_source_ref",
+        "target": target,
+        "source_ref": source_ref,
+        "reason": f"one bounded continuation for missing direct facets: {', '.join(missing_facets)}",
+        "read_role": "conditional_required",
+        "conditional_required": True,
+        "read_more_actionable": True,
+        "followthrough_actionable": True,
+        "read_more_command": command,
+        "bounded_read_more_command": command,
+        "missing_direct_evidence_facets": missing_facets,
+        "provenance_direct_evidence_continuation": {
+            "schema_version": 1,
+            "bounded": True,
+            "continuation_index": 1,
+            "maximum_continuations": 1,
+        },
+    }
+
+
+def apply_provenance_direct_evidence_ledger_to_reads(
+    next_reads: list[dict[str, Any]],
+    ledger: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not ledger.get("applies"):
+        return next_reads
+    selected = list(ledger.get("selected_primary_reads") or [])
+    selected_by_target = {str(read.get("target") or ""): read for read in selected if read.get("target")}
+    roles = dict(ledger.get("_source_roles_by_target") or {})
+    rows: list[dict[str, Any]] = list(selected)
+    continuations = list(ledger.get("missing_facet_continuations") or [])[:1]
+    rows.extend(continuations)
+    for read in next_reads:
+        target = str(read.get("target") or "")
+        if target in selected_by_target or any(target == item.get("target") for item in continuations):
+            continue
+        row = dict(read)
+        event_role = roles.get(target)
+        if event_role in {"assistant_recap", "report_writing_event", "compacted_summary"}:
+            row.update(
+                {
+                    "read_role": "optional_diagnostic",
+                    "secondary_context_role": event_role,
+                    "required_primary_proof_allowed": False,
+                    "read_more_actionable": False,
+                    "followthrough_actionable": False,
+                    "diagnostic_only": True,
+                    "expansion_actions": [],
+                    "context_actions": [],
+                }
+            )
+        elif event_role == "specification_context_read":
+            row.update(
+                {
+                    "read_role": "optional_diagnostic",
+                    "secondary_context_role": event_role,
+                    "required_primary_proof_allowed": False,
+                    "direct_action_proof": False,
+                    "read_more_actionable": False,
+                    "followthrough_actionable": False,
+                    "diagnostic_only": True,
+                    "expansion_actions": [],
+                    "context_actions": [],
+                }
+            )
+        elif event_role == "original_user_intent":
+            row.update(
+                {
+                    "read_role": "optional_diagnostic",
+                    "intent_source_role": "original_user_intent",
+                    "direct_action_proof": False,
+                    "required_primary_proof_allowed": False,
+                    "read_more_actionable": False,
+                    "followthrough_actionable": False,
+                    "diagnostic_only": True,
+                    "expansion_actions": [],
+                    "context_actions": [],
+                }
+            )
+        else:
+            row.update(
+                {
+                    "read_role": "optional_diagnostic",
+                    "required_primary_proof_allowed": False,
+                    "read_more_actionable": False,
+                    "followthrough_actionable": False,
+                    "diagnostic_only": True,
+                    "default_actionable": False,
+                    "expansion_actions": [],
+                    "context_actions": [],
+                }
+            )
+        rows.append(row)
+    return dedupe_dicts(rows)[:12]
+
+
+def public_provenance_direct_evidence_facet_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in ledger.items() if not key.startswith("_")}
+
+
+def provenance_bounded_direct_read_command(target: str) -> str:
+    return shell_command(
+        [
+            "jsonl-history-search",
+            "read-more",
+            target,
+            "--mode",
+            "window",
+            "--before",
+            str(PROVENANCE_COMPLETE_PROOF_READ_BEFORE),
+            "--after",
+            str(PROVENANCE_COMPLETE_PROOF_READ_AFTER),
+            "--max-records",
+            str(PROVENANCE_COMPLETE_PROOF_READ_MAX_RECORDS),
+            "--format",
+            "text",
+            "--projection",
+            "compact",
+            "--compact-text-limit",
+            str(PROVENANCE_COMPLETE_PROOF_COMPACT_TEXT_LIMIT),
+        ]
+    )
+
+
+def build_provenance_complete_proof_handoff(
+    *,
+    ledger: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    scope_boundary_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the authoritative terminal surface for source-session provenance proof."""
+    if not ledger.get("applies"):
+        return {}
+
+    selected_reads = []
+    for read in list(ledger.get("selected_primary_reads") or [])[:PROVENANCE_DIRECT_EVIDENCE_READ_CAP]:
+        target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+        if not target:
+            continue
+        proof = read.get("provenance_direct_evidence") or {}
+        selected_reads.append(
+            {
+                "target": target,
+                "source_ref": read.get("source_ref") or {},
+                "output_source_ref": proof.get("output_source_ref") or {},
+                "covered_facets": list(read.get("direct_evidence_facets") or []),
+                "correlated_call_output": bool(proof.get("correlated_output")),
+                "command": provenance_bounded_direct_read_command(target),
+                "window": {
+                    "before": PROVENANCE_COMPLETE_PROOF_READ_BEFORE,
+                    "after": PROVENANCE_COMPLETE_PROOF_READ_AFTER,
+                    "max_records": PROVENANCE_COMPLETE_PROOF_READ_MAX_RECORDS,
+                    "projection": "compact",
+                    "compact_text_limit": PROVENANCE_COMPLETE_PROOF_COMPACT_TEXT_LIMIT,
+                },
+            }
+        )
+
+    roles = list((ledger.get("_source_roles_by_target") or {}).values())
+    optional_diagnostic_count = sum(
+        1
+        for read in next_reads
+        if isinstance(read, dict) and read.get("read_role") == "optional_diagnostic"
+    )
+    suppression_counts = {
+        "assistant_recap_targets": roles.count("assistant_recap"),
+        "report_writing_targets": roles.count("report_writing_event"),
+        "compacted_summary_targets": roles.count("compacted_summary"),
+        "specification_context_targets": roles.count("specification_context_read"),
+        "optional_diagnostics_preserved_non_actionable": optional_diagnostic_count,
+        "secondary_executable_targets_exposed": 0,
+        "generic_continuation_commands_exposed": 0,
+    }
+    boundaries = {
+        "searched_scope": scope_boundary_summary.get("searched_scope") or {},
+        "not_searched_scope": scope_boundary_summary.get("not_searched_scope") or {},
+        "excluded_scope": scope_boundary_summary.get("excluded_scope") or {},
+        "caps": scope_boundary_summary.get("caps") or {},
+        "claim_boundary": scope_boundary_summary.get("claim_boundary"),
+    }
+    evidence_complete = bool(
+        ledger.get("evidence_complete")
+        and ledger.get("required_facets")
+        and not ledger.get("missing_required_facets")
+        and selected_reads
+        and all(read.get("correlated_call_output") for read in selected_reads)
+    )
+    handoff = {
+        "schema_version": 1,
+        "state": (
+            "provenance_complete_proof_handoff"
+            if evidence_complete
+            else "provenance_incomplete_direct_proof_handoff"
+        ),
+        "active": evidence_complete,
+        "applies": True,
+        "output_budget_bytes": PROVENANCE_COMPLETE_PROOF_OUTPUT_MAX_BYTES,
+        "required_facets": list(ledger.get("required_facets") or []),
+        "covered_direct_facets": list(ledger.get("covered_direct_facets") or []),
+        "missing_required_facets": list(ledger.get("missing_required_facets") or []),
+        "selected_direct_reads": selected_reads,
+        "searched_scope_boundaries": boundaries,
+        "suppression_counts": suppression_counts,
+        "optional_diagnostics": {
+            "preserved_at": "semantic_debug structured/debug fields",
+            "actionable": False,
+            "may_trigger_continuation": False,
+        },
+    }
+    if evidence_complete:
+        handoff.update(
+            {
+                "answer_status": "answer_ready_after_selected_direct_reads",
+                "stop_instruction": (
+                    "Open only the selected direct reads, synthesize the answer from their correlated call/output "
+                    "evidence, cite those refs, and stop. Do not open recaps, summaries, specifications, reports, "
+                    "candidates, or diagnostic/retrieval surfaces."
+                ),
+                "continuation_commands": [],
+            }
+        )
+        return handoff
+
+    continuations = []
+    for read in list(ledger.get("missing_facet_continuations") or [])[:1]:
+        target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+        if not target:
+            continue
+        continuations.append(
+            {
+                "target": target,
+                "missing_facets": list(read.get("missing_direct_evidence_facets") or []),
+                "command": provenance_bounded_direct_read_command(target),
+            }
+        )
+    handoff.update(
+        {
+            "answer_status": "missing_direct_evidence_facets",
+            "stop_instruction": (
+                "Run at most the single bounded missing-facet continuation, then answer with any remaining "
+                "facets explicitly unsupported and stop."
+            ),
+            "continuation_commands": continuations,
+        }
+    )
+    return handoff
 
 
 def build_source_window_action_proof(
@@ -7028,6 +8092,9 @@ def build_primary_source_followthrough(
         "raw_private_text_included": False,
         "raw_private_path_included": False,
     }
+    if isinstance(first.get("provenance_direct_evidence"), dict):
+        command["provenance_direct_evidence"] = first["provenance_direct_evidence"]
+        command["direct_evidence_facets"] = list(first.get("direct_evidence_facets") or [])
     if required_final_source_ref_ids:
         command["required_final_source_ref_ids"] = required_final_source_ref_ids
         command["reviewed_source_case_handle"] = reviewed_pointer.get("handle")
@@ -7239,6 +8306,16 @@ def primary_followthrough_window(
     inferred = read.get("inferred_anchor") if isinstance(read.get("inferred_anchor"), dict) else {}
     anchor_kind = inferred.get("anchor_kind")
     correction_meta = explicit_correction_window_meta(read)
+    if isinstance(read.get("provenance_direct_evidence"), dict):
+        return {
+            "before": 1,
+            "after": 3,
+            "max_records": 8,
+            "projection": "compact",
+            "compact_text_limit": 1800,
+            "format": "text",
+            "reason": "correlated_direct_event_window_covers_call_and_output",
+        }
     if correction_meta.get("bounded_to_explicit_date_window"):
         bundle = read.get("explicit_correction_window_bundle")
         if isinstance(bundle, dict) and bundle.get("same_source_window"):
@@ -8967,6 +10044,14 @@ def action_proof_primary_refs(
     for read in [item for item in action_reads if read_is_required_surface_actionable(item)][:4]:
         refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
 
+    direct_source_session_refs = [
+        ref
+        for ref in refs
+        if ref.get("selection_reason") == "correlated_direct_source_session_event"
+    ]
+    if direct_source_session_refs:
+        return dedupe_dicts(direct_source_session_refs)[:PROVENANCE_DIRECT_EVIDENCE_READ_CAP]
+
     buckets = source_window_action_proof.get("buckets") if isinstance(source_window_action_proof.get("buckets"), dict) else {}
     for bucket_name in ("command_tool_call", "command_tool_output", "changed_check_review_commit_evidence"):
         bucket = buckets.get(bucket_name) if isinstance(buckets.get(bucket_name), dict) else {}
@@ -8996,6 +10081,10 @@ def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str,
         "followthrough_actionable": read.get("followthrough_actionable"),
         "historical_provenance_selection": read.get("historical_provenance_selection")
         if isinstance(read.get("historical_provenance_selection"), dict)
+        else None,
+        "direct_evidence_facets": list(read.get("direct_evidence_facets") or []),
+        "provenance_direct_evidence": read.get("provenance_direct_evidence")
+        if isinstance(read.get("provenance_direct_evidence"), dict)
         else None,
     }
     return {key: value for key, value in row.items() if value not in (None, [], {})}

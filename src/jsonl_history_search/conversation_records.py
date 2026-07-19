@@ -129,7 +129,7 @@ def classify_conversation_record(record: Mapping[str, Any] | Record | Any) -> Co
     text = _record_text(raw)
     initial_tag = _initial_tag(text)
 
-    if top_type == "compacted" or "replacement_history" in payload_map:
+    if top_type == "compacted" or payload_type == "context_compacted" or "replacement_history" in payload_map:
         return _classification(
             COMPACTED_HISTORY_SUMMARY,
             "high",
