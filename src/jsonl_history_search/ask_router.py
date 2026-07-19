@@ -711,27 +711,28 @@ ROUTES: tuple[AskRoute, ...] = (
         first_command_template='{cli} what-happened-since {query} --cwd "$PWD" --format text',
         read_specialization="none; latest-status guidance is self-contained in the status command output",
         inspect_after=(
-            "status_anchor.follow_through_plan open_first / then_confirm / do_not_open_by_default before JSON or JQ reruns",
-            "status_anchor.parent_main_anchor_shortlist, anchor_candidates, and selected_anchor",
+            "the answer-ready parent/main path when emitted: selected canonical anchor, required post-anchor raw session reads, one bounded secondary confirmation batch, then answer and stop",
+            "status_anchor.parent_main_anchor_shortlist and selected_anchor",
             "for main-thread wording, parent_main_anchor_shortlist must select one unique high-confidence human history.jsonl row or fail closed before answer",
             "status_anchor.session_activity raw sessions/**/*.jsonl trace after the anchor",
-            "source_tiers and next_reads only as debugging detail after the follow-through plan leaves a named gap",
+            "JSON-only rejected candidates, diagnostics, source_tiers, and next_reads only after naming a required facet that remains missing or contradictory",
         ),
         stop_guidance=(
             "Run the status route before task/repo recovery scans. Use "
-            "status_anchor.follow_through_plan first: open_first required primary refs, then_confirm "
-            "target-window secondary refs, and do_not_open_by_default diagnostics. Do not rerun "
-            "JSON/JQ extraction, open diagnostic/post-window refs, or broaden manual search unless "
-            "a named status facet remains missing or contradictory after the plan reads. For "
+            "the answer-ready parent/main path when emitted: open the selected canonical anchor, "
+            "open the required post-anchor raw session refs, run at most the one bounded secondary "
+            "confirmation batch, then answer and stop. Do not rerun JSON/JQ extraction, open rejected/"
+            "diagnostic/optional refs, or broaden manual search unless a named required facet remains "
+            "missing or contradictory after those reads. For "
             "main-thread/parent-thread status wording, do not answer from inherited context or a "
             "current-session prompt; inspect status_anchor.parent_main_anchor_shortlist and do not "
             "answer unless it selects one unique high-confidence human history.jsonl row."
         ),
         manual_search_guidance=(
-            "Repo or task scans are follow-up only after the follow-through plan identifies "
-            "the anchor/window and required raw/session refs, or reports that it cannot find one. "
+            "Repo or task scans are follow-up only after the bounded answer-ready path reports a named "
+            "required facet that is still missing or contradictory, or cannot find a canonical anchor. "
             "Treat commits and repo state as secondary support, never as the status anchor; "
-            "diagnostic/post-window refs are not default answer support."
+            "never run broad session/state/task-family/Git archaeology after the required reads complete."
         ),
     ),
     AskRoute(
