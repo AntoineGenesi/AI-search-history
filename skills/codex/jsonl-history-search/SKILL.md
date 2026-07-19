@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use for obvious requests to search prior Codex or Claude conversations, recover what the user previously said, verify what an agent actually did, inspect source provenance, or debug a decision from conversation history. In the default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Bare `what happened?`, `what changed in this task file?`, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command. Route through the installed-or-source `ask --execute` command before answering from visible context.
+description: Use for obvious requests to search prior Codex or Claude conversations, recover what the user previously said, verify what an agent actually did, inspect source provenance, debug a decision from conversation history, or explain why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In the default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command. Route through the installed-or-source `ask --execute` command before answering from visible context.
 metadata:
   short-description: Search local AI conversation history
 ---
@@ -19,22 +19,31 @@ request clearly depends on prior AI conversation history. Examples include:
 - what the user previously said, requested, corrected, or preferred;
 - what an agent actually ran, changed, tested, or claimed;
 - why a prior decision or failure happened;
+- why a cleanup or multi-step process was deferred, repeated, or failed;
 - which conversation is the source behind a summary or outcome;
 - `what happened since my last message?`; and
 - the exact automatic trigger `what has happened since my last message in the
   parent thread?`, plus the narrow main-thread/parent-thread variants.
 
 The trigger is intentionally narrow. Do not trigger for bare `what happened?`,
-`what changed in this task file?`, local repo/task/artifact status prompts, or
-generic questions not anchored to prior conversation history. Ask one short
-clarifying question and use zero tools when the event or evidence source is
-ambiguous.
+`what changed in this task file?`, ordinary branch/cleanliness/local-status
+prompts, local repo/task/artifact status prompts, or generic questions not
+anchored to prior conversation history. Ask one short clarifying question and
+use zero tools when the event or evidence source is ambiguous.
 
 If a user or project instruction sets `JSONL activation mode: explicit-only`,
-natural wording alone is a non-trigger; require a leading `convo`. The leading
-word activates this skill but does not select a shell command.
+natural wording alone is a non-trigger; require a leading `convo`.
 
 ## First Move
+
+For a named `tasks`/`...md`, decide scope before any tool:
+
+- checkout/HEAD/current-Git intent, including ancestry or local review/status:
+  add exactly `--evidence-source local` after `"<user wording>"`;
+- conversation/source-session intent: add exactly
+  `--evidence-source conversation-history` there; or
+- unresolved scope: ask "Do you want current local Git/task evidence or prior
+  conversation history?" and use zero tools.
 
 Preserve the user's wording as one quoted argument. Run this installed-or-source
 resolution block before repository search, Git inspection, or synthesis from
