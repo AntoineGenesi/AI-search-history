@@ -16,8 +16,9 @@ from .conversation_records import (
     HUMAN_AUTHORED_USER_MESSAGE,
     TOOL_ACTION_OUTPUT,
     classify_conversation_record,
+    extract_human_ask,
 )
-from .latest_user_messages import latest_user_messages
+from .latest_user_messages import MIRROR_CORRELATION_WINDOW_SECONDS, latest_user_messages
 from .timeutil import parse_datetime
 
 
@@ -353,6 +354,11 @@ def status_anchor_report(
         canonical_parent_main_interval=canonical_parent_main_interval,
         canonical_parent_main_fallback=canonical_parent_main_fallback,
     )
+    if anchor_decision.get("selected_anchor"):
+        anchor_decision["selected_anchor"] = _attach_logical_message_identity(
+            anchor_decision["selected_anchor"],
+            anchor_candidates,
+        )
     prior_request_occurrence = anchor_decision.get("prior_request_occurrence") or prior_request_occurrence
     status_as_of_boundary = anchor_decision.get("status_as_of_boundary") or status_as_of_boundary
     selected_anchor = _with_read_more_command(anchor_decision.get("selected_anchor"), cwd=cwd, codex_home=codex_home)
@@ -623,6 +629,12 @@ def _rank_anchor_candidates(
                 "thread_key": message.get("thread_key"),
                 "thread_keys": _message_thread_keys(message),
                 "mirror_sources": message.get("mirror_sources") or [],
+                "logical_message_id": message.get("logical_message_id"),
+                "correlation_status": message.get("correlation_status"),
+                "correlated_session_identity": message.get("correlated_session_identity"),
+                "canonical_authority": message.get("canonical_authority"),
+                "session_activity_location": message.get("session_activity_location"),
+                "correlation_diagnostics": message.get("correlation_diagnostics") or [],
                 "snippet": text,
                 "classification": classification,
                 "score": score,
@@ -683,6 +695,9 @@ def _status_as_of_boundary_from_messages(query: str, messages: list[dict]) -> di
         "local_timestamp": status_message.get("local_timestamp"),
         "message_index": status_message.get("message_index"),
         "thread_keys": status_message.get("thread_keys") or [],
+        "logical_message_id": boundary_source.get("logical_message_id"),
+        "canonical_authority": boundary_source.get("canonical_authority"),
+        "session_activity_location": boundary_source.get("session_activity_location"),
         "snippet": status_message.get("snippet"),
         "boundary_policy": (
             "For non-audit status questions, candidate selection, raw session activity, source tiers, "
@@ -818,6 +833,34 @@ def _select_anchor_with_boundary(
             },
             candidates,
         )
+    quoted_authority = _quoted_anchor_authority_resolution(query, candidates)
+    if quoted_authority.get("status") == "selected":
+        selected = quoted_authority["selected_anchor"]
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "explicit_quoted_canonical_authority",
+                "anchor_scope": "explicit_user_anchor",
+                "anchor_reason": selected.get("explicit_anchor_reason") or "unique_canonical_authority_for_quoted_message",
+                "anchor_ref": selected.get("source_ref"),
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected as the unique canonical authority for the quoted logical message",
+                ),
+                "quoted_anchor_authority": quoted_authority,
+            },
+            candidates,
+        )
+    if quoted_authority.get("status") == "ambiguous":
+        return {
+            **base,
+            "context_boundary": "explicit_quoted_anchor_authority_ambiguous",
+            "anchor_scope": "explicit_user_anchor",
+            "anchor_reason": quoted_authority.get("reason"),
+            "selected_anchor": None,
+            "quoted_anchor_authority": quoted_authority,
+            "rejected_anchor_alternatives": quoted_authority.get("candidate_diagnostics") or [],
+        }
     by_ref = {candidate.get("source_ref"): candidate for candidate in candidates}
     user_chronology = _current_user_message_chronology_decision(
         query=query,
@@ -2954,6 +2997,9 @@ def _status_boundary_from_user_candidate(candidate: dict, *, kind: str, policy: 
         "local_timestamp": candidate.get("local_timestamp"),
         "message_index": candidate.get("message_index"),
         "thread_keys": candidate.get("thread_keys") or [],
+        "logical_message_id": candidate.get("logical_message_id"),
+        "canonical_authority": candidate.get("canonical_authority"),
+        "session_activity_location": candidate.get("session_activity_location"),
         "snippet": candidate.get("snippet"),
         "boundary_policy": policy,
     }
@@ -2984,6 +3030,85 @@ def _current_user_chronology_alternatives(candidates: list[dict], *, limit: int 
             continue
         alternatives.append(_current_user_boundary_candidate(candidate))
     return alternatives
+
+
+def _quoted_anchor_authority_resolution(query: str, candidates: list[dict]) -> dict:
+    if _wants_message_before_named_anchor(_normalize(query)):
+        return {"status": "not_applicable"}
+    fragments = [
+        _normalize(match.group(1))
+        for match in _QUOTED_ANCHOR_RE.finditer(query)
+        if len(_normalize(match.group(1)).split()) >= 3
+    ]
+    if not fragments:
+        return {"status": "not_applicable"}
+    matches = []
+    for candidate in candidates:
+        if _is_never_anchor(candidate):
+            continue
+        snippet = _normalize(str(candidate.get("snippet") or ""))
+        if any(fragment and (fragment in snippet or snippet in fragment) for fragment in fragments):
+            matches.append(candidate)
+    if not matches:
+        return {"status": "not_applicable"}
+
+    canonical = [candidate for candidate in matches if candidate.get("source_kind") == "codex_history"]
+    ambiguous = [
+        candidate
+        for candidate in matches
+        if str(candidate.get("correlation_status") or "").startswith("ambiguous_")
+    ]
+    diagnostics = [_quoted_authority_candidate_diagnostic(candidate) for candidate in matches[:8]]
+    if len(canonical) == 1 and not ambiguous:
+        selected = dict(canonical[0])
+        has_timestamp = any(
+            parse_datetime(match.group(0).replace(" ", "T"), timezone.utc) is not None
+            for match in _TIMESTAMP_ANCHOR_RE.finditer(query)
+        )
+        selected["explicit_anchor_reason"] = (
+            "explicit_timestamp_and_quoted_message_anchor"
+            if has_timestamp
+            else "unique_canonical_authority_for_quoted_message"
+        )
+        selected["score"] = max(int(selected.get("score") or 0), 100)
+        return {
+            "status": "selected",
+            "selection_rule": "exact normalized quote plus correlated session identity and bounded chronology",
+            "selected_anchor": selected,
+            "canonical_candidate_count": 1,
+            "session_candidate_count": len(matches) - 1,
+            "candidate_diagnostics": diagnostics,
+        }
+    if len(canonical) > 1:
+        reason = "quoted_message_matched_multiple_canonical_history_rows"
+    elif ambiguous:
+        reason = "quoted_message_canonical_session_correlation_is_ambiguous"
+    else:
+        reason = "quoted_message_has_no_canonical_history_authority"
+    return {
+        "status": "ambiguous",
+        "reason": reason,
+        "selection_rule": "quoted status anchors require exactly one canonical history authority",
+        "canonical_candidate_count": len(canonical),
+        "session_candidate_count": len(matches) - len(canonical),
+        "candidate_diagnostics": diagnostics,
+    }
+
+
+def _quoted_authority_candidate_diagnostic(candidate: dict) -> dict:
+    return {
+        "source_ref": candidate.get("source_ref"),
+        "source_kind": candidate.get("source_kind"),
+        "timestamp_utc": candidate.get("timestamp_utc"),
+        "logical_message_id": candidate.get("logical_message_id"),
+        "correlation_status": candidate.get("correlation_status"),
+        "decision": "candidate_diagnostic",
+        "rationale": "quoted logical-message authority candidate",
+        "snippet": candidate.get("snippet"),
+        "openable_source_ref": candidate.get("openable_source_ref"),
+        "openable_target": candidate.get("openable_target"),
+        "correlation_diagnostics": candidate.get("correlation_diagnostics") or [],
+    }
 
 
 def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
@@ -3332,6 +3457,9 @@ def _unproven_parent_main_anchor_alternatives(
                     "rationale": _parent_main_rejection_rationale(candidate),
                     "snippet": candidate.get("snippet"),
                     "source_kind": candidate.get("source_kind"),
+                    "logical_message_id": candidate.get("logical_message_id"),
+                    "correlation_status": candidate.get("correlation_status"),
+                    "correlation_diagnostics": candidate.get("correlation_diagnostics") or [],
                     "openable_source_ref": candidate.get("openable_source_ref"),
                     "openable_target": candidate.get("openable_target"),
                     "target_window_hits": candidate.get("target_window_hits") or [],
@@ -3446,6 +3574,15 @@ def _history_mirror_candidate(candidate: dict) -> dict | None:
 def _selected_with_reason(candidate: dict, reason_suffix: str) -> dict:
     selected = dict(candidate)
     selected["rationale"] = str(selected.get("rationale") or "").rstrip() + reason_suffix
+    return selected
+
+
+def _attach_logical_message_identity(selected: dict, candidates: list[dict]) -> dict:
+    selected_ref = str(selected.get("source_ref") or "")
+    for candidate in candidates:
+        if str(candidate.get("source_ref") or "") != selected_ref:
+            continue
+        return {**candidate, **selected}
     return selected
 
 
@@ -3910,6 +4047,9 @@ def _session_activity_trace(
     base = {
         "status": "no_selected_anchor",
         "anchor_timestamp_utc": None,
+        "logical_message_id": (selected_anchor or {}).get("logical_message_id"),
+        "canonical_authority": (selected_anchor or {}).get("canonical_authority"),
+        "session_activity_location": (selected_anchor or {}).get("session_activity_location"),
         "session_followups": [],
         "activity_after_anchor": _empty_activity_counts(),
         "next_reads": [],
@@ -3963,11 +4103,16 @@ def _session_activity_trace(
         if not session_files:
             missing.append(f"{context['role']} session file not found from {context.get('history_source_ref') or context.get('source_ref')}")
         for path in session_files:
+            activity_boundary = parse_datetime(str(context.get("session_anchor_timestamp_utc") or ""), timezone.utc)
+            if activity_boundary is None:
+                activity_boundary = anchor_timestamp
             scan = _scan_session_file_after_anchor(
                 path,
-                anchor_timestamp,
+                activity_boundary.astimezone(timezone.utc),
                 codex_home=codex_home,
                 cwd=cwd,
+                after_line=context.get("session_anchor_line"),
+                logical_message_id=selected_anchor.get("logical_message_id"),
                 target_window=target_window,
                 status_as_of_boundary=status_as_of_boundary,
                 audit_run_requested=audit_run_requested,
@@ -3978,6 +4123,10 @@ def _session_activity_trace(
                     **{key: value for key, value in context.items() if key != "session_files"},
                     "session_file": str(path),
                     "session_source_ref": _source_ref_for_path_line(path, None, codex_home),
+                    "logical_message_id": selected_anchor.get("logical_message_id"),
+                    "session_anchor_line": context.get("session_anchor_line"),
+                    "session_anchor_timestamp_utc": context.get("session_anchor_timestamp_utc"),
+                    "activity_boundary_policy": "strictly_after_correlated_session_user_row",
                     "records_after_anchor": scan["records_after_anchor"],
                     "first_after_anchor_ref": scan["first_after_anchor_ref"],
                     "last_after_anchor_ref": scan["last_after_anchor_ref"],
@@ -4092,18 +4241,35 @@ def _merge_activity_counts(target: dict, source: dict) -> None:
 
 def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -> list[dict]:
     contexts = []
+    activity_location = anchor.get("session_activity_location")
+    if isinstance(activity_location, Mapping) and activity_location.get("source_kind") == "codex_sessions":
+        context = _session_context_from_openable(
+            activity_location,
+            role=f"{role}_activity_location",
+            logical_message_id=anchor.get("logical_message_id"),
+        )
+        if context:
+            return [context]
     source_ref = str(anchor.get("source_ref") or "")
     if source_ref.startswith("codex_history:"):
         contexts.extend(_session_contexts_for_history_ref(source_ref, codex_home, role=role))
     if anchor.get("source_kind") == "codex_sessions":
-        context = _session_context_from_openable(anchor, role=role)
+        context = _session_context_from_openable(
+            anchor,
+            role=role,
+            logical_message_id=anchor.get("logical_message_id"),
+        )
         if context:
             contexts.append(context)
     for mirror in anchor.get("mirror_sources") or []:
         if not isinstance(mirror, dict):
             continue
         if mirror.get("source_kind") == "codex_sessions":
-            context = _session_context_from_openable(mirror, role=f"{role}_mirror")
+            context = _session_context_from_openable(
+                mirror,
+                role=f"{role}_mirror",
+                logical_message_id=anchor.get("logical_message_id"),
+            )
             if context:
                 contexts.append(context)
     return contexts
@@ -4122,7 +4288,7 @@ def _apply_parent_thread_lineage_to_ranked_candidates(
         return candidates
     updated = []
     for candidate in candidates:
-        if candidate.get("source_kind") != "codex_sessions":
+        if candidate.get("source_kind") != "codex_sessions" and not candidate.get("session_activity_location"):
             updated.append(candidate)
             continue
         lineage = candidate.get("lineage_resolution") or _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
@@ -4192,7 +4358,12 @@ def _session_contexts_for_history_ref(source_ref: str, codex_home: Path, *, role
     ]
 
 
-def _session_context_from_openable(source: dict, *, role: str) -> dict | None:
+def _session_context_from_openable(
+    source: Mapping[str, Any],
+    *,
+    role: str,
+    logical_message_id: str | None = None,
+) -> dict | None:
     openable = source.get("openable_source_ref") or {}
     path_text = openable.get("path")
     if not path_text:
@@ -4206,7 +4377,11 @@ def _session_context_from_openable(source: dict, *, role: str) -> dict | None:
     return {
         "role": role,
         "source_ref": source.get("source_ref"),
+        "logical_message_id": logical_message_id,
         "session_id_hash": _hash_value(_session_id_from_filename(path)),
+        "correlated_session_identity": source.get("correlated_session_identity"),
+        "session_anchor_line": openable.get("line") or _line_from_source_ref(str(source.get("source_ref") or "")),
+        "session_anchor_timestamp_utc": source.get("timestamp_utc"),
         "session_files": [path],
     }
 
@@ -4217,6 +4392,8 @@ def _scan_session_file_after_anchor(
     *,
     codex_home: Path,
     cwd: Path,
+    after_line: int | None = None,
+    logical_message_id: str | None = None,
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
@@ -4245,11 +4422,13 @@ def _scan_session_file_after_anchor(
                 continue
             if not isinstance(record, Mapping):
                 continue
+            if after_line is not None and line_number <= int(after_line):
+                continue
             timestamp = parse_datetime(
                 record.get("timestamp") or record.get("ts") or record.get("created_at") or record.get("time"),
                 timezone.utc,
             )
-            if timestamp is not None and timestamp.astimezone(timezone.utc) < anchor_timestamp:
+            if after_line is None and timestamp is not None and timestamp.astimezone(timezone.utc) <= anchor_timestamp:
                 continue
             if _is_newer_than_status_as_of(
                 timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if timestamp is not None else "",
@@ -4271,6 +4450,8 @@ def _scan_session_file_after_anchor(
                         cwd=cwd,
                         codex_home=codex_home,
                         target_window=target_window,
+                        logical_message_id=logical_message_id,
+                        window_role="session_activity",
                         reason="Inspect raw session JSONL activity after the selected anchor before using commits or repo state.",
                     )
                 )
@@ -4290,6 +4471,8 @@ def _scan_session_file_after_anchor(
                             cwd=cwd,
                             codex_home=codex_home,
                             target_window=target_window,
+                            logical_message_id=logical_message_id,
+                            window_role="spawned_session_activity",
                             reason="Inspect spawned worker/reviewer session launch as part of the long-absence trace.",
                         )
                     )
@@ -4361,6 +4544,7 @@ def _find_raw_session_anchor_row(path: Path, anchor_timestamp, normalized_anchor
     except OSError:
         return None
     anchor_utc = anchor_timestamp.astimezone(timezone.utc)
+    matches = []
     with handle:
         for line_number, line in enumerate(handle, 1):
             try:
@@ -4369,21 +4553,24 @@ def _find_raw_session_anchor_row(path: Path, anchor_timestamp, normalized_anchor
                 continue
             if not isinstance(record, Mapping):
                 continue
-            record_text = _normalize(_record_task_text(record))
             classification = classify_conversation_record(record)
-            if normalized_anchor in record_text and classification.label == HUMAN_AUTHORED_USER_MESSAGE:
-                return line_number, record
+            if classification.label != HUMAN_AUTHORED_USER_MESSAGE:
+                continue
+            record_text = _normalize(extract_human_ask(record).ask_text or "")
+            if record_text != normalized_anchor:
+                continue
             timestamp = parse_datetime(
                 record.get("timestamp") or record.get("ts") or record.get("created_at") or record.get("time"),
                 timezone.utc,
             )
-            if timestamp is None or abs((timestamp.astimezone(timezone.utc) - anchor_utc).total_seconds()) > 1:
+            if (
+                timestamp is None
+                or abs((timestamp.astimezone(timezone.utc) - anchor_utc).total_seconds())
+                > MIRROR_CORRELATION_WINDOW_SECONDS
+            ):
                 continue
-            if normalized_anchor in record_text:
-                return line_number, record
-            if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
-                return line_number, record
-    return None
+            matches.append((line_number, record))
+    return matches[0] if len(matches) == 1 else None
 
 
 def _raw_session_next_read(
@@ -4397,14 +4584,29 @@ def _raw_session_next_read(
     codex_home: Path,
     target_window: dict | None,
     reason: str,
+    logical_message_id: str | None = None,
+    window_role: str = "session_activity",
 ) -> dict:
     record_text = _record_task_text(record)
+    session_source_identity = _source_ref_for_path_line(path, None, codex_home)
+    window_material = "|".join(
+        (logical_message_id or "unlinked", session_source_identity, window_role, str(line_number))
+    )
     read = {
         "reason": reason,
         "source_ref": source_ref,
+        "source_kind": "codex_sessions",
+        "source_chronology": "pre_evaluation_primary",
+        "source_role": "raw_session_activity",
+        "logical_message_id": logical_message_id,
+        "logical_window_id": "logical-window-" + hashlib.sha256(window_material.encode()).hexdigest()[:16],
+        "window_role": window_role,
+        "window_source_identity": session_source_identity,
+        "window_start_line": line_number,
+        "window_end_line": line_number + 8,
         "openable_source_ref": {"path": str(path), "line": line_number},
         "openable_target": target,
-        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home),
+        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home, before=0, after=8),
     }
     if target_window:
         read["target_window_hits"] = _target_window_hits(record_text, target_window)
@@ -4468,7 +4670,12 @@ def _dedupe_session_contexts(contexts: list[dict]) -> list[dict]:
     deduped = []
     for context in contexts:
         files = tuple(str(path) for path in context.get("session_files") or [])
-        key = (context.get("role"), context.get("history_source_ref"), context.get("source_ref"), files)
+        key = (
+            context.get("logical_message_id"),
+            context.get("correlated_session_identity") or context.get("session_id_hash"),
+            context.get("session_anchor_line"),
+            files,
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -4873,12 +5080,20 @@ def _next_reads(
 ) -> list[dict]:
     reads = []
     if selected_anchor:
+        logical_message_id = selected_anchor.get("logical_message_id")
         read = {
             "reason": "Inspect selected conversation anchor before answering.",
             "source_ref": selected_anchor["source_ref"],
+            "source_kind": selected_anchor.get("source_kind"),
+            "source_chronology": "pre_evaluation_primary",
+            "source_role": "canonical_message_authority",
             "snippet": selected_anchor["snippet"],
             "source_tier": "required_primary",
             "answer_use_required": True,
+            "logical_message_id": logical_message_id,
+            "logical_window_id": f"{logical_message_id}:canonical-anchor" if logical_message_id else None,
+            "window_role": "canonical_anchor",
+            "canonical_authority_read": selected_anchor.get("source_kind") == "codex_history",
         }
         if target_window:
             read["target_window_hits"] = selected_anchor.get("target_window_hits") or _target_window_hits(
@@ -4896,15 +5111,6 @@ def _next_reads(
     boundary_read = _prior_request_boundary_read(status_as_of_boundary, cwd=cwd, codex_home=codex_home)
     if boundary_read:
         reads.append(boundary_read)
-    if selected_anchor:
-        reads.extend(
-            _selected_anchor_raw_session_reads(
-                selected_anchor,
-                cwd=cwd,
-                codex_home=codex_home,
-                target_window=target_window,
-            )
-        )
     for read in session_activity.get("next_reads") or []:
         reads.append(
             {
@@ -4945,6 +5151,9 @@ def _next_reads(
                 "source_ref": ref,
                 "source_tier": tier,
                 "answer_use_required": tier != "diagnostic_optional",
+                "source_chronology": (
+                    "pre_evaluation_secondary" if tier == "required_secondary" else "pre_anchor_diagnostic"
+                ),
             }
             if tier == "diagnostic_optional":
                 read.update(
@@ -4966,6 +5175,7 @@ def _next_reads(
                     "source_ref": ref,
                     "source_tier": blocker.get("source_tier") or "required_secondary",
                     "answer_use_required": True,
+                    "source_chronology": "pre_evaluation_secondary",
                 }
             )
     for commit in artifacts.get("commits") or []:
@@ -4977,6 +5187,7 @@ def _next_reads(
                 "snippet": commit.get("subject"),
                 "source_tier": commit.get("source_tier") or "required_secondary",
                 "answer_use_required": True,
+                "source_chronology": "pre_evaluation_secondary",
                 "commit": commit.get("commit"),
                 "committed_at": commit.get("committed_at"),
             }
@@ -5011,6 +5222,9 @@ def _prior_request_boundary_read(status_as_of_boundary: dict | None, *, cwd: Pat
         "prior_request_occurrence_boundary": not current_user_boundary,
         "current_user_message_boundary": current_user_boundary,
         "answer_support_role": "current_user_message_boundary" if current_user_boundary else "status_query_boundary",
+        "source_chronology": "pre_evaluation_primary",
+        "source_role": "canonical_message_boundary",
+        "logical_message_id": status_as_of_boundary.get("logical_message_id"),
     }
     _copy_openable_fields(read, status_as_of_boundary)
     if read.get("openable_target") and not read.get("read_more_command"):
@@ -5043,6 +5257,7 @@ def _prior_request_occurrence_recovery_reads(
             "answer_use_required": False,
             "read_more_actionable": True,
             "verification_or_rerun_only": True,
+            "source_chronology": "unknown_diagnostic",
             "prior_request_occurrence_candidate": True,
             "fail_closed_before_answer": True,
             "answer_support_role": "prior_request_occurrence_disambiguation_only",
@@ -5092,6 +5307,7 @@ def _parent_main_recovery_reads(
             "answer_use_required": False,
             "read_more_actionable": False,
             "verification_or_rerun_only": True,
+            "source_chronology": "unknown_diagnostic",
             "diagnostic_open_policy": (
                 "canonical history-anchor discovery material only; locate the intended history.jsonl human row, "
                 "then rerun with that timestamp or quoted message before a factual answer"
@@ -5127,6 +5343,7 @@ def _parent_main_recovery_reads(
             "answer_use_required": False,
             "read_more_actionable": True,
             "verification_or_rerun_only": True,
+            "source_chronology": "unknown_diagnostic",
             "diagnostic_open_policy": (
                 "parent/main recovery candidate; open only to prove the canonical history.jsonl anchor, "
                 "then rerun with that timestamp or quoted message before a factual answer"
@@ -5151,6 +5368,12 @@ def _is_parent_main_recovery_candidate(candidate: dict) -> bool:
     if candidate.get("classification") not in {"substantive_work_anchor", "ordinary_human_turn", "short_human_turn"}:
         return False
     if candidate.get("source_kind") not in {"codex_history", "codex_sessions"}:
+        return False
+    if candidate.get("source_kind") == "codex_sessions" and candidate.get("correlation_status") in {
+        "session_only",
+        "ambiguous_multiple_canonical",
+        "ambiguous_multiple_session_copies",
+    }:
         return False
     return bool(candidate.get("source_ref") or candidate.get("openable_target"))
 
@@ -5183,6 +5406,7 @@ def _target_window_follow_on_reads(
             "snippet": candidate.get("snippet"),
             "source_tier": tier,
             "answer_use_required": audit_run_requested,
+            "source_chronology": "pre_evaluation_primary" if audit_run_requested else "same_loop_or_post_hoc",
             "target_window_hits": candidate.get("target_window_hits") or [],
             "outside_target_task_ids": candidate.get("outside_target_task_ids") or [],
             "target_window_follow_on_context": not audit_run_requested,
@@ -5249,6 +5473,13 @@ def _source_role_for_read(read: dict) -> tuple[str, str, str]:
     source_kind = str(read.get("source_kind") or "")
     openable_target = _normalize_pathish(str(read.get("openable_target") or ""))
     source_tier = str(read.get("source_tier") or "")
+    chronology = str(read.get("source_chronology") or "")
+    if chronology in {"same_loop", "post_hoc", "same_loop_or_post_hoc"}:
+        return (
+            "post_hoc_diagnostic",
+            "post_hoc_answer_key_or_same_loop_echo",
+            "explicit source chronology marks this material as same-loop or post-hoc diagnostic evidence",
+        )
     if _is_post_hoc_or_diagnostic_read(read):
         label = (
             "post_hoc_answer_key_or_same_loop_echo"
@@ -5301,15 +5532,15 @@ def _is_post_hoc_or_diagnostic_read(read: dict) -> bool:
 
 
 def _is_post_hoc_or_same_loop_read(read: dict) -> bool:
-    source_ref = str(read.get("source_ref") or "").casefold()
-    openable_target = str(read.get("openable_target") or "").casefold()
+    chronology = str(read.get("source_chronology") or "").casefold()
+    if chronology in {"same_loop", "post_hoc", "same_loop_or_post_hoc"}:
+        return True
     role_text = " ".join(
         str(read.get(key) or "").casefold()
         for key in ("answer_support_role", "diagnostic_open_policy", "reason")
     )
-    text = f"{source_ref} {openable_target} {role_text}"
+    text = role_text
     markers = (
-        ".private",
         "same-run",
         "same_loop",
         "current-run",
@@ -5690,7 +5921,7 @@ def _apply_answer_facing_suppression(
                 "read_more_actionable": False,
                 "suppressed_from_answer_facing": True,
                 "diagnostic_open_policy": (
-                    "same-run/private pressure artifact or manual-lane output; open only when explicitly auditing that run"
+                    "explicitly same-loop/post-hoc or manual-lane output; open only when explicitly auditing that run"
                 ),
             }
         )
@@ -5699,40 +5930,11 @@ def _apply_answer_facing_suppression(
 
 
 def _is_suppressed_answer_facing_ref(read: dict) -> bool:
-    text = _normalize_pathish(
-        " ".join(
-            str(read.get(key) or "")
-            for key in (
-                "source_ref",
-                "openable_target",
-                "reason",
-                "snippet",
-            )
-        )
+    chronology = str(read.get("source_chronology") or "").casefold()
+    return bool(
+        read.get("suppress_answer_facing")
+        or chronology in {"same_loop", "post_hoc", "same_loop_or_post_hoc"}
     )
-    if not text:
-        return False
-    private_or_run = (
-        ".private/" in text
-        or text.startswith("private:")
-        or "/run-" in text
-        or "pressure-run" in text
-        or "pressure_run" in text
-    )
-    manual_lane = (
-        "/manual_default/" in text
-        or "/manual-lane/" in text
-        or "/manual_lane/" in text
-        or "manual_default" in text
-        or "manual-lane" in text
-        or "manual lane" in text
-    )
-    final_output = (
-        "final_answer.txt" in text
-        or "final-answer.txt" in text
-        or "final_answer" in text
-    )
-    return private_or_run or (manual_lane and final_output)
 
 
 def _suppressed_answer_facing_support(
@@ -5938,7 +6140,14 @@ def _clarification_request(
     }
 
 
-def _read_more_command(target: str, *, cwd: Path, codex_home: Path | None) -> str:
+def _read_more_command(
+    target: str,
+    *,
+    cwd: Path,
+    codex_home: Path | None,
+    before: int = 2,
+    after: int = 8,
+) -> str:
     parts = [
         "jsonl-history-search",
         "read-more",
@@ -5948,22 +6157,54 @@ def _read_more_command(target: str, *, cwd: Path, codex_home: Path | None) -> st
     ]
     if codex_home is not None:
         parts.extend(["--codex-home", str(codex_home)])
-    parts.extend(["--format", "json", "--mode", "window", "--before", "2", "--after", "8"])
+    parts.extend(["--format", "json", "--mode", "window", "--before", str(before), "--after", str(after)])
     return " ".join(shlex.quote(part) for part in parts)
 
 
 def _dedupe_reads(reads: list[dict]) -> list[dict]:
-    seen = set()
+    seen_refs = set()
+    seen_windows = set()
     deduped = []
     for read in reads:
         ref = read.get("source_ref")
-        if not ref or ref in seen:
+        window_id = read.get("logical_window_id")
+        if not ref:
             continue
-        seen.add(ref)
+        if window_id and window_id in seen_windows:
+            continue
+        if ref in seen_refs:
+            continue
+        if any(_logical_windows_overlap(existing, read) for existing in deduped):
+            continue
+        seen_refs.add(ref)
+        if window_id:
+            seen_windows.add(window_id)
         deduped.append(read)
     tier_order = {"required_primary": 0, "required_secondary": 1, "diagnostic_optional": 2}
     deduped.sort(key=lambda item: tier_order.get(item.get("source_tier"), 2))
     return deduped
+
+
+def _logical_windows_overlap(left: dict, right: dict) -> bool:
+    logical_id = left.get("logical_message_id")
+    if not logical_id or logical_id != right.get("logical_message_id"):
+        return False
+    left_role = str(left.get("window_role") or "")
+    right_role = str(right.get("window_role") or "")
+    if left_role == right_role == "canonical_anchor":
+        return True
+    if "activity" not in left_role or "activity" not in right_role:
+        return False
+    if left.get("window_source_identity") != right.get("window_source_identity"):
+        return False
+    try:
+        left_start = int(left.get("window_start_line"))
+        left_end = int(left.get("window_end_line"))
+        right_start = int(right.get("window_start_line"))
+        right_end = int(right.get("window_end_line"))
+    except (TypeError, ValueError):
+        return False
+    return left_start <= right_end and right_start <= left_end
 
 
 def _rel(path: Path, cwd: Path) -> str:

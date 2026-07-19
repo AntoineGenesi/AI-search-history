@@ -22,7 +22,8 @@ from .conversation_records import (
 from .timeutil import parse_datetime
 
 
-DEDUPLICATION_STRATEGY = "normalized_timestamp_utc_and_text_merge_codex_history_session_mirrors"
+MIRROR_CORRELATION_WINDOW_SECONDS = 5.0
+DEDUPLICATION_STRATEGY = "normalized_text_correlated_session_identity_and_bounded_chronology"
 SORT_STRATEGY = "timestamp_utc_desc_source_kind_ref_tiebreak"
 
 
@@ -35,9 +36,16 @@ class LatestUserMessage:
     source_identifier: str
     thread_key: str
     line: int
+    correlated_session_identity: str | None = None
+    session_identity_source: str | None = None
     openable_source_ref: dict[str, Any] | None = None
     openable_target: str | None = None
     mirror_sources: list[dict] = field(default_factory=list)
+    logical_message_id: str | None = None
+    correlation_status: str = "unresolved"
+    canonical_authority: dict[str, Any] | None = None
+    session_activity_location: dict[str, Any] | None = None
+    correlation_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 def build_latest_user_messages_payload(args) -> dict:
@@ -162,6 +170,8 @@ class _Source:
     path: Path
     ref: str
     identifier: str
+    raw_session_id: str | None = None
+    raw_session_identity_source: str | None = None
 
 
 def _codex_sources(codex_home: Path, *, max_files: int, warnings: list[str]) -> list[_Source]:
@@ -185,12 +195,15 @@ def _codex_sources(codex_home: Path, *, max_files: int, warnings: list[str]) -> 
         if len(sources) >= max_files:
             warnings.append("Stopped source selection at max file cap.")
             break
+        raw_session_id, raw_session_identity_source = _session_raw_identity(path)
         sources.append(
             _Source(
                 kind="codex_sessions",
                 path=path,
                 ref=_session_ref(path, codex_home, line=None),
                 identifier=_session_identifier(path, codex_home),
+                raw_session_id=raw_session_id,
+                raw_session_identity_source=raw_session_identity_source,
             )
         )
     if not sources:
@@ -225,6 +238,8 @@ def _extract_user_message(
             source_identifier=identifier,
             thread_key=identifier,
             line=line_number,
+            correlated_session_identity=_correlated_session_identity(data.get("session_id")),
+            session_identity_source="history_session_id" if data.get("session_id") else None,
             openable_source_ref=_openable_source_ref(source.path, line_number),
             openable_target=_openable_target(source.path, line_number),
         )
@@ -244,6 +259,8 @@ def _extract_user_message(
         source_identifier=source.identifier,
         thread_key=source.identifier,
         line=line_number,
+        correlated_session_identity=_correlated_session_identity(source.raw_session_id),
+        session_identity_source=source.raw_session_identity_source,
         openable_source_ref=_openable_source_ref(source.path, line_number),
         openable_target=_openable_target(source.path, line_number),
     )
@@ -262,21 +279,63 @@ def _simple_top_level_user_text(data: Mapping[str, Any]) -> str | None:
 
 
 def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUserMessage], int]:
-    by_key: dict[tuple[str, str], LatestUserMessage] = {}
+    canonical_groups: list[list[LatestUserMessage]] = [
+        [message] for message in messages if message.source_kind == "codex_history"
+    ]
+    standalone: list[LatestUserMessage] = []
     deduped = 0
-    for message in messages:
-        key = (_timestamp_key(message.timestamp_utc), _normalized_text(message.text))
-        existing = by_key.get(key)
-        if existing is None:
-            message.mirror_sources.append(_mirror_source(message))
-            by_key[key] = message
+    for message in (item for item in messages if item.source_kind != "codex_history"):
+        matches = [group for group in canonical_groups if _is_correlated_mirror(group[0], message)]
+        if len(matches) == 1:
+            matches[0].append(message)
+            deduped += 1
             continue
-        deduped += 1
-        existing.mirror_sources.append(_mirror_source(message))
-        if _source_priority(message.source_kind) > _source_priority(existing.source_kind):
-            message.mirror_sources = existing.mirror_sources
-            by_key[key] = message
-    deduped_messages = list(by_key.values())
+        if len(matches) > 1:
+            diagnostic = {
+                "reason": "session row matched multiple canonical rows inside the mirror correlation window",
+                "session_source_ref": message.source_ref,
+                "canonical_source_refs": [group[0].source_ref for group in matches],
+            }
+            message.correlation_status = "ambiguous_multiple_canonical"
+            message.correlation_diagnostics.append(diagnostic)
+            for group in matches:
+                group[0].correlation_status = "ambiguous_multiple_canonical"
+                group[0].correlation_diagnostics.append(diagnostic)
+        standalone.append(message)
+
+    deduped_messages = []
+    for group in canonical_groups:
+        canonical = group[0]
+        session_copies = group[1:]
+        canonical.mirror_sources = [_mirror_source(item) for item in group]
+        canonical.canonical_authority = _mirror_source(canonical)
+        canonical.logical_message_id = _logical_message_id(canonical)
+        if canonical.correlation_status == "ambiguous_multiple_canonical":
+            canonical.session_activity_location = None
+        elif len(session_copies) == 1:
+            canonical.correlation_status = "unique_canonical_session_mirror"
+            canonical.session_activity_location = _mirror_source(session_copies[0])
+        elif len(session_copies) > 1:
+            canonical.correlation_status = "ambiguous_multiple_session_copies"
+            canonical.correlation_diagnostics.append(
+                {
+                    "reason": "canonical row matched multiple session rows inside the mirror correlation window",
+                    "canonical_source_ref": canonical.source_ref,
+                    "session_source_refs": [item.source_ref for item in session_copies],
+                }
+            )
+        else:
+            canonical.correlation_status = "canonical_only"
+        deduped_messages.append(canonical)
+
+    for message in standalone:
+        message.mirror_sources = [_mirror_source(message)]
+        message.logical_message_id = _logical_message_id(message)
+        if message.correlation_status == "unresolved":
+            message.correlation_status = "session_only"
+        message.session_activity_location = _mirror_source(message)
+        deduped_messages.append(message)
+
     deduped_messages.sort(
         key=lambda item: (
             item.timestamp_utc,
@@ -301,6 +360,13 @@ def _message_to_dict(message: LatestUserMessage, local_tz, snippet_chars: int) -
         "thread_key": message.thread_key,
         "thread_keys": _thread_keys(message),
         "mirror_sources": message.mirror_sources,
+        "logical_message_id": message.logical_message_id,
+        "correlation_status": message.correlation_status,
+        "correlated_session_identity": message.correlated_session_identity,
+        "session_identity_source": message.session_identity_source,
+        "canonical_authority": message.canonical_authority,
+        "session_activity_location": message.session_activity_location,
+        "correlation_diagnostics": message.correlation_diagnostics,
         "snippet": text.replace("\n", " "),
         "truncated": truncated,
     }
@@ -317,6 +383,9 @@ def _mirror_source(message: LatestUserMessage) -> dict:
         "source_ref": message.source_ref,
         "source_identifier": message.source_identifier,
         "thread_key": message.thread_key,
+        "timestamp_utc": message.timestamp_utc.isoformat(timespec="milliseconds"),
+        "correlated_session_identity": message.correlated_session_identity,
+        "session_identity_source": message.session_identity_source,
     }
     if message.openable_source_ref:
         rendered["openable_source_ref"] = message.openable_source_ref
@@ -431,6 +500,58 @@ def _timestamp_key(value) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def _is_correlated_mirror(canonical: LatestUserMessage, session_copy: LatestUserMessage) -> bool:
+    if canonical.source_kind != "codex_history" or session_copy.source_kind != "codex_sessions":
+        return False
+    if not canonical.correlated_session_identity or not session_copy.correlated_session_identity:
+        return False
+    if canonical.correlated_session_identity != session_copy.correlated_session_identity:
+        return False
+    if _normalized_text(canonical.text) != _normalized_text(session_copy.text):
+        return False
+    delta = abs((session_copy.timestamp_utc - canonical.timestamp_utc).total_seconds())
+    return delta <= MIRROR_CORRELATION_WINDOW_SECONDS
+
+
+def _logical_message_id(message: LatestUserMessage) -> str:
+    identity = message.correlated_session_identity or "uncorrelated"
+    material = "\0".join((identity, _normalized_text(message.text), message.timestamp_utc.isoformat()))
+    return "logical-message-" + hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _correlated_session_identity(raw_session_id: Any) -> str | None:
+    if raw_session_id is None or not str(raw_session_id).strip():
+        return None
+    digest = hashlib.sha256(str(raw_session_id).encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"session-identity-{digest}"
+
+
+def _session_raw_identity(path: Path) -> tuple[str | None, str | None]:
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    with handle:
+        for index, line in enumerate(handle):
+            if index >= 64:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping) or str(record.get("type") or "") != "session_meta":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            raw_id = payload.get("session_id") or payload.get("id")
+            return (str(raw_id), "session_meta") if raw_id else (None, None)
+    stem = path.stem
+    if stem.startswith("rollout-"):
+        return None, None
+    return (stem, "filename_fallback") if stem else (None, None)
+
+
 def _normalized_text(text: str) -> str:
     return " ".join(text.split()).strip().casefold()
 
@@ -442,7 +563,7 @@ def _clean_text(value: Any) -> str:
 
 
 def _source_priority(source_kind: str) -> int:
-    return 2 if source_kind == "codex_sessions" else 1
+    return 2 if source_kind == "codex_history" else 1
 
 
 def _mtime(path: Path) -> float:
