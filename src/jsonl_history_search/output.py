@@ -4144,6 +4144,8 @@ def render_status_anchor_text(payload: dict) -> str:
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
+    if _is_answer_ready_parent_main_status(report):
+        return _render_answer_ready_parent_main_status_text(report, answer_status=answer_status)
     lines = [
         "Status Anchor",
         f"Status: {report['status']}",
@@ -4289,6 +4291,121 @@ def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: d
     return _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
 
 
+def _is_answer_ready_parent_main_status(report: dict) -> bool:
+    shortlist = report.get("parent_main_anchor_shortlist") or {}
+    readiness = report.get("answer_readiness") or {}
+    return (
+        shortlist.get("status") == "selected"
+        and shortlist.get("answer_allowed") is True
+        and readiness.get("answer_allowed") is True
+    )
+
+
+def _answer_ready_parent_main_reads(report: dict) -> tuple[dict, list[dict], list[dict]]:
+    selected = report.get("selected_anchor") or {}
+    selected_ref = selected.get("source_ref")
+    plan = report.get("follow_through_plan") or {}
+    primary = list(plan.get("open_first") or [])
+    canonical = next((read for read in primary if read.get("source_ref") == selected_ref), selected)
+    raw_activity = [read for read in primary if read.get("source_ref") != selected_ref]
+
+    secondary = []
+    seen = set()
+    for group in plan.get("then_confirm") or []:
+        for read in group.get("refs") or []:
+            ref = str(read.get("source_ref") or read.get("openable_target") or "")
+            if not ref or ref in seen:
+                continue
+            secondary.append(read)
+            seen.add(ref)
+            if len(secondary) >= 8:
+                return canonical, raw_activity, secondary
+    return canonical, raw_activity, secondary
+
+
+def _bounded_commit_confirmation_command(reads: list[dict]) -> str | None:
+    commit_ids = []
+    for read in reads:
+        source_ref = str(read.get("source_ref") or "")
+        if not source_ref.startswith("git_commit:"):
+            return None
+        commit_id = source_ref.split(":", 1)[1].strip()
+        if not commit_id:
+            return None
+        commit_ids.append(shlex.quote(commit_id))
+    if not commit_ids:
+        return None
+    refs = " ".join(commit_ids)
+    return (
+        f"for ref in {refs}; do "
+        "git show --no-patch --format='%H%n%aI%n%s%n%b' \"$ref\"; "
+        "git show --stat --oneline --format='' \"$ref\"; "
+        "done"
+    )
+
+
+def _render_answer_ready_parent_main_status_text(report: dict, *, answer_status: str) -> str:
+    selected = report.get("selected_anchor") or {}
+    readiness = report.get("answer_readiness") or {}
+    activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
+    canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
+    activity_location = selected.get("session_activity_location") or {}
+    required_facets = readiness.get("required_answer_facets") or []
+    lines = [
+        "Status Anchor",
+        f"Status: {report.get('status')}",
+        f"Answer status: {answer_status}",
+        "Answer-ready parent/main path: run only these bounded reads, in order.",
+        "1. Read the selected canonical anchor:",
+        f"- Authority: {selected.get('source_ref')}",
+    ]
+    _append_text_read(lines, canonical)
+    if activity_location.get("source_ref"):
+        lines.append(
+            "- Activity boundary: "
+            f"{activity_location.get('source_ref')} (required session reads start strictly after this logical row)."
+        )
+    lines.append("2. Read the required raw post-anchor session windows:")
+    if raw_activity:
+        for read in raw_activity:
+            _append_text_read(lines, read)
+    else:
+        lines.append("- No additional raw session window is required.")
+    lines.append(
+        "- Trace coverage: "
+        f"records={activity.get('records_after_anchor')} "
+        f"tool_calls={activity.get('tool_calls')} "
+        f"spawned_sessions={activity.get('spawned_session_calls')}"
+    )
+    lines.append("3. Run one bounded secondary commit/status confirmation batch if listed:")
+    if secondary:
+        lines.append("- Exact refs: " + ", ".join(str(read.get("source_ref")) for read in secondary))
+        batch_command = _bounded_commit_confirmation_command(secondary)
+        if batch_command:
+            lines.append(f"  command: {batch_command}")
+        else:
+            for read in secondary:
+                _append_text_read(lines, read)
+    else:
+        lines.append("- None required; do not add a repo, task, state, or Git-history scan.")
+    lines.extend(
+        [
+            "4. Answer the user and stop:",
+            "- After the reads above succeed without contradiction, answer now and stop.",
+            (
+                "- Continue only when a named required facet is still missing or contradictory: "
+                + ", ".join(required_facets)
+                + ". Name that facet before one targeted follow-up read."
+            ),
+            (
+                "- Do not run broad rg over sessions, state files, old task families, reports, or Git history; "
+                "do not open rejected, diagnostic, or optional refs after the required reads are complete."
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict) -> None:
     if not shortlist or shortlist.get("status") == "not_applicable":
         return
@@ -4342,6 +4459,8 @@ def render_status_anchor_markdown(payload: dict) -> str:
     status_boundary = report.get("status_as_of_boundary") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
+    if _is_answer_ready_parent_main_status(report):
+        return _render_answer_ready_parent_main_status_markdown(report, answer_status=answer_status)
     lines = [
         "# Status Anchor",
         "",
@@ -4513,6 +4632,73 @@ def render_status_anchor_markdown(payload: dict) -> str:
     if report.get("blind_spots"):
         lines.extend(["## Blind Spots", ""])
         lines.extend(f"- {blind}" for blind in report["blind_spots"])
+    return "\n".join(lines)
+
+
+def _render_answer_ready_parent_main_status_markdown(report: dict, *, answer_status: str) -> str:
+    selected = report.get("selected_anchor") or {}
+    readiness = report.get("answer_readiness") or {}
+    activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
+    canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
+    activity_location = selected.get("session_activity_location") or {}
+    required_facets = readiness.get("required_answer_facets") or []
+    lines = [
+        "# Status Anchor",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Answer status: `{answer_status}`",
+        "- Answer-ready parent/main path: run only these bounded reads, in order.",
+        "",
+        "## 1. Selected Canonical Anchor",
+        "",
+        f"- Authority: `{selected.get('source_ref')}`",
+    ]
+    _append_markdown_read(lines, canonical)
+    if activity_location.get("source_ref"):
+        lines.append(
+            f"- Activity boundary: `{activity_location.get('source_ref')}`; required session reads start "
+            "strictly after this logical row."
+        )
+    lines.extend(["", "## 2. Required Raw Session Reads", ""])
+    if raw_activity:
+        for read in raw_activity:
+            _append_markdown_read(lines, read)
+    else:
+        lines.append("- No additional raw session window is required.")
+    lines.append(
+        "- Trace coverage: "
+        f"records=`{activity.get('records_after_anchor')}`, "
+        f"tool calls=`{activity.get('tool_calls')}`, "
+        f"spawned sessions=`{activity.get('spawned_session_calls')}`."
+    )
+    lines.extend(["", "## 3. Bounded Secondary Confirmation", ""])
+    if secondary:
+        lines.append("- Exact refs: " + ", ".join(f"`{read.get('source_ref')}`" for read in secondary))
+        batch_command = _bounded_commit_confirmation_command(secondary)
+        if batch_command:
+            lines.append(f"- Command: `{batch_command}`")
+        else:
+            for read in secondary:
+                _append_markdown_read(lines, read)
+    else:
+        lines.append("- None required; do not add a repo, task, state, or Git-history scan.")
+    lines.extend(
+        [
+            "",
+            "## 4. Answer And Stop",
+            "",
+            "- After the reads above succeed without contradiction, answer now and stop.",
+            (
+                "- Continue only when a named required facet is still missing or contradictory: `"
+                + ", ".join(required_facets)
+                + "`. Name that facet before one targeted follow-up read."
+            ),
+            (
+                "- Do not run broad `rg` over sessions, state files, old task families, reports, or Git history; "
+                "do not open rejected, diagnostic, or optional refs after the required reads are complete."
+            ),
+        ]
+    )
     return "\n".join(lines)
 
 
