@@ -899,6 +899,16 @@ def _select_anchor_with_boundary(
             "rejected_anchor_alternatives": user_chronology.get("rejected_anchor_alternatives") or [],
         }
     explicit_anchor = _explicit_anchor_candidate(query, candidates)
+    if explicit_anchor and str(explicit_anchor.get("correlation_status") or "").startswith("ambiguous_"):
+        diagnostic = _quoted_authority_candidate_diagnostic(explicit_anchor)
+        return {
+            **base,
+            "context_boundary": "explicit_anchor_authority_ambiguous",
+            "anchor_scope": "explicit_user_anchor",
+            "anchor_reason": "explicit_anchor_canonical_session_correlation_is_ambiguous",
+            "selected_anchor": None,
+            "rejected_anchor_alternatives": [diagnostic],
+        }
     if explicit_anchor:
         return _with_rejected_alternatives(
             {
@@ -4240,6 +4250,8 @@ def _merge_activity_counts(target: dict, source: dict) -> None:
 
 
 def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -> list[dict]:
+    if str(anchor.get("correlation_status") or "").startswith("ambiguous_"):
+        return []
     contexts = []
     activity_location = anchor.get("session_activity_location")
     if isinstance(activity_location, Mapping) and activity_location.get("source_kind") == "codex_sessions":
@@ -4606,7 +4618,14 @@ def _raw_session_next_read(
         "window_end_line": line_number + 8,
         "openable_source_ref": {"path": str(path), "line": line_number},
         "openable_target": target,
-        "read_more_command": _read_more_command(target, cwd=cwd, codex_home=codex_home, before=0, after=8),
+        "read_more_command": _read_more_command(
+            target,
+            cwd=cwd,
+            codex_home=codex_home,
+            before=0,
+            after=8,
+            output_format="text",
+        ),
     }
     if target_window:
         read["target_window_hits"] = _target_window_hits(record_text, target_window)
@@ -4666,21 +4685,28 @@ def _session_files_for_id(codex_home: Path, session_id: Any) -> list[Path]:
 
 
 def _dedupe_session_contexts(contexts: list[dict]) -> list[dict]:
-    seen = set()
-    deduped = []
+    deduped_by_key: dict[tuple, dict] = {}
     for context in contexts:
         files = tuple(str(path) for path in context.get("session_files") or [])
+        logical_message_id = context.get("logical_message_id")
         key = (
-            context.get("logical_message_id"),
+            logical_message_id,
             context.get("correlated_session_identity") or context.get("session_id_hash"),
-            context.get("session_anchor_line"),
             files,
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(context)
-    return deduped
+        if not logical_message_id:
+            key = (*key, context.get("role"), context.get("session_anchor_line"))
+        existing = deduped_by_key.get(key)
+        if existing is None or _session_context_anchor_line(context) > _session_context_anchor_line(existing):
+            deduped_by_key[key] = context
+    return list(deduped_by_key.values())
+
+
+def _session_context_anchor_line(context: Mapping[str, Any]) -> int:
+    try:
+        return int(context.get("session_anchor_line") or -1)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _read_jsonl_line(path: Path, line_number: int) -> dict | None:
@@ -6147,6 +6173,7 @@ def _read_more_command(
     codex_home: Path | None,
     before: int = 2,
     after: int = 8,
+    output_format: str = "json",
 ) -> str:
     parts = [
         "jsonl-history-search",
@@ -6157,7 +6184,9 @@ def _read_more_command(
     ]
     if codex_home is not None:
         parts.extend(["--codex-home", str(codex_home)])
-    parts.extend(["--format", "json", "--mode", "window", "--before", str(before), "--after", str(after)])
+    parts.extend(
+        ["--format", output_format, "--mode", "window", "--before", str(before), "--after", str(after)]
+    )
     return " ".join(shlex.quote(part) for part in parts)
 
 

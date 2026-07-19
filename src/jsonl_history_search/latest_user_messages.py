@@ -23,7 +23,9 @@ from .timeutil import parse_datetime
 
 
 MIRROR_CORRELATION_WINDOW_SECONDS = 5.0
-DEDUPLICATION_STRATEGY = "normalized_text_correlated_session_identity_and_bounded_chronology"
+DEDUPLICATION_STRATEGY = (
+    "normalized_text_correlated_session_identity_bounded_chronology_and_adjacent_transport_pair"
+)
 SORT_STRATEGY = "timestamp_utc_desc_source_kind_ref_tiebreak"
 
 
@@ -38,6 +40,8 @@ class LatestUserMessage:
     line: int
     correlated_session_identity: str | None = None
     session_identity_source: str | None = None
+    transport_record_type: str | None = None
+    transport_payload_type: str | None = None
     openable_source_ref: dict[str, Any] | None = None
     openable_target: str | None = None
     mirror_sources: list[dict] = field(default_factory=list)
@@ -261,6 +265,13 @@ def _extract_user_message(
         line=line_number,
         correlated_session_identity=_correlated_session_identity(source.raw_session_id),
         session_identity_source=source.raw_session_identity_source,
+        transport_record_type=str(data.get("type") or "") or None,
+        transport_payload_type=(
+            str(data.get("payload", {}).get("type") or "")
+            if isinstance(data.get("payload"), Mapping)
+            else None
+        )
+        or None,
         openable_source_ref=_openable_source_ref(source.path, line_number),
         openable_target=_openable_target(source.path, line_number),
     )
@@ -282,9 +293,12 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
     canonical_groups: list[list[LatestUserMessage]] = [
         [message] for message in messages if message.source_kind == "codex_history"
     ]
+    session_messages, transport_duplicates = _collapse_session_transport_duplicates(
+        [item for item in messages if item.source_kind != "codex_history"]
+    )
     standalone: list[LatestUserMessage] = []
-    deduped = 0
-    for message in (item for item in messages if item.source_kind != "codex_history"):
+    deduped = transport_duplicates
+    for message in session_messages:
         matches = [group for group in canonical_groups if _is_correlated_mirror(group[0], message)]
         if len(matches) == 1:
             matches[0].append(message)
@@ -307,7 +321,9 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
     for group in canonical_groups:
         canonical = group[0]
         session_copies = group[1:]
-        canonical.mirror_sources = [_mirror_source(item) for item in group]
+        canonical.mirror_sources = [_mirror_source(canonical)]
+        for session_copy in session_copies:
+            canonical.mirror_sources.extend(session_copy.mirror_sources or [_mirror_source(session_copy)])
         canonical.canonical_authority = _mirror_source(canonical)
         canonical.logical_message_id = _logical_message_id(canonical)
         if canonical.correlation_status == "ambiguous_multiple_canonical":
@@ -329,7 +345,8 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
         deduped_messages.append(canonical)
 
     for message in standalone:
-        message.mirror_sources = [_mirror_source(message)]
+        if not message.mirror_sources:
+            message.mirror_sources = [_mirror_source(message)]
         message.logical_message_id = _logical_message_id(message)
         if message.correlation_status == "unresolved":
             message.correlation_status = "session_only"
@@ -346,6 +363,46 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
         reverse=True,
     )
     return deduped_messages, deduped
+
+
+def _collapse_session_transport_duplicates(
+    messages: list[LatestUserMessage],
+) -> tuple[list[LatestUserMessage], int]:
+    buckets: dict[tuple[str, str, str, str], list[LatestUserMessage]] = {}
+    for message in messages:
+        key = (
+            message.source_identifier,
+            message.correlated_session_identity or "uncorrelated",
+            message.timestamp_utc.isoformat(timespec="milliseconds"),
+            _normalized_text(message.text),
+        )
+        buckets.setdefault(key, []).append(message)
+
+    collapsed: list[LatestUserMessage] = []
+    duplicate_count = 0
+    for group in buckets.values():
+        ordered = sorted(group, key=lambda item: item.line)
+        signatures = {
+            (item.transport_record_type, item.transport_payload_type)
+            for item in ordered
+        }
+        is_known_pair = (
+            len(ordered) == 2
+            and ordered[1].line == ordered[0].line + 1
+            and signatures
+            == {
+                ("response_item", "message"),
+                ("event_msg", "user_message"),
+            }
+        )
+        if not is_known_pair:
+            collapsed.extend(ordered)
+            continue
+        activity_boundary = ordered[-1]
+        activity_boundary.mirror_sources = [_mirror_source(item) for item in ordered]
+        collapsed.append(activity_boundary)
+        duplicate_count += 1
+    return collapsed, duplicate_count
 
 
 def _message_to_dict(message: LatestUserMessage, local_tz, snippet_chars: int) -> dict:
