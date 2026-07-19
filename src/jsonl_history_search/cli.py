@@ -32,6 +32,12 @@ from .agent_loop_cost import (
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .ask_router import build_ask_router_payload, execution_kind_for_route_family
 from .capability_diagnostic import build_capability_diagnostic
+from .agent_skill_install import (
+    SUPPORTED_AGENTS,
+    default_agent_home,
+    install_agent_skill,
+    render_agent_skill_install,
+)
 from .codex_skill_install import default_codex_home, install_codex_skill, render_codex_skill_install
 from .compact_handoff_usefulness import (
     DEFAULT_ANSWER_USE_FIXTURE as DEFAULT_COMPACT_HANDOFF_ANSWER_USE_FIXTURE,
@@ -167,6 +173,7 @@ LOCAL_EVIDENCE_MODES = ("public", "internal")
 
 PUBLIC_HELP_EPILOG = """\
 Launch-facing commands:
+  install-agent-skill    Install the optional Codex or Claude skill after installing the Python CLI.
   install-codex-skill    Install the optional Codex skill after installing the Python CLI.
   validate-install        Check that the package/console script can run.
   diagnose-capabilities  Report installed core and optional capabilities.
@@ -1744,6 +1751,20 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         help="Codex home to update; defaults to CODEX_HOME or ~/.codex.",
     )
     install_skill.add_argument("--format", choices=("text", "json"), default="text")
+    install_agent = subparsers.add_parser(
+        "install-agent-skill",
+        description=(
+            "Install optional Codex or Claude skill/helper files. This command does not "
+            "install the Python package or copy conversation logs."
+        ),
+    )
+    install_agent.add_argument("--agent", choices=SUPPORTED_AGENTS, required=True)
+    install_agent.add_argument(
+        "--agent-home",
+        default=None,
+        help="Agent home to update; defaults to CODEX_HOME/CLAUDE_HOME or ~/.codex/~/.claude.",
+    )
+    install_agent.add_argument("--format", choices=("text", "json"), default="text")
     validate = subparsers.add_parser("validate-install")
     validate.add_argument("--format", choices=("text", "json", "markdown"), default="text")
     validate.add_argument(
@@ -1755,6 +1776,11 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "--codex-home",
         default=None,
         help="Optional Codex home whose global jsonl-history-search skill install should be checked read-only.",
+    )
+    validate.add_argument(
+        "--claude-home",
+        default=None,
+        help="Optional Claude home whose personal jsonl-history-search skill install should be checked read-only.",
     )
     return parser
 
@@ -17131,10 +17157,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(render_codex_skill_install(payload, args.format))
         return 0
+    if args.command == "install-agent-skill":
+        agent_home = Path(args.agent_home).expanduser() if args.agent_home else default_agent_home(args.agent)
+        try:
+            payload = install_agent_skill(agent=args.agent, agent_home=agent_home)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            print(f"{args.agent.title()} skill install failed: {exc}", file=sys.stderr)
+            return 1
+        print(render_agent_skill_install(payload, args.format))
+        return 0
     if args.command == "validate-install":
         payload = validate_install(
             package_root=Path(args.package_root).expanduser() if args.package_root else None,
             codex_home=Path(args.codex_home).expanduser() if args.codex_home else None,
+            claude_home=Path(args.claude_home).expanduser() if args.claude_home else None,
         )
         print(render(payload, args.format))
         return 1 if payload["install_validation"]["overall_status"] == "fail" else 0

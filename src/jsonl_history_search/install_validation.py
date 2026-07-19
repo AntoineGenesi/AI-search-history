@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_command_cookbook import agent_question_cookbook
+from .agent_skill_install import AgentSkillAssets, resolve_agent_skill_assets
 from .codex_skill_install import CodexSkillAssets, resolve_codex_skill_assets
 from .sources import Limits, build_source_plan
 
@@ -47,6 +48,7 @@ def validate_install(
     *,
     package_root: Path | None = None,
     codex_home: Path | None = None,
+    claude_home: Path | None = None,
 ) -> dict[str, Any]:
     root = (package_root or default_package_root()).expanduser().resolve()
     source_checkout = _is_source_checkout(root)
@@ -54,11 +56,21 @@ def validate_install(
         skill_assets = resolve_codex_skill_assets(root)
     except FileNotFoundError:
         skill_assets = None
+    try:
+        claude_skill_assets = resolve_agent_skill_assets("claude", root)
+    except FileNotFoundError:
+        claude_skill_assets = None
     checks = [
         _check_cli_import(),
         _check_console_script(root),
         _check_convo_console_alias(root),
         _check_package_skill(root, source_checkout=source_checkout, assets=skill_assets),
+        _check_package_agent_skill(
+            root,
+            agent="claude",
+            source_checkout=source_checkout,
+            assets=claude_skill_assets,
+        ),
         _check_package_helpers(root, source_checkout=source_checkout, assets=skill_assets),
         _check_package_helper_behavior(root, source_checkout=source_checkout),
         _check_package_ask_first_launcher_behavior(root, source_checkout=source_checkout),
@@ -74,11 +86,26 @@ def validate_install(
                 assets=skill_assets,
             )
         )
+    if claude_home is not None:
+        checks.extend(
+            _check_global_agent_install(
+                claude_home.expanduser(),
+                root,
+                agent="claude",
+                id_prefix="claude_global_",
+                source_checkout=source_checkout,
+                assets=claude_skill_assets,
+            )
+        )
     checks.extend(_check_install_currentness(root, source_checkout=source_checkout))
 
     counts = _status_counts(checks)
     failed = counts.get("fail", 0) > 0
-    preflight = _agent_preflight(checks, codex_home=codex_home)
+    preflight = _agent_preflight(
+        checks,
+        codex_home=codex_home,
+        claude_home=claude_home,
+    )
     payload = {
         "install_validation": {
             "overall_status": "fail" if failed else "pass",
@@ -86,6 +113,7 @@ def validate_install(
             "user_home_mutated": False,
             "package_root": str(root),
             "codex_home": str(codex_home.expanduser()) if codex_home is not None else None,
+            "claude_home": str(claude_home.expanduser()) if claude_home is not None else None,
             "currentness": _currentness_summary(root, checks, source_checkout=source_checkout, preflight=preflight),
             "agent_preflight": preflight,
             "summary": counts,
@@ -97,14 +125,16 @@ def validate_install(
     return payload
 
 
-def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) -> dict[str, Any]:
-    global_checks = [check for check in checks if check.id.startswith("global_")]
-    if codex_home is None:
-        freshness_status = "not_checked"
-        stale_or_missing: list[str] = []
-    else:
-        stale_or_missing = [check.id for check in global_checks if check.status == "fail"]
-        freshness_status = "pass" if not stale_or_missing else "fail"
+def _agent_preflight(
+    checks: list[ValidationCheck],
+    *,
+    codex_home: Path | None,
+    claude_home: Path | None,
+) -> dict[str, Any]:
+    codex_checks = [check for check in checks if check.id.startswith("global_")]
+    claude_checks = [check for check in checks if check.id.startswith("claude_global_")]
+    codex_freshness, codex_stale = _skill_freshness(codex_checks, checked=codex_home is not None)
+    claude_freshness, claude_stale = _skill_freshness(claude_checks, checked=claude_home is not None)
     by_id = {check.id: check for check in checks}
     cli_statuses = [by_id[check_id].status for check_id in ("cli_import", "console_script", "console_alias_convo")]
     if "fail" in cli_statuses:
@@ -113,38 +143,52 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
         cli_status = "source_mode_only"
     else:
         cli_status = "installed"
-    if codex_home is None:
-        skill_status = "not_checked"
-    elif freshness_status == "pass":
-        skill_status = "installed"
-    else:
-        skill_status = "missing_or_stale"
+    codex_skill_status = _layer_skill_status(codex_freshness)
+    claude_skill_status = _layer_skill_status(claude_freshness)
     return {
         "purpose": (
             "Run before free-agent or user-facing JSONL workflows that rely on "
-            "the installed global Codex skill."
+            "an installed Codex or Claude skill."
         ),
-        "global_skill_freshness": freshness_status,
-        "must_refresh_global_skill": freshness_status == "fail",
-        "stale_or_missing_global_checks": stale_or_missing,
+        "global_skill_freshness": codex_freshness,
+        "must_refresh_global_skill": codex_freshness == "fail",
+        "stale_or_missing_global_checks": codex_stale,
+        "agent_skill_freshness": {
+            "codex": codex_freshness,
+            "claude": claude_freshness,
+        },
+        "stale_or_missing_agent_checks": {
+            "codex": codex_stale,
+            "claude": claude_stale,
+        },
         "install_layers": {
             "python_cli": {
                 "status": cli_status,
                 "required": True,
-                "install_command": "pipx install jsonl-history-search",
+                "install_command": "pipx install /path/to/jsonl-history-search",
                 "detail": "The Python package provides the jsonl-history-search and convo commands.",
             },
             "codex_skill": {
-                "status": skill_status,
+                "status": codex_skill_status,
                 "required": False,
                 "install_command": "jsonl-history-search install-codex-skill",
                 "detail": "The optional Codex skill adds agent routing guidance; it does not provide the CLI.",
+            },
+            "claude_skill": {
+                "status": claude_skill_status,
+                "required": False,
+                "install_command": "jsonl-history-search install-agent-skill --agent claude",
+                "detail": "The optional Claude skill adds agent routing guidance; it does not provide the CLI.",
             },
         },
         "refresh_command": "jsonl-history-search install-codex-skill",
         "validate_global_command": (
             "jsonl-history-search validate-install --codex-home ~/.codex --format text"
         ),
+        "validate_agent_commands": {
+            "codex": "jsonl-history-search validate-install --codex-home ~/.codex --format text",
+            "claude": "jsonl-history-search validate-install --claude-home ~/.claude --format text",
+        },
         "agent_question_cookbook": agent_question_cookbook(),
         "jsh1098_route_demos": _jsh1098_route_demos(),
         "claim_boundary": (
@@ -156,6 +200,23 @@ def _agent_preflight(checks: list[ValidationCheck], *, codex_home: Path | None) 
             "savings, all-history completeness, or universal superiority."
         ),
     }
+
+
+def _skill_freshness(
+    checks: list[ValidationCheck],
+    *,
+    checked: bool,
+) -> tuple[str, list[str]]:
+    if not checked:
+        return "not_checked", []
+    stale = [check.id for check in checks if check.status == "fail"]
+    return ("fail" if stale else "pass"), stale
+
+
+def _layer_skill_status(freshness: str) -> str:
+    if freshness == "not_checked":
+        return "not_checked"
+    return "installed" if freshness == "pass" else "missing_or_stale"
 
 
 def _jsh1098_route_demos() -> list[dict[str, str]]:
@@ -646,6 +707,47 @@ def _check_package_skill(
         detail="Package Codex skill file is missing.",
         paths=[str(path)],
         recovery=["Restore `skills/codex/jsonl-history-search/SKILL.md` from the package checkout."],
+    )
+
+
+def _check_package_agent_skill(
+    package_root: Path,
+    *,
+    agent: str,
+    source_checkout: bool,
+    assets: AgentSkillAssets | None,
+) -> ValidationCheck:
+    path = package_root / "skills" / agent / "jsonl-history-search" / "SKILL.md"
+    check_id = f"package_{agent}_skill"
+    label = agent.title()
+    if path.is_file():
+        return ValidationCheck(
+            id=check_id,
+            name=f"Package {label} skill file",
+            status="pass",
+            detail=f"Package {label} skill file is present.",
+            paths=[str(path)],
+        )
+    if not source_checkout and assets is not None:
+        return ValidationCheck(
+            id=check_id,
+            name=f"Packaged {label} skill assets",
+            status="pass",
+            detail=f"Optional {label} skill assets are bundled with the installed Python package.",
+            paths=[str(assets.skill)],
+            metadata={"source_checkout": False, "asset_source": assets.source},
+        )
+    status = "warn" if not source_checkout else "fail"
+    return ValidationCheck(
+        id=check_id,
+        name=f"Package {label} skill file",
+        status=status,
+        detail=f"Optional {label} skill assets are missing from the Python package.",
+        paths=[str(path)],
+        recovery=[
+            f"Reinstall the Python package before running `jsonl-history-search install-agent-skill --agent {agent}`."
+        ],
+        metadata={"source_checkout": source_checkout},
     )
 
 
@@ -1198,6 +1300,170 @@ def _check_global_codex_install(
     return checks
 
 
+def _check_global_agent_install(
+    agent_home: Path,
+    package_root: Path,
+    *,
+    agent: str,
+    id_prefix: str,
+    source_checkout: bool,
+    assets: AgentSkillAssets | None,
+) -> list[ValidationCheck]:
+    label = agent.title()
+    install_command = f"jsonl-history-search install-agent-skill --agent {agent}"
+    skill_root = agent_home / "skills" / "jsonl-history-search"
+    package_skill_root = assets.root if assets is not None else package_root / "skills" / agent / "jsonl-history-search"
+    targets = {
+        "skill": (skill_root / "SKILL.md", package_skill_root / "SKILL.md"),
+        "references": (skill_root / "references", package_skill_root / "references"),
+        "helper": (
+            skill_root / "scripts" / "search_jsonl_history.py",
+            assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py",
+        ),
+        "ask_first_launcher": (
+            skill_root / "scripts" / "jsonl_ask_first.py",
+            assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py",
+        ),
+    }
+    if assets is not None:
+        targets["skill"] = (targets["skill"][0], assets.skill)
+        targets["references"] = (targets["references"][0], assets.references)
+    compare_packaged = assets is not None or source_checkout
+    checks = [
+        _check_agent_backup_skill_dirs(
+            agent_home,
+            agent=agent,
+            check_id=f"{id_prefix}backup_skill_dirs",
+            install_command=install_command,
+        )
+    ]
+    installed, packaged = targets["skill"]
+    if installed.is_file():
+        checks.append(
+            _global_copy_check(
+                f"{id_prefix}skill",
+                f"Global {label} skill file",
+                installed,
+                packaged,
+                compare_packaged=compare_packaged,
+                recovery_command=install_command,
+                agent_label=label,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id=f"{id_prefix}skill",
+                name=f"Global {label} skill file",
+                status="fail",
+                detail=f"Global {label} skill file is missing at the provided --{agent}-home.",
+                paths=[str(installed)],
+                recovery=[f"Run `{install_command}`."],
+            )
+        )
+    installed, packaged = targets["references"]
+    if installed.is_dir():
+        checks.append(
+            _global_tree_check(
+                f"{id_prefix}references",
+                f"Global {label} skill references",
+                installed,
+                packaged,
+                compare_packaged=compare_packaged,
+                recovery_command=install_command,
+                agent_label=label,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id=f"{id_prefix}references",
+                name=f"Global {label} skill references",
+                status="fail",
+                detail=f"Global {label} skill references folder is missing at the provided --{agent}-home.",
+                paths=[str(installed)],
+                recovery=[f"Run `{install_command}` to install the routed references folder."],
+            )
+        )
+    for key, title in (
+        ("helper", "helper script"),
+        ("ask_first_launcher", "ask-first launcher"),
+    ):
+        installed, packaged = targets[key]
+        check_id = f"{id_prefix}{key}"
+        if installed.is_file() and os.access(installed, os.X_OK):
+            checks.append(
+                _global_copy_check(
+                    check_id,
+                    f"Global {label} {title}",
+                    installed,
+                    packaged,
+                    compare_packaged=compare_packaged,
+                    recovery_command=install_command,
+                    agent_label=label,
+                )
+            )
+        else:
+            checks.append(
+                ValidationCheck(
+                    id=check_id,
+                    name=f"Global {label} {title} executability",
+                    status="fail",
+                    detail=f"Global {label} {title} is missing or not executable at the provided --{agent}-home.",
+                    paths=[str(installed)],
+                    recovery=[f"Run `{install_command}` to install the helper scripts."],
+                )
+            )
+    return checks
+
+
+def _check_agent_backup_skill_dirs(
+    agent_home: Path,
+    *,
+    agent: str,
+    check_id: str,
+    install_command: str,
+) -> ValidationCheck:
+    label = agent.title()
+    skills_dir = agent_home / "skills"
+    if not skills_dir.is_dir():
+        return ValidationCheck(
+            id=check_id,
+            name=f"Global {label} backup skill directories",
+            status="pass",
+            detail=f"No {label} skills directory exists at the provided --{agent}-home.",
+            paths=[str(skills_dir)],
+        )
+    backup_dirs = sorted(
+        path
+        for path in skills_dir.iterdir()
+        if path.is_dir()
+        and path.name != "jsonl-history-search"
+        and path.name.startswith("jsonl-history-search")
+    )
+    if not backup_dirs:
+        return ValidationCheck(
+            id=check_id,
+            name=f"Global {label} backup skill directories",
+            status="pass",
+            detail="No duplicate or backup jsonl-history-search skill directories are discoverable.",
+            paths=[str(skills_dir)],
+        )
+    return ValidationCheck(
+        id=check_id,
+        name=f"Global {label} backup skill directories",
+        status="fail",
+        detail=(
+            f"Duplicate or backup jsonl-history-search skill directories are discoverable beside the active {label} skill."
+        ),
+        paths=[str(path) for path in backup_dirs],
+        recovery=[
+            f"Move backup directories out of `{agent_home}/skills`, rerun `{install_command}`, then validate again."
+        ],
+        metadata={"backup_dir_names": [path.name for path in backup_dirs]},
+    )
+
+
 def _check_global_backup_skill_dirs(codex_home: Path) -> ValidationCheck:
     skills_dir = codex_home / "skills"
     if not skills_dir.is_dir():
@@ -1255,6 +1521,8 @@ def _global_copy_check(
     packaged: Path,
     *,
     compare_packaged: bool,
+    recovery_command: str = "jsonl-history-search install-codex-skill",
+    agent_label: str = "Codex",
 ) -> ValidationCheck:
     paths = [str(installed)]
     if not compare_packaged or not packaged.is_file():
@@ -1290,7 +1558,7 @@ def _global_copy_check(
         status="fail",
         detail=f"{name} is installed but stale relative to the bundled package copy.",
         paths=paths,
-        recovery=["Run `jsonl-history-search install-codex-skill` to refresh the optional Codex skill."],
+        recovery=[f"Run `{recovery_command}` to refresh the optional {agent_label} skill."],
         metadata=metadata,
     )
 
@@ -1302,6 +1570,8 @@ def _global_tree_check(
     packaged: Path,
     *,
     compare_packaged: bool,
+    recovery_command: str = "jsonl-history-search install-codex-skill",
+    agent_label: str = "Codex",
 ) -> ValidationCheck:
     paths = [str(installed)]
     if not compare_packaged or not packaged.is_dir():
@@ -1337,7 +1607,7 @@ def _global_tree_check(
         status="fail",
         detail=f"{name} folder is installed but stale relative to the bundled package copy.",
         paths=paths,
-        recovery=["Run `jsonl-history-search install-codex-skill` to refresh the optional Codex skill references."],
+        recovery=[f"Run `{recovery_command}` to refresh the optional {agent_label} skill references."],
         metadata=metadata,
     )
 
