@@ -4839,6 +4839,12 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "event_count": packet["tool_action_proof"]["event_count"],
             "source_locator_handoff": packet["source_locator_handoff"],
             "source_followthrough_plan": packet.get("source_followthrough_plan"),
+            "provenance_direct_evidence_facet_ledger": packet.get(
+                "provenance_direct_evidence_facet_ledger"
+            ),
+            "provenance_complete_proof_handoff": packet.get(
+                "provenance_complete_proof_handoff"
+            ),
             "investigation_state": packet["investigation_state"],
             "answer_ready_handoff": packet["answer_ready_handoff"],
             "agent_instruction": packet["agent_instruction"],
@@ -5239,6 +5245,13 @@ def _answer_action_contract_from_executed_output(
         source_followthrough_plan = compact.get("source_followthrough_plan") or {}
         source_followthrough_required = _source_followthrough_contract_reads(source_followthrough_plan)
         source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
+        provenance_ledger = compact.get("provenance_direct_evidence_facet_ledger") or {}
+        provenance_handoff = compact.get("provenance_complete_proof_handoff") or {}
+        provenance_reads = (
+            list(provenance_handoff.get("selected_direct_reads") or [])
+            if provenance_handoff.get("active")
+            else list(provenance_handoff.get("continuation_commands") or [])[:1]
+        )
         core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
@@ -5341,7 +5354,9 @@ def _answer_action_contract_from_executed_output(
         ):
             named_task_action_proof = {}
         route_first_reads = (
-            orchestration_reads
+            provenance_reads
+            if provenance_ledger.get("applies")
+            else orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")
             if route_family == "expectation_mismatch" and expectation_mismatch_plan
@@ -5364,7 +5379,44 @@ def _answer_action_contract_from_executed_output(
             "are limited to bounded_no_evidence routes executed through no-evidence-report."
         )
         source_inspection_boundary = None
-        if raw_worker_chronology_handoff:
+        if provenance_ledger.get("applies"):
+            if provenance_handoff.get("active"):
+                answer_status = "answer-ready-after-source-inspection"
+                promotion_status = "semantic_debug_provenance_direct_proof_ready_after_source_inspection"
+                promotion_reason = (
+                    "ask --execute semantic-debug selected direct-human original-request proof plus correlated "
+                    "action and verification proof. Open only those bounded reads before answering."
+                )
+                source_inspection_boundary = {
+                    "decision": "answer_after_selected_direct_proof",
+                    "answer_allowed": True,
+                    "inspect_required_primary_proof_before_answer": True,
+                    "required_primary_proof_source": (
+                        "direct_human_original_request_and_correlated_action_events"
+                    ),
+                    "missing_facets": [],
+                    "diagnostics_default_final_support": False,
+                }
+            else:
+                missing_facets = list(provenance_ledger.get("missing_required_facets") or [])
+                answer_status = "not-ready/missing-direct-provenance-facets"
+                promotion_status = "semantic_debug_provenance_direct_proof_fail_closed"
+                promotion_reason = (
+                    "The source-session provenance ledger is incomplete. Correlated action rows cannot "
+                    "substitute for a missing direct original user request."
+                )
+                source_inspection_boundary = {
+                    "decision": "fail_closed_missing_direct_provenance_facets",
+                    "answer_allowed": False,
+                    "inspect_required_primary_proof_before_answer": True,
+                    "required_primary_proof_source": (
+                        "direct_human_original_request_and_correlated_action_events"
+                    ),
+                    "missing_facets": missing_facets,
+                    "secondary_substitution_allowed": False,
+                    "diagnostics_default_final_support": False,
+                }
+        elif raw_worker_chronology_handoff:
             answer_status = "not-ready/missing-raw-worker-chronology"
             promotion_status = "semantic_debug_raw_worker_chronology_gate_fail_closed"
             promotion_reason = (
@@ -5597,6 +5649,10 @@ def _answer_action_contract_from_executed_output(
                 "default_read_policy": source_followthrough_plan.get("default_read_policy"),
             }
             contract["stop"] = source_followthrough_plan.get("stop_condition") or contract["stop"]
+        if provenance_ledger.get("applies"):
+            contract["provenance_direct_evidence_facet_ledger"] = provenance_ledger
+            contract["provenance_complete_proof_handoff"] = provenance_handoff
+            contract["stop"] = provenance_handoff.get("stop_instruction") or contract["stop"]
         if source_inspection_boundary:
             contract["source_inspection_boundary"] = source_inspection_boundary
         if target_proof_handoff:
