@@ -318,6 +318,7 @@ def status_anchor_report(
         codex_home=codex_home,
         cwd=cwd,
         status_as_of_boundary=status_as_of_boundary,
+        latest_messages=latest_messages,
     )
     prior_request_occurrence = _prior_request_occurrence_recovery(
         query=query,
@@ -1581,6 +1582,7 @@ def _canonical_parent_main_status_interval(
     codex_home: Path | None,
     cwd: Path,
     status_as_of_boundary: dict | None,
+    latest_messages: list[dict],
 ) -> dict:
     if not codex_home or not is_status_question(query) or not (
         _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
@@ -1592,6 +1594,7 @@ def _canonical_parent_main_status_interval(
     rows = _canonical_history_human_rows(history_path, query=query)
     if not rows:
         return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
+    rows = _attach_latest_correlation_to_canonical_rows(rows, latest_messages)
     require_side_parent_boundary = _requires_raw_parent_thread_boundary(query)
     boundary = _canonical_parent_main_boundary_row(
         rows,
@@ -1615,6 +1618,7 @@ def _canonical_parent_main_status_interval(
         lineage = _parent_thread_side_boundary_resolution(
             rows=rows,
             boundary=boundary,
+            query=query,
             cwd=cwd,
             codex_home=codex_home,
         )
@@ -1756,6 +1760,7 @@ def _parent_thread_side_boundary_resolution(
     *,
     rows: list[dict],
     boundary: dict,
+    query: str,
     cwd: Path,
     codex_home: Path | None,
 ) -> dict:
@@ -1766,6 +1771,7 @@ def _parent_thread_side_boundary_resolution(
         return _recover_parent_thread_side_boundary_without_direct_edge(
             rows=rows,
             boundary=boundary,
+            query=query,
             cwd=cwd,
             codex_home=codex_home,
             side_lineage=boundary_lineage,
@@ -1787,6 +1793,7 @@ def _parent_thread_side_boundary_resolution(
         return _recover_parent_thread_side_boundary_without_direct_edge(
             rows=rows,
             boundary=boundary,
+            query=query,
             cwd=cwd,
             codex_home=codex_home,
             side_lineage=boundary_lineage,
@@ -1858,6 +1865,7 @@ def _recover_parent_thread_side_boundary_without_direct_edge(
     *,
     rows: list[dict],
     boundary: dict,
+    query: str,
     cwd: Path,
     codex_home: Path,
     side_lineage: dict,
@@ -1867,8 +1875,8 @@ def _recover_parent_thread_side_boundary_without_direct_edge(
     if (
         not boundary_line
         or boundary.get("source_kind") != "codex_history"
-        or not _requires_raw_parent_thread_boundary(str(boundary.get("snippet") or ""))
-        or not is_status_question(str(boundary.get("snippet") or ""))
+        or not _requires_raw_parent_thread_boundary(query)
+        or not _canonical_row_matches_exact_status_query_boundary(boundary, query=query)
     ):
         return {
             "status": "ambiguous",
@@ -2406,7 +2414,33 @@ def _canonical_row_matches_exact_status_query_boundary(row: dict, *, query: str)
         return False
     normalized_text = _normalize(str(row.get("snippet") or "")).strip(" .?!")
     normalized_query = _normalize(query).strip(" .?!")
-    return bool(normalized_text and normalized_text == normalized_query and is_status_question(normalized_text))
+    if not normalized_text or not is_status_question(normalized_text):
+        return False
+    if normalized_text == normalized_query:
+        return True
+    if not _requires_raw_parent_thread_boundary(query):
+        return False
+    if _prefers_parent_main_anchor(normalized_text):
+        return False
+    for suffix in (
+        " in the parent thread",
+        " in parent thread",
+        " in the parent-thread",
+        " in parent-thread",
+        " in the main thread",
+        " in main thread",
+        " in the main-thread",
+        " in main-thread",
+        " in the parent/main thread",
+        " in parent/main thread",
+    ):
+        if normalized_query.endswith(suffix):
+            unscoped_query = normalized_query[: -len(suffix)].rstrip()
+            return bool(
+                unscoped_query == normalized_text
+                and _relative_status_requires_history_first_anchor(unscoped_query)
+            )
+    return False
 
 
 def _canonical_parent_main_boundary(row: dict) -> dict:
@@ -2575,6 +2609,37 @@ def _canonical_history_human_rows(path: Path, *, query: str) -> list[dict]:
                 continue
             rows.append(candidate)
     return rows
+
+
+def _attach_latest_correlation_to_canonical_rows(rows: list[dict], latest_messages: list[dict]) -> list[dict]:
+    latest_by_ref = {
+        str(message.get("source_ref") or ""): message
+        for message in latest_messages
+        if message.get("source_kind") == "codex_history"
+    }
+    enriched_rows = []
+    correlation_fields = (
+        "mirror_sources",
+        "logical_message_id",
+        "correlation_status",
+        "correlated_session_identity",
+        "canonical_authority",
+        "session_activity_location",
+        "correlation_diagnostics",
+        "thread_key",
+        "thread_keys",
+    )
+    for row in rows:
+        latest = latest_by_ref.get(str(row.get("source_ref") or ""))
+        if not latest:
+            enriched_rows.append(row)
+            continue
+        enriched = dict(row)
+        for field in correlation_fields:
+            if latest.get(field) is not None:
+                enriched[field] = latest.get(field)
+        enriched_rows.append(enriched)
+    return enriched_rows
 
 
 def _history_row_candidate(
