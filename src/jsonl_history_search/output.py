@@ -497,9 +497,10 @@ def render_ask_execute_text(payload: dict) -> str:
         f"Route family: {route.get('route_family')}",
         f"Execution status: {execution.get('status')}",
         f"Command family: {execution.get('command_family') or '(unsupported)'}",
-        f"First command: {first_command}",
-        f"Command resolution: {resolution.get('mode') or 'unresolved'}",
     ]
+    if first_command:
+        lines.append(f"First command: {first_command}")
+    lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
     if execution.get("report_output_status") == "unavailable":
@@ -620,9 +621,10 @@ def render_ask_execute_markdown(payload: dict) -> str:
         f"- Route family: `{route.get('route_family')}`",
         f"- Execution status: `{execution.get('status')}`",
         f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
-        f"- First command: `{first_command}`",
-        f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`",
     ]
+    if first_command:
+        lines.append(f"- First command: `{first_command}`")
+    lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
     if execution.get("report_output_status") == "unavailable":
