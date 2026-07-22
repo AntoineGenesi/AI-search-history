@@ -628,6 +628,8 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
     max_elapsed = 2.0
     for base in (codex_home / "sessions", claude_home / "projects"):
         base = base.expanduser()
+        if base.is_symlink():
+            continue
         if not base.exists() or not base.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(base):
