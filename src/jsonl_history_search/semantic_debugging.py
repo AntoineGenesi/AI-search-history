@@ -6964,8 +6964,12 @@ def provenance_compacted_human_intent(payload: dict[str, Any]) -> bool:
 
 
 def provenance_report_or_recap_tool_activity(tool_name: str, call_text: str) -> bool:
-    text = f"{tool_name} {call_text}".casefold().replace("\\", "/")
+    raw_text = f"{tool_name} {call_text}".casefold()
+    text = raw_text.replace("\\", "/")
     if any(marker in text for marker in ("tools.update_plan", "update_plan", "task_complete")):
+        return True
+    mutation_targets = provenance_patch_mutation_targets(raw_text)
+    if mutation_targets and all(provenance_secondary_artifact_path(path) for path in mutation_targets):
         return True
     artifact_scope = any(
         marker in text
@@ -7007,6 +7011,116 @@ def provenance_report_or_recap_tool_activity(tool_name: str, call_text: str) -> 
     return artifact_scope and artifact_operation and not substantive_direct_action
 
 
+def provenance_patch_mutation_targets(call: str) -> list[str]:
+    return [
+        match.group(1).strip().replace("\\", "/")
+        for match in re.finditer(
+            r"\*\*\* (?:add|update|delete) file:\s+(.+?)(?=\\n|\n)",
+            str(call or ""),
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
+def provenance_secondary_artifact_path(path: str) -> bool:
+    normalized = f"/{str(path or '').casefold().strip('/')}"
+    return any(
+        marker in normalized
+        for marker in (
+            "/.private/",
+            "/codex/state/",
+            "/reports/",
+            "/tasks/",
+        )
+    ) or normalized.endswith(".scratch.md")
+
+
+def provenance_direct_mutation_operation(call: str) -> bool:
+    text = str(call or "").casefold()
+    return any(
+        marker in text
+        for marker in (
+            "apply_patch",
+            "edit_file",
+            "write_file",
+        )
+    )
+
+
+def provenance_inspection_audit_only_operation(call: str) -> bool:
+    text = str(call or "").casefold()
+    if provenance_direct_mutation_operation(text):
+        return False
+    audit_markers = (
+        "git diff --stat",
+        "retained size",
+        "retained-size",
+        "forbidden credential",
+        "credential files",
+        "wheel assets",
+        "wheel-asset",
+        "diff summary",
+        "unzip -l",
+    )
+    return sum(marker in text for marker in audit_markers) >= 2
+
+
+def provenance_direct_install_operation(call: str) -> bool:
+    text = str(call or "").casefold()
+    if provenance_inspection_audit_only_operation(text):
+        return False
+    install_markers = (
+        "pip install",
+        "pipx install",
+        "bash install/preflight",
+        "./install/preflight",
+        "install_codex_global.sh",
+        "install_claude_global.sh",
+        "install-agent-skill",
+        "jsonl-history-search validate-install",
+        "isolated install",
+        "skill installer",
+    )
+    if not any(marker in text for marker in install_markers):
+        return False
+    inspection_markers = (
+        " cat ",
+        " find ",
+        " git diff --stat",
+        " head ",
+        " rg ",
+        " rg -",
+        " sed -n ",
+        " tail ",
+        " unzip -l ",
+    )
+    if not any(marker in f" {text} " for marker in inspection_markers):
+        return True
+    direct_execution_markers = (
+        " -m pip install ",
+        "cmd: \"pip install ",
+        "input: \"pip install ",
+        "input\\\": \\\"pip install ",
+    )
+    return text.strip().startswith(("pip install ", "pipx install ")) or any(
+        marker in text
+        for marker in direct_execution_markers
+    )
+
+
+def provenance_terminal_output_failed(output: str) -> bool:
+    text = re.sub(r"\s+", " ", str(output or "").casefold())
+    positive_failure_patterns = (
+        r"\b[1-9]\d*\s+(?:tests?\s+)?(?:failed|errors?)\b",
+        r"\b(?:failed|errors?)\s*[:=]\s*[1-9]\d*\b",
+        r"\b(?:exit|return)(?:_code|\s+code)?\s*[:=]?\s*[1-9]\d*\b",
+        r"[\"']status[\"']\s*:\s*[\"']failed[\"']",
+    )
+    if any(re.search(pattern, text) for pattern in positive_failure_patterns):
+        return True
+    return any(marker in text for marker in ("=== failures ===", "traceback (most recent call last)"))
+
+
 def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str]:
     call = re.sub(r"\s+", " ", str(call_text or "").casefold())
     output = re.sub(r"\s+", " ", str(output_text or "").casefold())
@@ -7014,6 +7128,7 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         return []
 
     allowed = provenance_direct_action_intent_facets(call)
+    successful_terminal_output = not provenance_terminal_output_failed(output)
     facets: list[str] = []
 
     implementation_result_markers = (
@@ -7025,7 +7140,17 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         "insertions(+)",
         "deletions(-)",
     )
-    if "implementation_change" in allowed and any(marker in output for marker in implementation_result_markers):
+    if (
+        "implementation_change" in allowed
+        and successful_terminal_output
+        and provenance_direct_mutation_operation(call)
+        and (
+            any(marker in output for marker in implementation_result_markers)
+            or "script completed" in output
+            or '"success": true' in output
+            or output.strip() in {"{}", "success", "ok"}
+        )
+    ):
         facets.append("implementation_change")
 
     test_result_markers = (
@@ -7036,7 +7161,11 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         " ok",
         "\nok",
     )
-    if "test" in allowed and any(marker in output for marker in test_result_markers):
+    if (
+        "test" in allowed
+        and successful_terminal_output
+        and any(marker in output for marker in test_result_markers)
+    ):
         facets.append("test")
 
     validation_result_markers = (
@@ -7052,7 +7181,11 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         "sha256",
         "sha-256",
     )
-    if "validation_safety" in allowed and any(marker in output for marker in validation_result_markers):
+    if (
+        "validation_safety" in allowed
+        and successful_terminal_output
+        and any(marker in output for marker in validation_result_markers)
+    ):
         facets.append("validation_safety")
 
     if "commit" in allowed and (
@@ -7073,7 +7206,12 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         " pass",
         "ready",
     )
-    if "install" in allowed and any(marker in output for marker in install_result_markers):
+    if (
+        "install" in allowed
+        and successful_terminal_output
+        and provenance_direct_install_operation(call)
+        and any(marker in output for marker in install_result_markers)
+    ):
         facets.append("install")
 
     limitation_result_markers = (
@@ -7101,7 +7239,11 @@ def provenance_direct_event_facets(call_text: str, output_text: str) -> list[str
         "smoke pass",
         "smoke recorded",
     )
-    if "runtime" in allowed and any(marker in output for marker in runtime_result_markers):
+    if (
+        "runtime" in allowed
+        and successful_terminal_output
+        and any(marker in output for marker in runtime_result_markers)
+    ):
         facets.append("runtime")
     return [facet for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS if facet in facets]
 
@@ -7173,16 +7315,7 @@ def provenance_structural_context_read_command(call: str) -> bool:
 
 def provenance_direct_action_intent_facets(call: str) -> set[str]:
     facets: set[str] = set()
-    if any(
-        marker in call
-        for marker in (
-            "apply_patch",
-            "edit_file",
-            "write_file",
-            "git diff --",
-            "diff --git",
-        )
-    ) and "diff --check" not in call:
+    if provenance_direct_mutation_operation(call):
         facets.add("implementation_change")
     if any(marker in call for marker in ("pytest ", "pytest\"", "python -m pytest", "python3 -m pytest", "unittest")):
         facets.add("test")
@@ -7206,21 +7339,7 @@ def provenance_direct_action_intent_facets(call: str) -> set[str]:
         facets.add("validation_safety")
     if any(marker in call for marker in ("git commit ", "git commit -", "git show", "git log", "git rev-parse")):
         facets.add("commit")
-    if any(
-        marker in call
-        for marker in (
-            "pip install",
-            "pipx install",
-            "bash install/preflight",
-            "./install/preflight",
-            "install_codex_global.sh",
-            "install_claude_global.sh",
-            "install-agent-skill",
-            "jsonl-history-search validate-install",
-            "isolated install",
-            "skill installer",
-        )
-    ):
+    if provenance_direct_install_operation(call):
         facets.add("install")
     if any(
         marker in call
@@ -7294,7 +7413,7 @@ def select_provenance_direct_events(
                 len(covers),
                 int(event.get("query_term_overlap_count", 0) or 0),
                 len(event_facets),
-                -int((event.get("source_ref") or {}).get("line") or 0),
+                int((event.get("source_ref") or {}).get("line") or 0),
             )
             if key > best_key:
                 best = event
