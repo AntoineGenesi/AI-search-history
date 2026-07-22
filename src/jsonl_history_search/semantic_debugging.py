@@ -6564,6 +6564,7 @@ def build_provenance_direct_evidence_facet_ledger(
     intent_candidates: list[dict[str, Any]] = []
     secondary_refs: list[dict[str, Any]] = []
     source_roles_by_target: dict[str, str] = {}
+    post_hoc_boundary_by_path: dict[str, int] = {}
     for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
         scan = provenance_direct_events_for_path(path, query=query)
         direct_events.extend(scan["direct_events"])
@@ -6571,6 +6572,8 @@ def build_provenance_direct_evidence_facet_ledger(
         intent_candidates.extend(scan["original_user_intent_candidates"])
         secondary_refs.extend(scan["secondary_context_refs"])
         source_roles_by_target.update(scan["source_roles_by_target"])
+        if scan.get("post_hoc_boundary_line"):
+            post_hoc_boundary_by_path[str(path)] = int(scan["post_hoc_boundary_line"])
 
     direct_events = dedupe_provenance_direct_events(direct_events)
     action_required_facets = [
@@ -6588,10 +6591,34 @@ def build_provenance_direct_evidence_facet_ledger(
         if "original_user_request" in required_facets
         else None
     )
+    selected_authorization = select_provenance_original_request_authorization(
+        intent_candidates,
+        selected_original_request=selected_original_request,
+        selected_events=selected_events,
+    )
+    selected_events = promote_provenance_action_chronology(
+        direct_events,
+        selected_events=selected_events,
+        selected_original_request=selected_original_request,
+        selected_authorization=selected_authorization,
+        post_hoc_boundary_by_path=post_hoc_boundary_by_path,
+    )
+    authorization_required = bool(
+        selected_original_request
+        and selected_original_request.get("request_chronology_role") == "deferred_request"
+    )
+    if authorization_required:
+        required_facets = [
+            *required_facets[:1],
+            "original_request_authorization",
+            *required_facets[1:],
+        ]
     facet_rows = []
     covered_facets = ["original_user_request"] if selected_original_request else []
+    if selected_authorization:
+        covered_facets.append("original_request_authorization")
     facet_order = (
-        ["original_user_request", *PROVENANCE_DIRECT_EVIDENCE_FACETS]
+        ["original_user_request", "original_request_authorization", *PROVENANCE_DIRECT_EVIDENCE_FACETS]
         if "original_user_request" in required_facets
         else list(PROVENANCE_DIRECT_EVIDENCE_FACETS)
     )
@@ -6610,6 +6637,21 @@ def build_provenance_direct_evidence_facet_ledger(
                     "evidence_refs": (
                         [provenance_original_user_request_ref(selected_original_request)]
                         if selected_original_request
+                        else []
+                    ),
+                }
+            )
+            continue
+        if facet == "original_request_authorization":
+            facet_rows.append(
+                {
+                    "facet": facet,
+                    "required": authorization_required,
+                    "status": "covered_by_direct_human_authorization" if selected_authorization else "not_covered",
+                    "direct_event_count": 1 if selected_authorization else 0,
+                    "evidence_refs": (
+                        [provenance_original_user_request_ref(selected_authorization)]
+                        if selected_authorization
                         else []
                     ),
                 }
@@ -6635,7 +6677,10 @@ def build_provenance_direct_evidence_facet_ledger(
         [provenance_original_user_request_read(selected_original_request)]
         if selected_original_request
         else []
-    ) + [provenance_direct_event_read(event) for event in selected_events]
+    )
+    if selected_authorization:
+        selected_reads.append(provenance_original_user_request_read(selected_authorization))
+    selected_reads.extend(provenance_direct_event_read(event) for event in selected_events)
     continuation = provenance_missing_facet_continuation(
         missing_facets=missing_facets,
         direct_events=direct_events,
@@ -6669,6 +6714,12 @@ def build_provenance_direct_evidence_facet_ledger(
                 if selected_original_request
                 else None
             ),
+            "selected_original_request_authorization": (
+                provenance_original_user_request_ref(selected_authorization)
+                if selected_authorization
+                else None
+            ),
+            "authorization_required": authorization_required,
             "selected_counts_as_original_user_request_proof": bool(selected_original_request),
         },
         "secondary_context": {
@@ -6722,6 +6773,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
     calls_by_id: dict[str, dict[str, Any]] = {}
     session_intent_by_id: dict[str, str] = {}
     post_hoc_prompt_echo_session = False
+    post_hoc_boundary_line: int | None = None
     try:
         records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
     except (AdapterReadError, OSError, ValueError):
@@ -6734,9 +6786,31 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
         payload_type = str(payload.get("type") or raw.get("type") or "").casefold()
         text = provenance_record_text(record, payload)
+        record_echo_reasons = provenance_original_request_prompt_echo_reasons(text, query=query)
+        if classification.label != HUMAN_AUTHORED_USER_MESSAGE:
+            record_echo_reasons = [
+                reason for reason in record_echo_reasons if reason == "post_hoc_gate_or_review_query_echo"
+            ]
+        if record_echo_reasons and not post_hoc_prompt_echo_session:
+            post_hoc_prompt_echo_session = True
+            post_hoc_boundary_line = int(record.line)
+            secondary_context_refs.append(
+                {
+                    "source_ref": guided_source_ref(source_ref),
+                    "context_role": "post_hoc_prompt_echo",
+                    "prompt_echo_reasons": record_echo_reasons,
+                }
+            )
+            source_roles_by_target[target] = "post_hoc_prompt_echo"
 
         worker_completion_facets = provenance_worker_completion_notification_facets(text)
         if worker_completion_facets:
+            if post_hoc_prompt_echo_session:
+                source_roles_by_target[target] = "post_hoc_prompt_echo_action"
+                secondary_context_refs.append(
+                    {"source_ref": guided_source_ref(source_ref), "context_role": "post_hoc_prompt_echo_action"}
+                )
+                continue
             direct_events.append(
                 {
                     "event_id": f"worker-completion-{path.name}-{record.line}",
@@ -6753,22 +6827,13 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
                     "correlated_output": True,
                     "correlated_session_command": True,
                     "primary_action_proof": True,
+                    "action_text": text,
                 }
             )
             source_roles_by_target[target] = "direct_worker_completion"
             continue
         if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
-            echo_reasons = provenance_original_request_prompt_echo_reasons(text, query=query)
-            if echo_reasons:
-                post_hoc_prompt_echo_session = True
-                secondary_context_refs.append(
-                    {
-                        "source_ref": guided_source_ref(source_ref),
-                        "context_role": "post_hoc_prompt_echo",
-                        "prompt_echo_reasons": echo_reasons,
-                    }
-                )
-                source_roles_by_target[target] = "post_hoc_prompt_echo"
+            if record_echo_reasons:
                 continue
             original_user_intent_refs.append(
                 {"source_ref": guided_source_ref(source_ref), "intent_source_role": "direct_human_message"}
@@ -6779,6 +6844,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
                 target=target,
                 text=text,
                 query=query,
+                canonical_message=raw.get("type") == "response_item" and payload_type == "message",
             )
             if candidate:
                 original_user_intent_candidates.append(candidate)
@@ -6885,6 +6951,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         "original_user_intent_candidates": original_user_intent_candidates,
         "secondary_context_refs": secondary_context_refs,
         "source_roles_by_target": source_roles_by_target,
+        "post_hoc_boundary_line": post_hoc_boundary_line,
     }
 
 
@@ -7009,6 +7076,7 @@ def provenance_original_user_request_candidate(
     target: str,
     text: str,
     query: str,
+    canonical_message: bool = False,
 ) -> dict[str, Any] | None:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     lowered = normalized.casefold()
@@ -7044,7 +7112,17 @@ def provenance_original_user_request_candidate(
         "query_term_overlap_count": len(overlap),
         "matched_query_terms": sorted(overlap)[:8],
         "substantive": True,
+        "canonical_message": canonical_message,
+        "request_chronology_role": provenance_original_request_chronology_role(lowered),
     }
+
+
+def provenance_original_request_chronology_role(text: str) -> str:
+    if any(marker in text for marker in ("ok so do that work", "go ahead", "proceed with", "do the backlog task")):
+        return "authorization"
+    if any(marker in text for marker in ("do later", "not now", "save this as a task", "defer", "right before release")):
+        return "deferred_request"
+    return "request"
 
 
 def select_provenance_original_user_request(
@@ -7081,8 +7159,99 @@ def select_provenance_original_user_request(
         eligible,
         key=lambda candidate: (
             -int(candidate.get("query_term_overlap_count") or 0),
+            -int(bool(candidate.get("canonical_message"))),
             int((candidate.get("source_ref") or {}).get("line") or 0),
         ),
+    )
+
+
+def select_provenance_original_request_authorization(
+    candidates: list[dict[str, Any]],
+    *,
+    selected_original_request: dict[str, Any] | None,
+    selected_events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not selected_original_request or selected_original_request.get("request_chronology_role") != "deferred_request":
+        return None
+    source_ref = selected_original_request.get("source_ref") or {}
+    path = str(source_ref.get("path") or "")
+    request_line = int(source_ref.get("line") or 0)
+    action_lines = [
+        int((event.get("source_ref") or {}).get("line") or 0)
+        for event in selected_events
+        if str((event.get("source_ref") or {}).get("path") or "") == path
+    ]
+    first_action_line = min((line for line in action_lines if line > 0), default=0)
+    eligible = [
+        candidate
+        for candidate in candidates
+        if str((candidate.get("source_ref") or {}).get("path") or "") == path
+        and request_line < int((candidate.get("source_ref") or {}).get("line") or 0) < first_action_line
+        and candidate.get("request_chronology_role") == "authorization"
+    ]
+    return min(
+        eligible,
+        key=lambda candidate: (
+            -int(bool(candidate.get("canonical_message"))),
+            int((candidate.get("source_ref") or {}).get("line") or 0),
+        ),
+        default=None,
+    )
+
+
+def promote_provenance_action_chronology(
+    events: list[dict[str, Any]],
+    *,
+    selected_events: list[dict[str, Any]],
+    selected_original_request: dict[str, Any] | None,
+    selected_authorization: dict[str, Any] | None,
+    post_hoc_boundary_by_path: dict[str, int],
+) -> list[dict[str, Any]]:
+    if not selected_original_request:
+        return selected_events
+    request_ref = selected_original_request.get("source_ref") or {}
+    path = str(request_ref.get("path") or "")
+    chronology_start = int(
+        ((selected_authorization or selected_original_request).get("source_ref") or {}).get("line") or 0
+    )
+    boundary = int(post_hoc_boundary_by_path.get(path) or 0)
+    relevant_workers = [
+        event
+        for event in events
+        if event.get("event_kind") == "completed_subagent_action_notification"
+        and str((event.get("source_ref") or {}).get("path") or "") == path
+        and int((event.get("source_ref") or {}).get("line") or 0) > chronology_start
+        and (not boundary or int((event.get("source_ref") or {}).get("line") or 0) < boundary)
+        and int(event.get("query_term_overlap_count") or 0) > 0
+        and "implementation_change" in set(event.get("facets") or [])
+        and provenance_installability_action_episode(event.get("action_text") or "")
+    ]
+    relevant_workers.sort(key=lambda event: int((event.get("source_ref") or {}).get("line") or 0))
+    if len(relevant_workers) > 1:
+        relevant_workers = [relevant_workers[0], relevant_workers[-1]]
+    result = list(selected_events)
+    for event in relevant_workers:
+        if event not in result and len(result) < PROVENANCE_DIRECT_EVIDENCE_READ_CAP - 2:
+            result.append(event)
+    return sorted(
+        dedupe_provenance_direct_events(result),
+        key=lambda event: int((event.get("source_ref") or {}).get("line") or 0),
+    )
+
+
+def provenance_installability_action_episode(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").casefold())
+    return any(
+        marker in normalized
+        for marker in (
+            "installability",
+            "pipx",
+            "pip and pipx",
+            "cli install",
+            "skill install",
+            "install preflight",
+            "python environment",
+        )
     )
 
 
@@ -7093,6 +7262,7 @@ def provenance_original_user_request_ref(candidate: dict[str, Any]) -> dict[str,
         "proof_kind": "original_user_request_direct_human",
         "query_term_overlap_count": int(candidate.get("query_term_overlap_count") or 0),
         "matched_query_terms": list(candidate.get("matched_query_terms") or []),
+        "request_chronology_role": candidate.get("request_chronology_role") or "request",
     }
 
 
@@ -7102,14 +7272,22 @@ def provenance_original_user_request_read(candidate: dict[str, Any]) -> dict[str
         "kind": "direct_human_message_source_ref",
         "target": source_ref_target(source_ref),
         "source_ref": source_ref,
-        "reason": "open direct original user-request evidence from the source session",
+        "reason": (
+            "open direct authorization that activated the deferred original request"
+            if candidate.get("request_chronology_role") == "authorization"
+            else "open direct original user-request evidence from the source session"
+        ),
         "read_role": "required_primary_proof",
         "read_more_actionable": True,
         "followthrough_actionable": True,
         "diagnostic_only": False,
         "proof_kind": "original_user_request_direct_human",
         "intent_source_role": "direct_human_message",
-        "direct_evidence_facets": ["original_user_request"],
+        "direct_evidence_facets": [
+            "original_request_authorization"
+            if candidate.get("request_chronology_role") == "authorization"
+            else "original_user_request"
+        ],
         "provenance_original_user_request_evidence": provenance_original_user_request_ref(candidate),
         "historical_provenance_selection": {
             "schema_version": 1,
