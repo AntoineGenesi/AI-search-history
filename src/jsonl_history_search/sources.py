@@ -722,7 +722,7 @@ def arbitrary_root_kind(root: Path) -> str:
 def safe_resolve(path: Path) -> Path:
     try:
         return path.expanduser().resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return path.expanduser().absolute()
 
 
