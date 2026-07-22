@@ -544,11 +544,11 @@ def build_source_plan(
     for requested_root in requested:
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
             resolved = safe_resolve(root)
+            kind = known_kind_for_resolved_path(resolved, known)
             danger = dangerous_reason(resolved, cwd)
-            if danger:
+            if danger and not (kind and danger == "cache/model directory rejected before traversal"):
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
                 continue
-            kind = known_kind_for_resolved_path(resolved, known)
             if not kind and not allow_arbitrary_root:
                 plan.rejected_roots.append(RejectedRoot(str(root), "not a known Codex/Claude transcript root; pass --allow-arbitrary-root with explicit hard caps"))
                 continue
