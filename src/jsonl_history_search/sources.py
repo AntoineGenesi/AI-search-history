@@ -543,11 +543,11 @@ def build_source_plan(
 
     for requested_root in requested:
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
-            resolved = safe_resolve(root)
-            kind = known_kind_for_resolved_path(resolved, known)
-            if kind and known_kind_uses_symlinked_provider_root(kind, codex_home, claude_home):
+            if requested_root_uses_symlinked_provider_root(root, codex_home, claude_home):
                 plan.rejected_roots.append(RejectedRoot(str(root), "symlinked known transcript root rejected before traversal"))
                 continue
+            resolved = safe_resolve(root)
+            kind = known_kind_for_resolved_path(resolved, known)
             danger = dangerous_reason(resolved, cwd)
             if danger and not (kind and danger == "cache/model directory rejected before traversal"):
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
@@ -601,13 +601,18 @@ def known_kind_for_resolved_path(resolved: Path, known: dict[Path, str]) -> str 
     return None
 
 
-def known_kind_uses_symlinked_provider_root(kind: str, codex_home: Path, claude_home: Path) -> bool:
-    if kind in {"codex_sessions", "codex_session_file"}:
-        return (codex_home / "sessions").expanduser().is_symlink()
-    if kind == "codex_history":
-        return (codex_home / "history.jsonl").expanduser().is_symlink()
-    if kind in {"claude_projects", "claude_session_file"}:
-        return (claude_home / "projects").expanduser().is_symlink()
+def requested_root_uses_symlinked_provider_root(root: Path, codex_home: Path, claude_home: Path) -> bool:
+    lexical_root = root.expanduser().absolute()
+    directory_roots = (codex_home / "sessions", claude_home / "projects")
+    for provider_root in directory_roots:
+        lexical_provider_root = provider_root.expanduser().absolute()
+        if provider_root.expanduser().is_symlink() and (
+            lexical_root == lexical_provider_root or resolved_path_is_inside(lexical_root, lexical_provider_root)
+        ):
+            return True
+    history = (codex_home / "history.jsonl").expanduser()
+    if history.is_symlink() and lexical_root == history.absolute():
+        return True
     return False
 
 
