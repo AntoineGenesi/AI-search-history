@@ -2433,6 +2433,8 @@ def _canonical_row_matches_exact_status_query_boundary(row: dict, *, query: str)
         " in main-thread",
         " in the parent/main thread",
         " in parent/main thread",
+        " in the main/parent thread",
+        " in main/parent thread",
     ):
         if normalized_query.endswith(suffix):
             unscoped_query = normalized_query[: -len(suffix)].rstrip()
