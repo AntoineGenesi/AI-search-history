@@ -37,6 +37,7 @@ from .conversation_records import (
     extract_human_ask,
 )
 from .forensics import build_forensics_payload
+from .latest_user_messages import latest_user_messages
 from .prompt_echo import clearly_intends_current_session, setup_echo_classification
 from .query import infer_query
 from .real_history_gold import validate_manifest_file
@@ -380,6 +381,7 @@ def build_semantic_debug_payload(
         family=family,
         candidates=source_selection_candidates,
         tool_proof=tool_proof,
+        source_plan=source_plan,
     )
     if provenance_direct_evidence_facet_ledger.get("applies"):
         next_reads = apply_provenance_direct_evidence_ledger_to_reads(
@@ -6544,12 +6546,19 @@ def build_provenance_direct_evidence_facet_ledger(
     family: dict[str, Any],
     candidates: list[dict[str, Any]],
     tool_proof: dict[str, Any],
+    source_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not provenance_direct_evidence_ledger_wanted(query, family):
         return {"schema_version": 1, "applies": False, "reason": "not_a_source_session_claimed_action_query"}
 
     required_facets = requested_provenance_direct_evidence_facets(query)
     source_paths = action_proof_candidate_paths(candidates, tool_proof)
+    recovered_source_paths = provenance_original_request_recovery_paths(
+        query=query,
+        source_plan=source_plan or {},
+        existing_paths=source_paths,
+    )
+    source_paths = dedupe([*recovered_source_paths, *source_paths])
     direct_events: list[dict[str, Any]] = []
     intent_refs: list[dict[str, Any]] = []
     intent_candidates: list[dict[str, Any]] = []
@@ -6646,6 +6655,11 @@ def build_provenance_direct_evidence_facet_ledger(
         "selected_primary_read_count": len(selected_reads),
         "missing_facet_continuations": [continuation] if continuation else [],
         "missing_facet_continuation_count": 1 if continuation else 0,
+        "original_request_source_recovery": {
+            "status": "recovered" if recovered_source_paths else "not_needed_or_not_found",
+            "recovered_source_count": len(recovered_source_paths),
+            "bounded": True,
+        },
         "original_user_intent": {
             "status": "present" if intent_refs else "not_present_in_direct_records",
             "source_refs": dedupe_dicts(intent_refs)[:PROVENANCE_DIRECT_EVIDENCE_REF_CAP],
@@ -6666,6 +6680,14 @@ def build_provenance_direct_evidence_facet_ledger(
             ),
             "compacted_summary_count": sum(
                 1 for row in secondary_refs if row.get("context_role") == "compacted_summary"
+            ),
+            "post_hoc_prompt_echo_count": sum(
+                1 for row in secondary_refs if row.get("context_role") == "post_hoc_prompt_echo"
+            ),
+            "post_hoc_prompt_echo_action_count": sum(
+                1
+                for row in secondary_refs
+                if row.get("context_role") == "post_hoc_prompt_echo_action"
             ),
             "source_refs": dedupe_dicts(secondary_refs)[:8],
             "counts_as_direct_action_proof": False,
@@ -6699,6 +6721,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
     source_roles_by_target: dict[str, str] = {}
     calls_by_id: dict[str, dict[str, Any]] = {}
     session_intent_by_id: dict[str, str] = {}
+    post_hoc_prompt_echo_session = False
     try:
         records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
     except (AdapterReadError, OSError, ValueError):
@@ -6712,7 +6735,41 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         payload_type = str(payload.get("type") or raw.get("type") or "").casefold()
         text = provenance_record_text(record, payload)
 
+        worker_completion_facets = provenance_worker_completion_notification_facets(text)
+        if worker_completion_facets:
+            direct_events.append(
+                {
+                    "event_id": f"worker-completion-{path.name}-{record.line}",
+                    "event_kind": "completed_subagent_action_notification",
+                    "tool_name": "subagent_notification",
+                    "source_ref": guided_source_ref(source_ref),
+                    "output_source_ref": guided_source_ref(source_ref),
+                    "target": target,
+                    "facets": worker_completion_facets,
+                    "query_term_overlap_count": len(
+                        action_proof_query_terms(query)
+                        & set(ACTION_PROOF_TEXT_RE.findall(text.casefold()))
+                    ),
+                    "correlated_output": True,
+                    "correlated_session_command": True,
+                    "primary_action_proof": True,
+                }
+            )
+            source_roles_by_target[target] = "direct_worker_completion"
+            continue
         if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+            echo_reasons = provenance_original_request_prompt_echo_reasons(text, query=query)
+            if echo_reasons:
+                post_hoc_prompt_echo_session = True
+                secondary_context_refs.append(
+                    {
+                        "source_ref": guided_source_ref(source_ref),
+                        "context_role": "post_hoc_prompt_echo",
+                        "prompt_echo_reasons": echo_reasons,
+                    }
+                )
+                source_roles_by_target[target] = "post_hoc_prompt_echo"
+                continue
             original_user_intent_refs.append(
                 {"source_ref": guided_source_ref(source_ref), "intent_source_role": "direct_human_message"}
             )
@@ -6766,6 +6823,17 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         call = calls_by_id.get(call_id)
         if not call:
             continue
+        if post_hoc_prompt_echo_session:
+            for ref in (call["source_ref"], source_ref):
+                ref_target = source_ref_target(ref)
+                source_roles_by_target[ref_target] = "post_hoc_prompt_echo_action"
+                secondary_context_refs.append(
+                    {
+                        "source_ref": guided_source_ref(ref),
+                        "context_role": "post_hoc_prompt_echo_action",
+                    }
+                )
+            continue
         output_session_id = provenance_tool_session_id(text)
         if output_session_id and provenance_direct_action_intent_facets(call["text"]):
             session_intent_by_id[output_session_id] = call["text"]
@@ -6818,6 +6886,99 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         "secondary_context_refs": secondary_context_refs,
         "source_roles_by_target": source_roles_by_target,
     }
+
+
+def provenance_original_request_recovery_paths(
+    *,
+    query: str,
+    source_plan: dict[str, Any],
+    existing_paths: list[Path],
+) -> list[Path]:
+    if not provenance_original_user_request_wanted(query):
+        return []
+    roots = (source_plan.get("sources") or {}).get("roots") or []
+    sessions_roots = [
+        Path(str(root.get("path") or "")).expanduser()
+        for root in roots
+        if isinstance(root, dict) and root.get("kind") == "codex_sessions" and root.get("path")
+    ]
+    if not sessions_roots:
+        return []
+    codex_home = sessions_roots[0].parent
+    try:
+        result = latest_user_messages(
+            codex_home=codex_home,
+            default_tz=timezone.utc,
+            limit=500,
+            max_files=200,
+            max_bytes=100 * 1024 * 1024,
+            max_elapsed=15.0,
+            snippet_chars=1200,
+        )
+    except (OSError, ValueError):
+        return []
+    topic_terms = action_proof_query_terms(query) - PROVENANCE_ORIGINAL_REQUEST_META_TERMS
+    existing = {str(path) for path in existing_paths}
+    eligible: list[tuple[str, Path]] = []
+    for message in result.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = str(message.get("snippet") or "")
+        if provenance_original_request_prompt_echo_reasons(text, query=query):
+            continue
+        if not topic_terms.intersection(ACTION_PROOF_TEXT_RE.findall(text.casefold())):
+            continue
+        source_ref = message.get("openable_source_ref") or {}
+        path = Path(str(source_ref.get("path") or "")).expanduser()
+        if not path.is_file() or str(path) in existing or any(path == item[1] for item in eligible):
+            continue
+        eligible.append((str(message.get("timestamp_utc") or ""), path))
+    eligible.sort(key=lambda item: (item[0], str(item[1])))
+    return [path for _timestamp, path in eligible[:3]]
+
+
+def provenance_worker_completion_notification_facets(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+    if "<subagent_notification>" not in normalized or '"status":{"completed"' not in normalized:
+        return []
+    facets: list[str] = []
+    if any(marker in normalized for marker in ("implemented", "implementation:", "key results", "added `")):
+        facets.append("implementation_change")
+    if any(marker in normalized for marker in ("passed", "tests:", "focused tests", "full suite")):
+        facets.append("test")
+        facets.append("validation_safety")
+    if any(marker in normalized for marker in ("commit", "branch head", "committed")):
+        facets.append("commit")
+    if any(marker in normalized for marker in ("pip install", "pipx install", "wheel smoke", "skill install")):
+        facets.append("install")
+    if any(marker in normalized for marker in ("smoke", "working `convo --help`", "working jsonl-history-search")):
+        facets.append("runtime")
+    if any(marker in normalized for marker in ("residual risks", "unavailable", "unproven", "limitation")):
+        facets.append("limitation")
+    return [facet for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS if facet in facets]
+
+
+def provenance_original_request_prompt_echo_reasons(text: str, *, query: str) -> list[str]:
+    echo = setup_echo_classification(text, query=query)
+    reasons: list[str] = []
+    if echo.get("is_setup_echo"):
+        reasons.append(f"setup_echo:{echo.get('reason') or 'setup_echo'}")
+    normalized = re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+    query_text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    if query_text and query_text in normalized and any(
+        marker in normalized
+        for marker in (
+            "exact target",
+            "target prompt",
+            "evaluation prompt",
+            "gate prompt",
+            "pressure lane",
+            "independent reviewer",
+            "isolated implementer",
+        )
+    ):
+        reasons.append("post_hoc_gate_or_review_query_echo")
+    return dedupe(reasons)
 
 
 PROVENANCE_ORIGINAL_REQUEST_META_TERMS = {
@@ -6891,19 +7052,25 @@ def select_provenance_original_user_request(
     *,
     selected_events: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    action_lines = [
-        int((event.get("source_ref") or {}).get("line") or 0)
-        for event in selected_events
-        if int((event.get("source_ref") or {}).get("line") or 0) > 0
-    ]
-    if not action_lines:
+    first_action_line_by_path: dict[str, int] = {}
+    for event in selected_events:
+        source_ref = event.get("source_ref") or {}
+        path = str(source_ref.get("path") or "")
+        line = int(source_ref.get("line") or 0)
+        if not path or line <= 0:
+            continue
+        current = first_action_line_by_path.get(path)
+        if current is None or line < current:
+            first_action_line_by_path[path] = line
+    if not first_action_line_by_path:
         return None
-    first_action_line = min(action_lines)
     eligible = [
         candidate
         for candidate in candidates
-        if int((candidate.get("source_ref") or {}).get("line") or 0) > 0
-        and int((candidate.get("source_ref") or {}).get("line") or 0) < first_action_line
+        if str((candidate.get("source_ref") or {}).get("path") or "") in first_action_line_by_path
+        and int((candidate.get("source_ref") or {}).get("line") or 0) > 0
+        and int((candidate.get("source_ref") or {}).get("line") or 0)
+        < first_action_line_by_path[str((candidate.get("source_ref") or {}).get("path") or "")]
         and candidate.get("intent_source_role") == "direct_human_message"
         and candidate.get("substantive") is True
         and int(candidate.get("query_term_overlap_count") or 0) > 0
@@ -6912,7 +7079,10 @@ def select_provenance_original_user_request(
         return None
     return min(
         eligible,
-        key=lambda candidate: int((candidate.get("source_ref") or {}).get("line") or 0),
+        key=lambda candidate: (
+            -int(candidate.get("query_term_overlap_count") or 0),
+            int((candidate.get("source_ref") or {}).get("line") or 0),
+        ),
     )
 
 
@@ -7395,6 +7565,7 @@ def provenance_direct_event_ref(event: dict[str, Any]) -> dict[str, Any]:
         "output_source_ref": event.get("output_source_ref"),
         "facets": list(event.get("facets") or []),
         "correlated_output": bool(event.get("correlated_output")),
+        "event_kind": event.get("event_kind"),
     }
 
 
@@ -7431,11 +7602,16 @@ def select_provenance_direct_events(
 
 def provenance_direct_event_read(event: dict[str, Any]) -> dict[str, Any]:
     source_ref = dict(event.get("source_ref") or {})
+    worker_completion = event.get("event_kind") == "completed_subagent_action_notification"
     return {
-        "kind": "tool_event_source_ref",
+        "kind": "worker_completion_source_ref" if worker_completion else "tool_event_source_ref",
         "target": source_ref_target(source_ref),
         "source_ref": source_ref,
-        "reason": "open correlated direct source-session tool call/output evidence",
+        "reason": (
+            "open direct completed-worker action chronology from the parent source session"
+            if worker_completion
+            else "open correlated direct source-session tool call/output evidence"
+        ),
         "read_role": "required_primary_proof",
         "read_more_actionable": True,
         "followthrough_actionable": True,
@@ -7444,13 +7620,25 @@ def provenance_direct_event_read(event: dict[str, Any]) -> dict[str, Any]:
         "provenance_direct_evidence": provenance_direct_event_ref(event),
         "action_proof_source_selection": {
             "schema_version": 1,
-            "selection_reason": "correlated_direct_source_session_event",
+            "selection_reason": (
+                "completed_subagent_action_notification"
+                if worker_completion
+                else "correlated_direct_source_session_event"
+            ),
             "source_window_verification_required": True,
-            "claim_boundary": "direct_call_and_correlated_output_support_only_classified_facets",
+            "claim_boundary": (
+                "completed_worker_notification_supports_only_explicitly_reported_action_facets"
+                if worker_completion
+                else "direct_call_and_correlated_output_support_only_classified_facets"
+            ),
         },
         "historical_provenance_selection": {
             "schema_version": 1,
-            "source_chronology_role": "target_historical_raw_direct_event_source_ref",
+            "source_chronology_role": (
+                "target_historical_raw_worker_completion_source_ref"
+                if worker_completion
+                else "target_historical_raw_direct_event_source_ref"
+            ),
             "final_support_allowed": True,
             "read_more_actionable": True,
             "followthrough_actionable": True,
@@ -7519,7 +7707,13 @@ def apply_provenance_direct_evidence_ledger_to_reads(
             continue
         row = dict(read)
         event_role = roles.get(target)
-        if event_role in {"assistant_recap", "report_writing_event", "compacted_summary"}:
+        if event_role in {
+            "assistant_recap",
+            "report_writing_event",
+            "compacted_summary",
+            "post_hoc_prompt_echo",
+            "post_hoc_prompt_echo_action",
+        }:
             row.update(
                 {
                     "read_role": "optional_diagnostic",
