@@ -112,12 +112,28 @@ if [ "$mode" = "editable" ]; then
 fi
 
 if [ "$mode" = "pipx" ]; then
-  if ! python3 -m pip --version >/dev/null 2>&1; then
-    warn "python3 -m pip is missing; Python-based pipx bootstrap is unavailable." "Prefer your OS package manager for pipx, or install pip for this Python first."
+  if python3 -m pip --version >/dev/null 2>&1; then
+    pip_available=1
   else
-    pass "python3 -m pip is available."
+    pip_available=0
   fi
-  if ! command -v pipx >/dev/null 2>&1; then
+  if command -v pipx >/dev/null 2>&1; then
+    pipx_available=1
+  else
+    pipx_available=0
+  fi
+
+  if [ "$pip_available" -eq 0 ] && [ "$pipx_available" -eq 0 ]; then
+    fail "Neither pipx nor python3 -m pip is available; a supported local CLI install cannot start." "Install this Python's pip and venv host components (Debian/Ubuntu: sudo apt install python3-pip python3-venv), then rerun this preflight. Do not extract wheels or create wrappers manually."
+    exit 1
+  fi
+
+  if [ "$pip_available" -eq 1 ]; then
+    pass "python3 -m pip is available."
+  else
+    pass "pipx is available; python3 -m pip is not required for this install."
+  fi
+  if [ "$pipx_available" -eq 0 ]; then
     python_for_pipx=$(python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; printf '%s' "$?")
     if [ "$python_for_pipx" -eq 0 ]; then
       fail "pipx is missing." "Install pipx with your OS package manager or run: python3 -m pip install --user pipx"
