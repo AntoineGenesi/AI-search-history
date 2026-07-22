@@ -6391,7 +6391,7 @@ def source_followthrough_stop_condition(
     direct_ledger = provenance_direct_evidence_facet_ledger or {}
     if direct_ledger.get("applies") and direct_ledger.get("evidence_complete"):
         return (
-            "Stop after the selected correlated direct-event reads support every required facet. "
+            "Stop after the selected direct proof reads support every required facet. "
             "Do not open assistant recaps, report-writing events, or compacted summaries as required primary proof."
         )
     if direct_ledger.get("applies") and direct_ledger.get("missing_required_facets"):
@@ -6487,7 +6487,9 @@ def provenance_direct_evidence_ledger_wanted(query: str, family: dict[str, Any])
 
 def requested_provenance_direct_evidence_facets(query: str) -> list[str]:
     text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
-    requested: list[str] = []
+    requested: list[str] = (
+        ["original_user_request"] if provenance_original_user_request_wanted(query) else []
+    )
     facet_terms = {
         "implementation_change": (
             "change",
@@ -6522,6 +6524,16 @@ def requested_provenance_direct_evidence_facets(query: str) -> list[str]:
     return requested
 
 
+def provenance_original_user_request_wanted(query: str) -> bool:
+    text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    patterns = (
+        r"\bwhat\s+(?:did|had)\s+i\s+(?:ask|request|tell)\b",
+        r"\bwhat\s+i\s+(?:asked|requested|told)\b",
+        r"\bwhat\s+was\s+my\s+(?:original\s+)?(?:ask|request|instruction)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def build_provenance_direct_evidence_facet_ledger(
     *,
     query: str,
@@ -6536,19 +6548,60 @@ def build_provenance_direct_evidence_facet_ledger(
     source_paths = action_proof_candidate_paths(candidates, tool_proof)
     direct_events: list[dict[str, Any]] = []
     intent_refs: list[dict[str, Any]] = []
+    intent_candidates: list[dict[str, Any]] = []
     secondary_refs: list[dict[str, Any]] = []
     source_roles_by_target: dict[str, str] = {}
     for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
         scan = provenance_direct_events_for_path(path, query=query)
         direct_events.extend(scan["direct_events"])
         intent_refs.extend(scan["original_user_intent_refs"])
+        intent_candidates.extend(scan["original_user_intent_candidates"])
         secondary_refs.extend(scan["secondary_context_refs"])
         source_roles_by_target.update(scan["source_roles_by_target"])
 
     direct_events = dedupe_provenance_direct_events(direct_events)
+    action_required_facets = [
+        facet for facet in required_facets if facet != "original_user_request"
+    ]
+    selected_events = select_provenance_direct_events(
+        direct_events,
+        required_facets=action_required_facets,
+    )
+    selected_original_request = (
+        select_provenance_original_user_request(
+            intent_candidates,
+            selected_events=selected_events,
+        )
+        if "original_user_request" in required_facets
+        else None
+    )
     facet_rows = []
-    covered_facets = []
-    for facet in PROVENANCE_DIRECT_EVIDENCE_FACETS:
+    covered_facets = ["original_user_request"] if selected_original_request else []
+    facet_order = (
+        ["original_user_request", *PROVENANCE_DIRECT_EVIDENCE_FACETS]
+        if "original_user_request" in required_facets
+        else list(PROVENANCE_DIRECT_EVIDENCE_FACETS)
+    )
+    for facet in facet_order:
+        if facet == "original_user_request":
+            facet_rows.append(
+                {
+                    "facet": facet,
+                    "required": True,
+                    "status": (
+                        "covered_by_direct_human_request"
+                        if selected_original_request
+                        else "not_covered"
+                    ),
+                    "direct_event_count": 1 if selected_original_request else 0,
+                    "evidence_refs": (
+                        [provenance_original_user_request_ref(selected_original_request)]
+                        if selected_original_request
+                        else []
+                    ),
+                }
+            )
+            continue
         matching = [event for event in direct_events if facet in set(event.get("facets") or [])]
         if matching:
             covered_facets.append(facet)
@@ -6565,11 +6618,11 @@ def build_provenance_direct_evidence_facet_ledger(
             }
         )
     missing_facets = [facet for facet in required_facets if facet not in covered_facets]
-    selected_events = select_provenance_direct_events(
-        direct_events,
-        required_facets=required_facets,
-    )
-    selected_reads = [provenance_direct_event_read(event) for event in selected_events]
+    selected_reads = (
+        [provenance_original_user_request_read(selected_original_request)]
+        if selected_original_request
+        else []
+    ) + [provenance_direct_event_read(event) for event in selected_events]
     continuation = provenance_missing_facet_continuation(
         missing_facets=missing_facets,
         direct_events=direct_events,
@@ -6593,6 +6646,12 @@ def build_provenance_direct_evidence_facet_ledger(
             "status": "present" if intent_refs else "not_present_in_direct_records",
             "source_refs": dedupe_dicts(intent_refs)[:PROVENANCE_DIRECT_EVIDENCE_REF_CAP],
             "counts_as_direct_action_proof": False,
+            "selected_original_user_request": (
+                provenance_original_user_request_ref(selected_original_request)
+                if selected_original_request
+                else None
+            ),
+            "selected_counts_as_original_user_request_proof": bool(selected_original_request),
         },
         "secondary_context": {
             "assistant_recap_count": sum(
@@ -6615,6 +6674,8 @@ def build_provenance_direct_evidence_facet_ledger(
         },
         "claim_boundaries": {
             "original_user_intent_counts_as_direct_action_evidence": False,
+            "direct_human_request_required_when_query_asks_what_user_requested": True,
+            "compacted_or_secondary_human_intent_counts_as_original_request_proof": False,
             "assistant_final_or_task_complete_recap_counts_as_direct_action_evidence": False,
             "report_writing_call_or_output_counts_as_direct_action_evidence": False,
             "compacted_summary_counts_as_direct_action_evidence": False,
@@ -6629,6 +6690,7 @@ def build_provenance_direct_evidence_facet_ledger(
 def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, Any]:
     direct_events: list[dict[str, Any]] = []
     original_user_intent_refs: list[dict[str, Any]] = []
+    original_user_intent_candidates: list[dict[str, Any]] = []
     secondary_context_refs: list[dict[str, Any]] = []
     source_roles_by_target: dict[str, str] = {}
     calls_by_id: dict[str, dict[str, Any]] = {}
@@ -6651,6 +6713,14 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
                 {"source_ref": guided_source_ref(source_ref), "intent_source_role": "direct_human_message"}
             )
             source_roles_by_target[target] = "original_user_intent"
+            candidate = provenance_original_user_request_candidate(
+                source_ref=source_ref,
+                target=target,
+                text=text,
+                query=query,
+            )
+            if candidate:
+                original_user_intent_candidates.append(candidate)
             continue
         if classification.label == COMPACTED_HISTORY_SUMMARY:
             embedded_intent = provenance_compacted_human_intent(payload)
@@ -6740,8 +6810,142 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
     return {
         "direct_events": direct_events,
         "original_user_intent_refs": original_user_intent_refs,
+        "original_user_intent_candidates": original_user_intent_candidates,
         "secondary_context_refs": secondary_context_refs,
         "source_roles_by_target": source_roles_by_target,
+    }
+
+
+PROVENANCE_ORIGINAL_REQUEST_META_TERMS = {
+    "actually",
+    "agent",
+    "ask",
+    "asked",
+    "back",
+    "change",
+    "changed",
+    "conversation",
+    "earlier",
+    "looking",
+    "request",
+    "requested",
+    "tell",
+    "told",
+    "verify",
+    "verified",
+    "what",
+    "work",
+}
+
+
+def provenance_original_user_request_candidate(
+    *,
+    source_ref: dict[str, Any],
+    target: str,
+    text: str,
+    query: str,
+) -> dict[str, Any] | None:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    lowered = normalized.casefold()
+    if not normalized or len(ACTION_PROOF_TEXT_RE.findall(lowered)) < 4:
+        return None
+    injected_markers = (
+        "<recommended_plugins>",
+        "<environment_context>",
+        "<apps_instructions>",
+        "<plugins_instructions>",
+        "here is a list of plugins that are available but not installed",
+    )
+    if any(marker in lowered for marker in injected_markers):
+        return None
+    later_update_markers = (
+        "coordinator update",
+        "update from the user",
+        "user update:",
+        "follow-up update:",
+    )
+    if any(marker in lowered for marker in later_update_markers):
+        return None
+    topic_terms = action_proof_query_terms(query) - PROVENANCE_ORIGINAL_REQUEST_META_TERMS
+    text_terms = set(ACTION_PROOF_TEXT_RE.findall(lowered))
+    overlap = topic_terms & text_terms
+    if not overlap:
+        return None
+    return {
+        "source_ref": guided_source_ref(source_ref),
+        "target": target,
+        "intent_source_role": "direct_human_message",
+        "proof_kind": "original_user_request_direct_human",
+        "query_term_overlap_count": len(overlap),
+        "matched_query_terms": sorted(overlap)[:8],
+        "substantive": True,
+    }
+
+
+def select_provenance_original_user_request(
+    candidates: list[dict[str, Any]],
+    *,
+    selected_events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    action_lines = [
+        int((event.get("source_ref") or {}).get("line") or 0)
+        for event in selected_events
+        if int((event.get("source_ref") or {}).get("line") or 0) > 0
+    ]
+    if not action_lines:
+        return None
+    first_action_line = min(action_lines)
+    eligible = [
+        candidate
+        for candidate in candidates
+        if int((candidate.get("source_ref") or {}).get("line") or 0) > 0
+        and int((candidate.get("source_ref") or {}).get("line") or 0) < first_action_line
+        and candidate.get("intent_source_role") == "direct_human_message"
+        and candidate.get("substantive") is True
+        and int(candidate.get("query_term_overlap_count") or 0) > 0
+    ]
+    if not eligible:
+        return None
+    return min(
+        eligible,
+        key=lambda candidate: int((candidate.get("source_ref") or {}).get("line") or 0),
+    )
+
+
+def provenance_original_user_request_ref(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_ref": candidate.get("source_ref") or {},
+        "intent_source_role": "direct_human_message",
+        "proof_kind": "original_user_request_direct_human",
+        "query_term_overlap_count": int(candidate.get("query_term_overlap_count") or 0),
+        "matched_query_terms": list(candidate.get("matched_query_terms") or []),
+    }
+
+
+def provenance_original_user_request_read(candidate: dict[str, Any]) -> dict[str, Any]:
+    source_ref = dict(candidate.get("source_ref") or {})
+    return {
+        "kind": "direct_human_message_source_ref",
+        "target": source_ref_target(source_ref),
+        "source_ref": source_ref,
+        "reason": "open direct original user-request evidence from the source session",
+        "read_role": "required_primary_proof",
+        "read_more_actionable": True,
+        "followthrough_actionable": True,
+        "diagnostic_only": False,
+        "proof_kind": "original_user_request_direct_human",
+        "intent_source_role": "direct_human_message",
+        "direct_evidence_facets": ["original_user_request"],
+        "provenance_original_user_request_evidence": provenance_original_user_request_ref(candidate),
+        "historical_provenance_selection": {
+            "schema_version": 1,
+            "source_chronology_role": "target_historical_raw_jsonl_source_ref",
+            "final_support_allowed": True,
+            "read_more_actionable": True,
+            "followthrough_actionable": True,
+            "diagnostic_only": False,
+            "raw_text_included": False,
+        },
     }
 
 
@@ -7294,13 +7498,31 @@ def build_provenance_complete_proof_handoff(
         if not target:
             continue
         proof = read.get("provenance_direct_evidence") or {}
+        original_request_proof = read.get("provenance_original_user_request_evidence") or {}
+        proof_kind = str(
+            read.get("proof_kind")
+            or (
+                "correlated_direct_tool_call_and_output"
+                if proof
+                else "unknown_direct_proof"
+            )
+        )
+        direct_human_request = bool(
+            proof_kind == "original_user_request_direct_human"
+            and original_request_proof.get("intent_source_role") == "direct_human_message"
+        )
+        correlated_call_output = bool(proof.get("correlated_output"))
         selected_reads.append(
             {
                 "target": target,
                 "source_ref": read.get("source_ref") or {},
                 "output_source_ref": proof.get("output_source_ref") or {},
                 "covered_facets": list(read.get("direct_evidence_facets") or []),
-                "correlated_call_output": bool(proof.get("correlated_output")),
+                "proof_kind": proof_kind,
+                "source_role": read.get("intent_source_role") or "direct_tool_call",
+                "direct_human_request": direct_human_request,
+                "correlated_call_output": correlated_call_output,
+                "required_facet_proof_valid": direct_human_request or correlated_call_output,
                 "command": provenance_bounded_direct_read_command(target),
                 "window": {
                     "before": PROVENANCE_COMPLETE_PROOF_READ_BEFORE,
@@ -7339,7 +7561,7 @@ def build_provenance_complete_proof_handoff(
         and ledger.get("required_facets")
         and not ledger.get("missing_required_facets")
         and selected_reads
-        and all(read.get("correlated_call_output") for read in selected_reads)
+        and all(read.get("required_facet_proof_valid") for read in selected_reads)
     )
     handoff = {
         "schema_version": 1,
@@ -7368,9 +7590,9 @@ def build_provenance_complete_proof_handoff(
             {
                 "answer_status": "answer_ready_after_selected_direct_reads",
                 "stop_instruction": (
-                    "Open only the selected direct reads, synthesize the answer from their correlated call/output "
-                    "evidence, cite those refs, and stop. Do not open recaps, summaries, specifications, reports, "
-                    "candidates, or diagnostic/retrieval surfaces."
+                    "Open only the selected direct reads, use direct-human evidence for the original request and "
+                    "correlated call/output evidence for actions and verification, cite those refs, and stop. Do "
+                    "not open recaps, summaries, specifications, reports, candidates, or diagnostic/retrieval surfaces."
                 ),
                 "continuation_commands": [],
             }

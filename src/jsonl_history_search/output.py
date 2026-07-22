@@ -1199,7 +1199,11 @@ def _append_compact_read_contract(
                 reason = item.get("reason") or item.get("purpose")
                 rendered = _with_cli_prefix(str(command), cli_prefix) if command else target or source_target or reason or str(item)
                 lines.append(f"{bullet}{rendered}")
-                inspection_command = _ask_execute_source_inspection_command(item, cli_prefix=cli_prefix)
+                inspection_command = (
+                    None
+                    if command
+                    else _ask_execute_source_inspection_command(item, cli_prefix=cli_prefix)
+                )
                 if inspection_command:
                     lines.append(f"  read-more: {inspection_command}")
             else:
@@ -1502,7 +1506,7 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
         lines.extend(
             [
                 f"- **Required facets:** `{required}`",
-                f"- **Covered by correlated direct evidence:** `{covered}`",
+                f"- **Covered by direct proof:** `{covered}`",
                 f"- **Missing facets:** `{missing}`",
                 "",
                 "## Selected Direct Reads",
@@ -1513,7 +1517,7 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
         lines.extend(
             [
                 f"Required facets: {required}",
-                f"Covered by correlated direct evidence: {covered}",
+                f"Covered by direct proof: {covered}",
                 f"Missing facets: {missing}",
                 "Selected direct reads:",
             ]
@@ -1524,6 +1528,8 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
     for index, read in enumerate(selected_reads, start=1):
         target = _bounded_projection_value(read.get("target"), 1_200)
         facets = ", ".join(read.get("covered_facets") or []) or "none"
+        proof_kind = _bounded_projection_value(read.get("proof_kind") or "unknown")
+        source_role = _bounded_projection_value(read.get("source_role") or "unknown")
         command = _bounded_projection_value(read.get("command"), 2_000)
         output_ref = source_ref_target(read.get("output_source_ref") or {})
         if markdown:
@@ -1531,7 +1537,13 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
                 [
                     f"{index}. `{target}`",
                     f"   - Facets: `{facets}`",
-                    f"   - Correlated output ref: `{_bounded_projection_value(output_ref, 1_200)}`",
+                    f"   - Proof kind: `{proof_kind}`",
+                    f"   - Source role: `{source_role}`",
+                    (
+                        f"   - Correlated output ref: `{_bounded_projection_value(output_ref, 1_200)}`"
+                        if output_ref
+                        else "   - Correlated output ref: `not applicable to direct-human proof`"
+                    ),
                     f"   - Bounded command: `{command}`",
                 ]
             )
@@ -1540,7 +1552,13 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
                 [
                     f"{index}. ref: {target}",
                     f"   facets: {facets}",
-                    f"   correlated output ref: {_bounded_projection_value(output_ref, 1_200)}",
+                    f"   proof kind: {proof_kind}",
+                    f"   source role: {source_role}",
+                    (
+                        f"   correlated output ref: {_bounded_projection_value(output_ref, 1_200)}"
+                        if output_ref
+                        else "   correlated output ref: not applicable to direct-human proof"
+                    ),
                     f"   bounded command: {command}",
                 ]
             )
