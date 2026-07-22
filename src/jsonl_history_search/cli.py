@@ -1855,12 +1855,28 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _history_home_from_args(
+    args: argparse.Namespace,
+    *,
+    provider: str,
+) -> Path:
+    provider_upper = provider.upper()
+    configured = (
+        os.environ.get(f"JSONL_HISTORY_{provider_upper}_HOME")
+        or getattr(args, f"{provider}_home", None)
+        or os.environ.get(f"{provider_upper}_HOME")
+    )
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / f".{provider}"
+
+
 def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
     tz = timezone_from_args(args.timezone, args.timezone_offset)
     now = parse_now(args.now, tz)
     cwd = Path(args.cwd).expanduser().resolve()
-    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
-    claude_home = Path(args.claude_home).expanduser() if args.claude_home else Path.home() / ".claude"
+    codex_home = _history_home_from_args(args, provider="codex")
+    claude_home = _history_home_from_args(args, provider="claude")
     limits = Limits(
         max_files=args.max_files,
         max_bytes=args.max_bytes,
@@ -9052,7 +9068,7 @@ def _remembered_user_wording_latest_recovery_config(args: argparse.Namespace) ->
     if explicit_roots and not explicit_codex_home:
         return None
     return {
-        "codex_home": str(Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"),
+        "codex_home": str(_history_home_from_args(args, provider="codex")),
         "max_files": int(getattr(args, "max_files", 200) or 200),
         "max_bytes": int(getattr(args, "max_bytes", 100 * 1024 * 1024) or 100 * 1024 * 1024),
         "max_elapsed": float(getattr(args, "max_elapsed", 15.0) or 15.0),
@@ -17144,8 +17160,8 @@ def _short_join(parts: list[str], *, limit: int = 520) -> str:
 
 def discovery_payload_from_args(args: argparse.Namespace) -> dict:
     cwd = Path(args.cwd).expanduser().resolve()
-    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
-    claude_home = Path(args.claude_home).expanduser() if args.claude_home else Path.home() / ".claude"
+    codex_home = _history_home_from_args(args, provider="codex")
+    claude_home = _history_home_from_args(args, provider="claude")
     limits = Limits(
         max_files=args.max_files,
         max_bytes=args.max_bytes,
