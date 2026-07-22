@@ -532,6 +532,7 @@ def render_ask_execute_text(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
+    _append_provenance_missing_facets(lines, action)
     _append_answer_handoff_text(lines, report.get("answer_handoff"))
     if not _append_remembered_user_missing_evidence_contract(lines, action):
         _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
@@ -642,6 +643,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
+    _append_provenance_missing_facets(lines, action, markdown=True)
     _append_answer_handoff_markdown(lines, report.get("answer_handoff"))
     if not _append_remembered_user_missing_evidence_contract(lines, action, markdown=True):
         _append_scoped_no_evidence_contract(
@@ -682,6 +684,20 @@ def render_ask_execute_markdown(payload: dict) -> str:
     if route.get("route_family") == "artifact_currentness":
         _append_artifact_currentness_execute_markdown(lines, report.get("executed_output") or {})
     return "\n".join(lines)
+
+
+def _append_provenance_missing_facets(
+    lines: list[str],
+    action: dict,
+    *,
+    markdown: bool = False,
+) -> None:
+    handoff = action.get("provenance_complete_proof_handoff") or {}
+    missing = list(handoff.get("missing_required_facets") or [])
+    if not handoff.get("applies") or not missing:
+        return
+    prefix = "- Missing required facets:" if markdown else "Missing required facets:"
+    lines.append(f"{prefix} {', '.join(str(facet) for facet in missing)}")
 
 
 def _append_answer_handoff_text(lines: list[str], handoff: object) -> None:

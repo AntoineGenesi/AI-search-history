@@ -6243,6 +6243,7 @@ def build_source_followthrough_plan(
         scope_boundary_summary=scope_boundary_summary or {},
         conditional=conditional,
         scoped_no_evidence=scoped_no_evidence,
+        provenance_direct_evidence_facet_ledger=provenance_direct_evidence_facet_ledger or {},
     )
     return {
         "schema_version": 1,
@@ -6426,7 +6427,10 @@ def source_followthrough_only_continue_if(
     scope_boundary_summary: dict[str, Any],
     conditional: list[dict[str, Any]],
     scoped_no_evidence: bool,
+    provenance_direct_evidence_facet_ledger: dict[str, Any] | None = None,
 ) -> list[str]:
+    if (provenance_direct_evidence_facet_ledger or {}).get("applies"):
+        return []
     followthrough = answer_ready_handoff.get("primary_source_followthrough")
     values: list[str] = []
     if isinstance(followthrough, dict):
