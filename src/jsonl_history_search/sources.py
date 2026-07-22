@@ -545,6 +545,9 @@ def build_source_plan(
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
             resolved = safe_resolve(root)
             kind = known_kind_for_resolved_path(resolved, known)
+            if kind and known_kind_uses_symlinked_provider_root(kind, codex_home, claude_home):
+                plan.rejected_roots.append(RejectedRoot(str(root), "symlinked known transcript root rejected before traversal"))
+                continue
             danger = dangerous_reason(resolved, cwd)
             if danger and not (kind and danger == "cache/model directory rejected before traversal"):
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
@@ -596,6 +599,16 @@ def known_kind_for_resolved_path(resolved: Path, known: dict[Path, str]) -> str 
                 return "claude_session_file"
             return root_kind
     return None
+
+
+def known_kind_uses_symlinked_provider_root(kind: str, codex_home: Path, claude_home: Path) -> bool:
+    if kind in {"codex_sessions", "codex_session_file"}:
+        return (codex_home / "sessions").expanduser().is_symlink()
+    if kind == "codex_history":
+        return (codex_home / "history.jsonl").expanduser().is_symlink()
+    if kind in {"claude_projects", "claude_session_file"}:
+        return (claude_home / "projects").expanduser().is_symlink()
+    return False
 
 
 def resolved_path_is_inside(path: Path, root: Path) -> bool:
