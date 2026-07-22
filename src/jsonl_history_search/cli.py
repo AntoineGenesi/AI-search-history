@@ -2333,14 +2333,6 @@ def _ask_execute_report_output_unavailable(
             execution_args=execution_args,
         )
     if execution_kind == "semantic-debug":
-        remembered = _remembered_user_wording_report_output_unavailable(
-            contract,
-            execution_kind=execution_kind,
-            report_output=report_output,
-            execution_args=execution_args,
-        )
-        if remembered:
-            return remembered
         provenance = _provenance_report_output_unavailable(
             contract,
             execution_kind=execution_kind,
@@ -2348,6 +2340,12 @@ def _ask_execute_report_output_unavailable(
         )
         if provenance:
             return provenance
+        return _semantic_debug_report_output_unavailable(
+            contract,
+            execution_kind=execution_kind,
+            report_output=report_output,
+            execution_args=execution_args,
+        )
     contract["ask_execute"]["execution"].update(
         {
             "status": "report_output_unavailable",
@@ -2369,7 +2367,7 @@ def _ask_execute_report_output_unavailable(
     return contract
 
 
-def _remembered_user_wording_report_output_unavailable(
+def _semantic_debug_report_output_unavailable(
     contract: dict,
     *,
     execution_kind: str,
@@ -2378,27 +2376,33 @@ def _remembered_user_wording_report_output_unavailable(
 ) -> dict:
     ask_execute = contract["ask_execute"]
     selected_route = ask_execute.get("selected_route") or {}
-    if selected_route.get("route_family") != "remembered_user_wording" or execution_args is None:
+    if execution_args is None:
         return {}
 
     compact_payload = _build_semantic_debug_in_memory_payload(execution_args)
     compact = compact_payload["semantic_debug"]
+    selected_route["first_command"] = None
+    selected_route["next_commands"] = []
+    selected_route["manual_search_guidance"] = None
+    selected_route["optional_deeper_reads"] = []
+    selected_route["route_instruction_status"] = "already_executed_in_memory"
     ask_execute["execution"].update(
         {
-            "status": "executed_in_memory_report_output_unavailable",
+            "status": "executed",
             "command_family": execution_kind,
-            "argv": _structured_execution_argv(execution_args),
+            "argv": [],
             "report_output": report_output,
             "report_written": None,
+            "report_output_status": "unavailable",
+            "execution_mode": "in_memory",
+            "route_instruction_status": "already_executed",
             "output_key": "semantic_debug",
-            "fallback_command": None,
             "reason": (
-                "The optional report destination is not writable; remembered-user primary-history "
-                "proof was still attempted in memory, so no manual fallback command is needed."
+                "Semantic-debug completed in memory; only optional report persistence was unavailable."
             ),
         }
     )
-    ask_execute["execution_status"] = "executed_in_memory_report_output_unavailable"
+    ask_execute["execution_status"] = "executed"
     ask_execute["executed_output"] = _compact_executed_output_for_ask(
         output_key="semantic_debug",
         compact=compact,

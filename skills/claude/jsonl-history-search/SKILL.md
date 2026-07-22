@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use for obvious requests to search prior Codex or Claude conversations, recover what the user previously said, verify what an agent actually did, inspect source provenance, debug a decision from conversation history, or explain why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In the default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command. Route through the installed-or-source `ask --execute` command before answering from visible context.
+description: Use for obvious requests to search prior Codex or Claude conversations, recover what the user previously said, verify what an agent actually did, inspect source provenance, debug a decision from conversation history, or explain why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In the default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command. Start exactly one installed `ask --execute` route and wait for it before answering from visible context.
 metadata:
   short-description: Search local AI conversation history
 ---
@@ -45,32 +45,34 @@ For a named `tasks`/`...md`, decide scope before any tool:
 - unresolved scope: ask "Do you want current local Git/task evidence or prior
   conversation history?" and use zero tools.
 
-Preserve the user's wording as one quoted argument. Run this installed-or-source
-resolution block before repository search, Git inspection, or synthesis from
+Preserve the user's wording as one quoted argument. Start exactly one installed
+history route before repository search, Git inspection, or synthesis from
 visible context:
 
 ```bash
-if command -v jsonl-history-search >/dev/null 2>&1; then
-  jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
-elif [ -f src/jsonl_history_search/cli.py ]; then
-  PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
-else
-  printf '%s\n' 'jsonl-history-search is not installed and this directory is not a source checkout' >&2
-  exit 127
-fi
+jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
-The `command -v` check is non-executing resolution. In a source checkout where
-the console command is absent, the first useful product command must be the
-source branch's `PYTHONPATH=src python3 -m jsonl_history_search.cli ask
---execute ...`. Do not first call `convo`, `convo --help`,
-`jsonl-history-search`, or `jsonl-history-search --help` and wait for failure.
+Wait for that command to exit. While it is running, do not start another `ask`,
+`ask --execute`, direct `semantic-debug`, installed helper, or source-checkout
+fallback. Only if it exits with command-not-found (126/127) or a clear
+install/import failure, and the current directory contains
+`src/jsonl_history_search/cli.py`, run this source recovery once:
+
+```bash
+PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
+```
+
+The source command is failure recovery, never a parallel or equivalent route.
+If neither command is available, report the installation failure. Do not probe
+with `convo`, `--help`, repository inventory, or another history route.
 
 ## Follow The Route
 
-The `ask --execute` result names the selected route, what to inspect, and when
-to stop. Read at most the one matching file under `references/` when more route
-guidance is needed:
+After the one `ask --execute` process exits, use its selected refs, inspection
+contract, and stop rule. Do not rerun `ask` or start direct `semantic-debug` to
+obtain the same evidence. Read at most the one matching file under `references/`
+when more route guidance is needed:
 
 - remembered wording or preference: `references/remembered-instruction.md`;
 - remembered topic or rationale: `references/remembered-topic.md`;
