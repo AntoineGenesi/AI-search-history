@@ -5692,6 +5692,11 @@ def _answer_action_contract_from_executed_output(
                 or []
             )
             contract["stop"] = named_task_action_proof.get("stop") or contract["stop"]
+        if provenance_ledger.get("applies"):
+            contract["read"] = provenance_reads
+            contract["diagnostics_after"] = []
+            contract["stop"] = provenance_handoff.get("stop_instruction") or contract["stop"]
+            contract.pop("only_continue_if", None)
         return contract
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
