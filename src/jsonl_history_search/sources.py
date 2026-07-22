@@ -543,12 +543,15 @@ def build_source_plan(
 
     for requested_root in requested:
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
+            if requested_root_uses_symlinked_provider_root(root, codex_home, claude_home):
+                plan.rejected_roots.append(RejectedRoot(str(root), "symlinked known transcript root rejected before traversal"))
+                continue
             resolved = safe_resolve(root)
+            kind = known_kind_for_resolved_path(resolved, known)
             danger = dangerous_reason(resolved, cwd)
-            if danger:
+            if danger and not (kind and danger == "cache/model directory rejected before traversal"):
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
                 continue
-            kind = known_kind_for_resolved_path(resolved, known)
             if not kind and not allow_arbitrary_root:
                 plan.rejected_roots.append(RejectedRoot(str(root), "not a known Codex/Claude transcript root; pass --allow-arbitrary-root with explicit hard caps"))
                 continue
@@ -598,6 +601,21 @@ def known_kind_for_resolved_path(resolved: Path, known: dict[Path, str]) -> str 
     return None
 
 
+def requested_root_uses_symlinked_provider_root(root: Path, codex_home: Path, claude_home: Path) -> bool:
+    lexical_root = root.expanduser().absolute()
+    directory_roots = (codex_home / "sessions", claude_home / "projects")
+    for provider_root in directory_roots:
+        lexical_provider_root = provider_root.expanduser().absolute()
+        if provider_root.expanduser().is_symlink() and (
+            lexical_root == lexical_provider_root or resolved_path_is_inside(lexical_root, lexical_provider_root)
+        ):
+            return True
+    history = (codex_home / "history.jsonl").expanduser()
+    if history.is_symlink() and lexical_root == history.absolute():
+        return True
+    return False
+
+
 def resolved_path_is_inside(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -615,6 +633,8 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
     max_elapsed = 2.0
     for base in (codex_home / "sessions", claude_home / "projects"):
         base = base.expanduser()
+        if base.is_symlink():
+            continue
         if not base.exists() or not base.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(base):
@@ -702,7 +722,7 @@ def arbitrary_root_kind(root: Path) -> str:
 def safe_resolve(path: Path) -> Path:
     try:
         return path.expanduser().resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return path.expanduser().absolute()
 
 
