@@ -5762,6 +5762,7 @@ def _answer_action_contract_from_executed_output(
                     or [],
                     diagnostics=target_proof_handoff.get("diagnostics_after") or [],
                     stop=contract.get("stop"),
+                    suppress_broad_fallback_labels=bool(provenance_handoff.get("active")),
                 )
                 contract["only_continue_if"] = contract["single_flight_contract"]["continue_only_if"]
         if merge_artifact_handoff:
@@ -6201,7 +6202,11 @@ def _semantic_debug_target_single_flight_contract(
     secondary_context: list[dict],
     diagnostics: list[dict],
     stop: object,
+    suppress_broad_fallback_labels: bool = False,
 ) -> dict:
+    do_not_rerun = ["ask --execute", "direct semantic-debug"]
+    if not suppress_broad_fallback_labels:
+        do_not_rerun.extend(["broad rg/find", "report archaeology"])
     return {
         "schema_version": 1,
         "status": "route_executed_selected_primary_reads_first",
@@ -6213,12 +6218,7 @@ def _semantic_debug_target_single_flight_contract(
         "selected_primary_reads": selected_primary[:_ASK_ANSWER_MAX_REFS],
         "diagnostics_default_actionable": False,
         "secondary_context_default_actionable": False,
-        "do_not_rerun": [
-            "ask --execute",
-            "direct semantic-debug",
-            "broad rg/find",
-            "report archaeology",
-        ],
+        "do_not_rerun": do_not_rerun,
         "stop_rule": stop
         or (
             "After the selected primary refs support the required facets, answer from those refs "
