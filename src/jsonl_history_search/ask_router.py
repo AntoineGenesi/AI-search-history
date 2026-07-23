@@ -13,6 +13,7 @@ from .agent_command_cookbook import (
     storage_cleanup_requested,
     storage_optional_deeper_reads,
 )
+from .audit_depth import resolve_audit_depth
 from .command_resolution import resolve_command
 from .worktree_currentness import is_worktree_cleanup_currentness_query
 
@@ -844,6 +845,7 @@ def build_ask_router_payload(
     *,
     evidence_source: EvidenceSource | None = None,
     activation_mode: ActivationMode = "implicit",
+    audit_depth: str | None = None,
 ) -> dict:
     route = classify_ask_route(
         query,
@@ -853,6 +855,7 @@ def build_ask_router_payload(
     explicit_convo_trigger = _explicit_convo_trigger_query(query) is not None
     named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(query)
+    audit_depth_payload = resolve_audit_depth(structured_execution_query, audit_depth)
     if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
         if route.route_family == LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY:
             resolution_guidance = (
@@ -882,7 +885,11 @@ def build_ask_router_payload(
         command_resolution = resolve_command(cwd)
         command_resolution_payload = command_resolution.as_dict()
         cli_prefix = command_resolution.command_prefix
-    first_command = route.first_command(query, cli=cli_prefix)
+    first_command = _first_command_with_audit_depth(
+        route.first_command(query, cli=cli_prefix),
+        route_family=route.route_family,
+        audit_depth=audit_depth_payload,
+    )
     explicit_task_match = _EXPLICIT_TASK_PATH_RE.search(query.lower())
     named_task_path = explicit_task_match.group(0) if explicit_task_match else ""
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
@@ -956,6 +963,7 @@ def build_ask_router_payload(
             "evidence_source": evidence_source,
             "evidence_source_applies": named_task_target,
             "activation_mode": activation_mode,
+            "audit_depth": audit_depth_payload,
             "explicit_convo_trigger": explicit_convo_trigger,
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
@@ -1000,6 +1008,18 @@ def execution_kind_for_route_family(route_family: str) -> str | None:
     if route_family in EXECUTABLE_SEMANTIC_WRAPUP_ROUTE_FAMILIES:
         return "semantic-wrapup"
     return None
+
+
+def _first_command_with_audit_depth(command: str, *, route_family: str, audit_depth: dict) -> str:
+    if route_family not in EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES:
+        return command
+    if audit_depth.get("source") == "default" and audit_depth.get("depth") == "quick":
+        return command
+    label = audit_depth.get("label") or "quick"
+    audit_arg = f" --audit-depth {shlex.quote(str(label))}"
+    if " --format " in command:
+        return command.replace(" --format ", f"{audit_arg} --format ", 1)
+    return f"{command}{audit_arg}"
 
 
 def classify_ask_route(
