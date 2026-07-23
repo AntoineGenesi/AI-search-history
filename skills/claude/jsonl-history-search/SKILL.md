@@ -101,5 +101,6 @@ when more route guidance is needed:
 5. Stop when inspected primary sources answer the question. Widen or escalate
    only for a named missing facet. If primary evidence is absent, capped,
    ambiguous, or contradictory, fail closed and say what remains unproved.
-6. Never modify, delete, publish, or upload conversation data as part of a
-   search request.
+6. Explicit full/deep history audits must preserve CLI audit-depth coverage
+   caveats; ordinary prompts and status/local questions stay quick.
+7. Never modify, delete, publish, or upload conversation data.

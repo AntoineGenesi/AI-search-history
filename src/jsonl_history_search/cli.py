@@ -729,8 +729,8 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         default=None,
         help=(
             "Audit-depth contract: quick (default), in-depth, or exhaustive. "
-            "This annotates the packet for audit workflows without changing caps "
-            "or implementing rolling inventory in this command."
+            "Non-quick semantic-debug output includes coverage status, slices, "
+            "cap accounting, and promotion-safety gates."
         ),
     )
     semantic_debug.add_argument(
