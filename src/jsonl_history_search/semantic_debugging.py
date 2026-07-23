@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import time
@@ -28,6 +29,7 @@ from .agent_contract import (
     source_ref_target,
 )
 from .answer_source_discipline import answer_source_discipline_summary, build_answer_source_discipline
+from .audit_coverage import AuditCoverageFilters, AuditCoverageOptions, build_audit_coverage_ledger
 from .audit_depth import resolve_audit_depth
 from .claims import classify_claim_action, parse_review_verdict
 from .conversation_records import (
@@ -1004,11 +1006,45 @@ def build_semantic_debug_payload(
             agent_instruction["stop_condition"] = provenance_complete_proof_handoff.get(
                 "stop_instruction"
             )
+    in_depth_audit_coverage = build_in_depth_semantic_debug_audit_coverage(
+        query=agent_find["query"]["original"],
+        audit_depth=audit_depth,
+        args=args,
+        source_scope=source_scope,
+        scope_boundary_summary=scope_boundary_summary,
+        next_reads=next_reads,
+        candidates=source_selection_candidates,
+    )
+    if in_depth_audit_coverage.get("applies"):
+        next_reads = apply_in_depth_audit_read_promotion_safety(
+            next_reads,
+            coverage=in_depth_audit_coverage,
+        )
+        source_locator_handoff["next_reads"] = next_reads
+        source_locator_handoff["in_depth_audit_coverage"] = in_depth_audit_coverage
+        audit_plan["in_depth_audit_coverage"] = in_depth_audit_coverage
+        final_answer_contract = apply_in_depth_audit_contract_gate(
+            final_answer_contract,
+            coverage=in_depth_audit_coverage,
+        )
+        answer_readiness = apply_in_depth_audit_answer_readiness_gate(
+            answer_readiness,
+            coverage=in_depth_audit_coverage,
+        )
+        answer_ready_handoff = apply_in_depth_audit_handoff_gate(
+            answer_ready_handoff,
+            coverage=in_depth_audit_coverage,
+        )
+        agent_instruction = apply_in_depth_audit_agent_instruction_gate(
+            agent_instruction,
+            coverage=in_depth_audit_coverage,
+        )
     packet = {
         "schema_version": SCHEMA_VERSION,
         "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
         "query": agent_find["query"]["original"],
         "audit_depth": audit_depth,
+        "in_depth_audit_coverage": in_depth_audit_coverage,
         "question_family": family,
         "investigation_state": investigation_state,
         "scope": source_scope,
@@ -1065,6 +1101,8 @@ def build_semantic_debug_payload(
         packet["claim_boundaries"].update(result["retrieval_diagnostics"].get("claim_boundaries", {}))
     if agent_find.get("retrieval_pressure"):
         packet["retrieval_pressure"] = agent_find["retrieval_pressure"]
+    if not in_depth_audit_coverage.get("applies"):
+        packet.pop("in_depth_audit_coverage", None)
     if source_locator_handoff.get("stage_diagnostics") and packet.get("retrieval_pressure"):
         packet["retrieval_pressure"]["stage_diagnostics"] = source_locator_handoff["stage_diagnostics"]
     if getattr(args, "compact_provenance_handoff", False):
@@ -12448,6 +12486,714 @@ def build_answer_readiness(
         "answer_readiness_link": "semantic_debug.answer_readiness",
         "uncertainty_labels": [item.get("label") for item in uncertainty],
     }
+
+
+SEMANTIC_DEBUG_AUDIT_SLICE_STATUSES = {
+    "complete",
+    "capped_retryable",
+    "capped_after_budget_with_no_completeness_claim",
+    "blocked_with_reason",
+}
+SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT = 8
+SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT = 96
+
+MODEL_TOKEN_RE = re.compile(r"\b(?:gpt|claude|o\d)[A-Za-z0-9._-]*(?:-[A-Za-z0-9._-]+)*\b", re.IGNORECASE)
+
+
+def build_in_depth_semantic_debug_audit_coverage(
+    *,
+    query: str,
+    audit_depth: dict[str, Any],
+    args: Any,
+    source_scope: dict[str, Any],
+    scope_boundary_summary: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    depth = str((audit_depth or {}).get("depth") or "quick")
+    if depth == "quick":
+        return {}
+
+    cap_hit = source_scope.get("cap_hit") if isinstance(source_scope.get("cap_hit"), dict) else {}
+    roots = tuple(Path(root) for root in (getattr(args, "root", None) or ()))
+    selected_models = semantic_debug_selected_model_terms(query)
+    wants_structural_inventory = semantic_debug_structural_inventory_wanted(query)
+    ledger = (
+        semantic_debug_build_audit_coverage_ledger(
+            roots=roots,
+            query=query,
+            selected_models=selected_models,
+            args=args,
+        )
+        if roots and wants_structural_inventory
+        else {}
+    )
+    slices = semantic_debug_audit_coverage_slices(
+        ledger=ledger,
+        cap_hit=cap_hit,
+        scope_boundary_summary=scope_boundary_summary,
+        roots=roots,
+        next_reads=next_reads,
+        candidates=candidates,
+    )
+    slice_status_counts = Counter(str(row.get("status")) for row in slices)
+    coverage_complete = bool(slices) and all(row.get("status") == "complete" for row in slices)
+    search_cap_hit = bool(cap_hit.get("hit"))
+    ledger_summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+    classification_counts = ledger_summary.get("classification_counts") if isinstance(ledger_summary, dict) else {}
+    blocked_or_unparseable = int((classification_counts or {}).get("blocked", 0) or 0) + int(
+        (classification_counts or {}).get("unparseable", 0) or 0
+    )
+    full_scoped_inventory = (
+        bool(ledger)
+        and ledger.get("status") == "complete"
+        and blocked_or_unparseable == 0
+        and not search_cap_hit
+    )
+    answer_promotion_allowed = coverage_complete and not search_cap_hit
+    if depth == "exhaustive":
+        answer_promotion_allowed = answer_promotion_allowed and full_scoped_inventory
+
+    demotion_summary = semantic_debug_promotion_demotion_summary(
+        next_reads=next_reads,
+        candidates=candidates,
+        query=query,
+        cap_hit=cap_hit,
+    )
+    if depth == "exhaustive" and not full_scoped_inventory:
+        status = "incomplete_exhaustive_audit"
+    elif answer_promotion_allowed:
+        status = "coverage_complete"
+    else:
+        status = "coverage_required_before_answer"
+
+    required_before_promotion = []
+    if search_cap_hit:
+        required_before_promotion.append(
+            "Search caps were hit; treat surfaced candidates as leads and rerun deterministic coverage slices/windows before final support."
+        )
+    incomplete_slices = [row for row in slices if row.get("status") != "complete"]
+    if incomplete_slices:
+        required_before_promotion.append(
+            "Resolve incomplete coverage slices or label them capped/blocked before claiming audit completeness."
+        )
+    if depth == "exhaustive" and not full_scoped_inventory:
+        required_before_promotion.append(
+            "Exhaustive mode requires full scoped inventory; return incomplete_exhaustive_audit until every trace is included, excluded_with_reason, blocked, or unparseable."
+        )
+    if demotion_summary["self_echo_or_current_run_count"]:
+        required_before_promotion.append(
+            "Keep current-run/self-echo evidence as diagnostic leads, not final support."
+        )
+    if demotion_summary["stale_adjacent_demoted_count"]:
+        required_before_promotion.append(
+            "Use stale adjacent refs only as diagnostics unless no fresher direct evidence exists and chronology/source role is labeled."
+        )
+
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "audit_depth": audit_depth,
+        "status": status,
+        "answer_promotion_allowed": answer_promotion_allowed,
+        "full_scoped_inventory_before_promotion": full_scoped_inventory,
+        "coverage_complete": coverage_complete,
+        "deterministic_slice_status_contract": sorted(SEMANTIC_DEBUG_AUDIT_SLICE_STATUSES),
+        "slices": slices,
+        "slice_status_counts": {key: int(slice_status_counts.get(key, 0)) for key in sorted(slice_status_counts)},
+        "search_cap_hit": {
+            "hit": search_cap_hit,
+            "caps_hit": list(cap_hit.get("caps_hit") or []),
+            "normalized_warnings": list(cap_hit.get("normalized_warnings") or []),
+            "evidence_role": "lead_only" if search_cap_hit else "not_cap_limited",
+        },
+        "structural_audit_coverage_ledger": semantic_debug_public_audit_coverage_ledger(ledger),
+        "selected_metadata_priority": {
+            "applies": wants_structural_inventory,
+            "selected_models_from_query": selected_models,
+            "structural_selected_model_counts": (ledger_summary or {}).get("structural_selected_model_counts", {}),
+            "included_selected_model_counts": (ledger_summary or {}).get("included_selected_model_counts", {}),
+            "quoted_or_tool_output_model_text_counts_as_selected_metadata": False,
+        },
+        "promotion_safety": {
+            "cap_hit_evidence_role": "lead_only" if search_cap_hit else "eligible_if_coverage_complete",
+            "top_n_only_evidence_role": (
+                "lead_only_until_coverage_complete" if not answer_promotion_allowed else "eligible_after_complete_coverage"
+            ),
+            "self_echo_evidence_role": "lead_only_not_final_support",
+            "stale_adjacent_ref_role": "diagnostic_unless_no_fresher_direct_evidence_and_labeled",
+            "final_support_requires": (
+                "complete_scoped_inventory"
+                if depth == "exhaustive"
+                else "complete_deterministic_coverage_slices"
+            ),
+        },
+        "demotion_summary": demotion_summary,
+        "required_before_promotion": dedupe(required_before_promotion),
+        "claim_boundaries": {
+            "does_not_claim_all_history_completeness": True,
+            "cap_increase_used_as_substitute_for_coverage": False,
+            "raw_private_text_included": False,
+            "top_n_candidates_are_final_support_without_coverage": False,
+            "current_run_self_echo_counts_as_final_support": False,
+            "stale_adjacent_refs_count_as_final_support_by_default": False,
+        },
+    }
+
+
+def semantic_debug_build_audit_coverage_ledger(
+    *,
+    roots: tuple[Path, ...],
+    query: str,
+    selected_models: list[str],
+    args: Any,
+) -> dict[str, Any]:
+    thread_sources = ("subagent",) if re.search(r"\b(?:subagent|subagents|worker|workers)\b", query, re.I) else ()
+    ledger_payload = build_audit_coverage_ledger(
+        AuditCoverageOptions(
+            roots=roots,
+            window_days=1,
+            filters=AuditCoverageFilters(
+                selected_models=tuple(selected_models),
+                thread_sources=thread_sources,
+            ),
+            max_files=getattr(args, "max_files", None),
+            max_bytes=getattr(args, "max_bytes", None),
+            trace_ledger_limit=0,
+        )
+    )
+    return ledger_payload.get("audit_coverage_ledger") or {}
+
+
+def semantic_debug_public_audit_coverage_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
+    if not ledger:
+        return {"status": "not_run", "reason": "not_a_structural_model_or_worker_inventory_prompt"}
+    summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+    return {
+        "status": ledger.get("status"),
+        "privacy_boundary": ledger.get("privacy_boundary"),
+        "metadata_extraction_policy": ledger.get("metadata_extraction_policy"),
+        "classification_contract": ledger.get("classification_contract"),
+        "deterministic_windowing": ledger.get("deterministic_windowing"),
+        "filters": ledger.get("filters"),
+        "summary": summary,
+        "trace_ledger_materialization": "omitted_from_semantic_debug_aggregate_surface",
+        "trace_ledger_truncated": ledger.get("trace_ledger_truncated"),
+    }
+
+
+def semantic_debug_audit_coverage_slices(
+    *,
+    ledger: dict[str, Any],
+    cap_hit: dict[str, Any],
+    scope_boundary_summary: dict[str, Any],
+    roots: tuple[Path, ...] = (),
+    next_reads: list[dict[str, Any]] | None = None,
+    candidates: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if ledger:
+        rows = []
+        for slice_row in ledger.get("slices") or []:
+            counts = slice_row.get("classification_counts") if isinstance(slice_row, dict) else {}
+            counts = counts if isinstance(counts, dict) else {}
+            blocked = int(counts.get("blocked", 0) or 0)
+            unparseable = int(counts.get("unparseable", 0) or 0)
+            if blocked:
+                status = "capped_after_budget_with_no_completeness_claim" if ledger.get("status") == "capped" else "blocked_with_reason"
+            elif unparseable:
+                status = "blocked_with_reason"
+            else:
+                status = "complete"
+            rows.append(
+                {
+                    "slice": slice_row.get("slice"),
+                    "status": status,
+                    "classification_counts": counts,
+                    "candidate_trace_count": slice_row.get("candidate_trace_count"),
+                    "included_selected_model_counts": slice_row.get("included_selected_model_counts", {}),
+                    "structural_selected_model_counts": slice_row.get("structural_selected_model_counts", {}),
+                    "blocked_or_unparseable_count": blocked + unparseable,
+                }
+            )
+        return rows or [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary)]
+    if cap_hit.get("hit"):
+        retry_rows = semantic_debug_generic_cap_retry_slices(
+            cap_hit=cap_hit,
+            roots=roots,
+            next_reads=next_reads or [],
+            candidates=candidates or [],
+        )
+        if retry_rows:
+            return [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary), *retry_rows]
+    return [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary)]
+
+
+def semantic_debug_selected_scope_slice(cap_hit: dict[str, Any], scope_boundary_summary: dict[str, Any]) -> dict[str, Any]:
+    searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
+    if cap_hit.get("hit"):
+        status = "capped_retryable"
+    else:
+        status = "complete"
+    return {
+        "slice": "selected_scope",
+        "status": status,
+        "searched_files": (searched_scope or {}).get("searched_files", 0),
+        "searched_bytes": (searched_scope or {}).get("searched_bytes", 0),
+        "cap_hit": {
+            "hit": bool(cap_hit.get("hit")),
+            "caps_hit": list(cap_hit.get("caps_hit") or []),
+        },
+    }
+
+
+def semantic_debug_generic_cap_retry_slices(
+    *,
+    cap_hit: dict[str, Any],
+    roots: tuple[Path, ...],
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_paths = semantic_debug_selected_ref_paths(next_reads=next_reads, candidates=candidates)
+    if selected_paths:
+        return semantic_debug_retry_rows_for_paths(
+            [(None, path) for path in selected_paths],
+            cap_hit=cap_hit,
+            basis="selected_source_refs",
+        )
+
+    root_paths = semantic_debug_bounded_root_jsonl_paths(roots)
+    return semantic_debug_retry_rows_for_paths(
+        root_paths,
+        cap_hit=cap_hit,
+        basis="selected_root_bounded_path_scan",
+    )
+
+
+def semantic_debug_selected_ref_paths(
+    *,
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[str]:
+    paths: list[str] = []
+    for row in [*next_reads, *candidates]:
+        if not isinstance(row, dict):
+            continue
+        path = semantic_debug_row_source_path(row)
+        if path:
+            paths.append(path)
+    return sorted(dedupe(paths))
+
+
+def semantic_debug_row_source_path(row: dict[str, Any]) -> str | None:
+    source_ref = row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {}
+    path = source_ref.get("path") if isinstance(source_ref, dict) else None
+    if path:
+        return str(path)
+    target = str(row.get("target") or "")
+    if re.search(r":\d+$", target):
+        return target.rsplit(":", 1)[0]
+    return None
+
+
+def semantic_debug_bounded_root_jsonl_paths(roots: tuple[Path, ...]) -> list[tuple[int | None, str]]:
+    rows: list[tuple[int | None, str]] = []
+    for root_index, root in enumerate(roots):
+        if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+            break
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                if not filename.endswith((".jsonl", ".jsonl.gz")):
+                    continue
+                rows.append((root_index, str(Path(dirpath) / filename)))
+                if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+                    break
+            if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+                break
+    return rows
+
+
+def semantic_debug_retry_rows_for_paths(
+    path_rows: list[tuple[int | None, str]],
+    *,
+    cap_hit: dict[str, Any],
+    basis: str,
+) -> list[dict[str, Any]]:
+    deduped: list[tuple[int | None, str]] = []
+    seen: set[tuple[int | None, str]] = set()
+    for root_index, path in sorted(path_rows, key=lambda item: (item[0] if item[0] is not None else -1, item[1])):
+        key = (root_index, path)
+        if key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    if not deduped:
+        return []
+
+    date_groups: dict[str, list[tuple[int | None, str]]] = {}
+    for item in deduped:
+        date_key = semantic_debug_path_date_key(item[1])
+        if date_key:
+            date_groups.setdefault(date_key, []).append(item)
+
+    if len(date_groups) > 1:
+        rows = []
+        for index, date_key in enumerate(sorted(date_groups), start=1):
+            items = date_groups[date_key]
+            rows.append(
+                {
+                    "slice": f"retry_date_window:{index:03d}:{date_key}",
+                    "status": "capped_retryable",
+                    "basis": basis,
+                    "window": {"type": "date", "date": date_key},
+                    "path_count": len(items),
+                    "example_paths": [path for _, path in items[:3]],
+                    "caps_to_retry": list(cap_hit.get("caps_hit") or []),
+                    "retry_guidance": "rerun in-depth semantic-debug/audit coverage against this deterministic date window before claiming completeness",
+                }
+            )
+        return rows[:SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT]
+
+    rows = []
+    for index, (root_index, path) in enumerate(deduped[:SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT], start=1):
+        window: dict[str, Any] = {"type": "path", "path": path}
+        if root_index is not None:
+            window["root_index"] = root_index
+        rows.append(
+            {
+                "slice": f"retry_path_window:{index:03d}",
+                "status": "capped_retryable",
+                "basis": basis,
+                "window": window,
+                "path_count": 1,
+                "caps_to_retry": list(cap_hit.get("caps_hit") or []),
+                "retry_guidance": "rerun in-depth semantic-debug/audit coverage against this deterministic path window before claiming completeness",
+            }
+        )
+    return rows
+
+
+def semantic_debug_path_date_key(path: str) -> str | None:
+    text = str(path)
+    for regex in (CODEX_SESSION_DATE_RE, CODEX_ROLLOUT_DATE_RE):
+        match = regex.search(text)
+        if match:
+            return f"{match.group('year')}-{match.group('month')}-{match.group('day')}"
+    match = re.search(r"(?<!\d)(20\d{2})[/\\-](\d{2})[/\\-](\d{2})(?!\d)", text)
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+
+def semantic_debug_selected_model_terms(query: str) -> list[str]:
+    return dedupe([match.group(0) for match in MODEL_TOKEN_RE.finditer(str(query or ""))])
+
+
+def semantic_debug_structural_inventory_wanted(query: str) -> bool:
+    lowered = str(query or "").casefold()
+    return bool(
+        semantic_debug_selected_model_terms(query)
+        or re.search(r"\b(?:selected model|model choice|subagent|subagents|worker|workers|trace|traces|session|sessions)\b", lowered)
+    )
+
+
+def semantic_debug_promotion_demotion_summary(
+    *,
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    query: str,
+    cap_hit: dict[str, Any],
+) -> dict[str, Any]:
+    fresher_direct_exists = any(
+        semantic_debug_read_is_fresher_direct_evidence(read, query=query)
+        for read in next_reads
+        if isinstance(read, dict)
+    )
+    stale_adjacent = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and semantic_debug_read_is_stale_adjacent_ref(read, query=query)
+    ]
+    self_echo = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and semantic_debug_read_is_self_echo_or_current_run(read, query=query)
+    ]
+    diagnostic_only = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and (read.get("diagnostic_only") or read.get("final_support_allowed") is False)
+    ]
+    return {
+        "cap_hit_demoted_to_lead_only": bool(cap_hit.get("hit")),
+        "top_n_only_candidate_count": len(candidates),
+        "top_n_only_role": "lead_only_until_coverage_complete",
+        "self_echo_or_current_run_count": len(self_echo),
+        "stale_adjacent_candidate_count": len(stale_adjacent),
+        "stale_adjacent_demoted_count": len(stale_adjacent) if fresher_direct_exists else 0,
+        "stale_adjacent_labeled_no_fresher_direct_count": 0 if fresher_direct_exists else len(stale_adjacent),
+        "fresher_direct_evidence_exists": fresher_direct_exists,
+        "diagnostic_only_read_count": len(diagnostic_only),
+    }
+
+
+def apply_in_depth_audit_read_promotion_safety(
+    next_reads: list[dict[str, Any]],
+    *,
+    coverage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not coverage.get("applies"):
+        return next_reads
+    query = ""
+    fresher_direct_exists = any(
+        semantic_debug_read_is_fresher_direct_evidence(read, query=query)
+        for read in next_reads
+        if isinstance(read, dict)
+    )
+    answer_promotion_allowed = bool(coverage.get("answer_promotion_allowed"))
+    rows: list[dict[str, Any]] = []
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        row = dict(read)
+        stale_adjacent = semantic_debug_read_is_stale_adjacent_ref(row, query=query)
+        self_echo = semantic_debug_read_is_self_echo_or_current_run(row, query=query)
+        if stale_adjacent:
+            row["stale_adjacent_ref_policy"] = {
+                "role": (
+                    "diagnostic_only"
+                    if fresher_direct_exists
+                    else "labeled_adjacent_context_no_fresher_direct_evidence"
+                ),
+                "fresher_direct_evidence_exists": fresher_direct_exists,
+                "chronology_or_source_role_labeled": True,
+            }
+            row["source_chronology_role"] = (
+                "stale_adjacent_diagnostic"
+                if fresher_direct_exists
+                else "stale_adjacent_labeled_context_no_fresher_direct"
+            )
+            if fresher_direct_exists:
+                row["target_source_role"] = "diagnostic_or_post_hoc"
+                row["diagnostic_only"] = True
+                row["read_more_actionable"] = False
+                row["followthrough_actionable"] = False
+                row["final_support_allowed"] = False
+        if self_echo:
+            row["self_echo_promotion_policy"] = "lead_only_not_final_support"
+            row["final_support_allowed"] = False
+            row["diagnostic_only"] = True
+        if not answer_promotion_allowed:
+            row["lead_only_for_audit_depth"] = coverage.get("audit_depth", {}).get("depth")
+            row["final_support_allowed"] = False
+            row.setdefault("read_more_actionable", True)
+            row.setdefault(
+                "promotion_block_reason",
+                coverage.get("status") or "in_depth_audit_coverage_required",
+            )
+        rows.append(row)
+    return rows
+
+
+def apply_in_depth_audit_contract_gate(contract: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
+    if not coverage.get("applies"):
+        return contract
+    row = dict(contract)
+    row.setdefault("claim_boundaries", {})
+    row["claim_boundaries"] = {
+        **row["claim_boundaries"],
+        "in_depth_answer_ready_requires_complete_coverage": True,
+        "exhaustive_answer_ready_requires_full_scoped_inventory": True,
+        "cap_hit_top_n_self_echo_or_stale_adjacent_support_without_coverage": "not_allowed",
+    }
+    row.setdefault("evidence_inputs", {})
+    row["evidence_inputs"] = {
+        **row["evidence_inputs"],
+        "in_depth_audit_coverage": "semantic_debug.in_depth_audit_coverage",
+    }
+    row["required_actions"] = dedupe(
+        list(coverage.get("required_before_promotion") or [])
+        + list(row.get("required_actions") or [])
+    )
+    if not coverage.get("answer_promotion_allowed"):
+        row["answer_scope"] = coverage.get("status")
+        row["source_use_required"] = True
+    return row
+
+
+def apply_in_depth_audit_answer_readiness_gate(readiness: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
+    if not coverage.get("applies") or coverage.get("answer_promotion_allowed"):
+        return readiness
+    row = dict(readiness)
+    status = (
+        "incomplete_exhaustive_audit"
+        if coverage.get("status") == "incomplete_exhaustive_audit"
+        else "in_depth_audit_coverage_required"
+    )
+    row["status"] = status
+    row["decision"] = coverage.get("status")
+    row["allowed_answer_scope"] = "lead_only_until_coverage_complete"
+    row["required_before_answer"] = dedupe(
+        list(coverage.get("required_before_promotion") or [])
+        + list(row.get("required_before_answer") or [])
+    )[:12]
+    row.setdefault("basis", {})
+    row["basis"] = {
+        **row["basis"],
+        "in_depth_audit_coverage_status": coverage.get("status"),
+        "in_depth_audit_slice_status_counts": coverage.get("slice_status_counts"),
+        "full_scoped_inventory_before_promotion": coverage.get("full_scoped_inventory_before_promotion"),
+    }
+    row.setdefault("source_use_contract", {})
+    row["source_use_contract"] = {
+        **row["source_use_contract"],
+        "in_depth_audit_coverage": {
+            "status": coverage.get("status"),
+            "answer_promotion_allowed": coverage.get("answer_promotion_allowed"),
+            "required_before_promotion": coverage.get("required_before_promotion"),
+        },
+    }
+    return row
+
+
+def apply_in_depth_audit_handoff_gate(handoff: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
+    if not coverage.get("applies"):
+        return handoff
+    row = dict(handoff)
+    row["in_depth_audit_coverage"] = coverage
+    row.setdefault("links", {})
+    row["links"] = {**row["links"], "in_depth_audit_coverage": "semantic_debug.in_depth_audit_coverage"}
+    row.setdefault("source_use_summary", {})
+    row["source_use_summary"] = {
+        **row["source_use_summary"],
+        "in_depth_audit_coverage": {
+            "status": coverage.get("status"),
+            "answer_promotion_allowed": coverage.get("answer_promotion_allowed"),
+            "slice_status_counts": coverage.get("slice_status_counts"),
+            "promotion_safety": coverage.get("promotion_safety"),
+        },
+    }
+    if not coverage.get("answer_promotion_allowed"):
+        gated_status = (
+            "incomplete_exhaustive_audit"
+            if coverage.get("status") == "incomplete_exhaustive_audit"
+            else "in_depth_audit_coverage_required"
+        )
+        row["answer_readiness_status"] = gated_status
+        row["decision"] = (
+            "incomplete_exhaustive_audit"
+            if coverage.get("status") == "incomplete_exhaustive_audit"
+            else "coverage_slices_required"
+        )
+        row["do_next"] = "complete_or_label_deterministic_audit_coverage_slices_before_answer"
+        row["do_not_answer_until"] = dedupe(
+            list(coverage.get("required_before_promotion") or [])
+            + list(row.get("do_not_answer_until") or [])
+        )[:8]
+        row.setdefault("source_action_guidance", {})
+        row["source_action_guidance"] = {
+            **row["source_action_guidance"],
+            "decision": row["decision"],
+            "stop_condition": (
+                "Do not answer from cap-hit, top-N-only, current/self-echo, or stale adjacent evidence; "
+                "first complete or label deterministic audit coverage slices."
+            ),
+            "in_depth_audit_coverage": {
+                "status": coverage.get("status"),
+                "slice_status_counts": coverage.get("slice_status_counts"),
+            },
+        }
+    return row
+
+
+def apply_in_depth_audit_agent_instruction_gate(instruction: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
+    if not coverage.get("applies") or coverage.get("answer_promotion_allowed"):
+        return instruction
+    row = dict(instruction)
+    row["decision"] = (
+        "incomplete_exhaustive_audit"
+        if coverage.get("status") == "incomplete_exhaustive_audit"
+        else "coverage_slices_required"
+    )
+    row["required_next_action"] = "complete_or_label_in_depth_audit_coverage_before_answer"
+    row["in_depth_audit_coverage"] = {
+        "status": coverage.get("status"),
+        "slice_status_counts": coverage.get("slice_status_counts"),
+        "required_before_promotion": coverage.get("required_before_promotion"),
+    }
+    row["commands"] = []
+    row["stop_condition"] = (
+        "Return incomplete_exhaustive_audit or coverage_slices_required instead of an answer-ready conclusion "
+        "until coverage is complete enough for the requested audit depth."
+    )
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "decision": row["decision"],
+        "stop_condition": row["stop_condition"],
+        "in_depth_audit_coverage": row["in_depth_audit_coverage"],
+    }
+    return row
+
+
+def semantic_debug_read_is_fresher_direct_evidence(read: dict[str, Any], *, query: str) -> bool:
+    if semantic_debug_read_is_stale_adjacent_ref(read, query=query):
+        return False
+    if semantic_debug_read_is_self_echo_or_current_run(read, query=query):
+        return False
+    role = str(read.get("target_source_role") or "")
+    target = str(read.get("target") or "")
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    path = str(source_ref.get("path") or target)
+    return role == "target_historical_raw" or path.endswith(".jsonl") or ".jsonl:" in target
+
+
+def semantic_debug_read_is_self_echo_or_current_run(read: dict[str, Any], *, query: str) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            read.get("reason"),
+            read.get("target"),
+            read.get("source_chronology_role"),
+            read.get("target_source_role"),
+            read.get("promotion_block_reason"),
+        )
+    ).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "self-echo",
+            "self echo",
+            "current-run",
+            "current run",
+            "current-session",
+            "current session",
+            "same-loop",
+            "same loop",
+            "prompt echo",
+            "tool-output echo",
+        )
+    )
+
+
+def semantic_debug_read_is_stale_adjacent_ref(read: dict[str, Any], *, query: str) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            read.get("reason"),
+            read.get("target"),
+            read.get("source_chronology_role"),
+            read.get("target_source_role"),
+        )
+    ).casefold()
+    if "stale" in text or "adjacent" in text:
+        return True
+    target = str(read.get("target") or "").casefold()
+    if any(part in target for part in ("/codex/state/reviews/", "/reports/", "/tasks/")):
+        query_text = str(query or "").casefold()
+        return any(cue in query_text for cue in ("last session", "recent", "current", "july 23", "latest"))
+    return False
 
 
 AUDIT_ROUTE_NAMES = {"git_history_reconstruction", "task_review_join", "tool_action_proof"}

@@ -5224,8 +5224,16 @@ def render_semantic_debug_text(payload: dict) -> str:
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
+    in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
+    coverage_blocks_answer = (
+        isinstance(in_depth_coverage, dict)
+        and in_depth_coverage.get("applies")
+        and not in_depth_coverage.get("answer_promotion_allowed")
+    )
     answer_status = (
-        "answer-scoped-no-evidence-now"
+        "not-ready/needs-more-proof"
+        if coverage_blocks_answer
+        else "answer-scoped-no-evidence-now"
         if scoped_no_evidence
         else "answer-after-required-reads"
         if required_reads or next_reads_for_required_surfaces
@@ -5270,6 +5278,13 @@ def render_semantic_debug_text(payload: dict) -> str:
         f"Answer status: {answer_status}",
         f"Audit depth: {(report.get('audit_depth') or {}).get('label', 'quick')}",
     ]
+    if isinstance(in_depth_coverage, dict) and in_depth_coverage.get("applies"):
+        lines.append(
+            "In-depth coverage: "
+            f"status={in_depth_coverage.get('status')} "
+            f"promotion_allowed={in_depth_coverage.get('answer_promotion_allowed')} "
+            f"slice_status_counts={in_depth_coverage.get('slice_status_counts')}"
+        )
     lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
@@ -5516,8 +5531,16 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
+    in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
+    coverage_blocks_answer = (
+        isinstance(in_depth_coverage, dict)
+        and in_depth_coverage.get("applies")
+        and not in_depth_coverage.get("answer_promotion_allowed")
+    )
     answer_status = (
-        "answer-scoped-no-evidence-now"
+        "not-ready/needs-more-proof"
+        if coverage_blocks_answer
+        else "answer-scoped-no-evidence-now"
         if scoped_no_evidence
         else "answer-after-required-reads"
         if required_reads or next_reads_for_required_surfaces
@@ -5555,6 +5578,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         f"**Answer status:** `{answer_status}`",
         f"**Audit depth:** `{(report.get('audit_depth') or {}).get('label', 'quick')}`",
     ]
+    if isinstance(in_depth_coverage, dict) and in_depth_coverage.get("applies"):
+        lines.append(
+            f"**In-depth coverage:** `status={in_depth_coverage.get('status')}` "
+            f"`promotion_allowed={in_depth_coverage.get('answer_promotion_allowed')}` "
+            f"`slice_status_counts={in_depth_coverage.get('slice_status_counts')}`"
+        )
     lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
