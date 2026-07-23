@@ -394,6 +394,7 @@ def build_semantic_debug_payload(
         family=family,
         candidates=source_selection_candidates,
         tool_proof=tool_proof,
+        source_plan=source_plan,
         source_locator_handoff=source_locator_handoff,
     )
     if provenance_work_episode_origin_source_selection.get("applies"):
@@ -5800,6 +5801,10 @@ PROVENANCE_DIRECT_EVIDENCE_READ_CAP = 4
 PROVENANCE_DIRECT_EVIDENCE_REF_CAP = 3
 PROVENANCE_DIRECT_SELECTED_SOURCE_PATH_CAP = 8
 PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP = 24
+PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP = 96
+PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_CANDIDATE_CAP = 8
+PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_VISITED_DIR_CAP = 128
+PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_DIRECTORY_ENTRY_CAP = 2048
 PROVENANCE_COMPLETE_PROOF_OUTPUT_MAX_BYTES = 12_288
 PROVENANCE_COMPLETE_PROOF_READ_BEFORE = 0
 PROVENANCE_COMPLETE_PROOF_READ_AFTER = 1
@@ -6646,6 +6651,7 @@ def promote_provenance_work_episode_origin_source_reads(
     family: dict[str, Any],
     candidates: list[dict[str, Any]],
     tool_proof: dict[str, Any],
+    source_plan: dict[str, Any] | None = None,
     source_locator_handoff: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not provenance_direct_evidence_ledger_wanted(query, family):
@@ -6663,12 +6669,17 @@ def promote_provenance_work_episode_origin_source_reads(
             "reason": "no_requested_direct_facets",
         }
 
-    candidate_paths = provenance_work_episode_origin_candidate_paths(
+    candidate_path_report = provenance_work_episode_origin_candidate_path_report(
         next_reads=next_reads,
         candidates=candidates,
         tool_proof=tool_proof,
+        query=query,
+        family=family,
+        source_plan=source_plan or {},
         source_locator_handoff=source_locator_handoff,
     )
+    candidate_paths = list(candidate_path_report.get("paths") or [])
+    candidate_surfacing = dict(candidate_path_report.get("surfacing") or {})
     scored: list[dict[str, Any]] = []
     for path_index, path in enumerate(candidate_paths):
         seed_read = provenance_work_episode_origin_seed_read(path)
@@ -6702,6 +6713,7 @@ def promote_provenance_work_episode_origin_source_reads(
             "status": "no_origin_episode_direct_facets_found",
             "candidate_path_count": len(candidate_paths),
             "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+            "origin_candidate_surfacing": candidate_surfacing,
             "required_facets": required_facets,
             "bounded": True,
         }
@@ -6717,6 +6729,7 @@ def promote_provenance_work_episode_origin_source_reads(
             "status": "no_origin_episode_selected_reads",
             "candidate_path_count": len(candidate_paths),
             "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+            "origin_candidate_surfacing": candidate_surfacing,
             "required_facets": required_facets,
             "bounded": True,
         }
@@ -6731,6 +6744,7 @@ def promote_provenance_work_episode_origin_source_reads(
         "status": "origin_episode_promoted",
         "candidate_path_count": len(candidate_paths),
         "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+        "origin_candidate_surfacing": candidate_surfacing,
         "selected_candidate_path_index": int(best["path_index"]),
         "selected_primary_read_count": len(selected_reads),
         "selected_primary_read_targets": [
@@ -6768,13 +6782,16 @@ def promote_provenance_work_episode_origin_source_reads(
     }
 
 
-def provenance_work_episode_origin_candidate_paths(
+def provenance_work_episode_origin_candidate_path_report(
     *,
     next_reads: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
     tool_proof: dict[str, Any],
+    query: str,
+    family: dict[str, Any],
+    source_plan: dict[str, Any],
     source_locator_handoff: dict[str, Any],
-) -> list[Path]:
+) -> dict[str, Any]:
     paths: list[Path] = []
     for row in [*next_reads, *candidates]:
         if isinstance(row, dict):
@@ -6790,9 +6807,16 @@ def provenance_work_episode_origin_candidate_paths(
         source_locator_handoff.get("omitted_window_recovery"),
         paths,
     )
+    recovered_path_report = provenance_work_episode_origin_recovered_path_report(
+        query=query,
+        family=family,
+        source_plan=source_plan,
+        existing_paths=paths,
+    )
+    surfaced_paths = list(recovered_path_report.get("paths") or [])
     result: list[Path] = []
     seen: set[str] = set()
-    for path in paths:
+    for path in [*surfaced_paths, *paths]:
         key = str(path)
         if key in seen or not path.is_file():
             continue
@@ -6800,7 +6824,283 @@ def provenance_work_episode_origin_candidate_paths(
         result.append(path)
         if len(result) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
             break
-    return result
+    return {
+        "paths": result,
+        "surfacing": {
+            "schema_version": 1,
+            "status": "recovered_candidate_paths_added" if surfaced_paths else "no_recovered_candidate_paths",
+            "recovered_candidate_path_count": len(surfaced_paths),
+            "candidate_path_count_after_surfacing": len(result),
+            "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+            "root_traversal": recovered_path_report.get("root_traversal") or {},
+            "recovery_sources": [
+                "latest_user_messages_direct_request_overlap",
+                "bounded_source_root_direct_provenance_scan",
+            ] if surfaced_paths else [],
+            "validated_by": "direct_provenance_facet_scanner",
+            "raw_text_included": False,
+            "bounded": True,
+            "claim_boundaries": {
+                "mentions_alone_promoted": False,
+                "secondary_artifacts_promoted": False,
+                "recovery_raises_caps": False,
+            },
+        },
+    }
+
+
+def provenance_work_episode_origin_candidate_paths(
+    *,
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+) -> list[Path]:
+    report = provenance_work_episode_origin_candidate_path_report(
+        next_reads=next_reads,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        query="",
+        family={},
+        source_plan={},
+        source_locator_handoff=source_locator_handoff,
+    )
+    return list(report.get("paths") or [])
+
+
+def provenance_work_episode_origin_recovered_paths(
+    *,
+    query: str,
+    family: dict[str, Any],
+    source_plan: dict[str, Any],
+    existing_paths: list[Path],
+) -> list[Path]:
+    report = provenance_work_episode_origin_recovered_path_report(
+        query=query,
+        family=family,
+        source_plan=source_plan,
+        existing_paths=existing_paths,
+    )
+    return list(report.get("paths") or [])
+
+
+def provenance_work_episode_origin_recovered_path_report(
+    *,
+    query: str,
+    family: dict[str, Any],
+    source_plan: dict[str, Any],
+    existing_paths: list[Path],
+) -> dict[str, Any]:
+    if not provenance_direct_evidence_ledger_wanted(query, family):
+        return {
+            "paths": [],
+            "root_traversal": provenance_work_episode_origin_empty_traversal_report(
+                "not_a_source_session_claimed_action_query"
+            ),
+        }
+    required_facets = requested_provenance_direct_evidence_facets(query)
+    if "original_user_request" not in required_facets:
+        return {
+            "paths": [],
+            "root_traversal": provenance_work_episode_origin_empty_traversal_report(
+                "original_user_request_not_requested"
+            ),
+        }
+    roots = provenance_work_episode_origin_recovery_roots(source_plan)
+    if not roots:
+        return {
+            "paths": [],
+            "root_traversal": provenance_work_episode_origin_empty_traversal_report(
+                "no_supported_source_roots"
+            ),
+        }
+    existing = {str(path) for path in existing_paths}
+    direct_request_paths = provenance_original_request_recovery_paths(
+        query=query,
+        source_plan=source_plan,
+        existing_paths=existing_paths,
+    )
+    path_rows: list[tuple[int, Path]] = []
+    for path in direct_request_paths:
+        path_rows.append((0, path))
+    traversal_report = provenance_work_episode_origin_bounded_root_path_report(roots)
+    for ordinal, path in enumerate(traversal_report.get("paths") or [], 1):
+        path_rows.append((ordinal, path))
+
+    result: list[Path] = []
+    seen: set[str] = set(existing)
+    scanned = 0
+    for _ordinal, path in path_rows:
+        key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        scanned += 1
+        if scanned > PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP:
+            break
+        seed_read = provenance_work_episode_origin_seed_read(path)
+        ledger = build_provenance_direct_evidence_facet_ledger(
+            query=query,
+            family=family,
+            candidates=[],
+            tool_proof={"events": []},
+            source_plan={},
+            selected_source_reads=[seed_read],
+        )
+        if not provenance_work_episode_origin_recovery_ledger_valid(
+            ledger,
+            required_facets=required_facets,
+        ):
+            continue
+        result.append(path)
+        if len(result) >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_CANDIDATE_CAP:
+            break
+    public_traversal_report = {
+        key: value for key, value in traversal_report.items() if key != "paths"
+    }
+    return {
+        "paths": result,
+        "root_traversal": {
+            **public_traversal_report,
+            "direct_request_recovery_path_count": len(direct_request_paths),
+            "validated_recovered_candidate_path_count": len(result),
+            "validation_policy": "direct_provenance_facet_scanner",
+            "raw_text_included": False,
+            "bounded": True,
+        },
+    }
+
+
+def provenance_work_episode_origin_empty_traversal_report(status: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": status,
+        "path_count": 0,
+        "visited_directory_count": 0,
+        "directory_entry_count": 0,
+        "limits": provenance_work_episode_origin_traversal_limits(),
+        "bounded": True,
+    }
+
+
+def provenance_work_episode_origin_traversal_limits() -> dict[str, int]:
+    return {
+        "jsonl_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP,
+        "visited_directory_cap": PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_VISITED_DIR_CAP,
+        "directory_entry_cap": PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_DIRECTORY_ENTRY_CAP,
+    }
+
+
+def provenance_work_episode_origin_recovery_roots(source_plan: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    for root in (source_plan.get("sources") or {}).get("roots") or []:
+        if not isinstance(root, dict) or not root.get("path"):
+            continue
+        kind = str(root.get("kind") or "")
+        if kind not in {"codex_sessions", "claude_projects", "arbitrary_jsonl_root"}:
+            continue
+        path = Path(str(root.get("path") or "")).expanduser()
+        if path.exists():
+            roots.append(path)
+    return roots
+
+
+def provenance_work_episode_origin_bounded_root_paths(roots: list[Path]) -> list[Path]:
+    report = provenance_work_episode_origin_bounded_root_path_report(roots)
+    return list(report.get("paths") or [])
+
+
+def provenance_work_episode_origin_bounded_root_path_report(roots: list[Path]) -> dict[str, Any]:
+    rows: list[Path] = []
+    visited_directory_count = 0
+    directory_entry_count = 0
+    stopped_reason = "exhausted_roots"
+    for root in roots:
+        if len(rows) >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP:
+            stopped_reason = "jsonl_path_cap_reached"
+            break
+        if root.is_file() and root.name.endswith((".jsonl", ".jsonl.gz")):
+            rows.append(root)
+            continue
+        if not root.is_dir():
+            continue
+        stack = [root]
+        while stack:
+            if visited_directory_count >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_VISITED_DIR_CAP:
+                stopped_reason = "visited_directory_cap_reached"
+                stack.clear()
+                break
+            dirpath = stack.pop()
+            visited_directory_count += 1
+            child_dirs: list[Path] = []
+            try:
+                with os.scandir(dirpath) as entries:
+                    for entry in entries:
+                        if directory_entry_count >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_DIRECTORY_ENTRY_CAP:
+                            stopped_reason = "directory_entry_cap_reached"
+                            stack.clear()
+                            break
+                        directory_entry_count += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                child_dirs.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False) and entry.name.endswith((".jsonl", ".jsonl.gz")):
+                                rows.append(Path(entry.path))
+                        except OSError:
+                            continue
+                        if len(rows) >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP:
+                            stopped_reason = "jsonl_path_cap_reached"
+                            stack.clear()
+                            break
+            except OSError:
+                continue
+            if stopped_reason != "exhausted_roots":
+                break
+            stack.extend(sorted(child_dirs, reverse=True))
+            if len(rows) >= PROVENANCE_WORK_EPISODE_ORIGIN_RECOVERY_SCAN_FILE_CAP:
+                stopped_reason = "jsonl_path_cap_reached"
+                break
+        if stopped_reason != "exhausted_roots":
+            break
+    return {
+        "schema_version": 1,
+        "status": "bounded_paths_available" if rows else "no_jsonl_paths_found",
+        "paths": rows,
+        "path_count": len(rows),
+        "visited_directory_count": visited_directory_count,
+        "directory_entry_count": directory_entry_count,
+        "stopped_reason": stopped_reason,
+        "limits": provenance_work_episode_origin_traversal_limits(),
+        "bounded": True,
+        "claim_boundaries": {
+            "traversal_uncapped": False,
+            "symlink_dirs_followed": False,
+        },
+    }
+
+
+def provenance_work_episode_origin_recovery_ledger_valid(
+    ledger: dict[str, Any],
+    *,
+    required_facets: list[str],
+) -> bool:
+    if not ledger.get("applies"):
+        return False
+    original = (ledger.get("original_user_intent") or {}).get("selected_original_user_request")
+    if not original:
+        return False
+    direct_events = list(ledger.get("_direct_events") or [])
+    if not direct_events:
+        return False
+    covered = set(ledger.get("covered_direct_facets") or [])
+    action_required = {
+        facet
+        for facet in required_facets
+        if facet not in {"original_user_request", "original_request_authorization"}
+    }
+    if action_required and not (covered & action_required):
+        return False
+    return True
 
 
 def provenance_work_episode_origin_collect_paths(value: Any, paths: list[Path]) -> None:
