@@ -391,6 +391,7 @@ def build_semantic_debug_payload(
         candidates=source_selection_candidates,
         tool_proof=tool_proof,
         source_plan=source_plan,
+        selected_source_reads=list(source_locator_handoff.get("next_reads") or next_reads),
     )
     if provenance_direct_evidence_facet_ledger.get("applies"):
         next_reads = apply_provenance_direct_evidence_ledger_to_reads(
@@ -5747,6 +5748,7 @@ ACTION_PROOF_BUCKET_RECORD_CAP = 8
 ACTION_PROOF_TEXT_LIMIT = 220
 PROVENANCE_DIRECT_EVIDENCE_READ_CAP = 4
 PROVENANCE_DIRECT_EVIDENCE_REF_CAP = 3
+PROVENANCE_DIRECT_SELECTED_SOURCE_PATH_CAP = 8
 PROVENANCE_COMPLETE_PROOF_OUTPUT_MAX_BYTES = 12_288
 PROVENANCE_COMPLETE_PROOF_READ_BEFORE = 0
 PROVENANCE_COMPLETE_PROOF_READ_AFTER = 1
@@ -6593,12 +6595,18 @@ def build_provenance_direct_evidence_facet_ledger(
     candidates: list[dict[str, Any]],
     tool_proof: dict[str, Any],
     source_plan: dict[str, Any] | None = None,
+    selected_source_reads: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not provenance_direct_evidence_ledger_wanted(query, family):
         return {"schema_version": 1, "applies": False, "reason": "not_a_source_session_claimed_action_query"}
 
     required_facets = requested_provenance_direct_evidence_facets(query)
-    source_paths = action_proof_candidate_paths(candidates, tool_proof)
+    selected_source_paths = provenance_direct_selected_source_read_paths(
+        selected_source_reads or []
+    )
+    source_paths = dedupe(
+        [*selected_source_paths, *action_proof_candidate_paths(candidates, tool_proof)]
+    )
     recovered_source_paths = provenance_original_request_recovery_paths(
         query=query,
         source_plan=source_plan or {},
@@ -6751,6 +6759,12 @@ def build_provenance_direct_evidence_facet_ledger(
             "recovered_source_count": len(recovered_source_paths),
             "bounded": True,
         },
+        "selected_source_ref_path_scan": {
+            "status": "used" if selected_source_paths else "not_supplied_or_not_qualified",
+            "selected_source_path_count": len(selected_source_paths),
+            "bounded": True,
+            "path_cap": PROVENANCE_DIRECT_SELECTED_SOURCE_PATH_CAP,
+        },
         "original_user_intent": {
             "status": "present" if intent_refs else "not_present_in_direct_records",
             "source_refs": dedupe_dicts(intent_refs)[:PROVENANCE_DIRECT_EVIDENCE_REF_CAP],
@@ -6808,6 +6822,47 @@ def build_provenance_direct_evidence_facet_ledger(
         "_source_roles_by_target": source_roles_by_target,
         "_direct_events": direct_events,
     }
+
+
+def provenance_direct_selected_source_read_paths(next_reads: list[dict[str, Any]]) -> list[Path]:
+    paths: list[Path] = []
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        if read.get("diagnostic_only") is True:
+            continue
+        selection = (
+            read.get("historical_provenance_selection")
+            if isinstance(read.get("historical_provenance_selection"), dict)
+            else {}
+        )
+        if selection.get("diagnostic_only") is True or selection.get("final_support_allowed") is False:
+            continue
+        if read.get("read_more_actionable") is False or read.get("followthrough_actionable") is False:
+            continue
+        if core_convo_read_is_diagnostic_or_post_hoc(read):
+            continue
+        if core_convo_target_source_role(read) != "target_historical_raw":
+            continue
+        if not core_convo_read_is_actionable_raw_source_ref(read):
+            continue
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        path = source_ref.get("path") or source_target_path_part(str(read.get("target") or ""))
+        if not path:
+            continue
+        paths.append(Path(str(path)).expanduser())
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        result.append(path)
+        if len(result) >= PROVENANCE_DIRECT_SELECTED_SOURCE_PATH_CAP:
+            break
+    return result
 
 
 def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, Any]:
