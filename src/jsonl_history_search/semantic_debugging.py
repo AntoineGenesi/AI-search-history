@@ -385,17 +385,67 @@ def build_semantic_debug_payload(
             audit_plan.get("checkpoint_plan", []),
             source_handle_routing,
         )
+    (
+        next_reads,
+        provenance_work_episode_origin_source_selection,
+    ) = promote_provenance_work_episode_origin_source_reads(
+        list(source_locator_handoff.get("next_reads") or next_reads),
+        query=agent_find["query"]["original"],
+        family=family,
+        candidates=source_selection_candidates,
+        tool_proof=tool_proof,
+        source_locator_handoff=source_locator_handoff,
+    )
+    if provenance_work_episode_origin_source_selection.get("applies"):
+        if provenance_work_episode_origin_source_selection.get("status") == "origin_episode_promoted":
+            source_locator_handoff["next_reads"] = next_reads
+        else:
+            source_locator_handoff["next_reads"] = mark_scoped_no_evidence_diagnostic_reads(
+                next_reads,
+                no_evidence,
+            )
+        next_reads = list(source_locator_handoff.get("next_reads") or [])
+        source_locator_handoff["provenance_work_episode_origin_source_selection"] = (
+            provenance_work_episode_origin_source_selection
+        )
+        source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
+        source_handle_routing = build_source_handle_routing(
+            agent_find["query"]["original"],
+            candidates=source_selection_candidates,
+            next_reads=next_reads,
+        )
+        source_locator_handoff["source_handle_routing"] = source_handle_routing
+        decision_context["next_reads"] = next_reads[:12]
+        decision_context["next_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=False,
+        )
+        decision_context["source_handle_routing"] = source_handle_routing
+        decision_context["route_guidance"] = decision_context_route_guidance(source_handle_routing)
+        audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
+        audit_plan["replay_commands"] = build_next_commands(
+            next_reads,
+            hints=hints,
+            include_semantic_debug_replay=True,
+        )
+        audit_plan["next_commands"] = decision_context["next_commands"]
+        audit_plan["source_handle_routing"] = audit_source_handle_guidance(source_handle_routing)
+        audit_plan["checkpoint_plan"] = source_handle_checkpoint_plan(
+            audit_plan.get("checkpoint_plan", []),
+            source_handle_routing,
+        )
     provenance_direct_evidence_facet_ledger = build_provenance_direct_evidence_facet_ledger(
         query=agent_find["query"]["original"],
         family=family,
         candidates=source_selection_candidates,
         tool_proof=tool_proof,
         source_plan=source_plan,
-        selected_source_reads=list(source_locator_handoff.get("next_reads") or next_reads),
+        selected_source_reads=list(next_reads),
     )
     if provenance_direct_evidence_facet_ledger.get("applies"):
         next_reads = apply_provenance_direct_evidence_ledger_to_reads(
-            list(source_locator_handoff.get("next_reads") or next_reads),
+            list(next_reads),
             provenance_direct_evidence_facet_ledger,
         )
         source_locator_handoff["next_reads"] = next_reads
@@ -5749,6 +5799,7 @@ ACTION_PROOF_TEXT_LIMIT = 220
 PROVENANCE_DIRECT_EVIDENCE_READ_CAP = 4
 PROVENANCE_DIRECT_EVIDENCE_REF_CAP = 3
 PROVENANCE_DIRECT_SELECTED_SOURCE_PATH_CAP = 8
+PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP = 24
 PROVENANCE_COMPLETE_PROOF_OUTPUT_MAX_BYTES = 12_288
 PROVENANCE_COMPLETE_PROOF_READ_BEFORE = 0
 PROVENANCE_COMPLETE_PROOF_READ_AFTER = 1
@@ -6588,6 +6639,251 @@ def provenance_original_user_request_wanted(query: str) -> bool:
     return any(re.search(pattern, text) for pattern in patterns)
 
 
+def promote_provenance_work_episode_origin_source_reads(
+    next_reads: list[dict[str, Any]],
+    *,
+    query: str,
+    family: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not provenance_direct_evidence_ledger_wanted(query, family):
+        return next_reads, {
+            "schema_version": 1,
+            "applies": False,
+            "reason": "not_a_source_session_claimed_action_query",
+        }
+
+    required_facets = requested_provenance_direct_evidence_facets(query)
+    if not required_facets:
+        return next_reads, {
+            "schema_version": 1,
+            "applies": False,
+            "reason": "no_requested_direct_facets",
+        }
+
+    candidate_paths = provenance_work_episode_origin_candidate_paths(
+        next_reads=next_reads,
+        candidates=candidates,
+        tool_proof=tool_proof,
+        source_locator_handoff=source_locator_handoff,
+    )
+    scored: list[dict[str, Any]] = []
+    for path_index, path in enumerate(candidate_paths):
+        seed_read = provenance_work_episode_origin_seed_read(path)
+        ledger = build_provenance_direct_evidence_facet_ledger(
+            query=query,
+            family=family,
+            candidates=[],
+            tool_proof={"events": []},
+            source_plan={},
+            selected_source_reads=[seed_read],
+        )
+        score = provenance_work_episode_origin_ledger_score(
+            ledger,
+            required_facets=required_facets,
+            path_index=path_index,
+        )
+        if score[0] <= 0:
+            continue
+        scored.append(
+            {
+                "path": str(path),
+                "path_index": path_index,
+                "score": score,
+                "ledger": ledger,
+            }
+        )
+    if not scored:
+        return next_reads, {
+            "schema_version": 1,
+            "applies": True,
+            "status": "no_origin_episode_direct_facets_found",
+            "candidate_path_count": len(candidate_paths),
+            "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+            "required_facets": required_facets,
+            "bounded": True,
+        }
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    best = scored[0]
+    ledger = best["ledger"]
+    selected_reads = list(ledger.get("selected_primary_reads") or [])
+    if not selected_reads:
+        return next_reads, {
+            "schema_version": 1,
+            "applies": True,
+            "status": "no_origin_episode_selected_reads",
+            "candidate_path_count": len(candidate_paths),
+            "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+            "required_facets": required_facets,
+            "bounded": True,
+        }
+
+    promoted_reads = dedupe_dicts(selected_reads + next_reads)[:12]
+    covered_required = [
+        facet for facet in required_facets if facet in set(ledger.get("covered_direct_facets") or [])
+    ]
+    return promoted_reads, {
+        "schema_version": 1,
+        "applies": True,
+        "status": "origin_episode_promoted",
+        "candidate_path_count": len(candidate_paths),
+        "candidate_path_cap": PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP,
+        "selected_candidate_path_index": int(best["path_index"]),
+        "selected_primary_read_count": len(selected_reads),
+        "selected_primary_read_targets": [
+            read.get("target") for read in selected_reads if read.get("target")
+        ],
+        "required_facets": required_facets,
+        "covered_required_facets": covered_required,
+        "missing_required_facets": list(ledger.get("missing_required_facets") or []),
+        "evidence_complete": bool(ledger.get("evidence_complete")),
+        "selection_basis": "direct_facet_coverage_and_work_episode_chronology",
+        "secondary_context_counts": {
+            "assistant_recap_count": (ledger.get("secondary_context") or {}).get(
+                "assistant_recap_count",
+                0,
+            ),
+            "report_writing_event_count": (ledger.get("secondary_context") or {}).get(
+                "report_writing_event_count",
+                0,
+            ),
+            "compacted_summary_count": (ledger.get("secondary_context") or {}).get(
+                "compacted_summary_count",
+                0,
+            ),
+            "post_hoc_prompt_echo_count": (ledger.get("secondary_context") or {}).get(
+                "post_hoc_prompt_echo_count",
+                0,
+            ),
+            "post_hoc_prompt_echo_action_count": (ledger.get("secondary_context") or {}).get(
+                "post_hoc_prompt_echo_action_count",
+                0,
+            ),
+        },
+        "raw_text_included": False,
+        "bounded": True,
+    }
+
+
+def provenance_work_episode_origin_candidate_paths(
+    *,
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    tool_proof: dict[str, Any],
+    source_locator_handoff: dict[str, Any],
+) -> list[Path]:
+    paths: list[Path] = []
+    for row in [*next_reads, *candidates]:
+        if isinstance(row, dict):
+            provenance_work_episode_origin_append_path(paths, semantic_debug_row_source_path(row))
+    for event in list(tool_proof.get("events") or []):
+        if isinstance(event, dict):
+            provenance_work_episode_origin_append_path(paths, semantic_debug_row_source_path(event))
+    provenance_work_episode_origin_collect_paths(
+        source_locator_handoff.get("source_windows"),
+        paths,
+    )
+    provenance_work_episode_origin_collect_paths(
+        source_locator_handoff.get("omitted_window_recovery"),
+        paths,
+    )
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        result.append(path)
+        if len(result) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
+            break
+    return result
+
+
+def provenance_work_episode_origin_collect_paths(value: Any, paths: list[Path]) -> None:
+    if len(paths) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
+        return
+    if isinstance(value, dict):
+        provenance_work_episode_origin_append_path(paths, semantic_debug_row_source_path(value))
+        for child in value.values():
+            provenance_work_episode_origin_collect_paths(child, paths)
+            if len(paths) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
+                return
+    elif isinstance(value, list):
+        for child in value:
+            provenance_work_episode_origin_collect_paths(child, paths)
+            if len(paths) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
+                return
+
+
+def provenance_work_episode_origin_append_path(paths: list[Path], path_value: str | None) -> None:
+    if not path_value or len(paths) >= PROVENANCE_WORK_EPISODE_ORIGIN_SOURCE_PATH_CAP:
+        return
+    if ".jsonl" not in str(path_value):
+        return
+    paths.append(Path(str(path_value)).expanduser())
+
+
+def provenance_work_episode_origin_seed_read(path: Path) -> dict[str, Any]:
+    source_ref = {"path": str(path), "line": 1, "session": path.stem}
+    return {
+        "kind": "jsonl_source_ref",
+        "target": source_ref_target(source_ref),
+        "source_ref": source_ref,
+        "reason": "bounded work-episode origin candidate source ref",
+        "read_more_actionable": True,
+        "followthrough_actionable": True,
+        "diagnostic_only": False,
+        "historical_provenance_selection": {
+            "schema_version": 1,
+            "source_chronology_role": "target_historical_raw_jsonl_source_ref",
+            "final_support_allowed": True,
+            "read_more_actionable": True,
+            "followthrough_actionable": True,
+            "diagnostic_only": False,
+            "raw_text_included": False,
+        },
+    }
+
+
+def provenance_work_episode_origin_ledger_score(
+    ledger: dict[str, Any],
+    *,
+    required_facets: list[str],
+    path_index: int,
+) -> tuple[int, int, int, int, int, int, int]:
+    if not ledger.get("applies"):
+        return (0, 0, 0, 0, 0, 0, 0)
+    covered = set(ledger.get("covered_direct_facets") or [])
+    required = set(required_facets)
+    covered_required = covered & required
+    selected_reads = list(ledger.get("selected_primary_reads") or [])
+    selected_original = bool((ledger.get("original_user_intent") or {}).get("selected_original_user_request"))
+    original_required = "original_user_request" in required
+    if original_required and not selected_original:
+        return (0, len(covered_required), 0, 0, len(selected_reads), -path_index, 0)
+    correlated_reads = sum(
+        1
+        for read in selected_reads
+        if (read.get("provenance_direct_evidence") or {}).get("correlated_output")
+    )
+    authorization_missing = int(
+        "original_request_authorization" in set(ledger.get("missing_required_facets") or [])
+    )
+    return (
+        len(covered_required),
+        int(bool(ledger.get("evidence_complete"))),
+        int(selected_original),
+        correlated_reads,
+        len(selected_reads),
+        -authorization_missing,
+        -path_index,
+    )
+
+
 def build_provenance_direct_evidence_facet_ledger(
     *,
     query: str,
@@ -7382,6 +7678,7 @@ def provenance_original_user_request_read(candidate: dict[str, Any]) -> dict[str
         "read_more_actionable": True,
         "followthrough_actionable": True,
         "diagnostic_only": False,
+        "target_source_role": "target_historical_raw",
         "proof_kind": "original_user_request_direct_human",
         "intent_source_role": "direct_human_message",
         "direct_evidence_facets": [
@@ -7895,6 +8192,7 @@ def provenance_direct_event_read(event: dict[str, Any]) -> dict[str, Any]:
         "read_more_actionable": True,
         "followthrough_actionable": True,
         "diagnostic_only": False,
+        "target_source_role": "target_historical_raw",
         "direct_evidence_facets": list(event.get("facets") or []),
         "provenance_direct_evidence": provenance_direct_event_ref(event),
         "action_proof_source_selection": {
