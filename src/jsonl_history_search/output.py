@@ -389,6 +389,7 @@ def render_ask_router_text(payload: dict) -> str:
         f"Stop condition: {report.get('stop_guidance')}",
         f"Only continue if: {report.get('manual_search_guidance')}",
         f"Chosen route: {report.get('chosen_route')}",
+        f"Audit depth: {(report.get('audit_depth') or {}).get('label', 'quick')}",
         f"Why: {report.get('why_it_applies')}",
         f"Read: {report.get('read_specialization')}",
     ]
@@ -1266,6 +1267,7 @@ def render_ask_router_markdown(payload: dict) -> str:
         f"- Only continue if: {report.get('manual_search_guidance')}",
         "",
         f"- Chosen route: `{report.get('chosen_route')}`",
+        f"- Audit depth: `{(report.get('audit_depth') or {}).get('label', 'quick')}`",
         f"- Why: {report.get('why_it_applies')}",
         f"- Read: `{report.get('read_specialization')}`",
     ]
@@ -5235,6 +5237,7 @@ def render_semantic_debug_text(payload: dict) -> str:
         "Semantic Debug",
         f"Status: {report.get('status')}",
         f"Answer status: {answer_status}",
+        f"Audit depth: {(report.get('audit_depth') or {}).get('label', 'quick')}",
     ]
     lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
@@ -5519,6 +5522,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         "",
         f"**Status:** {report.get('status')}",
         f"**Answer status:** `{answer_status}`",
+        f"**Audit depth:** `{(report.get('audit_depth') or {}).get('label', 'quick')}`",
     ]
     lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))

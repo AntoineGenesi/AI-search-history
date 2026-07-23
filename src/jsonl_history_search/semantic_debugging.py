@@ -28,6 +28,7 @@ from .agent_contract import (
     source_ref_target,
 )
 from .answer_source_discipline import answer_source_discipline_summary, build_answer_source_discipline
+from .audit_depth import resolve_audit_depth
 from .claims import classify_claim_action, parse_review_verdict
 from .conversation_records import (
     ASSISTANT_OR_AGENT_MESSAGE,
@@ -112,6 +113,10 @@ def build_semantic_debug_payload(
     mask_context: Any = None,
     configuration_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
+    audit_depth = resolve_audit_depth(
+        getattr(args, "query", ""),
+        getattr(args, "audit_depth", None),
+    )
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     result = run_retrieval_mode(
         retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
@@ -251,6 +256,7 @@ def build_semantic_debug_payload(
         watchlist_inputs=list(getattr(args, "watchlist", []) or []),
         source_handle_routing=source_handle_routing,
     )
+    audit_plan["audit_depth"] = audit_depth
     source_locator_handoff = build_source_locator_handoff(
         source_plan=source_plan,
         search_result=result,
@@ -331,6 +337,7 @@ def build_semantic_debug_payload(
             )
         source_locator_handoff = compact_text_semantic_handoff_actions(source_locator_handoff)
     source_locator_handoff["source_handle_routing"] = source_handle_routing
+    source_locator_handoff["audit_depth"] = audit_depth
     historical_provenance_self_echo_policy: dict[str, Any] = {}
     (
         next_reads,
@@ -1001,6 +1008,7 @@ def build_semantic_debug_payload(
         "schema_version": SCHEMA_VERSION,
         "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
         "query": agent_find["query"]["original"],
+        "audit_depth": audit_depth,
         "question_family": family,
         "investigation_state": investigation_state,
         "scope": source_scope,

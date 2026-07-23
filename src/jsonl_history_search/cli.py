@@ -11,6 +11,7 @@ from itertools import islice
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
+from .audit_depth import AUDIT_DEPTH_CHOICES
 from .agent_use_value_gate import (
     DEFAULT_JSH1043_MANIFEST_PATH,
     DEFAULT_JSH1043_REDUCED_RUN_SUMMARY_PATH,
@@ -293,6 +294,16 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             "Latest-status trigger mode. implicit (default) routes natural prior-message wording; "
             "explicit-only requires a leading `convo`. The environment variable "
             "JSONL_HISTORY_SEARCH_ACTIVATION_MODE sets the default."
+        ),
+    )
+    ask.add_argument(
+        "--audit-depth",
+        choices=AUDIT_DEPTH_CHOICES,
+        default=None,
+        help=(
+            "Audit-depth contract for history routes. quick is the default; "
+            "in-depth and exhaustive are explicit deeper contracts for later "
+            "coverage workflows. Omit to infer only from strong audit wording."
         ),
     )
     ask.add_argument(
@@ -688,6 +699,16 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Repeatable semantic-debug audit predicate to preserve in audit_plan.watchlist.",
+    )
+    semantic_debug.add_argument(
+        "--audit-depth",
+        choices=AUDIT_DEPTH_CHOICES,
+        default=None,
+        help=(
+            "Audit-depth contract: quick (default), in-depth, or exhaustive. "
+            "This annotates the packet for audit workflows without changing caps "
+            "or implementing rolling inventory in this command."
+        ),
     )
     semantic_debug.add_argument(
         "--gold-manifest",
@@ -2005,6 +2026,16 @@ def _configuration_warnings(source_plan: dict) -> list[str]:
     return list(warnings) if isinstance(warnings, list) else []
 
 
+def _render_for_report_output(payload: dict, report_output: str, requested_format: str) -> str:
+    report_path = Path(report_output).expanduser()
+    suffix = report_path.suffix.lower()
+    if suffix == ".json":
+        return render(payload, "json")
+    if suffix in {".md", ".markdown"}:
+        return render(payload, "markdown")
+    return render(payload, requested_format)
+
+
 def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
     route = route_payload["ask_router"]
     execution_kind = execution_kind_for_route_family(route.get("route_family", ""))
@@ -2015,6 +2046,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "evidence_source_applies": route.get("evidence_source_applies"),
         "first_action_category": route.get("first_action_category"),
         "why_it_applies": route.get("why_it_applies"),
+        "audit_depth": route.get("audit_depth"),
         "structured_execution_query": route.get("structured_execution_query"),
         "command_resolution": route.get("command_resolution"),
         "first_command": route.get("first_command"),
@@ -2772,6 +2804,8 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--since", str(args.since)])
     if getattr(args, "until", None):
         argv.extend(["--until", str(args.until)])
+    if getattr(args, "audit_depth", None):
+        argv.extend(["--audit-depth", str(args.audit_depth)])
     argv.extend(["--report-output", args.report_output])
     return argv
 
@@ -4853,6 +4887,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "schema_version": packet["schema_version"],
             "status": packet["status"],
             "query": packet["query"],
+            "audit_depth": packet.get("audit_depth"),
             "question_family": packet["question_family"],
             "report_written": str(Path(report_output).expanduser()),
             "candidate_count": len(packet["strongest_candidates"]),
@@ -17206,6 +17241,7 @@ def main(argv: list[str] | None = None) -> int:
             cwd=cwd,
             evidence_source=args.evidence_source,
             activation_mode=args.activation_mode,
+            audit_depth=args.audit_depth,
         )
         auto_execute_bounded = (
             args.auto_execute_bounded_no_evidence
@@ -17389,8 +17425,10 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render(payload, args.format)
         if args.report_output:
             report_path = Path(args.report_output).expanduser()
-            report_format = "json" if report_path.suffix.lower() == ".json" else args.format
-            report_path.write_text(render(payload, report_format), encoding="utf-8")
+            report_path.write_text(
+                _render_for_report_output(payload, args.report_output, args.format),
+                encoding="utf-8",
+            )
             packet = payload["semantic_debug"]
             if _semantic_debug_is_scoped_no_evidence(packet):
                 payload = _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
@@ -18065,7 +18103,10 @@ def main(argv: list[str] | None = None) -> int:
         payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
     rendered = render(payload, args.format)
     if getattr(args, "report_output", None):
-        Path(args.report_output).expanduser().write_text(rendered, encoding="utf-8")
+        Path(args.report_output).expanduser().write_text(
+            _render_for_report_output(payload, args.report_output, args.format),
+            encoding="utf-8",
+        )
         if "agent_find" in payload:
             if _agent_find_is_no_evidence_report(payload["agent_find"]):
                 payload = _short_no_evidence_report_written_payload(payload, args.report_output)
@@ -18148,6 +18189,7 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "schema_version": packet["schema_version"],
             "status": packet["status"],
             "query": packet["query"],
+            "audit_depth": packet.get("audit_depth"),
             "report_written": str(Path(report_output).expanduser()),
             "answer_ready_decision": answer_ready.get("decision"),
             "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
