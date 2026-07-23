@@ -566,9 +566,10 @@ def render_ask_execute_text(payload: dict) -> str:
         [
             f"Answer status: {action.get('answer_status')}",
             f"Promotion status: {action.get('promotion_status')}",
-            f"Stop condition: {action.get('stop')}",
         ]
     )
+    if action.get("stop") != single_flight.get("stop_rule"):
+        lines.append(f"Stop condition: {action.get('stop')}")
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
     _append_ask_execute_single_flight_contract(lines, single_flight)
@@ -685,9 +686,10 @@ def render_ask_execute_markdown(payload: dict) -> str:
             "",
             f"- Answer status: `{action.get('answer_status')}`",
             f"- Promotion status: `{action.get('promotion_status')}`",
-            f"- Stop condition: {action.get('stop')}",
         ]
     )
+    if action.get("stop") != single_flight.get("stop_rule"):
+        lines.append(f"- Stop condition: {action.get('stop')}")
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
     _append_ask_execute_single_flight_contract(lines, single_flight, markdown=True)
