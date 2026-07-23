@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import time
@@ -12493,6 +12494,8 @@ SEMANTIC_DEBUG_AUDIT_SLICE_STATUSES = {
     "capped_after_budget_with_no_completeness_claim",
     "blocked_with_reason",
 }
+SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT = 8
+SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT = 96
 
 MODEL_TOKEN_RE = re.compile(r"\b(?:gpt|claude|o\d)[A-Za-z0-9._-]*(?:-[A-Za-z0-9._-]+)*\b", re.IGNORECASE)
 
@@ -12529,6 +12532,9 @@ def build_in_depth_semantic_debug_audit_coverage(
         ledger=ledger,
         cap_hit=cap_hit,
         scope_boundary_summary=scope_boundary_summary,
+        roots=roots,
+        next_reads=next_reads,
+        candidates=candidates,
     )
     slice_status_counts = Counter(str(row.get("status")) for row in slices)
     coverage_complete = bool(slices) and all(row.get("status") == "complete" for row in slices)
@@ -12681,6 +12687,9 @@ def semantic_debug_audit_coverage_slices(
     ledger: dict[str, Any],
     cap_hit: dict[str, Any],
     scope_boundary_summary: dict[str, Any],
+    roots: tuple[Path, ...] = (),
+    next_reads: list[dict[str, Any]] | None = None,
+    candidates: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if ledger:
         rows = []
@@ -12707,6 +12716,15 @@ def semantic_debug_audit_coverage_slices(
                 }
             )
         return rows or [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary)]
+    if cap_hit.get("hit"):
+        retry_rows = semantic_debug_generic_cap_retry_slices(
+            cap_hit=cap_hit,
+            roots=roots,
+            next_reads=next_reads or [],
+            candidates=candidates or [],
+        )
+        if retry_rows:
+            return [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary), *retry_rows]
     return [semantic_debug_selected_scope_slice(cap_hit, scope_boundary_summary)]
 
 
@@ -12726,6 +12744,146 @@ def semantic_debug_selected_scope_slice(cap_hit: dict[str, Any], scope_boundary_
             "caps_hit": list(cap_hit.get("caps_hit") or []),
         },
     }
+
+
+def semantic_debug_generic_cap_retry_slices(
+    *,
+    cap_hit: dict[str, Any],
+    roots: tuple[Path, ...],
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_paths = semantic_debug_selected_ref_paths(next_reads=next_reads, candidates=candidates)
+    if selected_paths:
+        return semantic_debug_retry_rows_for_paths(
+            [(None, path) for path in selected_paths],
+            cap_hit=cap_hit,
+            basis="selected_source_refs",
+        )
+
+    root_paths = semantic_debug_bounded_root_jsonl_paths(roots)
+    return semantic_debug_retry_rows_for_paths(
+        root_paths,
+        cap_hit=cap_hit,
+        basis="selected_root_bounded_path_scan",
+    )
+
+
+def semantic_debug_selected_ref_paths(
+    *,
+    next_reads: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[str]:
+    paths: list[str] = []
+    for row in [*next_reads, *candidates]:
+        if not isinstance(row, dict):
+            continue
+        path = semantic_debug_row_source_path(row)
+        if path:
+            paths.append(path)
+    return sorted(dedupe(paths))
+
+
+def semantic_debug_row_source_path(row: dict[str, Any]) -> str | None:
+    source_ref = row.get("source_ref") if isinstance(row.get("source_ref"), dict) else {}
+    path = source_ref.get("path") if isinstance(source_ref, dict) else None
+    if path:
+        return str(path)
+    target = str(row.get("target") or "")
+    if re.search(r":\d+$", target):
+        return target.rsplit(":", 1)[0]
+    return None
+
+
+def semantic_debug_bounded_root_jsonl_paths(roots: tuple[Path, ...]) -> list[tuple[int | None, str]]:
+    rows: list[tuple[int | None, str]] = []
+    for root_index, root in enumerate(roots):
+        if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+            break
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for filename in sorted(filenames):
+                if not filename.endswith((".jsonl", ".jsonl.gz")):
+                    continue
+                rows.append((root_index, str(Path(dirpath) / filename)))
+                if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+                    break
+            if len(rows) >= SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT:
+                break
+    return rows
+
+
+def semantic_debug_retry_rows_for_paths(
+    path_rows: list[tuple[int | None, str]],
+    *,
+    cap_hit: dict[str, Any],
+    basis: str,
+) -> list[dict[str, Any]]:
+    deduped: list[tuple[int | None, str]] = []
+    seen: set[tuple[int | None, str]] = set()
+    for root_index, path in sorted(path_rows, key=lambda item: (item[0] if item[0] is not None else -1, item[1])):
+        key = (root_index, path)
+        if key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    if not deduped:
+        return []
+
+    date_groups: dict[str, list[tuple[int | None, str]]] = {}
+    for item in deduped:
+        date_key = semantic_debug_path_date_key(item[1])
+        if date_key:
+            date_groups.setdefault(date_key, []).append(item)
+
+    if len(date_groups) > 1:
+        rows = []
+        for index, date_key in enumerate(sorted(date_groups), start=1):
+            items = date_groups[date_key]
+            rows.append(
+                {
+                    "slice": f"retry_date_window:{index:03d}:{date_key}",
+                    "status": "capped_retryable",
+                    "basis": basis,
+                    "window": {"type": "date", "date": date_key},
+                    "path_count": len(items),
+                    "example_paths": [path for _, path in items[:3]],
+                    "caps_to_retry": list(cap_hit.get("caps_hit") or []),
+                    "retry_guidance": "rerun in-depth semantic-debug/audit coverage against this deterministic date window before claiming completeness",
+                }
+            )
+        return rows[:SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT]
+
+    rows = []
+    for index, (root_index, path) in enumerate(deduped[:SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT], start=1):
+        window: dict[str, Any] = {"type": "path", "path": path}
+        if root_index is not None:
+            window["root_index"] = root_index
+        rows.append(
+            {
+                "slice": f"retry_path_window:{index:03d}",
+                "status": "capped_retryable",
+                "basis": basis,
+                "window": window,
+                "path_count": 1,
+                "caps_to_retry": list(cap_hit.get("caps_hit") or []),
+                "retry_guidance": "rerun in-depth semantic-debug/audit coverage against this deterministic path window before claiming completeness",
+            }
+        )
+    return rows
+
+
+def semantic_debug_path_date_key(path: str) -> str | None:
+    text = str(path)
+    for regex in (CODEX_SESSION_DATE_RE, CODEX_ROLLOUT_DATE_RE):
+        match = regex.search(text)
+        if match:
+            return f"{match.group('year')}-{match.group('month')}-{match.group('day')}"
+    match = re.search(r"(?<!\d)(20\d{2})[/\\-](\d{2})[/\\-](\d{2})(?!\d)", text)
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
 
 
 def semantic_debug_selected_model_terms(query: str) -> list[str]:
