@@ -5325,11 +5325,33 @@ def _answer_action_contract_from_executed_output(
         source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
         provenance_ledger = compact.get("provenance_direct_evidence_facet_ledger") or {}
         provenance_handoff = compact.get("provenance_complete_proof_handoff") or {}
-        provenance_reads = (
-            list(provenance_handoff.get("selected_direct_reads") or [])
-            if provenance_handoff.get("active")
-            else list(provenance_handoff.get("continuation_commands") or [])[:1]
-        )
+        selected_provenance_reads = list(provenance_handoff.get("selected_direct_reads") or [])
+        continuation_provenance_reads = list(provenance_handoff.get("continuation_commands") or [])[:1]
+        if provenance_handoff.get("active"):
+            provenance_reads = selected_provenance_reads
+        else:
+            has_selected_original_request = any(
+                isinstance(read, dict)
+                and read.get("proof_kind") == "original_user_request_direct_human"
+                and read.get("direct_human_request") is True
+                for read in selected_provenance_reads
+            )
+            provenance_read_inputs = (
+                selected_provenance_reads + continuation_provenance_reads
+                if has_selected_original_request
+                else continuation_provenance_reads
+            )
+            provenance_reads = []
+            seen_provenance_targets: set[str] = set()
+            for read in provenance_read_inputs:
+                if not isinstance(read, dict):
+                    continue
+                target = str(read.get("target") or read.get("command") or "")
+                if target and target in seen_provenance_targets:
+                    continue
+                if target:
+                    seen_provenance_targets.add(target)
+                provenance_reads.append(read)
         core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
