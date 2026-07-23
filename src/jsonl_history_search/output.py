@@ -517,6 +517,7 @@ def render_ask_execute_text(payload: dict) -> str:
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
     first_command = route.get("first_command")
+    single_flight = _ask_execute_single_flight_contract(action)
     if (
         execution.get("status") == "report_output_unavailable"
         and action.get("answer_status") == "not-ready/missing-source-session-proof"
@@ -530,7 +531,12 @@ def render_ask_execute_text(payload: dict) -> str:
         f"Execution status: {execution.get('status')}",
         f"Command family: {execution.get('command_family') or '(unsupported)'}",
     ]
-    if first_command:
+    if single_flight:
+        lines.append(
+            "Route already executed: selected semantic-debug route completed by ask --execute; "
+            "do not run it again by default."
+        )
+    elif first_command:
         lines.append(f"First command: {first_command}")
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
     if execution.get("report_written"):
@@ -565,6 +571,7 @@ def render_ask_execute_text(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"Promotion reason: {action.get('promotion_reason')}")
+    _append_ask_execute_single_flight_contract(lines, single_flight)
     _append_provenance_missing_facets(lines, action)
     _append_answer_handoff_text(lines, report.get("answer_handoff"))
     if not _append_remembered_user_missing_evidence_contract(lines, action):
@@ -640,6 +647,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
     first_command = route.get("first_command")
+    single_flight = _ask_execute_single_flight_contract(action)
     if (
         execution.get("status") == "report_output_unavailable"
         and action.get("answer_status") == "not-ready/missing-source-session-proof"
@@ -654,7 +662,12 @@ def render_ask_execute_markdown(payload: dict) -> str:
         f"- Execution status: `{execution.get('status')}`",
         f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
     ]
-    if first_command:
+    if single_flight:
+        lines.append(
+            "- Route already executed: selected `semantic-debug` route completed by `ask --execute`; "
+            "do not run it again by default."
+        )
+    elif first_command:
         lines.append(f"- First command: `{first_command}`")
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
     if execution.get("report_written"):
@@ -677,6 +690,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     if action.get("promotion_reason"):
         lines.append(f"- Promotion reason: {action.get('promotion_reason')}")
+    _append_ask_execute_single_flight_contract(lines, single_flight, markdown=True)
     _append_provenance_missing_facets(lines, action, markdown=True)
     _append_answer_handoff_markdown(lines, report.get("answer_handoff"))
     if not _append_remembered_user_missing_evidence_contract(lines, action, markdown=True):
@@ -718,6 +732,70 @@ def render_ask_execute_markdown(payload: dict) -> str:
     if route.get("route_family") == "artifact_currentness":
         _append_artifact_currentness_execute_markdown(lines, report.get("executed_output") or {})
     return "\n".join(lines)
+
+
+def _ask_execute_single_flight_contract(action: dict) -> dict:
+    contract = action.get("single_flight_contract") if isinstance(action, dict) else None
+    if not isinstance(contract, dict):
+        return {}
+    if contract.get("route_already_executed") is not True:
+        return {}
+    if action.get("answer_status") != "answer-ready-after-source-inspection":
+        return {}
+    if not action.get("read"):
+        return {}
+    return contract
+
+
+def _append_ask_execute_single_flight_contract(
+    lines: list[str],
+    contract: dict,
+    *,
+    markdown: bool = False,
+) -> None:
+    if not contract:
+        return
+    do_not_rerun = ", ".join(str(item) for item in contract.get("do_not_rerun") or [])
+    continue_only_if = [
+        str(item)
+        for item in contract.get("continue_only_if") or []
+        if str(item).strip()
+    ]
+    if markdown:
+        lines.extend(
+            [
+                f"- Single-flight status: `{contract.get('status')}`",
+                (
+                    "- Default action: read the selected primary refs first, then answer if the "
+                    "required facets are supported."
+                ),
+            ]
+        )
+        if do_not_rerun:
+            lines.append(f"- Do not rerun by default: {do_not_rerun}.")
+        lines.append(
+            "- Diagnostics: secondary/current/post-hoc refs stay in JSON/report for named gaps or review; "
+            "they are not default follow-through."
+        )
+        if contract.get("stop_rule"):
+            lines.append(f"- Stop rule: {contract.get('stop_rule')}")
+        if continue_only_if:
+            lines.append(f"- Continue only if: {'; '.join(continue_only_if)}.")
+        return
+    lines.append(f"Single-flight status: {contract.get('status')}")
+    lines.append(
+        "Default action: read the selected primary refs first, then answer if the required facets are supported."
+    )
+    if do_not_rerun:
+        lines.append(f"Do not rerun by default: {do_not_rerun}.")
+    lines.append(
+        "Diagnostics: secondary/current/post-hoc refs stay in JSON/report for named gaps or review; "
+        "they are not default follow-through."
+    )
+    if contract.get("stop_rule"):
+        lines.append(f"Stop rule: {contract.get('stop_rule')}")
+    if continue_only_if:
+        lines.append(f"Continue only if: {'; '.join(continue_only_if)}.")
 
 
 def _append_provenance_missing_facets(

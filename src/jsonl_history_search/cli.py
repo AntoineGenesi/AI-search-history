@@ -5745,6 +5745,25 @@ def _answer_action_contract_from_executed_output(
                 target_proof_handoff.get("secondary_context_after_source_inspection")
                 or []
             ) + (target_proof_handoff.get("diagnostics_after") or [])[:4]
+            if (
+                target_proof_handoff.get("status") == "target_primary_proof_refs_available"
+                and answer_status == "answer-ready-after-source-inspection"
+                and not merge_artifact_handoff
+                and not raw_worker_chronology_handoff
+                and not named_task_action_proof
+            ):
+                selected_primary = list(target_proof_handoff.get("required_primary_proof") or [])
+                contract["read"] = selected_primary
+                contract["single_flight_contract"] = _semantic_debug_target_single_flight_contract(
+                    selected_primary=selected_primary,
+                    secondary_context=target_proof_handoff.get(
+                        "secondary_context_after_source_inspection"
+                    )
+                    or [],
+                    diagnostics=target_proof_handoff.get("diagnostics_after") or [],
+                    stop=contract.get("stop"),
+                )
+                contract["only_continue_if"] = contract["single_flight_contract"]["continue_only_if"]
         if merge_artifact_handoff:
             contract["named_task_merge_provenance_handoff"] = merge_artifact_handoff
             contract["stop"] = merge_artifact_handoff.get("stop") or contract["stop"]
@@ -6174,6 +6193,47 @@ def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
 _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES = frozenset(
     {"remembered_user_wording", "semantic_debug", "provenance"}
 )
+
+
+def _semantic_debug_target_single_flight_contract(
+    *,
+    selected_primary: list[dict],
+    secondary_context: list[dict],
+    diagnostics: list[dict],
+    stop: object,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "route_executed_selected_primary_reads_first",
+        "route_already_executed": True,
+        "default_action": "read_selected_primary_refs_then_answer_if_required_facets_are_supported",
+        "selected_primary_read_count": len(selected_primary),
+        "secondary_context_count": len(secondary_context),
+        "diagnostic_ref_count": len(diagnostics),
+        "selected_primary_reads": selected_primary[:_ASK_ANSWER_MAX_REFS],
+        "diagnostics_default_actionable": False,
+        "secondary_context_default_actionable": False,
+        "do_not_rerun": [
+            "ask --execute",
+            "direct semantic-debug",
+            "broad rg/find",
+            "report archaeology",
+        ],
+        "stop_rule": stop
+        or (
+            "After the selected primary refs support the required facets, answer from those refs "
+            "and stop."
+        ),
+        "continue_only_if": [
+            "a named required facet remains unsupported after opening the selected primary refs",
+            "the selected primary refs contradict each other",
+            "the requested target episode/entity is still not present in the selected primary refs",
+        ],
+        "diagnostic_policy": (
+            "Secondary, current, post-hoc, and diagnostic refs remain available in JSON/report for "
+            "named gaps or review, but are not default follow-through after successful target proof."
+        ),
+    }
 
 
 def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, query: str = "") -> dict:
