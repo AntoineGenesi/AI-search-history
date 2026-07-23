@@ -60,6 +60,8 @@ def render_text(payload: dict) -> str:
         return render_manifest_text(payload)
     if "generated_metadata_discovery" in payload:
         return render_generated_metadata_discovery_text(payload)
+    if "audit_coverage_ledger" in payload:
+        return render_audit_coverage_ledger_text(payload)
     if "expansion_family_probe" in payload:
         return render_expansion_family_probe_text(payload)
     if "expansion_family_audit" in payload:
@@ -297,6 +299,35 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "markdown":
         return render_markdown(payload)
     return render_text(payload)
+
+
+def render_audit_coverage_ledger_text(payload: dict) -> str:
+    ledger = payload["audit_coverage_ledger"]
+    summary = ledger.get("summary") or {}
+    lines = [
+        "Audit Coverage Ledger",
+        f"Status: {ledger.get('status')}",
+        f"Privacy boundary: {ledger.get('privacy_boundary')}",
+        f"Candidate traces: {summary.get('candidate_trace_count', 0)}",
+        f"Traces reported: {summary.get('traces_reported', 0)}",
+        "Classification counts:",
+    ]
+    for key, value in (summary.get("classification_counts") or {}).items():
+        lines.append(f"- {key}: {value}")
+    lines.append("Included selected-model counts:")
+    selected = summary.get("included_selected_model_counts") or {}
+    if selected:
+        for key, value in selected.items():
+            lines.append(f"- {key}: {value}")
+    else:
+        lines.append("- none")
+    lines.append("Slices:")
+    for slice_row in ledger.get("slices") or []:
+        lines.append(
+            f"- {slice_row.get('slice')}: traces={slice_row.get('candidate_trace_count', 0)} "
+            f"cap_status={slice_row.get('cap_status')}"
+        )
+    return "\n".join(lines)
 
 
 def render_retained_source_read_text(payload: dict) -> str:
