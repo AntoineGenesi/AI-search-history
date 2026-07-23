@@ -11,6 +11,7 @@ from itertools import islice
 from pathlib import Path
 
 from .agent_contract import build_agent_find_payload
+from .audit_coverage import audit_coverage_options_from_args, build_audit_coverage_ledger
 from .audit_depth import AUDIT_DEPTH_CHOICES
 from .agent_use_value_gate import (
     DEFAULT_JSH1043_MANIFEST_PATH,
@@ -611,6 +612,28 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     metadata_discovery.add_argument("--min-count", type=int, default=1)
     metadata_discovery.add_argument("--max-candidates", type=int, default=40)
     metadata_discovery.add_argument("--report-output", default=None)
+    audit_coverage = subparsers.add_parser(
+        "audit-coverage",
+        description=(
+            "Build a committed-safe selected-model/session coverage ledger from "
+            "structural session_meta and turn_context metadata."
+        ),
+    )
+    add_common_args(audit_coverage)
+    audit_coverage.add_argument("--start-date", default=None, help="Inclusive YYYY-MM-DD path-date window start.")
+    audit_coverage.add_argument("--end-date", default=None, help="Inclusive YYYY-MM-DD path-date window end.")
+    audit_coverage.add_argument("--window-days", type=int, default=1)
+    audit_coverage.add_argument("--selected-model", action="append", default=[])
+    audit_coverage.add_argument("--thread-source", action="append", default=[])
+    audit_coverage.add_argument("--agent-role", action="append", default=[])
+    audit_coverage.add_argument("--cwd-contains", action="append", default=[])
+    audit_coverage.add_argument(
+        "--trace-ledger-limit",
+        type=int,
+        default=200,
+        help="Maximum hashed per-trace rows to emit; use 0 for aggregate-only reports or -1 for all.",
+    )
+    audit_coverage.add_argument("--report-output", default=None)
     expansion_family_audit = subparsers.add_parser(
         "expansion-family-audit",
         description="Report-only audit of contextual query expansion family hygiene.",
@@ -17321,6 +17344,20 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["generated_metadata_discovery"]["status"]
         return 1 if status in {"root_rejected"} else 0
+    if args.command == "audit-coverage":
+        try:
+            payload = build_audit_coverage_ledger(audit_coverage_options_from_args(args))
+        except ValueError as exc:
+            print(f"audit-coverage failed: {exc}", file=sys.stderr)
+            return 2
+        rendered = render(payload, args.format)
+        if args.report_output:
+            Path(args.report_output).expanduser().write_text(
+                _render_for_report_output(payload, args.report_output, args.format),
+                encoding="utf-8",
+            )
+        print(rendered)
+        return 0 if payload["audit_coverage_ledger"].get("status") != "blocked" else 1
     if args.command == "expansion-family-audit":
         payload = build_expansion_family_audit_report()
         rendered = render(payload, args.format)
