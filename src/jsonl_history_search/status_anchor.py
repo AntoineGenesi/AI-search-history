@@ -349,6 +349,7 @@ def status_anchor_report(
         query=query,
         messages=latest_messages,
         candidates=anchor_candidates,
+        cwd=cwd,
         codex_home=codex_home,
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
@@ -775,6 +776,7 @@ def _select_anchor_with_boundary(
     query: str,
     messages: list[dict],
     candidates: list[dict],
+    cwd: Path | None = None,
     codex_home: Path | None = None,
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
@@ -805,6 +807,7 @@ def _select_anchor_with_boundary(
         query=query,
         candidates=candidates,
         codex_home=codex_home,
+        cwd=cwd,
         latest_messages=messages,
     )
     if explicit_authority.get("status") == "selected":
@@ -3349,6 +3352,7 @@ def _explicit_anchor_authority_resolution(
     query: str,
     candidates: list[dict],
     codex_home: Path | None,
+    cwd: Path | None,
     latest_messages: list[dict],
 ) -> dict:
     if _wants_message_before_named_anchor(_normalize(query)):
@@ -3382,6 +3386,7 @@ def _explicit_anchor_authority_resolution(
     canonical_timestamp_matches = []
     canonical_quote_matches = []
     rejected_canonical = []
+    lineage_rejected = []
     for row in rows:
         timestamp_match, quote_match = _explicit_anchor_match_flags(
             row,
@@ -3400,6 +3405,16 @@ def _explicit_anchor_authority_resolution(
             rejected_canonical.append(row)
             continue
         selected = dict(row)
+        lineage_rejection = _explicit_anchor_child_control_lineage_rejection(
+            selected,
+            codex_home=codex_home,
+            cwd=cwd,
+        )
+        if lineage_rejection:
+            selected.update(lineage_rejection)
+            rejected_canonical.append(selected)
+            lineage_rejected.append(selected)
+            continue
         selected["explicit_anchor_reason"] = _explicit_anchor_reason(
             has_timestamp=bool(parsed_times),
             has_quote=bool(quoted_fragments),
@@ -3456,6 +3471,7 @@ def _explicit_anchor_authority_resolution(
     reason = _explicit_anchor_ambiguity_reason(
         canonical_count=len(canonical_matches),
         ambiguous=bool(ambiguous),
+        lineage_rejected=bool(lineage_rejected),
         has_timestamp=bool(parsed_times),
         has_quote=bool(quoted_fragments),
         timestamp_match_count=len(canonical_timestamp_matches),
@@ -3477,7 +3493,35 @@ def _explicit_anchor_authority_resolution(
         ),
         "timestamp_count": len(parsed_times),
         "quoted_fragment_count": len(quoted_fragments),
+        "lineage_rejected_candidate_count": len(lineage_rejected),
         "candidate_diagnostics": candidate_diagnostics,
+    }
+
+
+def _explicit_anchor_child_control_lineage_rejection(
+    candidate: dict,
+    *,
+    codex_home: Path | None,
+    cwd: Path | None,
+) -> dict | None:
+    if codex_home is None or cwd is None:
+        return None
+    lineage = _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+    reason = _parent_thread_lineage_rejection_reason(lineage)
+    if reason not in {
+        "child_worker_reviewer_or_control_session",
+        "non_user_thread_source_not_parent_thread_anchor",
+    }:
+        return None
+    return {
+        "decision": "rejected",
+        "source_scope": "explicit_anchor_lineage_rejected_child_or_control_candidate",
+        "lineage_resolution": lineage,
+        "lineage_rejection_reason": reason,
+        "rationale": _append_rejection_rationale(
+            candidate.get("rationale"),
+            f"explicit_anchor_authority_rejected_{reason}",
+        ),
     }
 
 
@@ -3517,6 +3561,7 @@ def _explicit_anchor_ambiguity_reason(
     *,
     canonical_count: int,
     ambiguous: bool,
+    lineage_rejected: bool,
     has_timestamp: bool,
     has_quote: bool,
     timestamp_match_count: int,
@@ -3528,6 +3573,8 @@ def _explicit_anchor_ambiguity_reason(
         if has_timestamp:
             return "timestamp_matched_multiple_canonical_history_rows"
         return "quoted_message_matched_multiple_canonical_history_rows"
+    if lineage_rejected:
+        return "explicit_anchor_lineage_rejected_child_worker_reviewer_or_control_session"
     if ambiguous:
         return (
             "quoted_message_canonical_session_correlation_is_ambiguous"
@@ -3630,7 +3677,7 @@ def _quoted_anchor_authority_resolution(query: str, candidates: list[dict]) -> d
 
 
 def _quoted_authority_candidate_diagnostic(candidate: dict) -> dict:
-    return {
+    diagnostic = {
         "source_ref": candidate.get("source_ref"),
         "source_kind": candidate.get("source_kind"),
         "timestamp_utc": candidate.get("timestamp_utc"),
@@ -3643,6 +3690,13 @@ def _quoted_authority_candidate_diagnostic(candidate: dict) -> dict:
         "openable_target": candidate.get("openable_target"),
         "correlation_diagnostics": candidate.get("correlation_diagnostics") or [],
     }
+    if candidate.get("lineage_rejection_reason"):
+        diagnostic["lineage_rejection_reason"] = candidate.get("lineage_rejection_reason")
+    if candidate.get("lineage_resolution"):
+        diagnostic["lineage_resolution"] = candidate.get("lineage_resolution")
+    if candidate.get("source_scope"):
+        diagnostic["source_scope"] = candidate.get("source_scope")
+    return diagnostic
 
 
 def _explicit_anchor_candidate(query: str, candidates: list[dict]) -> dict | None:
