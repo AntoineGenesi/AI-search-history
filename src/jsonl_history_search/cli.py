@@ -77,6 +77,7 @@ from .harness_artifacts import (
     build_harness_offline_scorer_artifacts_payload,
 )
 from .harness_loop import DEFAULT_MINIMUM_LOOP_CASE_ID, build_harness_minimum_loop_payload
+from .history_home import history_home_from_args
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
@@ -1904,15 +1905,7 @@ def _history_home_from_args(
     *,
     provider: str,
 ) -> Path:
-    provider_upper = provider.upper()
-    configured = (
-        os.environ.get(f"JSONL_HISTORY_{provider_upper}_HOME")
-        or getattr(args, f"{provider}_home", None)
-        or os.environ.get(f"{provider_upper}_HOME")
-    )
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / f".{provider}"
+    return history_home_from_args(args, provider=provider)
 
 
 def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:

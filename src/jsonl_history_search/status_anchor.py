@@ -18,6 +18,7 @@ from .conversation_records import (
     classify_conversation_record,
     extract_human_ask,
 )
+from .history_home import history_home_from_args
 from .latest_user_messages import MIRROR_CORRELATION_WINDOW_SECONDS, latest_user_messages
 from .timeutil import parse_datetime
 
@@ -276,7 +277,7 @@ KNOWN_WORK = (
 
 def build_status_anchor_payload(args: Any) -> dict:
     default_tz = _timezone_from_args(args)
-    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
+    codex_home = history_home_from_args(args, provider="codex")
     cwd = Path(args.cwd).expanduser().resolve()
     query = getattr(args, "query", None) or DEFAULT_STATUS_QUERY
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
