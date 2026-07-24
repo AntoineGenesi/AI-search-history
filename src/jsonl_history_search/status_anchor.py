@@ -349,6 +349,7 @@ def status_anchor_report(
         query=query,
         messages=latest_messages,
         candidates=anchor_candidates,
+        codex_home=codex_home,
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
@@ -774,6 +775,7 @@ def _select_anchor_with_boundary(
     query: str,
     messages: list[dict],
     candidates: list[dict],
+    codex_home: Path | None = None,
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
@@ -799,6 +801,62 @@ def _select_anchor_with_boundary(
             "status_question",
         ],
     }
+    explicit_authority = _explicit_anchor_authority_resolution(
+        query=query,
+        candidates=candidates,
+        codex_home=codex_home,
+        latest_messages=messages,
+    )
+    if explicit_authority.get("status") == "selected":
+        selected = explicit_authority["selected_anchor"]
+        quoted_key = (
+            {"quoted_anchor_authority": explicit_authority}
+            if explicit_authority.get("quoted_fragment_count")
+            else {}
+        )
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": (
+                    "explicit_quoted_canonical_authority"
+                    if explicit_authority.get("quoted_fragment_count")
+                    and not explicit_authority.get("timestamp_count")
+                    else "explicit_anchor"
+                ),
+                "anchor_scope": "explicit_user_anchor",
+                "anchor_reason": selected.get("explicit_anchor_reason")
+                or "explicit_timestamp_or_quoted_message_anchor",
+                "anchor_ref": selected.get("source_ref"),
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected as the unique canonical history.jsonl authority for the explicit anchor",
+                ),
+                "explicit_anchor_authority": explicit_authority,
+                **quoted_key,
+            },
+            candidates,
+        )
+    if explicit_authority.get("status") == "ambiguous":
+        quoted_key = (
+            {"quoted_anchor_authority": explicit_authority}
+            if explicit_authority.get("quoted_fragment_count")
+            else {}
+        )
+        return {
+            **base,
+            "context_boundary": (
+                "explicit_quoted_anchor_authority_ambiguous"
+                if explicit_authority.get("quoted_fragment_count")
+                and not explicit_authority.get("timestamp_count")
+                else "explicit_anchor_authority_ambiguous"
+            ),
+            "anchor_scope": "explicit_user_anchor",
+            "anchor_reason": explicit_authority.get("reason"),
+            "selected_anchor": None,
+            "explicit_anchor_authority": explicit_authority,
+            **quoted_key,
+            "rejected_anchor_alternatives": explicit_authority.get("candidate_diagnostics") or [],
+        }
     if _requires_raw_parent_thread_boundary(query):
         interval = canonical_parent_main_interval or {"status": "not_applicable"}
         selected = _literal_parent_thread_contract_anchor(interval)
@@ -1604,6 +1662,55 @@ def _canonical_parent_main_status_interval(
         require_exact_query=require_side_parent_boundary,
     )
     if boundary is None:
+        out_of_band = _recover_out_of_band_parent_main_anchor(
+            rows=rows,
+            query=query,
+            cwd=cwd,
+            codex_home=codex_home,
+            status_as_of_boundary=status_as_of_boundary,
+        )
+        if out_of_band.get("status") == "selected":
+            selected = out_of_band.get("selected_anchor") or {}
+            return {
+                "status": "selected",
+                "kind": "canonical_parent_main_status_interval",
+                "reason": out_of_band.get("reason"),
+                "context_boundary": "out_of_band_parent_main_canonical_history_recovery",
+                "anchor_reason": "nearest_preceding_canonical_parent_main_history_anchor",
+                "status_as_of_boundary": status_as_of_boundary,
+                "selected_anchor": selected,
+                "start_anchor": selected,
+                "boundary": None,
+                "anchor_candidates": out_of_band.get("anchor_candidates") or [selected],
+                "rejected_anchor_alternatives": out_of_band.get("rejected_anchor_alternatives") or [],
+                "parent_thread_lineage_anchor": out_of_band,
+                "parent_thread_side_boundary": out_of_band,
+                "answer_target_window": {
+                    "kind": "out_of_band_parent_main_canonical_history_recovery",
+                    "start_source_ref": selected.get("source_ref"),
+                    "start_timestamp_utc": selected.get("timestamp_utc"),
+                    "boundary_source_ref": (status_as_of_boundary or {}).get("source_ref"),
+                    "boundary_timestamp_utc": (status_as_of_boundary or {}).get("timestamp_utc"),
+                    "inclusive_start": True,
+                    "inclusive_boundary": bool(status_as_of_boundary),
+                    "policy": (
+                        "When a natural parent-thread status ask is not present as a canonical history row, "
+                        "select the unique latest eligible canonical parent/root-session history row and bound "
+                        "activity by the current status row when one is available."
+                    ),
+                },
+            }
+        if out_of_band.get("status") == "ambiguous":
+            return {
+                "status": "ambiguous",
+                "kind": "canonical_parent_main_status_interval",
+                "context_boundary": "out_of_band_parent_main_canonical_history_ambiguous",
+                "anchor_reason": out_of_band.get("reason") or "out_of_band_parent_main_anchor_not_unique",
+                "reason": out_of_band.get("reason") or "out_of_band_parent_main_anchor_not_unique",
+                "status_as_of_boundary": status_as_of_boundary,
+                "parent_thread_side_boundary": out_of_band,
+                "rejected_anchor_alternatives": out_of_band.get("rejected_anchor_alternatives") or [],
+            }
         return {
             "status": "ambiguous",
             "kind": "canonical_parent_main_status_interval",
@@ -2014,6 +2121,133 @@ def _recover_parent_thread_side_boundary_without_direct_edge(
             "When the exact canonical parent-thread ask has no direct parent edge, select only the uniquely "
             "latest eligible canonical human row whose raw session is a user/root session compatible with "
             "--cwd/workspace roots; reject side/status, child/control, unrelated, and equally latest sessions."
+        ),
+    }
+
+
+def _recover_out_of_band_parent_main_anchor(
+    *,
+    rows: list[dict],
+    query: str,
+    cwd: Path,
+    codex_home: Path,
+    status_as_of_boundary: dict | None,
+) -> dict:
+    if not is_status_question(query) or not (
+        _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
+    ):
+        return {"status": "not_applicable", "reason": "query_not_parent_main_status"}
+    boundary_timestamp = parse_datetime(str((status_as_of_boundary or {}).get("timestamp_utc") or ""), timezone.utc)
+    if boundary_timestamp is not None:
+        boundary_timestamp = boundary_timestamp.astimezone(timezone.utc)
+    boundary_line = None
+    if str((status_as_of_boundary or {}).get("source_ref") or "").startswith("codex_history:"):
+        boundary_line = _line_from_source_ref(str((status_as_of_boundary or {}).get("source_ref") or ""))
+
+    eligible = []
+    rejected = []
+    latest_timestamp = None
+    for row in sorted(
+        rows,
+        key=lambda item: (str(item.get("timestamp_utc") or ""), int(item.get("line") or 0)),
+        reverse=True,
+    ):
+        row_line = int(row.get("line") or 0)
+        if boundary_line is not None and row_line >= boundary_line:
+            continue
+        row_timestamp = parse_datetime(str(row.get("timestamp_utc") or ""), timezone.utc)
+        if row_timestamp is not None:
+            row_timestamp = row_timestamp.astimezone(timezone.utc)
+            if boundary_timestamp is not None and row_timestamp > boundary_timestamp:
+                continue
+            row_timestamp_text = row_timestamp.isoformat(timespec="seconds")
+        else:
+            row_timestamp_text = str(row.get("timestamp_utc") or "")
+        if latest_timestamp is not None and row_timestamp_text < latest_timestamp:
+            break
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            if len(rejected) < 8:
+                rejected.append(
+                    _lineage_rejected_anchor(
+                        row,
+                        {"status": "not_inspected"},
+                        "status_worker_or_boundary_row_not_parent_main_anchor",
+                    )
+                )
+            continue
+        lineage = _lineage_for_anchor(row, codex_home=codex_home, cwd=cwd)
+        if lineage.get("status") != "ok":
+            if len(rejected) < 8:
+                rejected.append(_lineage_rejected_anchor(row, lineage, "candidate_session_metadata_not_found"))
+            continue
+        rejection = _no_edge_parent_candidate_rejection_reason(lineage)
+        if rejection:
+            if len(rejected) < 8:
+                rejected.append(_lineage_rejected_anchor(row, lineage, rejection))
+            continue
+        selected = dict(row)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["side_parent_boundary_anchor"] = True
+        selected["deterministic_parent_session_recovery_anchor"] = True
+        selected["lineage_resolution"] = lineage
+        selected["rationale"] = (
+            str(selected.get("rationale") or "").rstrip()
+            + "; selected as the latest canonical human row in a raw user/root session compatible "
+            "with the requested workspace after out-of-band status, side, child/control, and unrelated "
+            "sessions were rejected"
+        )
+        eligible.append(selected)
+        latest_timestamp = row_timestamp_text
+
+    if not eligible:
+        return {
+            "status": "not_found",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": "no_workspace_compatible_parent_session_candidate_for_out_of_band_status",
+            "status_as_of_boundary": status_as_of_boundary,
+            "rejected_anchor_alternatives": rejected[:8],
+        }
+    if len(eligible) != 1:
+        return {
+            "status": "ambiguous",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": "multiple_equally_latest_workspace_compatible_parent_sessions_for_out_of_band_status",
+            "status_as_of_boundary": status_as_of_boundary,
+            "eligible_parent_session_count": len(eligible),
+            "anchor_candidates": eligible[:8],
+            "rejected_anchor_alternatives": [
+                {
+                    **_lineage_rejected_anchor(
+                        candidate,
+                        candidate.get("lineage_resolution") or {},
+                        "equally_latest_parent_session_candidate",
+                    ),
+                    "decision": "ambiguous",
+                }
+                for candidate in eligible[:8]
+            ]
+            + rejected[: max(0, 8 - len(eligible))],
+        }
+
+    selected = eligible[0]
+    selected_identifier = str(selected.get("source_identifier") or "")
+    return {
+        "status": "selected",
+        "contract": "out_of_band_parent_main_anchor",
+        "reason": "unique_latest_workspace_compatible_parent_session_recovered_without_status_boundary",
+        "selection_mode": "canonical_history_session_chronology_recovery",
+        "selected_anchor": selected,
+        "selected_anchor_ref": selected.get("source_ref"),
+        "selected_lineage": selected.get("lineage_resolution"),
+        "selected_session_identifier": selected_identifier,
+        "direct_parent_thread_id_available": False,
+        "eligible_parent_session_count": 1,
+        "anchor_candidates": [selected] + rejected[:7],
+        "rejected_anchor_alternatives": rejected[:8],
+        "selection_policy": (
+            "For out-of-band natural parent/main status asks, select only the unique latest eligible "
+            "canonical history.jsonl human row whose raw session is a user/root session compatible with "
+            "--cwd/workspace roots; reject status, side, child/control, unrelated, and equally latest sessions."
         ),
     }
 
@@ -3108,6 +3342,228 @@ def _current_user_chronology_alternatives(candidates: list[dict], *, limit: int 
             continue
         alternatives.append(_current_user_boundary_candidate(candidate))
     return alternatives
+
+
+def _explicit_anchor_authority_resolution(
+    *,
+    query: str,
+    candidates: list[dict],
+    codex_home: Path | None,
+    latest_messages: list[dict],
+) -> dict:
+    if _wants_message_before_named_anchor(_normalize(query)):
+        return {"status": "not_applicable"}
+    parsed_times = [
+        parsed.astimezone(timezone.utc)
+        for parsed in (
+            parse_datetime(match.group(0).replace(" ", "T"), timezone.utc)
+            for match in _TIMESTAMP_ANCHOR_RE.finditer(query)
+        )
+        if parsed is not None
+    ]
+    quoted_fragments = [
+        _normalize(match.group(1))
+        for match in _QUOTED_ANCHOR_RE.finditer(query)
+        if len(_normalize(match.group(1)).split()) >= 3
+    ]
+    if not parsed_times and not quoted_fragments:
+        return {"status": "not_applicable"}
+
+    rows: list[dict] = []
+    if codex_home is not None:
+        history_path = codex_home / "history.jsonl"
+        if history_path.is_file():
+            rows = _attach_latest_correlation_to_canonical_rows(
+                _canonical_history_human_rows(history_path, query=query),
+                latest_messages,
+            )
+
+    canonical_matches = []
+    canonical_timestamp_matches = []
+    canonical_quote_matches = []
+    rejected_canonical = []
+    for row in rows:
+        timestamp_match, quote_match = _explicit_anchor_match_flags(
+            row,
+            parsed_times=parsed_times,
+            quoted_fragments=quoted_fragments,
+        )
+        if timestamp_match:
+            canonical_timestamp_matches.append(row)
+        if quote_match:
+            canonical_quote_matches.append(row)
+        if parsed_times and not timestamp_match:
+            continue
+        if quoted_fragments and not quote_match:
+            continue
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            rejected_canonical.append(row)
+            continue
+        selected = dict(row)
+        selected["explicit_anchor_reason"] = _explicit_anchor_reason(
+            has_timestamp=bool(parsed_times),
+            has_quote=bool(quoted_fragments),
+        )
+        selected["score"] = max(int(selected.get("score") or 0), _explicit_anchor_score(selected["explicit_anchor_reason"]))
+        canonical_matches.append(selected)
+
+    candidate_diagnostics = []
+    seen_diagnostic_refs = set()
+    for collection in (canonical_matches, rejected_canonical, candidates):
+        for candidate in collection:
+            timestamp_match, quote_match = _explicit_anchor_match_flags(
+                candidate,
+                parsed_times=parsed_times,
+                quoted_fragments=quoted_fragments,
+            )
+            if not timestamp_match and not quote_match:
+                continue
+            ref = str(candidate.get("source_ref") or "")
+            if ref in seen_diagnostic_refs:
+                continue
+            seen_diagnostic_refs.add(ref)
+            candidate_diagnostics.append(_quoted_authority_candidate_diagnostic(candidate))
+            if len(candidate_diagnostics) >= 8:
+                break
+        if len(candidate_diagnostics) >= 8:
+            break
+
+    ambiguous = [
+        candidate
+        for candidate in canonical_matches
+        if str(candidate.get("correlation_status") or "").startswith("ambiguous_")
+    ]
+    if len(canonical_matches) == 1 and not ambiguous:
+        return {
+            "status": "selected",
+            "selection_scope": "full_canonical_history",
+            "selection_rule": (
+                "explicit timestamp/quote anchors require exactly one canonical history.jsonl human row; "
+                "the full history file outranks capped latest-message chronology"
+            ),
+            "selected_anchor": canonical_matches[0],
+            "canonical_candidate_count": 1,
+            "session_candidate_count": _explicit_session_candidate_count(
+                candidates,
+                parsed_times=parsed_times,
+                quoted_fragments=quoted_fragments,
+            ),
+            "timestamp_count": len(parsed_times),
+            "quoted_fragment_count": len(quoted_fragments),
+            "candidate_diagnostics": candidate_diagnostics,
+        }
+
+    reason = _explicit_anchor_ambiguity_reason(
+        canonical_count=len(canonical_matches),
+        ambiguous=bool(ambiguous),
+        has_timestamp=bool(parsed_times),
+        has_quote=bool(quoted_fragments),
+        timestamp_match_count=len(canonical_timestamp_matches),
+        quote_match_count=len(canonical_quote_matches),
+    )
+    return {
+        "status": "ambiguous",
+        "reason": reason,
+        "selection_scope": "full_canonical_history",
+        "selection_rule": (
+            "explicit timestamp/quote anchors require exactly one canonical history.jsonl human row; "
+            "do not fall through to same-thread/current prompt selection"
+        ),
+        "canonical_candidate_count": len(canonical_matches),
+        "session_candidate_count": _explicit_session_candidate_count(
+            candidates,
+            parsed_times=parsed_times,
+            quoted_fragments=quoted_fragments,
+        ),
+        "timestamp_count": len(parsed_times),
+        "quoted_fragment_count": len(quoted_fragments),
+        "candidate_diagnostics": candidate_diagnostics,
+    }
+
+
+def _explicit_anchor_match_flags(
+    candidate: dict,
+    *,
+    parsed_times: list,
+    quoted_fragments: list[str],
+) -> tuple[bool, bool]:
+    timestamp_match = False
+    timestamp = parse_datetime(str(candidate.get("timestamp_utc") or ""), timezone.utc)
+    if timestamp is not None:
+        timestamp_utc = timestamp.astimezone(timezone.utc)
+        timestamp_match = any(abs((timestamp_utc - target).total_seconds()) <= 1 for target in parsed_times)
+    snippet = _normalize(str(candidate.get("snippet") or ""))
+    quote_match = any(fragment and (fragment in snippet or snippet in fragment) for fragment in quoted_fragments)
+    return timestamp_match, quote_match
+
+
+def _explicit_anchor_reason(*, has_timestamp: bool, has_quote: bool) -> str:
+    if has_timestamp and has_quote:
+        return "explicit_timestamp_and_quoted_message_anchor"
+    if has_timestamp:
+        return "explicit_timestamp_anchor"
+    return "unique_canonical_authority_for_quoted_message"
+
+
+def _explicit_anchor_score(reason: str) -> int:
+    if reason == "explicit_timestamp_and_quoted_message_anchor":
+        return 130
+    if reason == "explicit_timestamp_anchor":
+        return 120
+    return 110
+
+
+def _explicit_anchor_ambiguity_reason(
+    *,
+    canonical_count: int,
+    ambiguous: bool,
+    has_timestamp: bool,
+    has_quote: bool,
+    timestamp_match_count: int,
+    quote_match_count: int,
+) -> str:
+    if canonical_count > 1:
+        if has_timestamp and has_quote:
+            return "timestamp_and_quote_matched_multiple_canonical_history_rows"
+        if has_timestamp:
+            return "timestamp_matched_multiple_canonical_history_rows"
+        return "quoted_message_matched_multiple_canonical_history_rows"
+    if ambiguous:
+        return (
+            "quoted_message_canonical_session_correlation_is_ambiguous"
+            if has_quote and not has_timestamp
+            else "explicit_anchor_canonical_session_correlation_is_ambiguous"
+        )
+    if has_timestamp and has_quote and (timestamp_match_count or quote_match_count):
+        return "timestamp_and_quote_did_not_match_the_same_canonical_history_row"
+    if has_timestamp and not has_quote:
+        return "timestamp_anchor_has_no_canonical_history_authority"
+    if has_timestamp and has_quote:
+        return "timestamp_and_quote_have_no_canonical_history_authority"
+    return "quoted_message_has_no_canonical_history_authority"
+
+
+def _explicit_session_candidate_count(
+    candidates: list[dict],
+    *,
+    parsed_times: list,
+    quoted_fragments: list[str],
+) -> int:
+    count = 0
+    for candidate in candidates:
+        if candidate.get("source_kind") == "codex_history":
+            continue
+        timestamp_match, quote_match = _explicit_anchor_match_flags(
+            candidate,
+            parsed_times=parsed_times,
+            quoted_fragments=quoted_fragments,
+        )
+        if parsed_times and not timestamp_match:
+            continue
+        if quoted_fragments and not quote_match:
+            continue
+        count += 1
+    return count
 
 
 def _quoted_anchor_authority_resolution(query: str, candidates: list[dict]) -> dict:
