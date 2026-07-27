@@ -4835,21 +4835,11 @@ def _build_semantic_debug_in_memory_payload(args: argparse.Namespace) -> dict:
         configuration_warnings=_configuration_warnings(source_plan),
     )
     packet = payload["semantic_debug"]
-    if _semantic_debug_is_scoped_no_evidence(packet):
-        compact = _short_semantic_debug_no_evidence_report_written_payload(
-            packet,
-            args.report_output,
-        )["semantic_debug"]
-    else:
-        compact = _short_semantic_debug_report_written_payload(
-            packet,
-            args.report_output,
-        )["semantic_debug"]
-    compact["report_written"] = None
-    compact["message"] = (
+    packet["report_written"] = None
+    packet["message"] = (
         "Semantic-debug completed in memory because the optional report destination was unavailable."
     )
-    return {"semantic_debug": compact}
+    return {"semantic_debug": packet}
 
 
 def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
@@ -5052,11 +5042,15 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
         if isinstance(compact.get("searched_scope"), dict)
         else {}
     )
+    if not searched_scope and no_evidence:
+        searched_scope = _no_evidence_searched_scope_summary(no_evidence)
     scope_counts = (
         compact.get("scope_counts")
         if isinstance(compact.get("scope_counts"), dict)
         else {}
     )
+    if not scope_counts and no_evidence:
+        scope_counts = _no_evidence_scope_counts(no_evidence)
     if status not in {"no_evidence", "not_found_in_searched_scope"} and not no_evidence:
         return {}
 
@@ -8844,7 +8838,10 @@ def _semantic_debug_compact_candidate_count(compact: dict) -> int | None:
         ordering = locator.get("candidate_ordering")
         if isinstance(ordering, dict) and ordering.get("candidate_count") is not None:
             try:
-                return int(ordering.get("candidate_count"))
+                locator_candidate_count = int(ordering.get("candidate_count"))
+                if locator_candidate_count > 0:
+                    return locator_candidate_count
+                parsed_candidate_count = locator_candidate_count
             except (TypeError, ValueError):
                 pass
         next_reads = locator.get("next_reads")
@@ -9021,16 +9018,41 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             ),
         }
     if output_key == "semantic_debug":
+        no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+        searched_scope = (
+            compact.get("searched_scope")
+            if isinstance(compact.get("searched_scope"), dict)
+            else _no_evidence_searched_scope_summary(no_evidence)
+            if no_evidence
+            else None
+        )
+        scope_counts = (
+            compact.get("scope_counts")
+            if isinstance(compact.get("scope_counts"), dict)
+            else _no_evidence_scope_counts(no_evidence)
+            if no_evidence
+            else None
+        )
+        cap_hit = (
+            compact.get("cap_hit")
+            if isinstance(compact.get("cap_hit"), dict)
+            else _no_evidence_cap_hit(no_evidence)
+            if no_evidence
+            else None
+        )
         return {
             "schema_version": compact.get("schema_version"),
             "status": compact.get("status"),
             "report_written": compact.get("report_written"),
             "question_family": compact.get("question_family"),
             "candidate_count": _semantic_debug_compact_candidate_count(compact),
-            "event_count": compact.get("event_count"),
+            "event_count": compact.get("event_count")
+            if compact.get("event_count") is not None
+            else (compact.get("tool_action_proof") or {}).get("event_count"),
             "answer_ready_decision": compact.get("answer_ready_decision")
             or (compact.get("answer_ready_handoff") or {}).get("decision"),
-            "answer_readiness_summary": compact.get("answer_readiness_summary"),
+            "answer_readiness_summary": compact.get("answer_readiness_summary")
+            or summarize_answer_readiness(compact.get("answer_readiness") or {}),
             "historical_orchestration_provenance_final_support_plan": compact.get(
                 "historical_orchestration_provenance_final_support_plan"
             ),
@@ -9058,10 +9080,10 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
-            "searched_scope": compact.get("searched_scope"),
-            "scope_counts": compact.get("scope_counts"),
-            "cap_hit": compact.get("cap_hit"),
-            "no_evidence": compact.get("no_evidence"),
+            "searched_scope": searched_scope,
+            "scope_counts": scope_counts,
+            "cap_hit": cap_hit,
+            "no_evidence": no_evidence or compact.get("no_evidence"),
             "message": compact.get("message"),
         }
     return {
