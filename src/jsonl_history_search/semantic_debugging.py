@@ -6,7 +6,7 @@ import re
 import shlex
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 from statistics import median
@@ -1067,14 +1067,24 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         candidates=source_selection_candidates,
     )
+    in_depth_audit_followthrough = {}
     if in_depth_audit_coverage.get("applies"):
         next_reads = apply_in_depth_audit_read_promotion_safety(
             next_reads,
             coverage=in_depth_audit_coverage,
         )
+        in_depth_audit_followthrough = build_in_depth_audit_followthrough_plan(
+            query=agent_find["query"]["original"],
+            args=args,
+            coverage=in_depth_audit_coverage,
+            scope_boundary_summary=scope_boundary_summary,
+            next_reads=next_reads,
+        )
         source_locator_handoff["next_reads"] = next_reads
         source_locator_handoff["in_depth_audit_coverage"] = in_depth_audit_coverage
+        source_locator_handoff["in_depth_audit_followthrough"] = in_depth_audit_followthrough
         audit_plan["in_depth_audit_coverage"] = in_depth_audit_coverage
+        audit_plan["in_depth_audit_followthrough"] = in_depth_audit_followthrough
         final_answer_contract = apply_in_depth_audit_contract_gate(
             final_answer_contract,
             coverage=in_depth_audit_coverage,
@@ -1087,9 +1097,17 @@ def build_semantic_debug_payload(
             answer_ready_handoff,
             coverage=in_depth_audit_coverage,
         )
+        answer_ready_handoff = apply_in_depth_audit_followthrough_handoff(
+            answer_ready_handoff,
+            followthrough=in_depth_audit_followthrough,
+        )
         agent_instruction = apply_in_depth_audit_agent_instruction_gate(
             agent_instruction,
             coverage=in_depth_audit_coverage,
+        )
+        agent_instruction = apply_in_depth_audit_followthrough_instruction(
+            agent_instruction,
+            followthrough=in_depth_audit_followthrough,
         )
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -1097,6 +1115,7 @@ def build_semantic_debug_payload(
         "query": agent_find["query"]["original"],
         "audit_depth": audit_depth,
         "in_depth_audit_coverage": in_depth_audit_coverage,
+        "in_depth_audit_followthrough": in_depth_audit_followthrough,
         "question_family": family,
         "investigation_state": investigation_state,
         "scope": source_scope,
@@ -1155,6 +1174,7 @@ def build_semantic_debug_payload(
         packet["retrieval_pressure"] = agent_find["retrieval_pressure"]
     if not in_depth_audit_coverage.get("applies"):
         packet.pop("in_depth_audit_coverage", None)
+        packet.pop("in_depth_audit_followthrough", None)
     if source_locator_handoff.get("stage_diagnostics") and packet.get("retrieval_pressure"):
         packet["retrieval_pressure"]["stage_diagnostics"] = source_locator_handoff["stage_diagnostics"]
     if getattr(args, "compact_provenance_handoff", False):
@@ -7482,9 +7502,30 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         raw = record.raw if isinstance(record.raw, dict) else {}
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
         payload_type = str(payload.get("type") or raw.get("type") or "").casefold()
+        raw_role = str(payload.get("role") or raw.get("role") or "").casefold()
         text = provenance_record_text(record, payload)
+        simple_top_level_user_message = bool(
+            raw_role == "user"
+            and text
+            and str(raw.get("type") or "").casefold() != "response_item"
+            and "<subagent_notification>" not in text.casefold()
+            and payload_type
+            not in {
+                "function_call",
+                "tool_call",
+                "custom_tool_call",
+                "function_call_output",
+                "tool_output",
+                "custom_tool_call_output",
+                "tool_result",
+            }
+        )
+        human_authored_message = (
+            classification.label == HUMAN_AUTHORED_USER_MESSAGE
+            or simple_top_level_user_message
+        )
         record_echo_reasons = provenance_original_request_prompt_echo_reasons(text, query=query)
-        if classification.label != HUMAN_AUTHORED_USER_MESSAGE:
+        if not human_authored_message:
             record_echo_reasons = [
                 reason for reason in record_echo_reasons if reason == "post_hoc_gate_or_review_query_echo"
             ]
@@ -7529,7 +7570,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
             )
             source_roles_by_target[target] = "direct_worker_completion"
             continue
-        if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+        if human_authored_message:
             if record_echo_reasons:
                 continue
             original_user_intent_refs.append(
@@ -7541,7 +7582,10 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
                 target=target,
                 text=text,
                 query=query,
-                canonical_message=raw.get("type") == "response_item" and payload_type == "message",
+                canonical_message=(
+                    raw.get("type") == "response_item" and payload_type == "message"
+                )
+                or simple_top_level_user_message,
             )
             if candidate:
                 original_user_intent_candidates.append(candidate)
@@ -13649,6 +13693,191 @@ def apply_in_depth_audit_read_promotion_safety(
     return rows
 
 
+IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT = 4
+
+
+def build_in_depth_audit_followthrough_plan(
+    *,
+    query: str,
+    args: Any,
+    coverage: dict[str, Any],
+    scope_boundary_summary: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not coverage.get("applies"):
+        return {}
+
+    selected_reads = select_in_depth_audit_primary_reads(next_reads)
+    continuation = in_depth_audit_continuation_command(
+        query=query,
+        args=args,
+        coverage=coverage,
+    )
+    continuation_commands = [continuation] if continuation else []
+    coverage_complete = bool(coverage.get("answer_promotion_allowed"))
+    searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
+    not_searched_scope = scope_boundary_summary.get("not_searched_scope") if isinstance(scope_boundary_summary, dict) else {}
+    caps = scope_boundary_summary.get("caps") if isinstance(scope_boundary_summary, dict) else {}
+    stop_rule = (
+        "Open the ordered primary refs first with read-more/source-window inspection when transcript proof is needed. "
+        "The local runtime workflow should use raw transcript/JSONL windows whenever they are the right evidence; "
+        "metadata-only handoff is an efficiency or committed/public artifact mode, not the core retrieval principle. "
+        "If those inspected refs cover the asked facets within the named searched scope, answer with searched-scope/cap "
+        "caveats and stop; do not run broad rg/find/ls, repeat ask --execute, or rerun semantic-debug for the same question."
+    )
+    if not coverage_complete:
+        stop_rule += (
+            " If coverage is still incomplete after the selected refs, run at most the single bounded continuation "
+            "command, then either answer with the remaining gap named or report the blocked/capped window."
+        )
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "coverage_complete_primary_refs_first" if coverage_complete else "coverage_incomplete_primary_refs_first",
+        "audit_depth": coverage.get("audit_depth"),
+        "ordered_primary_refs_to_open_first": selected_reads,
+        "ordered_primary_ref_count": len(selected_reads),
+        "primary_read_limit": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
+        "coverage_state": {
+            "status": coverage.get("status"),
+            "answer_promotion_allowed": coverage.get("answer_promotion_allowed"),
+            "slice_status_counts": coverage.get("slice_status_counts"),
+            "search_cap_hit": coverage.get("search_cap_hit"),
+            "searched_scope": searched_scope,
+            "not_searched_scope": not_searched_scope,
+            "caps": caps,
+            "omitted_or_capped_windows": in_depth_audit_omitted_or_capped_windows(coverage),
+        },
+        "stop_rule": stop_rule,
+        "do_not_do": [
+            "broad rg/find/ls before opening ordered_primary_refs_to_open_first",
+            "repeat ask --execute for the same deep-history question",
+            "repeat semantic-debug for the same question except the single bounded continuation command",
+            "keep expanding read-more after selected refs cover the asked facets",
+            "claim full-history completeness from capped or top-N candidate samples",
+        ],
+        "artifact_and_local_evidence_boundary": {
+            "committed_public_export_surface": "refs_and_commands_without_raw_transcript_text",
+            "local_runtime_evidence_surface": "open_selected_refs_with_read_more_to_inspect_raw_transcript_windows_when_useful",
+            "metadata_only_is_efficiency_or_public_artifact_mode_not_product_principle": True,
+            "raw_window_inspection_available_for_local_proof": True,
+        },
+        "continuation_policy": {
+            "status": "single_bounded_continuation_available" if continuation_commands else "no_bounded_continuation_available",
+            "emit_only_when_coverage_incomplete": not coverage_complete,
+            "max_continuation_commands": 1,
+            "broad_search_recovery_allowed": False,
+        },
+        "continuation_commands": continuation_commands,
+    }
+
+
+def select_in_depth_audit_primary_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_targets: set[str] = set()
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
+            continue
+        target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+        if not target or target in seen_targets:
+            continue
+        seen_targets.add(target)
+        row = dict(read)
+        row["deep_audit_read_role"] = "ordered_primary_ref_to_open_first"
+        row["read_more_actionable"] = True
+        row["followthrough_actionable"] = True
+        rows.append(row)
+        if len(rows) >= IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT:
+            break
+    return rows
+
+
+def in_depth_audit_omitted_or_capped_windows(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for slice_row in coverage.get("slices") or []:
+        if not isinstance(slice_row, dict) or slice_row.get("status") == "complete":
+            continue
+        rows.append(
+            {
+                "slice": slice_row.get("slice"),
+                "status": slice_row.get("status"),
+                "basis": slice_row.get("basis"),
+                "window": slice_row.get("window"),
+                "path_count": slice_row.get("path_count"),
+                "caps_to_retry": slice_row.get("caps_to_retry"),
+                "retry_guidance": slice_row.get("retry_guidance"),
+            }
+        )
+    return rows[:8]
+
+
+def in_depth_audit_continuation_command(
+    *,
+    query: str,
+    args: Any,
+    coverage: dict[str, Any],
+) -> dict[str, Any] | None:
+    if coverage.get("answer_promotion_allowed"):
+        return None
+    slice_row = first_bounded_in_depth_continuation_slice(coverage)
+    if not slice_row:
+        return None
+    window = slice_row.get("window") if isinstance(slice_row.get("window"), dict) else {}
+    argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", "in-depth"]
+    for root in getattr(args, "root", None) or []:
+        argv.extend(["--root", str(root)])
+    cwd = getattr(args, "cwd", None)
+    if cwd:
+        argv.extend(["--cwd", str(cwd)])
+    if getattr(args, "allow_arbitrary_root", False):
+        argv.append("--allow-arbitrary-root")
+    if window.get("type") == "date" and window.get("date"):
+        start, end = in_depth_audit_date_window_bounds(str(window["date"]))
+        if not start or not end:
+            return None
+        argv.extend(["--since", start, "--until", end])
+    elif window.get("type") == "path" and window.get("path"):
+        argv.extend(["--path", str(window["path"])])
+    else:
+        return None
+    return {
+        "command_id": "continue_single_bounded_audit_slice",
+        "slice": slice_row.get("slice"),
+        "missing_or_capped_window": window,
+        "status": slice_row.get("status"),
+        "reason": "coverage incomplete; use this one bounded continuation instead of broad search or repeated semantic-debug churn",
+        "argv": argv,
+        "command": " ".join(shlex.quote(str(part)) for part in argv),
+    }
+
+
+def first_bounded_in_depth_continuation_slice(coverage: dict[str, Any]) -> dict[str, Any] | None:
+    incomplete = [
+        row
+        for row in coverage.get("slices") or []
+        if isinstance(row, dict) and row.get("status") != "complete"
+    ]
+    precise = [
+        row
+        for row in incomplete
+        if isinstance(row.get("window"), dict)
+        and row.get("slice") != "selected_scope"
+        and row["window"].get("type") in {"date", "path"}
+    ]
+    return (precise or incomplete or [None])[0]
+
+
+def in_depth_audit_date_window_bounds(date_text: str) -> tuple[str | None, str | None]:
+    try:
+        start_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        return None, None
+    end_date = start_date + timedelta(days=1)
+    return f"{start_date.date().isoformat()}T00:00:00+00:00", f"{end_date.date().isoformat()}T00:00:00+00:00"
+
+
 def apply_in_depth_audit_contract_gate(contract: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
     if not coverage.get("applies"):
         return contract
@@ -13760,6 +13989,45 @@ def apply_in_depth_audit_handoff_gate(handoff: dict[str, Any], *, coverage: dict
     return row
 
 
+def apply_in_depth_audit_followthrough_handoff(
+    handoff: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not followthrough.get("applies"):
+        return handoff
+    row = dict(handoff)
+    row["in_depth_audit_followthrough"] = followthrough
+    row.setdefault("links", {})
+    row["links"] = {
+        **row["links"],
+        "in_depth_audit_followthrough": "semantic_debug.in_depth_audit_followthrough",
+    }
+    row.setdefault("source_use_summary", {})
+    row["source_use_summary"] = {
+        **row["source_use_summary"],
+        "in_depth_audit_followthrough": {
+            "status": followthrough.get("status"),
+            "ordered_primary_ref_count": followthrough.get("ordered_primary_ref_count"),
+            "continuation_count": len(followthrough.get("continuation_commands") or []),
+            "continuation_policy": followthrough.get("continuation_policy"),
+        },
+    }
+    row["do_next"] = "open_ordered_deep_audit_primary_refs_then_stop_or_single_bounded_continuation"
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "deep_audit_followthrough": {
+            "status": followthrough.get("status"),
+            "ordered_primary_ref_count": followthrough.get("ordered_primary_ref_count"),
+            "continuation_count": len(followthrough.get("continuation_commands") or []),
+        },
+        "stop_condition": followthrough.get("stop_rule"),
+        "broad_search_policy": "do_not_use_rg_find_ls_before_selected_primary_refs",
+    }
+    return row
+
+
 def apply_in_depth_audit_agent_instruction_gate(instruction: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
     if not coverage.get("applies") or coverage.get("answer_promotion_allowed"):
         return instruction
@@ -13786,6 +14054,37 @@ def apply_in_depth_audit_agent_instruction_gate(instruction: dict[str, Any], *, 
         "decision": row["decision"],
         "stop_condition": row["stop_condition"],
         "in_depth_audit_coverage": row["in_depth_audit_coverage"],
+    }
+    return row
+
+
+def apply_in_depth_audit_followthrough_instruction(
+    instruction: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not followthrough.get("applies"):
+        return instruction
+    row = dict(instruction)
+    row["decision"] = "open_deep_audit_primary_refs_first"
+    row["required_next_action"] = "open_ordered_primary_refs_then_stop_or_run_one_bounded_continuation"
+    commands = []
+    for read in followthrough.get("ordered_primary_refs_to_open_first") or []:
+        for action in read.get("expansion_actions") or []:
+            if action.get("mode") == "window":
+                commands.append(action)
+                break
+    row["commands"] = commands[:IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT]
+    row["stop_condition"] = followthrough.get("stop_rule")
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "deep_audit_followthrough": {
+            "status": followthrough.get("status"),
+            "ordered_primary_ref_count": followthrough.get("ordered_primary_ref_count"),
+            "continuation_count": len(followthrough.get("continuation_commands") or []),
+        },
+        "stop_condition": followthrough.get("stop_rule"),
     }
     return row
 
