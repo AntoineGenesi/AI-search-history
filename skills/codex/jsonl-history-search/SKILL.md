@@ -1,26 +1,26 @@
 ---
 name: jsonl-history-search
-description: Use for obvious requests to search prior Codex or Claude conversations, recover what the user previously said, verify what an agent actually did, inspect source provenance, debug a decision from conversation history, or explain why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In the default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command. Start exactly one installed `ask --execute` route and wait for it before answering from visible context.
+description: Use for Codex or Claude conversation search, recovering what the user previously said, verifying agent actions, inspecting provenance, debugging decisions, or explaining why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Explicit "read through all chats/agent history" asks trigger in-depth/exhaustive `semantic-debug`, not quick ask. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
 metadata:
   short-description: Search local AI conversation history
 ---
 
 # JSONL History Search
 
-This skill is a low-context router for local Codex and Claude conversation
-history. Let the CLI choose the detailed route, then inspect the returned source
-references before answering.
+Router for local Codex/Claude history. Let CLI route; inspect refs before
+answering.
 
 ## Activation Gate
 
-Trigger this skill even when the user does not say JSONL or `convo` when the
-request clearly depends on prior AI conversation history. Examples include:
+Trigger even without JSONL or `convo` when the request depends on prior AI
+conversation history. Examples include:
 
 - what the user previously said, requested, corrected, or preferred;
 - what an agent actually ran, changed, tested, or claimed;
 - why a prior decision or failure happened;
 - why a cleanup or multi-step process was deferred, repeated, or failed;
 - which conversation is the source behind a summary or outcome;
+- read through all chats/agent history and find when X or Y happened;
 - `what happened since my last message?`; and
 - the exact automatic trigger `what has happened since my last message in the
   parent thread?`, plus the narrow main-thread/parent-thread variants.
@@ -31,8 +31,8 @@ prompts, local repo/task/artifact status prompts, or generic questions not
 anchored to prior conversation history. Ask one short clarifying question and
 use zero tools when the event or evidence source is ambiguous.
 
-If a user or project instruction sets `JSONL activation mode: explicit-only`,
-natural wording alone is a non-trigger; require a leading `convo`.
+If `JSONL activation mode: explicit-only` is set, natural wording is a
+non-trigger; require a leading `convo`.
 
 ## First Move
 
@@ -45,9 +45,16 @@ For a named `tasks`/`...md`, decide scope before any tool:
 - unresolved scope: ask "Do you want current local Git/task evidence or prior
   conversation history?" and use zero tools.
 
-Preserve the user's wording as one quoted argument. Start exactly one installed
-history route before repository search, Git inspection, or synthesis from
-visible context:
+Preserve user wording as one quoted argument. Start exactly one installed
+history route before repo search, Git, or visible-context synthesis. For
+explicit all-chats/agent-history audit wording, run:
+
+```bash
+jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
+```
+
+Use `--audit-depth exhaustive` only for scoped full coverage; keep
+coverage/cap/omitted-window caveats and fail closed. Otherwise run:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
@@ -69,10 +76,9 @@ with `convo`, `--help`, repository inventory, or another history route.
 
 ## Follow The Route
 
-After the one `ask --execute` process exits, use its selected refs, inspection
-contract, and stop rule. Do not rerun `ask` or start direct `semantic-debug` to
-obtain the same evidence. Read at most the one matching file under `references/`
-when more route guidance is needed:
+After the one `ask --execute` exits, use its selected refs, inspection contract,
+and stop rule. Do not rerun `ask` or direct `semantic-debug` for the same
+evidence. Read at most one matching file under `references/`:
 
 - remembered wording or preference: `references/remembered-instruction.md`;
 - remembered topic or rationale: `references/remembered-topic.md`;
@@ -86,16 +92,16 @@ when more route guidance is needed:
 
 ## Source And Stop Rules
 
-1. Treat CLI summaries as navigation, not as primary proof. Inspect the top
-   source refs or `source_locator_handoff`/`next_reads` named by the result.
+1. Treat CLI summaries as navigation, not as primary proof. Inspect
+   refs or `source_locator_handoff`/`next_reads` named by the result.
 2. Use the emitted command, or open a source window with:
 
    ```bash
    jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text
    ```
 
-3. Prefer original user turns for remembered wording and tool calls, tool
-   outputs, diffs, or commits for action claims. Later summaries are leads.
+3. Prefer original user turns for wording and tool calls, outputs, diffs, or
+   commits for action claims. Later summaries are leads.
 4. State the searched scope and uncertainty. `not_found_in_searched_scope`
    never means the evidence does not exist anywhere.
 5. Stop when inspected primary sources answer the question. Widen or escalate
