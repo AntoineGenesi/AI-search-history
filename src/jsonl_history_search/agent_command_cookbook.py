@@ -102,6 +102,19 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             ),
         },
         {
+            "id": "deep_history_audit",
+            "question_family": "Read all chats/agent history and find when X or Y happened.",
+            "route": "deep-history-audit / semantic-debug",
+            "first_command": (
+                'jsonl-history-search semantic-debug "<question>" --audit-depth in-depth '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "in_depth_audit_coverage, rolling/sliced windows, caps/omitted windows, "
+                "primary raw/session/tool refs, and continuation/read guidance when coverage is incomplete"
+            ),
+        },
+        {
             "id": "bounded_no_evidence",
             "question_family": "Is there evidence for this inside the searched source scope?",
             "route": "bounded-no-evidence / no-evidence-report",
@@ -394,6 +407,8 @@ def _entry_applies_to_route(entry: dict[str, str], route_family: str) -> bool:
         return entry_id == "action_proof"
     if route_family == "storage_retention_forensics":
         return entry_id == "storage_retention_forensics"
+    if route_family == "deep_history_audit":
+        return entry_id == "deep_history_audit"
     if route_family in {"orchestration_provenance", "semantic_debug", "remembered_topic", "process_actual_use"}:
         return entry_id == "source_provenance"
     return False

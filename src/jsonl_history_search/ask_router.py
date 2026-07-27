@@ -20,6 +20,7 @@ from .worktree_currentness import is_worktree_cleanup_currentness_query
 
 EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
     {
+        "deep_history_audit",
         "source_window_semantic_debug",
         "action_proof",
         "process_actual_use",
@@ -274,6 +275,40 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "wrong, capped, missing a required root, or the user asks for weak "
         "context records to be summarized. Preserve the boundary: this proves "
         "not_found_in_searched_scope, not all-history absence."
+    ),
+)
+
+DEEP_HISTORY_AUDIT_ROUTE = AskRoute(
+    route_family="deep_history_audit",
+    chosen_route="deep-history-audit / semantic-debug",
+    why_it_applies=(
+        "The wording asks to read, search, or audit a broad AI conversation "
+        "history scope such as all chats, all agent history, the whole "
+        "conversation history, or events across chats/agents/history. Use an "
+        "explicit semantic-debug audit-depth workflow instead of generic "
+        "ask --execute, latest-status, quick rg, or a quick semantic-debug sample."
+    ),
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.in_depth_audit_coverage windows/slices, searched roots, caps, and omitted windows",
+        "primary raw/session/tool source refs from source_locator_handoff and next_reads",
+        "coverage or cap status before claiming every/all-history completeness",
+        "copyable continuation, read-more, or audit-coverage command when coverage is incomplete",
+    ),
+    stop_guidance=(
+        "Run semantic-debug with explicit --audit-depth in-depth for broad all-chats/agent-history "
+        "audits, or --audit-depth exhaustive only when the wording defines a bounded every/all scope "
+        "that can be treated as a real full-coverage contract. Before answering, inspect primary refs "
+        "and the in_depth_audit_coverage ledger. If caps, omitted windows, unavailable roots, or weak "
+        "coverage prevent completeness, fail closed: state searched scope, caps/omissions, missing "
+        "facets, and the exact continuation/read command. Do not downgrade this family to ask --execute, "
+        "latest-status, broad rg, or local task/status archaeology."
+    ),
+    manual_search_guidance=(
+        "Manual rg or artifact search is follow-up only after the audit-depth route names a missing "
+        "facet or continuation. Preserve searched-scope boundaries and never claim all-history "
+        "completeness from capped/top-N samples."
     ),
 )
 
@@ -855,7 +890,13 @@ def build_ask_router_payload(
     explicit_convo_trigger = _explicit_convo_trigger_query(query) is not None
     named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(query)
-    audit_depth_payload = resolve_audit_depth(structured_execution_query, audit_depth)
+    normalized_route_query = _normalize_for_route(_explicit_convo_trigger_query(query) or query)
+    audit_depth_payload = _route_audit_depth_payload(
+        route=route,
+        normalized_query=normalized_route_query,
+        structured_execution_query=structured_execution_query,
+        requested=audit_depth,
+    )
     if route.route_family in NON_JSONL_COMMAND_ROUTE_FAMILIES:
         if route.route_family == LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY:
             resolution_guidance = (
@@ -1022,6 +1063,45 @@ def _first_command_with_audit_depth(command: str, *, route_family: str, audit_de
     return f"{command}{audit_arg}"
 
 
+def _route_audit_depth_payload(
+    *,
+    route: AskRoute,
+    normalized_query: str,
+    structured_execution_query: str,
+    requested: str | None,
+) -> dict:
+    payload = resolve_audit_depth(structured_execution_query, requested)
+    if route.route_family != "deep_history_audit" or payload.get("source") == "explicit":
+        return payload
+    if _looks_like_scoped_exhaustive_history_audit(normalized_query):
+        return {
+            "depth": "exhaustive",
+            "label": "exhaustive",
+            "contract": "exhaustive_scoped_audit",
+            "source": "inferred_deep_history_audit_route",
+            "requested": None,
+            "reason": (
+                "deep-history audit wording names a bounded every/all scope where "
+                "exhaustive coverage can be treated as a real contract"
+            ),
+        }
+    return {
+        "depth": "in_depth",
+        "label": "in-depth",
+        "contract": "in_depth_audit",
+        "source": "inferred_deep_history_audit_route",
+        "requested": None,
+        "reason": (
+            "broad all-chats/agent-history audit wording requires explicit in-depth "
+            "coverage; exhaustive is withheld until a bounded full-coverage scope is present"
+        ),
+    }
+
+
+def _normalize_for_route(query: str) -> str:
+    return " ".join(query.lower().replace("?", " ").replace("!", " ").split())
+
+
 def classify_ask_route(
     query: str,
     *,
@@ -1090,6 +1170,9 @@ def classify_ask_route(
 
     if _looks_like_current_local_scope_query(normalized):
         return ROUTES[8]
+
+    if _looks_like_deep_history_audit_query(normalized):
+        return DEEP_HISTORY_AUDIT_ROUTE
 
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
@@ -1710,6 +1793,127 @@ def _looks_like_devlog_failure_analysis_query(normalized: str) -> bool:
         )
     )
     return long_form_story or chronology_story
+
+
+def _looks_like_deep_history_audit_query(normalized: str) -> bool:
+    if not normalized:
+        return False
+    if _has_any(
+        normalized,
+        (
+            "git history",
+            "branch history",
+            "commit history",
+            "file history",
+            "repo history",
+            "repository history",
+            "working tree",
+            "worktree",
+            "local status",
+            "cleanliness",
+        ),
+    ):
+        return False
+    broad_history_scope = _has_any(
+        normalized,
+        (
+            "all chats",
+            "all the chats",
+            "all chat history",
+            "all conversation history",
+            "all conversations",
+            "all agent history",
+            "whole conversation history",
+            "entire conversation history",
+            "complete conversation history",
+            "across chats",
+            "across agents",
+            "across agent history",
+            "across history",
+            "across conversations",
+            "across sessions",
+            "through all chats",
+            "through all the chats",
+            "through all agent history",
+            "every conversation in",
+            "every session in",
+        ),
+    )
+    if not broad_history_scope:
+        return False
+    audit_or_search_intent = _has_any(
+        normalized,
+        (
+            "read through",
+            "go through",
+            "look through",
+            "search through",
+            "audit",
+            "inspect",
+            "review",
+            "find when",
+            "find where",
+            "find whether",
+            "find if",
+            "trace when",
+            "trace where",
+            "when did",
+            "where did",
+            "whether",
+        ),
+    )
+    return audit_or_search_intent
+
+
+def _looks_like_scoped_exhaustive_history_audit(normalized: str) -> bool:
+    if not _has_any(normalized, ("every", "all", "fully", "full", "exhaustive")):
+        return False
+    if not _has_any(
+        normalized,
+        (
+            "conversation",
+            "conversations",
+            "session",
+            "sessions",
+            "trace",
+            "traces",
+            "agent",
+            "agents",
+            "subagent",
+            "subagents",
+            "chat",
+            "chats",
+        ),
+    ):
+        return False
+    return _has_any(
+        normalized,
+        (
+            "bounded source scope",
+            "bounded history scope",
+            "selected source scope",
+            "selected root",
+            "specified root",
+            "provided root",
+            "given root",
+            "within this source scope",
+            "within the source scope",
+            "inside this source scope",
+            "inside the source scope",
+            "in this bounded scope",
+            "in the bounded scope",
+            "in this selected root",
+            "in the selected root",
+            "in this provided root",
+            "in the provided root",
+            "in this specified root",
+            "in the specified root",
+            "involved in the prior failure",
+            "involved in this failure",
+            "from this incident",
+            "from the incident",
+        ),
+    )
 
 
 def _looks_like_current_local_scope_query(normalized: str) -> bool:

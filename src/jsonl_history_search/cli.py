@@ -2130,6 +2130,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         command=execution_kind,
         report_output=report_output,
         query=route.get("structured_execution_query") or args.query,
+        audit_depth_override=_selected_route_audit_depth_label(selected_route),
     )
     try:
         Path(report_output).parent.mkdir(parents=True, exist_ok=True)
@@ -2703,6 +2704,7 @@ def _execution_args_from_ask(
     command: str,
     report_output: str,
     query: str | None = None,
+    audit_depth_override: str | None = None,
 ) -> argparse.Namespace:
     values = vars(args).copy()
     values.update(
@@ -2713,9 +2715,21 @@ def _execution_args_from_ask(
             "report_output": report_output,
         }
     )
+    if audit_depth_override is not None:
+        values["audit_depth"] = audit_depth_override
     if command == "artifact-currentness":
         values["artifact_or_query"] = values["query"]
     return argparse.Namespace(**values)
+
+
+def _selected_route_audit_depth_label(selected_route: dict) -> str | None:
+    audit_depth = selected_route.get("audit_depth") or {}
+    if not isinstance(audit_depth, dict):
+        return None
+    if audit_depth.get("source") == "default" and audit_depth.get("depth") == "quick":
+        return None
+    label = audit_depth.get("label")
+    return str(label) if label else None
 
 
 def _args_with_bounded_auto_execute_prompt_scope(args: argparse.Namespace) -> argparse.Namespace:
