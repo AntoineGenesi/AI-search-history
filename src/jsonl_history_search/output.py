@@ -5501,7 +5501,8 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"slice_status_counts={in_depth_coverage.get('slice_status_counts')}"
         )
     lines.extend(render_in_depth_audit_followthrough_text(in_depth_followthrough, command_by_target=command_by_target))
-    lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
+    if not deep_audit_followthrough_active:
+        lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_text(orchestration_role_bundle))
@@ -5820,7 +5821,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"`slice_status_counts={in_depth_coverage.get('slice_status_counts')}`"
         )
     lines.extend(render_in_depth_audit_followthrough_markdown(in_depth_followthrough, command_by_target=command_by_target))
-    lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
+    if not deep_audit_followthrough_active:
+        lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_markdown(orchestration_role_bundle))
