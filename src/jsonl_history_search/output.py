@@ -1764,6 +1764,132 @@ def _render_provenance_direct_proof_projection(report: dict, *, markdown: bool) 
     return _cap_utf8_projection("\n".join(lines), int(handoff.get("output_budget_bytes") or 12_288))
 
 
+def render_in_depth_audit_followthrough_text(
+    plan: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> list[str]:
+    if not plan.get("applies"):
+        return []
+    coverage_state = plan.get("coverage_state") or {}
+    lines = [
+        "Deep-history audit follow-through:",
+        (
+            f"- status: {plan.get('status')} "
+            f"ordered_primary_refs={plan.get('ordered_primary_ref_count', 0)} "
+            f"continuations={len(plan.get('continuation_commands') or [])}"
+        ),
+        (
+            f"- coverage: status={coverage_state.get('status')} "
+            f"promotion_allowed={coverage_state.get('answer_promotion_allowed')} "
+            f"slice_status_counts={coverage_state.get('slice_status_counts')}"
+        ),
+    ]
+    caps = coverage_state.get("caps") or {}
+    search_cap = coverage_state.get("search_cap_hit") or {}
+    lines.append(
+        f"- cap/omitted-window state: hit={search_cap.get('hit', caps.get('hit', False))} "
+        f"caps_hit={','.join(search_cap.get('caps_hit') or caps.get('caps_hit') or []) or 'none'} "
+        f"omitted_or_capped_windows={len(coverage_state.get('omitted_or_capped_windows') or [])}"
+    )
+    searched = coverage_state.get("searched_scope") or {}
+    not_searched = coverage_state.get("not_searched_scope") or {}
+    if searched or not_searched:
+        lines.append(
+            f"- searched scope: files={searched.get('searched_files', 0)} "
+            f"bytes={searched.get('searched_bytes', 0)} "
+            f"missing_roots={not_searched.get('missing_root_count', 0)} "
+            f"deferred_files={not_searched.get('source_plan_deferred_files', 0)}"
+        )
+    evidence_boundary = plan.get("artifact_and_local_evidence_boundary") or {}
+    if evidence_boundary:
+        lines.append(
+            "- artifact/local evidence boundary: committed/public/export artifacts use refs/commands without raw transcript text; "
+            "local runtime opens selected read-more/source windows when transcript evidence is useful"
+        )
+        lines.append("- metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle")
+    lines.append("- ordered primary refs to open first:")
+    reads = list(plan.get("ordered_primary_refs_to_open_first") or [])
+    if not reads:
+        lines.append("  - none surfaced; state the coverage gap instead of broad searching")
+    for read in reads:
+        _append_text_read(lines, read, command_by_target=command_by_target)
+    lines.append(f"- stop rule: {plan.get('stop_rule')}")
+    continuations = list(plan.get("continuation_commands") or [])[:1]
+    if continuations:
+        lines.append("- single bounded continuation only if selected refs leave coverage incomplete:")
+        for continuation in continuations:
+            lines.append(f"  - {continuation.get('command')}")
+    else:
+        lines.append("- continuation: none emitted; do not invent broad rg/find/ls recovery")
+    for item in list(plan.get("do_not_do") or [])[:5]:
+        lines.append(f"- do not: {item}")
+    return lines
+
+
+def render_in_depth_audit_followthrough_markdown(
+    plan: dict,
+    *,
+    command_by_target: dict[str, str] | None = None,
+) -> list[str]:
+    if not plan.get("applies"):
+        return []
+    coverage_state = plan.get("coverage_state") or {}
+    lines = [
+        "",
+        "## Deep-History Audit Follow-Through",
+        "",
+        f"- `status`: `{plan.get('status')}`",
+        f"- `ordered_primary_refs`: `{plan.get('ordered_primary_ref_count', 0)}`",
+        f"- `continuations`: `{len(plan.get('continuation_commands') or [])}`",
+        (
+            f"- `coverage`: `status={coverage_state.get('status')}` "
+            f"`promotion_allowed={coverage_state.get('answer_promotion_allowed')}` "
+            f"`slice_status_counts={coverage_state.get('slice_status_counts')}`"
+        ),
+    ]
+    caps = coverage_state.get("caps") or {}
+    search_cap = coverage_state.get("search_cap_hit") or {}
+    lines.append(
+        f"- `cap/omitted-window state`: `hit={search_cap.get('hit', caps.get('hit', False))}` "
+        f"`caps_hit={','.join(search_cap.get('caps_hit') or caps.get('caps_hit') or []) or 'none'}` "
+        f"`omitted_or_capped_windows={len(coverage_state.get('omitted_or_capped_windows') or [])}`"
+    )
+    searched = coverage_state.get("searched_scope") or {}
+    not_searched = coverage_state.get("not_searched_scope") or {}
+    if searched or not_searched:
+        lines.append(
+            f"- `searched_scope`: `files={searched.get('searched_files', 0)}` "
+            f"`bytes={searched.get('searched_bytes', 0)}` "
+            f"`missing_roots={not_searched.get('missing_root_count', 0)}` "
+            f"`deferred_files={not_searched.get('source_plan_deferred_files', 0)}`"
+        )
+    evidence_boundary = plan.get("artifact_and_local_evidence_boundary") or {}
+    if evidence_boundary:
+        lines.append(
+            "- `artifact/local evidence boundary`: committed/public/export artifacts use refs/commands without raw transcript text; "
+            "local runtime opens selected `read-more`/source windows when transcript evidence is useful"
+        )
+        lines.append("- Metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle.")
+    lines.extend(["", "### Ordered Primary Refs To Open First", ""])
+    reads = list(plan.get("ordered_primary_refs_to_open_first") or [])
+    if not reads:
+        lines.append("- None surfaced; state the coverage gap instead of broad searching.")
+    for read in reads:
+        _append_markdown_read(lines, read, command_by_target=command_by_target)
+    lines.extend(["", "### Stop / Continue Rule", "", f"- Stop rule: {plan.get('stop_rule')}"])
+    continuations = list(plan.get("continuation_commands") or [])[:1]
+    if continuations:
+        lines.append("- Single bounded continuation only if selected refs leave coverage incomplete:")
+        for continuation in continuations:
+            lines.append(f"  - `{continuation.get('command')}`")
+    else:
+        lines.append("- Continuation: none emitted; do not invent broad `rg`/`find`/`ls` recovery.")
+    for item in list(plan.get("do_not_do") or [])[:5]:
+        lines.append(f"- Do not: {item}")
+    return lines
+
+
 def _source_followthrough_direct_evidence_complete(plan: dict) -> bool:
     if not plan:
         return False
@@ -5305,6 +5431,13 @@ def render_semantic_debug_text(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
     in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
+    in_depth_followthrough = (
+        report.get("in_depth_audit_followthrough")
+        or handoff.get("in_depth_audit_followthrough")
+        or (report.get("source_locator_handoff") or {}).get("in_depth_audit_followthrough")
+        or {}
+    )
+    deep_audit_followthrough_active = bool(in_depth_followthrough.get("applies"))
     coverage_blocks_answer = (
         isinstance(in_depth_coverage, dict)
         and in_depth_coverage.get("applies")
@@ -5322,6 +5455,8 @@ def render_semantic_debug_text(payload: dict) -> str:
     stop_condition = (
         source_action_guidance.get("stop_condition")
         if scoped_no_evidence
+        else in_depth_followthrough.get("stop_rule")
+        if deep_audit_followthrough_active
         else followthrough.get("stop_after")
         if suppress_action_required_reads
         else action_proof_plan.get("stop_condition")
@@ -5365,6 +5500,7 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"promotion_allowed={in_depth_coverage.get('answer_promotion_allowed')} "
             f"slice_status_counts={in_depth_coverage.get('slice_status_counts')}"
         )
+    lines.extend(render_in_depth_audit_followthrough_text(in_depth_followthrough, command_by_target=command_by_target))
     lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
@@ -5374,7 +5510,9 @@ def render_semantic_debug_text(payload: dict) -> str:
     if longitudinal_plan and longitudinal_plan.get("applies"):
         lines.extend(render_longitudinal_phase_source_plan_text(longitudinal_plan))
     lines.append("Open these source refs first:")
-    if scoped_no_evidence:
+    if deep_audit_followthrough_active:
+        lines.append("- see Deep-history audit follow-through.ordered_primary_refs_to_open_first above")
+    elif scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
         if source_action_guidance.get("diagnostic_policy"):
             lines.append(f"- diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
@@ -5402,7 +5540,9 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append("- (no source refs surfaced)")
     lines.append(f"Stop condition: {stop_condition}")
     only_continue = (
-        ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
+        []
+        if deep_audit_followthrough_active
+        else ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
         or readiness.get("required_before_answer")
         or []
     )
@@ -5554,6 +5694,12 @@ def render_semantic_debug_text(payload: dict) -> str:
             lines.append("Optional diagnostic next reads (not required before scoped no-evidence answer):")
             for item in report.get("next_reads", [])[:8]:
                 _append_text_read_summary(lines, item)
+        elif deep_audit_followthrough_active:
+            lines.append("Fallback next reads (suppressed for deep-history audit follow-through):")
+            lines.append("- open ordered_primary_refs_to_open_first first; do not use broad search or extra read-more unless a named facet remains missing")
+            lines.append(
+                f"- additional next_reads preserved in JSON/report: {len(report.get('next_reads', []) or [])}"
+            )
         elif followthrough.get("applies"):
             lines.append("Fallback next reads (only if the primary source window leaves a named facet missing):")
             lines.append("- executable fallback commands suppressed in text output; use JSON next_reads only after a named facet gap")
@@ -5612,6 +5758,13 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
     in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
+    in_depth_followthrough = (
+        report.get("in_depth_audit_followthrough")
+        or handoff.get("in_depth_audit_followthrough")
+        or (report.get("source_locator_handoff") or {}).get("in_depth_audit_followthrough")
+        or {}
+    )
+    deep_audit_followthrough_active = bool(in_depth_followthrough.get("applies"))
     coverage_blocks_answer = (
         isinstance(in_depth_coverage, dict)
         and in_depth_coverage.get("applies")
@@ -5629,6 +5782,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     stop_condition = (
         source_action_guidance.get("stop_condition")
         if scoped_no_evidence
+        else in_depth_followthrough.get("stop_rule")
+        if deep_audit_followthrough_active
         else followthrough.get("stop_after")
         if suppress_action_required_reads
         else action_proof_plan.get("stop_condition")
@@ -5664,6 +5819,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"`promotion_allowed={in_depth_coverage.get('answer_promotion_allowed')}` "
             f"`slice_status_counts={in_depth_coverage.get('slice_status_counts')}`"
         )
+    lines.extend(render_in_depth_audit_followthrough_markdown(in_depth_followthrough, command_by_target=command_by_target))
     lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     if orchestration_role_bundle:
@@ -5671,7 +5827,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if longitudinal_plan and longitudinal_plan.get("applies"):
         lines.extend(render_longitudinal_phase_source_plan_markdown(longitudinal_plan))
     lines.extend(["", "## Open These Source Refs First", ""])
-    if scoped_no_evidence:
+    if deep_audit_followthrough_active:
+        lines.append("- See `Deep-History Audit Follow-Through.ordered_primary_refs_to_open_first` above.")
+    elif scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
         if source_action_guidance.get("diagnostic_policy"):
             lines.append(f"- Diagnostic policy: {source_action_guidance.get('diagnostic_policy')}")
@@ -5694,7 +5852,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.append("- No source refs surfaced.")
     lines.extend(["", "## Stop / Continue", "", f"- Stop condition: {stop_condition}"])
     only_continue = (
-        ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
+        []
+        if deep_audit_followthrough_active
+        else ((report.get("answer_ready_handoff") or {}).get("primary_source_followthrough") or {}).get("only_continue_if")
         or readiness.get("required_before_answer")
         or []
     )
@@ -5896,6 +6056,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.append("These are optional diagnostics, not required before the scoped no-evidence answer.")
         for item in report.get("next_reads", [])[:8]:
             _append_markdown_read_summary(lines, item)
+    elif deep_audit_followthrough_active:
+        lines.append("- Suppressed for deep-history audit follow-through.")
+        lines.append(
+            "- Open `ordered_primary_refs_to_open_first` first; do not use broad search or extra `read-more` unless a named facet remains missing."
+        )
+        lines.append(f"- Additional `next_reads` preserved in JSON/report: `{len(report.get('next_reads', []) or [])}`")
     elif followthrough.get("applies"):
         lines.append(
             "- Executable fallback commands suppressed in Markdown output; use JSON `next_reads` only after a named facet gap."
