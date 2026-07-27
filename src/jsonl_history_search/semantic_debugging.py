@@ -7502,9 +7502,30 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
         raw = record.raw if isinstance(record.raw, dict) else {}
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
         payload_type = str(payload.get("type") or raw.get("type") or "").casefold()
+        raw_role = str(payload.get("role") or raw.get("role") or "").casefold()
         text = provenance_record_text(record, payload)
+        simple_top_level_user_message = bool(
+            raw_role == "user"
+            and text
+            and str(raw.get("type") or "").casefold() != "response_item"
+            and "<subagent_notification>" not in text.casefold()
+            and payload_type
+            not in {
+                "function_call",
+                "tool_call",
+                "custom_tool_call",
+                "function_call_output",
+                "tool_output",
+                "custom_tool_call_output",
+                "tool_result",
+            }
+        )
+        human_authored_message = (
+            classification.label == HUMAN_AUTHORED_USER_MESSAGE
+            or simple_top_level_user_message
+        )
         record_echo_reasons = provenance_original_request_prompt_echo_reasons(text, query=query)
-        if classification.label != HUMAN_AUTHORED_USER_MESSAGE:
+        if not human_authored_message:
             record_echo_reasons = [
                 reason for reason in record_echo_reasons if reason == "post_hoc_gate_or_review_query_echo"
             ]
@@ -7549,7 +7570,7 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
             )
             source_roles_by_target[target] = "direct_worker_completion"
             continue
-        if classification.label == HUMAN_AUTHORED_USER_MESSAGE:
+        if human_authored_message:
             if record_echo_reasons:
                 continue
             original_user_intent_refs.append(
@@ -7561,7 +7582,10 @@ def provenance_direct_events_for_path(path: Path, *, query: str) -> dict[str, An
                 target=target,
                 text=text,
                 query=query,
-                canonical_message=raw.get("type") == "response_item" and payload_type == "message",
+                canonical_message=(
+                    raw.get("type") == "response_item" and payload_type == "message"
+                )
+                or simple_top_level_user_message,
             )
             if candidate:
                 original_user_intent_candidates.append(candidate)

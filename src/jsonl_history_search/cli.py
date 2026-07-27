@@ -5332,6 +5332,7 @@ def _answer_action_contract_from_executed_output(
         source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
         provenance_ledger = compact.get("provenance_direct_evidence_facet_ledger") or {}
         provenance_handoff = compact.get("provenance_complete_proof_handoff") or {}
+        provenance_applies = bool(provenance_ledger.get("applies") or provenance_handoff.get("applies"))
         selected_provenance_reads = list(provenance_handoff.get("selected_direct_reads") or [])
         continuation_provenance_reads = list(provenance_handoff.get("continuation_commands") or [])[:1]
         if provenance_handoff.get("active"):
@@ -5462,7 +5463,7 @@ def _answer_action_contract_from_executed_output(
             named_task_action_proof = {}
         route_first_reads = (
             provenance_reads
-            if provenance_ledger.get("applies")
+            if provenance_applies
             else orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")
@@ -5486,7 +5487,7 @@ def _answer_action_contract_from_executed_output(
             "are limited to bounded_no_evidence routes executed through no-evidence-report."
         )
         source_inspection_boundary = None
-        if provenance_ledger.get("applies"):
+        if provenance_applies:
             if provenance_handoff.get("active"):
                 answer_status = "answer-ready-after-source-inspection"
                 promotion_status = "semantic_debug_provenance_direct_proof_ready_after_source_inspection"
@@ -5505,7 +5506,11 @@ def _answer_action_contract_from_executed_output(
                     "diagnostics_default_final_support": False,
                 }
             else:
-                missing_facets = list(provenance_ledger.get("missing_required_facets") or [])
+                missing_facets = list(
+                    provenance_ledger.get("missing_required_facets")
+                    or provenance_handoff.get("missing_required_facets")
+                    or []
+                )
                 answer_status = "not-ready/missing-direct-provenance-facets"
                 promotion_status = "semantic_debug_provenance_direct_proof_fail_closed"
                 promotion_reason = (
@@ -5756,7 +5761,7 @@ def _answer_action_contract_from_executed_output(
                 "default_read_policy": source_followthrough_plan.get("default_read_policy"),
             }
             contract["stop"] = source_followthrough_plan.get("stop_condition") or contract["stop"]
-        if provenance_ledger.get("applies"):
+        if provenance_applies:
             contract["provenance_direct_evidence_facet_ledger"] = provenance_ledger
             contract["provenance_complete_proof_handoff"] = provenance_handoff
             contract["stop"] = provenance_handoff.get("stop_instruction") or contract["stop"]
@@ -8819,6 +8824,46 @@ def _compact_devlog_failure_analysis_for_stdout(failure_analysis: dict) -> dict:
     }
 
 
+def _semantic_debug_compact_candidate_count(compact: dict) -> int | None:
+    parsed_candidate_count: int | None = None
+    candidate_count = compact.get("candidate_count")
+    if candidate_count is not None:
+        try:
+            parsed_candidate_count = int(candidate_count)
+            if parsed_candidate_count > 0:
+                return parsed_candidate_count
+        except (TypeError, ValueError):
+            pass
+    strongest_candidates = compact.get("strongest_candidates")
+    if isinstance(strongest_candidates, list):
+        if strongest_candidates:
+            return len(strongest_candidates)
+        parsed_candidate_count = 0
+    locator = compact.get("source_locator_handoff")
+    if isinstance(locator, dict):
+        ordering = locator.get("candidate_ordering")
+        if isinstance(ordering, dict) and ordering.get("candidate_count") is not None:
+            try:
+                return int(ordering.get("candidate_count"))
+            except (TypeError, ValueError):
+                pass
+        next_reads = locator.get("next_reads")
+        if isinstance(next_reads, list) and next_reads:
+            return len(next_reads)
+    next_reads = compact.get("next_reads")
+    if isinstance(next_reads, list) and next_reads:
+        return len(next_reads)
+    scope_counts = compact.get("scope_counts")
+    if isinstance(scope_counts, dict):
+        selected_root_count = scope_counts.get("selected_root_count")
+        if selected_root_count is not None:
+            try:
+                return int(selected_root_count)
+            except (TypeError, ValueError):
+                pass
+    return parsed_candidate_count
+
+
 def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
     if output_key == "artifact_currentness":
         worktree = compact.get("worktree_currentness") or {}
@@ -8981,7 +9026,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "status": compact.get("status"),
             "report_written": compact.get("report_written"),
             "question_family": compact.get("question_family"),
-            "candidate_count": compact.get("candidate_count"),
+            "candidate_count": _semantic_debug_compact_candidate_count(compact),
             "event_count": compact.get("event_count"),
             "answer_ready_decision": compact.get("answer_ready_decision")
             or (compact.get("answer_ready_handoff") or {}).get("decision"),
@@ -9002,6 +9047,14 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "process_actual_use_bucket_evidence_bundle"
             ),
             "source_followthrough_plan": compact.get("source_followthrough_plan"),
+            "provenance_direct_evidence_facet_ledger": compact.get(
+                "provenance_direct_evidence_facet_ledger"
+            ),
+            "provenance_complete_proof_handoff": compact.get(
+                "provenance_complete_proof_handoff"
+            ),
+            "in_depth_audit_followthrough": compact.get("in_depth_audit_followthrough")
+            or (compact.get("source_locator_handoff") or {}).get("in_depth_audit_followthrough"),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],
@@ -18316,8 +18369,22 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "status": packet["status"],
             "query": packet["query"],
             "audit_depth": packet.get("audit_depth"),
+            "question_family": packet.get("question_family"),
             "report_written": str(Path(report_output).expanduser()),
+            "candidate_count": len(packet.get("strongest_candidates") or []),
+            "event_count": (packet.get("tool_action_proof") or {}).get("event_count"),
             "answer_ready_decision": answer_ready.get("decision"),
+            "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
+            "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
+            "source_followthrough_plan": packet.get("source_followthrough_plan"),
+            "provenance_direct_evidence_facet_ledger": packet.get(
+                "provenance_direct_evidence_facet_ledger"
+            ),
+            "provenance_complete_proof_handoff": packet.get(
+                "provenance_complete_proof_handoff"
+            ),
+            "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
+            "next_reads": packet.get("next_reads", [])[:5],
             "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
             "scope_counts": _no_evidence_scope_counts(no_evidence),
             "cap_hit": _no_evidence_cap_hit(no_evidence),
