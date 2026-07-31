@@ -8,8 +8,7 @@ jsonl-history-search latest-user-messages --cwd "$PWD" --limit 200 --snippet-cha
 jsonl-history-search find "<terms>" --role user --cwd "$PWD" --format text
 ```
 
-For status asks, use the router first. For main/parent wording, require raw
-lineage/history evidence. Visible context and local repository state are not substitutes.
+For status asks, use the router first. For main/parent wording, require raw lineage/history evidence. Visible context and local repository state are not substitutes.
 
 Mine user turns/corrections/reactions as leads, not proof. message timestamp is not capture/report/mtime.
 Open selected assistant/tool detail with bounded `read-more`; validate with

@@ -43,6 +43,7 @@ NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
 LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
 NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY = "named_task_evidence_source_required"
 EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY = "explicit_history_trigger_required"
+RAW_PHRASE_SOURCE_SEARCH_ROUTE_FAMILY = "raw_phrase_source_search"
 NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
     {
         NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
@@ -275,6 +276,36 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "wrong, capped, missing a required root, or the user asks for weak "
         "context records to be summarized. Preserve the boundary: this proves "
         "not_found_in_searched_scope, not all-history absence."
+    ),
+)
+
+RAW_PHRASE_SOURCE_SEARCH_ROUTE = AskRoute(
+    route_family=RAW_PHRASE_SOURCE_SEARCH_ROUTE_FAMILY,
+    chosen_route="raw-phrase-source-search / bulk-line-match",
+    why_it_applies=(
+        "The wording asks for exact/raw phrase search across Claude/Codex/config "
+        "source JSONL material, so use the local bulk phrase candidate generator "
+        "instead of drifting into ad hoc manual grep."
+    ),
+    first_command_template=(
+        '{cli} bulk-line-match --phrase <exact-phrase> '
+        '--cwd "$PWD" --format text'
+    ),
+    read_specialization="bulk-line-match command",
+    inspect_after=(
+        "bulk_line_match.candidates source_ref/target rows for selected exact phrase leads",
+        "bulk_line_match.searched_scope selected roots, caps, warnings, and rejected roots",
+        "selected high-value refs opened with read-more before final provenance claims",
+        "semantic-debug, follow-next-reads, or audit-coverage when the source question needs chronology or coverage proof",
+    ),
+    stop_guidance=(
+        "Run bulk-line-match with repeated --phrase or --phrases-file over selected JSONL roots. "
+        "Treat every row as a lead, not proof; open selected source refs with read-more and use "
+        "semantic-debug/follow-next-reads/audit-coverage before final provenance."
+    ),
+    manual_search_guidance=(
+        "Do not start with broad manual grep for this intent. Manual rg is a targeted fallback only "
+        "after bulk-line-match reports the searched scope, caps, and remaining missing phrase/source facet."
     ),
 )
 
@@ -1128,6 +1159,9 @@ def classify_ask_route(
     if _looks_like_bounded_no_evidence_query(normalized):
         return BOUNDED_NO_EVIDENCE_ROUTE
 
+    if _looks_like_raw_phrase_source_search_query(normalized):
+        return RAW_PHRASE_SOURCE_SEARCH_ROUTE
+
     if _looks_like_explicit_named_local_task_artifact_query(normalized):
         return LOCAL_ARTIFACT_VERIFICATION_ROUTE
 
@@ -1442,6 +1476,42 @@ def _looks_like_storage_retention_forensics_query(normalized: str) -> bool:
     if _has_any(compact, storage_subject_terms) and _has_any(compact, forensic_intent_terms):
         return True
     return False
+
+
+def _looks_like_raw_phrase_source_search_query(normalized: str) -> bool:
+    normalized = normalized.replace("_", " ")
+    search_terms = ("search", "scan", "find", "match", "locate")
+    phrase_terms = (
+        "exact phrase",
+        "exact phrases",
+        "raw phrase",
+        "raw phrases",
+        "literal phrase",
+        "literal phrases",
+        "ocr phrase",
+        "ocr phrases",
+        "screenshot phrase",
+        "screenshot phrases",
+    )
+    source_terms = (
+        "raw claude",
+        "raw codex",
+        "raw jsonl",
+        "jsonl source",
+        "jsonl sources",
+        "config source",
+        "config sources",
+        "claude/config",
+        "claude config",
+        "codex/config",
+        "source-ref",
+        "source refs",
+    )
+    has_phrase_intent = _has_any(normalized, phrase_terms) or (
+        _has_any(normalized, ("exact", "literal", "ocr", "screenshot"))
+        and _has_any(normalized, ("phrase", "phrases"))
+    )
+    return _has_any(normalized, search_terms) and has_phrase_intent and _has_any(normalized, source_terms)
 
 
 def _looks_like_skill_compliance_query(normalized: str) -> bool:

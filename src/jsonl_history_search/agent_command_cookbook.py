@@ -277,6 +277,40 @@ def ask_next_commands(
             },
         ]
 
+    if route_family == "raw_phrase_source_search":
+        return [
+            {
+                "purpose": "generate bulk phrase candidates",
+                "command": selected_first_command,
+                "inspect_next": (
+                    "bulk_line_match.candidates, phrase_id/phrase_text, source_ref/target, match_strength, "
+                    "and searched_scope caps; rows are leads only"
+                ),
+            },
+            {
+                "purpose": "open selected candidate source ref",
+                "command": (
+                    f'{cli_prefix} read-more <source-ref> '
+                    '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+                ),
+                "inspect_next": (
+                    "bounded raw context around a selected phrase candidate before using it as provenance"
+                ),
+            },
+            {
+                "purpose": "validate chronology or provenance when needed",
+                "command": f'{cli_prefix} semantic-debug "<question>" --cwd "$PWD" --format text',
+                "inspect_next": (
+                    "source_locator_handoff, next_reads, and audit/coverage warnings before final provenance"
+                ),
+            },
+            {
+                "purpose": "check remaining coverage gaps",
+                "command": f'{cli_prefix} audit-coverage --cwd "$PWD" --format text',
+                "inspect_next": "searched-scope metadata and omitted/capped windows before declaring absence or completeness",
+            },
+        ]
+
     commands: list[dict[str, Any]] = [
         {
             "purpose": "run selected first route",
