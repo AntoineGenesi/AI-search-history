@@ -18467,15 +18467,6 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "answer_ready_decision": answer_ready.get("decision"),
             "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
-            "source_followthrough_plan": packet.get("source_followthrough_plan"),
-            "provenance_direct_evidence_facet_ledger": packet.get(
-                "provenance_direct_evidence_facet_ledger"
-            ),
-            "provenance_complete_proof_handoff": packet.get(
-                "provenance_complete_proof_handoff"
-            ),
-            "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
-            "next_reads": packet.get("next_reads", [])[:5],
             "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
             "scope_counts": _no_evidence_scope_counts(no_evidence),
             "cap_hit": _no_evidence_cap_hit(no_evidence),
