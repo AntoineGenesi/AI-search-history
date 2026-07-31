@@ -77,6 +77,9 @@ ADMIN_STATUS_MARKERS = (
     "side thread",
     "latest admin",
     "last message",
+    "what did i say",
+    "what did i tell you",
+    "yet to do",
     "last substantive instruction",
     "last substantive message",
     "last real instruction",
@@ -94,6 +97,38 @@ ADMIN_STATUS_MARKERS = (
     "before hte last time",
     "time before that",
     "previous relevant time window",
+)
+
+STATUS_FOLLOWUP_META_OPENERS = (
+    "and just to confirm",
+    "and then after all that",
+    "after all that",
+    "just to confirm",
+    "to confirm",
+    "also ",
+    "oh yeah",
+    "one more thing",
+)
+
+STATUS_FOLLOWUP_META_MARKERS = (
+    "/usage",
+    "\\usage",
+    "usage credit",
+    "usage credits",
+    "usage reset",
+    "usage limit reset",
+    "banked usage",
+    "redeem",
+    "redemption",
+    "expires",
+    "cron",
+    "tmux",
+    "timer",
+    "alert",
+    "operator",
+    "spawn",
+    "codex job",
+    "continue with your work",
 )
 
 NON_ANCHOR_CONTEXT_MARKERS = (
@@ -743,6 +778,8 @@ def _score_anchor(text: str, index: int, *, timestamp_utc: str = "", status_cuto
         return -55 - recency_penalty, "worker_or_reviewer_prompt", "rejected", "worker/reviewer prompt is not a human status anchor"
     if any(marker in normalized for marker in ADMIN_STATUS_MARKERS):
         return -30 - recency_penalty, "admin_or_status_turn", "rejected", "admin/status turn is useful context but a poor unattended-work anchor"
+    if _looks_like_status_followup_meta_turn(normalized):
+        return -28 - recency_penalty, "followup_or_meta_control_turn", "rejected", "recent follow-up/control-meta turn is not the unattended-work anchor"
     if status_cutoff and timestamp_utc and timestamp_utc > status_cutoff:
         return -40 - recency_penalty, "post_status_context", "rejected", "newer than the status question; context, not the since-anchor"
     work_hits = [marker for marker in SUBSTANTIVE_WORK_MARKERS if marker in normalized]
@@ -2193,7 +2230,11 @@ def _recover_out_of_band_parent_main_anchor(
             row_timestamp_text = row_timestamp.isoformat(timespec="seconds")
         else:
             row_timestamp_text = str(row.get("timestamp_utc") or "")
-        if latest_timestamp is not None and row_timestamp_text < latest_timestamp:
+        if (
+            latest_timestamp is not None
+            and row_timestamp_text < latest_timestamp
+            and _eligible_parent_anchor_window_has_substantive(eligible)
+        ):
             break
         if _is_never_anchor(row) or not _is_eligible_anchor(row):
             if len(rejected) < 8:
@@ -2236,6 +2277,54 @@ def _recover_out_of_band_parent_main_anchor(
             "reason": "no_workspace_compatible_parent_session_candidate_for_out_of_band_status",
             "status_as_of_boundary": status_as_of_boundary,
             "rejected_anchor_alternatives": rejected[:8],
+        }
+    selection = _select_out_of_band_parent_main_anchor(eligible)
+    if selection.get("status") == "selected":
+        selected = selection["selected_anchor"]
+        selected_identifier = str(selected.get("source_identifier") or "")
+        return {
+            "status": "selected",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": selection.get("reason") or "unique_latest_workspace_compatible_parent_session_recovered_without_status_boundary",
+            "selection_mode": "canonical_history_session_chronology_recovery",
+            "selected_anchor": selected,
+            "selected_anchor_ref": selected.get("source_ref"),
+            "selected_lineage": selected.get("lineage_resolution"),
+            "selected_session_identifier": selected_identifier,
+            "direct_parent_thread_id_available": False,
+            "eligible_parent_session_count": len(eligible),
+            "anchor_candidates": (
+                [selected]
+                + [item for item in eligible if item.get("source_ref") != selected.get("source_ref")]
+                + rejected
+            )[:8],
+            "rejected_anchor_alternatives": rejected[:8],
+            "selection_policy": (
+                "For out-of-band natural parent/main status asks, select only a workspace-compatible "
+                "canonical history.jsonl human row. When the newest compatible row is a weak continuation/control "
+                "follow-up, prefer an older substantive anchor separated by elapsed-time or turn-gap evidence."
+            ),
+        }
+    if selection.get("status") == "ambiguous":
+        return {
+            "status": "ambiguous",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": selection.get("reason") or "out_of_band_parent_main_anchor_not_unique",
+            "status_as_of_boundary": status_as_of_boundary,
+            "eligible_parent_session_count": len(eligible),
+            "anchor_candidates": eligible[:8],
+            "rejected_anchor_alternatives": [
+                {
+                    **_lineage_rejected_anchor(
+                        candidate,
+                        candidate.get("lineage_resolution") or {},
+                        "equally_latest_parent_session_candidate",
+                    ),
+                    "decision": "ambiguous",
+                }
+                for candidate in eligible[:8]
+            ]
+            + rejected[: max(0, 8 - len(eligible))],
         }
     if len(eligible) != 1:
         return {
@@ -2280,6 +2369,77 @@ def _recover_out_of_band_parent_main_anchor(
             "--cwd/workspace roots; reject status, side, child/control, unrelated, and equally latest sessions."
         ),
     }
+
+
+def _eligible_parent_anchor_window_has_substantive(eligible: list[dict]) -> bool:
+    return any(item.get("classification") == "substantive_work_anchor" for item in eligible)
+
+
+def _select_out_of_band_parent_main_anchor(eligible: list[dict]) -> dict:
+    if not eligible:
+        return {"status": "not_found"}
+    latest = eligible[0]
+    substantive = [item for item in eligible if item.get("classification") == "substantive_work_anchor"]
+    if substantive:
+        selected = substantive[0]
+        if selected.get("source_ref") != latest.get("source_ref") and not _parent_resume_should_prefer_older_substantive(
+            latest,
+            selected,
+        ):
+            selected = latest
+        elif selected.get("source_ref") != latest.get("source_ref"):
+            selected = dict(selected)
+            selected["rationale"] = (
+                str(selected.get("rationale") or "").rstrip()
+                + "; selected over newer weak continuation/control follow-up by status-resume substantive-anchor priority"
+            )
+            selected["status_resume_selection_reason"] = "older_substantive_over_recent_continuation_followup"
+        return {
+            "status": "selected",
+            "reason": (
+                "older_substantive_parent_main_anchor_over_recent_continuation_followup"
+                if selected.get("source_ref") != latest.get("source_ref")
+                else "unique_latest_workspace_compatible_parent_session_recovered_without_status_boundary"
+            ),
+            "selected_anchor": selected,
+        }
+
+    latest_timestamp = str(latest.get("timestamp_utc") or "")
+    equally_latest = [
+        item
+        for item in eligible
+        if str(item.get("timestamp_utc") or "") == latest_timestamp
+    ]
+    if len(equally_latest) > 1:
+        return {
+            "status": "ambiguous",
+            "reason": "multiple_equally_latest_workspace_compatible_parent_sessions_for_out_of_band_status",
+        }
+    if _looks_like_status_followup_meta_turn(_normalize(str(latest.get("snippet") or ""))):
+        return {
+            "status": "ambiguous",
+            "reason": "recent_continuation_followup_without_older_substantive_parent_anchor",
+        }
+    return {
+        "status": "selected",
+        "reason": "unique_latest_workspace_compatible_parent_session_recovered_without_status_boundary",
+        "selected_anchor": latest,
+    }
+
+
+def _parent_resume_should_prefer_older_substantive(latest: dict, selected: dict) -> bool:
+    latest_class = latest.get("classification")
+    if latest_class not in {"ordinary_human_turn", "short_human_turn", "followup_or_meta_control_turn"}:
+        return False
+    if _looks_like_status_followup_meta_turn(_normalize(str(latest.get("snippet") or ""))):
+        return True
+    elapsed = _elapsed_seconds_between(selected, latest)
+    if elapsed is not None and elapsed >= 60 * 60:
+        return True
+    try:
+        return abs(int(selected.get("line") or 0) - int(latest.get("line") or 0)) >= 4
+    except (TypeError, ValueError):
+        return False
 
 
 def _parent_thread_lineage_anchor_resolution(
@@ -3952,6 +4112,7 @@ def _is_never_anchor(candidate: dict) -> bool:
         "non_human_boundary_or_tool_context",
         "worker_or_reviewer_prompt",
         "admin_or_status_turn",
+        "followup_or_meta_control_turn",
         "post_status_context",
     }
 
@@ -3968,6 +4129,7 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
             "admin_or_status_turn",
             "worker_or_reviewer_prompt",
             "non_human_boundary_or_tool_context",
+            "followup_or_meta_control_turn",
             "post_status_context",
         }:
             alternative = {
@@ -4094,6 +4256,33 @@ def _looks_like_task_prompt(normalized: str) -> bool:
         or "eval" in normalized
     )
     return taskish and role_or_process
+
+
+def _looks_like_status_followup_meta_turn(normalized: str) -> bool:
+    if not normalized:
+        return False
+    has_opener = any(marker in normalized for marker in STATUS_FOLLOWUP_META_OPENERS)
+    matched_markers = [marker for marker in STATUS_FOLLOWUP_META_MARKERS if marker in normalized]
+    if has_opener and matched_markers:
+        return True
+    if "after all that" in normalized and "continue with your work" in normalized:
+        return True
+    words = normalized.split()
+    if normalized.startswith(("ok keep going", "ok keep coordinating")):
+        return True
+    if normalized in {"keep coordinating", "keep going"}:
+        return True
+    if normalized.startswith("keep coordinating") and len(words) <= 6:
+        return True
+    if normalized.startswith(("no dont creat", "no dont create")):
+        return True
+    if "usage" in normalized and "redemption" in normalized:
+        return True
+    if "usage" in normalized and "redeem" in normalized and ("reset" in normalized or "credit" in normalized):
+        return True
+    if "codex that you spawn" in normalized and "redeem" in normalized:
+        return True
+    return "cron job" in normalized and "usage" in normalized and "codex" in normalized
 
 
 def _mirror_source_looks_like_prompt_noise(mirror: object) -> bool:
