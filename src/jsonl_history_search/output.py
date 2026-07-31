@@ -32,6 +32,8 @@ def render_text(payload: dict) -> str:
         return render_ask_execute_text(payload)
     if "ask_router" in payload:
         return render_ask_router_text(payload)
+    if "bulk_line_match" in payload:
+        return render_bulk_line_match_text(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_text(payload)
     if "latest_user_messages" in payload:
@@ -183,6 +185,8 @@ def render_markdown(payload: dict) -> str:
         return render_ask_execute_markdown(payload)
     if "ask_router" in payload:
         return render_ask_router_markdown(payload)
+    if "bulk_line_match" in payload:
+        return render_bulk_line_match_markdown(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_markdown(payload)
     if "latest_user_messages" in payload:
@@ -463,6 +467,43 @@ def render_ask_router_text(payload: dict) -> str:
             f"Boundary: {report.get('boundary')}",
         ]
     )
+    return "\n".join(lines)
+
+
+def render_bulk_line_match_text(payload: dict) -> str:
+    report = payload["bulk_line_match"]
+    scope = report.get("searched_scope") or {}
+    lines = [
+        "Bulk Line Match",
+        f"Status: {report.get('status')}",
+        f"Candidate role: {report.get('candidate_role')}",
+        f"Validation: {report.get('validation_guidance')}",
+        f"Phrases: {report.get('phrase_count', 0)}",
+        (
+            "Searched: "
+            f"{scope.get('searched_files', 0)} files, "
+            f"{scope.get('searched_lines', 0)} lines, "
+            f"{scope.get('searched_bytes', 0)} bytes"
+        ),
+        f"Caps: {', '.join(scope.get('cap_labels') or []) or '(none)'}",
+        f"Candidates: {report.get('candidate_count', 0)}",
+    ]
+    for candidate in report.get("candidates", [])[:20]:
+        lines.append(
+            "- "
+            f"{candidate.get('phrase_id')} {candidate.get('match_status')} {candidate.get('match_strength')} "
+            f"{candidate.get('target')} fields={','.join(candidate.get('matched_fields') or [])}"
+        )
+        if candidate.get("snippet"):
+            lines.append(f"  {candidate.get('snippet')}")
+    if report.get("validation_commands"):
+        lines.append("Validation commands:")
+        for command in report.get("validation_commands", []):
+            lines.append(f"- {command}")
+    for warning in scope.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    for blind in scope.get("blind_spots") or []:
+        lines.append(f"Blind spot: {blind}")
     return "\n".join(lines)
 
 
@@ -1427,6 +1468,42 @@ def render_ask_router_markdown(payload: dict) -> str:
             f"- Boundary: {report.get('boundary')}",
         ]
     )
+    return "\n".join(lines)
+
+
+def render_bulk_line_match_markdown(payload: dict) -> str:
+    report = payload["bulk_line_match"]
+    scope = report.get("searched_scope") or {}
+    lines = [
+        "# Bulk Line Match",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Candidate role: `{report.get('candidate_role')}`",
+        f"- Validation: {report.get('validation_guidance')}",
+        f"- Phrases: `{report.get('phrase_count', 0)}`",
+        (
+            "- Searched: "
+            f"`{scope.get('searched_files', 0)}` files, "
+            f"`{scope.get('searched_lines', 0)}` lines, "
+            f"`{scope.get('searched_bytes', 0)}` bytes"
+        ),
+        f"- Caps: `{', '.join(scope.get('cap_labels') or []) or '(none)'}`",
+        f"- Candidates: `{report.get('candidate_count', 0)}`",
+        "",
+        "## Candidates",
+        "",
+    ]
+    for candidate in report.get("candidates", [])[:20]:
+        lines.append(
+            "- "
+            f"`{candidate.get('phrase_id')}` `{candidate.get('match_status')}` `{candidate.get('match_strength')}` "
+            f"`{candidate.get('target')}` fields=`{','.join(candidate.get('matched_fields') or [])}`"
+        )
+        if candidate.get("snippet"):
+            lines.append(f"  {candidate.get('snippet')}")
+    lines.extend(["", "## Validation Commands", ""])
+    for command in report.get("validation_commands", []):
+        lines.append(f"- `{command}`")
     return "\n".join(lines)
 
 

@@ -34,6 +34,7 @@ from .agent_loop_cost import (
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .ask_router import build_ask_router_payload, execution_kind_for_route_family
 from .capability_diagnostic import build_capability_diagnostic
+from .bulk_line_matcher import build_bulk_line_match_payload, load_phrase_specs
 from .agent_skill_install import (
     SUPPORTED_AGENTS,
     default_agent_home,
@@ -182,6 +183,7 @@ Launch-facing commands:
   diagnose-capabilities  Report installed core and optional capabilities.
   ask                    Route a natural-language prompt to the first JSONL command.
   semantic-debug         Main evidence workflow for memory, action proof, provenance, and no-evidence questions.
+  bulk-line-match        Local bulk literal phrase candidate generation for selected JSONL roots.
   read-more              Open bounded context for an exact source ref.
   follow-next-reads      Expand saved next_reads from a JSON report without rerunning search.
   find                   Focused candidate recovery when the full semantic-debug packet is unnecessary.
@@ -206,7 +208,7 @@ Internal command groups:
   Agent-facing front doors:
     ask, semantic-debug, what-happened-since, semantic-wrapup,
     artifact-currentness, skill-check/skill-audit, no-evidence-report,
-    read-more, follow-next-reads, find
+    bulk-line-match, read-more, follow-next-reads, find
   Local diagnostics:
     validate-install, diagnose-capabilities, discover-jsonl,
     structured-tool-events, workflow-repeat-finder, forensics,
@@ -437,6 +439,37 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the full budgeted structural hybrid find report should be written.",
+    )
+    bulk_line_match = subparsers.add_parser(
+        "bulk-line-match",
+        description=(
+            "Local single-pass literal phrase matcher for many OCR/screenshot/source phrases. "
+            "Emits candidate refs only; validate selected refs with semantic-debug/read-more/"
+            "follow-next-reads/audit-coverage."
+        ),
+    )
+    add_common_args(bulk_line_match)
+    bulk_line_match.add_argument(
+        "--phrase",
+        action="append",
+        default=[],
+        help="Exact phrase to search for. Repeat for bulk batches.",
+    )
+    bulk_line_match.add_argument(
+        "--phrases-file",
+        default=None,
+        help="UTF-8 file containing one exact phrase per nonblank, non-comment line.",
+    )
+    bulk_line_match.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Require case-sensitive literal substring matches. Default is case-insensitive literal matching.",
+    )
+    bulk_line_match.add_argument(
+        "--snippet-chars",
+        type=int,
+        default=260,
+        help="Maximum candidate snippet characters; 0 keeps the parsed record text.",
     )
     latest_user = subparsers.add_parser(
         "latest-user-messages",
@@ -17494,6 +17527,42 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["jsonl_candidate_discovery"]["status"]
         return 1 if status in {"no_roots", "root_rejected"} else 0
+    if args.command == "bulk-line-match":
+        cwd = Path(args.cwd).expanduser().resolve()
+        codex_home = _history_home_from_args(args, provider="codex")
+        claude_home = _history_home_from_args(args, provider="claude")
+        limits = Limits(
+            max_files=args.max_files,
+            max_bytes=args.max_bytes,
+            max_matches=args.max_matches,
+            max_elapsed=args.max_elapsed,
+            hard_cap_files=args.hard_cap_files,
+            hard_cap_bytes=args.hard_cap_bytes,
+        )
+        plan = build_source_plan(
+            cwd=cwd,
+            codex_home=codex_home,
+            claude_home=claude_home,
+            roots=[Path(item).expanduser() for item in args.root] if args.root else None,
+            allow_arbitrary_root=args.allow_arbitrary_root,
+            limits=limits,
+        )
+        try:
+            phrases = load_phrase_specs(
+                phrases=args.phrase,
+                phrases_file=Path(args.phrases_file).expanduser() if args.phrases_file else None,
+            )
+        except OSError as exc:
+            print(f"bulk-line-match failed: {exc}", file=sys.stderr)
+            return 2
+        payload = build_bulk_line_match_payload(
+            plan=plan,
+            phrases=phrases,
+            case_sensitive=args.case_sensitive,
+            snippet_chars=args.snippet_chars,
+        )
+        print(render(payload, args.format))
+        return 2 if payload["bulk_line_match"]["status"] == "blocked" else 0
     if args.command == "metadata-discovery":
         _source_plan, _intent, plan = payload_from_args(args)
         payload = build_generated_metadata_discovery_report(
@@ -18398,15 +18467,6 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "answer_ready_decision": answer_ready.get("decision"),
             "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
-            "source_followthrough_plan": packet.get("source_followthrough_plan"),
-            "provenance_direct_evidence_facet_ledger": packet.get(
-                "provenance_direct_evidence_facet_ledger"
-            ),
-            "provenance_complete_proof_handoff": packet.get(
-                "provenance_complete_proof_handoff"
-            ),
-            "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
-            "next_reads": packet.get("next_reads", [])[:5],
             "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
             "scope_counts": _no_evidence_scope_counts(no_evidence),
             "cap_hit": _no_evidence_cap_hit(no_evidence),

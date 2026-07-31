@@ -967,10 +967,12 @@ def follow_next_read_priority_key(read: dict[str, Any]) -> tuple[int, int, str]:
         role_tier = 9
     else:
         role_tier = 4
-    recovery_id = str((read.get("omitted_window_recovery") or {}).get("recovery_id") or "")
+    raw_recovery = read.get("omitted_window_recovery")
+    recovery = raw_recovery if isinstance(raw_recovery, dict) else {}
+    recovery_id = str(recovery.get("recovery_id") or "")
     if recovery_id.startswith("clr"):
         tier = min(role_tier, 2)
-    elif read.get("omitted_window_recovery"):
+    elif raw_recovery:
         tier = min(role_tier, 3)
     else:
         tier = role_tier

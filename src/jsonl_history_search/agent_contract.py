@@ -1261,7 +1261,10 @@ def build_stage_diagnostics(
                 ),
                 "evidence_packet_count": int(evidence_packet_summary.get("packet_count") or 0),
                 "evidence_packet_limit": int(evidence_packet_summary.get("packet_limit") or EVIDENCE_PACKET_LIMIT),
-                "evidence_packet_child_count": int(evidence_packet_summary.get("hit_child_count") or 0),
+                "evidence_packet_child_count": max(
+                    int(evidence_packet_summary.get("hit_child_count") or 0),
+                    int(evidence_packet_summary.get("context_record_count") or 0),
+                ),
                 "evidence_packet_context_ref_count": int(evidence_packet_summary.get("context_record_count") or 0),
                 "evidence_packet_omitted_child_count": int(evidence_packet_summary.get("omitted_child_count") or 0),
                 "evidence_packet_deduplicated_child_count": int(
@@ -3983,6 +3986,12 @@ def build_evidence_packet_package(
         }
 
     normalized = normalize_evidence_packet_candidates(candidates)
+    context_normalized = normalize_evidence_packet_candidates(
+        fielded_selected_context_candidates(search_result)
+    )
+    context_by_group: dict[str, list[dict[str, Any]]] = {}
+    for item in context_normalized:
+        context_by_group.setdefault(str(item["group_key"]), []).append(item)
     groups: dict[str, dict[str, Any]] = {}
     duplicate_child_count = 0
     for item in normalized:
@@ -4039,7 +4048,15 @@ def build_evidence_packet_package(
         )
         hit_children = [evidence_packet_hit_child(child) for child in children[:EVIDENCE_PACKET_CHILD_LIMIT]]
         omitted_children_by_child_limit += max(0, len(children) - len(hit_children))
-        context_records_all = [evidence_packet_context_record(child) for child in children]
+        context_children = sorted(
+            dedupe_evidence_packet_context_children(context_by_group.get(str(group["group_key"])) or children),
+            key=lambda item: (
+                evidence_packet_line_sort_key(item["source_ref"]),
+                int(item["rank"]),
+                str(item["candidate_id"]),
+            ),
+        )
+        context_records_all = [evidence_packet_context_record(child) for child in context_children]
         context_records = context_records_all[:EVIDENCE_PACKET_CONTEXT_RECORD_LIMIT]
         omitted_context_records += max(0, len(context_records_all) - len(context_records))
         materialized_context = materialize_evidence_packet_context(
@@ -4059,10 +4076,10 @@ def build_evidence_packet_package(
             materialized_context_read_error_count += 1
         line_values = [
             evidence_packet_numeric_line(child["source_ref"].get("line"))
-            for child in children
+            for child in context_children
             if evidence_packet_numeric_line(child["source_ref"].get("line")) is not None
         ]
-        days = sorted({str(child.get("day")) for child in children if child.get("day")})
+        days = sorted({str(child.get("day")) for child in context_children if child.get("day")})
         packet = {
             "schema_version": 1,
             "packet_id": f"ep{packet_index:03d}",
@@ -4180,6 +4197,30 @@ def build_evidence_packet_package(
         ),
     }
     return {"packets": packets, "packaging": packaging}
+
+
+def fielded_selected_context_candidates(search_result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = search_result.get("_fielded_selected_context_refs") if isinstance(search_result, dict) else None
+    if not isinstance(rows, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            candidates.append(row)
+    return candidates
+
+
+def dedupe_evidence_packet_context_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for child in children:
+        source_ref = child.get("source_ref") if isinstance(child.get("source_ref"), dict) else {}
+        key = (str(source_ref.get("path") or ""), str(source_ref.get("line") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(child)
+    return deduped
 
 
 def normalized_evidence_passage(

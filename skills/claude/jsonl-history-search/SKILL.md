@@ -1,29 +1,28 @@
 ---
 name: jsonl-history-search
-description: Search local Codex/Claude history: prior user wording, action proof, provenance, decisions, and why cleanup/process was deferred or failed. For named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope gets one question with zero tools. In default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Explicit "read through all chats/agent history" asks trigger in-depth/exhaustive `semantic-debug`. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
+description: Search local Codex/Claude history for prior wording/provenance and why cleanup/process was deferred or failed. For named `tasks`/`...md`, use `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or one question with zero tools for unresolved scope. In implicit mode, `what has happened since my last message in the parent thread?` is exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
 metadata:
-  short-description: Search local AI conversation history
+  short-description: Search local AI history
 ---
 
 # JSONL History Search
 
-Router for local Codex/Claude history. Let CLI route; inspect refs before
-answering.
+Router for local Codex/Claude history. Inspect refs before answering.
 
 ## Activation Gate
 
 Trigger even without JSONL or `convo` when the request depends on prior AI
-conversation history. Examples include:
+conversation history. Examples:
 
 - what the user previously said, requested, corrected, or preferred;
 - what an agent actually ran, changed, tested, or claimed;
-- why a prior decision or failure happened;
+- why a decision or failure happened;
 - why a cleanup or multi-step process was deferred, repeated, or failed;
-- which conversation is the source behind a summary or outcome;
+- which conversation sourced a summary or outcome;
 - read through all chats/agent history and find when X or Y happened;
 - `what happened since my last message?`; and
 - the exact automatic trigger `what has happened since my last message in the
-  parent thread?`, plus the narrow main-thread/parent-thread variants.
+  parent thread?`.
 
 The trigger is intentionally narrow. Do not trigger for bare `what happened?`,
 `what changed in this task file?`, ordinary branch/cleanliness/local-status
@@ -104,11 +103,14 @@ evidence. Read at most one matching file under `references/`:
 
 3. Prefer original user turns for wording and tool calls, outputs, diffs, or
    commits for action claims. Later summaries are leads.
-4. State the searched scope and uncertainty. `not_found_in_searched_scope`
+4. For many exact screenshot/OCR/source phrases, use `bulk-line-match` with
+   `--phrase`/`--phrases-file`; rows are leads, not proof. Validate selected
+   refs with `read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage`.
+5. State the searched scope and uncertainty. `not_found_in_searched_scope`
    never means the evidence does not exist anywhere.
-5. Stop when inspected primary sources answer the question. Widen or escalate
+6. Stop when inspected primary sources answer the question. Widen or escalate
    only for a named missing facet. If primary evidence is absent, capped,
    ambiguous, or contradictory, fail closed and say what remains unproved.
-6. Explicit full/deep history audits must preserve CLI audit-depth coverage
+7. Explicit full/deep history audits must preserve CLI audit-depth coverage
    caveats; ordinary prompts and status/local questions stay quick.
-7. Never modify, delete, publish, or upload conversation data.
+8. Never modify, delete, publish, or upload conversation data.

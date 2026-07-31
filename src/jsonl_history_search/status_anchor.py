@@ -1156,8 +1156,35 @@ def _select_anchor_with_boundary(
                 ),
                 key=lambda item: int(item.get("message_index", 0)),
             )
-            same_thread_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=True)
             explicit_side_thread_local = _explicit_side_thread_local_status(query)
+            older_substantive_gap = _older_substantive_status_anchor_decision(
+                older,
+                status_message=status_message,
+                status_as_of_boundary=status_as_of_boundary,
+                audit_run_requested=audit_run_requested,
+                require_proven_history=relative_history_first and not explicit_side_thread_local,
+            )
+            if older_substantive_gap.get("status") == "selected" and not prefer_parent:
+                selected = older_substantive_gap.get("selected_anchor") or {}
+                return _with_rejected_alternatives(
+                    {
+                        **base,
+                        "context_boundary": "older_substantive_status_gap",
+                        "anchor_scope": "current_user_message_chronology",
+                        "anchor_reason": "older_substantive_status_anchor_by_elapsed_and_turn_gap",
+                        "anchor_ref": selected.get("source_ref"),
+                        "status_ref": status_ref,
+                        "status_as_of_boundary": status_as_of_boundary,
+                        "selected_anchor": _selected_with_reason(
+                            selected,
+                            "; selected over recent weak status/follow-up rows because an older substantive instruction "
+                            "is separated by the elapsed-time or turn-gap threshold",
+                        ),
+                        "older_substantive_status_gap": older_substantive_gap,
+                    },
+                    candidates,
+                )
+            same_thread_anchor = _first_eligible_thread_anchor(older, status_thread_keys, same_thread=True)
             parent_anchor = None
             if prefer_parent:
                 interval = canonical_parent_main_interval or {"status": "not_applicable"}
@@ -3265,6 +3292,107 @@ def _last_substantive_user_instruction_anchor(
     return None
 
 
+def _older_substantive_status_anchor_decision(
+    older: list[dict],
+    *,
+    status_message: dict,
+    status_as_of_boundary: dict | None,
+    audit_run_requested: bool,
+    require_proven_history: bool,
+) -> dict:
+    eligible = [
+        candidate
+        for candidate in older
+        if _is_eligible_anchor(candidate)
+        and not _is_never_anchor(candidate)
+        and not _is_newer_than_status_as_of(
+            str(candidate.get("timestamp_utc") or ""),
+            status_as_of_boundary=status_as_of_boundary,
+            audit_run_requested=audit_run_requested,
+        )
+    ]
+    if len(eligible) < 2:
+        return {"status": "not_applicable", "reason": "fewer_than_two_eligible_prior_user_rows"}
+
+    latest_eligible = eligible[0]
+    if latest_eligible.get("classification") == "substantive_work_anchor":
+        return {"status": "not_applicable", "reason": "latest_prior_eligible_row_is_substantive"}
+
+    selected: dict | None = None
+    for candidate in eligible[1:]:
+        if candidate.get("classification") != "substantive_work_anchor":
+            continue
+        selected_candidate = _history_mirror_candidate(candidate) or dict(candidate)
+        if require_proven_history and not _is_proven_parent_main_history_anchor(selected_candidate):
+            continue
+        selected = selected_candidate
+        break
+    if selected is None:
+        return {"status": "not_applicable", "reason": "no_older_substantive_anchor_available"}
+
+    latest_to_status_seconds = _elapsed_seconds_between(latest_eligible, status_message)
+    selected_to_latest_seconds = _elapsed_seconds_between(selected, latest_eligible)
+    selected_to_status_seconds = _elapsed_seconds_between(selected, status_message)
+    latest_index = int(latest_eligible.get("message_index") or 0)
+    selected_index = int(selected.get("message_index") or latest_index)
+    status_index = int(status_message.get("message_index") or 0)
+    turn_gap_latest_to_selected = abs(selected_index - latest_index)
+    turn_gap_status_to_selected = abs(selected_index - status_index)
+
+    latest_is_recent_followup = latest_to_status_seconds is not None and latest_to_status_seconds <= 20 * 60
+    if latest_to_status_seconds is None:
+        latest_is_recent_followup = abs(latest_index - status_index) <= 2
+    elapsed_gap_favors_selected = any(
+        value is not None and value >= 60 * 60
+        for value in (selected_to_latest_seconds, selected_to_status_seconds)
+    )
+    turn_gap_favors_selected = turn_gap_latest_to_selected >= 4 or turn_gap_status_to_selected >= 6
+    gap_metadata = {
+        "latest_to_status_seconds": latest_to_status_seconds,
+        "selected_to_latest_seconds": selected_to_latest_seconds,
+        "selected_to_status_seconds": selected_to_status_seconds,
+        "turn_gap_latest_to_selected": turn_gap_latest_to_selected,
+        "turn_gap_status_to_selected": turn_gap_status_to_selected,
+        "elapsed_gap_favors_selected": elapsed_gap_favors_selected,
+        "turn_gap_favors_selected": turn_gap_favors_selected,
+    }
+    if not (latest_is_recent_followup and (elapsed_gap_favors_selected or turn_gap_favors_selected)):
+        return {
+            "status": "not_applicable",
+            "reason": "elapsed_or_turn_gap_threshold_not_met",
+            "gap_metadata": gap_metadata,
+        }
+
+    rejected_refs = []
+    for candidate in older:
+        if candidate.get("source_ref") == selected.get("source_ref"):
+            break
+        if candidate.get("classification") in {"ordinary_human_turn", "short_human_turn", "admin_or_status_turn"}:
+            candidate["anchor_rejection_reason"] = (
+                "recent_status_or_followup_before_status_question; older substantive instruction "
+                "wins by elapsed-time or turn-gap threshold"
+            )
+            candidate["decision"] = "rejected"
+            rejected_refs.append(candidate.get("source_ref"))
+
+    return {
+        "status": "selected",
+        "reason": "recent_weak_followup_rows_rejected_in_favor_of_older_substantive_instruction",
+        "selected_anchor": selected,
+        "latest_rejected_followup": _current_user_boundary_candidate(latest_eligible),
+        "rejected_followup_refs": [ref for ref in rejected_refs if ref],
+        "gap_metadata": gap_metadata,
+    }
+
+
+def _elapsed_seconds_between(left: dict, right: dict) -> float | None:
+    left_time = parse_datetime(str(left.get("timestamp_utc") or ""), timezone.utc)
+    right_time = parse_datetime(str(right.get("timestamp_utc") or ""), timezone.utc)
+    if left_time is None or right_time is None:
+        return None
+    return abs((right_time.astimezone(timezone.utc) - left_time.astimezone(timezone.utc)).total_seconds())
+
+
 def _preceding_current_user_anchor(candidates: list[dict], target: dict) -> dict | None:
     older = [
         candidate
@@ -3858,6 +3986,8 @@ def _with_rejected_alternatives(decision: dict, candidates: list[dict]) -> dict:
             }
             if candidate.get("lineage_rejection_reason"):
                 alternative["lineage_rejection_reason"] = candidate.get("lineage_rejection_reason")
+            if candidate.get("anchor_rejection_reason"):
+                alternative["anchor_rejection_reason"] = candidate.get("anchor_rejection_reason")
             if candidate.get("lineage_resolution"):
                 alternative["lineage_resolution"] = candidate.get("lineage_resolution")
             alternatives.append(alternative)

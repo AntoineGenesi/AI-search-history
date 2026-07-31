@@ -951,6 +951,12 @@ def search_with_fielded_bm25(
         if continuation_ledger
         else None
     )
+    selected_context_refs = _fielded_selected_context_refs(
+        rows,
+        index,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
+    )
     payload = {
         "status": "planned_fielded_bm25",
         "fallback_reason": None,
@@ -980,6 +986,7 @@ def search_with_fielded_bm25(
         "candidate_records_scored": candidate_records_scored,
         "candidate_records_deduped": candidate_records_deduped,
         "materialization": materialization,
+        "_fielded_selected_context_refs": selected_context_refs,
         "_fielded_context_index": _fielded_context_index(index),
         "groups": group_matches(matches),
         "summary": index.sanitized_summary(),
@@ -1009,6 +1016,62 @@ def search_with_fielded_bm25(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def _fielded_selected_context_refs(
+    rows: list[tuple[Any, ...]],
+    index: FieldedBm25Index,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_labels = fusion.get("selected_labels_by_rowid") if isinstance(fusion, dict) else {}
+    selected_labels = selected_labels if isinstance(selected_labels, dict) else {}
+    refs: list[dict[str, Any]] = []
+    for ordinal, row in enumerate(rows, start=1):
+        rowid = int(row[0])
+        ref = index.records.get(rowid)
+        if ref is None:
+            continue
+        source_ref = _live_source_ref(ref)
+        session = ref.session_key or ref.path.stem
+        if session and not source_ref.get("session"):
+            source_ref["session"] = session
+        labels = sorted(
+            {
+                *[str(label) for label in row_stream_labels.get(rowid, set()) if label],
+                *[
+                    str(label)
+                    for label in (
+                        selected_labels.get(rowid)
+                        or selected_labels.get(str(rowid))
+                        or []
+                    )
+                    if label
+                ],
+            }
+        )
+        refs.append(
+            {
+                "candidate_id": f"fielded-context-{ordinal:03d}",
+                "rank": ordinal,
+                "source_ref": source_ref,
+                "target": _live_source_ref_target(source_ref),
+                "role": ref.role_bucket.replace("role_", "", 1) if ref.role_bucket else None,
+                "timestamp_utc": ref.record.timestamp.isoformat() if ref.record and ref.record.timestamp else None,
+                "session": session,
+                "day": ref.day_key,
+                "score": 0.0,
+                "confidence": "context",
+                "reason_codes": [
+                    "fielded_bm25:selected_source_window_context",
+                    *[f"fielded_bm25:evidence_channel:{label}" for label in labels],
+                ][:8],
+                "stages": ["fielded_source_window_context"],
+                "primary_stage": "fielded_source_window_context",
+            }
+        )
+    return refs
 
 
 def _build_continuation_next_read_recovery(
