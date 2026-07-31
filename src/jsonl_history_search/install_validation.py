@@ -922,8 +922,6 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
         )
 
     env = os.environ.copy()
-    src_path = str(package_root / "src")
-    env["PYTHONPATH"] = src_path if not env.get("PYTHONPATH") else f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
     route_result = run_subprocess(
         [sys.executable, str(launcher), "why", "did", "I", "mention", "the", "router?"],
         text=True,
@@ -1024,6 +1022,7 @@ def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_che
             "stdout_contains_ask_route": "Ask Route" in route_stdout,
             "stdout_contains_first_command": first_command_mode != "unresolved",
             "first_command_mode": first_command_mode,
+            "launcher_prefers_installed_console": first_command_mode == "installed_console",
             "non_bounded_route_only": "Ask Execute" not in route_stdout,
             "bounded_execution_status": bounded_payload.get("execution_status"),
             "bounded_command_family": bounded_payload.get("execution", {}).get("command_family"),

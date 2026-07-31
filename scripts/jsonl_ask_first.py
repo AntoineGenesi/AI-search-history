@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -19,8 +20,15 @@ def main(argv: list[str] | None = None) -> int:
     if not _has_option(args, "--execute") and not _has_option(args, "--auto-execute-bounded-no-evidence"):
         args.append("--auto-execute-bounded-no-evidence")
 
-    command = [sys.executable, "-m", "jsonl_history_search.cli", "ask", *args]
-    return subprocess.run(command, check=False, env=_source_checkout_env()).returncode
+    command, env = _cli_command()
+    return subprocess.run([*command, "ask", *args], check=False, env=env).returncode
+
+
+def _cli_command() -> tuple[list[str], dict[str, str]]:
+    env = os.environ.copy()
+    if shutil.which("jsonl-history-search"):
+        return ["jsonl-history-search"], env
+    return [sys.executable, "-m", "jsonl_history_search.cli"], _source_checkout_env()
 
 
 def _source_checkout_env() -> dict[str, str]:

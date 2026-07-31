@@ -1,17 +1,19 @@
 # Latest Messages And Parent Status
 
-For exact recent user wording, use:
+For user wording/correction leads:
 
 ```bash
 jsonl-history-search latest-user-messages --format json --max-matches 10
+jsonl-history-search latest-user-messages --cwd "$PWD" --limit 200 --snippet-chars 500 --format text
+jsonl-history-search find "<terms>" --role user --cwd "$PWD" --format text
 ```
 
-For `what happened since my last message?`, use the router first. If the user
-names a main or parent thread, require raw lineage/history evidence for that
-relationship. Visible context and local repository state are not substitute
-anchors.
+For status asks, use the router first. For main/parent wording, require raw
+lineage/history evidence. Visible context and local repository state are not substitutes.
 
-Open the required history/session source refs, state which user message became
-the anchor, and reconstruct only the requested window. If the parent or anchor
-is ambiguous, fail closed. Stop once the required raw window answers the
-question; do not crawl unrelated sessions.
+Mine user turns/corrections/reactions as leads, not proof. message timestamp is not capture/report/mtime.
+Open selected assistant/tool detail with bounded `read-more`; validate with
+`semantic-debug`, `follow-next-reads`, or `audit-coverage`.
+
+Open required refs, state the anchor, and reconstruct only that window. If the parent or anchor
+is ambiguous, fail closed. Stop once the raw window answers.
