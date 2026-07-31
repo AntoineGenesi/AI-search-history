@@ -283,9 +283,9 @@ RAW_PHRASE_SOURCE_SEARCH_ROUTE = AskRoute(
     route_family=RAW_PHRASE_SOURCE_SEARCH_ROUTE_FAMILY,
     chosen_route="raw-phrase-source-search / bulk-line-match",
     why_it_applies=(
-        "The wording asks for exact/raw phrase search across Claude/Codex/config "
-        "source JSONL material, so use the local bulk phrase candidate generator "
-        "instead of drifting into ad hoc manual grep."
+        "The wording asks for exact/raw/OCR/screenshot line occurrence search "
+        "across Claude/Codex/config/chat-log JSONL material, so use the local "
+        "bulk phrase candidate generator instead of drifting into ad hoc manual grep."
     ),
     first_command_template=(
         '{cli} bulk-line-match --phrase <exact-phrase> '
@@ -1479,8 +1479,19 @@ def _looks_like_storage_retention_forensics_query(normalized: str) -> bool:
 
 
 def _looks_like_raw_phrase_source_search_query(normalized: str) -> bool:
-    normalized = normalized.replace("_", " ")
+    normalized = normalized.replace("_", " ").replace("/", " ")
     search_terms = ("search", "scan", "find", "match", "locate")
+    occurrence_terms = (
+        "occurrence",
+        "occurrences",
+        "candidate source ref",
+        "candidate source refs",
+        "candidate refs",
+        "source ref",
+        "source refs",
+        "final provenance",
+        "validate before",
+    )
     phrase_terms = (
         "exact phrase",
         "exact phrases",
@@ -1490,8 +1501,14 @@ def _looks_like_raw_phrase_source_search_query(normalized: str) -> bool:
         "literal phrases",
         "ocr phrase",
         "ocr phrases",
+        "ocr line",
+        "ocr lines",
+        "extracted line",
+        "extracted lines",
         "screenshot phrase",
         "screenshot phrases",
+        "screenshot line",
+        "screenshot lines",
     )
     source_terms = (
         "raw claude",
@@ -1504,14 +1521,27 @@ def _looks_like_raw_phrase_source_search_query(normalized: str) -> bool:
         "claude/config",
         "claude config",
         "codex/config",
+        "jsonl convo",
+        "convo",
+        "chat log",
+        "chat logs",
+        "chat history",
+        "chat histories",
+        "conversation history",
+        "conversation histories",
+        "histories",
         "source-ref",
         "source refs",
     )
     has_phrase_intent = _has_any(normalized, phrase_terms) or (
         _has_any(normalized, ("exact", "literal", "ocr", "screenshot"))
-        and _has_any(normalized, ("phrase", "phrases"))
+        and _has_any(normalized, ("phrase", "phrases", "line", "lines"))
     )
-    return _has_any(normalized, search_terms) and has_phrase_intent and _has_any(normalized, source_terms)
+    has_search_intent = _has_any(normalized, search_terms) or (
+        _has_any(normalized, occurrence_terms)
+        and _has_any(normalized, ("produce", "candidate", "validate", "provenance", "source ref", "source refs"))
+    )
+    return has_search_intent and has_phrase_intent and _has_any(normalized, source_terms)
 
 
 def _looks_like_skill_compliance_query(normalized: str) -> bool:
@@ -2211,7 +2241,7 @@ def _looks_like_remembered_user_wording_query(normalized: str) -> bool:
             r"\bwhat exactly did i ask for(?:\b| about\b)",
             r"\bwhat did i ask for(?:\b| about\b)",
             r"\bwhat did i (?:say|tell|ask|request) (?:you )?before about\b",
-            r"\bwhat did i (?:say|tell|ask|request) about\b",
+            r"\bwhat did i (?:say|tell|ask|request) (?:you )?about\b",
             r"\bwhat constraint did i give (?:you )?(?:about|on|for)\b",
             r"\bwhat was my (?:ask|request|instruction) about\b",
         )

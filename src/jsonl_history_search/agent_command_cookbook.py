@@ -102,6 +102,19 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             ),
         },
         {
+            "id": "bulk_ocr_provenance",
+            "question_family": "Find OCR or screenshot line occurrences in chat-log histories.",
+            "route": "raw-phrase-source-search / bulk-line-match",
+            "first_command": (
+                'jsonl-history-search bulk-line-match --phrases-file <ocr-lines.txt> '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "bulk_line_match candidate source_ref/target rows as leads only; validate selected refs "
+                "with read-more windows and semantic-debug/follow-next-reads/audit-coverage before final provenance"
+            ),
+        },
+        {
             "id": "deep_history_audit",
             "question_family": "Read all chats/agent history and find when X or Y happened.",
             "route": "deep-history-audit / semantic-debug",
