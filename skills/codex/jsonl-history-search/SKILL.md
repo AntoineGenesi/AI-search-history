@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use for Codex or Claude conversation search, recovering what the user previously said, verifying agent actions, inspecting provenance, debugging decisions, or explaining why a cleanup/process was deferred or failed. For a named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope requires one local-versus-history question with zero tools. In default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Explicit "read through all chats/agent history" asks trigger in-depth/exhaustive `semantic-debug`, not quick ask. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
+description: Search local Codex/Claude history: prior user wording, action proof, provenance, decisions, and why cleanup/process was deferred or failed. For named `tasks`/`...md`, checkout/HEAD/current-Git intent uses `--evidence-source local`, conversation/source-session intent uses `--evidence-source conversation-history`, and unresolved scope gets one question with zero tools. In default implicit mode, `what has happened since my last message in the parent thread?` is an exact trigger. Explicit "read through all chats/agent history" asks trigger in-depth/exhaustive `semantic-debug`. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
 metadata:
   short-description: Search local AI conversation history
 ---
@@ -62,9 +62,11 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 
 Wait for that command to exit. While it is running, do not start another `ask`,
 `ask --execute`, direct `semantic-debug`, installed helper, or source-checkout
-fallback. Only if it exits with command-not-found (126/127) or a clear
-install/import failure, and the current directory contains
-`src/jsonl_history_search/cli.py`, run this source recovery once:
+fallback. Normal installed use must not depend on `PYTHONPATH`. Only if the
+installed command exits with command-not-found (126/127) or a clear
+install/import failure, and the current directory is explicitly a source
+checkout containing `src/jsonl_history_search/cli.py`, run this source recovery
+once:
 
 ```bash
 PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
