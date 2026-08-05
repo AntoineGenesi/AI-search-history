@@ -411,7 +411,7 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             default=RETRIEVAL_MODE_PACKAGE,
             help=(
                 "Retrieval backend for agent-facing find output. Default package keeps existing behavior; "
-                "fielded-bm25 explicitly opts into direct in-memory SQLite FTS5/BM25 record retrieval; "
+                "fielded-bm25 explicitly opts into SQLite FTS5/BM25 record retrieval with durable CLI cache unless ephemeral; "
                 "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
             ),
         )
@@ -815,7 +815,7 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         default=RETRIEVAL_MODE_PACKAGE,
         help=(
             "Retrieval backend for semantic-debug candidate evidence. Default package keeps existing behavior; "
-            "fielded-bm25 explicitly opts into direct in-memory SQLite FTS5/BM25 record retrieval; "
+            "fielded-bm25 explicitly opts into SQLite FTS5/BM25 record retrieval with durable CLI cache unless ephemeral; "
             "rrf-fusion explicitly opts into package plus fielded BM25 rank-only RRF diagnostics."
         ),
     )
