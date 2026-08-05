@@ -370,6 +370,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "bm25_rank_buckets": dict(fielded_result.get("bm25_rank_buckets") or {}),
         "materialization": fielded_materialization,
         "index_summary": fielded_index_summary,
+        "scope": _fielded_scope_diagnostics(fielded_result.get("fielded_scope") or fielded_index_summary.get("scope")),
         "elapsed_ms": fielded_elapsed_ms,
         "elapsed_label": elapsed_label(fielded_elapsed_ms),
         "profile": _phase_profile(
@@ -411,7 +412,10 @@ def build_fielded_bm25_retrieval_diagnostics(
             "capped": bool(cap_labels),
             "cap_labels": cap_labels,
             "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
-            "reason": "fielded_bm25_builds_in_memory_sqlite_fts5_index_from_planned_jsonl_sources",
+            "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
+            "refresh_status": str(fielded_index_summary.get("refresh_status") or "unknown"),
+            "scope_type": str((fielded_index_summary.get("scope") or {}).get("scope_type") or "none"),
+            "reason": "fielded_bm25_uses_ephemeral_or_opt_in_durable_sqlite_fts5_over_planned_jsonl_sources",
         },
         "shared_source_enumeration": {
             **planned_jsonl_file_diagnostics,
@@ -1399,6 +1403,10 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
                 "stream_limit": int(item.get("stream_limit") or 0),
                 "hit_limit": bool(item.get("hit_limit", False)),
                 "error_type": item.get("error_type") if item.get("error_type") is None else str(item.get("error_type")),
+                "scope_type": str(item.get("scope_type") or "active_selected_source_scope"),
+                "scope_row_count": int(item.get("scope_row_count") or 0),
+                "scope_hit_count": int(item.get("scope_hit_count") or 0),
+                "scope_enforced": bool(item.get("scope_enforced", True)),
                 "raw_query_text_included": False,
                 "raw_query_terms_included": False,
                 "raw_paths_included": False,
@@ -1429,6 +1437,10 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "selected_rows_by_stream": _safe_int_dict(streams.get("selected_rows_by_stream")),
         "rows_dropped_by_stream_cap": _safe_int_dict(streams.get("rows_dropped_by_stream_cap")),
         "rows_dropped_by_stream_cap_total": int(streams.get("rows_dropped_by_stream_cap_total") or 0),
+        "scope_type": str(streams.get("scope_type") or "active_selected_source_scope"),
+        "scope_enforced": bool(streams.get("scope_enforced", True)),
+        "scope_row_count": int(streams.get("scope_row_count") or 0),
+        "scope_hit_count_total": int(streams.get("scope_hit_count_total") or 0),
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -1438,6 +1450,31 @@ def _fielded_query_streams_diagnostics(fielded_result: dict[str, Any]) -> dict[s
         "source_lines_included": False,
         "line_numbers_included": False,
         "vectors_or_persisted_indexes_included": False,
+    }
+
+
+def _fielded_scope_diagnostics(value: Any) -> dict[str, Any]:
+    scope = value if isinstance(value, dict) else {}
+    return {
+        "schema_version": int(scope.get("schema_version") or 1),
+        "scope_type": str(scope.get("scope_type") or "none"),
+        "scope_enforced": bool(scope.get("scope_enforced", False)),
+        "scope_row_count": int(scope.get("scope_row_count") or 0),
+        "indexed_row_count_loaded_for_scope": int(scope.get("indexed_row_count_loaded_for_scope") or 0),
+        "source_file_scope_count": int(scope.get("source_file_scope_count") or 0),
+        "source_kind_counts": _safe_int_dict(scope.get("source_kind_counts")),
+        "session_scope_count": int(scope.get("session_scope_count") or 0),
+        "day_scope_count": int(scope.get("day_scope_count") or 0),
+        "date_window_filter_present": bool(scope.get("date_window_filter_present", False)),
+        "date_window_unknown_day_policy": str(
+            scope.get("date_window_unknown_day_policy")
+            or "include_unknown_day_exclude_known_outside_window"
+        ),
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
     }
 
 

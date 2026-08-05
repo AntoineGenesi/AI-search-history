@@ -152,7 +152,14 @@ from .real_history_timestamp_seek import DEFAULT_MANIFEST as DEFAULT_REAL_HISTOR
 from .real_history_timestamp_seek import DEFAULT_PRIVATE_BRIDGE as DEFAULT_REAL_HISTORY_TIMESTAMP_PRIVATE_BRIDGE
 from .real_history_timestamp_seek import DEFAULT_RAW_OUTPUT_DIR as DEFAULT_REAL_HISTORY_TIMESTAMP_RAW_OUTPUT_DIR
 from .real_history_timestamp_seek import build_real_history_timestamp_seek_payload
-from .retrieval_modes import QUERY_PLAN_MODE_AUTO, QUERY_PLAN_MODES, RETRIEVAL_MODE_PACKAGE, RETRIEVAL_MODES, run_retrieval_mode
+from .retrieval_modes import (
+    QUERY_PLAN_MODE_AUTO,
+    QUERY_PLAN_MODES,
+    RETRIEVAL_MODE_FIELDED_BM25,
+    RETRIEVAL_MODE_PACKAGE,
+    RETRIEVAL_MODES,
+    run_retrieval_mode,
+)
 from .scanner import search
 from .semantic_debugging import (
     DEFAULT_GOLD_MANIFEST,
@@ -1916,9 +1923,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--fielded-bm25-index-dir",
         default=None,
         help=(
-            "Opt-in local persistent segment cache directory for explicit fielded-bm25 retrieval. "
-            "No cache is written unless this path is supplied."
+            "Compatibility alias for the local durable SQLite FTS5 BM25 index directory used by "
+            "explicit fielded-bm25 retrieval. When omitted on CLI fielded-bm25 runs, a default "
+            "user cache directory is used unless --fielded-bm25-ephemeral is set."
         ),
+    )
+    parser.add_argument(
+        "--fielded-bm25-ephemeral",
+        action="store_true",
+        help="Opt out of durable BM25 index persistence for an explicit fielded-bm25 CLI run.",
     )
     parser.add_argument(
         "--mask-manifest",
@@ -4875,6 +4888,19 @@ def _build_semantic_debug_in_memory_payload(args: argparse.Namespace) -> dict:
     return {"semantic_debug": packet}
 
 
+def _fielded_bm25_index_dir_from_args(args: argparse.Namespace) -> str | None:
+    explicit = getattr(args, "fielded_bm25_index_dir", None)
+    if explicit:
+        return str(explicit)
+    if getattr(args, "fielded_bm25_ephemeral", False):
+        return None
+    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) != RETRIEVAL_MODE_FIELDED_BM25:
+        return None
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
+    return str(root / "jsonl-history-search" / "fielded-bm25")
+
+
 def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
     source_plan, intent, plan = payload_from_args(args)
     mask_context = _mask_context_from_args(args)
@@ -4886,7 +4912,7 @@ def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
         cwd=source_plan["cwd"],
         mask_context=mask_context,
         use_rg_prefilter=args.rg_prefilter,
-        fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
+        fielded_bm25_index_dir=_fielded_bm25_index_dir_from_args(args),
         query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
         continuation_ledger=getattr(args, "continuation_ledger", False),
     )
@@ -18325,7 +18351,7 @@ def main(argv: list[str] | None = None) -> int:
             cwd=source_plan["cwd"],
             mask_context=mask_context,
             use_rg_prefilter=args.rg_prefilter,
-            fielded_bm25_index_dir=getattr(args, "fielded_bm25_index_dir", None),
+            fielded_bm25_index_dir=_fielded_bm25_index_dir_from_args(args),
             query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
             continuation_ledger=getattr(args, "continuation_ledger", False),
         )
