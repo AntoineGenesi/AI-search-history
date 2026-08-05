@@ -7,7 +7,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from .tool_events import detect_events_for_record
 
 FIELDED_BM25_VERSION = "fielded-sqlite-fts5-record-chunk-v1"
 FIELDED_BM25_INDEX_SCHEMA_VERSION = "fielded-bm25-segment-cache-v2"
+FIELDED_BM25_DURABLE_SCHEMA_VERSION = "fielded-bm25-durable-sqlite-fts5-v1"
 FIELDED_BM25_PARSER_VERSION = "jsonl-record-parser-v1"
 FTS_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/-]*", re.IGNORECASE)
 TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
@@ -95,6 +96,8 @@ class FieldedBm25Index:
     files: dict[str, dict[str, Any]] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    scope_rowids: set[int] = field(default_factory=set)
+    scope_summary: dict[str, Any] = field(default_factory=dict)
     available: bool = True
     unavailable_reason: str | None = None
     version: str = FIELDED_BM25_VERSION
@@ -115,6 +118,16 @@ class FieldedBm25Index:
             "unavailable_reason": self.unavailable_reason,
             "persistent_index_enabled": bool(self.metrics.get("persistent_index_enabled", False)),
             "index_schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
+            "durable_fts_schema_version": FIELDED_BM25_DURABLE_SCHEMA_VERSION,
+            "persistent_storage_kind": str(self.metrics.get("persistent_storage_kind") or "ephemeral_memory_fts5"),
+            "index_path_category": str(self.metrics.get("index_path_category") or "ephemeral_memory"),
+            "durable_fts_database_present": bool(self.metrics.get("durable_fts_database_present", False)),
+            "durable_fts_index_reused": bool(self.metrics.get("durable_fts_index_reused", False)),
+            "durable_fts_sources_migrated": int(self.metrics.get("durable_fts_sources_migrated", 0)),
+            "compatibility_index_dir_mode": str(self.metrics.get("compatibility_index_dir_mode") or "not_applicable"),
+            "compatibility_migration_status": str(self.metrics.get("compatibility_migration_status") or "not_applicable"),
+            "refresh_status": str(self.metrics.get("refresh_status") or "ephemeral_rebuilt"),
+            "stale_status": str(self.metrics.get("stale_status") or "not_persistent"),
             "parser_version": FIELDED_BM25_PARSER_VERSION,
             "chunking_version": FIELDED_BM25_CHUNKING_VERSION,
             "sources_reused": int(self.metrics.get("sources_reused", 0)),
@@ -144,6 +157,7 @@ class FieldedBm25Index:
             "indexed_file_count": int(self.metrics.get("indexed_files", 0)),
             "indexed_record_count": int(self.metrics.get("indexed_records", 0)),
             "indexed_chunk_count": int(self.metrics.get("indexed_chunks", 0)),
+            "durable_record_meta_count": int(self.metrics.get("durable_record_meta_count", 0)),
             "build_bytes": int(self.metrics.get("build_bytes", 0)),
             "build_elapsed_ms": self.metrics.get("build_elapsed_ms", 0.0),
             "profile": _phase_profile_payload(self.metrics.get("profile"), "fielded_bm25_index_build"),
@@ -168,6 +182,7 @@ class FieldedBm25Index:
             "raw_session_ids_included": False,
             "raw_cwd_included": False,
             "vectors_or_persisted_indexes_included": False,
+            "scope": self.scope_summary or _empty_scope_summary(),
         }
 
 
@@ -176,6 +191,7 @@ class FieldedBm25PersistentCache:
     root: Path
     manifest: dict[str, Any] = field(default_factory=dict)
     sources_deleted: int = 0
+    compatibility_migration_status: str = "not_applicable"
 
     @classmethod
     def open(cls, root: Path) -> "FieldedBm25PersistentCache":
@@ -204,6 +220,7 @@ class FieldedBm25PersistentCache:
                 manifest = loaded
         cache = cls(root=root, manifest=manifest)
         cache.sources_deleted = cache.prune_missing_segments()
+        cache.compatibility_migration_status = cache._compatibility_migration_status()
         return cache
 
     @property
@@ -214,11 +231,41 @@ class FieldedBm25PersistentCache:
     def segments_dir(self) -> Path:
         return self.root / "segments"
 
+    @property
+    def db_path(self) -> Path:
+        return self.root / "fielded-bm25.sqlite3"
+
     def source_key(self, path: Path) -> str:
         return hashlib.sha256(str(Path(path).expanduser().resolve()).encode("utf-8", errors="replace")).hexdigest()
 
     def segment_path(self, source_key: str) -> Path:
         return self.segments_dir / f"{source_key}.json"
+
+    def open_connection(self) -> sqlite3.Connection:
+        existed = self.db_path.exists()
+        connection = sqlite3.connect(str(self.db_path))
+        connection.execute("PRAGMA temp_store = FILE")
+        connection.execute(f"PRAGMA cache_size = -{FIELDED_BM25_SQLITE_CACHE_SIZE_KIB}")
+        connection.execute(f"PRAGMA mmap_size = {FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES}")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        try:
+            _ensure_durable_schema(connection)
+        except sqlite3.Error:
+            connection.close()
+            try:
+                self.db_path.unlink()
+            except OSError:
+                pass
+            connection = sqlite3.connect(str(self.db_path))
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.execute(f"PRAGMA cache_size = -{FIELDED_BM25_SQLITE_CACHE_SIZE_KIB}")
+            connection.execute(f"PRAGMA mmap_size = {FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES}")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            _ensure_durable_schema(connection)
+            self.compatibility_migration_status = "durable_schema_reset_after_open_error"
+        if not existed and self.compatibility_migration_status == "not_applicable":
+            self.compatibility_migration_status = "durable_db_created"
+        return connection
 
     def metadata_for(
         self,
@@ -338,6 +385,109 @@ class FieldedBm25PersistentCache:
                 deleted += 1
         return deleted
 
+    def prune_missing_durable_sources(self, connection: sqlite3.Connection) -> int:
+        deleted = 0
+        try:
+            rows = list(connection.execute("SELECT source_key, path FROM source_files"))
+        except sqlite3.Error:
+            return 0
+        for source_key, raw_path in rows:
+            try:
+                exists = Path(str(raw_path)).exists()
+            except OSError:
+                exists = False
+            if not exists:
+                self.drop_durable_source(connection, str(source_key))
+                self._drop_source(str(source_key))
+                deleted += 1
+        return deleted
+
+    def durable_source_metadata(self, connection: sqlite3.Connection, source_key: str) -> dict[str, Any] | None:
+        try:
+            row = connection.execute(
+                "SELECT metadata_json FROM source_files WHERE source_key = ?",
+                (source_key,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        try:
+            metadata = json.loads(str(row[0]))
+        except json.JSONDecodeError:
+            return None
+        return metadata if isinstance(metadata, dict) else None
+
+    def drop_durable_source(self, connection: sqlite3.Connection, source_key: str) -> None:
+        try:
+            rowids = [
+                int(row[0])
+                for row in connection.execute("SELECT rowid FROM record_meta WHERE source_key = ?", (source_key,))
+            ]
+            for rowid in rowids:
+                connection.execute("DELETE FROM records WHERE rowid = ?", (rowid,))
+            connection.execute("DELETE FROM record_meta WHERE source_key = ?", (source_key,))
+            connection.execute("DELETE FROM source_files WHERE source_key = ?", (source_key,))
+        except sqlite3.Error:
+            return
+
+    def save_durable_source(
+        self,
+        connection: sqlite3.Connection,
+        path: Path,
+        *,
+        source_key: str,
+        metadata: dict[str, Any],
+        record_count: int,
+        byte_count: int,
+        refs: list[FieldedBm25RecordRef],
+    ) -> None:
+        source_kind = str(metadata.get("source_kind") or "")
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO source_files(
+                source_key, metadata_json, source_kind, path, record_count, row_count, byte_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_key,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                source_kind,
+                str(path),
+                int(record_count),
+                len(refs),
+                int(byte_count),
+                time.time(),
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO record_meta(
+                rowid, source_key, source_kind, path, line, line_end, source_ordinal,
+                role_bucket, timestamp_bucket, session_key, day_key, record_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(ref.rowid),
+                    source_key,
+                    ref.source_kind,
+                    str(ref.path),
+                    int(ref.line),
+                    int(ref.line_end or ref.line),
+                    int(ref.source_ordinal),
+                    ref.role_bucket,
+                    ref.timestamp_bucket,
+                    ref.session_key,
+                    ref.day_key,
+                    json.dumps(_record_to_persistent_payload(ref.record), sort_keys=True, separators=(",", ":"))
+                    if ref.record is not None
+                    else None,
+                )
+                for ref in refs
+            ],
+        )
+
     def save(self) -> None:
         payload = {
             "schema_version": FIELDED_BM25_INDEX_SCHEMA_VERSION,
@@ -358,6 +508,13 @@ class FieldedBm25PersistentCache:
         except OSError:
             pass
         self.manifest.setdefault("sources", {}).pop(source_key, None)
+
+    def _compatibility_migration_status(self) -> str:
+        if self.db_path.exists():
+            return "durable_db_present"
+        if self.manifest_path.exists():
+            return "legacy_segment_cache_directory_detected_durable_db_will_be_created"
+        return "new_index_directory_durable_db_will_be_created"
 
 
 @dataclass(frozen=True)
@@ -432,6 +589,90 @@ class FieldedGroupedWindowSignal:
         )
 
 
+def _ensure_durable_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fielded_bm25_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    existing = connection.execute(
+        "SELECT value FROM fielded_bm25_meta WHERE key = 'durable_schema_version'"
+    ).fetchone()
+    if existing is not None and existing[0] != FIELDED_BM25_DURABLE_SCHEMA_VERSION:
+        connection.execute("DROP TABLE IF EXISTS record_meta")
+        connection.execute("DROP TABLE IF EXISTS source_files")
+        connection.execute("DROP TABLE IF EXISTS fielded_bm25_meta")
+        connection.execute("DROP TABLE IF EXISTS records")
+        connection.execute(
+            """
+            CREATE TABLE fielded_bm25_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+    connection.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS records USING fts5(
+            source_kind,
+            role,
+            cwd_project,
+            timestamp_bucket,
+            tool_event,
+            artifact_task_path,
+            text
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_files(
+            source_key TEXT PRIMARY KEY,
+            metadata_json TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            path TEXT NOT NULL,
+            record_count INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            byte_count INTEGER NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS record_meta(
+            rowid INTEGER PRIMARY KEY,
+            source_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            path TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            line_end INTEGER NOT NULL,
+            source_ordinal INTEGER NOT NULL,
+            role_bucket TEXT NOT NULL,
+            timestamp_bucket TEXT NOT NULL,
+            session_key TEXT,
+            day_key TEXT,
+            record_json TEXT
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_record_meta_source_key ON record_meta(source_key)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_record_meta_session_key ON record_meta(session_key)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_record_meta_day_key ON record_meta(day_key)")
+    connection.execute(
+        "INSERT OR REPLACE INTO fielded_bm25_meta(key, value) VALUES ('durable_schema_version', ?)",
+        (FIELDED_BM25_DURABLE_SCHEMA_VERSION,),
+    )
+    connection.execute(
+        "INSERT OR REPLACE INTO fielded_bm25_meta(key, value) VALUES ('segment_schema_version', ?)",
+        (FIELDED_BM25_INDEX_SCHEMA_VERSION,),
+    )
+    connection.commit()
+
+
 def sqlite_fts5_available() -> bool:
     try:
         connection = sqlite3.connect(":memory:")
@@ -453,25 +694,29 @@ def build_fielded_bm25_index(
 ) -> FieldedBm25Index:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_index_build")
+    persistent_cache = FieldedBm25PersistentCache.open(Path(persistent_index_dir)) if persistent_index_dir else None
     try:
-        connection = sqlite3.connect(":memory:")
-        connection.execute("PRAGMA temp_store = FILE")
-        connection.execute(f"PRAGMA cache_size = -{FIELDED_BM25_SQLITE_CACHE_SIZE_KIB}")
-        connection.execute(f"PRAGMA mmap_size = {FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES}")
-        connection.execute("PRAGMA synchronous = OFF")
-        connection.execute(
-            """
-            CREATE VIRTUAL TABLE records USING fts5(
-                source_kind,
-                role,
-                cwd_project,
-                timestamp_bucket,
-                tool_event,
-                artifact_task_path,
-                text
+        if persistent_cache is not None:
+            connection = persistent_cache.open_connection()
+        else:
+            connection = sqlite3.connect(":memory:")
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.execute(f"PRAGMA cache_size = -{FIELDED_BM25_SQLITE_CACHE_SIZE_KIB}")
+            connection.execute(f"PRAGMA mmap_size = {FIELDED_BM25_SQLITE_MMAP_SIZE_BYTES}")
+            connection.execute("PRAGMA synchronous = OFF")
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE records USING fts5(
+                    source_kind,
+                    role,
+                    cwd_project,
+                    timestamp_bucket,
+                    tool_event,
+                    artifact_task_path,
+                    text
+                )
+                """
             )
-            """
-        )
     except sqlite3.Error as exc:
         profile = finish_phase_profile(profile_token, indexed_file_count=0, indexed_record_count=0, indexed_chunk_count=0)
         return FieldedBm25Index(
@@ -491,6 +736,18 @@ def build_fielded_bm25_index(
             "indexed_chunks": 0,
             "read_error_files": 0,
             "persistent_index_enabled": persistent_index_dir is not None,
+            "persistent_storage_kind": "durable_sqlite_fts5" if persistent_cache is not None else "ephemeral_memory_fts5",
+            "index_path_category": "user_supplied_fielded_bm25_index_dir" if persistent_cache is not None else "ephemeral_memory",
+            "durable_fts_database_present": persistent_cache is not None,
+            "durable_fts_index_reused": False,
+            "durable_fts_sources_migrated": 0,
+            "durable_record_meta_count": 0,
+            "compatibility_index_dir_mode": "upgraded_to_durable_sqlite_fts5" if persistent_cache is not None else "not_applicable",
+            "compatibility_migration_status": (
+                persistent_cache.compatibility_migration_status if persistent_cache is not None else "not_applicable"
+            ),
+            "refresh_status": "checking" if persistent_cache is not None else "ephemeral_rebuilt",
+            "stale_status": "checking" if persistent_cache is not None else "not_persistent",
             "sources_reused": 0,
             "sources_reindexed": 0,
             "sources_invalidated": 0,
@@ -507,20 +764,16 @@ def build_fielded_bm25_index(
             "sqlite_pressure_settings_enabled": True,
         },
     )
-    persistent_cache = FieldedBm25PersistentCache.open(Path(persistent_index_dir)) if persistent_index_dir else None
     if persistent_cache is not None:
-        index.metrics["sources_deleted"] = persistent_cache.sources_deleted
-    rowid = 0
+        index.metrics["sources_deleted"] = persistent_cache.sources_deleted + persistent_cache.prune_missing_durable_sources(
+            connection
+        )
+    rowid = _max_record_rowid(connection) if persistent_cache is not None else 0
     insert_buffer: list[tuple[int, str, str, str, str, str, str, str]] = []
     if planned_jsonl_files is not None:
         enumerated_files = [(path, size, list(planned_jsonl_files.warnings)) for path, size in planned_jsonl_files.files]
     else:
         enumerated_files = enumerate_jsonl_files(plan)
-    if persistent_cache is not None:
-        selected_source_keys = {persistent_cache.source_key(path) for path, _size, _warnings in enumerated_files}
-        index.metrics["sources_deleted"] = int(index.metrics.get("sources_deleted", 0)) + persistent_cache.prune_unselected_sources(
-            selected_source_keys
-        )
 
     for path, size, enum_warnings in enumerated_files:
         index.warnings = list(enum_warnings)
@@ -534,36 +787,44 @@ def build_fielded_bm25_index(
             content_fingerprint, fingerprint_bytes = _source_content_fingerprint(path)
             index.metrics["content_fingerprint_files"] += 1
             index.metrics["content_fingerprint_bytes"] += fingerprint_bytes
-            segment, invalidated = persistent_cache.load_segment(
+            source_key = persistent_cache.source_key(path)
+            metadata = persistent_cache.metadata_for(
                 path,
                 size=file_bytes,
                 source_kind=source_kind,
                 content_fingerprint=content_fingerprint,
             )
-            if invalidated:
-                index.metrics["sources_invalidated"] += 1
-            if segment is not None:
-                rowid = _load_persistent_segment_rows(
+            durable_metadata = persistent_cache.durable_source_metadata(connection, source_key)
+            if durable_metadata == metadata:
+                loaded_rows = _load_durable_source_rows(
                     connection,
                     index,
-                    insert_buffer,
-                    rowid,
+                    source_key=source_key,
                     path=path,
                     source_kind=source_kind,
-                    segment=segment,
                 )
-                file_records = int(segment.get("record_count") or 0)
-                index.files[str(path)] = {
-                    "source_kind": source_kind,
-                    "record_count": file_records,
-                    "byte_count": file_bytes,
-                }
-                index.metrics["indexed_files"] += 1
-                index.metrics["indexed_records"] += file_records
-                index.metrics["build_bytes"] += file_bytes
-                index.metrics["sources_reused"] += 1
-                index.metrics["segments_loaded"] += int(segment.get("row_count") or len(segment.get("rows") or []))
-                continue
+                if loaded_rows:
+                    file_records = _durable_source_record_count(connection, source_key)
+                    index.files[str(path)] = {
+                        "source_kind": source_kind,
+                        "record_count": file_records,
+                        "byte_count": file_bytes,
+                    }
+                    index.metrics["indexed_files"] += 1
+                    index.metrics["indexed_records"] += file_records
+                    index.metrics["indexed_chunks"] += loaded_rows
+                    index.metrics["build_bytes"] += file_bytes
+                    index.metrics["sources_reused"] += 1
+                    index.metrics["segments_loaded"] += loaded_rows
+                    index.metrics["durable_fts_index_reused"] = True
+                    continue
+                persistent_cache.drop_durable_source(connection, source_key)
+                persistent_cache._drop_source(source_key)
+                index.metrics["sources_invalidated"] += 1
+            elif durable_metadata is not None:
+                persistent_cache.drop_durable_source(connection, source_key)
+                persistent_cache._drop_source(source_key)
+                index.metrics["sources_invalidated"] += 1
             index.metrics["sources_reindexed"] += 1
         try:
             if path.suffix == ".jsonl":
@@ -633,6 +894,13 @@ def build_fielded_bm25_index(
             index.metrics["indexed_chunks"] += file_records
         index.metrics["build_bytes"] += file_bytes
         if persistent_cache is not None:
+            source_key = persistent_cache.source_key(path)
+            metadata = persistent_cache.metadata_for(
+                path,
+                size=file_bytes,
+                source_kind=source_kind,
+                content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
+            )
             segment_rows = [
                 _persistent_row_from_ref(connection, index.records[candidate_rowid])
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
@@ -648,11 +916,38 @@ def build_fielded_bm25_index(
                 content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
             )
             index.metrics["segments_written"] += len(segment_rows)
+            durable_refs = [
+                index.records[candidate_rowid]
+                for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
+                if candidate_rowid in index.records
+            ]
+            persistent_cache.save_durable_source(
+                connection,
+                path,
+                source_key=source_key,
+                metadata=metadata,
+                record_count=file_records,
+                byte_count=file_bytes,
+                refs=durable_refs,
+            )
     _flush_insert_buffer(connection, insert_buffer)
+    _prepare_active_scope(connection, index, intent=None)
     connection.commit()
     if persistent_cache is not None:
+        index.metrics["durable_record_meta_count"] = _durable_record_meta_count(connection)
         persistent_cache.save()
         index.metrics["warm_query_reused_index"] = bool(index.metrics.get("sources_reused", 0))
+        if index.metrics["warm_query_reused_index"]:
+            index.metrics["refresh_status"] = "warm_reused_with_incremental_refresh"
+        elif int(index.metrics.get("sources_invalidated", 0)) or int(index.metrics.get("sources_deleted", 0)):
+            index.metrics["refresh_status"] = "refreshed_stale_sources"
+        else:
+            index.metrics["refresh_status"] = "cold_built"
+        index.metrics["stale_status"] = (
+            "refreshed"
+            if int(index.metrics.get("sources_invalidated", 0)) or int(index.metrics.get("sources_deleted", 0))
+            else "fresh"
+        )
     index.metrics["build_elapsed_ms"] = _elapsed_ms(started)
     if planned_jsonl_files is not None:
         index.metrics["planned_file_enumeration_reused"] = True
@@ -724,6 +1019,7 @@ def search_with_fielded_bm25(
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
 
+    _prepare_active_scope(index.connection, index, intent=intent)
     candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
     candidate_pool_limit = max(candidate_limit * FIELDED_SOURCE_GROUPING_POOL_FACTOR, candidate_limit)
     raw_rows, row_stream_labels, stream_rows, stream_diagnostics, stream_error_types = _execute_fielded_query_streams(
@@ -977,6 +1273,7 @@ def search_with_fielded_bm25(
         "candidate_rows_surfaced": len(matches),
         "fielded_context_neighborhood": context_neighborhood_summary,
         "fielded_source_grouping": source_grouping,
+        "fielded_scope": index.scope_summary,
         "bm25_rank_buckets": dict(sorted(bm25_rank_buckets.items())),
         "searched_files": len(opened_paths),
         "opened_files": len(opened_paths),
@@ -1407,6 +1704,186 @@ def _persistent_row_from_ref(connection: sqlite3.Connection, ref: FieldedBm25Rec
         "day_key": ref.day_key,
         "record": record_payload,
         "fts": fts,
+    }
+
+
+def _max_record_rowid(connection: sqlite3.Connection) -> int:
+    try:
+        row = connection.execute("SELECT max(rowid) FROM records").fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _durable_record_meta_count(connection: sqlite3.Connection) -> int:
+    try:
+        row = connection.execute("SELECT count(*) FROM record_meta").fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _durable_source_record_count(connection: sqlite3.Connection, source_key: str) -> int:
+    try:
+        row = connection.execute("SELECT record_count FROM source_files WHERE source_key = ?", (source_key,)).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _load_durable_source_rows(
+    connection: sqlite3.Connection,
+    index: FieldedBm25Index,
+    *,
+    source_key: str,
+    path: Path,
+    source_kind: str,
+) -> int:
+    try:
+        rows = list(
+            connection.execute(
+                """
+                SELECT rowid, source_kind, path, line, line_end, source_ordinal,
+                       role_bucket, timestamp_bucket, session_key, day_key, record_json
+                FROM record_meta
+                WHERE source_key = ?
+                ORDER BY source_ordinal ASC, rowid ASC
+                """,
+                (source_key,),
+            )
+        )
+    except sqlite3.Error:
+        return 0
+    for row in rows:
+        record_payload = None
+        if row[10]:
+            try:
+                loaded_record = json.loads(str(row[10]))
+            except json.JSONDecodeError:
+                loaded_record = None
+            record_payload = loaded_record if isinstance(loaded_record, dict) else None
+        record = _record_from_persistent_payload(record_payload, path=Path(row[2] or path)) if record_payload else None
+        rowid = int(row[0])
+        index.records[rowid] = FieldedBm25RecordRef(
+            rowid=rowid,
+            path=Path(row[2] or path),
+            line=int(row[3] or 1),
+            line_end=int(row[4] or row[3] or 1),
+            source_kind=str(row[1] or source_kind),
+            source_ordinal=int(row[5] or row[3] or 1),
+            role_bucket=str(row[6] or "unknown"),
+            timestamp_bucket=str(row[7] or "timestamp_absent"),
+            session_key=str(row[8]) if row[8] else None,
+            day_key=str(row[9]) if row[9] else None,
+            record=record,
+        )
+    return len(rows)
+
+
+def _prepare_active_scope(
+    connection: sqlite3.Connection,
+    index: FieldedBm25Index,
+    *,
+    intent: QueryIntent | None,
+) -> None:
+    scoped_rowids = {
+        rowid
+        for rowid, ref in index.records.items()
+        if _ref_within_intent_date_scope(ref, intent)
+    }
+    try:
+        connection.execute("CREATE TEMP TABLE IF NOT EXISTS bm25_active_scope(rowid INTEGER PRIMARY KEY)")
+        connection.execute("DELETE FROM bm25_active_scope")
+        connection.executemany(
+            "INSERT OR IGNORE INTO bm25_active_scope(rowid) VALUES (?)",
+            [(int(rowid),) for rowid in sorted(scoped_rowids)],
+        )
+    except sqlite3.Error:
+        scoped_rowids = set()
+    index.scope_rowids = scoped_rowids
+    index.scope_summary = _scope_summary(index, intent=intent)
+
+
+def _ref_within_intent_date_scope(ref: FieldedBm25RecordRef, intent: QueryIntent | None) -> bool:
+    if intent is None or getattr(intent, "date_window_start", None) is None or getattr(intent, "date_window_end", None) is None:
+        return True
+    day_key = ref.day_key
+    if not day_key:
+        return True
+    if day_key.endswith("-xx"):
+        return True
+    try:
+        day_start = datetime.fromisoformat(day_key)
+    except ValueError:
+        return True
+    window_start = intent.date_window_start
+    window_end = intent.date_window_end
+    if window_start is None or window_end is None:
+        return True
+    if window_start.tzinfo is not None:
+        day_start = day_start.replace(tzinfo=window_start.tzinfo)
+    day_end = day_start + timedelta(days=1)
+    return day_end > window_start and day_start < window_end
+
+
+def _scope_summary(index: FieldedBm25Index, *, intent: QueryIntent | None) -> dict[str, Any]:
+    scoped_refs = [index.records[rowid] for rowid in index.scope_rowids if rowid in index.records]
+    source_key_count = len(
+        {hashlib.sha256(str(ref.path).encode("utf-8", errors="replace")).hexdigest() for ref in scoped_refs}
+    )
+    source_kind_counts: dict[str, int] = {}
+    session_count = 0
+    day_count = 0
+    sessions: set[str] = set()
+    days: set[str] = set()
+    for ref in scoped_refs:
+        source_kind_counts[ref.source_kind] = source_kind_counts.get(ref.source_kind, 0) + 1
+        if ref.session_key:
+            sessions.add(ref.session_key)
+        if ref.day_key:
+            days.add(ref.day_key)
+    session_count = len(sessions)
+    day_count = len(days)
+    date_window_present = bool(
+        intent is not None and getattr(intent, "date_window_start", None) is not None and getattr(intent, "date_window_end", None) is not None
+    )
+    return {
+        "schema_version": 1,
+        "scope_type": "selected_source_file_set_with_metadata_filters",
+        "scope_enforced": True,
+        "scope_row_count": len(index.scope_rowids),
+        "indexed_row_count_loaded_for_scope": len(index.records),
+        "source_file_scope_count": source_key_count,
+        "source_kind_counts": dict(sorted(source_kind_counts.items())),
+        "session_scope_count": session_count,
+        "day_scope_count": day_count,
+        "date_window_filter_present": date_window_present,
+        "date_window_unknown_day_policy": "include_unknown_day_exclude_known_outside_window",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
+    }
+
+
+def _empty_scope_summary() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "scope_type": "none",
+        "scope_enforced": False,
+        "scope_row_count": 0,
+        "indexed_row_count_loaded_for_scope": 0,
+        "source_file_scope_count": 0,
+        "source_kind_counts": {},
+        "session_scope_count": 0,
+        "day_scope_count": 0,
+        "date_window_filter_present": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_cwd_included": False,
     }
 
 
@@ -4300,6 +4777,7 @@ def _execute_fielded_query_streams(
                     SELECT rowid, bm25(records) AS bm25_score
                     FROM records
                     WHERE records MATCH ?
+                      AND rowid IN (SELECT rowid FROM bm25_active_scope)
                     ORDER BY bm25_score ASC
                     LIMIT ?
                     """,
@@ -4318,6 +4796,8 @@ def _execute_fielded_query_streams(
                     hit_limit=False,
                     status="query_failed",
                     error_type=error_type,
+                    scope_row_count=len(index.scope_rowids),
+                    scope_hit_count=0,
                 )
             )
             continue
@@ -4340,6 +4820,8 @@ def _execute_fielded_query_streams(
                 hit_limit=len(rows) >= candidate_pool_limit,
                 status="available",
                 error_type=None,
+                scope_row_count=len(index.scope_rowids),
+                scope_hit_count=len(rows),
             )
         )
     return merged_rows, row_stream_labels, stream_rows, diagnostics, error_types
@@ -4555,6 +5037,8 @@ def _query_stream_summary(
 ) -> dict[str, Any]:
     generated = sum(int(item.get("row_count") or 0) for item in diagnostics)
     deduped_by_stream = sum(int(item.get("deduped_row_count") or 0) for item in diagnostics)
+    scope_row_count = max([int(item.get("scope_row_count") or 0) for item in diagnostics] or [0])
+    scope_hit_count = sum(int(item.get("scope_hit_count") or 0) for item in diagnostics)
     saturated_labels = [
         str(item.get("label"))
         for item in diagnostics
@@ -4581,6 +5065,10 @@ def _query_stream_summary(
         "selected_rows_by_stream": dict(selection.get("selected_rows_by_stream") or {}),
         "rows_dropped_by_stream_cap": dict(selection.get("rows_dropped_by_stream_cap") or {}),
         "rows_dropped_by_stream_cap_total": int(selection.get("rows_dropped_by_stream_cap_total") or 0),
+        "scope_type": "active_selected_source_scope",
+        "scope_enforced": True,
+        "scope_row_count": scope_row_count,
+        "scope_hit_count_total": scope_hit_count,
         "raw_paths_included": False,
         "raw_text_included": False,
         "raw_query_text_included": False,
@@ -4602,6 +5090,8 @@ def _query_stream_diagnostic(
     hit_limit: bool,
     status: str,
     error_type: str | None,
+    scope_row_count: int = 0,
+    scope_hit_count: int | None = None,
 ) -> dict[str, Any]:
     return {
         "label": stream.label,
@@ -4618,6 +5108,10 @@ def _query_stream_diagnostic(
         "stream_limit": int(stream_limit),
         "hit_limit": bool(hit_limit),
         "error_type": error_type,
+        "scope_type": "active_selected_source_scope",
+        "scope_row_count": int(scope_row_count),
+        "scope_hit_count": int(row_count if scope_hit_count is None else scope_hit_count),
+        "scope_enforced": True,
         "raw_query_text_included": False,
         "raw_query_terms_included": False,
         "raw_paths_included": False,
@@ -5396,6 +5890,7 @@ def _unavailable_payload(
         "candidate_records_scored": 0,
         "candidate_records_deduped": 0,
         "materialization": _new_materialization_counters(),
+        "fielded_scope": index.scope_summary or _empty_scope_summary(),
         "bm25_rank_buckets": {},
         "groups": [],
         "summary": index.sanitized_summary(),
