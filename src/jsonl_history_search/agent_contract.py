@@ -109,7 +109,7 @@ def build_agent_find_payload(
     context_bytes = len(str(candidate_dicts).encode("utf-8"))
     raw_baseline_bytes = search_result.get("searched_bytes", 0)
     estimated_reduction_ratio = reduction_ratio(context_bytes, raw_baseline_bytes)
-    status = "found" if candidates else "no_evidence"
+    status = derive_agent_find_status(search_result=search_result, candidates=candidates)
     no_evidence_report = build_no_evidence_report(
         status=status,
         source_plan=source_plan,
@@ -241,6 +241,13 @@ def build_agent_find_payload(
     return {"agent_find": agent_find}
 
 
+def derive_agent_find_status(*, search_result: dict[str, Any], candidates: list[CandidateRow]) -> str:
+    retrieval_status = str(search_result.get("status") or "")
+    if retrieval_status.startswith("failed_closed"):
+        return retrieval_status
+    return "found" if candidates else "no_evidence"
+
+
 def command_surface() -> dict[str, str]:
     return {
         "read-more": "Bounded provenance expansion for an exact source_ref: record, window, before/next, or source/session/day neighborhood without rerunning broad search.",
@@ -313,7 +320,7 @@ def build_compact_provenance_handoff(
     pressure_summary = compact_retrieval_pressure_summary(retrieval_pressure)
     packet: dict[str, Any] = {
         "schema_version": 1,
-        "status": "no_evidence" if status == "no_evidence" else "candidates_found",
+        "status": compact_provenance_status(status),
         "command_surface": command_surface,
         "derived_from": [
             "source_locator_handoff",
@@ -386,6 +393,14 @@ def build_compact_provenance_handoff(
         "field_tiers": compact_handoff_field_tiers(output_budget),
     }
     return packet
+
+
+def compact_provenance_status(status: str) -> str:
+    if status == "no_evidence":
+        return "no_evidence"
+    if str(status or "").startswith("failed_closed"):
+        return str(status)
+    return "candidates_found"
 
 
 def compact_final_evidence_contract_projection(value: Any) -> dict[str, Any]:
@@ -995,6 +1010,9 @@ def build_stage_diagnostics(
     cap_labels = list(pressure.get("cap_labels") or diagnostics.get("cap_labels") or [])
     candidate_count = int(pressure.get("fielded_bm25", {}).get("candidate_count") or 0)
     no_evidence_needed = bool(no_evidence_report.get("needed"))
+    retrieval_status = str(search_result.get("status") or fielded.get("status") or "")
+    retrieval_failed_closed = retrieval_status.startswith("failed_closed")
+    retrieval_budget = fielded.get("retrieval_budget") if isinstance(fielded.get("retrieval_budget"), dict) else {}
 
     stages = [
         stage_diagnostic(
@@ -1027,9 +1045,20 @@ def build_stage_diagnostics(
         ),
         stage_diagnostic(
             "fielded_index_search",
-            "capped" if cap_labels else "available" if fielded.get("status") else "not_run",
-            "none",
+            retrieval_status
+            if retrieval_failed_closed
+            else "capped"
+            if cap_labels
+            else "available"
+            if fielded.get("status")
+            else "not_run",
+            "increase_bm25_query_timeout_or_narrow_scope"
+            if retrieval_failed_closed and retrieval_budget.get("timed_out")
+            else "none",
             {
+                "retrieval_status": retrieval_status,
+                "timed_out": bool(retrieval_budget.get("timed_out", False)),
+                "partial_results": bool(retrieval_budget.get("partial_results", False)),
                 "candidate_count": candidate_count,
                 "candidate_rows": int(fielded.get("candidate_rows") or 0),
                 "candidate_row_limit": int(fielded.get("candidate_row_limit") or 0),
@@ -1368,6 +1397,7 @@ def build_stage_diagnostics(
         "dominant_pressure_stage": dominant_stage(
             cap_labels=cap_labels,
             no_evidence_needed=no_evidence_needed,
+            retrieval_failed_closed=retrieval_failed_closed,
             source_window_packaging=source_window_packaging,
             candidate_count=candidate_count,
         ),
@@ -1399,9 +1429,12 @@ def dominant_stage(
     *,
     cap_labels: list[Any],
     no_evidence_needed: bool,
+    retrieval_failed_closed: bool,
     source_window_packaging: dict[str, Any],
     candidate_count: int,
 ) -> str:
+    if retrieval_failed_closed:
+        return "fielded_index_search"
     if no_evidence_needed or candidate_count == 0:
         return "searched_scope_no_evidence"
     if source_window_packaging.get("status") != "packaged":
@@ -2657,7 +2690,12 @@ def build_compact_answerability(
     ]
     weak_candidate_count = max(0, len(candidates) - len(strong_candidates))
 
-    if candidates and not source_plan_present:
+    if status.startswith("failed_closed"):
+        support_class = ANSWERABILITY_INSUFFICIENT_GROUNDING
+        answerable = False
+        grounding_state = "retrieval_failed_closed_before_candidate_evidence"
+        reasons = ["retrieval_failed_closed_before_no_evidence_or_candidate_support"]
+    elif candidates and not source_plan_present:
         support_class = ANSWERABILITY_SUPPORTED_IN_SEARCHED_SCOPE
         answerable = True
         grounding_state = "candidate_support_without_source_tier_plan"
@@ -3338,6 +3376,14 @@ def build_source_locator_handoff(
 
 def source_locator_no_evidence_meaning(no_evidence_report: dict[str, Any] | None) -> dict[str, Any]:
     report = no_evidence_report if isinstance(no_evidence_report, dict) else {}
+    if report.get("retrieval_failure"):
+        return {
+            "answer_scope": report.get("answer_scope") or "not_evaluated_retrieval_failed_closed",
+            "not_all_history_absence": False,
+            "meaning": "Retrieval failed closed before completing; no scoped no-evidence conclusion was produced.",
+            "retrieval_status": report.get("retrieval_status"),
+            "read_more_required_before_scoped_no_evidence_answer": False,
+        }
     if report.get("needed"):
         return {
             "answer_scope": report.get("answer_scope") or "not_found_in_searched_scope",
@@ -6377,6 +6423,30 @@ def build_no_evidence_report(
     no_evidence_mode: bool = False,
 ) -> dict:
     source_scope = build_source_scope_summary(source_plan, search_result)
+    if status.startswith("failed_closed"):
+        retrieval_budget = {}
+        diagnostics = search_result.get("retrieval_diagnostics")
+        if isinstance(diagnostics, dict):
+            fielded = diagnostics.get("fielded_bm25")
+            if isinstance(fielded, dict) and isinstance(fielded.get("retrieval_budget"), dict):
+                retrieval_budget = fielded["retrieval_budget"]
+        return {
+            "needed": False,
+            "reason": "Retrieval failed closed before completing; do not treat this as searched-scope no-evidence.",
+            "retrieval_failure": True,
+            "retrieval_status": status,
+            "answer_scope": "not_evaluated_retrieval_failed_closed",
+            "searched_scope": source_scope["searched_scope"],
+            "not_searched_scope": source_scope["not_searched_scope"],
+            "cap_hit": source_scope["cap_hit"],
+            "warnings": search_result.get("warnings", []),
+            "blind_spots": search_result.get("blind_spots", []),
+            "retrieval_budget": retrieval_budget,
+            "why_not_confident": (
+                "The retrieval backend stopped fail-closed under its configured timeout or cap. "
+                "Rerun with a narrower query/source scope or a larger explicit retrieval budget before making a no-evidence claim."
+            ),
+        }
     if status != "no_evidence" and no_evidence_mode:
         claim_boundary_report = build_claim_boundary_no_evidence_report(
             source_plan=source_plan,

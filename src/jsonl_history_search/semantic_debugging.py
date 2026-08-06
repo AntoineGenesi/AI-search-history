@@ -1132,9 +1132,10 @@ def build_semantic_debug_payload(
             agent_instruction,
             followthrough=in_depth_audit_followthrough,
         )
+    command_status = semantic_debug_command_status(agent_find.get("status"))
     packet = {
         "schema_version": SCHEMA_VERSION,
-        "status": "no_evidence" if agent_find["status"] == "no_evidence" else "candidates_found",
+        "status": command_status,
         "query": agent_find["query"]["original"],
         "audit_depth": audit_depth,
         "in_depth_audit_coverage": in_depth_audit_coverage,
@@ -1237,6 +1238,15 @@ def build_semantic_debug_payload(
         "warnings": sorted(set(result.get("warnings", []) + tool_payload.get("warnings", []) + (forensics_payload or {}).get("warnings", []))),
         "blind_spots": sorted(set(result.get("blind_spots", []) + tool_payload.get("blind_spots", []) + (forensics_payload or {}).get("blind_spots", []))),
     }
+
+
+def semantic_debug_command_status(agent_find_status: Any) -> str:
+    status = str(agent_find_status or "")
+    if status == "no_evidence":
+        return "no_evidence"
+    if status.startswith("failed_closed"):
+        return status
+    return "candidates_found"
 
 
 def classify_question_family(query: str, *, hints: dict[str, str | None], status: str) -> dict[str, Any]:
