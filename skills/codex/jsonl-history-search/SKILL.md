@@ -2,7 +2,7 @@
 name: jsonl-history-search
 description: cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or zero tools for unresolved scope. Trigger: `what has happened since my last message in the parent thread?`. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command; aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
 metadata:
-  short-description: Search local AI history
+  short-description: History
 ---
 
 # JSONL History Search
@@ -42,11 +42,11 @@ For a named `tasks`/`...md`, decide scope before any tool:
 - unresolved scope: ask "Do you want current local Git/task evidence or prior
   conversation history?" and use zero tools.
 
-Start exactly one installed route before repo search, Git, or visible-context synthesis. Exact alias
+Start exactly one installed route before repo/Git/context synthesis. Exact alias
 `what has happened since my last message? use the convo tool`: run `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `use the convo tool`/`convo CLI`: `jsonl-history-search`; no
-connector discovery/plugin install/`convo --help` first. For old-context decisions like
-`before compaction`, `outside visible context`, or `earlier in the thread`, run
-`semantic-debug`. For explicit all-chats/agent-history audit wording, run:
+connector discovery/plugin install/`convo --help` first. old-context decisions
+like `before compaction`, `outside visible context`, or `earlier in the thread`
+use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
 ```bash
 jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
@@ -59,25 +59,27 @@ Otherwise run:
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
-Wait for that command to exit. While it is running, do not start another `ask`,
+Wait for that command to exit. While it runs, do not start another `ask`,
 `ask --execute`, direct `semantic-debug`, or source-checkout
-fallback. Only if the installed command exits with command-not-found (126/127) or a clear
-install/import failure, and when cwd contains
-`src/jsonl_history_search/cli.py`, run recovery
-once:
+fallback. Only if
+the installed command exits with command-not-found (126/127) or a clear
+install/import failure, and cwd contains `src/jsonl_history_search/cli.py`, run
+recovery once:
 
 ```bash
 PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
 The source command is failure recovery, never a parallel or equivalent route.
-If neither command is available, report the installation failure. Do not probe.
+If neither command is available, report the installation failure.
 
 ## Follow The Route
 
-After the one `ask --execute` exits, use its selected refs, inspection contract,
-and stop rule. Do not rerun `ask` or direct `semantic-debug` for the same
-evidence. Read at most one matching file under `references/`:
+After one `ask --execute`, follow selected refs, stop rule, and any
+`method_selection_packet` (`required_surfaces`, `read_order`,
+`secondary_policy`, `stop_rule`, `continue_only_if`,
+`cap_language_required`, `single_flight_policy`). Do not rerun `ask` or
+direct `semantic-debug`. Read at most one matching file under `references/`:
 
 - remembered wording or preference: `references/remembered-instruction.md`;
 - remembered topic or rationale: `references/remembered-topic.md`;
@@ -101,14 +103,14 @@ evidence. Read at most one matching file under `references/`:
 
 3. Prefer original user turns for wording and tool calls, outputs, diffs, or
    commits for action claims. Later summaries are leads.
-4. For many exact screenshot/OCR/source phrases, use `bulk-line-match` with
-   `--phrase`/`--phrases-file`; rows are leads, not proof. Validate selected
-   refs with `read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage`.
+4. Exact screenshot/OCR/source phrases: use `bulk-line-match` with
+   `--phrase`/`--phrases-file`; rows are leads, not proof. Validate refs with
+   `read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage`.
 5. State the searched scope and uncertainty. `not_found_in_searched_scope`
    never means the evidence does not exist anywhere.
-6. Stop when inspected primary sources answer the question. Widen or escalate
-   only for a named missing facet. If primary evidence is absent, capped,
+6. Stop when inspected primary sources answer the question. Widen/escalate
+   only for a named missing facet. If primary evidence is absent/capped,
    ambiguous, or contradictory, fail closed and say what remains unproved.
-7. Explicit full/deep history audits must preserve CLI audit-depth coverage
-   caveats; ordinary prompts and status/local questions stay quick.
+7. Full/deep history audits preserve CLI audit-depth coverage caveats;
+   ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.

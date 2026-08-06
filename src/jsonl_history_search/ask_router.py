@@ -59,6 +59,217 @@ EvidenceSource = Literal["local", "conversation-history"]
 ActivationMode = Literal["implicit", "explicit-only"]
 
 
+METHOD_SELECTION_PACKET_SCHEMA_VERSION = "route-family-method-packet/v1"
+
+
+METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
+    "long_range_history": {
+        "method_id": "long_range_history",
+        "forbidden_first_moves": [
+            "visible-context synthesis before history refs",
+            "repo/Git/task artifact search before semantic-debug",
+            "latest-status interval reconstruction unless the wording asks for since/after status",
+            "broad manual rg as route discovery",
+        ],
+        "required_surfaces": [
+            "semantic_debug.source_locator_handoff primary raw/session/tool source refs",
+            "semantic_debug.next_reads or equivalent read-more commands for the old thread/decision window",
+            "searched roots, caps, omitted context, and missing prior-context facet",
+        ],
+        "read_order": [
+            "Run the first_command once.",
+            "Open primary raw conversation/session/tool refs for the old-context window.",
+            "Use task/review/report/current-context echoes only as secondary diagnostics.",
+            "Report searched scope/caps before claiming recovered prior-thread history.",
+        ],
+        "secondary_policy": (
+            "Same-loop echoes, task/review/report artifacts, visible context, Git, and repo files are "
+            "secondary diagnostics only until primary old-context refs are opened."
+        ),
+        "stop_rule": (
+            "Stop when inspected primary refs answer what was decided, said, or happened before compaction "
+            "or outside visible context, with searched-scope/cap caveats."
+        ),
+        "continue_only_if": (
+            "Continue only for a named missing prior-context facet, capped/ambiguous refs, unavailable roots, "
+            "or an explicit user request for secondary artifacts."
+        ),
+        "cap_language_required": True,
+        "single_flight_policy": (
+            "Run exactly one semantic-debug route command first; do not parallel ask/ask --execute/repo discovery "
+            "for the same evidence."
+        ),
+    },
+    "deep_history_audit": {
+        "method_id": "deep_history_audit",
+        "forbidden_first_moves": [
+            "ask --execute as broad audit discovery",
+            "quick semantic-debug sample for all-chats/all-agent wording",
+            "latest-status or local artifact currentness substitution",
+            "broad repo/Git archaeology before audit coverage",
+        ],
+        "required_surfaces": [
+            "semantic_debug.in_depth_audit_coverage windows/slices",
+            "searched roots, cap statuses, omitted windows, and trace counts",
+            "source_locator_handoff and next_reads primary raw/session/tool refs",
+            "audit-coverage or copyable continuation command when coverage is incomplete",
+        ],
+        "read_order": [
+            "Run first_command with the resolved audit depth.",
+            "Inspect in_depth_audit_coverage before any completeness claim.",
+            "Open promoted primary raw/session/tool refs from source_locator_handoff or next_reads.",
+            "Use continuation/audit-coverage only when required coverage remains incomplete.",
+        ],
+        "secondary_policy": (
+            "Task/report/review outputs and repo artifacts are manual leads only; they cannot close all-history "
+            "or every-agent completeness without audit coverage and opened primary refs."
+        ),
+        "stop_rule": (
+            "Stop only when coverage and inspected primary refs support the scoped answer; otherwise fail closed "
+            "with searched scope, caps/omissions, missing facets, and next command."
+        ),
+        "continue_only_if": (
+            "Continue only when coverage is incomplete, a required facet is missing, caps/omissions block the "
+            "answer, or the user explicitly asks for exhaustive follow-through."
+        ),
+        "cap_language_required": True,
+        "single_flight_policy": (
+            "Run exactly one semantic-debug audit-depth command first; do not rerun ask, ask --execute, broad rg, "
+            "or alternate discovery before inspecting audit coverage."
+        ),
+    },
+    "provenance": {
+        "method_id": "provenance",
+        "forbidden_first_moves": [
+            "artifact-currentness or current Git status before historical source refs",
+            "TODO/task/review/report sweeps before semantic-debug",
+            "answering from current-run echoes or post-hoc answer-key artifacts",
+            "broad repo rg as chronology reconstruction",
+        ],
+        "required_surfaces": [
+            "semantic_debug.source_locator_handoff.next_reads",
+            "target historical raw JSONL/session/tool refs",
+            "historical task/review/branch/commit secondary refs named by the route",
+            "diagnostic-only current-run/prior-final/adjudication/report rows demoted until target reads are opened",
+        ],
+        "read_order": [
+            "Run first_command once.",
+            "Open target historical raw session/tool refs before repo artifacts.",
+            "Then inspect historical task/review/branch/commit refs for chronology roles.",
+            "Use current-run echoes, reports, and adjudication artifacts only as diagnostics.",
+        ],
+        "secondary_policy": (
+            "Historical task/review/commit refs can support chronology after raw source refs; later recaps, "
+            "same-loop output, final-answer artifacts, and answer-key-adjacent rows are diagnostics only."
+        ),
+        "stop_rule": (
+            "Stop when opened raw refs plus legitimate historical artifacts distinguish the requested task, "
+            "review, branch, commit, implementation, source-session, and merge facets."
+        ),
+        "continue_only_if": (
+            "Continue only for a named missing chronology/source-session facet, unresolved contradiction, capped "
+            "history source, or user-requested current-run audit."
+        ),
+        "cap_language_required": True,
+        "single_flight_policy": (
+            "Run exactly one semantic-debug provenance command first; do not run artifact-currentness, TODO scans, "
+            "or broad repo searches as parallel first moves."
+        ),
+    },
+    "orchestration_provenance": {
+        "method_id": "orchestration_provenance",
+        "forbidden_first_moves": [
+            "what-happened-since/status anchoring for historical launched-run provenance",
+            "current-run tool-output echo recovery before original raw refs",
+            "task/review/report sweeps before parent/worker/reviewer source refs",
+            "broad rg/listing as coordinator/worker/reviewer discovery",
+        ],
+        "required_surfaces": [
+            "semantic_debug.source_locator_handoff.next_reads",
+            "pre-existing parent raw source refs",
+            "pre-existing worker/subagent raw source refs",
+            "pre-existing reviewer/raw validation source refs when the prompt asks follow-through",
+            "historical provenance self-echo diagnostics after target refs",
+        ],
+        "read_order": [
+            "Run first_command once.",
+            "Open pre-existing parent/coordinator refs.",
+            "Open worker/subagent refs, then reviewer/validation refs when relevant.",
+            "Only then use current-run command outputs or lane prompts as diagnostics.",
+        ],
+        "secondary_policy": (
+            "Current-run command output, lane prompts, status summaries, reports, and same-run echoes are "
+            "diagnostics unless the user explicitly asks about the current run/tool/lane."
+        ),
+        "stop_rule": (
+            "Stop when opened pre-existing parent, worker/subagent, and reviewer refs prove the launched-run "
+            "provenance and follow-through facets requested."
+        ),
+        "continue_only_if": (
+            "Continue only for a named missing parent/worker/reviewer facet, capped or ambiguous refs, or an "
+            "explicit request to audit the current run."
+        ),
+        "cap_language_required": True,
+        "single_flight_policy": (
+            "Run exactly one semantic-debug orchestration-provenance command first; do not parallel latest-status "
+            "or broad repo recovery."
+        ),
+    },
+    "action_proof": {
+        "method_id": "action_proof",
+        "forbidden_first_moves": [
+            "answering from assistant claims or later summaries",
+            "repo grep before conversation tool/action refs",
+            "task/review/report artifact proof before tool outputs",
+            "rerunning broad discovery after primary action proof answers",
+        ],
+        "required_surfaces": [
+            "semantic_debug.source_window_action_proof",
+            "tool_action_proof primary refs and required proof reads",
+            "tool calls, command outputs, diffs, commits, tests, or filesystem effects tied to the claim",
+            "source_locator_handoff.next_reads for exact source follow-through",
+        ],
+        "read_order": [
+            "Run first_command once.",
+            "Inspect source_window_action_proof and tool_action_proof.",
+            "Open primary tool/action refs and their outputs before assistant prose.",
+            "Use diffs, commits, tests, and reviews only after tying them to primary action evidence.",
+        ],
+        "secondary_policy": (
+            "Assistant prose, task/review/report summaries, and later recaps are leads only; they do not prove "
+            "the agent actually ran, changed, tested, read, or followed something."
+        ),
+        "stop_rule": (
+            "Stop when inspected primary tool/action refs answer the named action claim; report weak/no evidence "
+            "instead of widening by default."
+        ),
+        "continue_only_if": (
+            "Continue only for a specific missing action facet, weak/no evidence with too-narrow searched scope, "
+            "or an explicit user request for secondary confirmation."
+        ),
+        "cap_language_required": True,
+        "single_flight_policy": (
+            "Run exactly one semantic-debug action-proof command first; do not run broad rg or artifact sweeps "
+            "before primary action refs."
+        ),
+    },
+}
+
+
+def _method_selection_packet(route_family: str, first_command: str) -> dict | None:
+    template = METHOD_SELECTION_PACKET_TEMPLATES.get(route_family)
+    if not template:
+        return None
+    packet = {
+        "schema_version": METHOD_SELECTION_PACKET_SCHEMA_VERSION,
+        "route_family": route_family,
+        "method_id": template["method_id"],
+        "first_command": first_command,
+    }
+    packet.update(template)
+    return packet
+
+
 @dataclass(frozen=True)
 class AskRoute:
     route_family: str
@@ -1038,6 +1249,7 @@ def build_ask_router_payload(
         route_family=route.route_family,
         audit_depth=audit_depth_payload,
     )
+    method_selection_packet = _method_selection_packet(route.route_family, first_command)
     explicit_task_match = _EXPLICIT_TASK_PATH_RE.search(query.lower())
     named_task_path = explicit_task_match.group(0) if explicit_task_match else ""
     if route.route_family == STORAGE_RETENTION_ROUTE_FAMILY:
@@ -1122,6 +1334,7 @@ def build_ask_router_payload(
             "structured_execution_query": structured_execution_query,
             "command_resolution": command_resolution_payload,
             "first_command": first_command,
+            "method_selection_packet": method_selection_packet,
             "next_commands": next_commands,
             "answer_ready_handoff": answer_ready_handoff,
             "optional_deeper_reads": optional_deeper_reads,

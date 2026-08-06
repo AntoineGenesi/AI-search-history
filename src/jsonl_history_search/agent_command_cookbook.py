@@ -91,14 +91,41 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
         {
             "id": "source_provenance",
             "question_family": "Find the source session behind this report/task/review.",
-            "route": "semantic-debug",
+            "route": "task-review-commit-provenance / semantic-debug",
             "first_command": (
-                'jsonl-history-search ask "find the source session behind this report task or review" '
+                'jsonl-history-search semantic-debug "find the source session behind this report task or review" '
                 '--cwd "$PWD" --format text'
             ),
             "inspect_next": (
-                "semantic_debug.source_locator_handoff primary raw/session/tool source refs and next_reads first; "
-                "use linked task/review/report/commit artifacts only after those primary refs have been opened"
+                "semantic_debug.source_locator_handoff.next_reads, target historical raw JSONL/session/tool refs, "
+                "then historical task/review/branch/commit refs; use linked task/review/report/commit artifacts "
+                "only after those primary refs have been opened; post-hoc reports and current-run echoes are diagnostics"
+            ),
+        },
+        {
+            "id": "orchestration_provenance",
+            "question_family": "Prove which coordinator, worker, and reviewer sessions handled a launched task.",
+            "route": "orchestration-provenance / semantic-debug",
+            "first_command": (
+                'jsonl-history-search semantic-debug "which coordinator worker and reviewer sessions handled this task?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "pre-existing parent/coordinator, worker/subagent, and reviewer raw refs from "
+                "source_locator_handoff.next_reads before current-run command-output echoes"
+            ),
+        },
+        {
+            "id": "long_range_history",
+            "question_family": "Recover an old decision from before compaction or outside visible context.",
+            "route": "long-range-history / semantic-debug",
+            "first_command": (
+                'jsonl-history-search semantic-debug "before compaction what did we decide about this?" '
+                '--cwd "$PWD" --format text'
+            ),
+            "inspect_next": (
+                "semantic_debug.source_locator_handoff primary old-context raw/session/tool refs, next_reads/read-more, "
+                "searched roots, caps, and omitted context before visible-context or repo artifact synthesis"
             ),
         },
         {
@@ -142,10 +169,13 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             "question_family": "What did the worker or agent actually do versus claim?",
             "route": "action-proof / semantic-debug",
             "first_command": (
-                'jsonl-history-search ask "what did the worker actually do versus claim?" '
+                'jsonl-history-search semantic-debug "what did the worker actually do versus claim?" '
                 '--cwd "$PWD" --format text'
             ),
-            "inspect_next": "tool_action_proof primary refs, command/tool events, diffs, commits, and review metadata",
+            "inspect_next": (
+                "semantic_debug.source_window_action_proof, tool_action_proof primary refs, command/tool outputs, "
+                "diffs, commits, tests, and only then assistant claims or later summaries"
+            ),
         },
         {
             "id": "storage_retention_forensics",
@@ -324,6 +354,10 @@ def ask_next_commands(
             },
         ]
 
+    method_followthrough = _method_followthrough_commands(
+        route_family=route_family,
+        cli_prefix=cli_prefix,
+    )
     commands: list[dict[str, Any]] = [
         {
             "purpose": "run selected first route",
@@ -344,6 +378,9 @@ def ask_next_commands(
                 }
             )
             break
+    if method_followthrough:
+        commands.extend(method_followthrough)
+        return commands
     if route_family == "bounded_no_evidence":
         commands.append(
             {
@@ -391,6 +428,112 @@ def ask_next_commands(
             }
         )
     return commands
+
+
+def _method_followthrough_commands(
+    *,
+    route_family: str,
+    cli_prefix: str,
+) -> list[dict[str, str]]:
+    read_more = (
+        f'{cli_prefix} read-more <source-ref> '
+        '--mode window --before 2 --after 2 --cwd "$PWD" --format text'
+    )
+    if route_family == "long_range_history":
+        return [
+            {
+                "purpose": "open long_range_history primary old-context refs",
+                "command": read_more,
+                "inspect_next": (
+                    "replace <source-ref> with semantic_debug.source_locator_handoff or next_reads "
+                    "primary raw/session/tool refs for the old thread or pre-compaction decision window"
+                ),
+            },
+            {
+                "purpose": "check long_range_history searched scope and caps",
+                "command": "Inspect semantic_debug searched roots, caps, omitted context, and missing prior-context facet before final answer",
+                "inspect_next": (
+                    "state searched scope and uncertainty; use visible context, task/review/report, Git, or repo artifacts "
+                    "only as secondary diagnostics after primary refs"
+                ),
+            },
+        ]
+    if route_family == "deep_history_audit":
+        return [
+            {
+                "purpose": "inspect deep_history_audit coverage surface",
+                "command": "Inspect semantic_debug.in_depth_audit_coverage windows/slices, cap statuses, omitted windows, and trace counts",
+                "inspect_next": (
+                    "do this before claiming all-chats/all-agent completeness or opening secondary artifacts"
+                ),
+            },
+            {
+                "purpose": "open deep_history_audit primary refs",
+                "command": read_more,
+                "inspect_next": (
+                    "replace <source-ref> with source_locator_handoff or next_reads primary raw/session/tool refs promoted by the audit"
+                ),
+            },
+            {
+                "purpose": "continue deep_history_audit only for incomplete coverage",
+                "command": f'{cli_prefix} audit-coverage --cwd "$PWD" --format text',
+                "inspect_next": (
+                    "run only when coverage is incomplete, capped, omitted, or a required audit facet remains missing"
+                ),
+            },
+        ]
+    if route_family == "provenance":
+        return [
+            {
+                "purpose": "open provenance target historical raw refs",
+                "command": read_more,
+                "inspect_next": (
+                    "replace <source-ref> with semantic_debug.source_locator_handoff.next_reads target historical raw JSONL/session/tool refs"
+                ),
+            },
+            {
+                "purpose": "open provenance historical artifact refs second",
+                "command": "sed -n '<line-window>p' <historical-task-review-branch-commit-ref>",
+                "inspect_next": (
+                    "use only historical task/review/branch/commit refs named by the route after target raw refs; "
+                    "current-run echoes, reports, adjudication, and prior-final rows are diagnostics"
+                ),
+            },
+        ]
+    if route_family == "orchestration_provenance":
+        return [
+            {
+                "purpose": "open orchestration_provenance parent raw refs",
+                "command": read_more,
+                "inspect_next": "pre-existing parent/coordinator refs from source_locator_handoff.next_reads before current-run echoes",
+            },
+            {
+                "purpose": "open orchestration_provenance worker and reviewer refs",
+                "command": read_more,
+                "inspect_next": (
+                    "worker/subagent refs first, then reviewer/validation refs when the prompt asks follow-through; "
+                    "lane prompts and same-run command output remain diagnostics"
+                ),
+            },
+        ]
+    if route_family == "action_proof":
+        return [
+            {
+                "purpose": "open action_proof tool/action primary refs",
+                "command": read_more,
+                "inspect_next": (
+                    "replace <source-ref> with semantic_debug.source_window_action_proof or tool_action_proof primary refs"
+                ),
+            },
+            {
+                "purpose": "inspect action_proof effects before claims",
+                "command": "Inspect tool calls, command outputs, diffs, commits, tests, or filesystem effects tied to the claimed action",
+                "inspect_next": (
+                    "assistant prose, task/review/report summaries, and later recaps are leads only until tied to primary action evidence"
+                ),
+            },
+        ]
+    return []
 
 
 def named_task_local_next_commands(
@@ -456,6 +599,10 @@ def _entry_applies_to_route(entry: dict[str, str], route_family: str) -> bool:
         return entry_id == "storage_retention_forensics"
     if route_family == "deep_history_audit":
         return entry_id == "deep_history_audit"
-    if route_family in {"orchestration_provenance", "semantic_debug", "remembered_topic", "process_actual_use"}:
+    if route_family == "long_range_history":
+        return entry_id == "long_range_history"
+    if route_family == "orchestration_provenance":
+        return entry_id == "orchestration_provenance"
+    if route_family in {"provenance", "semantic_debug", "remembered_topic", "process_actual_use"}:
         return entry_id == "source_provenance"
     return False
