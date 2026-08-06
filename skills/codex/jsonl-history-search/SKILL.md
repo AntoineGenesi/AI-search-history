@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Search local Codex/Claude history for prior wording/provenance and why cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or one question with zero tools for unresolved scope. In implicit mode, `what has happened since my last message in the parent thread?` is exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command; aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
+description: cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or zero tools for unresolved scope. Trigger: `what has happened since my last message in the parent thread?`. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command; aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
 metadata:
   short-description: Search local AI history
 ---
@@ -35,15 +35,15 @@ non-trigger; require an explicit history-tool alias such as leading `convo` or
 
 For a named `tasks`/`...md`, decide scope before any tool:
 
-- checkout/HEAD/current-Git intent, including ancestry or local review/status:
+- checkout/HEAD/current-Git intent:
   add exactly `--evidence-source local` after `"<user wording>"`;
 - conversation/source-session intent: add exactly
   `--evidence-source conversation-history` there; or
 - unresolved scope: ask "Do you want current local Git/task evidence or prior
   conversation history?" and use zero tools.
 
-Start exactly one installed history route before repo search, Git, or visible-context synthesis. For aliases above like
-`use the convo tool` or `convo CLI`, use `jsonl-history-search`; do not try
+Start exactly one installed route before repo search, Git, or visible-context synthesis. Exact alias
+`what has happened since my last message? use the convo tool`: run `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `use the convo tool`/`convo CLI`: `jsonl-history-search`; no
 connector discovery/plugin install/`convo --help` first. For old-context decisions like
 `before compaction`, `outside visible context`, or `earlier in the thread`, run
 `semantic-debug`. For explicit all-chats/agent-history audit wording, run:

@@ -65,7 +65,19 @@ def validate_install(
         _check_console_script(root),
         _check_convo_console_alias(root),
         _check_package_skill(root, source_checkout=source_checkout, assets=skill_assets),
+        _check_package_agent_alias_skill(
+            root,
+            agent="codex",
+            source_checkout=source_checkout,
+            assets=skill_assets,
+        ),
         _check_package_agent_skill(
+            root,
+            agent="claude",
+            source_checkout=source_checkout,
+            assets=claude_skill_assets,
+        ),
+        _check_package_agent_alias_skill(
             root,
             agent="claude",
             source_checkout=source_checkout,
@@ -751,6 +763,47 @@ def _check_package_agent_skill(
     )
 
 
+def _check_package_agent_alias_skill(
+    package_root: Path,
+    *,
+    agent: str,
+    source_checkout: bool,
+    assets: AgentSkillAssets | None,
+) -> ValidationCheck:
+    path = package_root / "skills" / agent / "convo" / "SKILL.md"
+    check_id = "package_convo_skill" if agent == "codex" else f"package_{agent}_convo_skill"
+    label = "Codex" if agent == "codex" else agent.title()
+    if path.is_file():
+        return ValidationCheck(
+            id=check_id,
+            name=f"Package {label} Convo alias skill file",
+            status="pass",
+            detail=f"Package {label} Convo alias skill file is present.",
+            paths=[str(path)],
+        )
+    if not source_checkout and assets is not None:
+        return ValidationCheck(
+            id=check_id,
+            name=f"Packaged {label} Convo alias skill assets",
+            status="pass",
+            detail=f"Optional {label} Convo alias skill assets are bundled with the installed Python package.",
+            paths=[str(assets.alias_skill)],
+            metadata={"source_checkout": False, "asset_source": assets.source},
+        )
+    status = "warn" if not source_checkout else "fail"
+    return ValidationCheck(
+        id=check_id,
+        name=f"Package {label} Convo alias skill file",
+        status=status,
+        detail=f"Optional {label} Convo alias skill asset is missing from the Python package.",
+        paths=[str(path)],
+        recovery=[
+            f"Restore `skills/{agent}/convo/SKILL.md` or reinstall the package before running the agent skill installer."
+        ],
+        metadata={"source_checkout": source_checkout},
+    )
+
+
 def _check_package_helpers(
     package_root: Path,
     *,
@@ -1216,12 +1269,14 @@ def _check_global_codex_install(
     assets: CodexSkillAssets | None = None,
 ) -> list[ValidationCheck]:
     skill_root = codex_home / "skills" / "jsonl-history-search"
+    alias_skill = codex_home / "skills" / "convo" / "SKILL.md"
     skill = skill_root / "SKILL.md"
     references = skill_root / "references"
     helper = skill_root / "scripts" / "search_jsonl_history.py"
     ask_first_launcher = skill_root / "scripts" / "jsonl_ask_first.py"
     package_skill_root = assets.root if assets is not None else package_root / "skills" / "codex" / "jsonl-history-search"
     package_skill = assets.skill if assets is not None else package_skill_root / "SKILL.md"
+    package_alias_skill = assets.alias_skill if assets is not None else package_root / "skills" / "codex" / "convo" / "SKILL.md"
     package_references = assets.references if assets is not None else package_skill_root / "references"
     package_helper = assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py"
     package_ask_first_launcher = assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py"
@@ -1238,6 +1293,27 @@ def _check_global_codex_install(
                 status="fail",
                 detail="Global Codex skill file is missing at the provided --codex-home.",
                 paths=[str(skill)],
+                recovery=["Run `jsonl-history-search install-codex-skill`."],
+            )
+        )
+    if alias_skill.is_file():
+        checks.append(
+            _global_copy_check(
+                "global_convo_alias_skill",
+                "Global Codex Convo alias skill file",
+                alias_skill,
+                package_alias_skill,
+                compare_packaged=compare_packaged,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id="global_convo_alias_skill",
+                name="Global Codex Convo alias skill file",
+                status="fail",
+                detail="Global Codex Convo alias skill file is missing at the provided --codex-home.",
+                paths=[str(alias_skill)],
                 recovery=["Run `jsonl-history-search install-codex-skill`."],
             )
         )
@@ -1311,9 +1387,12 @@ def _check_global_agent_install(
     label = agent.title()
     install_command = f"jsonl-history-search install-agent-skill --agent {agent}"
     skill_root = agent_home / "skills" / "jsonl-history-search"
+    alias_skill = agent_home / "skills" / "convo" / "SKILL.md"
     package_skill_root = assets.root if assets is not None else package_root / "skills" / agent / "jsonl-history-search"
+    package_alias_skill = assets.alias_skill if assets is not None else package_root / "skills" / agent / "convo" / "SKILL.md"
     targets = {
         "skill": (skill_root / "SKILL.md", package_skill_root / "SKILL.md"),
+        "convo_alias_skill": (alias_skill, package_alias_skill),
         "references": (skill_root / "references", package_skill_root / "references"),
         "helper": (
             skill_root / "scripts" / "search_jsonl_history.py",
@@ -1356,6 +1435,30 @@ def _check_global_agent_install(
                 name=f"Global {label} skill file",
                 status="fail",
                 detail=f"Global {label} skill file is missing at the provided --{agent}-home.",
+                paths=[str(installed)],
+                recovery=[f"Run `{install_command}`."],
+            )
+        )
+    installed, packaged = targets["convo_alias_skill"]
+    if installed.is_file():
+        checks.append(
+            _global_copy_check(
+                f"{id_prefix}convo_alias_skill",
+                f"Global {label} Convo alias skill file",
+                installed,
+                packaged,
+                compare_packaged=compare_packaged,
+                recovery_command=install_command,
+                agent_label=label,
+            )
+        )
+    else:
+        checks.append(
+            ValidationCheck(
+                id=f"{id_prefix}convo_alias_skill",
+                name=f"Global {label} Convo alias skill file",
+                status="fail",
+                detail=f"Global {label} Convo alias skill file is missing at the provided --{agent}-home.",
                 paths=[str(installed)],
                 recovery=[f"Run `{install_command}`."],
             )

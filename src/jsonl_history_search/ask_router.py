@@ -1340,7 +1340,7 @@ def classify_ask_route(
     if _looks_like_generic_non_history_query(normalized):
         return NON_HISTORY_CLARIFICATION_ROUTE
 
-    if "convo" in normalized and not _looks_like_history_tool_alias_context(normalized):
+    if _looks_like_generic_history_tool_alias_non_history_query(normalized):
         return NON_HISTORY_CLARIFICATION_ROUTE
 
     return AskRoute(
@@ -2424,6 +2424,12 @@ def _looks_like_task_window_status_handoff_query(normalized: str) -> bool:
             "next serious action",
         ),
     )
+
+
+def _looks_like_generic_history_tool_alias_non_history_query(normalized: str) -> bool:
+    if not _has_any(normalized, ("convo", "the skill", "this skill", "that skill")):
+        return False
+    return not _looks_like_history_tool_alias_context(normalized)
 
 
 def _looks_like_latest_status_anchor_query(normalized: str) -> bool:

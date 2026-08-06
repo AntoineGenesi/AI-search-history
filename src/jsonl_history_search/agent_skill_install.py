@@ -17,6 +17,7 @@ SUPPORTED_AGENTS = ("codex", "claude")
 class AgentSkillAssets:
     root: Path
     skill: Path
+    alias_skill: Path
     references: Path
     search_helper: Path
     ask_first_helper: Path
@@ -49,7 +50,7 @@ def resolve_agent_skill_assets(
 
     installed_root = _installed_asset_root(agent)
     if installed_root is not None:
-        assets = _assets_from_root(installed_root, source="installed_package")
+        assets = _assets_from_root(installed_root, agent=agent, source="installed_package")
         if _assets_complete(assets):
             return assets
 
@@ -69,11 +70,14 @@ def install_agent_skill(
     target_home = (agent_home or default_agent_home(agent)).expanduser().resolve()
     assets = resolve_agent_skill_assets(agent, package_root)
     skill_root = target_home / "skills" / SKILL_NAME
+    alias_root = target_home / "skills" / "convo"
     scripts_root = skill_root / "scripts"
     references_root = skill_root / "references"
 
     scripts_root.mkdir(parents=True, exist_ok=True)
+    alias_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(assets.skill, skill_root / "SKILL.md")
+    shutil.copy2(assets.alias_skill, alias_root / "SKILL.md")
     if references_root.exists():
         shutil.rmtree(references_root)
     shutil.copytree(assets.references, references_root)
@@ -98,6 +102,12 @@ def install_agent_skill(
                 "path": str(skill_root),
                 "asset_source": assets.source,
             },
+            "agent_alias_skill": {
+                "status": "installed",
+                "optional": True,
+                "path": str(alias_root),
+                "asset_source": assets.source,
+            },
             "privacy": {
                 "conversation_logs_read": False,
                 "conversation_logs_copied": False,
@@ -117,11 +127,14 @@ def render_agent_skill_install(payload: dict[str, Any], output_format: str) -> s
     agent_label = install["agent"].title()
     cli = install["python_cli"]
     skill = install["agent_skill"]
+    alias = install.get("agent_alias_skill") or {}
     lines = [
         "Python CLI install: AVAILABLE",
         f"  {cli['detail']}",
         f"Optional {agent_label} skill install: INSTALLED",
         f"  Path: {skill['path']}",
+        "Optional Convo alias skill install: INSTALLED",
+        f"  Path: {alias.get('path')}",
         f"  Asset source: {skill['asset_source']}",
         "Privacy: no conversation logs were read or copied.",
         "Validate both layers:",
@@ -140,6 +153,7 @@ def _source_checkout_assets(root: Path, *, agent: str, source: str) -> AgentSkil
     assets = AgentSkillAssets(
         root=skill_root,
         skill=skill_root / "SKILL.md",
+        alias_skill=root / "skills" / agent / "convo" / "SKILL.md",
         references=skill_root / "references",
         search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
@@ -148,10 +162,11 @@ def _source_checkout_assets(root: Path, *, agent: str, source: str) -> AgentSkil
     return assets if _assets_complete(assets) else None
 
 
-def _assets_from_root(root: Path, *, source: str) -> AgentSkillAssets:
+def _assets_from_root(root: Path, *, agent: str, source: str) -> AgentSkillAssets:
     return AgentSkillAssets(
         root=root,
         skill=root / "SKILL.md",
+        alias_skill=_installed_alias_skill(agent) or root.parent / f"{agent}-convo-skill" / "SKILL.md",
         references=root / "references",
         search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
@@ -162,6 +177,7 @@ def _assets_from_root(root: Path, *, source: str) -> AgentSkillAssets:
 def _assets_complete(assets: AgentSkillAssets) -> bool:
     return (
         assets.skill.is_file()
+        and assets.alias_skill.is_file()
         and assets.references.is_dir()
         and any(assets.references.glob("*.md"))
         and assets.search_helper.is_file()
@@ -178,6 +194,18 @@ def _installed_asset_root(agent: str) -> Path | None:
     for entry in distribution.files or []:
         if str(entry).replace("\\", "/").endswith(suffix):
             return Path(distribution.locate_file(entry)).resolve().parent
+    return None
+
+
+def _installed_alias_skill(agent: str) -> Path | None:
+    try:
+        distribution = metadata.distribution("jsonl-history-search")
+    except metadata.PackageNotFoundError:
+        return None
+    suffix = (Path("share") / "jsonl-history-search" / f"{agent}-convo-skill" / "SKILL.md").as_posix()
+    for entry in distribution.files or []:
+        if str(entry).replace("\\", "/").endswith(suffix):
+            return Path(distribution.locate_file(entry)).resolve()
     return None
 
 
