@@ -1441,7 +1441,7 @@ def classify_ask_route(
             return NAMED_TASK_CONVERSATION_HISTORY_ROUTE
         return NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE
 
-    if _looks_like_skill_compliance_query(normalized):
+    if _looks_like_skill_compliance_query(normalized) and not _looks_like_action_proof_query(normalized):
         return ROUTES[0]
 
     if _looks_like_reviewed_source_window_prompt(normalized):
@@ -1788,14 +1788,29 @@ def _looks_like_bare_correction_or_complaint_prompt(normalized: str) -> bool:
 
 
 def _looks_like_action_proof_query(normalized: str) -> bool:
-    actor_terms = ("agent", "worker", "assistant", "ai", "model", "codex", "claude")
+    actor_terms = (
+        "agent",
+        "worker",
+        "implementer",
+        "reviewer",
+        "coordinator",
+        "assistant",
+        "ai",
+        "model",
+        "codex",
+        "claude",
+    )
     action_terms = (
         "actually do",
         "actually did",
+        "actually add",
+        "actually added",
         "actually run",
         "actually ran",
         "actually edit",
         "actually edited",
+        "actually render",
+        "actually rendered",
         "actually test",
         "actually tested",
         "actually review",
@@ -1810,6 +1825,10 @@ def _looks_like_action_proof_query(normalized: str) -> bool:
         "run the test",
         "run tests",
         "ran tests",
+        "rendered",
+        "render",
+        "add it",
+        "added it",
         "reviewed",
         "merged",
         "committed",
@@ -1819,6 +1838,9 @@ def _looks_like_action_proof_query(normalized: str) -> bool:
         "revert",
         "deleted",
         "edit",
+        "source/action proof",
+        "tool/action",
+        "primary tool/action",
     )
     claim_contrast_terms = (
         "only claim",
