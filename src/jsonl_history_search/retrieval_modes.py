@@ -55,6 +55,7 @@ def run_retrieval_mode(
             cwd=cwd,
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
+            fielded_bm25_index_dir=fielded_bm25_index_dir,
         )
     if retrieval_mode == RETRIEVAL_MODE_FIELDED_BM25:
         return run_fielded_bm25_retrieval(
@@ -179,6 +180,7 @@ def run_rrf_fusion_retrieval(
     cwd: str | None,
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
+    fielded_bm25_index_dir: str | None = None,
 ) -> dict[str, Any]:
     total_profile_token = start_phase_profile("total_explicit_rrf_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
@@ -191,7 +193,12 @@ def run_rrf_fusion_retrieval(
     enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
 
     fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
-    fielded_index = build_fielded_bm25_index(plan, default_tz=default_tz, planned_jsonl_files=planned_jsonl_files)
+    fielded_index = build_fielded_bm25_index(
+        plan,
+        default_tz=default_tz,
+        planned_jsonl_files=planned_jsonl_files,
+        persistent_index_dir=fielded_bm25_index_dir,
+    )
     fielded_index_profile = finish_phase_profile(
         fielded_index_profile_token,
         indexed_file_count=int(fielded_index.metrics.get("indexed_files", 0)),
@@ -908,7 +915,13 @@ def build_rrf_retrieval_diagnostics(
             "capped": bool(cap_labels),
             "cap_labels": cap_labels,
             "costlier_than_package_lane": True,
-            "reason": "rrf_fusion_runs_fielded_bm25_then_package_search_before_rank_fusion",
+            "fielded_bm25_storage_kind": str(
+                fielded_index_summary.get("persistent_storage_kind") or "ephemeral_memory_fts5"
+            ),
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
+            "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
+            "refresh_status": str(fielded_index_summary.get("refresh_status") or "unknown"),
+            "reason": "rrf_fusion_runs_fielded_bm25_then_package_search_before_rank_fusion_and_uses_file_backed_bm25_when_configured",
         },
         "shared_source_enumeration": {
             **planned_jsonl_file_diagnostics,
@@ -993,6 +1006,11 @@ def build_rrf_retrieval_diagnostics(
             "duplicate_file_overlap_count": len(overlap),
             "duplicate_searched_bytes_lower_bound": duplicate_bytes_lower_bound,
             "fielded_bm25_materialization": fielded_materialization,
+            "fielded_bm25_storage_kind": str(
+                fielded_index_summary.get("persistent_storage_kind") or "ephemeral_memory_fts5"
+            ),
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
+            "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
             "local_work_only_not_model_tokens": True,
         },
         "fusion": {
@@ -1020,6 +1038,7 @@ def build_rrf_retrieval_diagnostics(
             "fused_score_threshold_used": False,
             "scanner_scheduling_constants_changed": False,
             "package_lane_scoped_or_skipped": False,
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
         },
 }
 

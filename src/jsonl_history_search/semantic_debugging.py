@@ -44,7 +44,12 @@ from .latest_user_messages import latest_user_messages
 from .prompt_echo import clearly_intends_current_session, setup_echo_classification
 from .query import infer_query
 from .real_history_gold import validate_manifest_file
-from .retrieval_modes import RETRIEVAL_MODE_FIELDED_BM25, RETRIEVAL_MODE_PACKAGE, run_retrieval_mode
+from .retrieval_modes import (
+    RETRIEVAL_MODE_FIELDED_BM25,
+    RETRIEVAL_MODE_PACKAGE,
+    RETRIEVAL_MODE_RRF_FUSION,
+    run_retrieval_mode,
+)
 from .scanner import search
 from .tool_events import build_tool_events_payload
 
@@ -106,12 +111,17 @@ CORE_CONVO_FIRST_READ_PLAN_LIMIT = 12
 
 
 def _fielded_bm25_index_dir_from_args(args: Any) -> str | None:
+    if getattr(args, "fielded_bm25_ephemeral", False):
+        return None
+    if getattr(args, "fielded_bm25_storage", "file") == "memory":
+        return None
     explicit = getattr(args, "fielded_bm25_index_dir", None)
     if explicit:
         return str(explicit)
-    if getattr(args, "fielded_bm25_ephemeral", False):
-        return None
-    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) != RETRIEVAL_MODE_FIELDED_BM25:
+    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) not in {
+        RETRIEVAL_MODE_FIELDED_BM25,
+        RETRIEVAL_MODE_RRF_FUSION,
+    }:
         return None
     cache_home = os.environ.get("XDG_CACHE_HOME")
     root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"

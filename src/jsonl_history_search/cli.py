@@ -157,6 +157,7 @@ from .retrieval_modes import (
     QUERY_PLAN_MODES,
     RETRIEVAL_MODE_FIELDED_BM25,
     RETRIEVAL_MODE_PACKAGE,
+    RETRIEVAL_MODE_RRF_FUSION,
     RETRIEVAL_MODES,
     run_retrieval_mode,
 )
@@ -1924,14 +1925,23 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Compatibility alias for the local durable SQLite FTS5 BM25 index directory used by "
-            "explicit fielded-bm25 retrieval. When omitted on CLI fielded-bm25 runs, a default "
-            "user cache directory is used unless --fielded-bm25-ephemeral is set."
+            "explicit fielded-bm25 and rrf-fusion retrieval. When omitted on CLI BM25-backed runs, "
+            "a default user cache directory is used unless --fielded-bm25-ephemeral is set."
+        ),
+    )
+    parser.add_argument(
+        "--fielded-bm25-storage",
+        choices=("file", "memory"),
+        default="file",
+        help=(
+            "Storage backend for the BM25 side of explicit fielded-bm25 and rrf-fusion retrieval. "
+            "Default file uses a durable SQLite FTS5 index; memory keeps the older ephemeral behavior."
         ),
     )
     parser.add_argument(
         "--fielded-bm25-ephemeral",
         action="store_true",
-        help="Opt out of durable BM25 index persistence for an explicit fielded-bm25 CLI run.",
+        help="Compatibility alias for --fielded-bm25-storage memory.",
     )
     parser.add_argument(
         "--mask-manifest",
@@ -4889,12 +4899,17 @@ def _build_semantic_debug_in_memory_payload(args: argparse.Namespace) -> dict:
 
 
 def _fielded_bm25_index_dir_from_args(args: argparse.Namespace) -> str | None:
+    if getattr(args, "fielded_bm25_ephemeral", False):
+        return None
+    if getattr(args, "fielded_bm25_storage", "file") == "memory":
+        return None
     explicit = getattr(args, "fielded_bm25_index_dir", None)
     if explicit:
         return str(explicit)
-    if getattr(args, "fielded_bm25_ephemeral", False):
-        return None
-    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) != RETRIEVAL_MODE_FIELDED_BM25:
+    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) not in {
+        RETRIEVAL_MODE_FIELDED_BM25,
+        RETRIEVAL_MODE_RRF_FUSION,
+    }:
         return None
     cache_home = os.environ.get("XDG_CACHE_HOME")
     root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
