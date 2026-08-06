@@ -29,6 +29,7 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "provenance",
         "remembered_user_wording",
         "remembered_topic",
+        "long_range_history",
         "semantic_debug",
     }
 )
@@ -41,6 +42,7 @@ EXECUTABLE_ARTIFACT_CURRENTNESS_ROUTE_FAMILIES = frozenset({"artifact_currentnes
 STORAGE_RETENTION_ROUTE_FAMILY = "storage_retention_forensics"
 NON_HISTORY_CLARIFICATION_ROUTE_FAMILY = "non_history_clarification"
 LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY = "local_artifact_verification"
+LOCAL_CHECKOUT_LOOKUP_ROUTE_FAMILY = "local_checkout_lookup"
 NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY = "named_task_evidence_source_required"
 EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY = "explicit_history_trigger_required"
 RAW_PHRASE_SOURCE_SEARCH_ROUTE_FAMILY = "raw_phrase_source_search"
@@ -48,6 +50,7 @@ NON_JSONL_COMMAND_ROUTE_FAMILIES = frozenset(
     {
         NON_HISTORY_CLARIFICATION_ROUTE_FAMILY,
         LOCAL_ARTIFACT_VERIFICATION_ROUTE_FAMILY,
+        LOCAL_CHECKOUT_LOOKUP_ROUTE_FAMILY,
         NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
         EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
     }
@@ -150,6 +153,36 @@ NAMED_TASK_LOCAL_ROUTE = AskRoute(
         "Use only target-bound git status/log/branch --contains/merge-base checks "
         "plus bounded reads of the named task and canonical review. If those do "
         "not prove merge/reachability, report that bounded uncertainty and stop."
+    ),
+)
+
+LOCAL_CHECKOUT_LOOKUP_ROUTE = AskRoute(
+    route_family=LOCAL_CHECKOUT_LOOKUP_ROUTE_FAMILY,
+    chosen_route="local-checkout-lookup / git-or-rg",
+    why_it_applies=(
+        "The wording asks about local Git, repo, file, or codebase history/search. "
+        "Use bounded local Git/rg/file inspection rather than JSONL conversation "
+        "history retrieval."
+    ),
+    first_command_template=(
+        "No JSONL command; use bounded local Git/rg for the named repo, file, "
+        "branch, commit, symbol, or codebase target."
+    ),
+    read_specialization="none",
+    inspect_after=(
+        "git status/log/show/diff for Git or checkout-history questions",
+        "rg --files or rg -n for ordinary repo/codebase search questions",
+        "targeted file reads for named files or symbols",
+    ),
+    stop_guidance=(
+        "Do not invoke JSONL for Git history, branch history, commit history, "
+        "file history, repo history, current checkout/status/cleanliness, or "
+        "ordinary codebase search. Answer from bounded local evidence."
+    ),
+    manual_search_guidance=(
+        "Use local Git/rg/file commands scoped to the named target. Conversation "
+        "history is only a later explicit backstop if the user asks why an agent "
+        "discussed or decided something in prior chat."
     ),
 )
 
@@ -347,6 +380,39 @@ DEEP_HISTORY_AUDIT_ROUTE = AskRoute(
         "Manual rg or artifact search is follow-up only after the audit-depth route names a missing "
         "facet or continuation. Preserve searched-scope boundaries and never claim all-history "
         "completeness from capped/top-N samples."
+    ),
+)
+
+LONG_RANGE_HISTORY_ROUTE = AskRoute(
+    route_family="long_range_history",
+    chosen_route="long-range-history / semantic-debug",
+    why_it_applies=(
+        "The wording asks for old chat-thread provenance, decisions, or history "
+        "that may sit before compaction or outside the visible/current context "
+        "window. Use semantic-debug conversation retrieval before visible-context "
+        "guessing, repo grep, or local artifact search."
+    ),
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.source_locator_handoff primary raw/session/tool source refs before current-context summaries",
+        "top source refs and read-more follow-through for the old thread/decision window",
+        "same-loop/current-run echoes, task/review/report artifacts, and visible-context summaries as diagnostics only",
+        "searched roots, caps, and missing/omitted context before claiming recovered prior-thread history",
+    ),
+    stop_guidance=(
+        "Run semantic-debug first for long-range old-chat context. Open primary "
+        "raw conversation refs before answering what was decided, said, or happened "
+        "before compaction or outside visible context. This route proves a history "
+        "retrieval first move only; it is not all-history completeness or interval "
+        "reconstruction. If refs are absent, capped, or ambiguous, fail closed with "
+        "searched scope and the missing prior-context facet."
+    ),
+    manual_search_guidance=(
+        "Manual rg, Git, repo, task, or file searches are follow-up only after "
+        "semantic-debug names a concrete missing secondary facet. Do not use this "
+        "route for Git/branch/commit/file/repo history, current checkout/status, "
+        "or ordinary codebase lookup."
     ),
 )
 
@@ -1023,6 +1089,7 @@ def build_ask_router_payload(
     if route.route_family in {
         NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE_FAMILY,
         EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
+        LOCAL_CHECKOUT_LOOKUP_ROUTE_FAMILY,
     }:
         next_commands = []
     elif route is NAMED_TASK_LOCAL_ROUTE:
@@ -1219,6 +1286,9 @@ def classify_ask_route(
     if _looks_like_deep_history_audit_query(normalized):
         return DEEP_HISTORY_AUDIT_ROUTE
 
+    if _looks_like_long_range_history_query(normalized):
+        return LONG_RANGE_HISTORY_ROUTE
+
     if _looks_like_devlog_failure_analysis_query(normalized):
         return DEVLOG_FAILURE_ANALYSIS_ROUTE
 
@@ -1243,8 +1313,14 @@ def classify_ask_route(
     ):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
+    if _looks_like_current_checkout_status_query(normalized):
+        return LOCAL_CHECKOUT_LOOKUP_ROUTE
+
     if is_worktree_cleanup_currentness_query(query):
         return ROUTES[7]
+
+    if _looks_like_local_checkout_lookup_query(normalized):
+        return LOCAL_CHECKOUT_LOOKUP_ROUTE
 
     if _looks_like_named_ticket_causal_provenance_query(normalized):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
@@ -2155,6 +2231,19 @@ def _looks_like_current_local_scope_query(normalized: str) -> bool:
     if _has_any(
         normalized,
         (
+            "current branch",
+            "branch cleanliness",
+            "checkout status",
+            "repo status",
+            "repository status",
+            "local status",
+            "cleanliness",
+        ),
+    ):
+        return False
+    if _has_any(
+        normalized,
+        (
             "conversation history",
             "prior conversation",
             "source session",
@@ -2193,6 +2282,67 @@ def _looks_like_current_local_scope_query(normalized: str) -> bool:
         ),
     )
     return current_scope and local_target
+
+
+def _looks_like_local_checkout_lookup_query(normalized: str) -> bool:
+    if _looks_like_non_conversation_history_scope(normalized):
+        return True
+    code_lookup = _has_any(
+        normalized,
+        (
+            "search the repo",
+            "search this repo",
+            "search the repository",
+            "grep for",
+            "rg for",
+            "find where",
+            "find the file",
+            "where is",
+            "where function",
+            "where class",
+            "where method",
+            "is defined",
+            "defined in",
+            "codebase",
+            "source code",
+        ),
+    )
+    code_target = bool(
+        re.search(r"\b[a-z0-9_./-]+\.(?:py|js|ts|tsx|jsx|md|toml|yaml|yml|json)\b", normalized)
+        or re.search(r"\bfunction\s+[a-z_][a-z0-9_]*\b", normalized)
+        or re.search(r"\bclass\s+[a-z_][a-z0-9_]*\b", normalized)
+    )
+    return code_lookup and code_target
+
+
+def _looks_like_current_checkout_status_query(normalized: str) -> bool:
+    return _has_any(
+        normalized,
+        (
+            "current branch",
+            "branch cleanliness",
+            "current checkout",
+            "checkout status",
+            "local repo status",
+            "local repository status",
+            "repo status",
+            "repository status",
+            "local status",
+        ),
+    ) and _has_any(
+        normalized,
+        (
+            "check",
+            "status",
+            "cleanliness",
+            "clean",
+            "dirty",
+            "branch",
+            "checkout",
+            "repo",
+            "repository",
+        ),
+    )
 
 
 def _looks_like_explicit_current_or_prior_answer_audit(normalized: str) -> bool:
@@ -2282,8 +2432,12 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
         (
             "what happened since",
             "what has happened since",
-            "what happened before",
-            "what has happened before",
+            "what happened after compaction",
+            "what happened after context compaction",
+            "what happened after the context got compacted",
+            "what has happened after compaction",
+            "what has happened after context compaction",
+            "what has happened after the context got compacted",
             "what changed since",
             "what changed while i was away",
             "what did you do while i was away",
@@ -2302,6 +2456,8 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
             "keep working",
         ),
     ):
+        return True
+    if re.search(r"^what (?:has )?happened before\b", normalized):
         return True
     anchor_terms = (
         "last message",
@@ -2332,6 +2488,126 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
         "catch me up",
     )
     return _has_any(normalized, anchor_terms) and _has_any(normalized, status_verbs)
+
+
+def _looks_like_long_range_history_query(normalized: str) -> bool:
+    if not normalized:
+        return False
+    if _looks_like_non_conversation_history_scope(normalized):
+        return False
+    long_range_anchor = _has_any(
+        normalized,
+        (
+            "before compaction",
+            "before context compaction",
+            "before the compaction",
+            "before the context got compacted",
+            "before this context got compacted",
+            "before current context",
+            "before the current context",
+            "before visible context",
+            "before the visible context",
+            "outside visible context",
+            "outside the visible context",
+            "outside current context",
+            "outside the current context",
+            "outside this context window",
+            "outside the current context window",
+            "before this context window",
+            "before the current context window",
+            "far back in chat history",
+            "far back through chat history",
+            "far back in the chat history",
+            "earlier in the thread",
+            "earlier in this thread",
+            "earlier in the chat",
+            "earlier in this chat",
+            "old chat history",
+            "old conversation history",
+        ),
+    )
+    if not long_range_anchor:
+        return False
+    old_chat_context = _has_any(
+        normalized,
+        (
+            "chat",
+            "thread",
+            "conversation",
+            "history",
+            "context",
+            "context window",
+            "visible context",
+            "compaction",
+            "compacted",
+        ),
+    )
+    if not old_chat_context:
+        return False
+    provenance_intent = _has_any(
+        normalized,
+        (
+            "what did we decide",
+            "what did i decide",
+            "what was decided",
+            "what was the decision",
+            "decision from",
+            "recover what happened",
+            "recover the decision",
+            "recover what we decided",
+            "what happened in the thread",
+            "what happened earlier in the thread",
+            "what happened earlier in this thread",
+            "what happened before this context window",
+            "what happened before the current context window",
+            "what did we agree",
+            "what did i ask",
+            "what did i tell",
+            "what was my ask",
+            "what was the ask",
+            "what was the plan",
+            "why did we",
+            "why did i",
+            "why was",
+            "trace the old",
+            "trace what",
+            "find the prior",
+            "recover",
+        ),
+    )
+    return provenance_intent
+
+
+def _looks_like_non_conversation_history_scope(normalized: str) -> bool:
+    return _has_any(
+        normalized,
+        (
+            "git history",
+            "branch history",
+            "commit history",
+            "file history",
+            "repo history",
+            "repository history",
+            "current checkout",
+            "current branch",
+            "current repo",
+            "current repository",
+            "checkout status",
+            "repo status",
+            "repository status",
+            "local status",
+            "cleanliness",
+            "worktree",
+            "working tree",
+            "codebase",
+            "source code",
+            "search the repo",
+            "search this repo",
+            "grep for",
+            "rg for",
+            "where function",
+        ),
+    )
 
 
 def _looks_like_recency_only_user_wording_query(normalized: str) -> bool:
