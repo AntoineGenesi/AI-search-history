@@ -230,17 +230,24 @@ EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE = AskRoute(
     route_family=EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY,
     chosen_route="explicit history trigger required",
     why_it_applies=(
-        "Latest-status implicit activation is disabled. Prefix the same request "
-        "with `convo` to select conversation-history routing."
+        "Latest-status implicit activation is disabled. Add an explicit history-tool "
+        "alias such as leading `convo` or suffix `use the convo tool` to select "
+        "conversation-history routing."
     ),
-    first_command_template="No tool call; ask the user to prefix the history request with `convo`.",
+    first_command_template=(
+        "No tool call; ask the user to add an explicit history-tool alias such as "
+        "leading `convo` or suffix `use the convo tool`."
+    ),
     read_specialization="none",
     inspect_after=(),
     stop_guidance=(
-        "Use zero tools in explicit-only mode until the user supplies an explicit `convo` trigger. "
-        "Do not run JSONL, Git, repo search, task/state scans, or filesystem inspection."
+        "Use zero tools in explicit-only mode until the user supplies an explicit "
+        "history-tool alias. Do not run JSONL, Git, repo search, task/state scans, "
+        "or filesystem inspection."
     ),
-    manual_search_guidance="There is no search step until the explicit `convo` trigger is present.",
+    manual_search_guidance=(
+        "There is no search step until the explicit history-tool alias is present."
+    ),
 )
 
 BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
@@ -942,7 +949,8 @@ def build_ask_router_payload(
             )
         elif route.route_family == EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE_FAMILY:
             resolution_guidance = (
-                "No command resolution is allowed until explicit-only mode receives a leading `convo` trigger."
+                "No command resolution is allowed until explicit-only mode receives an explicit "
+                "history-tool alias such as leading `convo` or suffix `use the convo tool`."
             )
         else:
             resolution_guidance = "No JSONL command resolution is needed for this no-tool route."

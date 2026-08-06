@@ -304,7 +304,8 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         default=os.environ.get("JSONL_HISTORY_SEARCH_ACTIVATION_MODE", "implicit"),
         help=(
             "Latest-status trigger mode. implicit (default) routes natural prior-message wording; "
-            "explicit-only requires a leading `convo`. The environment variable "
+            "explicit-only requires an explicit history-tool alias such as leading `convo` "
+            "or suffix `use the convo tool`. The environment variable "
             "JSONL_HISTORY_SEARCH_ACTIVATION_MODE sets the default."
         ),
     )
