@@ -913,15 +913,17 @@ def build_ask_router_payload(
     activation_mode: ActivationMode = "implicit",
     audit_depth: str | None = None,
 ) -> dict:
+    explicit_history_tool_alias = _explicit_history_tool_alias(query)
+    route_query = _explicit_history_tool_alias_query(query) or query
     route = classify_ask_route(
         query,
         evidence_source=evidence_source,
         activation_mode=activation_mode,
     )
-    explicit_convo_trigger = _explicit_convo_trigger_query(query) is not None
+    explicit_convo_trigger = explicit_history_tool_alias is not None
     named_task_target = _has_explicit_task_path(query)
-    structured_execution_query = route.command_query(query)
-    normalized_route_query = _normalize_for_route(_explicit_convo_trigger_query(query) or query)
+    structured_execution_query = route.command_query(route_query)
+    normalized_route_query = _normalize_for_route(route_query)
     audit_depth_payload = _route_audit_depth_payload(
         route=route,
         normalized_query=normalized_route_query,
@@ -958,7 +960,7 @@ def build_ask_router_payload(
         command_resolution_payload = command_resolution.as_dict()
         cli_prefix = command_resolution.command_prefix
     first_command = _first_command_with_audit_depth(
-        route.first_command(query, cli=cli_prefix),
+        route.first_command(route_query, cli=cli_prefix),
         route_family=route.route_family,
         audit_depth=audit_depth_payload,
     )
@@ -1037,6 +1039,7 @@ def build_ask_router_payload(
             "activation_mode": activation_mode,
             "audit_depth": audit_depth_payload,
             "explicit_convo_trigger": explicit_convo_trigger,
+            "explicit_history_tool_alias": explicit_history_tool_alias,
             "chosen_route": route.chosen_route,
             "route_family": route.route_family,
             "first_action_category": first_action_category,
@@ -1139,7 +1142,7 @@ def classify_ask_route(
     evidence_source: EvidenceSource | None = None,
     activation_mode: ActivationMode = "implicit",
 ) -> AskRoute:
-    explicit_query = _explicit_convo_trigger_query(query)
+    explicit_query = _explicit_history_tool_alias_query(query)
     classification_query = explicit_query if explicit_query is not None else query
     normalized = " ".join(classification_query.lower().replace("?", " ").replace("!", " ").split())
 
@@ -1253,6 +1256,9 @@ def classify_ask_route(
     if _looks_like_generic_non_history_query(normalized):
         return NON_HISTORY_CLARIFICATION_ROUTE
 
+    if "convo" in normalized and not _looks_like_history_tool_alias_context(normalized):
+        return NON_HISTORY_CLARIFICATION_ROUTE
+
     return AskRoute(
         route_family="semantic_debug",
         chosen_route="semantic-debug",
@@ -1290,11 +1296,132 @@ def classify_ask_route(
 
 
 def _explicit_convo_trigger_query(query: str) -> str | None:
-    match = re.match(r"^\s*convo(?:\s*:\s*|\s+)(?P<query>.+?)\s*$", query, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
+    return _explicit_history_tool_alias_query(query)
+
+
+_EXPLICIT_HISTORY_TOOL_ALIAS_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("convo tool", r"\bconvo\s+tool\b"),
+    ("convo cli", r"\bconvo\s+cli\b"),
+    ("jsonl-search-history", r"\bjsonl[-\s]+search[-\s]+history\b"),
+    ("jsonl-history-search", r"\bjsonl[-\s]+history[-\s]+search\b"),
+    ("jsonl tool", r"\bjsonl\s+tool\b"),
+    ("the skill", r"\bthe\s+skill\b"),
+    ("convo", r"^\s*convo(?:\s*:\s*|\s+)"),
+)
+
+
+_EXPLICIT_HISTORY_TOOL_DIRECTIVE_RE = re.compile(
+    r"""
+    (?:
+        (?:^|[\s,;:.!?])
+        (?:
+            use|using|with|via|through|run|invoke|call|ask|load|try
+        )
+        \s+
+        (?:
+            the\s+
+        )?
+        (?P<alias>
+            convo\s+tool|
+            convo\s+cli|
+            jsonl[-\s]+search[-\s]+history|
+            jsonl[-\s]+history[-\s]+search|
+            jsonl\s+tool|
+            the\s+skill
+        )
+        \s*\.?\s*$
+    )
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _explicit_history_tool_alias(query: str) -> dict | None:
+    normalized = _normalize_for_route(query)
+    stripped = _strip_explicit_history_tool_alias(query)
+    classification_normalized = _normalize_for_route(stripped or query)
+    if not _looks_like_history_tool_alias_context(classification_normalized):
         return None
-    explicit_query = match.group("query").strip()
-    return explicit_query or None
+    for label, pattern in _EXPLICIT_HISTORY_TOOL_ALIAS_PATTERNS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            return {
+                "matched_alias": label,
+                "canonical_command": "jsonl-history-search",
+                "source_checkout_fallback": "PYTHONPATH=src python3 -m jsonl_history_search.cli",
+                "guidance": (
+                    "Resolve this explicit history-tool alias to the local "
+                    "`jsonl-history-search` CLI/skill workflow. Use the installed "
+                    "command first, or the source-checkout fallback when the console "
+                    "script is unavailable in a package checkout. Do not start with "
+                    "connector discovery, plugin install, or `convo --help`."
+                ),
+            }
+    return None
+
+
+def _explicit_history_tool_alias_query(query: str) -> str | None:
+    if _explicit_history_tool_alias(query) is None:
+        return None
+    stripped = _strip_explicit_history_tool_alias(query)
+    return stripped or None
+
+
+def _strip_explicit_history_tool_alias(query: str) -> str | None:
+    leading = re.match(r"^\s*convo(?:\s*:\s*|\s+)(?P<query>.+?)\s*$", query, flags=re.IGNORECASE | re.DOTALL)
+    if leading:
+        return leading.group("query").strip() or None
+    leading_named_tool = re.match(
+        (
+            r"^\s*(?:convo\s+tool|convo\s+cli|jsonl[-\s]+search[-\s]+history|"
+            r"jsonl[-\s]+history[-\s]+search|jsonl\s+tool)"
+            r"(?:\s*:\s*|\s+)(?P<query>.+?)\s*$"
+        ),
+        query,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if leading_named_tool:
+        return leading_named_tool.group("query").strip() or None
+    stripped = _EXPLICIT_HISTORY_TOOL_DIRECTIVE_RE.sub(" ", query).strip()
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return stripped if stripped != query.strip() else None
+
+
+def _looks_like_history_tool_alias_context(normalized: str) -> bool:
+    if not normalized:
+        return False
+    return (
+        _looks_like_latest_status_anchor_query(normalized)
+        or _looks_like_deep_history_audit_query(normalized)
+        or _looks_like_devlog_failure_analysis_query(normalized)
+        or _looks_like_orchestration_provenance_query(normalized)
+        or _looks_like_action_proof_query(normalized)
+        or _looks_like_recency_only_user_wording_query(normalized)
+        or _looks_like_remembered_user_wording_query(normalized)
+        or _looks_like_remembered_topic_causal_instruction_query(normalized)
+        or _looks_like_process_actual_use_query(normalized)
+        or _looks_like_expectation_mismatch_query(normalized)
+        or _has_any(
+            normalized,
+            (
+                "chat history",
+                "conversation history",
+                "prior conversation",
+                "prior message",
+                "previous message",
+                "source provenance",
+                "source refs",
+                "source sessions",
+                "raw session",
+                "raw history",
+                "history logs",
+                "action proof",
+                "tool evidence",
+                "what happened at",
+                "what happened since",
+                "what has happened since",
+            ),
+        )
+    )
 
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:

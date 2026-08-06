@@ -436,6 +436,15 @@ def render_ask_router_text(payload: dict) -> str:
                 f"Command guidance: {resolution.get('guidance')}",
             ]
         )
+    alias = report.get("explicit_history_tool_alias") or {}
+    if alias:
+        lines.extend(
+            [
+                f"Explicit history-tool alias: {alias.get('matched_alias')}",
+                f"Canonical history command: {alias.get('canonical_command')}",
+                f"Alias guidance: {alias.get('guidance')}",
+            ]
+        )
     handoff = report.get("answer_ready_handoff") or {}
     if handoff:
         lines.extend(
@@ -1429,6 +1438,15 @@ def render_ask_router_markdown(payload: dict) -> str:
                 f"- Command resolution: `{resolution.get('mode')}`",
                 f"- Source fallback: `{resolution.get('source_fallback_command') or '(not available from this cwd)'}`",
                 f"- Command guidance: {resolution.get('guidance')}",
+            ]
+        )
+    alias = report.get("explicit_history_tool_alias") or {}
+    if alias:
+        lines.extend(
+            [
+                f"- Explicit history-tool alias: `{alias.get('matched_alias')}`",
+                f"- Canonical history command: `{alias.get('canonical_command')}`",
+                f"- Alias guidance: {alias.get('guidance')}",
             ]
         )
     handoff = report.get("answer_ready_handoff") or {}

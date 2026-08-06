@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Search local Codex/Claude history for prior wording/provenance and why cleanup/process was deferred or failed. For named `tasks`/`...md`, use `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or one question with zero tools for unresolved scope. In implicit mode, `what has happened since my last message in the parent thread?` is exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command.
+description: Search local Codex/Claude history for prior wording/provenance and why cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or one question with zero tools for unresolved scope. In implicit mode, `what has happened since my last message in the parent thread?` is exact trigger. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command; suffix `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
 metadata:
   short-description: Search local AI history
 ---
@@ -12,14 +12,10 @@ Router for local Codex/Claude history. Inspect refs before answering.
 ## Activation Gate
 
 Trigger even without JSONL or `convo` when the request depends on prior AI
-conversation history. Examples:
+conversation history:
 
-- what the user previously said, requested, corrected, or preferred;
-- what an agent actually ran, changed, tested, or claimed;
-- why a decision or failure happened;
+- what the user previously said;
 - why a cleanup or multi-step process was deferred, repeated, or failed;
-- which conversation sourced a summary or outcome;
-- read through all chats/agent history and find when X or Y happened;
 - `what happened since my last message?`; and
 - the exact automatic trigger `what has happened since my last message in the
   parent thread?`.
@@ -31,7 +27,8 @@ anchored to prior conversation history. Ask one short clarifying question and
 use zero tools when the event or evidence source is ambiguous.
 
 If `JSONL activation mode: explicit-only` is set, natural wording is a
-non-trigger; require a leading `convo`.
+non-trigger; require an explicit history-tool alias such as leading `convo` or
+`use the convo tool`.
 
 ## First Move
 
@@ -44,27 +41,30 @@ For a named `tasks`/`...md`, decide scope before any tool:
 - unresolved scope: ask "Do you want current local Git/task evidence or prior
   conversation history?" and use zero tools.
 
-Preserve user wording as one quoted argument. Start exactly one installed
-history route before repo search, Git, or visible-context synthesis. For
+Start exactly one installed history route before repo search, Git, or visible-context synthesis. For
+history/status/provenance/action-proof asks that say `use the convo tool`,
+`convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, or
+`the skill`, use canonical `jsonl-history-search`; do not try connector
+discovery, plugin install, or `convo --help` first. For
 explicit all-chats/agent-history audit wording, run:
 
 ```bash
 jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
 ```
 
-Use `--audit-depth exhaustive` only for scoped full coverage; keep
-coverage/cap/omitted-window caveats and fail closed. Otherwise run:
+Use `--audit-depth exhaustive` only for scoped full coverage; keep coverage/cap
+caveats and fail closed. Otherwise run:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
 Wait for that command to exit. While it is running, do not start another `ask`,
-`ask --execute`, direct `semantic-debug`, installed helper, or source-checkout
-fallback. Normal installed use must not depend on `PYTHONPATH`. Only if the
-installed command exits with command-not-found (126/127) or a clear
-install/import failure, and the current directory is explicitly a source
-checkout containing `src/jsonl_history_search/cli.py`, run this source recovery
+`ask --execute`, direct `semantic-debug`, or source-checkout
+fallback. Only if
+the installed command exits with command-not-found (126/127) or a clear
+install/import failure, and when cwd contains
+`src/jsonl_history_search/cli.py`, run recovery
 once:
 
 ```bash
@@ -73,7 +73,7 @@ PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>
 
 The source command is failure recovery, never a parallel or equivalent route.
 If neither command is available, report the installation failure. Do not probe
-with `convo`, `--help`, repository inventory, or another history route.
+with `convo`, `--help`, or repository inventory.
 
 ## Follow The Route
 
