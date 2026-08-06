@@ -1691,6 +1691,7 @@ def _looks_like_history_tool_alias_context(normalized: str) -> bool:
         return False
     return (
         _looks_like_latest_status_anchor_query(normalized)
+        or _looks_like_long_range_history_query(normalized)
         or _looks_like_deep_history_audit_query(normalized)
         or _looks_like_devlog_failure_analysis_query(normalized)
         or _looks_like_orchestration_provenance_query(normalized)
@@ -1791,6 +1792,8 @@ def _looks_like_bare_correction_or_complaint_prompt(normalized: str) -> bool:
 
 
 def _looks_like_action_proof_query(normalized: str) -> bool:
+    if _has_any(normalized, ("action proof", "source/action proof", "tool/action proof")):
+        return True
     actor_terms = (
         "agent",
         "worker",
@@ -2560,6 +2563,8 @@ def _looks_like_local_checkout_lookup_query(normalized: str) -> bool:
 
 
 def _looks_like_current_checkout_status_query(normalized: str) -> bool:
+    if _looks_like_history_tool_alias_context(normalized):
+        return False
     status_intent = bool(
         re.search(r"\b(?:check|status|clean|dirty|branch|repo|repository)\b", normalized)
     ) or _has_any(
@@ -2744,7 +2749,9 @@ def _looks_like_latest_status_anchor_query(normalized: str) -> bool:
 def _looks_like_long_range_history_query(normalized: str) -> bool:
     if not normalized:
         return False
-    if _looks_like_non_conversation_history_scope(normalized):
+    if _looks_like_non_conversation_history_scope(
+        normalized
+    ) and not _looks_like_old_context_repo_history_query(normalized):
         return False
     long_range_anchor = _has_any(
         normalized,
@@ -2817,16 +2824,55 @@ def _looks_like_long_range_history_query(normalized: str) -> bool:
             "what was my ask",
             "what was the ask",
             "what was the plan",
+            "what was said",
             "why did we",
             "why did i",
             "why was",
+            "review",
             "trace the old",
             "trace what",
             "find the prior",
             "recover",
+            "what happened",
         ),
     )
     return provenance_intent
+
+
+def _looks_like_old_context_repo_history_query(normalized: str) -> bool:
+    if not _has_any(
+        normalized,
+        (
+            "before compaction",
+            "before context compaction",
+            "before the compaction",
+            "before visible context",
+            "before the visible context",
+            "outside visible context",
+            "outside the visible context",
+            "outside current context",
+            "outside the current context",
+        ),
+    ):
+        return False
+    if not _has_any(normalized, ("repo history", "repository history", "current repo history")):
+        return False
+    return not _has_any(
+        normalized,
+        (
+            "git history",
+            "branch history",
+            "commit history",
+            "file history",
+            "for this branch",
+            "on this branch",
+            "search the repo",
+            "search this repo",
+            "grep for",
+            "rg for",
+            "where function",
+        ),
+    )
 
 
 def _looks_like_non_conversation_history_scope(normalized: str) -> bool:
