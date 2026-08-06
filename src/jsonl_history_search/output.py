@@ -4512,6 +4512,7 @@ def render_status_anchor_text(payload: dict) -> str:
     answer_readiness = report.get("answer_readiness") or {}
     parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
+    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
     if _is_answer_ready_parent_main_status(report):
@@ -4555,6 +4556,7 @@ def render_status_anchor_text(payload: dict) -> str:
         )
     _append_parent_main_anchor_shortlist_text(lines, parent_main_shortlist)
     _append_status_follow_through_plan_text(lines, follow_through_plan)
+    _append_status_post_anchor_interval_text(lines, post_anchor_interval)
     lines.append("Open these source refs first:")
     if selected:
         _append_text_read(lines, selected)
@@ -4718,6 +4720,7 @@ def _render_answer_ready_parent_main_status_text(report: dict, *, answer_status:
     selected = report.get("selected_anchor") or {}
     readiness = report.get("answer_readiness") or {}
     activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
+    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
     canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
     activity_location = selected.get("session_activity_location") or {}
     required_facets = readiness.get("required_answer_facets") or []
@@ -4747,6 +4750,7 @@ def _render_answer_ready_parent_main_status_text(report: dict, *, answer_status:
         f"tool_calls={activity.get('tool_calls')} "
         f"spawned_sessions={activity.get('spawned_session_calls')}"
     )
+    _append_status_post_anchor_interval_text(lines, post_anchor_interval)
     lines.append("3. Run one bounded secondary commit/status confirmation batch if listed:")
     if secondary:
         lines.append("- Exact refs: " + ", ".join(str(read.get("source_ref")) for read in secondary))
@@ -4827,6 +4831,7 @@ def render_status_anchor_markdown(payload: dict) -> str:
     answer_readiness = report.get("answer_readiness") or {}
     parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
     status_boundary = report.get("status_as_of_boundary") or {}
+    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
     open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
     answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
     if _is_answer_ready_parent_main_status(report):
@@ -4894,6 +4899,8 @@ def render_status_anchor_markdown(payload: dict) -> str:
     _append_parent_main_anchor_shortlist_markdown(lines, parent_main_shortlist)
     lines.extend(["## Follow-Through Plan", ""])
     _append_status_follow_through_plan_markdown(lines, follow_through_plan)
+    lines.extend(["", "## Post-Anchor Interval Reconstruction", ""])
+    _append_status_post_anchor_interval_markdown(lines, post_anchor_interval)
     lines.extend([
         "",
         "## Open These Source Refs First",
@@ -5009,6 +5016,7 @@ def _render_answer_ready_parent_main_status_markdown(report: dict, *, answer_sta
     selected = report.get("selected_anchor") or {}
     readiness = report.get("answer_readiness") or {}
     activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
+    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
     canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
     activity_location = selected.get("session_activity_location") or {}
     required_facets = readiness.get("required_answer_facets") or []
@@ -5041,6 +5049,8 @@ def _render_answer_ready_parent_main_status_markdown(report: dict, *, answer_sta
         f"tool calls=`{activity.get('tool_calls')}`, "
         f"spawned sessions=`{activity.get('spawned_session_calls')}`."
     )
+    lines.extend(["", "## Post-Anchor Interval Reconstruction", ""])
+    _append_status_post_anchor_interval_markdown(lines, post_anchor_interval)
     lines.extend(["", "## 3. Bounded Secondary Confirmation", ""])
     if secondary:
         lines.append("- Exact refs: " + ", ".join(f"`{read.get('source_ref')}`" for read in secondary))
@@ -5263,6 +5273,132 @@ def _append_status_follow_through_plan_markdown(lines: list[str], plan: dict) ->
         lines.append(f"- Read-more boundary warning: {plan.get('read_more_boundary_warning')}")
     if plan.get("rerun_policy"):
         lines.append(f"- Rerun policy: {plan.get('rerun_policy')}")
+
+
+def _append_status_post_anchor_interval_text(lines: list[str], interval: dict) -> None:
+    if not interval:
+        return
+    coverage = interval.get("coverage") or {}
+    anchor = interval.get("anchor") or {}
+    boundary = interval.get("boundary") or {}
+    lines.append("Post-anchor interval reconstruction:")
+    lines.append(
+        "Interval coverage: "
+        f"status={coverage.get('status')} complete={coverage.get('complete')} "
+        f"records_after_anchor={coverage.get('records_after_anchor')} "
+        f"entries={interval.get('chronological_entry_count')} "
+        f"omitted={coverage.get('omitted_activity_entry_count', 0)}"
+    )
+    if anchor:
+        lines.append(f"Interval anchor: {anchor.get('timestamp_utc')} {anchor.get('source_ref')}")
+    if boundary:
+        lines.append(
+            "Interval boundary: "
+            f"{boundary.get('kind')} {boundary.get('timestamp_utc')} {boundary.get('source_ref')}"
+        )
+    entries = interval.get("chronological_activity") or []
+    lines.append("Interval chronological activity:")
+    if entries:
+        for entry in entries[:8]:
+            lines.append(
+                "- "
+                f"{entry.get('timestamp_utc')} {entry.get('source_ref')} "
+                f"{entry.get('activity_kind')}: {entry.get('snippet')}"
+            )
+            if entry.get("read_more_command"):
+                lines.append(f"  read-more: {entry.get('read_more_command')}")
+    else:
+        lines.append("- (no chronological activity refs surfaced)")
+    spawned_refs = interval.get("spawned_session_launch_refs") or []
+    if spawned_refs:
+        lines.append("Interval spawned/worker/reviewer launch refs: " + ", ".join(str(ref) for ref in spawned_refs[:8]))
+    joins = interval.get("secondary_evidence_joins") or {}
+    join_counts = {
+        key: len(joins.get(key) or [])
+        for key in ("tasks", "reports", "reviews", "git_commits")
+    }
+    lines.append(
+        "Interval secondary joins: "
+        f"tasks={join_counts['tasks']} reports={join_counts['reports']} "
+        f"reviews={join_counts['reviews']} git_commits={join_counts['git_commits']}"
+    )
+    omitted_ranges = interval.get("omitted_ranges") or []
+    if omitted_ranges:
+        lines.append("Interval omitted ranges:")
+        for item in omitted_ranges:
+            lines.append(
+                "- "
+                f"after={item.get('after_ref')} last={item.get('last_ref')} "
+                f"omitted={item.get('omitted_count')}: {item.get('guidance')}"
+            )
+            if item.get("read_next_command"):
+                lines.append(f"  next-read: {item.get('read_next_command')}")
+    guidance = interval.get("next_read_guidance") or {}
+    if guidance:
+        lines.append(
+            f"Interval next-read guidance: status={guidance.get('status')} policy={guidance.get('policy')}"
+        )
+
+
+def _append_status_post_anchor_interval_markdown(lines: list[str], interval: dict) -> None:
+    if not interval:
+        lines.append("- No post-anchor interval reconstruction surfaced.")
+        return
+    coverage = interval.get("coverage") or {}
+    anchor = interval.get("anchor") or {}
+    boundary = interval.get("boundary") or {}
+    lines.append(
+        f"- Coverage: `status={coverage.get('status')}` `complete={coverage.get('complete')}` "
+        f"`records_after_anchor={coverage.get('records_after_anchor')}` "
+        f"`entries={interval.get('chronological_entry_count')}` "
+        f"`omitted={coverage.get('omitted_activity_entry_count', 0)}`"
+    )
+    if anchor:
+        lines.append(f"- Anchor: `{anchor.get('timestamp_utc')}` `{anchor.get('source_ref')}`")
+    if boundary:
+        lines.append(
+            f"- Boundary: `{boundary.get('kind')}` `{boundary.get('timestamp_utc')}` `{boundary.get('source_ref')}`"
+        )
+    entries = interval.get("chronological_activity") or []
+    lines.extend(["", "### Chronological Activity", ""])
+    if entries:
+        for entry in entries[:8]:
+            lines.append(
+                f"- `{entry.get('timestamp_utc')}` `{entry.get('source_ref')}` "
+                f"`{entry.get('activity_kind')}`: {entry.get('snippet')}"
+            )
+            if entry.get("read_more_command"):
+                lines.append(f"  - Read more: `{entry.get('read_more_command')}`")
+    else:
+        lines.append("- No chronological activity refs surfaced.")
+    spawned_refs = interval.get("spawned_session_launch_refs") or []
+    if spawned_refs:
+        lines.append("")
+        lines.append("- Spawned/worker/reviewer launch refs: " + ", ".join(f"`{ref}`" for ref in spawned_refs[:8]))
+    joins = interval.get("secondary_evidence_joins") or {}
+    join_counts = {
+        key: len(joins.get(key) or [])
+        for key in ("tasks", "reports", "reviews", "git_commits")
+    }
+    lines.append("")
+    lines.append(
+        f"- Secondary joins: `tasks={join_counts['tasks']}` `reports={join_counts['reports']}` "
+        f"`reviews={join_counts['reviews']}` `git_commits={join_counts['git_commits']}`"
+    )
+    omitted_ranges = interval.get("omitted_ranges") or []
+    if omitted_ranges:
+        lines.extend(["", "### Omitted Ranges", ""])
+        for item in omitted_ranges:
+            lines.append(
+                f"- `after={item.get('after_ref')}` `last={item.get('last_ref')}` "
+                f"`omitted={item.get('omitted_count')}`: {item.get('guidance')}"
+            )
+            if item.get("read_next_command"):
+                lines.append(f"  - Next read: `{item.get('read_next_command')}`")
+    guidance = interval.get("next_read_guidance") or {}
+    if guidance:
+        lines.append("")
+        lines.append(f"- Next-read guidance: `status={guidance.get('status')}` {guidance.get('policy')}")
 
 
 def render_retained_trace_counters_text(payload: dict) -> str:

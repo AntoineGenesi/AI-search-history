@@ -25,6 +25,7 @@ from .timeutil import parse_datetime
 
 DEFAULT_STATUS_QUERY = "what happened since my last message?"
 SCHEMA_VERSION = 1
+POST_ANCHOR_INTERVAL_ENTRY_LIMIT = 40
 
 SOURCE_MODES = (
     "ground_truth_chat_logs",
@@ -449,6 +450,14 @@ def status_anchor_report(
         status_as_of_timestamp_utc=status_as_of_boundary.get("timestamp_utc") if status_as_of_boundary else None,
         audit_run_requested=audit_run_requested,
     )
+    post_anchor_interval = _post_anchor_interval_reconstruction(
+        selected_anchor=selected_anchor,
+        status_as_of_boundary=status_as_of_boundary,
+        session_activity=session_activity,
+        artifacts=artifacts,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
     current_value_items = [item for item in artifacts["value_items"] if item.get("current_window_evidence")]
     behavior_deltas = [item for item in current_value_items if item["value_kind"] == "behavior_delta"]
     non_deltas = [item for item in current_value_items if item["value_kind"] == "non_delta"]
@@ -471,11 +480,13 @@ def status_anchor_report(
         source_tiers=source_tiers,
         target_window=target_window,
         session_activity=session_activity,
+        post_anchor_interval=post_anchor_interval,
     )
     answer_readiness = _answer_readiness_contract(
         selected_anchor=selected_anchor,
         anchor_decision=anchor_decision,
         session_activity=session_activity,
+        post_anchor_interval=post_anchor_interval,
         source_tiers=source_tiers,
         follow_through_plan=follow_through_plan,
         target_window=target_window,
@@ -566,6 +577,12 @@ def status_anchor_report(
             "answer_allowed": answer_readiness["answer_allowed"],
             "answer_readiness_status": answer_readiness["status"],
             "missing_required_answer_facet_count": len(answer_readiness["missing_required_answer_facets"]),
+            "post_anchor_interval_status": post_anchor_interval.get("status"),
+            "post_anchor_interval_coverage_status": (post_anchor_interval.get("coverage") or {}).get("status"),
+            "post_anchor_interval_entry_count": post_anchor_interval.get("chronological_entry_count", 0),
+            "post_anchor_interval_omitted_entry_count": (post_anchor_interval.get("coverage") or {}).get(
+                "omitted_activity_entry_count", 0
+            ),
             "unresolved_blocker_count": len(unresolved_blockers),
             "raw_session_file_count": session_activity["summary"]["session_file_count"],
             "raw_session_record_count": session_activity["summary"]["records_after_anchor"],
@@ -590,6 +607,7 @@ def status_anchor_report(
         "selected_anchor": selected_anchor,
         "anchor_decision": anchor_decision,
         "session_activity": session_activity,
+        "post_anchor_interval_reconstruction": post_anchor_interval,
         "evidence_contract": _evidence_contract(),
         "next_reads": next_reads,
         "source_tiers": source_tiers,
@@ -4958,6 +4976,9 @@ def _session_activity_trace(
         "canonical_authority": (selected_anchor or {}).get("canonical_authority"),
         "session_activity_location": (selected_anchor or {}).get("session_activity_location"),
         "session_followups": [],
+        "chronological_activity_after_anchor": [],
+        "omitted_activity_after_anchor_count": 0,
+        "omitted_activity_ranges": [],
         "activity_after_anchor": _empty_activity_counts(),
         "next_reads": [],
         "evidence_boundary": {
@@ -4972,6 +4993,8 @@ def _session_activity_trace(
             "session_file_count": 0,
             "records_after_anchor": 0,
             "spawned_session_call_count": 0,
+            "interval_ledger_entry_count": 0,
+            "omitted_interval_ledger_entry_count": 0,
         },
     }
     if not selected_anchor:
@@ -5003,6 +5026,8 @@ def _session_activity_trace(
 
     activity = _empty_activity_counts()
     followups = []
+    chronological_entries = []
+    omitted_ranges = []
     next_reads = []
     missing = []
     for context in unique_contexts:
@@ -5025,6 +5050,8 @@ def _session_activity_trace(
                 audit_run_requested=audit_run_requested,
             )
             _merge_activity_counts(activity, scan["activity_after_anchor"])
+            chronological_entries.extend(scan.get("chronological_activity_after_anchor") or [])
+            omitted_ranges.extend(scan.get("omitted_activity_ranges") or [])
             followups.append(
                 {
                     **{key: value for key, value in context.items() if key != "session_files"},
@@ -5047,6 +5074,8 @@ def _session_activity_trace(
         "session_file_count": len({item["session_file"] for item in followups}),
         "records_after_anchor": activity["records_after_anchor"],
         "spawned_session_call_count": activity["spawned_session_calls"],
+        "interval_ledger_entry_count": len(chronological_entries),
+        "omitted_interval_ledger_entry_count": sum(int(item.get("omitted_count") or 0) for item in omitted_ranges),
     }
     status = "raw_session_trace_found" if summary["session_file_count"] and summary["records_after_anchor"] else "raw_session_trace_empty"
     if missing and status == "raw_session_trace_found":
@@ -5056,6 +5085,9 @@ def _session_activity_trace(
         "status": status,
         "anchor_timestamp_utc": anchor_timestamp.isoformat(timespec="seconds"),
         "session_followups": followups,
+        "chronological_activity_after_anchor": _sort_interval_entries(chronological_entries),
+        "omitted_activity_after_anchor_count": summary["omitted_interval_ledger_entry_count"],
+        "omitted_activity_ranges": omitted_ranges,
         "activity_after_anchor": activity,
         "next_reads": _dedupe_reads(next_reads),
         "missing_logs": missing,
@@ -5110,6 +5142,9 @@ def _demote_unqualified_out_of_band_anchor_without_activity(
         "status": "no_selected_anchor",
         "anchor_timestamp_utc": None,
         "session_followups": [],
+        "chronological_activity_after_anchor": [],
+        "omitted_activity_after_anchor_count": 0,
+        "omitted_activity_ranges": [],
         "activity_after_anchor": _empty_activity_counts(),
         "next_reads": [],
         "missing_logs": [
@@ -5119,6 +5154,8 @@ def _demote_unqualified_out_of_band_anchor_without_activity(
             "session_file_count": 0,
             "records_after_anchor": 0,
             "spawned_session_call_count": 0,
+            "interval_ledger_entry_count": 0,
+            "omitted_interval_ledger_entry_count": 0,
         },
     }
     return None, demoted_decision, demoted_activity
@@ -5311,6 +5348,9 @@ def _scan_session_file_after_anchor(
     first_ref = None
     last_ref = None
     spawned_refs = []
+    chronological_entries = []
+    omitted_count = 0
+    omitted_after_ref = None
     next_reads = []
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
@@ -5321,6 +5361,8 @@ def _scan_session_file_after_anchor(
             "first_after_anchor_ref": None,
             "last_after_anchor_ref": None,
             "spawned_session_call_refs": [],
+            "chronological_activity_after_anchor": [],
+            "omitted_activity_ranges": [],
             "next_reads": [],
         }
     with handle:
@@ -5366,6 +5408,21 @@ def _scan_session_file_after_anchor(
                 )
             last_ref = source_ref
             _count_session_record(record, activity)
+            entry = _interval_activity_entry(
+                record,
+                source_ref,
+                line_number,
+                path=path,
+                cwd=cwd,
+                codex_home=codex_home,
+                target_window=target_window,
+            )
+            if len(chronological_entries) < POST_ANCHOR_INTERVAL_ENTRY_LIMIT:
+                chronological_entries.append(entry)
+            else:
+                omitted_count += 1
+                if omitted_after_ref is None:
+                    omitted_after_ref = chronological_entries[-1].get("source_ref") if chronological_entries else source_ref
             if _is_spawned_session_call(record):
                 spawned_refs.append(source_ref)
                 if len(next_reads) < 4:
@@ -5391,8 +5448,142 @@ def _scan_session_file_after_anchor(
         "first_after_anchor_ref": first_ref,
         "last_after_anchor_ref": last_ref,
         "spawned_session_call_refs": spawned_refs[:10],
+        "chronological_activity_after_anchor": chronological_entries,
+        "omitted_activity_ranges": _omitted_interval_ranges(
+            omitted_count=omitted_count,
+            omitted_after_ref=omitted_after_ref,
+            last_ref=last_ref,
+            path=path,
+            codex_home=codex_home,
+            cwd=cwd,
+        ),
         "next_reads": next_reads,
     }
+
+
+def _sort_interval_entries(entries: list[dict]) -> list[dict]:
+    return sorted(entries, key=lambda item: (str(item.get("timestamp_utc") or ""), str(item.get("source_ref") or "")))
+
+
+def _interval_activity_entry(
+    record: Mapping[str, Any],
+    source_ref: str,
+    line_number: int,
+    *,
+    path: Path,
+    cwd: Path,
+    codex_home: Path,
+    target_window: dict | None,
+) -> dict:
+    classification = classify_conversation_record(record)
+    timestamp = parse_datetime(
+        record.get("timestamp") or record.get("ts") or record.get("created_at") or record.get("time"),
+        timezone.utc,
+    )
+    target = f"{path}:{line_number}"
+    snippet = _compact(str(classification.extracted_text or _interval_record_hint(record) or ""), 180)
+    entry = {
+        "source_ref": source_ref,
+        "source_kind": "codex_sessions",
+        "timestamp_utc": timestamp.astimezone(timezone.utc).isoformat(timespec="seconds") if timestamp else None,
+        "line": line_number,
+        "activity_kind": _interval_activity_kind(record, classification.label),
+        "classification": classification.label,
+        "snippet": snippet,
+        "openable_target": target,
+        "read_more_command": _read_more_command(
+            target,
+            cwd=cwd,
+            codex_home=codex_home,
+            before=0,
+            after=4,
+            output_format="text",
+        ),
+        "answer_support_role": "post_anchor_interval_activity",
+    }
+    if target_window:
+        text = _record_task_text(record)
+        entry["target_window_hits"] = _target_window_hits(text, target_window)
+        entry["outside_target_task_ids"] = _outside_target_task_ids(text, target_window)
+    if _is_spawned_session_call(record):
+        entry["spawned_session_launch_ref"] = True
+    return entry
+
+
+def _interval_activity_kind(record: Mapping[str, Any], classification_label: str) -> str:
+    payload = record.get("payload")
+    payload_map = payload if isinstance(payload, Mapping) else {}
+    payload_type = str(payload_map.get("type") or record.get("type") or "").casefold()
+    if _is_spawned_session_call(record):
+        return "spawned_session_launch"
+    if classification_label == HUMAN_AUTHORED_USER_MESSAGE:
+        return "human_user_message"
+    if classification_label == ASSISTANT_OR_AGENT_MESSAGE:
+        return "assistant_or_agent_message"
+    if classification_label == TOOL_ACTION_OUTPUT:
+        return "tool_output"
+    if classification_label == COMPACTED_HISTORY_SUMMARY:
+        return "compacted_summary"
+    if payload_type in {"function_call", "custom_tool_call", "tool_call", "tool_search_call"}:
+        return "tool_call"
+    if payload_type in {"function_call_output", "custom_tool_call_output", "tool_call_output", "tool_search_output"}:
+        return "tool_output"
+    return "other_session_record"
+
+
+def _interval_record_hint(record: Mapping[str, Any]) -> str:
+    payload = record.get("payload")
+    payload_map = payload if isinstance(payload, Mapping) else {}
+    name = str(payload_map.get("name") or record.get("name") or "")
+    arguments = str(payload_map.get("arguments") or "")
+    output = str(payload_map.get("output") or "")
+    return " ".join(part for part in (name, arguments, output) if part)
+
+
+def _omitted_interval_ranges(
+    *,
+    omitted_count: int,
+    omitted_after_ref: str | None,
+    last_ref: str | None,
+    path: Path,
+    codex_home: Path,
+    cwd: Path,
+) -> list[dict]:
+    if omitted_count <= 0:
+        return []
+    read_next_command = None
+    if omitted_after_ref:
+        read_next_command = " ".join(
+            shlex.quote(part)
+            for part in [
+                "jsonl-history-search",
+                "read-more",
+                omitted_after_ref,
+                "--cwd",
+                str(cwd),
+                "--codex-home",
+                str(codex_home),
+                "--format",
+                "text",
+                "--mode",
+                "next",
+                "--next-count",
+                str(min(omitted_count, POST_ANCHOR_INTERVAL_ENTRY_LIMIT)),
+            ]
+        )
+    return [
+        {
+            "session_source_ref": _source_ref_for_path_line(path, None, codex_home),
+            "omitted_count": omitted_count,
+            "after_ref": omitted_after_ref,
+            "last_ref": last_ref,
+            "guidance": (
+                "The model-facing post-anchor interval ledger was capped. Continue from after_ref before "
+                "answering or state this omitted range explicitly."
+            ),
+            "read_next_command": read_next_command,
+        }
+    ]
 
 
 def _selected_anchor_raw_session_reads(
@@ -5445,6 +5636,205 @@ def _selected_anchor_raw_session_reads(
             )
             return [read]
     return []
+
+
+def _post_anchor_interval_reconstruction(
+    *,
+    selected_anchor: dict | None,
+    status_as_of_boundary: dict | None,
+    session_activity: dict,
+    artifacts: dict,
+    cwd: Path,
+    codex_home: Path | None,
+) -> dict:
+    coverage = _post_anchor_interval_coverage(session_activity)
+    chronological_entries = list(session_activity.get("chronological_activity_after_anchor") or [])
+    secondary_joins = _post_anchor_secondary_joins(artifacts)
+    boundary = (
+        {
+            "kind": status_as_of_boundary.get("kind"),
+            "timestamp_utc": status_as_of_boundary.get("timestamp_utc"),
+            "source_ref": status_as_of_boundary.get("source_ref"),
+            "source_kind": status_as_of_boundary.get("source_kind"),
+            "openable_target": status_as_of_boundary.get("openable_target"),
+            "role": "exclusive_status_as_of_boundary",
+        }
+        if status_as_of_boundary
+        else {
+            "kind": "command_time_or_latest_available_boundary",
+            "timestamp_utc": None,
+            "source_ref": None,
+            "role": "open_interval_to_now",
+            "policy": "No explicit status-as-of row was available; reconstruct to now/latest available bounded logs.",
+        }
+    )
+    anchor = (
+        {
+            "timestamp_utc": selected_anchor.get("timestamp_utc"),
+            "source_ref": selected_anchor.get("source_ref"),
+            "source_kind": selected_anchor.get("source_kind"),
+            "openable_target": selected_anchor.get("openable_target"),
+            "read_more_command": selected_anchor.get("read_more_command"),
+            "role": "inclusive_selected_user_anchor",
+        }
+        if selected_anchor
+        else None
+    )
+    omitted_ranges = list(session_activity.get("omitted_activity_ranges") or [])
+    warnings = list(coverage.get("warnings") or [])
+    warnings.extend(item.get("guidance") for item in omitted_ranges if item.get("guidance"))
+    return {
+        "status": coverage["status"],
+        "anchor": anchor,
+        "boundary": boundary,
+        "coverage": coverage,
+        "chronological_activity": chronological_entries,
+        "chronological_entry_count": len(chronological_entries),
+        "spawned_session_launch_refs": [
+            entry.get("source_ref") for entry in chronological_entries if entry.get("spawned_session_launch_ref")
+        ],
+        "worker_reviewer_or_spawned_session_policy": (
+            "Spawned worker/reviewer/free-agent launch refs are part of the post-anchor interval. Inspect them "
+            "when they are needed to explain the interval; do not let a later spawned topic replace earlier parent activity."
+        ),
+        "secondary_evidence_joins": secondary_joins,
+        "secondary_evidence_policy": (
+            "Task/report/review/git joins are secondary evidence only. They may confirm raw interval activity but "
+            "must not replace missing raw chronological coverage."
+        ),
+        "omitted_ranges": omitted_ranges,
+        "omitted_range_warning": " ".join(warnings),
+        "next_read_guidance": _post_anchor_interval_next_read_guidance(
+            selected_anchor=selected_anchor,
+            session_activity=session_activity,
+            omitted_ranges=omitted_ranges,
+            cwd=cwd,
+            codex_home=codex_home,
+        ),
+    }
+
+
+def _post_anchor_interval_coverage(session_activity: dict) -> dict:
+    raw_status = str(session_activity.get("status") or "")
+    summary = session_activity.get("summary") or {}
+    records_after_anchor = int(summary.get("records_after_anchor") or 0)
+    omitted_count = int(summary.get("omitted_interval_ledger_entry_count") or 0)
+    missing_logs = list(session_activity.get("missing_logs") or [])
+    blocking_missing_logs = [
+        item for item in missing_logs if not str(item).startswith("status_question session file not found")
+    ]
+    warnings = []
+    if raw_status in {"no_selected_anchor", "missing_codex_home", "missing_anchor_timestamp", "no_session_context_found"}:
+        return {
+            "status": "missing",
+            "complete": False,
+            "raw_session_trace_status": raw_status,
+            "records_after_anchor": records_after_anchor,
+            "omitted_activity_entry_count": omitted_count,
+            "missing_logs": missing_logs,
+            "blocking_missing_logs": blocking_missing_logs,
+            "warnings": ["No complete post-anchor interval can be reconstructed until the selected anchor/session context is proven."],
+        }
+    if raw_status == "raw_session_trace_empty" or records_after_anchor <= 0:
+        return {
+            "status": "missing",
+            "complete": False,
+            "raw_session_trace_status": raw_status,
+            "records_after_anchor": records_after_anchor,
+            "omitted_activity_entry_count": omitted_count,
+            "missing_logs": missing_logs,
+            "blocking_missing_logs": blocking_missing_logs,
+            "warnings": ["No raw post-anchor records were found; do not answer from secondary artifacts alone."],
+        }
+    if missing_logs:
+        warnings.append("At least one derived session log was missing; inspect whether it is boundary-only or interval activity.")
+    if blocking_missing_logs:
+        warnings.append("At least one post-anchor interval session log was missing; reconstruct it before answering.")
+    if omitted_count:
+        warnings.append(
+            "The chronological interval ledger is capped and omitted post-anchor records; continue the omitted range before answering."
+        )
+    complete = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"} and not blocking_missing_logs and omitted_count == 0
+    status = "complete" if complete else "partial"
+    return {
+        "status": status,
+        "complete": complete,
+        "raw_session_trace_status": raw_status,
+        "records_after_anchor": records_after_anchor,
+        "chronological_entry_limit": POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+        "chronological_entry_count": int(summary.get("interval_ledger_entry_count") or 0),
+        "omitted_activity_entry_count": omitted_count,
+        "missing_logs": missing_logs,
+        "blocking_missing_logs": blocking_missing_logs,
+        "warnings": warnings,
+    }
+
+
+def _post_anchor_secondary_joins(artifacts: dict) -> dict:
+    return {
+        "tasks": [_secondary_join_item(item) for item in artifacts.get("tasks", []) if item.get("current_window_evidence")],
+        "reports": [_secondary_join_item(item) for item in artifacts.get("reports", []) if item.get("current_window_evidence")],
+        "reviews": [_secondary_join_item(item) for item in artifacts.get("reviews", []) if item.get("current_window_evidence")],
+        "git_commits": [
+            {
+                "source_ref": f"git_commit:{commit.get('commit')}",
+                "committed_at": commit.get("committed_at"),
+                "snippet": commit.get("subject"),
+                "source_tier": commit.get("source_tier"),
+                "evidence_role": commit.get("evidence_role"),
+            }
+            for commit in artifacts.get("commits", [])
+        ],
+    }
+
+
+def _secondary_join_item(item: dict) -> dict:
+    return {
+        "source_ref": item.get("source_ref"),
+        "kind": item.get("kind"),
+        "snippet": item.get("snippet"),
+        "source_tier": item.get("source_tier"),
+        "evidence_timestamp_utc": item.get("evidence_timestamp_utc"),
+    }
+
+
+def _post_anchor_interval_next_read_guidance(
+    *,
+    selected_anchor: dict | None,
+    session_activity: dict,
+    omitted_ranges: list[dict],
+    cwd: Path,
+    codex_home: Path | None,
+) -> dict:
+    if omitted_ranges:
+        return {
+            "status": "continue_omitted_range",
+            "commands": [item.get("read_next_command") for item in omitted_ranges if item.get("read_next_command")],
+            "policy": "Read the omitted interval range before answering, or explicitly report the omitted range as a blocker.",
+        }
+    blocking_missing_logs = [
+        item
+        for item in (session_activity.get("missing_logs") or [])
+        if not str(item).startswith("status_question session file not found")
+    ]
+    if blocking_missing_logs:
+        return {
+            "status": "recover_missing_session_logs",
+            "missing_logs": blocking_missing_logs,
+            "policy": "Recover or inspect the missing derived session logs before treating the interval as answer-ready.",
+        }
+    if selected_anchor and selected_anchor.get("openable_target"):
+        return {
+            "status": "open_anchor_then_interval",
+            "commands": [
+                _read_more_command(str(selected_anchor["openable_target"]), cwd=cwd, codex_home=codex_home, output_format="text")
+            ],
+            "policy": "Open the anchor and the listed chronological interval refs before secondary joins.",
+        }
+    return {
+        "status": "no_specific_next_read",
+        "policy": "No selected anchor/interval read was available; rerun with an explicit timestamp or quoted anchor.",
+    }
 
 
 def _find_raw_session_anchor_row(path: Path, anchor_timestamp, normalized_anchor: str) -> tuple[int, Mapping[str, Any]] | None:
@@ -6483,6 +6873,7 @@ def _follow_through_plan(
     source_tiers: dict,
     target_window: dict | None,
     session_activity: dict,
+    post_anchor_interval: dict | None = None,
 ) -> dict:
     required_primary = list(source_tiers.get("required_primary") or [])
     required_secondary = list(source_tiers.get("required_secondary") or [])
@@ -6521,6 +6912,14 @@ def _follow_through_plan(
             "refs. Stop when those refs cover the expected status facets; do not open diagnostics or rerun "
             f"JSON/JQ unless {named_gap}."
         )
+    interval = post_anchor_interval or {}
+    interval_coverage = interval.get("coverage") or {}
+    if interval_coverage.get("complete") is False and not has_parent_main_recovery:
+        stop_condition = (
+            "Fail closed before answer: the selected anchor is not enough. Reconstruct the full post-anchor "
+            "interval to the status boundary/now first, including omitted ranges or missing session logs, before "
+            "using secondary task/git/review joins."
+        )
     return {
         "status": "ready" if open_first or then_confirm else "no_follow_through_refs",
         "open_first": open_first,
@@ -6536,6 +6935,8 @@ def _follow_through_plan(
             session_activity=session_activity,
         ),
         "required_answer_facets": _required_answer_facets(target_window=target_window),
+        "post_anchor_interval_coverage_status": interval_coverage.get("status"),
+        "post_anchor_interval_next_read_guidance": interval.get("next_read_guidance"),
         "required_facets_stop_condition": (
             "Do not synthesize a factual status answer until every required_answer_facet is covered "
             "by inspected required primary raw refs and required secondary refs, or explicitly reported "
@@ -6641,7 +7042,7 @@ def _expected_status_answer_facets(
     target_window: dict | None,
     session_activity: dict,
 ) -> list[str]:
-    facets = ["anchor_and_boundary", "raw_current_window_activity"]
+    facets = ["anchor_and_boundary", "post_anchor_interval_coverage", "raw_current_window_activity"]
     if target_window:
         facets.append("target_window_task_report_review_status")
     else:
@@ -6656,6 +7057,7 @@ def _required_answer_facets(*, target_window: dict | None) -> list[str]:
     task_facet = "target_window_task_outcome_value_deltas" if target_window else "task_outcome_value_deltas"
     return [
         "selected_anchor_and_boundary",
+        "post_anchor_interval_coverage",
         "raw_post_anchor_activity",
         task_facet,
         "unresolved_blockers_or_next_action",
@@ -6668,6 +7070,7 @@ def _answer_readiness_contract(
     selected_anchor: dict | None,
     anchor_decision: dict,
     session_activity: dict,
+    post_anchor_interval: dict,
     source_tiers: dict,
     follow_through_plan: dict,
     target_window: dict | None,
@@ -6685,6 +7088,10 @@ def _answer_readiness_contract(
     raw_activity_ready = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
     if not raw_activity_ready:
         missing.append("raw_post_anchor_activity")
+    interval_coverage = post_anchor_interval.get("coverage") or {}
+    interval_coverage_ready = bool(interval_coverage.get("complete"))
+    if selected_anchor and not interval_coverage_ready:
+        missing.append("post_anchor_interval_coverage")
     task_facet = "target_window_task_outcome_value_deltas" if target_window else "task_outcome_value_deltas"
     target_or_task_ready = True
     recovery_material = any(
@@ -6699,9 +7106,16 @@ def _answer_readiness_contract(
     status = "answer_ready" if answer_allowed else "fail_closed_missing_required_facets"
     stop_condition = (
         "Answer allowed only after selected_anchor_and_boundary and raw_post_anchor_activity are proven, "
+        "the post-anchor interval is reconstructed to the status boundary/now, "
         "then every required_answer_facet is covered or explicitly caveated. Missing facets are a stop "
         "condition, not optional guidance."
     )
+    if selected_anchor and not interval_coverage_ready:
+        stop_condition = (
+            "Fail closed before answer: the selected anchor is known, but the post-anchor interval "
+            "reconstruction is partial or missing. Read the omitted range or missing session logs named in "
+            "post_anchor_interval_reconstruction.next_read_guidance before synthesizing a status answer."
+        )
     if recovery_material or not selected_anchor:
         stop_condition = (
             "Fail closed before answer: recovery candidates are verification/rerun material only. "
@@ -6739,12 +7153,14 @@ def _answer_readiness_contract(
         },
         "facet_status": {
             "selected_anchor_and_boundary": selected_anchor_ready,
+            "post_anchor_interval_coverage": interval_coverage_ready,
             "raw_post_anchor_activity": raw_activity_ready,
             task_facet: target_or_task_ready,
             "unresolved_blockers_or_next_action": True,
             "caveats_non_claims": True,
         },
         "missing_required_answer_facets": missing,
+        "post_anchor_interval_coverage": interval_coverage,
         "stop_condition": stop_condition,
         "required_facets_stop_condition": follow_through_plan.get("required_facets_stop_condition"),
         "non_answer_support_fields": [
