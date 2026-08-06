@@ -613,6 +613,9 @@ def render_ask_execute_text(payload: dict) -> str:
     elif first_command:
         lines.append(f"First command: {first_command}")
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
+    packet = route.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_text(packet))
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
     if execution.get("report_output_status") == "unavailable":
@@ -745,6 +748,9 @@ def render_ask_execute_markdown(payload: dict) -> str:
     elif first_command:
         lines.append(f"- First command: `{first_command}`")
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
+    packet = route.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_markdown(packet))
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
     if execution.get("report_output_status") == "unavailable":
