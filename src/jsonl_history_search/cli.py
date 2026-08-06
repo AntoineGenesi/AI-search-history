@@ -137,6 +137,13 @@ from .real_history_remaining_miss_diagnostic import (
     DEFAULT_MISS_AUDIT_REPORT as DEFAULT_REAL_HISTORY_REMAINING_MISS_AUDIT_REPORT,
 )
 from .real_history_remaining_miss_diagnostic import build_real_history_remaining_miss_diagnostic_payload
+from .receiving_agent_trace_ledger import (
+    DEFAULT_REPORT_JSON as DEFAULT_RECEIVING_AGENT_LEDGER_JSON,
+    DEFAULT_REPORT_MD as DEFAULT_RECEIVING_AGENT_LEDGER_MD,
+    build_receiving_agent_trace_ledger,
+    parse_lane_arg,
+    render_receiving_agent_trace_ledger_markdown,
+)
 from .repo_source_no_evidence import build_repo_source_no_evidence_payload
 from .real_history_opened_file_progress_diagnostic import (
     DEFAULT_JSH706_BENCHMARK_REPORT as DEFAULT_REAL_HISTORY_OPENED_PROGRESS_JSH706_BENCHMARK,
@@ -1508,6 +1515,22 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help=f"Optional rendered report path; default for committed report is {DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH}.",
+    )
+    receiving_agent_ledger = subparsers.add_parser("receiving-agent-ledger")
+    receiving_agent_ledger.add_argument("--format", choices=("json", "markdown"), default="json")
+    receiving_agent_ledger.add_argument(
+        "--lane",
+        action="append",
+        required=True,
+        help="Retained private lane as id=path. Path may be a lane directory or events.jsonl file; may be repeated.",
+    )
+    receiving_agent_ledger.add_argument(
+        "--report-output",
+        default=None,
+        help=(
+            "Optional committed-safe report path. Defaults to "
+            f"{DEFAULT_RECEIVING_AGENT_LEDGER_JSON} for JSON and {DEFAULT_RECEIVING_AGENT_LEDGER_MD} for Markdown."
+        ),
     )
     harness_artifacts = subparsers.add_parser("validate-harness-artifacts")
     harness_artifacts.add_argument("--format", choices=("text", "json", "markdown"), default="markdown")
@@ -18131,6 +18154,24 @@ def main(argv: list[str] | None = None) -> int:
         report_output = Path(args.report_output).expanduser() if args.report_output else DEFAULT_RETAINED_TRACE_COUNTER_REPORT_PATH
         report_output.parent.mkdir(parents=True, exist_ok=True)
         report_output.write_text(render(payload, "markdown"), encoding="utf-8")
+        print(rendered)
+        return 0
+    if args.command == "receiving-agent-ledger":
+        lanes = [parse_lane_arg(item) for item in args.lane]
+        payload = build_receiving_agent_trace_ledger(lanes, repo_root=Path.cwd())
+        rendered = (
+            render(payload, "json")
+            if args.format == "json"
+            else render_receiving_agent_trace_ledger_markdown(payload)
+        )
+        if args.report_output:
+            report_output = Path(args.report_output).expanduser()
+        elif args.format == "markdown":
+            report_output = DEFAULT_RECEIVING_AGENT_LEDGER_MD
+        else:
+            report_output = DEFAULT_RECEIVING_AGENT_LEDGER_JSON
+        report_output.parent.mkdir(parents=True, exist_ok=True)
+        report_output.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0
     if args.command == "validate-harness-artifacts":
