@@ -36,4 +36,3 @@ Do not invoke JSONL for ordinary writing/editing, local repo status, branch
 status, current file/task status, or bare ambiguous `what happened?` prompts.
 Ask one short clarifying question when the user has not asked for prior
 conversation history, provenance, action proof, or latest-message status.
-
