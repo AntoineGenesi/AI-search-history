@@ -2137,6 +2137,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "structured_execution_query": route.get("structured_execution_query"),
         "command_resolution": route.get("command_resolution"),
         "first_command": route.get("first_command"),
+        "method_selection_packet": route.get("method_selection_packet"),
         "next_commands": route.get("next_commands", []),
         "answer_ready_handoff": route.get("answer_ready_handoff"),
         "optional_deeper_reads": route.get("optional_deeper_reads", []),

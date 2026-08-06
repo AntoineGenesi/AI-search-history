@@ -456,6 +456,9 @@ def render_ask_router_text(payload: dict) -> str:
                 f"Optional deeper reads only if: {handoff.get('only_continue_if')}",
             ]
         )
+    packet = report.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_text(packet))
     lines.append("Next commands:")
     for item in report.get("next_commands", []):
         lines.append(f"- {item.get('purpose')}: {item.get('command')}")
@@ -477,6 +480,27 @@ def render_ask_router_text(payload: dict) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _render_method_selection_packet_text(packet: dict) -> list[str]:
+    lines = [
+        "Method selection packet:",
+        f"- schema_version: {packet.get('schema_version')}",
+        f"- route_family: {packet.get('route_family')}",
+        f"- method_id: {packet.get('method_id')}",
+        f"- first_command: {packet.get('first_command')}",
+        f"- cap_language_required: {packet.get('cap_language_required')}",
+        f"- single_flight_policy: {packet.get('single_flight_policy')}",
+        f"- secondary_policy: {packet.get('secondary_policy')}",
+        f"- stop_rule: {packet.get('stop_rule')}",
+        f"- continue_only_if: {packet.get('continue_only_if')}",
+    ]
+    for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
+        values = packet.get(field) or []
+        lines.append(f"- {field}:")
+        for value in values:
+            lines.append(f"  - {value}")
+    return lines
 
 
 def render_bulk_line_match_text(payload: dict) -> str:
@@ -589,6 +613,9 @@ def render_ask_execute_text(payload: dict) -> str:
     elif first_command:
         lines.append(f"First command: {first_command}")
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
+    packet = route.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_text(packet))
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
     if execution.get("report_output_status") == "unavailable":
@@ -721,6 +748,9 @@ def render_ask_execute_markdown(payload: dict) -> str:
     elif first_command:
         lines.append(f"- First command: `{first_command}`")
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
+    packet = route.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_markdown(packet))
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
     if execution.get("report_output_status") == "unavailable":
@@ -1463,6 +1493,9 @@ def render_ask_router_markdown(payload: dict) -> str:
                 f"- Optional deeper reads only if: {handoff.get('only_continue_if')}",
             ]
         )
+    packet = report.get("method_selection_packet") or {}
+    if packet:
+        lines.extend(_render_method_selection_packet_markdown(packet))
     lines.extend(["", "## Next Commands", ""])
     for item in report.get("next_commands", []):
         lines.append(f"- **{item.get('purpose')}**: `{item.get('command')}`")
@@ -1487,6 +1520,29 @@ def render_ask_router_markdown(payload: dict) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _render_method_selection_packet_markdown(packet: dict) -> list[str]:
+    lines = [
+        "",
+        "## Method Selection Packet",
+        "",
+        f"- `schema_version`: `{packet.get('schema_version')}`",
+        f"- `route_family`: `{packet.get('route_family')}`",
+        f"- `method_id`: `{packet.get('method_id')}`",
+        f"- `first_command`: `{packet.get('first_command')}`",
+        f"- `cap_language_required`: `{packet.get('cap_language_required')}`",
+        f"- `single_flight_policy`: {packet.get('single_flight_policy')}",
+        f"- `secondary_policy`: {packet.get('secondary_policy')}",
+        f"- `stop_rule`: {packet.get('stop_rule')}",
+        f"- `continue_only_if`: {packet.get('continue_only_if')}",
+    ]
+    for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
+        values = packet.get(field) or []
+        lines.append(f"- `{field}`:")
+        for value in values:
+            lines.append(f"  - {value}")
+    return lines
 
 
 def render_bulk_line_match_markdown(payload: dict) -> str:
