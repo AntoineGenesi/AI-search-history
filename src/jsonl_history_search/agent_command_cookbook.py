@@ -70,7 +70,7 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
             "question_family": "What happened since my last message?",
             "route": "latest-status / what-happened-since",
             "first_command": (
-                'jsonl-history-search ask "what happened since my last message in the main thread?" '
+                'jsonl-history-search what-happened-since "what happened since my last message in the main thread?" '
                 '--cwd "$PWD" --format text'
             ),
             "inspect_next": (
