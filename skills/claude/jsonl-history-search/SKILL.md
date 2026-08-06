@@ -1,18 +1,15 @@
 ---
 name: jsonl-history-search
-description: cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or zero tools for unresolved scope. Trigger: `what has happened since my last message in the parent thread?`. Bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, local repo/task/artifact status prompts, and generic questions not anchored to prior conversation history are non-triggers. A leading `convo` explicitly triggers the skill but is not itself an executable command; aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
+description: cleanup/process was deferred or failed. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or zero tools for unresolved scope. Trigger: `what has happened since my last message in the parent thread?`. Non-triggers: bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, repo/Git history prompts, local repo/task/artifact status prompts, generic questions not anchored to prior conversation history, and writing/editing/summarizing prompts. A leading `convo` or aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
 metadata:
   short-description: History
 ---
 
 # JSONL History Search
 
-Router for local Codex/Claude history.
-
 ## Activation Gate
 
-Trigger even without JSONL or `convo` when the request depends on prior AI
-conversation history:
+Trigger when the request depends on prior AI conversation history:
 
 - what the user previously said;
 - old decisions before/outside visible context;
@@ -23,9 +20,10 @@ conversation history:
 
 The trigger is intentionally narrow. Do not trigger for bare `what happened?`,
 `what changed in this task file?`, ordinary branch/cleanliness/local-status
-prompts, local repo/task/artifact status prompts, or generic questions not
-anchored to prior conversation history. Ask one short clarifying question and
-use zero tools when the event or evidence source is ambiguous.
+prompts, repo/Git history prompts, local repo/task/artifact status prompts,
+generic questions not anchored to prior conversation history, or
+writing/editing/summarizing prompts. Ask one short clarifying question and use
+zero tools when the event or evidence source is ambiguous.
 
 If `JSONL activation mode: explicit-only` is set, natural wording is a
 non-trigger; require an explicit history-tool alias such as leading `convo` or

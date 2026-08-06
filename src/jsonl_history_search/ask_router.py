@@ -1485,13 +1485,16 @@ def classify_ask_route(
     if _looks_like_coordinator_context_query(normalized):
         return COORDINATOR_CONTEXT_ROUTE
 
-    if _looks_like_active_status_front_door_query(normalized):
-        return ACTIVE_STATUS_FRONT_DOOR_ROUTE
-
     if _looks_like_latest_status_anchor_query(normalized):
         if activation_mode == "explicit-only" and explicit_query is None:
             return EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE
         return ROUTES[5]
+
+    if _looks_like_current_checkout_status_query(normalized):
+        return LOCAL_CHECKOUT_LOOKUP_ROUTE
+
+    if _looks_like_active_status_front_door_query(normalized):
+        return ACTIVE_STATUS_FRONT_DOOR_ROUTE
 
     if _looks_like_current_local_scope_query(normalized):
         return ROUTES[8]
@@ -1526,9 +1529,6 @@ def classify_ask_route(
     ):
         return TASK_REVIEW_COMMIT_PROVENANCE_ROUTE
 
-    if _looks_like_current_checkout_status_query(normalized):
-        return LOCAL_CHECKOUT_LOOKUP_ROUTE
-
     if is_worktree_cleanup_currentness_query(query):
         return ROUTES[7]
 
@@ -1551,6 +1551,9 @@ def classify_ask_route(
         return ROUTES[9]
 
     if _looks_like_generic_non_history_query(normalized):
+        return NON_HISTORY_CLARIFICATION_ROUTE
+
+    if _looks_like_generic_writing_or_visible_context_query(normalized):
         return NON_HISTORY_CLARIFICATION_ROUTE
 
     if _looks_like_generic_history_tool_alias_non_history_query(normalized):
@@ -2486,6 +2489,12 @@ def _looks_like_current_local_scope_query(normalized: str) -> bool:
             "historical source",
             "history.jsonl",
             "provenance",
+            "git history",
+            "branch history",
+            "commit history",
+            "file history",
+            "repo history",
+            "repository history",
         ),
     ):
         return False
@@ -2551,31 +2560,32 @@ def _looks_like_local_checkout_lookup_query(normalized: str) -> bool:
 
 
 def _looks_like_current_checkout_status_query(normalized: str) -> bool:
-    return _has_any(
+    status_intent = bool(
+        re.search(r"\b(?:check|status|clean|dirty|branch|repo|repository)\b", normalized)
+    ) or _has_any(
+        normalized,
+        ("what happened", "what is", "what's", "cleanliness"),
+    )
+    return status_intent and _has_any(
         normalized,
         (
             "current branch",
             "branch cleanliness",
+            "this branch",
+            "on this branch",
             "current checkout",
             "checkout status",
+            "current repo status",
+            "current repository status",
             "local repo status",
             "local repository status",
             "repo status",
             "repository status",
             "local status",
-        ),
-    ) and _has_any(
-        normalized,
-        (
-            "check",
-            "status",
-            "cleanliness",
-            "clean",
-            "dirty",
-            "branch",
-            "checkout",
-            "repo",
-            "repository",
+            "current task status",
+            "this task status",
+            "current status of this task",
+            "status of this task",
         ),
     )
 
@@ -3496,6 +3506,66 @@ def _looks_like_generic_non_history_query(normalized: str) -> bool:
         "what happened here",
         "what just happened",
     }
+
+
+def _looks_like_generic_writing_or_visible_context_query(normalized: str) -> bool:
+    if _has_any(
+        normalized,
+        (
+            "conversation history",
+            "chat history",
+            "prior conversation",
+            "previous conversation",
+            "old conversation",
+            "source provenance",
+            "source refs",
+            "action proof",
+            "what happened since",
+            "latest message",
+            "last message",
+        ),
+    ):
+        return False
+    writing_or_visible_context = _has_any(
+        normalized,
+        (
+            "make this conversation",
+            "rewrite this conversation",
+            "edit this conversation",
+            "make this convo",
+            "rewrite this convo",
+            "edit this convo",
+            "conversation friendlier",
+            "conversation to sound",
+            "convo opening",
+            "summarize the visible conversation",
+            "summarise the visible conversation",
+            "visible conversation above",
+            "conversation above",
+        ),
+    )
+    generic_write_action = _has_any(
+        normalized,
+        (
+            "make",
+            "rewrite",
+            "edit",
+            "summarize",
+            "summarise",
+            "friendlier",
+        ),
+    )
+    local_visible_target = _has_any(
+        normalized,
+        (
+            "this conversation",
+            "this convo",
+            "visible conversation",
+            "conversation above",
+            "convo opening",
+        ),
+    )
+    return writing_or_visible_context or (generic_write_action and local_visible_target)
 
 
 def _looks_like_reviewed_source_window_prompt(normalized: str) -> bool:
