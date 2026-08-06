@@ -1882,6 +1882,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
     parser.add_argument("--max-matches", type=int, default=40)
     parser.add_argument("--max-elapsed", type=float, default=15.0)
+    parser.add_argument(
+        "--bm25-max-candidate-rows",
+        type=int,
+        default=5000,
+        help="Fail-closed row cap for explicit fielded-bm25/RRF SQLite FTS query materialization.",
+    )
+    parser.add_argument(
+        "--bm25-query-timeout",
+        type=float,
+        default=None,
+        help="Optional seconds budget for explicit fielded-bm25/RRF FTS query/materialization; defaults to --max-elapsed.",
+    )
     parser.add_argument("--timezone", default=None)
     parser.add_argument("--timezone-offset", default="+00:00")
     parser.add_argument("--now", default=None)
@@ -1977,6 +1989,8 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         max_elapsed=args.max_elapsed,
         hard_cap_files=args.hard_cap_files,
         hard_cap_bytes=args.hard_cap_bytes,
+        bm25_max_candidate_rows=args.bm25_max_candidate_rows,
+        bm25_query_timeout=args.bm25_query_timeout,
     )
     explicit_window_start, explicit_window_end = _explicit_search_window_from_args(args, tz)
     intent = infer_query(

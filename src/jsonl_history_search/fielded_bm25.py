@@ -42,6 +42,8 @@ CHUNK_RECORD_LIMIT = 1
 FIELDED_BM25_CHUNKING_VERSION = f"record-limit-{CHUNK_RECORD_LIMIT}"
 INDEX_LINE_TEXT_LIMIT = 1200
 FIELDED_SOURCE_GROUPING_POOL_FACTOR = 4
+FIELDED_BM25_DEFAULT_MAX_CANDIDATE_ROWS = 5000
+FIELDED_BM25_SQLITE_PROGRESS_OPS = 1000
 FTS_FIELD_NAMES = {"role", "timestamp_bucket", "tool_event", "artifact_task_path", "cwd_project", "text"}
 CONTEXT_NEIGHBORHOOD_STREAM_LABEL = "context_neighborhood"
 CONTEXT_NEIGHBORHOOD_RADIUS_BEFORE = 5
@@ -983,12 +985,27 @@ def search_with_fielded_bm25(
     query = _fts_query_for_intent(intent)
     query_plan_mode = _normalize_query_plan_mode(query_plan_mode)
     query_streams = _fielded_query_streams_for_intent(intent, query, query_plan_mode=query_plan_mode)
+    candidate_limit_uncapped = max(plan.limits.max_matches * 5, plan.limits.max_matches)
+    candidate_pool_limit_uncapped = max(
+        candidate_limit_uncapped * FIELDED_SOURCE_GROUPING_POOL_FACTOR,
+        candidate_limit_uncapped,
+    )
+    retrieval_budget = _fielded_bm25_retrieval_budget(
+        plan,
+        started=started,
+        candidate_limit_uncapped=candidate_limit_uncapped,
+        candidate_pool_limit_uncapped=candidate_pool_limit_uncapped,
+    )
+    candidate_limit = int(retrieval_budget["candidate_row_limit"])
+    candidate_pool_limit = int(retrieval_budget["candidate_row_pool_limit"])
+    if retrieval_budget["candidate_row_pool_cap_hit"]:
+        warnings.append("Fielded BM25 candidate row pool capped at BM25 candidate row cap.")
     child_plan_summary = _child_query_plan_summary(
         intent=intent,
         streams=query_streams,
         query_plan_mode=query_plan_mode,
         diagnostics=[],
-        candidate_pool_limit=0,
+        candidate_pool_limit=candidate_pool_limit,
     )
     expected_diag = _init_fielded_expected_ref_diagnostics(expected_ref_diagnostics)
     _mark_expected_indexed(expected_diag, index)
@@ -1001,6 +1018,7 @@ def search_with_fielded_bm25(
             expected_diag,
             query_streams=query_streams,
             child_query_plan=child_plan_summary,
+            retrieval_budget=retrieval_budget,
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
@@ -1015,18 +1033,48 @@ def search_with_fielded_bm25(
             status="ineligible_query",
             query_streams=query_streams,
             child_query_plan=child_plan_summary,
+            retrieval_budget=retrieval_budget,
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
 
     _prepare_active_scope(index.connection, index, intent=intent)
-    candidate_limit = max(plan.limits.max_matches * 5, plan.limits.max_matches)
-    candidate_pool_limit = max(candidate_limit * FIELDED_SOURCE_GROUPING_POOL_FACTOR, candidate_limit)
-    raw_rows, row_stream_labels, stream_rows, stream_diagnostics, stream_error_types = _execute_fielded_query_streams(
+    if _fielded_deadline_expired(retrieval_budget):
+        warnings.append("Fielded BM25 query/materialization timeout reached before FTS query execution.")
+        retrieval_budget = {
+            **retrieval_budget,
+            "timed_out": True,
+            "timeout_reason": "sqlite_fts_query_or_candidate_materialization_timeout",
+            "partial_results": True,
+        }
+        payload = _empty_payload(
+            index,
+            started,
+            warnings,
+            query,
+            expected_diag,
+            status="failed_closed_timeout",
+            query_streams=query_streams,
+            child_query_plan=child_plan_summary,
+            retrieval_budget=retrieval_budget,
+        )
+        payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
+        return payload
+    (
+        raw_rows,
+        row_stream_labels,
+        stream_rows,
+        stream_diagnostics,
+        stream_error_types,
+        query_timed_out,
+    ) = _execute_fielded_query_streams(
         index,
         query_streams,
         candidate_pool_limit=candidate_pool_limit,
+        deadline_monotonic=retrieval_budget["deadline_monotonic"],
     )
+    if query_timed_out:
+        warnings.append("Fielded BM25 query/materialization timeout reached during SQLite FTS query.")
     _mark_expected_row_reach(expected_diag, index, _stream_row_values(stream_rows), stage="pre_dedupe")
     _mark_expected_row_reach(expected_diag, index, raw_rows, stage="query_stream")
     if stream_error_types:
@@ -1038,7 +1086,7 @@ def search_with_fielded_bm25(
             warnings,
             query,
             expected_diag,
-            status="query_failed",
+            status="failed_closed_timeout" if query_timed_out else "query_failed",
             query_streams=query_streams,
             query_stream_diagnostics=stream_diagnostics,
             child_query_plan=_child_query_plan_summary(
@@ -1048,6 +1096,7 @@ def search_with_fielded_bm25(
                 diagnostics=stream_diagnostics,
                 candidate_pool_limit=candidate_pool_limit,
             ),
+            retrieval_budget=retrieval_budget,
         )
         payload["profile"] = finish_phase_profile(profile_token, candidate_rows=0, candidate_count=0)
         return payload
@@ -1146,8 +1195,13 @@ def search_with_fielded_bm25(
     opened_paths: set[str] = set()
     searched_bytes = 0
     materialization = _new_materialization_counters()
+    materialization_timed_out = False
 
     for rank, row in enumerate(rows, start=1):
+        if _fielded_deadline_expired(retrieval_budget):
+            materialization_timed_out = True
+            warnings.append("Fielded BM25 query/materialization timeout reached during candidate materialization.")
+            break
         rowid = int(row[0])
         chunk_ref = index.records.get(rowid)
         if chunk_ref is None:
@@ -1253,10 +1307,20 @@ def search_with_fielded_bm25(
         row_stream_labels=row_stream_labels,
         fusion=fusion,
     )
+    timed_out = bool(query_timed_out or materialization_timed_out)
+    retrieval_budget = {
+        **retrieval_budget,
+        "timed_out": timed_out,
+        "timeout_reason": (
+            "sqlite_fts_query_or_candidate_materialization_timeout" if timed_out else None
+        ),
+        "partial_results": bool(timed_out or retrieval_budget["candidate_row_pool_cap_hit"]),
+    }
     payload = {
-        "status": "planned_fielded_bm25",
+        "status": "failed_closed_timeout" if timed_out else "planned_fielded_bm25",
         "fallback_reason": None,
         "fts": _fts_stats(index, query=query),
+        "retrieval_budget": _public_retrieval_budget(retrieval_budget),
         "query_profile": _query_profile(intent, query),
         "query_plan_mode": query_plan_mode,
         "fielded_child_query_plan": child_plan_summary,
@@ -1313,6 +1377,50 @@ def search_with_fielded_bm25(
         payload["masking"] = mask_context.stats.to_dict()
         payload["warnings"] = sorted(set(payload["warnings"] + mask_context.stats.warnings))
     return payload
+
+
+def _fielded_bm25_retrieval_budget(
+    plan: SourcePlan,
+    *,
+    started: float,
+    candidate_limit_uncapped: int,
+    candidate_pool_limit_uncapped: int,
+) -> dict[str, Any]:
+    configured_cap = int(
+        getattr(plan.limits, "bm25_max_candidate_rows", FIELDED_BM25_DEFAULT_MAX_CANDIDATE_ROWS)
+        or FIELDED_BM25_DEFAULT_MAX_CANDIDATE_ROWS
+    )
+    configured_cap = max(1, configured_cap)
+    candidate_pool_limit = min(candidate_pool_limit_uncapped, configured_cap)
+    candidate_limit = min(candidate_limit_uncapped, candidate_pool_limit)
+    timeout_value = getattr(plan.limits, "bm25_query_timeout", None)
+    timeout_seconds = float(timeout_value if timeout_value is not None else plan.limits.max_elapsed)
+    timeout_seconds = max(0.0, timeout_seconds)
+    return {
+        "schema_version": 1,
+        "enforced": True,
+        "candidate_row_limit": int(candidate_limit),
+        "candidate_row_limit_uncapped": int(candidate_limit_uncapped),
+        "candidate_row_pool_limit": int(candidate_pool_limit),
+        "candidate_row_pool_limit_uncapped": int(candidate_pool_limit_uncapped),
+        "max_candidate_rows": int(configured_cap),
+        "candidate_row_pool_cap_hit": candidate_pool_limit < candidate_pool_limit_uncapped,
+        "timeout_seconds": timeout_seconds,
+        "timeout_source": "bm25_query_timeout" if timeout_value is not None else "max_elapsed",
+        "deadline_monotonic": started + timeout_seconds,
+        "timed_out": False,
+        "timeout_reason": None,
+        "partial_results": candidate_pool_limit < candidate_pool_limit_uncapped,
+        "fail_closed_on_timeout": True,
+        "raw_query_text_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def _fielded_deadline_expired(retrieval_budget: dict[str, Any]) -> bool:
+    deadline = retrieval_budget.get("deadline_monotonic")
+    return deadline is not None and time.perf_counter() >= float(deadline)
 
 
 def _fielded_selected_context_refs(
@@ -4761,16 +4869,49 @@ def _execute_fielded_query_streams(
     streams: list[FieldedQueryStream],
     *,
     candidate_pool_limit: int,
-) -> tuple[list[tuple[Any, ...]], dict[int, set[str]], dict[str, list[tuple[Any, ...]]], list[dict[str, Any]], set[str]]:
+    deadline_monotonic: float | None = None,
+) -> tuple[
+    list[tuple[Any, ...]],
+    dict[int, set[str]],
+    dict[str, list[tuple[Any, ...]]],
+    list[dict[str, Any]],
+    set[str],
+    bool,
+]:
     merged_rows: list[tuple[Any, ...]] = []
     seen_rowids: set[int] = set()
     row_stream_labels: dict[int, set[str]] = {}
     stream_rows: dict[str, list[tuple[Any, ...]]] = {}
     diagnostics: list[dict[str, Any]] = []
     error_types: set[str] = set()
+    timed_out = False
     assert index.connection is not None
     for stream in streams:
+        if deadline_monotonic is not None and time.perf_counter() >= deadline_monotonic:
+            timed_out = True
+            diagnostics.append(
+                _query_stream_diagnostic(
+                    stream,
+                    row_count=0,
+                    deduped_row_count=0,
+                    stream_limit=candidate_pool_limit,
+                    hit_limit=False,
+                    status="query_timeout",
+                    error_type="TimeoutError",
+                    scope_row_count=len(index.scope_rowids),
+                    scope_hit_count=0,
+                )
+            )
+            break
         try:
+            if deadline_monotonic is not None:
+                def _progress_handler() -> int:
+                    return 1 if time.perf_counter() >= float(deadline_monotonic) else 0
+
+                index.connection.set_progress_handler(
+                    _progress_handler,
+                    FIELDED_BM25_SQLITE_PROGRESS_OPS,
+                )
             rows = list(
                 index.connection.execute(
                     """
@@ -4785,7 +4926,9 @@ def _execute_fielded_query_streams(
                 )
             )
         except sqlite3.Error as exc:
-            error_type = type(exc).__name__
+            interrupted_by_deadline = deadline_monotonic is not None and time.perf_counter() >= deadline_monotonic
+            timed_out = timed_out or interrupted_by_deadline
+            error_type = "TimeoutError" if interrupted_by_deadline else type(exc).__name__
             error_types.add(error_type)
             diagnostics.append(
                 _query_stream_diagnostic(
@@ -4794,13 +4937,16 @@ def _execute_fielded_query_streams(
                     deduped_row_count=0,
                     stream_limit=candidate_pool_limit,
                     hit_limit=False,
-                    status="query_failed",
+                    status="query_timeout" if interrupted_by_deadline else "query_failed",
                     error_type=error_type,
                     scope_row_count=len(index.scope_rowids),
                     scope_hit_count=0,
                 )
             )
             continue
+        finally:
+            if deadline_monotonic is not None:
+                index.connection.set_progress_handler(None, 0)
         stream_rows[stream.label] = rows
         deduped_count = 0
         for row in rows:
@@ -4824,7 +4970,7 @@ def _execute_fielded_query_streams(
                 scope_hit_count=len(rows),
             )
         )
-    return merged_rows, row_stream_labels, stream_rows, diagnostics, error_types
+    return merged_rows, row_stream_labels, stream_rows, diagnostics, error_types, timed_out
 
 
 def _build_fielded_evidence_channels(
@@ -5852,6 +5998,7 @@ def _unavailable_payload(
     query_streams: list[FieldedQueryStream] | None = None,
     query_stream_diagnostics: list[dict[str, Any]] | None = None,
     child_query_plan: dict[str, Any] | None = None,
+    retrieval_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     query_streams = query_streams or []
     query_stream_diagnostics = query_stream_diagnostics or [
@@ -5870,6 +6017,7 @@ def _unavailable_payload(
         "status": "fts_unavailable",
         "fallback_reason": "sqlite_fts5_unavailable",
         "fts": _fts_stats(index, query=query),
+        "retrieval_budget": _public_retrieval_budget(retrieval_budget or _empty_retrieval_budget()),
         "query_profile": {"raw_query_text_included": False, "raw_query_terms_included": False},
         "query_plan_mode": (child_query_plan or {}).get("query_plan_mode", QUERY_PLAN_MODE_AUTO),
         "fielded_child_query_plan": child_query_plan or _empty_child_query_plan_summary(),
@@ -5912,6 +6060,7 @@ def _empty_payload(
     query_streams: list[FieldedQueryStream] | None = None,
     query_stream_diagnostics: list[dict[str, Any]] | None = None,
     child_query_plan: dict[str, Any] | None = None,
+    retrieval_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _unavailable_payload(
         index,
@@ -5922,11 +6071,42 @@ def _empty_payload(
         query_streams=query_streams,
         query_stream_diagnostics=query_stream_diagnostics,
         child_query_plan=child_query_plan,
+        retrieval_budget=retrieval_budget,
     )
     payload["status"] = status
     payload["fallback_reason"] = None
     payload["fts"] = _fts_stats(index, query=query)
     return payload
+
+
+def _empty_retrieval_budget() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "enforced": False,
+        "candidate_row_limit": 0,
+        "candidate_row_limit_uncapped": 0,
+        "candidate_row_pool_limit": 0,
+        "candidate_row_pool_limit_uncapped": 0,
+        "max_candidate_rows": 0,
+        "candidate_row_pool_cap_hit": False,
+        "timeout_seconds": 0.0,
+        "timeout_source": "not_applicable",
+        "deadline_monotonic": None,
+        "timed_out": False,
+        "timeout_reason": None,
+        "partial_results": False,
+        "fail_closed_on_timeout": False,
+        "raw_query_text_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def _public_retrieval_budget(retrieval_budget: dict[str, Any]) -> dict[str, Any]:
+    public = dict(retrieval_budget)
+    public.pop("deadline_monotonic", None)
+    public["deadline_monotonic_included"] = False
+    return public
 
 
 def _rank_bucket(rank: int) -> str:

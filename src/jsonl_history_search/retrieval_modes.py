@@ -98,7 +98,7 @@ def run_fielded_bm25_retrieval(
     fielded_index = build_fielded_bm25_index(
         plan,
         default_tz=default_tz,
-        planned_jsonl_files=selected_jsonl_files,
+        planned_jsonl_files=planned_jsonl_files,
         persistent_index_dir=fielded_bm25_index_dir,
     )
     fielded_index_profile = finish_phase_profile(
@@ -191,6 +191,8 @@ def run_rrf_fusion_retrieval(
         byte_count=planned_jsonl_files.byte_count,
     )
     enumeration_elapsed_ms = float(enumeration_profile["elapsed_ms"])
+    source_catalog = build_command_local_source_catalog(plan, planned_jsonl_files)
+    _selected_jsonl_files, source_plan = build_command_local_source_plan(plan, planned_jsonl_files, intent)
 
     fielded_index_profile_token = start_phase_profile("fielded_bm25_index_build")
     fielded_index = build_fielded_bm25_index(
@@ -304,6 +306,8 @@ def run_rrf_fusion_retrieval(
                 fusion_elapsed_ms=fusion_elapsed_ms,
                 enumeration_elapsed_ms=enumeration_elapsed_ms,
                 planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
+                source_catalog=source_catalog,
+                source_plan=source_plan,
                 package_searched_paths=package_searched_paths,
                 fielded_searched_paths=fielded_searched_paths,
                 warnings=warnings,
@@ -376,6 +380,7 @@ def build_fielded_bm25_retrieval_diagnostics(
         "candidate_records_deduped": int(fielded_result.get("candidate_records_deduped", 0) or 0),
         "bm25_rank_buckets": dict(fielded_result.get("bm25_rank_buckets") or {}),
         "materialization": fielded_materialization,
+        "retrieval_budget": _fielded_retrieval_budget_diagnostics(fielded_result),
         "index_summary": fielded_index_summary,
         "scope": _fielded_scope_diagnostics(fielded_result.get("fielded_scope") or fielded_index_summary.get("scope")),
         "elapsed_ms": fielded_elapsed_ms,
@@ -430,6 +435,12 @@ def build_fielded_bm25_retrieval_diagnostics(
             "profile": _phase_profile(profiles.get("shared_source_enumeration"), "shared_source_enumeration"),
             "consumed_by_lanes": [RETRIEVAL_MODE_FIELDED_BM25],
         },
+        "source_scope_layers": _bm25_source_scope_layers(
+            planned_jsonl_file_diagnostics=planned_jsonl_file_diagnostics,
+            fielded_index_summary=fielded_index_summary,
+            source_plan=source_plan,
+            fielded_result=fielded_result,
+        ),
         "source_catalog": source_catalog,
         "source_plan": source_plan,
         "fielded_bm25": fielded_summary,
@@ -880,6 +891,8 @@ def build_rrf_retrieval_diagnostics(
     fusion_elapsed_ms: float,
     enumeration_elapsed_ms: float,
     planned_jsonl_file_diagnostics: dict[str, Any],
+    source_catalog: dict[str, Any],
+    source_plan: dict[str, Any],
     package_searched_paths: set[str],
     fielded_searched_paths: set[str],
     warnings: list[str],
@@ -929,6 +942,14 @@ def build_rrf_retrieval_diagnostics(
             "profile": _phase_profile(profiles.get("shared_source_enumeration"), "shared_source_enumeration"),
             "consumed_by_lanes": list(RRF_LANE_NAMES),
         },
+        "source_scope_layers": _bm25_source_scope_layers(
+            planned_jsonl_file_diagnostics=planned_jsonl_file_diagnostics,
+            fielded_index_summary=fielded_index_summary,
+            source_plan=source_plan,
+            fielded_result=fielded_result,
+        ),
+        "source_catalog": source_catalog,
+        "source_plan": source_plan,
         "rrf_summary": {
             "rank_constant": int(fused_result.get("rank_constant") or DEFAULT_RRF_RANK_CONSTANT),
             "lane_names": list(fused_result.get("lane_names") or RRF_LANE_NAMES),
@@ -974,6 +995,7 @@ def build_rrf_retrieval_diagnostics(
                 ),
                 "candidate_rows": int(fielded_result.get("candidate_rows_generated", 0) or 0),
                 "candidate_row_limit": int(fielded_result.get("candidate_row_limit", 0) or 0),
+                "retrieval_budget": _fielded_retrieval_budget_diagnostics(fielded_result),
                 "query_streams": _fielded_query_streams_diagnostics(fielded_result),
                 "context_neighborhood": fielded_context_neighborhood,
                 "searched_files": int(fielded_result.get("searched_files", 0)),
@@ -1041,6 +1063,93 @@ def build_rrf_retrieval_diagnostics(
             "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
         },
 }
+
+
+def _fielded_retrieval_budget_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
+    budget = fielded_result.get("retrieval_budget") if isinstance(fielded_result, dict) else {}
+    if not isinstance(budget, dict):
+        budget = {}
+    return {
+        "schema_version": int(budget.get("schema_version") or 1),
+        "enforced": bool(budget.get("enforced", False)),
+        "candidate_row_limit": int(budget.get("candidate_row_limit") or 0),
+        "candidate_row_limit_uncapped": int(budget.get("candidate_row_limit_uncapped") or 0),
+        "candidate_row_pool_limit": int(budget.get("candidate_row_pool_limit") or 0),
+        "candidate_row_pool_limit_uncapped": int(budget.get("candidate_row_pool_limit_uncapped") or 0),
+        "max_candidate_rows": int(budget.get("max_candidate_rows") or 0),
+        "candidate_row_pool_cap_hit": bool(budget.get("candidate_row_pool_cap_hit", False)),
+        "timeout_seconds": float(budget.get("timeout_seconds") or 0.0),
+        "timeout_source": str(budget.get("timeout_source") or "unknown"),
+        "timed_out": bool(budget.get("timed_out", False)),
+        "timeout_reason": budget.get("timeout_reason"),
+        "partial_results": bool(budget.get("partial_results", False)),
+        "fail_closed_on_timeout": bool(budget.get("fail_closed_on_timeout", False)),
+        "deadline_monotonic_included": False,
+        "raw_query_text_included": False,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def _bm25_source_scope_layers(
+    *,
+    planned_jsonl_file_diagnostics: dict[str, Any],
+    fielded_index_summary: dict[str, Any],
+    source_plan: dict[str, Any],
+    fielded_result: dict[str, Any],
+) -> dict[str, Any]:
+    scope = fielded_result.get("fielded_scope") if isinstance(fielded_result.get("fielded_scope"), dict) else {}
+    return {
+        "schema_version": 1,
+        "semantics": "explicit_roots_define_intended_bounded_scope_indexed_scope_is_bm25_index_coverage_query_selected_scope_is_planning_layer",
+        "intended_bounded_scope": {
+            "basis": "shared_source_enumeration_after_root_safety_and_hard_caps",
+            "file_count": int(planned_jsonl_file_diagnostics.get("file_count") or 0),
+            "byte_count": int(planned_jsonl_file_diagnostics.get("byte_count") or 0),
+            "cap_labels": [str(item) for item in planned_jsonl_file_diagnostics.get("cap_labels") or []],
+            "cap_hits": dict(planned_jsonl_file_diagnostics.get("cap_hits") or {}),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "indexed_scope": {
+            "basis": "fielded_bm25_sqlite_fts_index_loaded_for_this_command",
+            "file_count": int(fielded_index_summary.get("indexed_file_count") or 0),
+            "record_count": int(fielded_index_summary.get("indexed_record_count") or 0),
+            "chunk_count": int(fielded_index_summary.get("indexed_chunk_count") or 0),
+            "byte_count": int(fielded_index_summary.get("build_bytes") or 0),
+            "scope_row_count_after_metadata_filters": int(scope.get("scope_row_count") or 0),
+            "source_file_scope_count_after_metadata_filters": int(scope.get("source_file_scope_count") or 0),
+            "date_window_filter_present": bool(scope.get("date_window_filter_present", False)),
+            "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
+            "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "query_selected_scope": {
+            "basis": "command_local_source_plan_query_layer_not_the_meaning_of_explicit_root_scope",
+            "file_count": int(source_plan.get("sources_selected") or 0),
+            "sources_total": int(source_plan.get("sources_total") or 0),
+            "sources_pruned_hard": int(source_plan.get("sources_pruned_hard") or 0),
+            "sources_deferred_budget": int(source_plan.get("sources_deferred_budget") or 0),
+            "byte_count_selected": int(source_plan.get("byte_count_selected") or 0),
+            "byte_count_total": int(source_plan.get("byte_count_total") or 0),
+            "exhaustive_available": bool(source_plan.get("exhaustive_available", False)),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "opened_result_scope": {
+            "basis": "candidate_materialization_opened_files",
+            "file_count": int(fielded_result.get("searched_files") or 0),
+            "byte_count": int(fielded_result.get("searched_bytes") or 0),
+            "record_count": int(fielded_result.get("records_considered") or 0),
+            "raw_paths_included": False,
+            "raw_text_included": False,
+        },
+        "legacy_count_warning": "Do not compare one ambiguous source_count across modes; compare intended_bounded_scope, indexed_scope, and query_selected_scope separately.",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+    }
 
 
 def _fielded_source_grouping_diagnostics(fielded_result: dict[str, Any]) -> dict[str, Any]:
@@ -1747,6 +1856,10 @@ def cap_labels_from_warnings(warnings: list[str]) -> list[str]:
             labels.add("max_bytes")
         if "reservoir-capped" in lowered:
             labels.add("reservoir")
+        if "bm25 candidate row" in lowered:
+            labels.add("bm25_candidate_rows")
+        if "bm25 query/materialization timeout" in lowered:
+            labels.add("bm25_timeout")
     return sorted(labels)
 
 

@@ -28,6 +28,8 @@ class Limits:
     max_elapsed: float = 15.0
     hard_cap_files: int | None = None
     hard_cap_bytes: int | None = None
+    bm25_max_candidate_rows: int = 5000
+    bm25_query_timeout: float | None = None
 
     def effective_files(self) -> int:
         return min(self.max_files, self.hard_cap_files) if self.hard_cap_files else self.max_files
@@ -43,6 +45,8 @@ class Limits:
             "max_elapsed": self.max_elapsed,
             "hard_cap_files": self.hard_cap_files,
             "hard_cap_bytes": self.hard_cap_bytes,
+            "bm25_max_candidate_rows": self.bm25_max_candidate_rows,
+            "bm25_query_timeout": self.bm25_query_timeout,
             "effective_files": self.effective_files(),
             "effective_bytes": self.effective_bytes(),
         }
@@ -826,6 +830,10 @@ def cap_labels_from_warnings(warnings: list[str]) -> list[str]:
         labels.add("max_match")
     if "reservoir-capped" in lowered:
         labels.add("reservoir")
+    if "bm25 candidate row" in lowered:
+        labels.add("bm25_candidate_rows")
+    if "bm25 query/materialization timeout" in lowered:
+        labels.add("bm25_timeout")
     return sorted(labels)
 
 
