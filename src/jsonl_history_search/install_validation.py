@@ -184,7 +184,10 @@ def _agent_preflight(
                 "status": codex_skill_status,
                 "required": False,
                 "install_command": "jsonl-history-search install-codex-skill",
-                "detail": "The optional Codex skill adds agent routing guidance; it does not provide the CLI.",
+                "detail": (
+                    "The optional Codex skill adds agent routing guidance through this package's "
+                    "CODEX_HOME/skills or ~/.codex/skills compatibility route; it does not provide the CLI."
+                ),
             },
             "claude_skill": {
                 "status": claude_skill_status,
@@ -200,6 +203,19 @@ def _agent_preflight(
         "validate_agent_commands": {
             "codex": "jsonl-history-search validate-install --codex-home ~/.codex --format text",
             "claude": "jsonl-history-search validate-install --claude-home ~/.claude --format text",
+        },
+        "agent_skill_routes": {
+            "codex": {
+                "implemented_route": "CODEX_HOME/skills or ~/.codex/skills",
+                "boundary": (
+                    "Compatibility route implemented by this package; current official Codex docs may "
+                    "describe .agents/skills and plugin distribution separately."
+                ),
+            },
+            "claude": {
+                "implemented_route": "CLAUDE_HOME/skills, ~/.claude/skills, or project .claude/skills via --agent-home",
+                "boundary": "Claude Code skill files only; does not provide Claude Desktop plugin/MCP/connector integration.",
+            },
         },
         "agent_question_cookbook": agent_question_cookbook(),
         "jsh1098_route_demos": _jsh1098_route_demos(),
