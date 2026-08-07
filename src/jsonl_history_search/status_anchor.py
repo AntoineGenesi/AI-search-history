@@ -454,6 +454,7 @@ def status_anchor_report(
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
         interval_entry_limit=COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+        include_linked_spawned_sessions=complete_interval,
     )
     selected_anchor, anchor_decision, session_activity = _demote_unqualified_out_of_band_anchor_without_activity(
         query=effective_query,
@@ -4998,6 +4999,7 @@ def _session_activity_trace(
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
     interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+    include_linked_spawned_sessions: bool = False,
 ) -> dict:
     base = {
         "status": "no_selected_anchor",
@@ -5044,6 +5046,16 @@ def _session_activity_trace(
     status_ref = anchor_decision.get("status_ref")
     if status_ref and not selected_anchor.get("side_parent_boundary_anchor"):
         contexts.extend(_session_contexts_for_history_ref(str(status_ref), codex_home, role="status_question"))
+    if include_linked_spawned_sessions and anchor_decision.get("anchor_scope") == "parent_thread":
+        contexts.extend(
+            _linked_worker_reviewer_session_contexts(
+                selected_anchor,
+                anchor_timestamp=anchor_timestamp,
+                cwd=cwd,
+                codex_home=codex_home,
+                existing_contexts=contexts,
+            )
+        )
 
     unique_contexts = _dedupe_session_contexts(contexts)
     if not unique_contexts:
@@ -5250,6 +5262,98 @@ def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -
             if context:
                 contexts.append(context)
     return contexts
+
+
+def _linked_worker_reviewer_session_contexts(
+    selected_anchor: dict,
+    *,
+    anchor_timestamp,
+    cwd: Path,
+    codex_home: Path,
+    existing_contexts: list[dict],
+) -> list[dict]:
+    parent_hashes = _selected_parent_identity_hashes(selected_anchor, codex_home=codex_home, cwd=cwd)
+    if not parent_hashes:
+        return []
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    existing_files = {
+        str(Path(path_item))
+        for context in existing_contexts
+        for path_item in (context.get("session_files") or [])
+    }
+    linked_contexts: list[dict] = []
+    for path in sorted(sessions_root.rglob("*.jsonl")):
+        if str(path) in existing_files:
+            continue
+        meta = _session_lineage_metadata(path, cwd=cwd)
+        if meta.get("status") != "ok":
+            continue
+        if meta.get("parent_thread_id_hash") not in parent_hashes:
+            continue
+        if not _is_worker_reviewer_or_subagent_lineage(meta):
+            continue
+        role = str(meta.get("agent_role") or meta.get("thread_source") or meta.get("source_kind") or "child").casefold()
+        linked_contexts.append(
+            {
+                "role": f"linked_{role}_session",
+                "session_id_hash": meta.get("session_id_hash"),
+                "parent_thread_id_hash": meta.get("parent_thread_id_hash"),
+                "raw_thread_id_hash": meta.get("raw_thread_id_hash"),
+                "session_anchor_timestamp_utc": anchor_timestamp.isoformat(timespec="seconds"),
+                "session_files": [path],
+                "lineage_resolution": meta,
+                "linked_parent_thread_interval_session": True,
+                "activity_boundary_policy": "strictly_after_selected_parent_anchor_timestamp",
+            }
+        )
+    return linked_contexts
+
+
+def _selected_parent_identity_hashes(selected_anchor: dict, *, codex_home: Path, cwd: Path) -> set[str]:
+    hashes = {
+        str(value)
+        for value in (
+            selected_anchor.get("session_id_hash"),
+            selected_anchor.get("raw_thread_id_hash"),
+            selected_anchor.get("root_thread_id_hash"),
+        )
+        if value
+    }
+    source_identifier = str(selected_anchor.get("source_identifier") or "")
+    if source_identifier.startswith("history-session-"):
+        hashes.add(source_identifier[len("history-session-") :])
+    source_ref = str(selected_anchor.get("source_ref") or "")
+    if source_ref.startswith("codex_history:"):
+        line_number = _line_from_source_ref(source_ref)
+        if line_number is not None:
+            record = _read_jsonl_line(codex_home / "history.jsonl", line_number)
+            if isinstance(record, Mapping):
+                for key in ("session_id", "conversation_id", "thread_id"):
+                    hashed = _hash_value(record.get(key))
+                    if hashed:
+                        hashes.add(hashed)
+    lineage = selected_anchor.get("lineage_resolution")
+    if not isinstance(lineage, Mapping):
+        lineage = _lineage_for_anchor(selected_anchor, codex_home=codex_home, cwd=cwd)
+    if isinstance(lineage, Mapping):
+        for key in ("session_id_hash", "raw_thread_id_hash", "root_thread_id_hash"):
+            value = lineage.get(key)
+            if value:
+                hashes.add(str(value))
+    return hashes - {""}
+
+
+def _is_worker_reviewer_or_subagent_lineage(lineage: Mapping[str, Any]) -> bool:
+    role = str(lineage.get("agent_role") or "").casefold()
+    thread_source = str(lineage.get("thread_source") or "").casefold()
+    source_kind = str(lineage.get("source_kind") or "").casefold()
+    return (
+        role in {"implementer", "worker", "reviewer", "rereviewer"}
+        or thread_source in {"subagent", "worker", "reviewer", "rereviewer"}
+        or source_kind == "subagent"
+    )
 
 
 def _apply_parent_thread_lineage_to_ranked_candidates(
