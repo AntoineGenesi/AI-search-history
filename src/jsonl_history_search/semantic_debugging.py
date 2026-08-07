@@ -1179,6 +1179,7 @@ def build_semantic_debug_payload(
         next_reads = apply_in_depth_audit_read_promotion_safety(
             next_reads,
             coverage=in_depth_audit_coverage,
+            query=agent_find["query"]["original"],
         )
         in_depth_audit_followthrough = build_in_depth_audit_followthrough_plan(
             query=agent_find["query"]["original"],
@@ -1188,6 +1189,12 @@ def build_semantic_debug_payload(
             next_reads=next_reads,
         )
         source_locator_handoff["next_reads"] = next_reads
+        source_handle_routing = build_source_handle_routing(
+            agent_find["query"]["original"],
+            candidates=source_selection_candidates,
+            next_reads=next_reads,
+        )
+        source_locator_handoff["source_handle_routing"] = source_handle_routing
         source_locator_handoff["in_depth_audit_coverage"] = in_depth_audit_coverage
         source_locator_handoff["in_depth_audit_followthrough"] = in_depth_audit_followthrough
         audit_plan["in_depth_audit_coverage"] = in_depth_audit_coverage
@@ -1208,6 +1215,18 @@ def build_semantic_debug_payload(
             answer_ready_handoff,
             followthrough=in_depth_audit_followthrough,
         )
+        final_answer_contract = apply_deep_audit_target_persistence_contract_gate(
+            final_answer_contract,
+            followthrough=in_depth_audit_followthrough,
+        )
+        answer_readiness = apply_deep_audit_target_persistence_answer_readiness_gate(
+            answer_readiness,
+            followthrough=in_depth_audit_followthrough,
+        )
+        answer_ready_handoff = apply_deep_audit_target_persistence_handoff_gate(
+            answer_ready_handoff,
+            followthrough=in_depth_audit_followthrough,
+        )
         agent_instruction = apply_in_depth_audit_agent_instruction_gate(
             agent_instruction,
             coverage=in_depth_audit_coverage,
@@ -1215,6 +1234,66 @@ def build_semantic_debug_payload(
         agent_instruction = apply_in_depth_audit_followthrough_instruction(
             agent_instruction,
             followthrough=in_depth_audit_followthrough,
+        )
+        agent_instruction = apply_deep_audit_target_persistence_instruction_gate(
+            agent_instruction,
+            followthrough=in_depth_audit_followthrough,
+        )
+        if deep_audit_target_persistence_blocked(in_depth_audit_followthrough):
+            provenance_complete_proof_handoff = {
+                "schema_version": 1,
+                "active": False,
+                "status": "suppressed_by_deep_audit_target_mismatch",
+                "suppressed_prior_active": bool(provenance_complete_proof_handoff.get("active")),
+                "reason": (
+                    "deep-audit target mismatch blocks answer-ready proof handoffs until target-matching "
+                    "raw transcript/session/tool refs are recovered"
+                ),
+                "target_mismatch_answer_block": in_depth_audit_followthrough.get("target_mismatch_answer_block"),
+            }
+            source_locator_handoff["provenance_complete_proof_handoff"] = provenance_complete_proof_handoff
+            answer_ready_handoff["provenance_complete_proof_handoff"] = provenance_complete_proof_handoff
+        source_followthrough_plan = build_source_followthrough_plan(
+            next_reads=next_reads,
+            answer_ready_handoff=answer_ready_handoff,
+            action_proof_plan=action_proof_plan,
+            process_actual_use_read_plan=process_actual_use_read_plan,
+            historical_orchestration_plan=historical_orchestration_plan,
+            historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+            longitudinal_phase_source_plan=longitudinal_phase_source_plan,
+            no_evidence=no_evidence,
+            scope_boundary_summary=scope_boundary_summary,
+            provenance_direct_evidence_facet_ledger=provenance_direct_evidence_facet_ledger,
+        )
+        source_followthrough_plan = apply_deep_audit_target_persistence_source_followthrough_gate(
+            source_followthrough_plan,
+            followthrough=in_depth_audit_followthrough,
+        )
+        source_followthrough_summary = source_followthrough_plan_summary(source_followthrough_plan)
+        source_locator_handoff["source_followthrough_plan"] = source_followthrough_summary
+        answer_ready_handoff["source_followthrough_plan"] = source_followthrough_summary
+        answer_ready_handoff["source_use_summary"]["source_followthrough_plan"] = {
+            "link": "semantic_debug.source_followthrough_plan",
+            "status": source_followthrough_plan.get("status"),
+            "counts": source_followthrough_plan.get("counts"),
+            "optional_diagnostics_default_actionable": False,
+            "conditional_reads_default_actionable": False,
+        }
+        agent_instruction["source_followthrough_plan"] = source_followthrough_summary
+        final_answer_contract["evidence_inputs"]["source_followthrough_plan"] = source_followthrough_summary
+        investigation_state = build_investigation_state(
+            query=agent_find["query"]["original"],
+            family=family,
+            source_locator_handoff=source_locator_handoff,
+            search_result=result,
+            agent_find=agent_find,
+            source_scope=source_scope,
+            next_reads=next_reads,
+            no_evidence=no_evidence,
+            uncertainty=uncertainty,
+            answer_readiness=answer_readiness,
+            source_handle_routing=source_handle_routing,
+            source_window_action_proof=source_window_action_proof,
         )
     command_status = semantic_debug_command_status(agent_find.get("status"))
     packet = {
@@ -13867,10 +13946,10 @@ def apply_in_depth_audit_read_promotion_safety(
     next_reads: list[dict[str, Any]],
     *,
     coverage: dict[str, Any],
+    query: str = "",
 ) -> list[dict[str, Any]]:
     if not coverage.get("applies"):
         return next_reads
-    query = ""
     fresher_direct_exists = any(
         semantic_debug_read_is_fresher_direct_evidence(read, query=query)
         for read in next_reads
@@ -13884,6 +13963,8 @@ def apply_in_depth_audit_read_promotion_safety(
         row = dict(read)
         stale_adjacent = semantic_debug_read_is_stale_adjacent_ref(row, query=query)
         self_echo = semantic_debug_read_is_self_echo_or_current_run(row, query=query)
+        target_alignment = deep_audit_read_target_alignment(row, query=query)
+        target_drift_risk = bool(target_alignment.get("target_drift_risk"))
         if stale_adjacent:
             row["stale_adjacent_ref_policy"] = {
                 "role": (
@@ -13909,6 +13990,28 @@ def apply_in_depth_audit_read_promotion_safety(
             row["self_echo_promotion_policy"] = "lead_only_not_final_support"
             row["final_support_allowed"] = False
             row["diagnostic_only"] = True
+        if target_drift_risk:
+            row["deep_audit_target_alignment"] = target_alignment
+            row["deep_audit_target_drift_policy"] = {
+                "role": "diagnostic_only_previous_lane_or_eval_artifact",
+                "target_match": False,
+                "target_fingerprint_required": True,
+                "final_support_allowed": False,
+                "read_more_actionable": False,
+                "reason": (
+                    "previous-lane/eval artifacts can help diagnose drift but cannot become "
+                    "primary answer material for the unresolved original audit target"
+                ),
+            }
+            row["source_chronology_role"] = "previous_lane_or_eval_diagnostic_only"
+            row["diagnostic_only"] = True
+            row["read_more_actionable"] = False
+            row["followthrough_actionable"] = False
+            row["final_support_allowed"] = False
+            row["diagnostic_open_policy"] = (
+                "diagnostic-only previous-lane/eval artifact; do not open or cite as final support "
+                "for the original deep-audit target"
+            )
         if not answer_promotion_allowed:
             row["lead_only_for_audit_depth"] = coverage.get("audit_depth", {}).get("depth")
             row["final_support_allowed"] = False
@@ -13971,6 +14074,7 @@ def build_in_depth_audit_followthrough_plan(
         if continuation:
             continuation_commands.append(continuation)
     answer_ready = bool(coverage_complete)
+    target_answer_block = deep_audit_target_persistence_answer_block(target_contract)
     workflow = {
         "schema_version": 1,
         "applies": True,
@@ -13996,6 +14100,7 @@ def build_in_depth_audit_followthrough_plan(
             "commit, and report artifacts are secondary joins unless explicitly requested."
         ),
         "target_persistence_contract": target_contract,
+        "target_mismatch_answer_block": target_answer_block,
     }
     return {
         "schema_version": 1,
@@ -14008,6 +14113,7 @@ def build_in_depth_audit_followthrough_plan(
         "ordered_primary_refs_to_open_first": selected_reads,
         "ordered_primary_ref_count": len(selected_reads),
         "target_persistence_contract": target_contract,
+        "target_mismatch_answer_block": target_answer_block,
         "primary_read_limit": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
         "coverage_state": {
             "status": coverage.get("status"),
@@ -14086,10 +14192,14 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
     for read in next_reads:
         if not isinstance(read, dict):
             continue
-        if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
-            continue
-        actionable_read_count += 1
         alignment = deep_audit_read_target_alignment(read, query=query)
+        if read.get("deep_audit_target_alignment") and isinstance(read.get("deep_audit_target_alignment"), dict):
+            alignment = {**alignment, **read["deep_audit_target_alignment"]}
+        nonactionable = bool(read.get("diagnostic_only") or read.get("read_more_actionable") is False)
+        if nonactionable and not alignment.get("target_drift_risk"):
+            continue
+        if not nonactionable:
+            actionable_read_count += 1
         target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
         row = {
             "target_hash_12": hashlib.sha256(target.encode("utf-8", errors="replace")).hexdigest()[:12] if target else None,
@@ -14097,10 +14207,12 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             "target_drift_risk": alignment.get("target_drift_risk"),
             "matched_terms": alignment.get("matched_terms"),
             "drift_markers": alignment.get("drift_markers"),
-            "final_support_allowed": bool(alignment.get("target_match")) and not alignment.get("target_drift_risk"),
+            "final_support_allowed": (
+                bool(alignment.get("target_match")) and not alignment.get("target_drift_risk") and not nonactionable
+            ),
             "diagnostic_only_if_drift": bool(alignment.get("target_drift_risk") and not alignment.get("target_match")),
         }
-        if alignment.get("target_match"):
+        if alignment.get("target_match") and not nonactionable:
             target_matched_reads.append(row)
         if alignment.get("target_drift_risk"):
             drift_risk_reads.append(row)
@@ -14141,6 +14253,30 @@ def deep_audit_target_persistence_ready(contract: dict[str, Any]) -> bool:
     if not contract:
         return True
     return bool(contract.get("target_persistence_ready"))
+
+
+def deep_audit_target_persistence_answer_block(contract: dict[str, Any]) -> dict[str, Any]:
+    if not contract or contract.get("target_persistence_ready"):
+        return {
+            "blocked": False,
+            "status": "target_persistence_ready",
+            "primary_answer_material_allowed": True,
+            "previous_lane_or_eval_primary_material_allowed": False,
+        }
+    return {
+        "blocked": True,
+        "status": "target_mismatch_detected",
+        "primary_answer_material_allowed": False,
+        "previous_lane_or_eval_primary_material_allowed": False,
+        "required_before_answer": (
+            "Recover at least one target-matching raw transcript/session/tool ref for the original audit target, "
+            "or state NOT ANSWERABLE YET with the target mismatch and searched-scope/cap boundaries."
+        ),
+        "blocked_material": "previous_lane_or_eval_artifacts",
+        "target_fingerprint_12": contract.get("target_fingerprint_12"),
+        "target_matched_read_count": contract.get("target_matched_read_count", 0),
+        "target_drift_risk_count": contract.get("target_drift_risk_count", 0),
+    }
 
 
 def deep_audit_target_terms(query: str) -> list[str]:
@@ -14524,6 +14660,208 @@ def apply_in_depth_audit_followthrough_handoff(
     return row
 
 
+def deep_audit_target_persistence_blocked(followthrough: dict[str, Any]) -> bool:
+    if not isinstance(followthrough, dict) or not followthrough.get("applies"):
+        return False
+    block = followthrough.get("target_mismatch_answer_block") or {}
+    if block.get("blocked") is True:
+        return True
+    contract = followthrough.get("target_persistence_contract") or {}
+    return bool(contract.get("target_persistence_required")) and not bool(contract.get("target_persistence_ready"))
+
+
+def apply_deep_audit_target_persistence_contract_gate(
+    contract: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_target_persistence_blocked(followthrough):
+        return contract
+    target_contract = followthrough.get("target_persistence_contract") or {}
+    block = followthrough.get("target_mismatch_answer_block") or deep_audit_target_persistence_answer_block(target_contract)
+    row = dict(contract)
+    row["answer_scope"] = "not_answerable_yet_target_mismatch"
+    row["source_use_required"] = True
+    row.setdefault("evidence_inputs", {})
+    row["evidence_inputs"] = {
+        **row["evidence_inputs"],
+        "deep_audit_target_persistence_contract": {
+            "link": "semantic_debug.in_depth_audit_followthrough.target_persistence_contract",
+            "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+            "target_matched_read_count": target_contract.get("target_matched_read_count", 0),
+            "target_drift_risk_count": target_contract.get("target_drift_risk_count", 0),
+            "target_persistence_ready": target_contract.get("target_persistence_ready"),
+        },
+    }
+    row["required_actions"] = dedupe(
+        [
+            block.get("required_before_answer")
+            or "Recover target-matching raw transcript refs before answering the original deep-audit target.",
+            "Do not use previous-lane/eval artifacts as primary answer material for this unresolved audit target.",
+        ]
+        + list(row.get("required_actions") or [])
+    )
+    row.setdefault("claim_boundaries", {})
+    row["claim_boundaries"] = {
+        **row["claim_boundaries"],
+        "deep_audit_target_mismatch_answer_allowed": False,
+        "previous_lane_eval_artifacts_final_support": "not_allowed",
+    }
+    return row
+
+
+def apply_deep_audit_target_persistence_answer_readiness_gate(
+    readiness: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_target_persistence_blocked(followthrough):
+        return readiness
+    target_contract = followthrough.get("target_persistence_contract") or {}
+    block = followthrough.get("target_mismatch_answer_block") or deep_audit_target_persistence_answer_block(target_contract)
+    row = dict(readiness)
+    row["status"] = "target_mismatch_detected"
+    row["decision"] = "target_persistence_required_before_answer"
+    row["allowed_answer_scope"] = "not_answerable_yet_original_audit_target"
+    row["required_before_answer"] = dedupe(
+        [
+            block.get("required_before_answer")
+            or "Recover target-matching raw transcript refs before answering the original deep-audit target.",
+        ]
+        + list(row.get("required_before_answer") or [])
+    )[:12]
+    row.setdefault("basis", {})
+    row["basis"] = {
+        **row["basis"],
+        "deep_audit_target_persistence_status": block.get("status") or "target_mismatch_detected",
+        "deep_audit_target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+        "target_matched_read_count": target_contract.get("target_matched_read_count", 0),
+        "target_drift_risk_count": target_contract.get("target_drift_risk_count", 0),
+    }
+    row.setdefault("source_use_contract", {})
+    row["source_use_contract"] = {
+        **row["source_use_contract"],
+        "deep_audit_target_persistence": {
+            "answer_blocked": True,
+            "target_persistence_ready": False,
+            "previous_lane_or_eval_primary_material_allowed": False,
+            "link": "semantic_debug.in_depth_audit_followthrough.target_mismatch_answer_block",
+        },
+    }
+    return row
+
+
+def apply_deep_audit_target_persistence_handoff_gate(
+    handoff: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_target_persistence_blocked(followthrough):
+        return handoff
+    target_contract = followthrough.get("target_persistence_contract") or {}
+    block = followthrough.get("target_mismatch_answer_block") or deep_audit_target_persistence_answer_block(target_contract)
+    row = dict(handoff)
+    row["answer_readiness_status"] = "target_mismatch_detected"
+    row["answer_gate_status"] = "blocked"
+    row["decision"] = "target_persistence_required_before_answer"
+    row["do_next"] = "refocus_original_audit_target_before_answer"
+    row["target_mismatch_answer_block"] = block
+    row["do_not_answer_until"] = dedupe(
+        [
+            block.get("required_before_answer")
+            or "Recover target-matching raw transcript refs before answering the original deep-audit target.",
+        ]
+        + list(row.get("do_not_answer_until") or [])
+    )[:8]
+    row.setdefault("links", {})
+    row["links"] = {
+        **row["links"],
+        "target_mismatch_answer_block": "semantic_debug.in_depth_audit_followthrough.target_mismatch_answer_block",
+    }
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "decision": "target_persistence_required_before_answer",
+        "target_mismatch_answer_block": block,
+        "stop_condition": (
+            "Fail closed: do not answer from previous-lane/eval artifacts. "
+            "Use only target-matching raw transcript/session/tool refs for the original audit target, "
+            "or report NOT ANSWERABLE YET with searched-scope/cap boundaries."
+        ),
+    }
+    row.setdefault("source_use_summary", {})
+    row["source_use_summary"] = {
+        **row["source_use_summary"],
+        "deep_audit_target_persistence": {
+            "status": "target_mismatch_detected",
+            "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+            "target_matched_read_count": target_contract.get("target_matched_read_count", 0),
+            "target_drift_risk_count": target_contract.get("target_drift_risk_count", 0),
+            "primary_answer_material_allowed": False,
+        },
+    }
+    return row
+
+
+def apply_deep_audit_target_persistence_source_followthrough_gate(
+    plan: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_target_persistence_blocked(followthrough):
+        return plan
+    target_contract = followthrough.get("target_persistence_contract") or {}
+    block = followthrough.get("target_mismatch_answer_block") or deep_audit_target_persistence_answer_block(target_contract)
+    prior_required = list(plan.get("default_required_primary_proof") or []) + list(plan.get("required_primary_proof") or [])
+    prior_conditional = list(plan.get("conditional_required") or [])
+    prior_optional = list(plan.get("optional_diagnostic") or [])
+    quarantined = []
+    for read in dedupe_dicts(prior_required + prior_conditional + prior_optional):
+        row = dict(read)
+        row["read_role"] = "optional_diagnostic"
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        row["final_support_allowed"] = False
+        row["default_actionable"] = False
+        row["diagnostic_open_policy"] = (
+            "suppressed by deep-audit target mismatch; not primary answer material"
+        )
+        quarantined.append(row)
+    return {
+        **plan,
+        "status": "target_mismatch_blocked",
+        "default_read_policy": (
+            "No source-followthrough read is default-actionable while deep-audit target persistence is blocked. "
+            "Recover target-matching raw transcript/session/tool refs or fail closed."
+        ),
+        "default_required_primary_proof": [],
+        "required_primary_proof": [],
+        "conditional_required": [],
+        "optional_diagnostic": quarantined[:8],
+        "stop_condition": (
+            "Fail closed: previous-lane/eval artifacts and stale follow-through refs are diagnostic-only "
+            "until a target-matching raw source ref supports the original audit target."
+        ),
+        "only_continue_if": [
+            block.get("required_before_answer")
+            or "Recover target-matching raw transcript refs before answering the original deep-audit target."
+        ],
+        "counts": {
+            "default_required_primary_proof_count": 0,
+            "required_primary_proof_count": 0,
+            "conditional_required_count": 0,
+            "optional_diagnostic_count": len(quarantined[:8]),
+        },
+        "target_mismatch_answer_block": block,
+        "claim_boundaries": {
+            **(plan.get("claim_boundaries") or {}),
+            "deep_audit_target_mismatch_answer_allowed": False,
+            "previous_lane_eval_artifacts_final_support": "not_allowed",
+        },
+    }
+
+
 def apply_in_depth_audit_agent_instruction_gate(instruction: dict[str, Any], *, coverage: dict[str, Any]) -> dict[str, Any]:
     if not coverage.get("applies") or coverage.get("answer_promotion_allowed"):
         return instruction
@@ -14550,6 +14888,33 @@ def apply_in_depth_audit_agent_instruction_gate(instruction: dict[str, Any], *, 
         "decision": row["decision"],
         "stop_condition": row["stop_condition"],
         "in_depth_audit_coverage": row["in_depth_audit_coverage"],
+    }
+    return row
+
+
+def apply_deep_audit_target_persistence_instruction_gate(
+    instruction: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_target_persistence_blocked(followthrough):
+        return instruction
+    block = followthrough.get("target_mismatch_answer_block") or {}
+    row = dict(instruction)
+    row["decision"] = "target_persistence_required_before_answer"
+    row["required_next_action"] = "refocus_original_deep_audit_target_or_report_not_answerable_yet"
+    row["commands"] = list(followthrough.get("continuation_commands") or [])[:IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT]
+    row["stop_condition"] = (
+        "Fail closed instead of answering if opened material is previous-lane/eval evidence and no "
+        "target-matching raw transcript/session/tool ref supports the original audit target."
+    )
+    row["target_mismatch_answer_block"] = block
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "decision": "target_persistence_required_before_answer",
+        "target_mismatch_answer_block": block,
+        "stop_condition": row["stop_condition"],
     }
     return row
 

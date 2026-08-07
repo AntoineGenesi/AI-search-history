@@ -2059,6 +2059,7 @@ def render_in_depth_audit_followthrough_text(
     if workflow.get("do_not_abandon_jsonl_guidance"):
         lines.append(f"- do not abandon JSONL: {workflow.get('do_not_abandon_jsonl_guidance')}")
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
+    target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
         lines.append(
             f"- target persistence: required={target_contract.get('target_persistence_required')} "
@@ -2067,10 +2068,18 @@ def render_in_depth_audit_followthrough_text(
             f"target_matched_reads={target_contract.get('target_matched_read_count', 0)} "
             f"drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}"
         )
+        if target_block.get("blocked"):
+            lines.append(
+                "- answer blocked: target_mismatch_detected; primary_answer_material_allowed=False; "
+                "previous_lane_or_eval_primary_material_allowed=False"
+            )
         if target_contract.get("answer_ready_blocked_by_target_drift"):
             lines.append("- target mismatch: target_mismatch_detected; fail closed and rerun the scoped continuation for the original target")
         else:
             lines.append("- target drift policy: previous-lane/eval artifacts remain diagnostic-only unless explicitly requested")
+        drift_reads = list(target_contract.get("target_drift_risk_reads") or [])
+        if drift_reads:
+            lines.append(f"- quarantined drift-risk refs: {len(drift_reads)} diagnostic-only hashes retained in JSON")
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.append("- pending coverage slices:")
@@ -2154,6 +2163,7 @@ def render_in_depth_audit_followthrough_markdown(
     if workflow.get("do_not_abandon_jsonl_guidance"):
         lines.append(f"- `do_not_abandon_jsonl`: {workflow.get('do_not_abandon_jsonl_guidance')}")
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
+    target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
         lines.append(
             f"- `target_persistence`: `required={target_contract.get('target_persistence_required')}` "
@@ -2162,10 +2172,18 @@ def render_in_depth_audit_followthrough_markdown(
             f"`target_matched_reads={target_contract.get('target_matched_read_count', 0)}` "
             f"`drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}`"
         )
+        if target_block.get("blocked"):
+            lines.append(
+                "- `answer_blocked`: `target_mismatch_detected` `primary_answer_material_allowed=False` "
+                "`previous_lane_or_eval_primary_material_allowed=False`"
+            )
         if target_contract.get("answer_ready_blocked_by_target_drift"):
             lines.append("- `target_mismatch`: `target_mismatch_detected`; fail closed and rerun the scoped continuation for the original target")
         else:
             lines.append("- `target_drift_policy`: previous-lane/eval artifacts remain diagnostic-only unless explicitly requested")
+        drift_reads = list(target_contract.get("target_drift_risk_reads") or [])
+        if drift_reads:
+            lines.append(f"- `quarantined_drift_risk_refs`: `{len(drift_reads)}` diagnostic-only hashes retained in JSON")
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.extend(["", "### Pending Coverage Slices", ""])
