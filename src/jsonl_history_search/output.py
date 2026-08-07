@@ -4935,6 +4935,8 @@ def _status_anchor_answer_format_ready(report: dict) -> bool:
 
 
 def _status_anchor_canonical_continuation_command(report: dict) -> str:
+    if _status_anchor_parent_main_complete_interval_recovery_required(report):
+        return _status_anchor_rerun_answer_command(report)
     interval = report.get("post_anchor_interval_reconstruction") or {}
     guidance = interval.get("next_read_guidance") or {}
     commands = [str(command) for command in guidance.get("commands") or [] if command]
@@ -4943,8 +4945,6 @@ def _status_anchor_canonical_continuation_command(report: dict) -> str:
     for item in interval.get("omitted_ranges") or []:
         if item.get("read_next_command"):
             return str(item["read_next_command"])
-    if _status_anchor_parent_main_complete_interval_recovery_required(report):
-        return _status_anchor_rerun_answer_command(report)
     selected = report.get("selected_anchor") or {}
     if selected.get("read_more_command"):
         return str(selected["read_more_command"])
@@ -4975,17 +4975,22 @@ def _status_anchor_rerun_answer_command(report: dict) -> str:
 
 def _status_anchor_parent_main_complete_interval_recovery_required(report: dict) -> bool:
     command_options = report.get("command_options") or {}
+    routing = report.get("routing") or {}
+    selected = report.get("selected_anchor") or {}
     if command_options.get("complete_interval") and command_options.get("parent_thread"):
         return False
-    routing = report.get("routing") or {}
     query = " ".join(str(report.get("query") or "").casefold().replace("?", " ").replace("!", " ").split())
-    parent_main = routing.get("anchor_scope") == "parent_thread" or any(
-        marker in query
-        for marker in (
-            "parent thread",
-            "main thread",
-            "parent/main",
-            "main/parent",
+    parent_main = (
+        bool(command_options.get("parent_thread"))
+        or (routing.get("anchor_scope") == "parent_thread" and not selected)
+        or any(
+            marker in query
+            for marker in (
+                "parent thread",
+                "main thread",
+                "parent/main",
+                "main/parent",
+            )
         )
     )
     if not parent_main:
