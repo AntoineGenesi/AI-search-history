@@ -1262,6 +1262,8 @@ def build_semantic_debug_payload(
     if result.get("retrieval_diagnostics"):
         packet["retrieval_diagnostics"] = result["retrieval_diagnostics"]
         packet["claim_boundaries"].update(result["retrieval_diagnostics"].get("claim_boundaries", {}))
+    if agent_find.get("cap_next_action"):
+        packet["cap_next_action"] = agent_find["cap_next_action"]
     if agent_find.get("bm25_escalation"):
         packet["bm25_escalation"] = agent_find["bm25_escalation"]
     if agent_find.get("retrieval_pressure"):

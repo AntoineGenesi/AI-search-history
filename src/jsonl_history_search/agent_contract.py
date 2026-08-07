@@ -135,11 +135,15 @@ def build_agent_find_payload(
             next_read_rows,
             no_evidence_report=no_evidence_report,
         )
-    bm25_escalation = build_bm25_escalation_guidance(
+    cap_next_action = build_cap_next_action_guidance(
         status=status,
         source_plan=source_plan,
         search_result=search_result,
         candidates=candidates,
+    )
+    bm25_escalation = build_bm25_escalation_guidance(
+        source_plan=source_plan,
+        cap_next_action=cap_next_action,
     )
     agent_find = {
         "schema_version": 1,
@@ -188,6 +192,8 @@ def build_agent_find_payload(
             "searched_bytes": search_result.get("searched_bytes", 0),
         },
     }
+    if cap_next_action:
+        agent_find["cap_next_action"] = cap_next_action
     if bm25_escalation:
         agent_find["bm25_escalation"] = bm25_escalation
     if search_result.get("retrieval_diagnostics"):
@@ -7352,7 +7358,7 @@ def cap_hit_status(*, warnings: list[str], limits: dict) -> dict:
     }
 
 
-def build_bm25_escalation_guidance(
+def build_cap_next_action_guidance(
     *,
     status: str,
     source_plan: dict,
@@ -7365,23 +7371,96 @@ def build_bm25_escalation_guidance(
     source_scope = build_source_scope_summary(source_plan, search_result)
     cap_hit = source_scope["cap_hit"]
     reasons: list[str] = []
+    confidence_counts = Counter(str(candidate.confidence or "unknown").lower() for candidate in candidates)
+    usable_evidence = returned_evidence_usable(candidates)
+    cap_names = set(cap_hit.get("caps_hit") or [])
+    broad_retrieval_caps = {
+        "max_file_cap",
+        "max_byte_cap",
+        "max_elapsed_cap",
+        "max_match_cap",
+        "weak_candidate_reservoir_cap",
+    }
+    deferred_sources = int(source_scope["not_searched_scope"]["source_plan"].get("sources_deferred_budget") or 0)
+    searched_files = int(source_scope["searched_scope"].get("searched_files") or search_result.get("searched_files") or 0)
+    source_or_candidate_pressure = deferred_sources > 0 or bool(cap_names & broad_retrieval_caps)
+    weak_surface = weak_candidate_surface(candidates)
     if status == "no_evidence":
         reasons.append("no_candidate_rows_in_searched_scope")
     if cap_hit.get("hit"):
         reasons.append("cap_pressure_reported")
-    if int(source_scope["not_searched_scope"]["source_plan"].get("sources_deferred_budget") or 0) > 0:
+    if deferred_sources > 0:
         reasons.append("source_plan_budget_deferred_files")
-    if weak_candidate_surface(candidates):
+    if weak_surface:
         reasons.append("only_low_confidence_candidate_surface")
     if not reasons:
         return None
 
-    command = build_fielded_bm25_retry_command(source_plan)
+    if usable_evidence:
+        selected_action = "read_exact_source_window" if cap_hit.get("hit") else "use_returned_evidence"
+        rationale = (
+            "Returned candidates include usable evidence; inspect the surfaced source refs before broadening retrieval."
+        )
+        bm25_recommended = False
+    elif weak_surface and not source_or_candidate_pressure:
+        selected_action = "refine_query_or_scope"
+        rationale = "Candidates are weak/noisy, but no broad source pressure is reported; narrow terms, source, role, or date first."
+        bm25_recommended = False
+    elif (status == "no_evidence" and (searched_files > 0 or source_or_candidate_pressure)) or (
+        weak_surface and source_or_candidate_pressure
+    ) or (
+        not candidates and source_or_candidate_pressure
+    ):
+        selected_action = "scoped_file_backed_bm25"
+        rationale = (
+            "Default retrieval did not surface usable evidence and source/candidate pressure may have hidden relevant records."
+        )
+        bm25_recommended = True
+    elif status == "no_evidence":
+        selected_action = "refine_query_or_scope"
+        rationale = (
+            "No usable source scope was searched; fix selected roots, bounds, or query scope before retrying a retrieval index."
+        )
+        bm25_recommended = False
+    elif cap_hit.get("hit"):
+        selected_action = "refine_query_or_scope"
+        rationale = "A cap was reported, but the current result is not a good BM25 case; refine the query/scope before indexing."
+        bm25_recommended = False
+    else:
+        selected_action = "use_returned_evidence"
+        rationale = "Use the returned evidence before broadening retrieval."
+        bm25_recommended = False
+
+    command = build_fielded_bm25_retry_command(source_plan) if bm25_recommended else None
+    action_order = [
+        selected_action,
+        *[
+            action
+            for action in (
+                "use_returned_evidence",
+                "read_exact_source_window",
+                "refine_query_or_scope",
+                "raise_cheap_cap",
+                "scoped_file_backed_bm25",
+            )
+            if action != selected_action
+        ],
+    ]
     return {
         "schema_version": 1,
-        "status": "recommended",
-        "retrieval_mode": "fielded-bm25",
+        "status": "actionable",
+        "selected_action": selected_action,
         "trigger_reasons": reasons,
+        "rationale": rationale,
+        "bm25_recommended": bm25_recommended,
+        "action_order": action_order,
+        "candidate_surface": {
+            "candidate_count": len(candidates),
+            "confidence_counts": dict(sorted(confidence_counts.items())),
+            "top_confidence": str(candidates[0].confidence) if candidates else None,
+            "usable_evidence_present": usable_evidence,
+            "only_low_confidence": weak_surface,
+        },
         "cap_hit": {
             "hit": bool(cap_hit.get("hit")),
             "caps_hit": list(cap_hit.get("caps_hit") or []),
@@ -7395,13 +7474,38 @@ def build_bm25_escalation_guidance(
             "sources_total": int(source_scope["not_searched_scope"]["source_plan"].get("sources_total") or 0),
             "sources_selected": int(source_scope["not_searched_scope"]["source_plan"].get("sources_selected") or 0),
             "sources_pruned_hard": int(source_scope["not_searched_scope"]["source_plan"].get("sources_pruned_hard") or 0),
-            "sources_deferred_budget": int(
-                source_scope["not_searched_scope"]["source_plan"].get("sources_deferred_budget") or 0
-            ),
+            "sources_deferred_budget": deferred_sources,
             "exhaustive_available": bool(
                 source_scope["not_searched_scope"]["source_plan"].get("exhaustive_available", False)
             ),
         },
+        "command": command,
+        "claim_boundaries": {
+            "default_behavior_changed": False,
+            "bm25_auto_invoked": False,
+            "rrf_auto_invoked": False,
+            "all_history_completeness_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+        },
+    }
+
+
+def build_bm25_escalation_guidance(
+    *,
+    source_plan: dict,
+    cap_next_action: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not cap_next_action or cap_next_action.get("selected_action") != "scoped_file_backed_bm25":
+        return None
+    command = cap_next_action.get("command") or build_fielded_bm25_retry_command(source_plan)
+    return {
+        "schema_version": 1,
+        "status": "recommended",
+        "retrieval_mode": "fielded-bm25",
+        "trigger_reasons": list(cap_next_action.get("trigger_reasons") or []),
+        "cap_hit": cap_next_action.get("cap_hit") or {},
+        "source_scope_summary": cap_next_action.get("source_scope_summary") or {},
         "recommendation": (
             "Retry explicitly with file-backed fielded BM25 over the same bounded source/time scope before "
             "treating this package result as complete."
@@ -7426,6 +7530,16 @@ def build_bm25_escalation_guidance(
             "raw_query_text_included": bool(command.get("contains_query_text", False)),
         },
     }
+
+
+def returned_evidence_usable(candidates: list[CandidateRow]) -> bool:
+    if not candidates:
+        return False
+    for candidate in candidates[:3]:
+        confidence = str(candidate.confidence or "").lower()
+        if confidence in {"high", "medium"} and candidate.path and candidate.line > 0:
+            return True
+    return False
 
 
 def weak_candidate_surface(candidates: list[CandidateRow]) -> bool:

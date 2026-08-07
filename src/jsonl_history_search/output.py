@@ -5879,6 +5879,12 @@ def render_semantic_debug_text(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if report.get("cap_next_action"):
+        action = report["cap_next_action"]
+        reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
+        lines.append(f"Cap next action: {action.get('selected_action')} ({reasons})")
+        if action.get("rationale"):
+            lines.append(f"Cap action rationale: {action.get('rationale')}")
     if report.get("bm25_escalation"):
         escalation = report["bm25_escalation"]
         command = (escalation.get("command") or {}).get("shell")
@@ -6214,6 +6220,20 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if report.get("cap_next_action"):
+        action = report["cap_next_action"]
+        reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
+        lines.extend(
+            [
+                "",
+                "## Cap Next Action",
+                "",
+                f"- Selected action: `{action.get('selected_action')}`",
+                f"- Reasons: `{reasons}`",
+            ]
+        )
+        if action.get("rationale"):
+            lines.append(f"- Rationale: {action.get('rationale')}")
     if report.get("bm25_escalation"):
         escalation = report["bm25_escalation"]
         command = (escalation.get("command") or {}).get("shell")
@@ -8316,6 +8336,12 @@ def render_agent_find_text(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.append(f"Cap hit: {', '.join(cap_hit.get('caps_hit', []))}")
+    if report.get("cap_next_action"):
+        action = report["cap_next_action"]
+        reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
+        lines.append(f"Cap next action: {action.get('selected_action')} ({reasons})")
+        if action.get("rationale"):
+            lines.append(f"Cap action rationale: {action.get('rationale')}")
     if report.get("bm25_escalation"):
         escalation = report["bm25_escalation"]
         command = (escalation.get("command") or {}).get("shell")
@@ -8397,6 +8423,17 @@ def render_agent_find_markdown(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.extend(["", f"**Cap hit:** {', '.join(cap_hit.get('caps_hit', []))}"])
+    if report.get("cap_next_action"):
+        action = report["cap_next_action"]
+        reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
+        lines.extend(
+            [
+                "",
+                f"**Cap next action:** {action.get('selected_action')} ({reasons})",
+            ]
+        )
+        if action.get("rationale"):
+            lines.append(f"**Cap action rationale:** {action.get('rationale')}")
     if report.get("bm25_escalation"):
         escalation = report["bm25_escalation"]
         command = (escalation.get("command") or {}).get("shell")
