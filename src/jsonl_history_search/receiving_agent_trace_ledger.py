@@ -38,6 +38,11 @@ CHOSEN_ROUTE_RE = re.compile(r"(?im)^\s*Chosen route:\s*([^\n\r]+?)\s*$")
 JSON_ROUTE_FAMILY_RE = re.compile(r'"route_family"\s*:\s*"([^"]+)"')
 SOURCE_REF_RE = re.compile(r"\b(?:jsonl_source_ref|source ref|source-ref|raw/session|primary)\b", re.IGNORECASE)
 CAP_LANGUAGE_RE = re.compile(r"\b(?:cap|coverage|bounded|unproved|not proved|cannot prove|uncertain|uncertainty)\b", re.IGNORECASE)
+ANSWER_READY_RE = re.compile(r"(?im)(?:^|\n)\s*ANSWER READY\b")
+NOT_ANSWERABLE_RE = re.compile(r"(?im)(?:^|\n)\s*NOT ANSWERABLE YET\b")
+STALE_SELECTED_ANCHOR_RE = re.compile(r"\bstale_selected_anchor\b", re.IGNORECASE)
+SELECTED_ANCHOR_FRESHNESS_RE = re.compile(r"\bselected_anchor_freshness\b", re.IGNORECASE)
+PARENT_MAIN_ANCHOR_FRESHNESS_RE = re.compile(r"\bparent_main_anchor_freshness\b", re.IGNORECASE)
 PRIVATE_PATH_TOKEN_RE = re.compile(r"(?:(?:^|[/\\])\.private[/\\])")
 ABSOLUTE_PRIVATE_RE = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\\\Users\\\\)")
 RUNTIME_SECRET_RE = re.compile(
@@ -250,6 +255,27 @@ def _final_status(final_path: Path, final_text: str) -> dict[str, Any]:
     }
 
 
+def _latest_status_freshness_signals(texts: Iterable[str]) -> dict[str, Any]:
+    joined = "\n".join(text for text in texts if text)
+    stale_count = len(STALE_SELECTED_ANCHOR_RE.findall(joined))
+    selected_count = len(SELECTED_ANCHOR_FRESHNESS_RE.findall(joined))
+    parent_main_count = len(PARENT_MAIN_ANCHOR_FRESHNESS_RE.findall(joined))
+    return {
+        "answer_ready_seen": bool(ANSWER_READY_RE.search(joined)),
+        "not_answerable_yet_seen": bool(NOT_ANSWERABLE_RE.search(joined)),
+        "stale_selected_anchor_seen": stale_count > 0,
+        "selected_anchor_freshness_signal_seen": selected_count > 0 or parent_main_count > 0,
+        "signal_counts": {
+            "answer_ready": len(ANSWER_READY_RE.findall(joined)),
+            "not_answerable_yet": len(NOT_ANSWERABLE_RE.findall(joined)),
+            "stale_selected_anchor": stale_count,
+            "selected_anchor_freshness": selected_count,
+            "parent_main_anchor_freshness": parent_main_count,
+        },
+        "privacy_boundary": "committed-safe counters/booleans only; raw status text is not retained",
+    }
+
+
 def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = None) -> dict[str, Any]:
     lane_path = lane_path.expanduser()
     if lane_path.is_file():
@@ -285,11 +311,13 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     read_more_mentions = 0
     semantic_debug_mentions = 0
     source_ref_signal_count = 0
+    freshness_signal_texts: list[str] = [final_text]
 
     for event_index, event in enumerate(parsed.events):
         event_type = str(event.get("type") or "<missing>")
         event_counts[event_type] = event_counts.get(event_type, 0) + 1
         raw_probe = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        freshness_signal_texts.append(raw_probe)
         lowered_probe = raw_probe.lower()
         read_more_mentions += lowered_probe.count("read-more")
         semantic_debug_mentions += lowered_probe.count("semantic-debug")
@@ -340,6 +368,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
 
         output_text = _event_command_output(event)
         if output_text:
+            freshness_signal_texts.append(output_text)
             route_families.extend(ROUTE_FAMILY_RE.findall(output_text))
             route_families.extend(JSON_ROUTE_FAMILY_RE.findall(output_text))
             chosen_routes.extend(CHOSEN_ROUTE_RE.findall(output_text))
@@ -381,6 +410,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         follow_through_status = "not_applicable_no_jsonl_activation"
 
     wrong_reason_counts = {reason: wrong_reasons.count(reason) for reason in sorted(set(wrong_reasons))}
+    latest_status_freshness = _latest_status_freshness_signals(freshness_signal_texts)
     lane_report = {
         "lane_id": lane_id,
         "private_artifacts": {
@@ -449,6 +479,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             "primary_ref_use_signal_count": source_ref_signal_count,
             "primary_ref_use": source_ref_signal_count > 0 or read_more_completed > 0,
         },
+        "latest_status_freshness": latest_status_freshness,
         "final_answer": _final_status(final_path, final_text),
         "overtrigger": {
             "status": overtrigger_status,
@@ -479,6 +510,15 @@ def build_receiving_agent_trace_ledger(lanes: Iterable[LaneSpec], *, repo_root: 
         "read_more_completed_count": sum(int(lane["command_counts"]["read_more_completed"]) for lane in lane_reports),
         "broad_search_completed_count": sum(int(lane["command_counts"]["broad_search_completed"]) for lane in lane_reports),
         "wrong_command_completed_count": sum(int(lane["command_counts"]["wrong_command_completed"]) for lane in lane_reports),
+        "latest_status_answer_ready_seen_count": sum(
+            1 for lane in lane_reports if lane["latest_status_freshness"]["answer_ready_seen"]
+        ),
+        "latest_status_not_answerable_yet_seen_count": sum(
+            1 for lane in lane_reports if lane["latest_status_freshness"]["not_answerable_yet_seen"]
+        ),
+        "latest_status_stale_selected_anchor_seen_count": sum(
+            1 for lane in lane_reports if lane["latest_status_freshness"]["stale_selected_anchor_seen"]
+        ),
     }
     payload = {
         "receiving_agent_trace_ledger": {
@@ -532,12 +572,16 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
         f"- Read-more commands: `{summary['read_more_completed_count']}`",
         f"- Broad searches/listings: `{summary['broad_search_completed_count']}`",
         f"- Wrong command shapes/routes: `{summary['wrong_command_completed_count']}`",
+        f"- Latest-status ANSWER READY signals: `{summary['latest_status_answer_ready_seen_count']}`",
+        f"- Latest-status NOT ANSWERABLE signals: `{summary['latest_status_not_answerable_yet_seen_count']}`",
+        f"- Latest-status stale-anchor signals: `{summary['latest_status_stale_selected_anchor_seen_count']}`",
         "",
     ]
     for lane in ledger["lanes"]:
         counts = lane["command_counts"]
         route = lane["route_selection"]
         final = lane["final_answer"]
+        freshness = lane["latest_status_freshness"]
         lines.extend(
             [
                 f"## {lane['lane_id']}",
@@ -552,6 +596,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
                 f"- JSONL/read-more/semantic-debug/ask-execute: `{counts['jsonl_completed']}` / `{counts['read_more_completed']}` / `{counts['semantic_debug_completed']}` / `{counts['ask_execute_completed']}`",
                 f"- Broad/wrong/wrong-or-broad: `{counts['broad_search_completed']}` / `{counts['wrong_command_completed']}` / `{counts['wrong_or_broad_completed']}`",
                 f"- Read-more mentions vs commands: `{counts['read_more_mentions']}` / `{counts['read_more_completed']}`",
+                f"- Latest-status freshness: answer-ready `{freshness['answer_ready_seen']}`, not-answerable `{freshness['not_answerable_yet_seen']}`, stale-anchor `{freshness['stale_selected_anchor_seen']}`, freshness-signal `{freshness['selected_anchor_freshness_signal_seen']}`",
                 f"- Source follow-through: `{lane['source_follow_through']['status']}`; primary-ref signal `{lane['source_follow_through']['primary_ref_use']}`",
                 f"- Final answer: `{final['status']}`, bytes `{final['bytes']}`, correctness `{final['final_correctness']}`",
                 f"- Cap/coverage language: `{final['cap_or_coverage_language_present']}`; source-grounding language: `{final['source_grounding_language_present']}`",

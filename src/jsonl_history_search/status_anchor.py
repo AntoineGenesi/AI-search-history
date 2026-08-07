@@ -340,6 +340,7 @@ def build_status_anchor_payload(args: Any) -> dict:
             parent_thread_mode=parent_thread_mode,
             complete_interval=complete_interval,
             command_options={
+                "query": query,
                 "cwd": str(cwd),
                 "codex_home": str(codex_home) if codex_home else None,
                 "max_matches": limit,
@@ -511,6 +512,9 @@ def status_anchor_report(
         source_tiers=source_tiers,
         follow_through_plan=follow_through_plan,
         target_window=target_window,
+        parent_main_anchor_shortlist=parent_main_anchor_shortlist,
+        complete_interval_requested=complete_interval,
+        command_options=command_options or {},
     )
     answer_brief = _answer_brief(
         selected_anchor=selected_anchor,
@@ -7312,6 +7316,121 @@ def _required_answer_facets(*, target_window: dict | None) -> list[str]:
     ]
 
 
+def _parent_main_anchor_freshness(
+    *,
+    selected_anchor: dict | None,
+    parent_main_status: bool,
+    complete_interval_requested: bool,
+    command_options: dict,
+    parent_main_anchor_shortlist: dict,
+) -> dict:
+    if not parent_main_status or not complete_interval_requested:
+        return {
+            "status": "not_applicable",
+            "current": True,
+            "reason": "freshness gate applies only to parent/main complete-interval answer mode",
+        }
+    if not selected_anchor:
+        return {"status": "missing_selected_anchor", "current": False, "newer_candidate_count": 0}
+    selected_ref = str(selected_anchor.get("source_ref") or "")
+    selected_time = parse_datetime(str(selected_anchor.get("timestamp_utc") or ""), timezone.utc)
+    if selected_time is None:
+        return {
+            "status": "selected_anchor_timestamp_missing",
+            "current": False,
+            "selected_anchor": selected_ref or None,
+            "newer_candidate_count": 0,
+        }
+    selected_time = selected_time.astimezone(timezone.utc)
+    newer_candidates = []
+    for candidate in parent_main_anchor_shortlist.get("candidates") or []:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_ref = str(candidate.get("source_ref") or "")
+        if not candidate_ref or candidate_ref == selected_ref:
+            continue
+        if candidate.get("source_kind") != "codex_history":
+            continue
+        if candidate.get("source_scope") not in {
+            "canonical_parent_main_history",
+            "canonical_history_rejected_or_boundary",
+        }:
+            continue
+        if candidate.get("lineage_rejection_reason"):
+            continue
+        if candidate.get("classification") in {
+            "worker_or_reviewer_prompt",
+            "non_human_boundary_or_tool_context",
+            "admin_or_status_turn",
+            "post_status_context",
+        }:
+            continue
+        snippet = str(candidate.get("snippet") or "")
+        if _looks_like_status_followup_meta_turn(_normalize(snippet)):
+            continue
+        candidate_time = parse_datetime(str(candidate.get("timestamp_utc") or ""), timezone.utc)
+        if candidate_time is None or candidate_time.astimezone(timezone.utc) <= selected_time:
+            continue
+        newer_candidates.append(candidate)
+    newer_candidates.sort(key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)
+    if not newer_candidates:
+        return {
+            "status": "current",
+            "current": True,
+            "selected_anchor": selected_ref or None,
+            "newer_candidate_count": 0,
+        }
+    newest = newer_candidates[0]
+    return {
+        "status": "stale_selected_anchor",
+        "current": False,
+        "selected_anchor": selected_ref or None,
+        "selected_timestamp_utc": selected_anchor.get("timestamp_utc"),
+        "newer_candidate_count": len(newer_candidates),
+        "newest_candidate": {
+            "source_ref": newest.get("source_ref"),
+            "timestamp_utc": newest.get("timestamp_utc"),
+            "classification": newest.get("classification"),
+            "read_more_command": newest.get("read_more_command"),
+        },
+        "canonical_continuation_command": _explicit_parent_anchor_rerun_command(
+            query=str(command_options.get("query") or DEFAULT_STATUS_QUERY),
+            timestamp_utc=str(newest.get("timestamp_utc") or ""),
+            cwd=str(command_options.get("cwd") or "."),
+            codex_home=str(command_options.get("codex_home") or ""),
+            max_matches=command_options.get("max_matches"),
+        ),
+        "reason": (
+            "parent-thread complete-interval answer mode selected an older anchor while a newer "
+            "non-noise canonical parent/main user row was available before the status boundary"
+        ),
+    }
+
+
+def _explicit_parent_anchor_rerun_command(
+    *,
+    query: str,
+    timestamp_utc: str,
+    cwd: str,
+    codex_home: str,
+    max_matches: Any,
+) -> str:
+    anchored_query = f"{query.rstrip()} Use {timestamp_utc} as the parent-thread anchor."
+    parts = [
+        "jsonl-history-search",
+        "what-happened-since",
+        anchored_query,
+        "--cwd",
+        cwd or ".",
+    ]
+    if codex_home:
+        parts.extend(["--codex-home", codex_home])
+    parts.extend(["--parent-thread", "--complete-interval", "--format", "answer"])
+    if max_matches:
+        parts.extend(["--max-matches", str(max_matches)])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def _answer_readiness_contract(
     *,
     selected_anchor: dict | None,
@@ -7321,16 +7440,29 @@ def _answer_readiness_contract(
     source_tiers: dict,
     follow_through_plan: dict,
     target_window: dict | None,
+    parent_main_anchor_shortlist: dict | None = None,
+    complete_interval_requested: bool = False,
+    command_options: dict | None = None,
 ) -> dict:
     required_facets = _required_answer_facets(target_window=target_window)
     missing = []
     parent_main_status = _is_parent_main_status_decision(anchor_decision)
+    parent_main_freshness = _parent_main_anchor_freshness(
+        selected_anchor=selected_anchor,
+        parent_main_status=parent_main_status,
+        complete_interval_requested=complete_interval_requested,
+        command_options=command_options or {},
+        parent_main_anchor_shortlist=parent_main_anchor_shortlist or {},
+    )
     selected_anchor_ready = bool(selected_anchor)
     if not selected_anchor:
         missing.append("selected_anchor_and_boundary")
     elif parent_main_status and not _is_proven_parent_main_history_anchor(selected_anchor):
         selected_anchor_ready = False
         missing.append("selected_anchor_and_boundary")
+    elif parent_main_freshness.get("current") is False:
+        selected_anchor_ready = False
+        missing.append("selected_anchor_freshness")
     raw_status = session_activity.get("status")
     raw_activity_ready = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
     if not raw_activity_ready:
@@ -7363,6 +7495,12 @@ def _answer_readiness_contract(
             "reconstruction is partial or missing. Read the omitted range or missing session logs named in "
             "post_anchor_interval_reconstruction.next_read_guidance before synthesizing a status answer."
         )
+    if parent_main_freshness.get("current") is False:
+        stop_condition = (
+            "Fail closed before answer: the selected parent/main anchor is stale. A newer canonical "
+            "history.jsonl parent/main user row exists before the status boundary; rerun with the newer "
+            "timestamp or quoted message before synthesizing a status answer."
+        )
     if recovery_material or not selected_anchor:
         stop_condition = (
             "Fail closed before answer: recovery candidates are verification/rerun material only. "
@@ -7377,6 +7515,7 @@ def _answer_readiness_contract(
                 not parent_main_status
                 or _is_proven_parent_main_history_anchor(selected_anchor)
             )
+            and parent_main_freshness.get("current") is not False
         ),
         "parent_main_status_answer": parent_main_status,
         "proven_parent_main_history_anchor": bool(
@@ -7400,6 +7539,7 @@ def _answer_readiness_contract(
         },
         "facet_status": {
             "selected_anchor_and_boundary": selected_anchor_ready,
+            "selected_anchor_freshness": parent_main_freshness.get("current"),
             "post_anchor_interval_coverage": interval_coverage_ready,
             "raw_post_anchor_activity": raw_activity_ready,
             task_facet: target_or_task_ready,
@@ -7408,6 +7548,7 @@ def _answer_readiness_contract(
         },
         "missing_required_answer_facets": missing,
         "post_anchor_interval_coverage": interval_coverage,
+        "parent_main_anchor_freshness": parent_main_freshness,
         "stop_condition": stop_condition,
         "required_facets_stop_condition": follow_through_plan.get("required_facets_stop_condition"),
         "non_answer_support_fields": [

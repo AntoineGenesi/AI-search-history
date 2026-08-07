@@ -4975,6 +4975,9 @@ def _status_anchor_answer_format_ready(report: dict) -> bool:
 
 
 def _status_anchor_canonical_continuation_command(report: dict) -> str:
+    freshness = ((report.get("answer_readiness") or {}).get("parent_main_anchor_freshness") or {})
+    if freshness.get("current") is False and freshness.get("canonical_continuation_command"):
+        return str(freshness["canonical_continuation_command"])
     if _status_anchor_parent_main_complete_interval_recovery_required(report):
         return _status_anchor_rerun_answer_command(report)
     interval = report.get("post_anchor_interval_reconstruction") or {}
