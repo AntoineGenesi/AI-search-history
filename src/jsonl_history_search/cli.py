@@ -178,7 +178,7 @@ from .semantic_debugging import (
 )
 from .skill_audit import build_skill_audit_payload
 from .source_expansion import ExpansionRequest, build_follow_next_reads_payload, build_source_expansion_payload
-from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan
+from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan, normalize_local_path
 from .status_anchor import DEFAULT_STATUS_QUERY, build_status_anchor_payload
 from .structural_hybrid import search_structural_hybrid_budgeted
 from .timeutil import parse_datetime, parse_now, timezone_from_args
@@ -2004,8 +2004,8 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
     tz = timezone_from_args(args.timezone, args.timezone_offset)
     now = parse_now(args.now, tz)
     cwd = Path(args.cwd).expanduser().resolve()
-    codex_home = _history_home_from_args(args, provider="codex")
-    claude_home = _history_home_from_args(args, provider="claude")
+    codex_home = normalize_local_path(_history_home_from_args(args, provider="codex"))
+    claude_home = normalize_local_path(_history_home_from_args(args, provider="claude"))
     limits = Limits(
         max_files=args.max_files,
         max_bytes=args.max_bytes,
@@ -17689,8 +17689,8 @@ def _short_join(parts: list[str], *, limit: int = 520) -> str:
 
 def discovery_payload_from_args(args: argparse.Namespace) -> dict:
     cwd = Path(args.cwd).expanduser().resolve()
-    codex_home = _history_home_from_args(args, provider="codex")
-    claude_home = _history_home_from_args(args, provider="claude")
+    codex_home = normalize_local_path(_history_home_from_args(args, provider="codex"))
+    claude_home = normalize_local_path(_history_home_from_args(args, provider="claude"))
     limits = Limits(
         max_files=args.max_files,
         max_bytes=args.max_bytes,
@@ -17799,8 +17799,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if status in {"no_roots", "root_rejected"} else 0
     if args.command == "bulk-line-match":
         cwd = Path(args.cwd).expanduser().resolve()
-        codex_home = _history_home_from_args(args, provider="codex")
-        claude_home = _history_home_from_args(args, provider="claude")
+        codex_home = normalize_local_path(_history_home_from_args(args, provider="codex"))
+        claude_home = normalize_local_path(_history_home_from_args(args, provider="claude"))
         limits = Limits(
             max_files=args.max_files,
             max_bytes=args.max_bytes,

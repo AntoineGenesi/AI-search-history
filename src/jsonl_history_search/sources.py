@@ -4,9 +4,9 @@ import hashlib
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .expansion import task_slug_variants
@@ -18,6 +18,8 @@ YEAR_PART_RE = re.compile(r"^\d{4}$")
 MONTH_OR_DAY_PART_RE = re.compile(r"^\d{2}$")
 LATEST_SESSION_TIMESTAMP_TAIL_BYTES = 64 * 1024
 LATEST_SESSION_TIMESTAMP_MAX_LINES = 120
+WINDOWS_DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
+WINDOWS_ENV_VAR_RE = re.compile(r"%([A-Za-z_][A-Za-z0-9_]*)%")
 
 
 @dataclass
@@ -60,6 +62,11 @@ class PlannedRoot:
     recursive: bool = True
     known: bool = True
     estimate: str = "not_enumerated_by_plan"
+    source_role: str = "transcript_root"
+    provider: str = ""
+    app: str = ""
+    platform: str = ""
+    root_format: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -71,6 +78,11 @@ class PlannedRoot:
             "estimate": self.estimate,
             "scope_label": "selected_root",
             "privacy_label": "private_root",
+            "source_role": self.source_role,
+            "provider": self.provider,
+            "app": self.app,
+            "platform": self.platform,
+            "root_format": self.root_format,
         }
 
 
@@ -83,10 +95,75 @@ class RejectedRoot:
         return {"path": self.path, "reason": self.reason, "scope_label": "excluded_root"}
 
 
+@dataclass(frozen=True)
+class RootCandidate:
+    kind: str
+    path: Path
+    reason: str
+    source_role: str
+    provider: str
+    app: str
+    platform: str
+    root_format: str
+    recursive: bool = True
+    known: bool = True
+    include_when_missing: bool = True
+
+    def planned_root(self) -> PlannedRoot:
+        return PlannedRoot(
+            kind=self.kind,
+            path=self.path,
+            reason=self.reason,
+            recursive=self.recursive,
+            known=self.known,
+            source_role=self.source_role,
+            provider=self.provider,
+            app=self.app,
+            platform=self.platform,
+            root_format=self.root_format,
+        )
+
+
+@dataclass
+class RootDiagnostic:
+    kind: str
+    path: Path
+    reason: str
+    source_role: str
+    provider: str
+    app: str
+    platform: str
+    root_format: str
+    exists: bool
+    recursive: bool = True
+    known: bool = True
+    status: str = "detected"
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "path": str(self.path),
+            "reason": self.reason,
+            "source_role": self.source_role,
+            "provider": self.provider,
+            "app": self.app,
+            "platform": self.platform,
+            "root_format": self.root_format,
+            "exists": self.exists,
+            "recursive": self.recursive,
+            "known": self.known,
+            "status": self.status,
+            "scope_label": "diagnostic_root" if self.source_role == "diagnostic_only" else "candidate_root",
+            "privacy_label": "private_root",
+        }
+
+
 @dataclass
 class SourcePlan:
     roots: list[PlannedRoot] = field(default_factory=list)
     rejected_roots: list[RejectedRoot] = field(default_factory=list)
+    diagnostic_roots: list[RootDiagnostic] = field(default_factory=list)
+    missing_roots: list[RootDiagnostic] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     blind_spots: list[str] = field(default_factory=list)
     limits: Limits = field(default_factory=Limits)
@@ -96,6 +173,8 @@ class SourcePlan:
         return {
             "roots": [root.to_dict() for root in self.roots],
             "rejected_roots": [root.to_dict() for root in self.rejected_roots],
+            "diagnostic_roots": [root.to_dict() for root in self.diagnostic_roots],
+            "missing_roots": [root.to_dict() for root in self.missing_roots],
             "warnings": self.warnings,
             "blind_spots": self.blind_spots,
             "limits": self.limits.to_dict(),
@@ -103,6 +182,9 @@ class SourcePlan:
             "selected_root_count": len(self.roots),
             "private_root_count": len(self.roots),
             "rejected_root_count": len(self.rejected_roots),
+            "diagnostic_root_count": len(self.diagnostic_roots),
+            "missing_root_count": len(self.missing_roots),
+            "root_role_counts": root_role_counts(self),
             "scope_terms": [
                 "selected_root",
                 "private_root",
@@ -513,10 +595,14 @@ def build_source_plan(
     current_session_only: bool = False,
 ) -> SourcePlan:
     plan = SourcePlan(limits=limits)
-    known = known_roots(codex_home, claude_home)
-    requested = roots
-    if requested is None and current_session_only:
-        latest, latest_warning = latest_known_session_file(codex_home, claude_home)
+    codex_home = normalize_local_path(codex_home)
+    claude_home = normalize_local_path(claude_home)
+    normalized_roots = [normalize_local_path(root) for root in roots] if roots is not None else None
+    candidates = known_root_candidates(codex_home, claude_home, cwd=cwd)
+    known = known_roots(codex_home, claude_home, cwd=cwd, candidates=candidates)
+    record_root_inventory(plan, candidates)
+    if normalized_roots is None and current_session_only:
+        latest, latest_warning = latest_known_session_file(codex_home, claude_home, root_candidates=candidates)
         if latest is None:
             plan.scope_resolution = {
                 "status": "ambiguous_current_session",
@@ -529,7 +615,7 @@ def build_source_plan(
             if latest_warning:
                 plan.warnings.append(latest_warning)
             return plan
-        requested = [latest]
+        normalized_roots = [latest]
         plan.scope_resolution = {
             "status": "scoped_to_latest_known_session",
             "strategy": "latest_known_codex_or_claude_session_file",
@@ -538,20 +624,29 @@ def build_source_plan(
         plan.warnings.append("Current-session wording detected; scoped to the latest known session file by default.")
         if latest_warning:
             plan.warnings.append(latest_warning)
-    elif requested is None:
-        requested = [codex_home / "sessions", codex_home / "history.jsonl", claude_home / "projects"]
+    elif normalized_roots is None:
+        normalized_roots = [candidate.path for candidate in candidates if candidate.source_role == "transcript_root"]
 
     if allow_arbitrary_root and (limits.hard_cap_files is None or limits.hard_cap_bytes is None):
-        plan.rejected_roots.extend(RejectedRoot(str(root), "arbitrary root override requires --hard-cap-files and --hard-cap-bytes") for root in requested)
+        plan.rejected_roots.extend(
+            RejectedRoot(str(root), "arbitrary root override requires --hard-cap-files and --hard-cap-bytes")
+            for root in normalized_roots
+        )
         return plan
 
-    for requested_root in requested:
+    for requested_root in normalized_roots:
         for root in normalize_requested_root(requested_root, codex_home, claude_home):
             if requested_root_uses_symlinked_provider_root(root, codex_home, claude_home):
                 plan.rejected_roots.append(RejectedRoot(str(root), "symlinked known transcript root rejected before traversal"))
                 continue
             resolved = safe_resolve(root)
-            kind = known_kind_for_resolved_path(resolved, known)
+            candidate = known_candidate_for_resolved_path(resolved, known)
+            kind = candidate.kind if candidate else None
+            if candidate and candidate.source_role != "transcript_root":
+                plan.rejected_roots.append(
+                    RejectedRoot(str(root), "known cache/log/diagnostic-only root; not selected as a transcript root")
+                )
+                continue
             danger = dangerous_reason(resolved, cwd)
             if danger and not (kind and danger == "cache/model directory rejected before traversal"):
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
@@ -561,15 +656,23 @@ def build_source_plan(
                 continue
             if allow_arbitrary_root and not kind:
                 plan.warnings.append(f"Arbitrary root enabled for {root}; strict hard caps apply.")
-            plan.roots.append(
-                PlannedRoot(
-                    kind=kind or arbitrary_root_kind(root),
-                    path=root,
-                    reason="known transcript root" if kind else "explicit arbitrary root override",
-                    recursive=root.suffix not in {".jsonl", ".json"},
-                    known=bool(kind),
+            if candidate:
+                plan.roots.append(candidate.planned_root())
+            else:
+                plan.roots.append(
+                    PlannedRoot(
+                        kind=arbitrary_root_kind(root),
+                        path=root,
+                        reason="explicit arbitrary root override",
+                        recursive=root.suffix not in {".jsonl", ".json"},
+                        known=False,
+                        source_role="transcript_root",
+                        provider="unknown",
+                        app="unknown",
+                        platform=platform_for_path(root),
+                        root_format="json" if root.suffix == ".json" else "jsonl",
+                    )
                 )
-            )
 
     if not plan.roots:
         plan.blind_spots.append("No transcript roots selected; search will not open JSONL files.")
@@ -579,29 +682,348 @@ def build_source_plan(
     return plan
 
 
-def known_roots(codex_home: Path, claude_home: Path) -> dict[Path, str]:
-    return {
-        safe_resolve(codex_home / "sessions"): "codex_sessions",
-        safe_resolve(codex_home / "history.jsonl"): "codex_history",
-        safe_resolve(claude_home / "projects"): "claude_projects",
-    }
+def root_role_counts(plan: SourcePlan) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for root in plan.roots:
+        counts[root.source_role] = counts.get(root.source_role, 0) + 1
+    for root in plan.diagnostic_roots:
+        counts[root.source_role] = counts.get(root.source_role, 0) + 1
+    for root in plan.missing_roots:
+        key = f"missing_{root.source_role}"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 
-def known_kind_for_resolved_path(resolved: Path, known: dict[Path, str]) -> str | None:
+def record_root_inventory(plan: SourcePlan, candidates: list[RootCandidate]) -> None:
+    for candidate in candidates:
+        exists = candidate.path.expanduser().exists()
+        if candidate.source_role == "diagnostic_only":
+            if exists:
+                plan.diagnostic_roots.append(root_diagnostic(candidate, exists=True, status="detected"))
+            continue
+        if not exists and candidate.include_when_missing:
+            plan.missing_roots.append(root_diagnostic(candidate, exists=False, status="missing"))
+
+
+def root_diagnostic(candidate: RootCandidate, *, exists: bool, status: str) -> RootDiagnostic:
+    return RootDiagnostic(
+        kind=candidate.kind,
+        path=candidate.path,
+        reason=candidate.reason,
+        source_role=candidate.source_role,
+        provider=candidate.provider,
+        app=candidate.app,
+        platform=candidate.platform,
+        root_format=candidate.root_format,
+        exists=exists,
+        recursive=candidate.recursive,
+        known=candidate.known,
+        status=status,
+    )
+
+
+def known_root_candidates(codex_home: Path, claude_home: Path, *, cwd: Path) -> list[RootCandidate]:
+    codex_home = normalize_local_path(codex_home)
+    claude_home = normalize_local_path(claude_home)
+    candidates: list[RootCandidate] = []
+    candidates.extend(codex_root_candidates(codex_home, platform=platform_for_path(codex_home)))
+    candidates.extend(claude_code_root_candidates(claude_home, platform=platform_for_path(claude_home)))
+
+    default_codex = is_default_provider_home(codex_home, "codex")
+    default_claude = is_default_provider_home(claude_home, "claude")
+    explicit_windows_profiles = windows_user_profile_candidates(cwd=cwd, include_auto=False)
+    auto_windows_profiles = windows_user_profile_candidates(
+        cwd=cwd,
+        include_auto=default_codex or default_claude,
+    )
+    windows_profiles = unique_paths(explicit_windows_profiles + auto_windows_profiles)
+    include_windows_codex = default_codex or bool(explicit_windows_profiles)
+    include_windows_claude = default_claude or bool(explicit_windows_profiles)
+    if include_windows_codex:
+        for profile in windows_profiles:
+            candidates.extend(
+                codex_root_candidates(
+                    profile / ".codex",
+                    platform="windows_wsl_mount",
+                    kind_prefix="windows_",
+                    include_posix_history=False,
+                )
+            )
+            candidates.extend(codex_app_diagnostic_candidates(profile))
+    if include_windows_claude:
+        for profile in windows_profiles:
+            candidates.extend(
+                claude_code_root_candidates(
+                    profile / ".claude",
+                    platform="windows_wsl_mount",
+                    kind_prefix="windows_",
+                )
+            )
+            candidates.extend(claude_desktop_json_candidates(profile))
+
+    candidates.extend(claude_desktop_json_candidates(Path.home(), platform=platform_for_path(Path.home())))
+    return unique_candidates(candidates)
+
+
+def codex_root_candidates(
+    codex_home: Path,
+    *,
+    platform: str,
+    kind_prefix: str = "",
+    include_posix_history: bool = True,
+) -> list[RootCandidate]:
+    app = "codex_app" if kind_prefix == "windows_" else "codex_cli"
+    candidates = [
+        RootCandidate(
+            kind=f"{kind_prefix}codex_sessions",
+            path=codex_home / "sessions",
+            reason="known Codex transcript root",
+            source_role="transcript_root",
+            provider="codex",
+            app=app,
+            platform=platform,
+            root_format="jsonl",
+        ),
+    ]
+    if kind_prefix == "windows_":
+        candidates.extend(
+            [
+                RootCandidate(
+                    kind="windows_codex_archived_sessions",
+                    path=codex_home / "archived_sessions",
+                    reason="known Windows Codex archived transcript root",
+                    source_role="transcript_root",
+                    provider="codex",
+                    app=app,
+                    platform=platform,
+                    root_format="jsonl",
+                ),
+                RootCandidate(
+                    kind="windows_codex_transcription_history",
+                    path=codex_home / "transcription-history.jsonl",
+                    reason="known Windows Codex transcription history JSONL",
+                    source_role="transcript_root",
+                    provider="codex",
+                    app=app,
+                    platform=platform,
+                    root_format="jsonl",
+                    recursive=False,
+                ),
+                RootCandidate(
+                    kind="windows_codex_session_index",
+                    path=codex_home / "session_index.jsonl",
+                    reason="Windows Codex session index metadata; diagnostic only until parsed as transcript evidence",
+                    source_role="diagnostic_only",
+                    provider="codex",
+                    app=app,
+                    platform=platform,
+                    root_format="jsonl_metadata",
+                    recursive=False,
+                    include_when_missing=False,
+                ),
+            ]
+        )
+    if include_posix_history:
+        candidates.insert(
+            1,
+            RootCandidate(
+                kind=f"{kind_prefix}codex_history",
+                path=codex_home / "history.jsonl",
+                reason="known Codex prompt history JSONL",
+                source_role="transcript_root",
+                provider="codex",
+                app=app,
+                platform=platform,
+                root_format="jsonl",
+                recursive=False,
+            ),
+        )
+    candidates.extend(codex_state_diagnostic_candidates(codex_home, platform=platform, app=app, kind_prefix=kind_prefix))
+    return candidates
+
+
+def claude_code_root_candidates(claude_home: Path, *, platform: str, kind_prefix: str = "") -> list[RootCandidate]:
+    return [
+        RootCandidate(
+            kind=f"{kind_prefix}claude_projects",
+            path=claude_home / "projects",
+            reason="known Claude Code transcript root",
+            source_role="transcript_root",
+            provider="claude",
+            app="claude_code",
+            platform=platform,
+            root_format="jsonl",
+        )
+    ]
+
+
+def codex_state_diagnostic_candidates(
+    codex_home: Path,
+    *,
+    platform: str,
+    app: str,
+    kind_prefix: str = "",
+) -> list[RootCandidate]:
+    candidates: list[RootCandidate] = []
+    for name in (
+        "state.sqlite",
+        "state_5.sqlite",
+        "goals.sqlite",
+        "goals_1.sqlite",
+        "logs.sqlite",
+        "logs_2.sqlite",
+    ):
+        path = codex_home / name
+        if not path.exists():
+            continue
+        candidates.append(
+            RootCandidate(
+                kind=f"{kind_prefix}codex_state_db",
+                path=path,
+                reason="Codex SQLite state/cache metadata; diagnostic only, not transcript JSONL",
+                source_role="diagnostic_only",
+                provider="codex",
+                app=app,
+                platform=platform,
+                root_format="sqlite",
+                recursive=False,
+                include_when_missing=False,
+            )
+        )
+    return candidates
+
+
+def codex_app_diagnostic_candidates(profile: Path) -> list[RootCandidate]:
+    candidates: list[RootCandidate] = []
+    for path, kind, root_format in (
+        (profile / "AppData" / "Roaming" / "Codex" / "logs", "windows_codex_app_logs", "logs"),
+        (profile / "AppData" / "Local" / "Codex" / "logs", "windows_codex_app_logs", "logs"),
+        (profile / "AppData" / "Local" / "Codex" / "cache", "windows_codex_app_cache", "cache"),
+        (profile / "AppData" / "Roaming" / "OpenAI" / "Codex" / "logs", "windows_codex_app_logs", "logs"),
+        (profile / "AppData" / "Local" / "OpenAI" / "Codex" / "cache", "windows_codex_app_cache", "cache"),
+    ):
+        if not path.exists():
+            continue
+        candidates.append(
+            RootCandidate(
+                kind=kind,
+                path=path,
+                reason="Codex desktop app cache/log location detected; diagnostic only, not a transcript root",
+                source_role="diagnostic_only",
+                provider="codex",
+                app="codex_app",
+                platform="windows_wsl_mount",
+                root_format=root_format,
+                include_when_missing=False,
+            )
+        )
+    return candidates
+
+
+def claude_desktop_json_candidates(profile: Path, *, platform: str = "windows_wsl_mount") -> list[RootCandidate]:
+    roots = []
+    configured_home = os.environ.get("JSONL_HISTORY_CLAUDE_DESKTOP_HOME")
+    configured_json = os.environ.get("JSONL_HISTORY_CLAUDE_DESKTOP_JSON")
+    for raw in (configured_json, configured_home):
+        if raw:
+            roots.append(normalize_local_path(Path(raw)))
+    roots.extend(
+        [
+            profile / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions",
+            profile / "AppData" / "Roaming" / "Claude-3p" / "local-agent-mode-sessions",
+            profile / "Library" / "Application Support" / "Claude-3p" / "local-agent-mode-sessions",
+        ]
+    )
+    candidates: list[RootCandidate] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        if root.is_dir():
+            candidates.append(
+                RootCandidate(
+                    kind="claude_desktop_json_directory",
+                    path=root,
+                    reason="Claude Desktop 3P local-agent-mode-sessions directory detected; local_*.json files are parsed as transcript state",
+                    source_role="transcript_root",
+                    provider="claude",
+                    app="claude_desktop",
+                    platform=platform_for_path(root) if platform == "windows_wsl_mount" else platform,
+                    root_format="json",
+                    include_when_missing=False,
+                )
+            )
+        elif root.suffix == ".json":
+            candidates.append(
+                RootCandidate(
+                    kind="claude_desktop_json_sessions",
+                    path=root,
+                    reason="Claude Desktop 3P local session JSON file detected",
+                    source_role="transcript_root",
+                    provider="claude",
+                    app="claude_desktop",
+                    platform=platform_for_path(root) if platform == "windows_wsl_mount" else platform,
+                    root_format="json",
+                    recursive=False,
+                    include_when_missing=False,
+                )
+            )
+    return candidates
+
+
+def unique_candidates(candidates: list[RootCandidate]) -> list[RootCandidate]:
+    seen: set[tuple[str, Path, str]] = set()
+    unique: list[RootCandidate] = []
+    for candidate in candidates:
+        key = (candidate.kind, safe_resolve(candidate.path), candidate.source_role)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def known_roots(
+    codex_home: Path,
+    claude_home: Path,
+    *,
+    cwd: Path | None = None,
+    candidates: list[RootCandidate] | None = None,
+) -> dict[Path, RootCandidate]:
+    roots = candidates or known_root_candidates(codex_home, claude_home, cwd=cwd or Path.cwd())
+    return {safe_resolve(candidate.path): candidate for candidate in roots}
+
+
+def known_kind_for_resolved_path(resolved: Path, known: dict[Path, RootCandidate]) -> str | None:
+    candidate = known_candidate_for_resolved_path(resolved, known)
+    return candidate.kind if candidate else None
+
+
+def known_candidate_for_resolved_path(resolved: Path, known: dict[Path, RootCandidate]) -> RootCandidate | None:
     direct = known.get(resolved)
     if direct:
         return direct
-    if resolved.suffix != ".jsonl":
+    if resolved.suffix not in {".jsonl", ".json"}:
         return None
-    for root, root_kind in known.items():
-        if root_kind == "codex_history":
+    for root, candidate in known.items():
+        if candidate.source_role != "transcript_root":
+            continue
+        if candidate.kind in {"codex_history", "codex_transcription_history", "claude_desktop_json_sessions"}:
             continue
         if resolved_path_is_inside(resolved, root):
-            if root_kind == "codex_sessions":
-                return "codex_session_file"
-            if root_kind == "claude_projects":
-                return "claude_session_file"
-            return root_kind
+            kind = candidate.kind
+            if kind in {"codex_sessions", "codex_archived_sessions", "windows_codex_sessions", "windows_codex_archived_sessions"}:
+                kind = "codex_session_file"
+            elif kind in {"claude_projects", "windows_claude_projects"}:
+                kind = "claude_session_file"
+            elif kind == "claude_desktop_json_directory":
+                kind = "claude_desktop_json_sessions"
+            return replace(
+                candidate,
+                kind=kind,
+                path=resolved,
+                recursive=False,
+                root_format="json" if resolved.suffix == ".json" else candidate.root_format,
+            )
     return None
 
 
@@ -628,14 +1050,25 @@ def resolved_path_is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path | None, str | None]:
-    candidates: list[tuple[int, float, float, str, Path]] = []
+def latest_known_session_file(
+    codex_home: Path,
+    claude_home: Path,
+    *,
+    root_candidates: list[RootCandidate] | None = None,
+) -> tuple[Path | None, str | None]:
+    session_candidates: list[tuple[int, float, float, str, Path]] = []
     warning: str | None = None
     started = time.monotonic()
     visited = 0
     max_candidates = 5000
     max_elapsed = 2.0
-    for base in (codex_home / "sessions", claude_home / "projects"):
+    root_candidates = root_candidates or known_root_candidates(codex_home, claude_home, cwd=Path.cwd())
+    bases = [
+        candidate.path
+        for candidate in root_candidates
+        if candidate.source_role == "transcript_root" and candidate.recursive and candidate.root_format == "jsonl"
+    ]
+    for base in bases:
         base = base.expanduser()
         if base.is_symlink():
             continue
@@ -657,7 +1090,7 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
                 mtime = stat_mtime(path)
                 latest_event = latest_session_event_timestamp(path)
                 rank_timestamp = latest_event.timestamp() if latest_event is not None else mtime
-                candidates.append(
+                session_candidates.append(
                     (1 if latest_event is not None else 0, rank_timestamp, mtime, path.as_posix(), path)
                 )
                 visited += 1
@@ -668,10 +1101,10 @@ def latest_known_session_file(codex_home: Path, claude_home: Path) -> tuple[Path
                 break
         if warning:
             break
-    if not candidates:
+    if not session_candidates:
         return None, warning
     _has_event_timestamp, _rank_timestamp, _mtime, _label, path = max(
-        candidates,
+        session_candidates,
         key=lambda item: (item[0], item[1], item[2], item[3]),
     )
     return path, warning
@@ -709,9 +1142,14 @@ def _tail_jsonl_lines(path: Path, *, max_bytes: int, max_lines: int) -> list[str
 
 
 def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) -> list[Path]:
+    root = normalize_local_path(root)
     resolved = safe_resolve(root)
     if resolved == safe_resolve(codex_home):
-        return [codex_home / "sessions", codex_home / "history.jsonl"]
+        return [
+            candidate.path
+            for candidate in codex_root_candidates(codex_home, platform=platform_for_path(codex_home))
+            if candidate.source_role == "transcript_root"
+        ]
     if resolved == safe_resolve(claude_home):
         return [claude_home / "projects"]
     return [root]
@@ -721,6 +1159,96 @@ def arbitrary_root_kind(root: Path) -> str:
     if root.suffix == ".json":
         return "arbitrary_json_file"
     return "arbitrary_jsonl_root"
+
+
+def normalize_local_path(path: Path) -> Path:
+    text = os.path.expanduser(str(path))
+    text = expand_windows_environment_markers(text)
+    windows_path = windows_path_to_wsl_path(text)
+    return windows_path if windows_path is not None else Path(text)
+
+
+def expand_windows_environment_markers(value: str) -> str:
+    def replace_var(match: re.Match[str]) -> str:
+        return os.environ.get(match.group(1), match.group(0))
+
+    return WINDOWS_ENV_VAR_RE.sub(replace_var, value)
+
+
+def windows_path_to_wsl_path(value: str, *, mount_root: Path = Path("/mnt")) -> Path | None:
+    match = WINDOWS_DRIVE_PATH_RE.match(value.strip())
+    if not match:
+        return None
+    drive = match.group(1).lower()
+    remainder = match.group(2)
+    parts = [part for part in PureWindowsPath(remainder).parts if part not in {"\\", "/"}]
+    return mount_root / drive / Path(*parts)
+
+
+def windows_user_profile_candidates(*, cwd: Path, include_auto: bool) -> list[Path]:
+    profiles: list[Path] = []
+    explicit = os.environ.get("JSONL_HISTORY_WINDOWS_USERPROFILE")
+    if explicit:
+        profiles.append(normalize_local_path(Path(explicit)))
+    if not include_auto:
+        return unique_paths(profiles)
+    raw_userprofile = os.environ.get("USERPROFILE")
+    if raw_userprofile and looks_like_windows_profile(raw_userprofile):
+        profiles.append(normalize_local_path(Path(raw_userprofile)))
+    home_drive = os.environ.get("HOMEDRIVE")
+    home_path = os.environ.get("HOMEPATH")
+    if home_drive and home_path:
+        normalized = windows_path_to_wsl_path(f"{home_drive}{home_path}")
+        if normalized is not None:
+            profiles.append(normalized)
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if user and (Path("/mnt/c/Users") / user).exists():
+        profiles.append(Path("/mnt/c/Users") / user)
+    mounted_from_cwd = windows_user_profile_from_mounted_path(cwd)
+    if mounted_from_cwd is not None:
+        profiles.append(mounted_from_cwd)
+    return unique_paths(profiles)
+
+
+def looks_like_windows_profile(value: str) -> bool:
+    if WINDOWS_DRIVE_PATH_RE.match(value.strip()):
+        return True
+    parts = Path(value).parts
+    return len(parts) >= 5 and parts[1] == "mnt" and len(parts[2]) == 1 and parts[3].lower() == "users"
+
+
+def windows_user_profile_from_mounted_path(path: Path) -> Path | None:
+    parts = safe_resolve(path).parts
+    lowered = [part.lower() for part in parts]
+    if len(parts) >= 5 and parts[1] == "mnt" and len(parts[2]) == 1 and lowered[3] == "users":
+        return Path(*parts[:5])
+    return None
+
+
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in paths:
+        resolved = safe_resolve(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def is_default_provider_home(path: Path, provider: str) -> bool:
+    return safe_resolve(path) == safe_resolve(Path.home() / f".{provider}")
+
+
+def platform_for_path(path: Path) -> str:
+    text = str(path)
+    if WINDOWS_DRIVE_PATH_RE.match(text):
+        return "windows_path"
+    parts = safe_resolve(path).parts
+    if len(parts) >= 4 and parts[1] == "mnt" and len(parts[2]) == 1 and parts[3].lower() == "users":
+        return "windows_wsl_mount"
+    return "posix_wsl"
 
 
 def safe_resolve(path: Path) -> Path:
@@ -1255,7 +1783,11 @@ def iter_directory_jsonl_files(
             try:
                 if entry.is_dir(follow_symlinks=False):
                     dirs.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".jsonl"):
+                elif (
+                    entry.is_file(follow_symlinks=False)
+                    and entry.name.endswith(directory_file_suffixes(source_kind))
+                    and directory_file_allowed(Path(entry.path), source_kind)
+                ):
                     files.append(Path(entry.path))
             except OSError:
                 continue
@@ -1292,6 +1824,18 @@ def filename_preference_score(path: Path, preferred_terms: list[str]) -> int:
         if any(stem and stem in token for stem in term_stems for token in name_tokens):
             score += 1
     return score
+
+
+def directory_file_suffixes(source_kind: str) -> tuple[str, ...]:
+    if source_kind == "claude_desktop_json_directory":
+        return (".json",)
+    return (".jsonl",)
+
+
+def directory_file_allowed(path: Path, source_kind: str) -> bool:
+    if source_kind == "claude_desktop_json_directory":
+        return path.name.startswith("local_") and path.suffix == ".json"
+    return True
 
 
 def filename_term_stems(term: str) -> list[str]:
