@@ -5311,20 +5311,36 @@ def _answer_action_contract_from_executed_output(
     if output_key == "status_anchor":
         source_tiers = compact.get("source_tiers") or {}
         answer_readiness = compact.get("answer_readiness") or {}
+        latest_followthrough = _latest_status_followthrough_contract(compact)
+        interval_reads = latest_followthrough.get("required_post_anchor_interval_reads") or []
+        boundary_reads = latest_followthrough.get("status_boundary_reads") or []
+        answer_allowed = bool(answer_readiness.get("answer_allowed"))
+        read_contract = (
+            (latest_followthrough.get("selected_anchor_reads") or [])[:2]
+            + interval_reads[:4]
+            + boundary_reads[:2]
+        )
+        if not read_contract:
+            read_contract = (source_tiers.get("required_primary") or [])[:6]
+        if not read_contract:
+            read_contract = (compact.get("follow_through_plan") or {}).get("open_first") or compact.get("next_reads", [])[:4]
         return {
             "answer_status": (
                 "status-package-ready-after-required-reads"
-                if answer_readiness.get("answer_allowed")
+                if answer_allowed
                 else "not-ready/needs-more-proof"
             ),
-            "promotion_status": compact.get("status"),
-            "promotion_reason": (
-                "The latest-status route is executable, but receiving agents should inspect "
-                "required primary raw JSONL reads before turning the packet into a factual status answer."
+            "promotion_status": (
+                "latest_status_ready_after_post_anchor_interval_reads"
+                if answer_allowed
+                else compact.get("status")
             ),
-            "read": (source_tiers.get("required_primary") or [])
-            or (compact.get("follow_through_plan") or {}).get("open_first")
-            or compact.get("next_reads", [])[:4],
+            "promotion_reason": (
+                "The latest-status route is executable, but a factual answer requires opened selected-anchor "
+                "and post-anchor interval raw JSONL refs before any secondary task/report/git joins."
+            ),
+            "read": read_contract,
+            "latest_status_followthrough_contract": latest_followthrough,
             "then_confirm": (compact.get("follow_through_plan") or {}).get("then_confirm") or [],
             "diagnostics_after": (compact.get("follow_through_plan") or {}).get("do_not_open_by_default") or [],
             "selected_anchor": compact.get("selected_anchor"),
@@ -5344,6 +5360,7 @@ def _answer_action_contract_from_executed_output(
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
             "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "follow_through_plan": compact.get("follow_through_plan"),
+            "post_anchor_interval_reconstruction": latest_followthrough.get("post_anchor_interval_reconstruction"),
             "evidence_modes": (compact.get("evidence_contract") or {}).get("source_modes"),
             "source_role_labels": (compact.get("evidence_contract") or {}).get("source_role_labels"),
             "stop": (compact.get("follow_through_plan") or {}).get("stop_condition")
@@ -9018,6 +9035,10 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
             "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "answer_readiness": compact.get("answer_readiness"),
+            "post_anchor_interval_reconstruction": _compact_post_anchor_interval_for_ask(
+                compact.get("post_anchor_interval_reconstruction") or {}
+            ),
+            "latest_status_followthrough_contract": _latest_status_followthrough_contract(compact),
             "source_tiers": {
                 "tier_order": (compact.get("source_tiers") or {}).get("tier_order"),
                 "counts": (compact.get("source_tiers") or {}).get("counts"),
@@ -10399,6 +10420,18 @@ def _ask_answer_from_execute(
         answer_opened = list(workflow_gate.get("opened") or answer_opened)
 
     if route_family == "latest_status":
+        interval_gate = _latest_status_post_anchor_interval_final_proof_gate(
+            action=action,
+            opened=answer_opened,
+        )
+        answer["source_contract"]["latest_status_post_anchor_interval_answer_gate"] = interval_gate
+        if interval_gate.get("status") not in {"answer_allowed", "not_applied"}:
+            answer["proof_summary"] = list(interval_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "latest-status post-anchor interval proof missing; selected-anchor or secondary evidence is not enough",
+                interval_gate,
+            )
         latest_target_gate = _latest_status_target_episode_anchor_gate(
             query=str(report.get("query") or ""),
             action=action,
@@ -10508,6 +10541,163 @@ def _ask_answer_from_execute(
     answer["answer_status"] = "answered-from-proof"
     answer["answer"] = _sanitize_final_answer_prose(direct_answer)
     return base
+
+
+def _latest_status_followthrough_contract(compact: dict) -> dict:
+    interval = _compact_post_anchor_interval_for_ask(compact.get("post_anchor_interval_reconstruction") or {})
+    coverage = interval.get("coverage") or {}
+    guidance = interval.get("next_read_guidance") or {}
+    source_tiers = compact.get("source_tiers") or {}
+    required_primary = list(source_tiers.get("required_primary") or [])
+    selected_anchor_ref = str((compact.get("selected_anchor") or {}).get("source_ref") or "")
+    selected_anchor_reads = [
+        read
+        for read in required_primary
+        if str(read.get("answer_support_role") or "") == "selected_parent_thread_raw_user_row"
+        or bool(read.get("canonical_authority_read"))
+        or (selected_anchor_ref and str(read.get("source_ref") or "") == selected_anchor_ref)
+    ]
+    interval_reads = [
+        read for read in required_primary if str(read.get("answer_support_role") or "") == "post_anchor_interval_activity"
+    ]
+    if not interval_reads:
+        interval_reads = [
+            read
+            for read in required_primary
+            if str(read.get("window_role") or "") == "session_activity"
+            and not read.get("selected_anchor_raw_session_row")
+        ]
+    interval_reads = [
+        {
+            **read,
+            "answer_support_role": read.get("answer_support_role") or "post_anchor_interval_activity",
+        }
+        for read in interval_reads
+    ]
+    boundary_reads = [
+        read
+        for read in required_primary
+        if str(read.get("answer_support_role") or "")
+        in {"current_user_message_boundary", "status_query_boundary"}
+    ]
+    complete = coverage.get("complete") is True
+    return {
+        "schema_version": "latest_status_followthrough_contract.v1",
+        "status": "post_anchor_interval_ready" if complete else "post_anchor_interval_not_ready",
+        "answer_promotion_requires_opened_post_anchor_interval_refs": True,
+        "answer_promotion_allowed_after_contract": bool((compact.get("answer_readiness") or {}).get("answer_allowed")),
+        "required_read_order": [
+            "selected_anchor_raw_session_row",
+            "post_anchor_interval_activity_raw_session_refs",
+            "required_secondary_task_report_review_git_refs",
+        ],
+        "selected_anchor_read_count": len(selected_anchor_reads),
+        "post_anchor_interval_read_count": len(interval_reads),
+        "required_post_anchor_interval_reads": interval_reads[:6],
+        "selected_anchor_reads": selected_anchor_reads[:2],
+        "status_boundary_reads": boundary_reads[:2],
+        "post_anchor_interval_reconstruction": interval,
+        "coverage_status": coverage.get("status"),
+        "coverage_complete": coverage.get("complete"),
+        "omitted_activity_entry_count": coverage.get("omitted_activity_entry_count", 0),
+        "next_read_guidance": guidance,
+        "stop": (
+            "Do not answer from the selected anchor, task/report/git joins, visible context, or latest surfaced topic alone. "
+            "Open post_anchor_interval_activity raw refs first; if coverage is partial or missing, follow "
+            "post_anchor_interval_reconstruction.next_read_guidance or fail closed."
+        ),
+    }
+
+
+def _compact_post_anchor_interval_for_ask(interval: dict) -> dict:
+    if not interval:
+        return {}
+    compact = dict(interval)
+    compact["chronological_activity"] = list(interval.get("chronological_activity") or [])[:8]
+    joins = interval.get("secondary_evidence_joins") or {}
+    compact["secondary_evidence_joins"] = {
+        key: list(joins.get(key) or [])[:4]
+        for key in ("tasks", "reports", "reviews", "git_commits")
+    }
+    return compact
+
+
+def _latest_status_post_anchor_interval_final_proof_gate(
+    *,
+    action: dict,
+    opened: list[dict],
+) -> dict:
+    contract = (
+        action.get("latest_status_followthrough_contract")
+        if isinstance(action.get("latest_status_followthrough_contract"), dict)
+        else {}
+    )
+    if not contract:
+        return {
+            "schema_version": 1,
+            "status": "not_applied",
+            "reason": "latest_status_followthrough_contract_absent",
+        }
+    required_reads = list(contract.get("required_post_anchor_interval_reads") or [])
+    opened_interval = [
+        item
+        for item in opened
+        if _latest_status_opened_answer_support_role(item) == "post_anchor_interval_activity"
+    ]
+    opened_anchor = [
+        item
+        for item in opened
+        if _latest_status_opened_answer_support_role(item) == "selected_parent_thread_raw_user_row"
+    ]
+    if opened_interval:
+        return {
+            "schema_version": 1,
+            "status": "answer_allowed",
+            "selected_anchor_ref_count": len(opened_anchor),
+            "post_anchor_interval_ref_count": len(opened_interval),
+            "coverage_status": contract.get("coverage_status"),
+            "coverage_complete": contract.get("coverage_complete"),
+            "summary_lines": [
+                f"{_opened_target_label(item)}: post_anchor_interval_activity"
+                for item in opened_interval[:6]
+            ],
+        }
+    return {
+        "schema_version": 1,
+        "status": "missing_post_anchor_interval_refs",
+        "selected_anchor_ref_count": len(opened_anchor),
+        "post_anchor_interval_ref_count": 0,
+        "required_post_anchor_interval_read_count": len(required_reads),
+        "coverage_status": contract.get("coverage_status"),
+        "coverage_complete": contract.get("coverage_complete"),
+        "next_read_guidance": contract.get("next_read_guidance"),
+        "required_next_reads": required_reads[:6],
+        "summary_lines": [
+            "No opened ref had answer_support_role=post_anchor_interval_activity; selected-anchor, "
+            "secondary task/report/git, or visible-context evidence cannot support latest-status prose."
+        ],
+        "required_next_proof": (
+            "Open at least one required raw post-anchor interval ref, and if coverage is partial/missing "
+            "follow post_anchor_interval_reconstruction.next_read_guidance before answering."
+        ),
+    }
+
+
+def _latest_status_opened_answer_support_role(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    for container in (ref, item):
+        role = str(container.get("answer_support_role") or "")
+        if role:
+            return role
+        if str(container.get("window_role") or "") == "session_activity":
+            return "post_anchor_interval_activity"
+        if str(container.get("source_role") or "") == "raw_session_activity":
+            return "post_anchor_interval_activity"
+    return ""
+
+
+def _opened_target_label(item: dict) -> str:
+    return str(item.get("target") or item.get("source_ref") or "(unknown target)")
 
 
 def _ask_answer_finalization_veto(
