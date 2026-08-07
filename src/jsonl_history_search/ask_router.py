@@ -2448,6 +2448,46 @@ def _looks_like_deep_history_audit_query(normalized: str) -> bool:
             "every session in",
         ),
     )
+    outcome_audit_history_scope = (
+        _has_any(
+            normalized,
+            (
+                "chatlogs",
+                "chat logs",
+                "convo",
+                "conversation history",
+                "chat history",
+                "history",
+            ),
+        )
+        and _has_any(
+            normalized,
+            (
+                "long-running coordinator",
+                "long running coordinator",
+                "coordinator session",
+                "coordinator thread",
+                "long-running session",
+                "long running session",
+            ),
+        )
+        and _has_any(
+            normalized,
+            (
+                "accepted",
+                "committed",
+                "reviewed",
+                "reviewer",
+                "task outcomes",
+                "task outcome",
+                "claimed completed",
+                "claimed complete",
+                "completed work",
+                "whether the agent claimed",
+            ),
+        )
+    )
+    broad_history_scope = broad_history_scope or outcome_audit_history_scope
     if not broad_history_scope:
         return False
     audit_or_search_intent = _has_any(

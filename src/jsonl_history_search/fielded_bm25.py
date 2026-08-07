@@ -2350,6 +2350,9 @@ def _select_source_grouped_candidate_rows(
         rows,
         index,
         bm25_rank_by_rowid=bm25_rank_by_rowid,
+        intent=intent,
+        row_stream_labels=row_stream_labels,
+        fusion=fusion,
     )
     protected_rows = _protected_evidence_selection_rows(
         rows,
@@ -2668,7 +2671,13 @@ def _collapse_adjacent_candidate_runs(
     index: FieldedBm25Index,
     *,
     bm25_rank_by_rowid: dict[int, int],
+    intent: QueryIntent | None = None,
+    row_stream_labels: dict[int, set[str]] | None = None,
+    fusion: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[int, int], dict[int, int]]:
+    row_stream_labels = row_stream_labels or {}
+    fusion = fusion or {}
+    primary_intent = _primary_intent(intent) if intent is not None else "generic_history"
     row_by_id = {int(row[0]): row for row in rows}
     sortable: list[tuple[tuple[str, str], int, int, int]] = []
     for row in rows:
@@ -2690,7 +2699,17 @@ def _collapse_adjacent_candidate_runs(
     def flush_run() -> None:
         if not current_run:
             return
-        representative = min(current_run, key=lambda rowid: (bm25_rank_by_rowid.get(rowid, 10**12), rowid))
+        representative = min(
+            current_run,
+            key=lambda rowid: _adjacent_run_representative_key(
+                rowid,
+                index,
+                primary_intent=primary_intent,
+                row_stream_labels=row_stream_labels,
+                fusion=fusion,
+                bm25_rank_by_rowid=bm25_rank_by_rowid,
+            ),
+        )
         run_sizes[representative] = len(current_run)
         representative_to_suppressed[representative] = max(len(current_run) - 1, 0)
         row = row_by_id.get(representative)
@@ -2709,6 +2728,30 @@ def _collapse_adjacent_candidate_runs(
     flush_run()
     representatives.sort(key=lambda row: (bm25_rank_by_rowid.get(int(row[0]), 10**12), int(row[0])))
     return representatives, run_sizes, representative_to_suppressed
+
+
+def _adjacent_run_representative_key(
+    rowid: int,
+    index: FieldedBm25Index,
+    *,
+    primary_intent: str,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+    bm25_rank_by_rowid: dict[int, int],
+) -> tuple[int, int, int]:
+    bucket = 10
+    ref = index.records.get(rowid)
+    labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+    if any(_selection_channel_bucket(label) == "top_exact" for label in labels):
+        bucket = min(bucket, 0)
+    elif primary_intent == "workflow_failure":
+        if _row_has_tool_event_evidence(rowid, index, row_stream_labels=row_stream_labels, fusion=fusion):
+            bucket = min(bucket, 1)
+        elif ref is not None and str(ref.timestamp_bucket or "") != "timestamp_absent":
+            bucket = min(bucket, 2)
+        elif any("workflow_failure" in label or "failure" in label for label in labels):
+            bucket = min(bucket, 3)
+    return (bucket, bm25_rank_by_rowid.get(rowid, 10**12), rowid)
 
 
 def _interleave_group_representatives(
@@ -3352,6 +3395,17 @@ def _row_matches_source_window_intent(
     if primary_intent in {"source_next_reads", "next_reads"}:
         return True
     return False
+
+
+def _row_has_tool_event_evidence(
+    rowid: int,
+    _index: FieldedBm25Index,
+    *,
+    row_stream_labels: dict[int, set[str]],
+    fusion: dict[str, Any],
+) -> bool:
+    labels = _selection_labels_for_row(rowid, row_stream_labels=row_stream_labels, fusion=fusion)
+    return any("tool_event" in label or "role_text_tool" in label for label in labels)
 
 
 def _selection_labels_for_row(
