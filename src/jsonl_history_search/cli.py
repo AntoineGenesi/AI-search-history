@@ -32,7 +32,11 @@ from .agent_loop_cost import (
     write_retained_trace_counter_packet,
 )
 from .archive_snapshot import build_archive_snapshot_proof_payload
-from .ask_router import build_ask_router_payload, execution_kind_for_route_family
+from .ask_router import (
+    build_ask_router_payload,
+    execution_kind_for_route_family,
+    _looks_like_parent_main_complete_interval_status_query,
+)
 from .capability_diagnostic import build_capability_diagnostic
 from .bulk_line_matcher import build_bulk_line_match_payload, load_phrase_specs
 from .agent_skill_install import (
@@ -2294,6 +2298,11 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         query=route.get("structured_execution_query") or args.query,
         audit_depth_override=_selected_route_audit_depth_label(selected_route),
     )
+    if execution_kind == "what-happened-since" and _looks_like_parent_main_complete_interval_status_query(
+        _normalize_ask_route_text(str(route.get("structured_execution_query") or args.query))
+    ):
+        execution_args.parent_thread = True
+        execution_args.complete_interval = True
     try:
         Path(report_output).parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -2998,8 +3007,17 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--until", str(args.until)])
     if getattr(args, "audit_depth", None):
         argv.extend(["--audit-depth", str(args.audit_depth)])
+    if args.command == "what-happened-since":
+        if getattr(args, "parent_thread", False):
+            argv.append("--parent-thread")
+        if getattr(args, "complete_interval", False):
+            argv.append("--complete-interval")
     argv.extend(["--report-output", args.report_output])
     return argv
+
+
+def _normalize_ask_route_text(text: str) -> str:
+    return " ".join(text.lower().replace("?", " ").replace("!", " ").split())
 
 
 def _ask_execute_sidecar_path(report_output: str, label: str) -> Path:

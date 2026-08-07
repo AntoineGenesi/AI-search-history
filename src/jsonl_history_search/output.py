@@ -4679,6 +4679,15 @@ def render_status_anchor_text(payload: dict) -> str:
             f"{fail_closed.get('guidance')} "
             f"answer_allowed={fail_closed.get('answer_allowed')}"
         )
+    if _status_anchor_parent_main_complete_interval_recovery_required(report):
+        lines.append(
+            "Complete-interval answer command: "
+            f"{_status_anchor_rerun_answer_command(report)}"
+        )
+        lines.append(
+            "Combined-history boundary: combined Codex history.jsonl is not an unrecoverable blocker; "
+            "use the canonical parent history row/session linkage or fail closed with this exact command/read."
+        )
     if answer_readiness:
         lines.append(
             "Answer readiness: "
@@ -4934,6 +4943,8 @@ def _status_anchor_canonical_continuation_command(report: dict) -> str:
     for item in interval.get("omitted_ranges") or []:
         if item.get("read_next_command"):
             return str(item["read_next_command"])
+    if _status_anchor_parent_main_complete_interval_recovery_required(report):
+        return _status_anchor_rerun_answer_command(report)
     selected = report.get("selected_anchor") or {}
     if selected.get("read_more_command"):
         return str(selected["read_more_command"])
@@ -4942,6 +4953,9 @@ def _status_anchor_canonical_continuation_command(report: dict) -> str:
 
 def _status_anchor_rerun_answer_command(report: dict) -> str:
     command_options = report.get("command_options") or {}
+    parent_thread = bool(command_options.get("parent_thread")) or _status_anchor_parent_main_complete_interval_recovery_required(
+        report
+    )
     parts = [
         "jsonl-history-search",
         "what-happened-since",
@@ -4951,12 +4965,60 @@ def _status_anchor_rerun_answer_command(report: dict) -> str:
     ]
     if command_options.get("codex_home"):
         parts.extend(["--codex-home", str(command_options["codex_home"])])
-    if command_options.get("parent_thread"):
+    if parent_thread:
         parts.append("--parent-thread")
     parts.extend(["--complete-interval", "--format", "answer"])
     if command_options.get("max_matches"):
         parts.extend(["--max-matches", str(command_options["max_matches"])])
     return " ".join(shlex.quote(part) for part in parts)
+
+
+def _status_anchor_parent_main_complete_interval_recovery_required(report: dict) -> bool:
+    command_options = report.get("command_options") or {}
+    if command_options.get("complete_interval") and command_options.get("parent_thread"):
+        return False
+    routing = report.get("routing") or {}
+    query = " ".join(str(report.get("query") or "").casefold().replace("?", " ").replace("!", " ").split())
+    parent_main = routing.get("anchor_scope") == "parent_thread" or any(
+        marker in query
+        for marker in (
+            "parent thread",
+            "main thread",
+            "parent/main",
+            "main/parent",
+        )
+    )
+    if not parent_main:
+        return False
+    since_or_after = any(
+        marker in query
+        for marker in (
+            "what happened since",
+            "what has happened since",
+            "what happened after",
+            "what has happened after",
+            "since my last",
+            "since my latest",
+            "after my last",
+            "after my latest",
+        )
+    )
+    message_anchor = any(
+        marker in query
+        for marker in (
+            "last message",
+            "latest message",
+            "last user message",
+            "latest user message",
+            "last actual message",
+            "latest actual message",
+            "last substantive instruction",
+            "latest substantive instruction",
+            "last substantive message",
+            "last real instruction",
+        )
+    )
+    return since_or_after and message_anchor
 
 
 def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: dict | None) -> str:
@@ -5159,15 +5221,15 @@ def render_status_anchor_markdown(payload: dict) -> str:
             lines.append(f"- Boundary: {clarification.get('candidate_refs_policy')}")
         lines.append("")
     if fail_closed.get("guidance"):
-        lines.extend(
-            [
-                "## Fail-Closed Guidance",
-                "",
-                f"- {fail_closed.get('guidance')}",
-                f"- Answer allowed: `{fail_closed.get('answer_allowed')}`",
-                "",
-            ]
-        )
+        lines.extend(["## Fail-Closed Guidance", "", f"- {fail_closed.get('guidance')}"])
+        lines.append(f"- Answer allowed: `{fail_closed.get('answer_allowed')}`")
+        if _status_anchor_parent_main_complete_interval_recovery_required(report):
+            lines.append(f"- Complete-interval answer command: `{_status_anchor_rerun_answer_command(report)}`")
+            lines.append(
+                "- Combined-history boundary: combined Codex `history.jsonl` is not an unrecoverable blocker; "
+                "use the canonical parent history row/session linkage or fail closed with this exact command/read."
+            )
+        lines.append("")
     if answer_readiness:
         lines.extend(
             [

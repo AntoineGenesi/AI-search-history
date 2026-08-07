@@ -1249,6 +1249,13 @@ def build_ask_router_payload(
         route_family=route.route_family,
         audit_depth=audit_depth_payload,
     )
+    if route.route_family == "latest_status" and _looks_like_parent_main_complete_interval_status_query(
+        normalized_route_query
+    ):
+        first_command = _parent_main_complete_interval_status_command(
+            cli_prefix=cli_prefix,
+            query=structured_execution_query,
+        )
     method_selection_packet = _method_selection_packet(route.route_family, first_command)
     explicit_task_match = _EXPLICIT_TASK_PATH_RE.search(query.lower())
     named_task_path = explicit_task_match.group(0) if explicit_task_match else ""
@@ -1383,6 +1390,56 @@ def _first_command_with_audit_depth(command: str, *, route_family: str, audit_de
     if " --format " in command:
         return command.replace(" --format ", f"{audit_arg} --format ", 1)
     return f"{command}{audit_arg}"
+
+
+def _looks_like_parent_main_complete_interval_status_query(normalized: str) -> bool:
+    parent_main = _has_any(
+        normalized,
+        (
+            "parent thread",
+            "main thread",
+            "parent/main",
+            "main/parent",
+        ),
+    )
+    if not parent_main:
+        return False
+    since_or_after = _has_any(
+        normalized,
+        (
+            "what happened since",
+            "what has happened since",
+            "what happened after",
+            "what has happened after",
+            "since my last",
+            "since my latest",
+            "after my last",
+            "after my latest",
+        ),
+    )
+    message_anchor = _has_any(
+        normalized,
+        (
+            "last message",
+            "latest message",
+            "last user message",
+            "latest user message",
+            "last actual message",
+            "latest actual message",
+            "last substantive instruction",
+            "latest substantive instruction",
+            "last substantive message",
+            "last real instruction",
+        ),
+    )
+    return since_or_after and message_anchor
+
+
+def _parent_main_complete_interval_status_command(*, cli_prefix: str, query: str) -> str:
+    return (
+        f"{cli_prefix} what-happened-since {shlex.quote(query)} "
+        '--cwd "$PWD" --parent-thread --complete-interval --format answer'
+    )
 
 
 def _route_audit_depth_payload(
