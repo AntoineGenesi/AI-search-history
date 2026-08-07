@@ -302,6 +302,14 @@ def render(payload: dict, output_format: str) -> str:
         return render_json(payload)
     if output_format == "markdown":
         return render_markdown(payload)
+    if output_format == "answer":
+        return render_answer(payload)
+    return render_text(payload)
+
+
+def render_answer(payload: dict) -> str:
+    if "status_anchor" in payload:
+        return render_status_anchor_answer(payload)
     return render_text(payload)
 
 
@@ -4792,6 +4800,139 @@ def render_status_anchor_text(payload: dict) -> str:
     for warning in report.get("warnings", []):
         lines.append(f"Warning: {warning}")
     return "\n".join(lines)
+
+
+def render_status_anchor_answer(payload: dict) -> str:
+    report = payload["status_anchor"]
+    if not _status_anchor_answer_format_ready(report):
+        return "\n".join(
+            [
+                "NOT ANSWERABLE YET",
+                _status_anchor_canonical_continuation_command(report),
+            ]
+        )
+
+    selected = report.get("selected_anchor") or {}
+    routing = report.get("routing") or {}
+    interval = report.get("post_anchor_interval_reconstruction") or {}
+    coverage = interval.get("coverage") or {}
+    boundary = interval.get("boundary") or {}
+    session_activity = report.get("session_activity") or {}
+    followups = session_activity.get("session_followups") or []
+    joins = interval.get("secondary_evidence_joins") or {}
+    entries = interval.get("chronological_activity") or []
+    parent_identity = selected.get("source_identifier") or selected.get("source_ref")
+    parent_hash = selected.get("session_id_hash") or selected.get("source_identifier")
+    lines = [
+        "ANSWER READY",
+        (
+            "Selected parent history row: "
+            f"{selected.get('timestamp_utc')} {selected.get('source_ref')} "
+            f"identity={parent_identity} hash={parent_hash}"
+        ),
+        (
+            "Parent-thread boundary: "
+            f"scope={routing.get('anchor_scope')} reason={routing.get('anchor_reason')} "
+            f"ref={routing.get('anchor_ref')}"
+        ),
+        (
+            "Interval bounds: "
+            f"anchor={selected.get('timestamp_utc')} "
+            f"boundary={boundary.get('timestamp_utc') or 'now/latest'} "
+            f"boundary_ref={boundary.get('source_ref') or '(none)'}"
+        ),
+        (
+            "Coverage: "
+            f"status={coverage.get('status')} complete={coverage.get('complete')} "
+            f"records_after_anchor={coverage.get('records_after_anchor')} "
+            f"entries={interval.get('chronological_entry_count')} "
+            f"omitted={coverage.get('omitted_activity_entry_count', 0)}"
+        ),
+        "Touched session files:",
+    ]
+    if followups:
+        for item in followups[:12]:
+            lines.append(
+                "- "
+                f"role={item.get('role')} session_hash={item.get('session_id_hash')} "
+                f"records_after_anchor={item.get('records_after_anchor')} "
+                f"file={item.get('session_file')}"
+            )
+    else:
+        lines.append("- (none surfaced)")
+    lines.append("Timeline:")
+    if entries:
+        for entry in entries[:16]:
+            lines.append(
+                "- "
+                f"{entry.get('timestamp_utc')} {entry.get('source_ref')} "
+                f"{entry.get('activity_kind')}: {entry.get('snippet')}"
+            )
+    else:
+        lines.append("- (no chronological activity refs surfaced)")
+    lines.append("Secondary joins (capped):")
+    for key in ("tasks", "reports", "reviews", "git_commits"):
+        items = joins.get(key) or []
+        lines.append(f"- {key}: {len(items)}")
+        for item in items[:3]:
+            lines.append(
+                "  - "
+                f"{item.get('source_ref')} {item.get('evidence_timestamp_utc') or item.get('committed_at')}: "
+                f"{item.get('snippet')}"
+            )
+    return "\n".join(lines)
+
+
+def _status_anchor_answer_format_ready(report: dict) -> bool:
+    readiness = report.get("answer_readiness") or {}
+    interval = report.get("post_anchor_interval_reconstruction") or {}
+    coverage = interval.get("coverage") or {}
+    selected = report.get("selected_anchor") or {}
+    routing = report.get("routing") or {}
+    command_options = report.get("command_options") or {}
+    if not selected:
+        return False
+    if readiness.get("answer_allowed") is not True:
+        return False
+    if coverage.get("complete") is not True:
+        return False
+    if command_options.get("parent_thread") and routing.get("anchor_scope") != "parent_thread":
+        return False
+    return True
+
+
+def _status_anchor_canonical_continuation_command(report: dict) -> str:
+    interval = report.get("post_anchor_interval_reconstruction") or {}
+    guidance = interval.get("next_read_guidance") or {}
+    commands = [str(command) for command in guidance.get("commands") or [] if command]
+    if commands:
+        return commands[0]
+    for item in interval.get("omitted_ranges") or []:
+        if item.get("read_next_command"):
+            return str(item["read_next_command"])
+    selected = report.get("selected_anchor") or {}
+    if selected.get("read_more_command"):
+        return str(selected["read_more_command"])
+    return _status_anchor_rerun_answer_command(report)
+
+
+def _status_anchor_rerun_answer_command(report: dict) -> str:
+    command_options = report.get("command_options") or {}
+    parts = [
+        "jsonl-history-search",
+        "what-happened-since",
+        str(report.get("query") or "what happened since my last message?"),
+        "--cwd",
+        str(command_options.get("cwd") or "."),
+    ]
+    if command_options.get("codex_home"):
+        parts.extend(["--codex-home", str(command_options["codex_home"])])
+    if command_options.get("parent_thread"):
+        parts.append("--parent-thread")
+    parts.extend(["--complete-interval", "--format", "answer"])
+    if command_options.get("max_matches"):
+        parts.extend(["--max-matches", str(command_options["max_matches"])])
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: dict | None) -> str:
