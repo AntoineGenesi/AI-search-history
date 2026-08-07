@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -134,6 +135,16 @@ def build_agent_find_payload(
             next_read_rows,
             no_evidence_report=no_evidence_report,
         )
+    cap_next_action = build_cap_next_action_guidance(
+        status=status,
+        source_plan=source_plan,
+        search_result=search_result,
+        candidates=candidates,
+    )
+    bm25_escalation = build_bm25_escalation_guidance(
+        source_plan=source_plan,
+        cap_next_action=cap_next_action,
+    )
     agent_find = {
         "schema_version": 1,
         "status": status,
@@ -181,6 +192,10 @@ def build_agent_find_payload(
             "searched_bytes": search_result.get("searched_bytes", 0),
         },
     }
+    if cap_next_action:
+        agent_find["cap_next_action"] = cap_next_action
+    if bm25_escalation:
+        agent_find["bm25_escalation"] = bm25_escalation
     if search_result.get("retrieval_diagnostics"):
         agent_find["retrieval_diagnostics"] = search_result["retrieval_diagnostics"]
         retrieval_pressure = build_retrieval_pressure_summary(search_result)
@@ -7161,9 +7176,7 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
     roots = list(sources.get("roots", []))
     rejected_roots = list(sources.get("rejected_roots", []))
     retrieval_diagnostics = search_result.get("retrieval_diagnostics") if isinstance(search_result, dict) else {}
-    retrieval_source_plan = sanitize_source_plan(
-        retrieval_diagnostics.get("source_plan") if isinstance(retrieval_diagnostics, dict) else {}
-    )
+    retrieval_source_plan = source_scope_retrieval_source_plan(search_result, source_plan)
     blind_spots = list(search_result.get("blind_spots", []) or sources.get("blind_spots", []))
     missing_roots = [root for root in roots if root_is_missing(root, blind_spots)]
     missing_paths = {root.get("path") for root in missing_roots}
@@ -7228,6 +7241,67 @@ def build_source_scope_summary(source_plan: dict, search_result: dict) -> dict:
     }
 
 
+def source_scope_retrieval_source_plan(search_result: dict, source_plan: dict) -> dict[str, Any]:
+    diagnostics = search_result.get("retrieval_diagnostics") if isinstance(search_result, dict) else {}
+    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("source_plan"), dict):
+        return sanitize_source_plan(diagnostics.get("source_plan"))
+    return package_source_plan_fallback(search_result, source_plan)
+
+
+def package_source_plan_fallback(search_result: dict, source_plan: dict) -> dict[str, Any]:
+    sources = source_plan.get("sources") if isinstance(source_plan.get("sources"), dict) else {}
+    limits = sources.get("limits") if isinstance(sources.get("limits"), dict) else {}
+    planned_count = int(search_result.get("planned_files_count") or 0)
+    opened_count = int(search_result.get("opened_files_count") or search_result.get("searched_files") or 0)
+    searched_bytes = int(search_result.get("searched_bytes") or 0)
+    deferred_count = max(planned_count - opened_count, 0)
+    plan = sanitize_source_plan(
+        {
+            "source": "package_scanner_source_progress",
+            "basis": "default_package_planned_files_and_opened_files",
+            "selection_policy": "package_scanner_streaming_progress_not_fielded_bm25_source_tiers",
+            "sources_total": planned_count,
+            "sources_selected": opened_count,
+            "sources_deferred_budget": deferred_count,
+            "byte_count_selected": searched_bytes,
+            "byte_count_total": searched_bytes,
+            "deferred_reason_counts": {"package_planned_but_unopened": deferred_count} if deferred_count else {},
+            "budget_basis": {
+                "policy": "default_package_scanner_opened_file_progress",
+                "max_selected_files": int(limits.get("max_files") or 0),
+                "max_selected_bytes": int(limits.get("max_bytes") or 0),
+                "eligible_source_count_after_hard_prune": planned_count,
+                "effective_files": int(limits.get("effective_files") or limits.get("max_files") or 0),
+                "effective_bytes": int(limits.get("effective_bytes") or limits.get("max_bytes") or 0),
+                "max_matches": int(limits.get("max_matches") or 0),
+            },
+            "retry_guidance": {
+                "needed": bool(deferred_count),
+                "deferred_source_count": deferred_count,
+                "guidance": (
+                    "Some package-planned files were not opened before scan stop; retry with narrower scope, larger safe caps, "
+                    "or explicit fielded BM25 over the same source set."
+                    if deferred_count
+                    else ""
+                ),
+            },
+            "materialization_budget": {
+                "max_files": int(limits.get("max_files") or 0),
+                "max_bytes": int(limits.get("max_bytes") or 0),
+                "max_elapsed": float(limits.get("max_elapsed") or 0.0),
+                "effective_files": int(limits.get("effective_files") or limits.get("max_files") or 0),
+                "effective_bytes": int(limits.get("effective_bytes") or limits.get("max_bytes") or 0),
+            },
+            "exhaustive_available": bool(
+                planned_count > 0
+                and deferred_count == 0
+                and not (search_result.get("warnings") or sources.get("warnings"))
+            ),
+        }
+    )
+    return plan
+
+
 def compact_scope_root(root: dict) -> dict:
     return {
         "kind": root.get("kind"),
@@ -7281,6 +7355,246 @@ def cap_hit_status(*, warnings: list[str], limits: dict) -> dict:
         "caps_hit": sorted(caps_hit),
         "normalized_warnings": sorted(normalized_warnings),
         "limits": limits,
+    }
+
+
+def build_cap_next_action_guidance(
+    *,
+    status: str,
+    source_plan: dict,
+    search_result: dict,
+    candidates: list[CandidateRow],
+) -> dict[str, Any] | None:
+    retrieval_mode = str(search_result.get("retrieval_mode") or "package")
+    if retrieval_mode != "package":
+        return None
+    source_scope = build_source_scope_summary(source_plan, search_result)
+    cap_hit = source_scope["cap_hit"]
+    reasons: list[str] = []
+    confidence_counts = Counter(str(candidate.confidence or "unknown").lower() for candidate in candidates)
+    usable_evidence = returned_evidence_usable(candidates)
+    cap_names = set(cap_hit.get("caps_hit") or [])
+    broad_retrieval_caps = {
+        "max_file_cap",
+        "max_byte_cap",
+        "max_elapsed_cap",
+        "max_match_cap",
+        "weak_candidate_reservoir_cap",
+    }
+    deferred_sources = int(source_scope["not_searched_scope"]["source_plan"].get("sources_deferred_budget") or 0)
+    searched_files = int(source_scope["searched_scope"].get("searched_files") or search_result.get("searched_files") or 0)
+    source_or_candidate_pressure = deferred_sources > 0 or bool(cap_names & broad_retrieval_caps)
+    weak_surface = weak_candidate_surface(candidates)
+    if status == "no_evidence":
+        reasons.append("no_candidate_rows_in_searched_scope")
+    if cap_hit.get("hit"):
+        reasons.append("cap_pressure_reported")
+    if deferred_sources > 0:
+        reasons.append("source_plan_budget_deferred_files")
+    if weak_surface:
+        reasons.append("only_low_confidence_candidate_surface")
+    if not reasons:
+        return None
+
+    if usable_evidence:
+        selected_action = "read_exact_source_window" if cap_hit.get("hit") else "use_returned_evidence"
+        rationale = (
+            "Returned candidates include usable evidence; inspect the surfaced source refs before broadening retrieval."
+        )
+        bm25_recommended = False
+    elif weak_surface and not source_or_candidate_pressure:
+        selected_action = "refine_query_or_scope"
+        rationale = "Candidates are weak/noisy, but no broad source pressure is reported; narrow terms, source, role, or date first."
+        bm25_recommended = False
+    elif (status == "no_evidence" and (searched_files > 0 or source_or_candidate_pressure)) or (
+        weak_surface and source_or_candidate_pressure
+    ) or (
+        not candidates and source_or_candidate_pressure
+    ):
+        selected_action = "scoped_file_backed_bm25"
+        rationale = (
+            "Default retrieval did not surface usable evidence and source/candidate pressure may have hidden relevant records."
+        )
+        bm25_recommended = True
+    elif status == "no_evidence":
+        selected_action = "refine_query_or_scope"
+        rationale = (
+            "No usable source scope was searched; fix selected roots, bounds, or query scope before retrying a retrieval index."
+        )
+        bm25_recommended = False
+    elif cap_hit.get("hit"):
+        selected_action = "refine_query_or_scope"
+        rationale = "A cap was reported, but the current result is not a good BM25 case; refine the query/scope before indexing."
+        bm25_recommended = False
+    else:
+        selected_action = "use_returned_evidence"
+        rationale = "Use the returned evidence before broadening retrieval."
+        bm25_recommended = False
+
+    command = build_fielded_bm25_retry_command(source_plan) if bm25_recommended else None
+    action_order = [
+        selected_action,
+        *[
+            action
+            for action in (
+                "use_returned_evidence",
+                "read_exact_source_window",
+                "refine_query_or_scope",
+                "raise_cheap_cap",
+                "scoped_file_backed_bm25",
+            )
+            if action != selected_action
+        ],
+    ]
+    return {
+        "schema_version": 1,
+        "status": "actionable",
+        "selected_action": selected_action,
+        "trigger_reasons": reasons,
+        "rationale": rationale,
+        "bm25_recommended": bm25_recommended,
+        "action_order": action_order,
+        "candidate_surface": {
+            "candidate_count": len(candidates),
+            "confidence_counts": dict(sorted(confidence_counts.items())),
+            "top_confidence": str(candidates[0].confidence) if candidates else None,
+            "usable_evidence_present": usable_evidence,
+            "only_low_confidence": weak_surface,
+        },
+        "cap_hit": {
+            "hit": bool(cap_hit.get("hit")),
+            "caps_hit": list(cap_hit.get("caps_hit") or []),
+            "normalized_warnings": list(cap_hit.get("normalized_warnings") or []),
+        },
+        "source_scope_summary": {
+            "searched_files": int(source_scope["searched_scope"].get("searched_files") or 0),
+            "searched_bytes": int(source_scope["searched_scope"].get("searched_bytes") or 0),
+            "missing_root_count": int(source_scope["not_searched_scope"].get("missing_root_count") or 0),
+            "rejected_root_count": int(source_scope["excluded_scope"].get("rejected_root_count") or 0),
+            "sources_total": int(source_scope["not_searched_scope"]["source_plan"].get("sources_total") or 0),
+            "sources_selected": int(source_scope["not_searched_scope"]["source_plan"].get("sources_selected") or 0),
+            "sources_pruned_hard": int(source_scope["not_searched_scope"]["source_plan"].get("sources_pruned_hard") or 0),
+            "sources_deferred_budget": deferred_sources,
+            "exhaustive_available": bool(
+                source_scope["not_searched_scope"]["source_plan"].get("exhaustive_available", False)
+            ),
+        },
+        "command": command,
+        "claim_boundaries": {
+            "default_behavior_changed": False,
+            "bm25_auto_invoked": False,
+            "rrf_auto_invoked": False,
+            "all_history_completeness_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+        },
+    }
+
+
+def build_bm25_escalation_guidance(
+    *,
+    source_plan: dict,
+    cap_next_action: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not cap_next_action or cap_next_action.get("selected_action") != "scoped_file_backed_bm25":
+        return None
+    command = cap_next_action.get("command") or build_fielded_bm25_retry_command(source_plan)
+    return {
+        "schema_version": 1,
+        "status": "recommended",
+        "retrieval_mode": "fielded-bm25",
+        "trigger_reasons": list(cap_next_action.get("trigger_reasons") or []),
+        "cap_hit": cap_next_action.get("cap_hit") or {},
+        "source_scope_summary": cap_next_action.get("source_scope_summary") or {},
+        "recommendation": (
+            "Retry explicitly with file-backed fielded BM25 over the same bounded source/time scope before "
+            "treating this package result as complete."
+        ),
+        "command": command,
+        "rrf_policy": {
+            "recommended_now": False,
+            "reason": "RRF remains explicit/high-recall only; this hint recommends bounded fielded BM25 first.",
+        },
+        "claim_boundaries": {
+            "default_behavior_changed": False,
+            "bm25_auto_invoked": False,
+            "rrf_auto_invoked": False,
+            "all_history_completeness_claim_supported": False,
+            "final_answer_quality_claim_supported": False,
+            "token_savings_claim_supported": False,
+        },
+        "privacy": {
+            "raw_text_included": False,
+            "raw_snippets_included": False,
+            "raw_paths_included": bool(command.get("contains_local_paths", False)),
+            "raw_query_text_included": bool(command.get("contains_query_text", False)),
+        },
+    }
+
+
+def returned_evidence_usable(candidates: list[CandidateRow]) -> bool:
+    if not candidates:
+        return False
+    for candidate in candidates[:3]:
+        confidence = str(candidate.confidence or "").lower()
+        if confidence in {"high", "medium"} and candidate.path and candidate.line > 0:
+            return True
+    return False
+
+
+def weak_candidate_surface(candidates: list[CandidateRow]) -> bool:
+    if not candidates:
+        return False
+    return all(str(candidate.confidence or "").lower() in {"low", "weak"} for candidate in candidates)
+
+
+def build_fielded_bm25_retry_command(source_plan: dict) -> dict[str, Any]:
+    query = str((source_plan.get("query") or {}).get("original") or "")
+    argv = [
+        "jsonl-history-search",
+        "find",
+        query,
+        "--retrieval-mode",
+        "fielded-bm25",
+        "--fielded-bm25-storage",
+        "file",
+    ]
+    if source_plan.get("cwd"):
+        argv.extend(["--cwd", str(source_plan["cwd"])])
+    if source_plan.get("codex_home"):
+        argv.extend(["--codex-home", str(source_plan["codex_home"])])
+    if source_plan.get("claude_home"):
+        argv.extend(["--claude-home", str(source_plan["claude_home"])])
+    roots = list((source_plan.get("sources") or {}).get("roots") or [])
+    for root in roots:
+        path = root.get("path") if isinstance(root, dict) else None
+        if path:
+            argv.extend(["--root", str(path)])
+    if any(not bool(root.get("known", False)) for root in roots if isinstance(root, dict)):
+        limits = (source_plan.get("sources") or {}).get("limits") or {}
+        argv.append("--allow-arbitrary-root")
+        if limits.get("hard_cap_files") is not None:
+            argv.extend(["--hard-cap-files", str(limits["hard_cap_files"])])
+        if limits.get("hard_cap_bytes") is not None:
+            argv.extend(["--hard-cap-bytes", str(limits["hard_cap_bytes"])])
+    limits = (source_plan.get("sources") or {}).get("limits") or {}
+    for flag, key in (
+        ("--max-files", "max_files"),
+        ("--max-bytes", "max_bytes"),
+        ("--max-matches", "max_matches"),
+        ("--max-elapsed", "max_elapsed"),
+    ):
+        if limits.get(key) is not None:
+            argv.extend([flag, str(limits[key])])
+    query_window = ((source_plan.get("query") or {}).get("date_window") or {})
+    if query_window.get("start") and query_window.get("end"):
+        argv.extend(["--since", str(query_window["start"]), "--until", str(query_window["end"])])
+    return {
+        "argv": argv,
+        "shell": " ".join(shlex.quote(str(part)) for part in argv),
+        "preserves_current_scope": True,
+        "contains_local_paths": bool(source_plan.get("cwd") or source_plan.get("codex_home") or source_plan.get("claude_home") or roots),
+        "contains_query_text": bool(query),
     }
 
 
