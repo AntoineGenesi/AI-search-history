@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -13372,6 +13373,56 @@ SEMANTIC_DEBUG_GENERIC_RETRY_SLICE_LIMIT = 8
 SEMANTIC_DEBUG_GENERIC_RETRY_SCAN_FILE_LIMIT = 96
 
 MODEL_TOKEN_RE = re.compile(r"\b(?:gpt|claude|o\d)[A-Za-z0-9._-]*(?:-[A-Za-z0-9._-]+)*\b", re.IGNORECASE)
+DEEP_AUDIT_TARGET_STOPWORDS = {
+    "about",
+    "after",
+    "agent",
+    "agents",
+    "audit",
+    "because",
+    "before",
+    "chat",
+    "chatlog",
+    "chatlogs",
+    "code",
+    "convo",
+    "conversation",
+    "deep",
+    "failure",
+    "from",
+    "happened",
+    "history",
+    "long",
+    "long-running",
+    "running",
+    "session",
+    "sessions",
+    "task",
+    "that",
+    "the",
+    "this",
+    "through",
+    "tool",
+    "what",
+    "when",
+    "where",
+    "with",
+    "workflow",
+}
+DEEP_AUDIT_DRIFT_MARKERS = (
+    "latest_parent_explicit",
+    "latest-parent",
+    "no-hint",
+    "receiving-agent",
+    "free-running",
+    "evaluation",
+    "eval",
+    "benchmark",
+    "previous lane",
+    "previous-lane",
+    "same-run",
+    "same run",
+)
 
 
 def build_in_depth_semantic_debug_audit_coverage(
@@ -13885,13 +13936,16 @@ def build_in_depth_audit_followthrough_plan(
     if not coverage.get("applies"):
         return {}
 
-    selected_reads = select_in_depth_audit_primary_reads(next_reads)
+    target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=next_reads)
+    selected_reads = select_in_depth_audit_primary_reads_for_query(next_reads, query=query)
     continuation_commands = in_depth_audit_continuation_commands(
         query=query,
         args=args,
         coverage=coverage,
+        target_contract=target_contract,
     )
-    coverage_complete = bool(coverage.get("answer_promotion_allowed"))
+    target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
+    coverage_complete = bool(coverage.get("answer_promotion_allowed")) and target_persistence_ready
     searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
     not_searched_scope = scope_boundary_summary.get("not_searched_scope") if isinstance(scope_boundary_summary, dict) else {}
     caps = scope_boundary_summary.get("caps") if isinstance(scope_boundary_summary, dict) else {}
@@ -13908,6 +13962,14 @@ def build_in_depth_audit_followthrough_plan(
             "commands for the pending date/path slices that affect the requested facets, then either answer with "
             "the remaining gaps named or report the blocked/capped windows."
         )
+    if not target_persistence_ready and not continuation_commands:
+        continuation = in_depth_audit_target_refocus_command(
+            query=query,
+            args=args,
+            target_contract=target_contract,
+        )
+        if continuation:
+            continuation_commands.append(continuation)
     answer_ready = bool(coverage_complete)
     workflow = {
         "schema_version": 1,
@@ -13916,8 +13978,8 @@ def build_in_depth_audit_followthrough_plan(
         "hard_stop": not answer_ready,
         "answer_status": "answer_ready" if answer_ready else "not_answerable_yet",
         "hard_stop_semantics": (
-            "NOT ANSWERABLE YET: open ordered primary refs, then run the scoped continuation commands for "
-            "pending cap/coverage slices before answering."
+            "NOT ANSWERABLE YET: open target-matching ordered primary refs, then run the scoped continuation "
+            "commands for pending cap/coverage slices before answering."
             if not answer_ready
             else "Answer only after ordered primary refs support the requested facets within searched scope."
         ),
@@ -13933,6 +13995,7 @@ def build_in_depth_audit_followthrough_plan(
             "Use raw transcript/session/tool refs as primary evidence for broad coordinator audits; task, review, "
             "commit, and report artifacts are secondary joins unless explicitly requested."
         ),
+        "target_persistence_contract": target_contract,
     }
     return {
         "schema_version": 1,
@@ -13944,6 +14007,7 @@ def build_in_depth_audit_followthrough_plan(
         "audit_depth": coverage.get("audit_depth"),
         "ordered_primary_refs_to_open_first": selected_reads,
         "ordered_primary_ref_count": len(selected_reads),
+        "target_persistence_contract": target_contract,
         "primary_read_limit": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
         "coverage_state": {
             "status": coverage.get("status"),
@@ -13963,6 +14027,7 @@ def build_in_depth_audit_followthrough_plan(
             "repeat semantic-debug for the same question except the emitted scoped continuation commands",
             "keep expanding read-more after selected refs cover the asked facets",
             "claim full-history completeness from capped or top-N candidate samples",
+            "answer from previous-lane/eval artifacts when target_persistence_contract.target_persistence_ready is false",
         ],
         "artifact_and_local_evidence_boundary": {
             "committed_public_export_surface": "refs_and_commands_without_raw_transcript_text",
@@ -13970,6 +14035,7 @@ def build_in_depth_audit_followthrough_plan(
             "metadata_only_is_efficiency_or_public_artifact_mode_not_product_principle": True,
             "raw_window_inspection_available_for_local_proof": True,
         },
+        "target_drift_policy": target_contract.get("target_drift_policy"),
         "continuation_policy": {
             "status": "scoped_continuations_available" if continuation_commands else "no_bounded_continuation_available",
             "emit_only_when_coverage_incomplete": not coverage_complete,
@@ -13983,12 +14049,19 @@ def build_in_depth_audit_followthrough_plan(
 
 
 def select_in_depth_audit_primary_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return select_in_depth_audit_primary_reads_for_query(next_reads, query="")
+
+
+def select_in_depth_audit_primary_reads_for_query(next_reads: list[dict[str, Any]], *, query: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen_targets: set[str] = set()
     for read in next_reads:
         if not isinstance(read, dict):
             continue
         if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
+            continue
+        alignment = deep_audit_read_target_alignment(read, query=query)
+        if alignment.get("target_drift_risk") and not alignment.get("target_match"):
             continue
         target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
         if not target or target in seen_targets:
@@ -13998,10 +14071,127 @@ def select_in_depth_audit_primary_reads(next_reads: list[dict[str, Any]]) -> lis
         row["deep_audit_read_role"] = "ordered_primary_ref_to_open_first"
         row["read_more_actionable"] = True
         row["followthrough_actionable"] = True
+        row["target_alignment"] = alignment
         rows.append(row)
         if len(rows) >= IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT:
             break
     return rows
+
+
+def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list[dict[str, Any]]) -> dict[str, Any]:
+    terms = deep_audit_target_terms(query)
+    drift_risk_reads = []
+    target_matched_reads = []
+    actionable_read_count = 0
+    for read in next_reads:
+        if not isinstance(read, dict):
+            continue
+        if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
+            continue
+        actionable_read_count += 1
+        alignment = deep_audit_read_target_alignment(read, query=query)
+        target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+        row = {
+            "target_hash_12": hashlib.sha256(target.encode("utf-8", errors="replace")).hexdigest()[:12] if target else None,
+            "target_match": alignment.get("target_match"),
+            "target_drift_risk": alignment.get("target_drift_risk"),
+            "matched_terms": alignment.get("matched_terms"),
+            "drift_markers": alignment.get("drift_markers"),
+            "final_support_allowed": bool(alignment.get("target_match")) and not alignment.get("target_drift_risk"),
+            "diagnostic_only_if_drift": bool(alignment.get("target_drift_risk") and not alignment.get("target_match")),
+        }
+        if alignment.get("target_match"):
+            target_matched_reads.append(row)
+        if alignment.get("target_drift_risk"):
+            drift_risk_reads.append(row)
+    target_fingerprint = hashlib.sha256(deep_audit_normalize_text(query).encode("utf-8", errors="replace")).hexdigest()[:12]
+    target_persistence_ready = len(target_matched_reads) > 0 and not any(
+        read.get("target_drift_risk") and read.get("target_match") for read in drift_risk_reads
+    )
+    return {
+        "schema_version": 1,
+        "target_fingerprint_12": target_fingerprint,
+        "target_terms": terms[:12],
+        "target_term_count": len(terms),
+        "target_persistence_required": True,
+        "target_matched_read_count": len(target_matched_reads),
+        "actionable_read_count": actionable_read_count,
+        "target_drift_risk_count": len(drift_risk_reads),
+        "target_persistence_ready": target_persistence_ready,
+        "answer_ready_blocked_by_target_drift": not target_persistence_ready,
+        "target_drift_risk_reads": drift_risk_reads[:8],
+        "target_match_reads": target_matched_reads[:8],
+        "answer_ready_requires_target_persistence": True,
+        "target_drift_policy": {
+            "previous_lane_or_eval_artifacts_are_diagnostic_only": True,
+            "do_not_answer_from_drift_refs_without_target_match": True,
+            "do_not_answer_from_any_previous_lane_or_eval_ref": True,
+            "if_continuation_results_shift_target": "fail_closed_and_rerun_scoped_continuation_for_original_target",
+            "raw_text_included": False,
+        },
+        "canonical_target_reminder": (
+            "Keep the original audit target fixed across caps and continuations; do not pivot to previous "
+            "receiving-agent lanes, same-run eval artifacts, or adjacent task reports unless they are explicitly "
+            "the requested audit subject."
+        ),
+    }
+
+
+def deep_audit_target_persistence_ready(contract: dict[str, Any]) -> bool:
+    if not contract:
+        return True
+    return bool(contract.get("target_persistence_ready"))
+
+
+def deep_audit_target_terms(query: str) -> list[str]:
+    normalized = deep_audit_normalize_text(query)
+    terms = []
+    for term in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", normalized):
+        if term in DEEP_AUDIT_TARGET_STOPWORDS:
+            continue
+        if len(term) <= 3 and not any(char.isdigit() for char in term):
+            continue
+        terms.append(term)
+    return dedupe(terms)
+
+
+def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dict[str, Any]:
+    terms = deep_audit_target_terms(query)
+    haystack = deep_audit_normalize_text(
+        " ".join(
+            str(value or "")
+            for value in (
+                read.get("target"),
+                read.get("reason"),
+                read.get("target_source_role"),
+                read.get("source_chronology_role"),
+                source_ref_target(read.get("source_ref") or {}),
+            )
+        )
+    )
+    matched_terms = [term for term in terms if term in haystack]
+    drift_markers = [marker for marker in DEEP_AUDIT_DRIFT_MARKERS if marker in haystack]
+    role = str(read.get("target_source_role") or "")
+    target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
+    drift_risk = bool(drift_markers)
+    strong_match_terms = [term for term in matched_terms if term not in {"jsonl", "search", "coordinator"}]
+    target_match = bool(strong_match_terms) or (
+        not terms and (role == "target_historical_raw" or target.endswith(".jsonl") or ".jsonl:" in target)
+    )
+    if drift_risk:
+        target_match = False
+    return {
+        "target_match": target_match,
+        "target_drift_risk": drift_risk,
+        "matched_terms": matched_terms[:8],
+        "drift_markers": drift_markers[:8],
+        "target_term_count": len(terms),
+        "raw_text_included": False,
+    }
+
+
+def deep_audit_normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
 
 
 def in_depth_audit_omitted_or_capped_windows(coverage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -14028,6 +14218,7 @@ def in_depth_audit_continuation_commands(
     query: str,
     args: Any,
     coverage: dict[str, Any],
+    target_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if coverage.get("answer_promotion_allowed"):
         return []
@@ -14038,6 +14229,7 @@ def in_depth_audit_continuation_commands(
             args=args,
             slice_row=slice_row,
             index=len(commands) + 1,
+            target_contract=target_contract or {},
         )
         if command:
             commands.append(command)
@@ -14052,6 +14244,7 @@ def in_depth_audit_continuation_command_for_slice(
     args: Any,
     slice_row: dict[str, Any],
     index: int,
+    target_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     window = slice_row.get("window") if isinstance(slice_row.get("window"), dict) else {}
     argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", "in-depth"]
@@ -14071,6 +14264,7 @@ def in_depth_audit_continuation_command_for_slice(
         argv.extend(["--path", str(window["path"])])
     else:
         return None
+    target_contract = target_contract or {}
     return {
         "command_id": f"continue_scoped_audit_slice_{index:02d}",
         "slice": slice_row.get("slice"),
@@ -14080,6 +14274,46 @@ def in_depth_audit_continuation_command_for_slice(
         "cap_labels": list(slice_row.get("caps_to_retry") or (slice_row.get("cap_hit") or {}).get("caps_hit") or []),
         "retry_guidance": slice_row.get("retry_guidance"),
         "reason": "coverage incomplete; use this scoped continuation instead of broad git/rg/task artifact inspection",
+        "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+        "target_persistence_required": True,
+        "target_reminder": target_contract.get("canonical_target_reminder"),
+        "argv": argv,
+        "command": " ".join(shlex.quote(str(part)) for part in argv),
+    }
+
+
+def in_depth_audit_target_refocus_command(
+    *,
+    query: str,
+    args: Any,
+    target_contract: dict[str, Any],
+) -> dict[str, Any] | None:
+    argv = [
+        "jsonl-history-search",
+        "semantic-debug",
+        query,
+        "--audit-depth",
+        "in-depth",
+    ]
+    for root in getattr(args, "root", None) or []:
+        argv.extend(["--root", str(root)])
+    cwd = getattr(args, "cwd", None)
+    if cwd:
+        argv.extend(["--cwd", str(cwd)])
+    if getattr(args, "allow_arbitrary_root", False):
+        argv.append("--allow-arbitrary-root")
+    return {
+        "command_id": "refocus_original_audit_target_01",
+        "slice": "target_persistence_refocus",
+        "missing_or_capped_window": {"type": "target_persistence", "target_fingerprint_12": target_contract.get("target_fingerprint_12")},
+        "status": "target_mismatch_detected",
+        "coverage_label": "target_mismatch_detected",
+        "cap_labels": [],
+        "retry_guidance": "rerun the original audit query and require target-matching raw transcript refs before answering",
+        "reason": "target persistence incomplete; previous-lane/eval artifacts were diagnostic-only and cannot support the answer",
+        "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+        "target_persistence_required": True,
+        "target_reminder": target_contract.get("canonical_target_reminder"),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
     }

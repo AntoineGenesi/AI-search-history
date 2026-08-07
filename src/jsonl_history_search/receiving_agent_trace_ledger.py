@@ -43,6 +43,13 @@ NOT_ANSWERABLE_RE = re.compile(r"(?im)(?:^|\n)\s*NOT ANSWERABLE YET\b")
 STALE_SELECTED_ANCHOR_RE = re.compile(r"\bstale_selected_anchor\b", re.IGNORECASE)
 SELECTED_ANCHOR_FRESHNESS_RE = re.compile(r"\bselected_anchor_freshness\b", re.IGNORECASE)
 PARENT_MAIN_ANCHOR_FRESHNESS_RE = re.compile(r"\bparent_main_anchor_freshness\b", re.IGNORECASE)
+AUDIT_CONTINUATION_WORKFLOW_RE = re.compile(r"\bAUDIT CONTINUATION WORKFLOW\b|\baudit_continuation_workflow\b", re.IGNORECASE)
+TARGET_PERSISTENCE_RE = re.compile(r"\btarget[_ -]persistence\b", re.IGNORECASE)
+TARGET_DRIFT_RE = re.compile(r"\btarget[_ -]drift\b|\bdrift_risk_reads\b|\btarget_drift_risk\b", re.IGNORECASE)
+TARGET_MISMATCH_RE = re.compile(
+    r"\b(?:status|coverage_label|target mismatch)\s*[:=]\s*[`'\"]?target_mismatch_detected\b",
+    re.IGNORECASE,
+)
 PRIVATE_PATH_TOKEN_RE = re.compile(r"(?:(?:^|[/\\])\.private[/\\])")
 ABSOLUTE_PRIVATE_RE = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\\\Users\\\\)")
 RUNTIME_SECRET_RE = re.compile(
@@ -276,6 +283,23 @@ def _latest_status_freshness_signals(texts: Iterable[str]) -> dict[str, Any]:
     }
 
 
+def _deep_audit_target_persistence_signals(texts: Iterable[str]) -> dict[str, Any]:
+    joined = "\n".join(text for text in texts if text)
+    return {
+        "audit_continuation_workflow_seen": bool(AUDIT_CONTINUATION_WORKFLOW_RE.search(joined)),
+        "target_persistence_signal_seen": bool(TARGET_PERSISTENCE_RE.search(joined)),
+        "target_drift_signal_seen": bool(TARGET_DRIFT_RE.search(joined)),
+        "target_mismatch_signal_seen": bool(TARGET_MISMATCH_RE.search(joined)),
+        "signal_counts": {
+            "audit_continuation_workflow": len(AUDIT_CONTINUATION_WORKFLOW_RE.findall(joined)),
+            "target_persistence": len(TARGET_PERSISTENCE_RE.findall(joined)),
+            "target_drift": len(TARGET_DRIFT_RE.findall(joined)),
+            "target_mismatch": len(TARGET_MISMATCH_RE.findall(joined)),
+        },
+        "privacy_boundary": "committed-safe counters/booleans only; raw audit target text is not retained",
+    }
+
+
 def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = None) -> dict[str, Any]:
     lane_path = lane_path.expanduser()
     if lane_path.is_file():
@@ -411,6 +435,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
 
     wrong_reason_counts = {reason: wrong_reasons.count(reason) for reason in sorted(set(wrong_reasons))}
     latest_status_freshness = _latest_status_freshness_signals(freshness_signal_texts)
+    deep_audit_target_persistence = _deep_audit_target_persistence_signals(freshness_signal_texts)
     lane_report = {
         "lane_id": lane_id,
         "private_artifacts": {
@@ -480,6 +505,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             "primary_ref_use": source_ref_signal_count > 0 or read_more_completed > 0,
         },
         "latest_status_freshness": latest_status_freshness,
+        "deep_audit_target_persistence": deep_audit_target_persistence,
         "final_answer": _final_status(final_path, final_text),
         "overtrigger": {
             "status": overtrigger_status,
@@ -518,6 +544,15 @@ def build_receiving_agent_trace_ledger(lanes: Iterable[LaneSpec], *, repo_root: 
         ),
         "latest_status_stale_selected_anchor_seen_count": sum(
             1 for lane in lane_reports if lane["latest_status_freshness"]["stale_selected_anchor_seen"]
+        ),
+        "deep_audit_target_persistence_seen_count": sum(
+            1 for lane in lane_reports if lane["deep_audit_target_persistence"]["target_persistence_signal_seen"]
+        ),
+        "deep_audit_target_drift_seen_count": sum(
+            1 for lane in lane_reports if lane["deep_audit_target_persistence"]["target_drift_signal_seen"]
+        ),
+        "deep_audit_target_mismatch_seen_count": sum(
+            1 for lane in lane_reports if lane["deep_audit_target_persistence"]["target_mismatch_signal_seen"]
         ),
     }
     payload = {
@@ -575,6 +610,9 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
         f"- Latest-status ANSWER READY signals: `{summary['latest_status_answer_ready_seen_count']}`",
         f"- Latest-status NOT ANSWERABLE signals: `{summary['latest_status_not_answerable_yet_seen_count']}`",
         f"- Latest-status stale-anchor signals: `{summary['latest_status_stale_selected_anchor_seen_count']}`",
+        f"- Deep-audit target-persistence signals: `{summary['deep_audit_target_persistence_seen_count']}`",
+        f"- Deep-audit target-drift signals: `{summary['deep_audit_target_drift_seen_count']}`",
+        f"- Deep-audit target-mismatch signals: `{summary['deep_audit_target_mismatch_seen_count']}`",
         "",
     ]
     for lane in ledger["lanes"]:
@@ -582,6 +620,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
         route = lane["route_selection"]
         final = lane["final_answer"]
         freshness = lane["latest_status_freshness"]
+        audit_target = lane["deep_audit_target_persistence"]
         lines.extend(
             [
                 f"## {lane['lane_id']}",
@@ -597,6 +636,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
                 f"- Broad/wrong/wrong-or-broad: `{counts['broad_search_completed']}` / `{counts['wrong_command_completed']}` / `{counts['wrong_or_broad_completed']}`",
                 f"- Read-more mentions vs commands: `{counts['read_more_mentions']}` / `{counts['read_more_completed']}`",
                 f"- Latest-status freshness: answer-ready `{freshness['answer_ready_seen']}`, not-answerable `{freshness['not_answerable_yet_seen']}`, stale-anchor `{freshness['stale_selected_anchor_seen']}`, freshness-signal `{freshness['selected_anchor_freshness_signal_seen']}`",
+                f"- Deep-audit target persistence: workflow `{audit_target['audit_continuation_workflow_seen']}`, target-persistence `{audit_target['target_persistence_signal_seen']}`, target-drift `{audit_target['target_drift_signal_seen']}`, target-mismatch `{audit_target['target_mismatch_signal_seen']}`",
                 f"- Source follow-through: `{lane['source_follow_through']['status']}`; primary-ref signal `{lane['source_follow_through']['primary_ref_use']}`",
                 f"- Final answer: `{final['status']}`, bytes `{final['bytes']}`, correctness `{final['final_correctness']}`",
                 f"- Cap/coverage language: `{final['cap_or_coverage_language_present']}`; source-grounding language: `{final['source_grounding_language_present']}`",
