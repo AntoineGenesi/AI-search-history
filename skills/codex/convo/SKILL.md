@@ -11,12 +11,14 @@ Use this alias only for explicit local conversation-history retrieval.
 
 ## First Move
 
-For exactly:
+For exactly either of these latest-message asks:
 
 `what has happened since my last message? use the convo tool`
+`what happened since my last message? use the convo tool`
 
-run this before repo search, `which/command -v`, `convo --help`, connector
-discovery, plugin install, Git, or visible-context synthesis:
+run the matching `what-happened-since` command before repo search,
+`which/command -v`, `convo --help`, connector discovery, plugin install, Git,
+or visible-context synthesis:
 
 ```bash
 jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text
@@ -29,6 +31,9 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
 Then follow the returned refs and stop rules from the JSONL history output.
+For latest-status, inspect `post_anchor_interval_reconstruction` coverage and
+its `next_read_guidance`; do not answer from the selected anchor, visible
+context, or secondary task/report/Git evidence alone.
 
 ## Non-Triggers
 

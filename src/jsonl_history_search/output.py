@@ -645,6 +645,10 @@ def render_ask_execute_text(payload: dict) -> str:
             f"Promotion status: {action.get('promotion_status')}",
         ]
     )
+    _append_latest_status_followthrough_contract(
+        lines,
+        _ask_execute_latest_status_contract(action, report.get("executed_output") or {}),
+    )
     if action.get("stop") != single_flight.get("stop_rule"):
         lines.append(f"Stop condition: {action.get('stop')}")
     if action.get("promotion_reason"):
@@ -768,6 +772,11 @@ def render_ask_execute_markdown(payload: dict) -> str:
             f"- Promotion status: `{action.get('promotion_status')}`",
         ]
     )
+    _append_latest_status_followthrough_contract(
+        lines,
+        _ask_execute_latest_status_contract(action, report.get("executed_output") or {}),
+        markdown=True,
+    )
     if action.get("stop") != single_flight.get("stop_rule"):
         lines.append(f"- Stop condition: {action.get('stop')}")
     if action.get("promotion_reason"):
@@ -827,6 +836,79 @@ def _ask_execute_single_flight_contract(action: dict) -> dict:
     if not action.get("read"):
         return {}
     return contract
+
+
+def _ask_execute_latest_status_contract(action: dict, executed: dict) -> dict:
+    contract = action.get("latest_status_followthrough_contract")
+    if isinstance(contract, dict) and contract:
+        return contract
+    contract = executed.get("latest_status_followthrough_contract")
+    if isinstance(contract, dict):
+        return contract
+    return {}
+
+
+def _append_latest_status_followthrough_contract(
+    lines: list[str],
+    contract: dict,
+    *,
+    markdown: bool = False,
+) -> None:
+    if not contract:
+        return
+    guidance = contract.get("next_read_guidance") if isinstance(contract.get("next_read_guidance"), dict) else {}
+    interval = (
+        contract.get("post_anchor_interval_reconstruction")
+        if isinstance(contract.get("post_anchor_interval_reconstruction"), dict)
+        else {}
+    )
+    coverage = interval.get("coverage") if isinstance(interval.get("coverage"), dict) else {}
+    read_order = " -> ".join(str(item) for item in contract.get("required_read_order") or [])
+    if markdown:
+        lines.extend(
+            [
+                "",
+                "## Latest-status follow-through",
+                "",
+                f"- Contract: `{contract.get('schema_version')}`",
+                f"- Status: `{contract.get('status')}`",
+                (
+                    "- Post-anchor interval coverage: "
+                    f"`status={contract.get('coverage_status') or coverage.get('status')}` "
+                    f"`complete={contract.get('coverage_complete') if contract.get('coverage_complete') is not None else coverage.get('complete')}` "
+                    f"`omitted={contract.get('omitted_activity_entry_count', 0)}`"
+                ),
+                f"- Required read order: {read_order}",
+                (
+                    "- Required post-anchor interval refs: "
+                    f"`{contract.get('post_anchor_interval_read_count', 0)}`"
+                ),
+            ]
+        )
+        if guidance:
+            lines.append(
+                "- `post_anchor_interval_reconstruction.next_read_guidance`: "
+                f"`status={guidance.get('status')}` {guidance.get('policy')}"
+            )
+        lines.append(f"- Stop before answer: {contract.get('stop')}")
+        return
+    lines.append("Latest-status follow-through:")
+    lines.append(f"Contract: {contract.get('schema_version')} status={contract.get('status')}")
+    lines.append(
+        "Post-anchor interval coverage: "
+        f"status={contract.get('coverage_status') or coverage.get('status')} "
+        f"complete={contract.get('coverage_complete') if contract.get('coverage_complete') is not None else coverage.get('complete')} "
+        f"omitted={contract.get('omitted_activity_entry_count', 0)}"
+    )
+    if read_order:
+        lines.append(f"Required read order: {read_order}")
+    lines.append(f"Required post-anchor interval refs: {contract.get('post_anchor_interval_read_count', 0)}")
+    if guidance:
+        lines.append(
+            "post_anchor_interval_reconstruction.next_read_guidance: "
+            f"status={guidance.get('status')} policy={guidance.get('policy')}"
+        )
+    lines.append(f"Stop before answer: {contract.get('stop')}")
 
 
 def _append_ask_execute_single_flight_contract(
