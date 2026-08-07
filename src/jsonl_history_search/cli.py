@@ -102,6 +102,7 @@ from .prompt_echo import setup_echo_classification
 from .output import render
 from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
+from .profiling import finish_phase_profile, start_phase_profile
 from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
@@ -166,6 +167,7 @@ from .retrieval_modes import (
     RETRIEVAL_MODE_PACKAGE,
     RETRIEVAL_MODE_RRF_FUSION,
     RETRIEVAL_MODES,
+    elapsed_label,
     run_retrieval_mode,
 )
 from .scanner import search
@@ -1989,6 +1991,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--rrf-fusion-storage",
+        choices=("file", "memory"),
+        default="file",
+        help=(
+            "Storage backend for explicit rrf-fusion candidate materialization. Default file writes or "
+            "reuses a sanitized bounded materialization under the BM25 cache/index root; memory is an "
+            "explicit small-probe opt-out."
+        ),
+    )
+    parser.add_argument(
         "--fielded-bm25-ephemeral",
         action="store_true",
         help="Compatibility alias for --fielded-bm25-storage memory.",
@@ -2158,6 +2170,47 @@ def _render_for_report_output(payload: dict, report_output: str, requested_forma
     if suffix in {".md", ".markdown"}:
         return render(payload, "markdown")
     return render(payload, requested_format)
+
+
+def _attach_retrieval_output_report_diagnostics(
+    payload: dict,
+    *,
+    report_key: str,
+    phase: str,
+    profile: dict,
+    output_format: str,
+    report_output: str | None,
+    report_written: bool,
+) -> None:
+    report = payload.get(report_key)
+    if not isinstance(report, dict):
+        return
+    diagnostics = report.get("retrieval_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return
+    if diagnostics.get("retrieval_mode") != RETRIEVAL_MODE_RRF_FUSION:
+        return
+    elapsed_ms = float(profile.get("elapsed_ms") or 0.0)
+    output_report = {
+        "phase": phase,
+        "elapsed_ms": elapsed_ms,
+        "elapsed_label": elapsed_label(elapsed_ms),
+        "profile": profile,
+        "output_format": output_format,
+        "report_written": bool(report_written),
+        "report_output_supplied": report_output is not None,
+        "report_output_path_included": False,
+        "report_output_path_category": "user_supplied_report_output" if report_output else "none",
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "raw_query_text_included": False,
+        "source_lines_included": False,
+        "vectors_or_persisted_indexes_included": False,
+    }
+    diagnostics["output_report"] = output_report
+    phase_profiles = diagnostics.setdefault("phase_profiles", {})
+    if isinstance(phase_profiles, dict):
+        phase_profiles[phase] = profile
 
 
 def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
@@ -4925,6 +4978,23 @@ def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dic
         mask_context=_mask_context_from_args(args),
         configuration_warnings=_configuration_warnings(source_plan),
     )
+    output_profile_token = start_phase_profile("semantic_debug_output_report")
+    rendered = render(payload, "json")
+    output_profile = finish_phase_profile(
+        output_profile_token,
+        stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+        report_bytes=len(rendered.encode("utf-8", errors="replace")),
+        report_written=True,
+    )
+    _attach_retrieval_output_report_diagnostics(
+        payload,
+        report_key="semantic_debug",
+        phase="semantic_debug_output_report",
+        profile=output_profile,
+        output_format="json",
+        report_output=args.report_output,
+        report_written=True,
+    )
     Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
     packet = payload["semantic_debug"]
     if _semantic_debug_is_scoped_no_evidence(packet):
@@ -4964,9 +5034,23 @@ def _fielded_bm25_index_dir_from_args(args: argparse.Namespace) -> str | None:
         RETRIEVAL_MODE_RRF_FUSION,
     }:
         return None
+    return str(_default_fielded_bm25_index_dir())
+
+
+def _default_fielded_bm25_index_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME")
     root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
-    return str(root / "jsonl-history-search" / "fielded-bm25")
+    return root / "jsonl-history-search" / "fielded-bm25"
+
+
+def _rrf_fusion_materialization_dir_from_args(args: argparse.Namespace) -> str | None:
+    if getattr(args, "rrf_fusion_storage", "file") == "memory":
+        return None
+    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) != RETRIEVAL_MODE_RRF_FUSION:
+        return None
+    fielded_index_dir = _fielded_bm25_index_dir_from_args(args)
+    root = Path(fielded_index_dir) if fielded_index_dir else _default_fielded_bm25_index_dir()
+    return str(root / "rrf-materializations")
 
 
 def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
@@ -4981,6 +5065,8 @@ def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
         mask_context=mask_context,
         use_rg_prefilter=args.rg_prefilter,
         fielded_bm25_index_dir=_fielded_bm25_index_dir_from_args(args),
+        rrf_fusion_storage=getattr(args, "rrf_fusion_storage", "memory"),
+        rrf_fusion_materialization_dir=_rrf_fusion_materialization_dir_from_args(args),
         query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
         continuation_ledger=getattr(args, "continuation_ledger", False),
     )
@@ -5004,6 +5090,23 @@ def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
         compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
         evidence_context_window=getattr(args, "evidence_context_window", 0),
         no_evidence_mode=True,
+    )
+    output_profile_token = start_phase_profile("agent_find_output_report")
+    rendered = render(payload, "json")
+    output_profile = finish_phase_profile(
+        output_profile_token,
+        stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+        report_bytes=len(rendered.encode("utf-8", errors="replace")),
+        report_written=True,
+    )
+    _attach_retrieval_output_report_diagnostics(
+        payload,
+        report_key="agent_find",
+        phase="agent_find_output_report",
+        profile=output_profile,
+        output_format="json",
+        report_output=args.report_output,
+        report_written=True,
     )
     Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
     if _agent_find_is_no_evidence_report(payload["agent_find"]):
@@ -17995,9 +18098,28 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=_mask_context_from_args(args),
             configuration_warnings=_configuration_warnings(source_plan),
         )
+        output_profile_token = start_phase_profile("semantic_debug_output_report")
         rendered = render(payload, args.format)
+        report_bytes = 0
         if args.report_output:
             report_path = Path(args.report_output).expanduser()
+            report_rendered = _render_for_report_output(payload, args.report_output, args.format)
+            report_bytes = len(report_rendered.encode("utf-8", errors="replace"))
+            output_profile = finish_phase_profile(
+                output_profile_token,
+                stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+                report_bytes=report_bytes,
+                report_written=True,
+            )
+            _attach_retrieval_output_report_diagnostics(
+                payload,
+                report_key="semantic_debug",
+                phase="semantic_debug_output_report",
+                profile=output_profile,
+                output_format=args.format,
+                report_output=args.report_output,
+                report_written=True,
+            )
             report_path.write_text(
                 _render_for_report_output(payload, args.report_output, args.format),
                 encoding="utf-8",
@@ -18007,6 +18129,23 @@ def main(argv: list[str] | None = None) -> int:
                 payload = _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
             else:
                 payload = _short_semantic_debug_report_written_payload(packet, args.report_output)
+            rendered = render(payload, args.format)
+        else:
+            output_profile = finish_phase_profile(
+                output_profile_token,
+                stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+                report_bytes=report_bytes,
+                report_written=False,
+            )
+            _attach_retrieval_output_report_diagnostics(
+                payload,
+                report_key="semantic_debug",
+                phase="semantic_debug_output_report",
+                profile=output_profile,
+                output_format=args.format,
+                report_output=None,
+                report_written=False,
+            )
             rendered = render(payload, args.format)
         print(rendered)
         return 0
@@ -18604,6 +18743,7 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=mask_context,
         )
         result["warnings"] = sorted(set(result["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
+        output_profile_token = start_phase_profile("agent_find_output_report")
         payload = build_agent_find_payload(
             source_plan=source_plan,
             search_result=result,
@@ -18647,6 +18787,8 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=mask_context,
             use_rg_prefilter=args.rg_prefilter,
             fielded_bm25_index_dir=_fielded_bm25_index_dir_from_args(args),
+            rrf_fusion_storage=getattr(args, "rrf_fusion_storage", "memory"),
+            rrf_fusion_materialization_dir=_rrf_fusion_materialization_dir_from_args(args),
             query_plan_mode=getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
             continuation_ledger=getattr(args, "continuation_ledger", False),
         )
@@ -18661,6 +18803,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.include_manifest
             else None
         )
+        output_profile_token = start_phase_profile("agent_find_output_report")
         payload = build_agent_find_payload(
             source_plan=source_plan,
             search_result=result,
@@ -18693,7 +18836,23 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"source_plan": source_plan, **result}
         payload["warnings"] = sorted(set(payload["warnings"] + intent.warnings + _configuration_warnings(source_plan)))
     rendered = render(payload, args.format)
-    if getattr(args, "report_output", None):
+    if getattr(args, "report_output", None) and "agent_find" in payload:
+        report_rendered = _render_for_report_output(payload, args.report_output, args.format)
+        output_profile = finish_phase_profile(
+            output_profile_token,
+            stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+            report_bytes=len(report_rendered.encode("utf-8", errors="replace")),
+            report_written=True,
+        )
+        _attach_retrieval_output_report_diagnostics(
+            payload,
+            report_key="agent_find",
+            phase="agent_find_output_report",
+            profile=output_profile,
+            output_format=args.format,
+            report_output=args.report_output,
+            report_written=True,
+        )
         Path(args.report_output).expanduser().write_text(
             _render_for_report_output(payload, args.report_output, args.format),
             encoding="utf-8",
@@ -18704,6 +18863,28 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 payload = _short_report_written_payload(payload, args.report_output)
             rendered = render(payload, args.format)
+    elif getattr(args, "report_output", None):
+        Path(args.report_output).expanduser().write_text(
+            _render_for_report_output(payload, args.report_output, args.format),
+            encoding="utf-8",
+        )
+    elif "agent_find" in payload:
+        output_profile = finish_phase_profile(
+            output_profile_token,
+            stdout_bytes=len(rendered.encode("utf-8", errors="replace")),
+            report_bytes=0,
+            report_written=False,
+        )
+        _attach_retrieval_output_report_diagnostics(
+            payload,
+            report_key="agent_find",
+            phase="agent_find_output_report",
+            profile=output_profile,
+            output_format=args.format,
+            report_output=None,
+            report_written=False,
+        )
+        rendered = render(payload, args.format)
     print(rendered)
     return 0
 

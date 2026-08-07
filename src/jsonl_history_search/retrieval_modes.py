@@ -5,7 +5,14 @@ from typing import Any
 
 from .fielded_bm25 import build_fielded_bm25_index, search_with_fielded_bm25
 from .profiling import finish_phase_profile, start_phase_profile
-from .rrf_fusion import DEFAULT_RRF_RANK_CONSTANT, RrfLane, fuse_ranked_groups
+from .rrf_fusion import (
+    DEFAULT_RRF_RANK_CONSTANT,
+    RRF_FUSION_STORAGE_MEMORY,
+    RRF_FUSION_STORAGE_MODES,
+    RrfLane,
+    fuse_ranked_groups,
+    materialize_rrf_fusion,
+)
 from .scanner import search
 from .sources import (
     build_command_local_source_catalog,
@@ -35,6 +42,8 @@ def run_retrieval_mode(
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
     fielded_bm25_index_dir: str | None = None,
+    rrf_fusion_storage: str = RRF_FUSION_STORAGE_MEMORY,
+    rrf_fusion_materialization_dir: str | None = None,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
     continuation_ledger: bool = False,
 ) -> dict[str, Any]:
@@ -56,6 +65,8 @@ def run_retrieval_mode(
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
             fielded_bm25_index_dir=fielded_bm25_index_dir,
+            rrf_fusion_storage=rrf_fusion_storage,
+            rrf_fusion_materialization_dir=rrf_fusion_materialization_dir,
         )
     if retrieval_mode == RETRIEVAL_MODE_FIELDED_BM25:
         return run_fielded_bm25_retrieval(
@@ -181,7 +192,11 @@ def run_rrf_fusion_retrieval(
     mask_context: Any = None,
     use_rg_prefilter: bool = False,
     fielded_bm25_index_dir: str | None = None,
+    rrf_fusion_storage: str = RRF_FUSION_STORAGE_MEMORY,
+    rrf_fusion_materialization_dir: str | None = None,
 ) -> dict[str, Any]:
+    if rrf_fusion_storage not in RRF_FUSION_STORAGE_MODES:
+        raise ValueError(f"unsupported RRF fusion storage mode: {rrf_fusion_storage}")
     total_profile_token = start_phase_profile("total_explicit_rrf_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
     planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
@@ -255,15 +270,24 @@ def run_rrf_fusion_retrieval(
     package_searched_paths = set(package_result.pop("_searched_file_paths", []) or [])
 
     fusion_profile_token = start_phase_profile("rrf_fusion")
+    lanes = [
+        RrfLane(RRF_LANE_NAMES[0], package_result.get("groups", [])),
+        RrfLane(RRF_LANE_NAMES[1], fielded_result.get("groups", [])),
+    ]
     fused_result = fuse_ranked_groups(
-        [
-            RrfLane(RRF_LANE_NAMES[0], package_result.get("groups", [])),
-            RrfLane(RRF_LANE_NAMES[1], fielded_result.get("groups", [])),
-        ],
+        lanes,
         rank_constant=DEFAULT_RRF_RANK_CONSTANT,
         candidate_window_size=plan.limits.max_matches,
         final_limit=plan.limits.max_matches,
         preferred_lane=RRF_LANE_NAMES[0],
+    )
+    rrf_materialization = materialize_rrf_fusion(
+        lanes,
+        fused_result,
+        storage_mode=rrf_fusion_storage,
+        materialization_dir=rrf_fusion_materialization_dir,
+        candidate_window_size=plan.limits.max_matches,
+        final_limit=plan.limits.max_matches,
     )
     fused_count = _candidate_count(fused_result)
     fusion_profile = finish_phase_profile(fusion_profile_token, candidate_count=fused_count)
@@ -278,11 +302,21 @@ def run_rrf_fusion_retrieval(
 
     package_warnings = list(package_result.get("warnings", []) or [])
     fielded_warnings = list(fielded_result.get("warnings", []) or [])
-    warnings = sorted(set(package_warnings + fielded_warnings))
+    materialization_warnings = (
+        ["rrf_fusion_file_materialization_unavailable"]
+        if (
+            rrf_fusion_storage == "file"
+            and not bool(rrf_materialization.get("fusion_used_file_backed_materialization", False))
+        )
+        else []
+    )
+    warnings = sorted(set(package_warnings + fielded_warnings + materialization_warnings))
     fused_result.update(
         {
             "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
             "preserve_match_order": True,
+            "rrf_storage": rrf_materialization,
+            "rrf_materialization": rrf_materialization,
             "warnings": warnings,
             "blind_spots": sorted(
                 set((package_result.get("blind_spots", []) or []) + (fielded_result.get("blind_spots", []) or []))
@@ -304,6 +338,7 @@ def run_rrf_fusion_retrieval(
                 fielded_index_elapsed_ms=fielded_index_elapsed_ms,
                 fielded_elapsed_ms=fielded_elapsed_ms,
                 fusion_elapsed_ms=fusion_elapsed_ms,
+                rrf_materialization=rrf_materialization,
                 enumeration_elapsed_ms=enumeration_elapsed_ms,
                 planned_jsonl_file_diagnostics=planned_jsonl_files.to_diagnostics(),
                 source_catalog=source_catalog,
@@ -889,6 +924,7 @@ def build_rrf_retrieval_diagnostics(
     fielded_index_elapsed_ms: float,
     fielded_elapsed_ms: float,
     fusion_elapsed_ms: float,
+    rrf_materialization: dict[str, Any],
     enumeration_elapsed_ms: float,
     planned_jsonl_file_diagnostics: dict[str, Any],
     source_catalog: dict[str, Any],
@@ -917,6 +953,8 @@ def build_rrf_retrieval_diagnostics(
         package_result=package_result,
         planned_file_count=int(planned_jsonl_file_diagnostics.get("file_count") or 0),
     )
+    rrf_storage_mode = str(rrf_materialization.get("storage_mode") or "memory")
+    rrf_storage_backend = str(rrf_materialization.get("effective_backend") or "unknown")
     return {
         "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
         "feature_state": "active_explicit_opt_in",
@@ -934,7 +972,15 @@ def build_rrf_retrieval_diagnostics(
             "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
             "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
             "refresh_status": str(fielded_index_summary.get("refresh_status") or "unknown"),
-            "reason": "rrf_fusion_runs_fielded_bm25_then_package_search_before_rank_fusion_and_uses_file_backed_bm25_when_configured",
+            "rrf_storage_mode": rrf_storage_mode,
+            "rrf_materialization_backend": rrf_storage_backend,
+            "rrf_file_backed_materialization_used": bool(
+                rrf_materialization.get("fusion_used_file_backed_materialization", False)
+            ),
+            "rrf_in_memory_materialization_used": bool(
+                rrf_materialization.get("fusion_used_in_memory_materialization", False)
+            ),
+            "reason": "rrf_fusion_runs_fielded_bm25_then_package_search_before_rank_fusion_and_uses_file_backed_bm25_and_rrf_materialization_when_configured",
         },
         "shared_source_enumeration": {
             **planned_jsonl_file_diagnostics,
@@ -965,7 +1011,11 @@ def build_rrf_retrieval_diagnostics(
             "package_only_count": fused_result.get("package_only_count", 0),
             "fielded_only_count": fused_result.get("fielded_only_count", 0),
             "top_n_fielded_only_promotion_count": fused_result.get("top_n_fielded_only_promotion_count", 0),
+            "storage_mode": rrf_storage_mode,
+            "materialization_backend": rrf_storage_backend,
         },
+        "rrf_storage": rrf_materialization,
+        "rrf_materialization": rrf_materialization,
         "lanes": [
             {
                 "name": RRF_LANE_NAMES[0],
@@ -1033,6 +1083,8 @@ def build_rrf_retrieval_diagnostics(
             ),
             "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
             "durable_fts_index_reused": bool(fielded_index_summary.get("durable_fts_index_reused", False)),
+            "rrf_materialization": rrf_materialization,
+            "rrf_materialization_storage_kind": rrf_storage_backend,
             "local_work_only_not_model_tokens": True,
         },
         "fusion": {
@@ -1041,6 +1093,14 @@ def build_rrf_retrieval_diagnostics(
             "profile": _phase_profile(profiles.get("rrf_fusion"), "rrf_fusion"),
             "candidate_count": fused_count,
             "cap_labels": cap_labels_from_warnings(warnings),
+            "storage_mode": rrf_storage_mode,
+            "materialization_backend": rrf_storage_backend,
+            "file_backed_materialization_used": bool(
+                rrf_materialization.get("fusion_used_file_backed_materialization", False)
+            ),
+            "in_memory_materialization_used": bool(
+                rrf_materialization.get("fusion_used_in_memory_materialization", False)
+            ),
         },
         "total_explicit_rrf_retrieval": _phase_profile(
             profiles.get("total_explicit_rrf_retrieval"),
@@ -1061,6 +1121,10 @@ def build_rrf_retrieval_diagnostics(
             "scanner_scheduling_constants_changed": False,
             "package_lane_scoped_or_skipped": False,
             "persistent_index_or_cache_used": bool(fielded_index_summary.get("persistent_index_enabled", False)),
+            "rrf_file_backed_materialization_used": bool(
+                rrf_materialization.get("fusion_used_file_backed_materialization", False)
+            ),
+            "cap_triggered_escalation_enabled": False,
         },
 }
 
