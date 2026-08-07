@@ -5161,6 +5161,8 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "candidate_count": len(packet["strongest_candidates"]),
             "event_count": packet["tool_action_proof"]["event_count"],
             "source_locator_handoff": packet["source_locator_handoff"],
+            "audit_continuation_workflow": packet.get("audit_continuation_workflow"),
+            "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
             "source_followthrough_plan": packet.get("source_followthrough_plan"),
             "provenance_direct_evidence_facet_ledger": packet.get(
                 "provenance_direct_evidence_facet_ledger"
@@ -9346,6 +9348,12 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             ),
             "in_depth_audit_followthrough": compact.get("in_depth_audit_followthrough")
             or (compact.get("source_locator_handoff") or {}).get("in_depth_audit_followthrough"),
+            "audit_continuation_workflow": compact.get("audit_continuation_workflow")
+            or (
+                compact.get("in_depth_audit_followthrough")
+                or (compact.get("source_locator_handoff") or {}).get("in_depth_audit_followthrough")
+                or {}
+            ).get("audit_continuation_workflow"),
             "decision_context_summary": compact.get("decision_context_summary"),
             "audit_plan_summary": compact.get("audit_plan_summary"),
             "next_reads": compact.get("next_reads", [])[:3],

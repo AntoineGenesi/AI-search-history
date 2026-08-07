@@ -1223,6 +1223,7 @@ def build_semantic_debug_payload(
         "audit_depth": audit_depth,
         "in_depth_audit_coverage": in_depth_audit_coverage,
         "in_depth_audit_followthrough": in_depth_audit_followthrough,
+        "audit_continuation_workflow": in_depth_audit_followthrough.get("audit_continuation_workflow"),
         "question_family": family,
         "investigation_state": investigation_state,
         "scope": source_scope,
@@ -1287,6 +1288,7 @@ def build_semantic_debug_payload(
     if not in_depth_audit_coverage.get("applies"):
         packet.pop("in_depth_audit_coverage", None)
         packet.pop("in_depth_audit_followthrough", None)
+        packet.pop("audit_continuation_workflow", None)
     if source_locator_handoff.get("stage_diagnostics") and packet.get("retrieval_pressure"):
         packet["retrieval_pressure"]["stage_diagnostics"] = source_locator_handoff["stage_diagnostics"]
     if getattr(args, "compact_provenance_handoff", False):
@@ -13869,6 +13871,7 @@ def apply_in_depth_audit_read_promotion_safety(
 
 
 IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT = 4
+IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT = 8
 
 
 def build_in_depth_audit_followthrough_plan(
@@ -13883,12 +13886,11 @@ def build_in_depth_audit_followthrough_plan(
         return {}
 
     selected_reads = select_in_depth_audit_primary_reads(next_reads)
-    continuation = in_depth_audit_continuation_command(
+    continuation_commands = in_depth_audit_continuation_commands(
         query=query,
         args=args,
         coverage=coverage,
     )
-    continuation_commands = [continuation] if continuation else []
     coverage_complete = bool(coverage.get("answer_promotion_allowed"))
     searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
     not_searched_scope = scope_boundary_summary.get("not_searched_scope") if isinstance(scope_boundary_summary, dict) else {}
@@ -13902,13 +13904,43 @@ def build_in_depth_audit_followthrough_plan(
     )
     if not coverage_complete:
         stop_rule += (
-            " If coverage is still incomplete after the selected refs, run at most the single bounded continuation "
-            "command, then either answer with the remaining gap named or report the blocked/capped window."
+            " If coverage is still incomplete after the selected refs, run the emitted scoped continuation "
+            "commands for the pending date/path slices that affect the requested facets, then either answer with "
+            "the remaining gaps named or report the blocked/capped windows."
         )
+    answer_ready = bool(coverage_complete)
+    workflow = {
+        "schema_version": 1,
+        "applies": True,
+        "answer_ready": answer_ready,
+        "hard_stop": not answer_ready,
+        "answer_status": "answer_ready" if answer_ready else "not_answerable_yet",
+        "hard_stop_semantics": (
+            "NOT ANSWERABLE YET: open ordered primary refs, then run the scoped continuation commands for "
+            "pending cap/coverage slices before answering."
+            if not answer_ready
+            else "Answer only after ordered primary refs support the requested facets within searched scope."
+        ),
+        "ordered_primary_refs_to_open_first": selected_reads,
+        "pending_slices": in_depth_audit_pending_slice_labels(coverage),
+        "continuation_commands": continuation_commands,
+        "do_not_abandon_jsonl_guidance": (
+            "Do not abandon JSONL/convo for broad git/rg/task artifact inspection after a cap. Continue with "
+            "these scoped semantic-debug commands first; use local task/review/git artifacts only when the user "
+            "explicitly asks for local artifacts or after transcript slices name a specific supporting join."
+        ),
+        "primary_evidence_policy": (
+            "Use raw transcript/session/tool refs as primary evidence for broad coordinator audits; task, review, "
+            "commit, and report artifacts are secondary joins unless explicitly requested."
+        ),
+    }
     return {
         "schema_version": 1,
         "applies": True,
         "status": "coverage_complete_primary_refs_first" if coverage_complete else "coverage_incomplete_primary_refs_first",
+        "answer_ready": answer_ready,
+        "hard_stop": not answer_ready,
+        "answer_status": "answer_ready" if answer_ready else "not_answerable_yet",
         "audit_depth": coverage.get("audit_depth"),
         "ordered_primary_refs_to_open_first": selected_reads,
         "ordered_primary_ref_count": len(selected_reads),
@@ -13926,8 +13958,9 @@ def build_in_depth_audit_followthrough_plan(
         "stop_rule": stop_rule,
         "do_not_do": [
             "broad rg/find/ls before opening ordered_primary_refs_to_open_first",
+            "broad git/rg/task artifact inspection unless the user explicitly asks for local artifacts",
             "repeat ask --execute for the same deep-history question",
-            "repeat semantic-debug for the same question except the single bounded continuation command",
+            "repeat semantic-debug for the same question except the emitted scoped continuation commands",
             "keep expanding read-more after selected refs cover the asked facets",
             "claim full-history completeness from capped or top-N candidate samples",
         ],
@@ -13938,12 +13971,14 @@ def build_in_depth_audit_followthrough_plan(
             "raw_window_inspection_available_for_local_proof": True,
         },
         "continuation_policy": {
-            "status": "single_bounded_continuation_available" if continuation_commands else "no_bounded_continuation_available",
+            "status": "scoped_continuations_available" if continuation_commands else "no_bounded_continuation_available",
             "emit_only_when_coverage_incomplete": not coverage_complete,
-            "max_continuation_commands": 1,
+            "max_continuation_commands": IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT,
             "broad_search_recovery_allowed": False,
         },
+        "pending_slice_count": len(workflow["pending_slices"]),
         "continuation_commands": continuation_commands,
+        "audit_continuation_workflow": workflow,
     }
 
 
@@ -13988,17 +14023,36 @@ def in_depth_audit_omitted_or_capped_windows(coverage: dict[str, Any]) -> list[d
     return rows[:8]
 
 
-def in_depth_audit_continuation_command(
+def in_depth_audit_continuation_commands(
     *,
     query: str,
     args: Any,
     coverage: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]]:
     if coverage.get("answer_promotion_allowed"):
-        return None
-    slice_row = first_bounded_in_depth_continuation_slice(coverage)
-    if not slice_row:
-        return None
+        return []
+    commands = []
+    for slice_row in bounded_in_depth_continuation_slices(coverage):
+        command = in_depth_audit_continuation_command_for_slice(
+            query=query,
+            args=args,
+            slice_row=slice_row,
+            index=len(commands) + 1,
+        )
+        if command:
+            commands.append(command)
+        if len(commands) >= IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT:
+            break
+    return commands
+
+
+def in_depth_audit_continuation_command_for_slice(
+    *,
+    query: str,
+    args: Any,
+    slice_row: dict[str, Any],
+    index: int,
+) -> dict[str, Any] | None:
     window = slice_row.get("window") if isinstance(slice_row.get("window"), dict) else {}
     argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", "in-depth"]
     for root in getattr(args, "root", None) or []:
@@ -14018,17 +14072,20 @@ def in_depth_audit_continuation_command(
     else:
         return None
     return {
-        "command_id": "continue_single_bounded_audit_slice",
+        "command_id": f"continue_scoped_audit_slice_{index:02d}",
         "slice": slice_row.get("slice"),
         "missing_or_capped_window": window,
         "status": slice_row.get("status"),
-        "reason": "coverage incomplete; use this one bounded continuation instead of broad search or repeated semantic-debug churn",
+        "coverage_label": slice_row.get("status"),
+        "cap_labels": list(slice_row.get("caps_to_retry") or (slice_row.get("cap_hit") or {}).get("caps_hit") or []),
+        "retry_guidance": slice_row.get("retry_guidance"),
+        "reason": "coverage incomplete; use this scoped continuation instead of broad git/rg/task artifact inspection",
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
     }
 
 
-def first_bounded_in_depth_continuation_slice(coverage: dict[str, Any]) -> dict[str, Any] | None:
+def bounded_in_depth_continuation_slices(coverage: dict[str, Any]) -> list[dict[str, Any]]:
     incomplete = [
         row
         for row in coverage.get("slices") or []
@@ -14041,7 +14098,30 @@ def first_bounded_in_depth_continuation_slice(coverage: dict[str, Any]) -> dict[
         and row.get("slice") != "selected_scope"
         and row["window"].get("type") in {"date", "path"}
     ]
-    return (precise or incomplete or [None])[0]
+    return (precise or incomplete)[:IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT]
+
+
+def first_bounded_in_depth_continuation_slice(coverage: dict[str, Any]) -> dict[str, Any] | None:
+    return (bounded_in_depth_continuation_slices(coverage) or [None])[0]
+
+
+def in_depth_audit_pending_slice_labels(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for slice_row in coverage.get("slices") or []:
+        if not isinstance(slice_row, dict) or slice_row.get("status") == "complete":
+            continue
+        rows.append(
+            {
+                "slice": slice_row.get("slice"),
+                "coverage_label": slice_row.get("status"),
+                "cap_labels": list(slice_row.get("caps_to_retry") or (slice_row.get("cap_hit") or {}).get("caps_hit") or []),
+                "basis": slice_row.get("basis"),
+                "window": slice_row.get("window"),
+                "path_count": slice_row.get("path_count"),
+                "retry_guidance": slice_row.get("retry_guidance"),
+            }
+        )
+    return rows[:IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT]
 
 
 def in_depth_audit_date_window_bounds(date_text: str) -> tuple[str | None, str | None]:
@@ -14173,10 +14253,12 @@ def apply_in_depth_audit_followthrough_handoff(
         return handoff
     row = dict(handoff)
     row["in_depth_audit_followthrough"] = followthrough
+    row["audit_continuation_workflow"] = followthrough.get("audit_continuation_workflow")
     row.setdefault("links", {})
     row["links"] = {
         **row["links"],
         "in_depth_audit_followthrough": "semantic_debug.in_depth_audit_followthrough",
+        "audit_continuation_workflow": "semantic_debug.audit_continuation_workflow",
     }
     row.setdefault("source_use_summary", {})
     row["source_use_summary"] = {
@@ -14188,7 +14270,7 @@ def apply_in_depth_audit_followthrough_handoff(
             "continuation_policy": followthrough.get("continuation_policy"),
         },
     }
-    row["do_next"] = "open_ordered_deep_audit_primary_refs_then_stop_or_single_bounded_continuation"
+    row["do_next"] = "open_ordered_deep_audit_primary_refs_then_run_scoped_continuations_or_fail_closed"
     row.setdefault("source_action_guidance", {})
     row["source_action_guidance"] = {
         **row["source_action_guidance"],
@@ -14197,8 +14279,13 @@ def apply_in_depth_audit_followthrough_handoff(
             "ordered_primary_ref_count": followthrough.get("ordered_primary_ref_count"),
             "continuation_count": len(followthrough.get("continuation_commands") or []),
         },
+        "audit_continuation_workflow": {
+            "answer_ready": (followthrough.get("audit_continuation_workflow") or {}).get("answer_ready"),
+            "hard_stop": (followthrough.get("audit_continuation_workflow") or {}).get("hard_stop"),
+            "pending_slice_count": len((followthrough.get("audit_continuation_workflow") or {}).get("pending_slices") or []),
+        },
         "stop_condition": followthrough.get("stop_rule"),
-        "broad_search_policy": "do_not_use_rg_find_ls_before_selected_primary_refs",
+        "broad_search_policy": "do_not_use_git_rg_task_artifact_inspection_before_jsonl_continuations_unless_explicit_local_artifacts",
     }
     return row
 
@@ -14242,7 +14329,9 @@ def apply_in_depth_audit_followthrough_instruction(
         return instruction
     row = dict(instruction)
     row["decision"] = "open_deep_audit_primary_refs_first"
-    row["required_next_action"] = "open_ordered_primary_refs_then_stop_or_run_one_bounded_continuation"
+    workflow = followthrough.get("audit_continuation_workflow") or {}
+    row["audit_continuation_workflow"] = workflow
+    row["required_next_action"] = "open_ordered_primary_refs_then_run_scoped_audit_continuations_before_answer"
     commands = []
     for read in followthrough.get("ordered_primary_refs_to_open_first") or []:
         for action in read.get("expansion_actions") or []:
@@ -14258,6 +14347,11 @@ def apply_in_depth_audit_followthrough_instruction(
             "status": followthrough.get("status"),
             "ordered_primary_ref_count": followthrough.get("ordered_primary_ref_count"),
             "continuation_count": len(followthrough.get("continuation_commands") or []),
+        },
+        "audit_continuation_workflow": {
+            "answer_ready": workflow.get("answer_ready"),
+            "hard_stop": workflow.get("hard_stop"),
+            "pending_slice_count": len(workflow.get("pending_slices") or []),
         },
         "stop_condition": followthrough.get("stop_rule"),
     }

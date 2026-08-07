@@ -2012,9 +2012,16 @@ def render_in_depth_audit_followthrough_text(
 ) -> list[str]:
     if not plan.get("applies"):
         return []
+    workflow = plan.get("audit_continuation_workflow") or {}
     coverage_state = plan.get("coverage_state") or {}
     lines = [
-        "Deep-history audit follow-through:",
+        "AUDIT CONTINUATION WORKFLOW:",
+        (
+            f"- answer_ready={workflow.get('answer_ready', plan.get('answer_ready'))} "
+            f"hard_stop={workflow.get('hard_stop', plan.get('hard_stop'))} "
+            f"answer_status={workflow.get('answer_status', plan.get('answer_status'))}"
+        ),
+        f"- hard-stop semantics: {workflow.get('hard_stop_semantics') or 'Open ordered primary refs before answering.'}",
         (
             f"- status: {plan.get('status')} "
             f"ordered_primary_refs={plan.get('ordered_primary_ref_count', 0)} "
@@ -2049,6 +2056,17 @@ def render_in_depth_audit_followthrough_text(
             "local runtime opens selected read-more/source windows when transcript evidence is useful"
         )
         lines.append("- metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle")
+    if workflow.get("do_not_abandon_jsonl_guidance"):
+        lines.append(f"- do not abandon JSONL: {workflow.get('do_not_abandon_jsonl_guidance')}")
+    pending_slices = list(workflow.get("pending_slices") or [])[:8]
+    if pending_slices:
+        lines.append("- pending coverage slices:")
+        for slice_row in pending_slices:
+            caps = ",".join(str(item) for item in slice_row.get("cap_labels") or []) or "none"
+            lines.append(
+                f"  - {slice_row.get('slice')}: coverage_label={slice_row.get('coverage_label')} "
+                f"cap_labels={caps} window={slice_row.get('window')}"
+            )
     lines.append("- ordered primary refs to open first:")
     reads = list(plan.get("ordered_primary_refs_to_open_first") or [])
     if not reads:
@@ -2056,11 +2074,14 @@ def render_in_depth_audit_followthrough_text(
     for read in reads:
         _append_text_read(lines, read, command_by_target=command_by_target)
     lines.append(f"- stop rule: {plan.get('stop_rule')}")
-    continuations = list(plan.get("continuation_commands") or [])[:1]
+    continuations = list(plan.get("continuation_commands") or [])[:8]
     if continuations:
-        lines.append("- single bounded continuation only if selected refs leave coverage incomplete:")
+        lines.append("- scoped continuation commands if selected refs leave coverage incomplete:")
         for continuation in continuations:
-            lines.append(f"  - {continuation.get('command')}")
+            caps = ",".join(str(item) for item in continuation.get("cap_labels") or []) or "none"
+            lines.append(
+                f"  - [{continuation.get('coverage_label')}; caps={caps}] {continuation.get('command')}"
+            )
     else:
         lines.append("- continuation: none emitted; do not invent broad rg/find/ls recovery")
     for item in list(plan.get("do_not_do") or [])[:5]:
@@ -2075,11 +2096,16 @@ def render_in_depth_audit_followthrough_markdown(
 ) -> list[str]:
     if not plan.get("applies"):
         return []
+    workflow = plan.get("audit_continuation_workflow") or {}
     coverage_state = plan.get("coverage_state") or {}
     lines = [
         "",
-        "## Deep-History Audit Follow-Through",
+        "## Audit Continuation Workflow",
         "",
+        f"- `answer_ready`: `{workflow.get('answer_ready', plan.get('answer_ready'))}`",
+        f"- `hard_stop`: `{workflow.get('hard_stop', plan.get('hard_stop'))}`",
+        f"- `answer_status`: `{workflow.get('answer_status', plan.get('answer_status'))}`",
+        f"- `hard_stop_semantics`: {workflow.get('hard_stop_semantics') or 'Open ordered primary refs before answering.'}",
         f"- `status`: `{plan.get('status')}`",
         f"- `ordered_primary_refs`: `{plan.get('ordered_primary_ref_count', 0)}`",
         f"- `continuations`: `{len(plan.get('continuation_commands') or [])}`",
@@ -2112,6 +2138,17 @@ def render_in_depth_audit_followthrough_markdown(
             "local runtime opens selected `read-more`/source windows when transcript evidence is useful"
         )
         lines.append("- Metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle.")
+    if workflow.get("do_not_abandon_jsonl_guidance"):
+        lines.append(f"- `do_not_abandon_jsonl`: {workflow.get('do_not_abandon_jsonl_guidance')}")
+    pending_slices = list(workflow.get("pending_slices") or [])[:8]
+    if pending_slices:
+        lines.extend(["", "### Pending Coverage Slices", ""])
+        for slice_row in pending_slices:
+            caps = ",".join(str(item) for item in slice_row.get("cap_labels") or []) or "none"
+            lines.append(
+                f"- `{slice_row.get('slice')}` `coverage_label={slice_row.get('coverage_label')}` "
+                f"`cap_labels={caps}` `window={slice_row.get('window')}`"
+            )
     lines.extend(["", "### Ordered Primary Refs To Open First", ""])
     reads = list(plan.get("ordered_primary_refs_to_open_first") or [])
     if not reads:
@@ -2119,11 +2156,14 @@ def render_in_depth_audit_followthrough_markdown(
     for read in reads:
         _append_markdown_read(lines, read, command_by_target=command_by_target)
     lines.extend(["", "### Stop / Continue Rule", "", f"- Stop rule: {plan.get('stop_rule')}"])
-    continuations = list(plan.get("continuation_commands") or [])[:1]
+    continuations = list(plan.get("continuation_commands") or [])[:8]
     if continuations:
-        lines.append("- Single bounded continuation only if selected refs leave coverage incomplete:")
+        lines.append("- Scoped continuation commands if selected refs leave coverage incomplete:")
         for continuation in continuations:
-            lines.append(f"  - `{continuation.get('command')}`")
+            caps = ",".join(str(item) for item in continuation.get("cap_labels") or []) or "none"
+            lines.append(
+                f"  - `[{continuation.get('coverage_label')}; caps={caps}]` `{continuation.get('command')}`"
+            )
     else:
         lines.append("- Continuation: none emitted; do not invent broad `rg`/`find`/`ls` recovery.")
     for item in list(plan.get("do_not_do") or [])[:5]:
@@ -6134,7 +6174,7 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.extend(render_longitudinal_phase_source_plan_text(longitudinal_plan))
     lines.append("Open these source refs first:")
     if deep_audit_followthrough_active:
-        lines.append("- see Deep-history audit follow-through.ordered_primary_refs_to_open_first above")
+        lines.append("- see AUDIT CONTINUATION WORKFLOW.ordered_primary_refs_to_open_first above")
     elif scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
         if source_action_guidance.get("diagnostic_policy"):
@@ -6481,7 +6521,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         lines.extend(render_longitudinal_phase_source_plan_markdown(longitudinal_plan))
     lines.extend(["", "## Open These Source Refs First", ""])
     if deep_audit_followthrough_active:
-        lines.append("- See `Deep-History Audit Follow-Through.ordered_primary_refs_to_open_first` above.")
+        lines.append("- See `Audit Continuation Workflow.ordered_primary_refs_to_open_first` above.")
     elif scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
         if source_action_guidance.get("diagnostic_policy"):
