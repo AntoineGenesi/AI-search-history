@@ -1896,6 +1896,11 @@ def _canonical_parent_main_status_interval(
             lineage.get("selected_session_identifier") if require_side_parent_boundary else None
         ),
     )
+    if require_side_parent_boundary:
+        anchor_candidates = _merge_parent_main_anchor_candidates(
+            anchor_candidates,
+            _canonical_parent_main_anchor_candidates(rows, boundary),
+        )
     if lineage.get("status") in {"selected", "ambiguous"}:
         anchor_candidates = _apply_lineage_resolution_to_candidates(anchor_candidates, lineage)
         if lineage.get("status") == "selected":
@@ -1905,6 +1910,11 @@ def _canonical_parent_main_status_interval(
                 str(selected.get("rationale") or "").rstrip()
                 + "; selected by structural parent/root lineage, cwd, workspace-root, and role/source metadata before ranking"
             )
+    anchor_candidates = _apply_parent_main_candidate_lineage_filter(
+        anchor_candidates,
+        codex_home=codex_home,
+        cwd=cwd,
+    )
     return {
         "status": "selected",
         "kind": "canonical_parent_main_status_interval",
@@ -1982,6 +1992,27 @@ def _canonical_parent_main_anchor_candidates(
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def _merge_parent_main_anchor_candidates(primary: list[dict], secondary: list[dict]) -> list[dict]:
+    merged = []
+    seen = set()
+    for candidate in sorted(
+        [dict(item) for item in primary + secondary],
+        key=lambda item: (
+            str(item.get("timestamp_utc") or ""),
+            int(item.get("line") or 0),
+        ),
+        reverse=True,
+    ):
+        ref = str(candidate.get("source_ref") or "")
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        merged.append(candidate)
+        if len(merged) >= 8:
+            break
+    return merged
 
 
 def _parent_thread_side_boundary_resolution(
@@ -2600,6 +2631,43 @@ def _apply_lineage_resolution_to_candidates(candidates: list[dict], lineage: dic
             updated.append(enriched)
             continue
         updated.append(candidate)
+    return updated
+
+
+def _apply_parent_main_candidate_lineage_filter(
+    candidates: list[dict],
+    *,
+    codex_home: Path | None,
+    cwd: Path,
+) -> list[dict]:
+    if codex_home is None:
+        return candidates
+    updated = []
+    for candidate in candidates:
+        if candidate.get("lineage_rejection_reason") or candidate.get("parent_thread_lineage_anchor"):
+            updated.append(candidate)
+            continue
+        if candidate.get("source_kind") not in {"codex_history", "codex_sessions"}:
+            updated.append(candidate)
+            continue
+        lineage = candidate.get("lineage_resolution") or _lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        rejection = _parent_thread_lineage_rejection_reason(lineage)
+        if not rejection:
+            enriched = dict(candidate)
+            enriched["lineage_resolution"] = lineage
+            updated.append(enriched)
+            continue
+        enriched = dict(candidate)
+        enriched.update(
+            {
+                "decision": "rejected",
+                "source_scope": "structural_lineage_rejected_parent_main_candidate",
+                "lineage_resolution": lineage,
+                "lineage_rejection_reason": rejection,
+                "rationale": _append_rejection_rationale(candidate.get("rationale"), rejection),
+            }
+        )
+        updated.append(enriched)
     return updated
 
 
@@ -4612,6 +4680,11 @@ def _apply_parent_main_anchor_shortlist_contract(
     )
     high_confidence_refs = _parent_main_high_confidence_refs(canonical_candidates)
     selected_ref = str((selected_anchor or {}).get("source_ref") or "")
+    stale_newer_candidate = _parent_main_newer_high_confidence_candidate(
+        candidates=canonical_candidates,
+        high_confidence_refs=high_confidence_refs,
+        selected_anchor=selected_anchor,
+    )
     literal_parent_contract_anchor = _literal_parent_thread_contract_anchor(canonical_parent_main_interval)
     literal_parent_contract_selected = not _requires_raw_parent_thread_boundary(query) or bool(
         literal_parent_contract_anchor
@@ -4629,7 +4702,8 @@ def _apply_parent_main_anchor_shortlist_contract(
         rejected=(anchor_decision.get("rejected_anchor_alternatives") or []),
         canonical_refs={str(candidate.get("source_ref") or "") for candidate in canonical_candidates},
     )
-    status = "selected" if unique_selected else "anchor_ambiguous"
+    stale_selected = bool(stale_newer_candidate)
+    status = "selected" if unique_selected else "stale_selected_anchor" if stale_selected else "anchor_ambiguous"
     answer_allowed = bool(unique_selected)
     selected_shortlist_ref = selected_ref if unique_selected else None
     shortlist_candidates = []
@@ -4642,8 +4716,17 @@ def _apply_parent_main_anchor_shortlist_contract(
             confidence = "medium"
             ambiguity = "older_canonical_parent_main_candidate"
         decision = "selected" if unique_selected and ref == selected_ref else "rejected"
+        if candidate.get("lineage_rejection_reason"):
+            confidence = "not_anchor"
+            ambiguity = str(candidate.get("lineage_rejection_reason") or "lineage_rejected_parent_main_candidate")
+            decision = "diagnostic_rejected"
+        if stale_selected and ref == selected_ref:
+            decision = "selected_stale"
+            ambiguity = "older_than_newest_canonical_parent_main_candidate"
         if status == "anchor_ambiguous" and ref in high_confidence_refs:
             decision = "ambiguous"
+        if stale_selected and ref in high_confidence_refs:
+            decision = "newer_candidate"
         shortlist_candidates.append(
             _parent_main_shortlist_item(
                 candidate,
@@ -4673,7 +4756,8 @@ def _apply_parent_main_anchor_shortlist_contract(
     recovery_commands = [
         item.get("read_more_command")
         for item in shortlist_candidates
-        if item.get("read_more_command") and item.get("decision") in {"ambiguous", "diagnostic_rejected"}
+        if item.get("read_more_command")
+        and item.get("decision") in {"ambiguous", "diagnostic_rejected", "newer_candidate", "selected_stale"}
     ][:4]
     recovery = {
         "read_more_commands": recovery_commands,
@@ -4702,8 +4786,20 @@ def _apply_parent_main_anchor_shortlist_contract(
         "candidates": shortlist_candidates,
         "recovery": recovery,
     }
+    if stale_newer_candidate:
+        shortlist["newest_candidate"] = {
+            "source_ref": stale_newer_candidate.get("source_ref"),
+            "timestamp_utc": stale_newer_candidate.get("timestamp_utc"),
+            "classification": stale_newer_candidate.get("classification"),
+        }
     if unique_selected or not selected_anchor:
         return selected_anchor, anchor_decision, shortlist
+    if stale_selected:
+        updated_decision = {
+            **anchor_decision,
+            "parent_main_anchor_shortlist_status": status,
+        }
+        return selected_anchor, updated_decision, shortlist
 
     rejected = _shortlist_rejected_anchor_alternatives(shortlist_candidates)
     for item in anchor_decision.get("rejected_anchor_alternatives") or []:
@@ -4741,7 +4837,7 @@ def _parent_main_canonical_shortlist_candidates(
     candidates = [dict(candidate) for candidate in canonical_parent_main_interval.get("anchor_candidates") or []]
     selected = canonical_parent_main_interval.get("selected_anchor") or selected_anchor
     if selected and not any(candidate.get("source_ref") == selected.get("source_ref") for candidate in candidates):
-        candidates.insert(0, dict(selected))
+        candidates.append(dict(selected))
     return candidates[:8]
 
 
@@ -4761,6 +4857,41 @@ def _parent_main_high_confidence_refs(candidates: list[dict]) -> set[str]:
         if int(candidate.get("score") or 0) == top_score and str(candidate.get("timestamp_utc") or "") == top_timestamp:
             refs.add(str(candidate.get("source_ref") or ""))
     return {ref for ref in refs if ref}
+
+
+def _parent_main_newer_high_confidence_candidate(
+    *,
+    candidates: list[dict],
+    high_confidence_refs: set[str],
+    selected_anchor: dict | None,
+) -> dict | None:
+    if not selected_anchor or not high_confidence_refs:
+        return None
+    selected_ref = str(selected_anchor.get("source_ref") or "")
+    if selected_ref in high_confidence_refs:
+        return None
+    selected_time = parse_datetime(str(selected_anchor.get("timestamp_utc") or ""), timezone.utc)
+    if selected_time is None:
+        return None
+    selected_time = selected_time.astimezone(timezone.utc)
+    newer = []
+    for candidate in candidates:
+        if str(candidate.get("source_ref") or "") not in high_confidence_refs:
+            continue
+        candidate_time = parse_datetime(str(candidate.get("timestamp_utc") or ""), timezone.utc)
+        if candidate_time is None or candidate_time.astimezone(timezone.utc) <= selected_time:
+            continue
+        newer.append(candidate)
+    if not newer:
+        return None
+    newer.sort(
+        key=lambda item: (
+            str(item.get("timestamp_utc") or ""),
+            int(item.get("line") or 0),
+        ),
+        reverse=True,
+    )
+    return newer[0]
 
 
 def _parent_main_diagnostic_shortlist_candidates(
@@ -4907,6 +5038,7 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
     anchor_reason = str(anchor_decision.get("anchor_reason") or "")
     return (
         context_boundary.startswith("explicit_parent_main")
+        or context_boundary.startswith("explicit_parent_thread_side_boundary")
         or context_boundary.startswith("relative_status_history")
         or context_boundary.startswith("prior_request_occurrence")
         or context_boundary.startswith("natural_status_duplicate_prior_parent_main")
@@ -4915,6 +5047,7 @@ def _is_parent_main_status_decision(anchor_decision: dict) -> bool:
         or anchor_reason in {
             "first_side_thread_user_message_after_boundary",
             "parent_main_last_actual_work_handoff",
+            "raw_side_session_parent_thread_id_matched_parent_history_session",
             "unique_prior_request_occurrence_parent_main_anchor",
             "prior_request_occurrence_not_unique",
             "prior_request_occurrence_preceding_anchor_not_proven",

@@ -4880,12 +4880,18 @@ def render_status_anchor_text(payload: dict) -> str:
 def render_status_anchor_answer(payload: dict) -> str:
     report = payload["status_anchor"]
     if not _status_anchor_answer_format_ready(report):
-        return "\n".join(
-            [
-                "NOT ANSWERABLE YET",
-                _status_anchor_canonical_continuation_command(report),
-            ]
-        )
+        lines = ["NOT ANSWERABLE YET", _status_anchor_canonical_continuation_command(report)]
+        freshness = (report.get("answer_readiness") or {}).get("parent_main_anchor_freshness") or {}
+        if freshness.get("status") == "stale_selected_anchor":
+            newest = freshness.get("newest_candidate") or {}
+            lines.append(
+                "parent_main_anchor_freshness: "
+                "status=stale_selected_anchor "
+                "selected_anchor_freshness=false "
+                f"newest_ref={newest.get('source_ref') or '(unknown)'} "
+                f"newest_timestamp={newest.get('timestamp_utc') or '(unknown)'}"
+            )
+        return "\n".join(lines)
 
     selected = report.get("selected_anchor") or {}
     routing = report.get("routing") or {}
