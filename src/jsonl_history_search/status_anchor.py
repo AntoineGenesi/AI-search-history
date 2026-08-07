@@ -455,6 +455,7 @@ def status_anchor_report(
         audit_run_requested=audit_run_requested,
         interval_entry_limit=COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
         include_linked_spawned_sessions=complete_interval,
+        complete_interval_requested=complete_interval,
     )
     selected_anchor, anchor_decision, session_activity = _demote_unqualified_out_of_band_anchor_without_activity(
         query=effective_query,
@@ -5000,6 +5001,7 @@ def _session_activity_trace(
     audit_run_requested: bool = False,
     interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
     include_linked_spawned_sessions: bool = False,
+    complete_interval_requested: bool = False,
 ) -> dict:
     base = {
         "status": "no_selected_anchor",
@@ -5072,6 +5074,7 @@ def _session_activity_trace(
     omitted_ranges = []
     next_reads = []
     missing = []
+    scan_started = time.perf_counter()
     for context in unique_contexts:
         session_files = list(context.get("session_files") or [])
         if not session_files:
@@ -5091,6 +5094,7 @@ def _session_activity_trace(
                 status_as_of_boundary=status_as_of_boundary,
                 audit_run_requested=audit_run_requested,
                 interval_entry_limit=interval_entry_limit,
+                block_on_entry_omission=not complete_interval_requested,
             )
             _merge_activity_counts(activity, scan["activity_after_anchor"])
             chronological_entries.extend(scan.get("chronological_activity_after_anchor") or [])
@@ -5113,12 +5117,42 @@ def _session_activity_trace(
             )
             next_reads.extend(scan["next_reads"])
 
+    if complete_interval_requested and len(chronological_entries) > interval_entry_limit:
+        sorted_entries = _sort_interval_entries(chronological_entries)
+        head_limit = max(1, interval_entry_limit // 2)
+        tail_limit = max(0, interval_entry_limit - head_limit)
+        chronological_entries = sorted_entries[:head_limit] + sorted_entries[-tail_limit:]
+        omitted_ranges.append(
+            {
+                "session_source_ref": "multiple_touched_sessions",
+                "omitted_count": max(0, len(sorted_entries) - len(chronological_entries)),
+                "after_ref": chronological_entries[head_limit - 1].get("source_ref") if chronological_entries else None,
+                "last_ref": sorted_entries[-1].get("source_ref") if sorted_entries else None,
+                "blocking": False,
+                "guidance": (
+                    "The command scanned all touched sessions but summarized middle rows from the aggregate "
+                    "model-facing ledger. This is not a coverage blocker by itself."
+                ),
+                "read_next_command": None,
+            }
+        )
+
     summary = {
         "session_file_count": len({item["session_file"] for item in followups}),
         "records_after_anchor": activity["records_after_anchor"],
         "spawned_session_call_count": activity["spawned_session_calls"],
         "interval_ledger_entry_count": len(chronological_entries),
         "omitted_interval_ledger_entry_count": sum(int(item.get("omitted_count") or 0) for item in omitted_ranges),
+        "blocking_omitted_interval_ledger_entry_count": sum(
+            int(item.get("omitted_count") or 0) for item in omitted_ranges if item.get("blocking") is not False
+        ),
+        "scan_elapsed_ms": round((time.perf_counter() - scan_started) * 1000, 3),
+        "scan_mode": "complete_interval_summary" if complete_interval_requested else "bounded_interval",
+        "entry_storage_policy": (
+            "scan_all_records_store_head_tail_summary"
+            if complete_interval_requested
+            else "scan_all_records_store_first_entries_block_on_omission"
+        ),
     }
     status = "raw_session_trace_found" if summary["session_file_count"] and summary["records_after_anchor"] else "raw_session_trace_empty"
     if missing and status == "raw_session_trace_found":
@@ -5479,15 +5513,21 @@ def _scan_session_file_after_anchor(
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
     interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+    block_on_entry_omission: bool = True,
 ) -> dict:
     activity = _empty_activity_counts()
     first_ref = None
     last_ref = None
     spawned_refs = []
     chronological_entries = []
+    chronological_head_entries = []
+    chronological_tail_entries = []
     omitted_count = 0
     omitted_after_ref = None
     next_reads = []
+    total_interval_entries = 0
+    head_entry_limit = max(1, interval_entry_limit // 2) if interval_entry_limit > 0 else 0
+    tail_entry_limit = max(0, interval_entry_limit - head_entry_limit) if interval_entry_limit > 0 else 0
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
@@ -5553,12 +5593,23 @@ def _scan_session_file_after_anchor(
                 codex_home=codex_home,
                 target_window=target_window,
             )
-            if len(chronological_entries) < interval_entry_limit:
-                chronological_entries.append(entry)
-            else:
+            total_interval_entries += 1
+            if block_on_entry_omission:
+                if len(chronological_entries) < interval_entry_limit:
+                    chronological_entries.append(entry)
+                else:
+                    omitted_count += 1
+                    if omitted_after_ref is None:
+                        omitted_after_ref = chronological_entries[-1].get("source_ref") if chronological_entries else source_ref
+            elif interval_entry_limit <= 0:
                 omitted_count += 1
-                if omitted_after_ref is None:
-                    omitted_after_ref = chronological_entries[-1].get("source_ref") if chronological_entries else source_ref
+            else:
+                if len(chronological_head_entries) < head_entry_limit:
+                    chronological_head_entries.append(entry)
+                else:
+                    chronological_tail_entries.append(entry)
+                    if len(chronological_tail_entries) > tail_entry_limit:
+                        chronological_tail_entries.pop(0)
             if _is_spawned_session_call(record):
                 spawned_refs.append(source_ref)
                 if len(next_reads) < 4:
@@ -5578,6 +5629,11 @@ def _scan_session_file_after_anchor(
                             reason="Inspect spawned worker/reviewer session launch as part of the long-absence trace.",
                         )
                     )
+    if not block_on_entry_omission:
+        chronological_entries = chronological_head_entries + chronological_tail_entries
+        omitted_count = max(0, total_interval_entries - len(chronological_entries))
+        if omitted_count > 0 and chronological_head_entries:
+            omitted_after_ref = chronological_head_entries[-1].get("source_ref")
     return {
         "records_after_anchor": activity["records_after_anchor"],
         "activity_after_anchor": activity,
@@ -5593,13 +5649,24 @@ def _scan_session_file_after_anchor(
             codex_home=codex_home,
             cwd=cwd,
             interval_entry_limit=interval_entry_limit,
+            blocking=block_on_entry_omission,
         ),
         "next_reads": next_reads,
     }
 
 
 def _sort_interval_entries(entries: list[dict]) -> list[dict]:
-    return sorted(entries, key=lambda item: (str(item.get("timestamp_utc") or ""), str(item.get("source_ref") or "")))
+    return sorted(entries, key=_interval_entry_sort_key)
+
+
+def _interval_entry_sort_key(item: dict) -> tuple[str, str, int, str]:
+    source_ref = str(item.get("source_ref") or "")
+    source_without_line, _, line_text = source_ref.rpartition(":")
+    try:
+        line_number = int(line_text)
+    except ValueError:
+        line_number = int(item.get("line") or 0)
+    return (str(item.get("timestamp_utc") or ""), source_without_line, line_number, source_ref)
 
 
 def _interval_activity_entry(
@@ -5686,11 +5753,12 @@ def _omitted_interval_ranges(
     codex_home: Path,
     cwd: Path,
     interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+    blocking: bool = True,
 ) -> list[dict]:
     if omitted_count <= 0:
         return []
     read_next_command = None
-    if omitted_after_ref:
+    if blocking and omitted_after_ref:
         read_next_command = " ".join(
             shlex.quote(part)
             for part in [
@@ -5715,9 +5783,15 @@ def _omitted_interval_ranges(
             "omitted_count": omitted_count,
             "after_ref": omitted_after_ref,
             "last_ref": last_ref,
+            "blocking": blocking,
             "guidance": (
                 "The model-facing post-anchor interval ledger was capped. Continue from after_ref before "
                 "answering or state this omitted range explicitly."
+                if blocking
+                else (
+                    "The command scanned the full post-anchor interval but summarized middle rows from the "
+                    "model-facing ledger. This is not a coverage blocker by itself."
+                )
             ),
             "read_next_command": read_next_command,
         }
@@ -5786,7 +5860,7 @@ def _post_anchor_interval_reconstruction(
     codex_home: Path | None,
     complete_interval: bool = False,
 ) -> dict:
-    coverage = _post_anchor_interval_coverage(session_activity)
+    coverage = _post_anchor_interval_coverage(session_activity, complete_interval=complete_interval)
     coverage["chronological_entry_limit"] = (
         COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT
     )
@@ -5858,11 +5932,14 @@ def _post_anchor_interval_reconstruction(
     }
 
 
-def _post_anchor_interval_coverage(session_activity: dict) -> dict:
+def _post_anchor_interval_coverage(session_activity: dict, *, complete_interval: bool = False) -> dict:
     raw_status = str(session_activity.get("status") or "")
     summary = session_activity.get("summary") or {}
     records_after_anchor = int(summary.get("records_after_anchor") or 0)
     omitted_count = int(summary.get("omitted_interval_ledger_entry_count") or 0)
+    blocking_omitted_count = int(summary.get("blocking_omitted_interval_ledger_entry_count") or 0)
+    if not complete_interval and blocking_omitted_count == 0:
+        blocking_omitted_count = omitted_count
     missing_logs = list(session_activity.get("missing_logs") or [])
     blocking_missing_logs = [
         item for item in missing_logs if not str(item).startswith("status_question session file not found")
@@ -5875,6 +5952,7 @@ def _post_anchor_interval_coverage(session_activity: dict) -> dict:
             "raw_session_trace_status": raw_status,
             "records_after_anchor": records_after_anchor,
             "omitted_activity_entry_count": omitted_count,
+            "blocking_omitted_activity_entry_count": blocking_omitted_count,
             "missing_logs": missing_logs,
             "blocking_missing_logs": blocking_missing_logs,
             "warnings": ["No complete post-anchor interval can be reconstructed until the selected anchor/session context is proven."],
@@ -5886,6 +5964,7 @@ def _post_anchor_interval_coverage(session_activity: dict) -> dict:
             "raw_session_trace_status": raw_status,
             "records_after_anchor": records_after_anchor,
             "omitted_activity_entry_count": omitted_count,
+            "blocking_omitted_activity_entry_count": blocking_omitted_count,
             "missing_logs": missing_logs,
             "blocking_missing_logs": blocking_missing_logs,
             "warnings": ["No raw post-anchor records were found; do not answer from secondary artifacts alone."],
@@ -5895,10 +5974,19 @@ def _post_anchor_interval_coverage(session_activity: dict) -> dict:
     if blocking_missing_logs:
         warnings.append("At least one post-anchor interval session log was missing; reconstruct it before answering.")
     if omitted_count:
-        warnings.append(
-            "The chronological interval ledger is capped and omitted post-anchor records; continue the omitted range before answering."
-        )
-    complete = raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"} and not blocking_missing_logs and omitted_count == 0
+        if complete_interval:
+            warnings.append(
+                "The full post-anchor interval was scanned, but middle rows were summarized out of the compact ledger."
+            )
+        else:
+            warnings.append(
+                "The chronological interval ledger is capped and omitted post-anchor records; continue the omitted range before answering."
+            )
+    complete = (
+        raw_status in {"raw_session_trace_found", "partial_raw_session_trace_found"}
+        and not blocking_missing_logs
+        and blocking_omitted_count == 0
+    )
     status = "complete" if complete else "partial"
     return {
         "status": status,
@@ -5908,6 +5996,11 @@ def _post_anchor_interval_coverage(session_activity: dict) -> dict:
         "chronological_entry_limit": POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
         "chronological_entry_count": int(summary.get("interval_ledger_entry_count") or 0),
         "omitted_activity_entry_count": omitted_count,
+        "blocking_omitted_activity_entry_count": blocking_omitted_count,
+        "ledger_summary_truncated": bool(complete_interval and omitted_count),
+        "scan_elapsed_ms": summary.get("scan_elapsed_ms"),
+        "scan_mode": summary.get("scan_mode"),
+        "entry_storage_policy": summary.get("entry_storage_policy"),
         "missing_logs": missing_logs,
         "blocking_missing_logs": blocking_missing_logs,
         "warnings": warnings,
@@ -5950,11 +6043,21 @@ def _post_anchor_interval_next_read_guidance(
     cwd: Path,
     codex_home: Path | None,
 ) -> dict:
-    if omitted_ranges:
+    blocking_omitted_ranges = [item for item in omitted_ranges if item.get("blocking") is not False]
+    if blocking_omitted_ranges:
         return {
             "status": "continue_omitted_range",
-            "commands": [item.get("read_next_command") for item in omitted_ranges if item.get("read_next_command")],
+            "commands": [item.get("read_next_command") for item in blocking_omitted_ranges if item.get("read_next_command")],
             "policy": "Read the omitted interval range before answering, or explicitly report the omitted range as a blocker.",
+        }
+    if omitted_ranges:
+        return {
+            "status": "complete_interval_summary_truncated",
+            "commands": [],
+            "policy": (
+                "The command scanned the full interval and summarized middle rows out of the model-facing ledger; "
+                "do not run read-more solely for summarized rows."
+            ),
         }
     blocking_missing_logs = [
         item

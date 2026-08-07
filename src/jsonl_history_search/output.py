@@ -4862,7 +4862,15 @@ def render_status_anchor_answer(payload: dict) -> str:
         lines.append("- (none surfaced)")
     lines.append("Timeline:")
     if entries:
-        for entry in entries[:16]:
+        timeline_entries = _status_anchor_answer_timeline_entries(entries, limit=16)
+        for entry in timeline_entries:
+            if entry.get("activity_kind") == "summary_gap":
+                lines.append(
+                    "- "
+                    f"... {entry.get('omitted_count')} compact timeline entries summarized between "
+                    f"{entry.get('after_source_ref')} and {entry.get('before_source_ref')}"
+                )
+                continue
             lines.append(
                 "- "
                 f"{entry.get('timestamp_utc')} {entry.get('source_ref')} "
@@ -4881,6 +4889,22 @@ def render_status_anchor_answer(payload: dict) -> str:
                 f"{item.get('snippet')}"
             )
     return "\n".join(lines)
+
+
+def _status_anchor_answer_timeline_entries(entries: list[dict], *, limit: int) -> list[dict]:
+    if len(entries) <= limit:
+        return entries
+    head_count = max(1, limit // 2)
+    tail_count = max(1, limit - head_count - 1)
+    head = entries[:head_count]
+    tail = entries[-tail_count:]
+    gap = {
+        "activity_kind": "summary_gap",
+        "omitted_count": max(0, len(entries) - len(head) - len(tail)),
+        "after_source_ref": head[-1].get("source_ref") if head else None,
+        "before_source_ref": tail[0].get("source_ref") if tail else None,
+    }
+    return head + [gap] + tail
 
 
 def _status_anchor_answer_format_ready(report: dict) -> bool:
