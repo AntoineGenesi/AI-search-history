@@ -88,8 +88,8 @@ direct `semantic-debug`. Read one matching file under `references/`:
 
 ## Source And Stop Rules
 
-1. Treat CLI summaries as navigation, not as primary proof. Inspect
-   use its selected refs or `source_locator_handoff`/`next_reads` named by the result.
+1. Treat CLI summaries as navigation, not as primary proof. Use its selected refs
+   or `source_locator_handoff`/`next_reads` to inspect refs before answering.
 2. Use the emitted command, or open a source window with:
 
    ```bash
