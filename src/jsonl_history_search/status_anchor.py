@@ -26,6 +26,7 @@ from .timeutil import parse_datetime
 DEFAULT_STATUS_QUERY = "what happened since my last message?"
 SCHEMA_VERSION = 1
 POST_ANCHOR_INTERVAL_ENTRY_LIMIT = 40
+COMPLETE_INTERVAL_ENTRY_HARD_CAP = 400
 
 SOURCE_MODES = (
     "ground_truth_chat_logs",
@@ -316,6 +317,8 @@ def build_status_anchor_payload(args: Any) -> dict:
     codex_home = history_home_from_args(args, provider="codex")
     cwd = Path(args.cwd).expanduser().resolve()
     query = getattr(args, "query", None) or DEFAULT_STATUS_QUERY
+    parent_thread_mode = bool(getattr(args, "parent_thread", False))
+    complete_interval = bool(getattr(args, "complete_interval", False))
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
     snippet_chars = max(0, getattr(args, "snippet_chars", 280))
     latest = latest_user_messages(
@@ -334,6 +337,15 @@ def build_status_anchor_payload(args: Any) -> dict:
             cwd=cwd,
             codex_home=codex_home,
             started=time.monotonic(),
+            parent_thread_mode=parent_thread_mode,
+            complete_interval=complete_interval,
+            command_options={
+                "cwd": str(cwd),
+                "codex_home": str(codex_home) if codex_home else None,
+                "max_matches": limit,
+                "parent_thread": parent_thread_mode,
+                "complete_interval": complete_interval,
+            },
         )
     }
 
@@ -345,20 +357,25 @@ def status_anchor_report(
     cwd: Path,
     codex_home: Path | None = None,
     started: float | None = None,
+    parent_thread_mode: bool = False,
+    complete_interval: bool = False,
+    command_options: dict | None = None,
 ) -> dict:
+    original_query = query
+    effective_query = _query_with_parent_thread_mode(query, parent_thread_mode)
     latest_messages = latest.get("messages", [])
-    target_window = _target_window_from_query(query)
-    status_as_of_boundary = _status_as_of_boundary_from_messages(query, latest_messages)
-    audit_run_requested = _audit_run_requested(query, target_window)
+    target_window = _target_window_from_query(effective_query)
+    status_as_of_boundary = _status_as_of_boundary_from_messages(effective_query, latest_messages)
+    audit_run_requested = _audit_run_requested(effective_query, target_window)
     canonical_parent_main_interval = _canonical_parent_main_status_interval(
-        query=query,
+        query=effective_query,
         codex_home=codex_home,
         cwd=cwd,
         status_as_of_boundary=status_as_of_boundary,
         latest_messages=latest_messages,
     )
     prior_request_occurrence = _prior_request_occurrence_recovery(
-        query=query,
+        query=effective_query,
         latest_messages=latest_messages,
         codex_home=codex_home,
         status_as_of_boundary=status_as_of_boundary,
@@ -370,19 +387,19 @@ def status_anchor_report(
     }
     anchor_candidates = _rank_anchor_candidates(
         latest_messages,
-        query=query,
+        query=effective_query,
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
     )
     anchor_candidates = _apply_parent_thread_lineage_to_ranked_candidates(
-        query=query,
+        query=effective_query,
         candidates=anchor_candidates,
         cwd=cwd,
         codex_home=codex_home,
     )
     anchor_decision = _select_anchor_with_boundary(
-        query=query,
+        query=effective_query,
         messages=latest_messages,
         candidates=anchor_candidates,
         cwd=cwd,
@@ -436,9 +453,11 @@ def status_anchor_report(
         target_window=target_window,
         status_as_of_boundary=status_as_of_boundary,
         audit_run_requested=audit_run_requested,
+        interval_entry_limit=COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+        include_linked_spawned_sessions=complete_interval,
     )
     selected_anchor, anchor_decision, session_activity = _demote_unqualified_out_of_band_anchor_without_activity(
-        query=query,
+        query=effective_query,
         selected_anchor=selected_anchor,
         anchor_decision=anchor_decision,
         session_activity=session_activity,
@@ -457,6 +476,7 @@ def status_anchor_report(
         artifacts=artifacts,
         cwd=cwd,
         codex_home=codex_home,
+        complete_interval=complete_interval,
     )
     current_value_items = [item for item in artifacts["value_items"] if item.get("current_window_evidence")]
     behavior_deltas = [item for item in current_value_items if item["value_kind"] == "behavior_delta"]
@@ -529,10 +549,12 @@ def status_anchor_report(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ok" if selected_anchor else "anchor_ambiguous",
-        "query": query,
+        "query": original_query,
+        "effective_query": effective_query,
+        "command_options": command_options or {},
         "routing": {
             "route": "what_happened_since_status_anchor",
-            "natural_status_triggered": is_status_question(query),
+            "natural_status_triggered": is_status_question(effective_query),
             "jsonl_first": True,
             "built_on": "latest_user_messages",
             "no_spawned_agents": True,
@@ -601,6 +623,8 @@ def status_anchor_report(
                 "canonical_high_confidence_count", 0
             ),
             "parent_thread_side_boundary_status": parent_thread_side_boundary.get("status"),
+            "parent_thread_mode_requested": parent_thread_mode,
+            "complete_interval_requested": complete_interval,
         },
         "anchor_candidates": anchor_candidates,
         "parent_main_anchor_shortlist": parent_main_anchor_shortlist,
@@ -651,6 +675,12 @@ def status_anchor_report(
 def is_status_question(query: str) -> bool:
     normalized = _normalize(query)
     return any(pattern in normalized for pattern in STATUS_QUERY_PATTERNS)
+
+
+def _query_with_parent_thread_mode(query: str, parent_thread_mode: bool) -> str:
+    if not parent_thread_mode or _requires_raw_parent_thread_boundary(query):
+        return query
+    return f"{query.rstrip()} in the parent thread"
 
 
 def _rank_anchor_candidates(
@@ -4968,6 +4998,8 @@ def _session_activity_trace(
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
+    interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
+    include_linked_spawned_sessions: bool = False,
 ) -> dict:
     base = {
         "status": "no_selected_anchor",
@@ -5014,6 +5046,16 @@ def _session_activity_trace(
     status_ref = anchor_decision.get("status_ref")
     if status_ref and not selected_anchor.get("side_parent_boundary_anchor"):
         contexts.extend(_session_contexts_for_history_ref(str(status_ref), codex_home, role="status_question"))
+    if include_linked_spawned_sessions and anchor_decision.get("anchor_scope") == "parent_thread":
+        contexts.extend(
+            _linked_worker_reviewer_session_contexts(
+                selected_anchor,
+                anchor_timestamp=anchor_timestamp,
+                cwd=cwd,
+                codex_home=codex_home,
+                existing_contexts=contexts,
+            )
+        )
 
     unique_contexts = _dedupe_session_contexts(contexts)
     if not unique_contexts:
@@ -5048,6 +5090,7 @@ def _session_activity_trace(
                 target_window=target_window,
                 status_as_of_boundary=status_as_of_boundary,
                 audit_run_requested=audit_run_requested,
+                interval_entry_limit=interval_entry_limit,
             )
             _merge_activity_counts(activity, scan["activity_after_anchor"])
             chronological_entries.extend(scan.get("chronological_activity_after_anchor") or [])
@@ -5221,6 +5264,98 @@ def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -
     return contexts
 
 
+def _linked_worker_reviewer_session_contexts(
+    selected_anchor: dict,
+    *,
+    anchor_timestamp,
+    cwd: Path,
+    codex_home: Path,
+    existing_contexts: list[dict],
+) -> list[dict]:
+    parent_hashes = _selected_parent_identity_hashes(selected_anchor, codex_home=codex_home, cwd=cwd)
+    if not parent_hashes:
+        return []
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    existing_files = {
+        str(Path(path_item))
+        for context in existing_contexts
+        for path_item in (context.get("session_files") or [])
+    }
+    linked_contexts: list[dict] = []
+    for path in sorted(sessions_root.rglob("*.jsonl")):
+        if str(path) in existing_files:
+            continue
+        meta = _session_lineage_metadata(path, cwd=cwd)
+        if meta.get("status") != "ok":
+            continue
+        if meta.get("parent_thread_id_hash") not in parent_hashes:
+            continue
+        if not _is_worker_reviewer_or_subagent_lineage(meta):
+            continue
+        role = str(meta.get("agent_role") or meta.get("thread_source") or meta.get("source_kind") or "child").casefold()
+        linked_contexts.append(
+            {
+                "role": f"linked_{role}_session",
+                "session_id_hash": meta.get("session_id_hash"),
+                "parent_thread_id_hash": meta.get("parent_thread_id_hash"),
+                "raw_thread_id_hash": meta.get("raw_thread_id_hash"),
+                "session_anchor_timestamp_utc": anchor_timestamp.isoformat(timespec="seconds"),
+                "session_files": [path],
+                "lineage_resolution": meta,
+                "linked_parent_thread_interval_session": True,
+                "activity_boundary_policy": "strictly_after_selected_parent_anchor_timestamp",
+            }
+        )
+    return linked_contexts
+
+
+def _selected_parent_identity_hashes(selected_anchor: dict, *, codex_home: Path, cwd: Path) -> set[str]:
+    hashes = {
+        str(value)
+        for value in (
+            selected_anchor.get("session_id_hash"),
+            selected_anchor.get("raw_thread_id_hash"),
+            selected_anchor.get("root_thread_id_hash"),
+        )
+        if value
+    }
+    source_identifier = str(selected_anchor.get("source_identifier") or "")
+    if source_identifier.startswith("history-session-"):
+        hashes.add(source_identifier[len("history-session-") :])
+    source_ref = str(selected_anchor.get("source_ref") or "")
+    if source_ref.startswith("codex_history:"):
+        line_number = _line_from_source_ref(source_ref)
+        if line_number is not None:
+            record = _read_jsonl_line(codex_home / "history.jsonl", line_number)
+            if isinstance(record, Mapping):
+                for key in ("session_id", "conversation_id", "thread_id"):
+                    hashed = _hash_value(record.get(key))
+                    if hashed:
+                        hashes.add(hashed)
+    lineage = selected_anchor.get("lineage_resolution")
+    if not isinstance(lineage, Mapping):
+        lineage = _lineage_for_anchor(selected_anchor, codex_home=codex_home, cwd=cwd)
+    if isinstance(lineage, Mapping):
+        for key in ("session_id_hash", "raw_thread_id_hash", "root_thread_id_hash"):
+            value = lineage.get(key)
+            if value:
+                hashes.add(str(value))
+    return hashes - {""}
+
+
+def _is_worker_reviewer_or_subagent_lineage(lineage: Mapping[str, Any]) -> bool:
+    role = str(lineage.get("agent_role") or "").casefold()
+    thread_source = str(lineage.get("thread_source") or "").casefold()
+    source_kind = str(lineage.get("source_kind") or "").casefold()
+    return (
+        role in {"implementer", "worker", "reviewer", "rereviewer"}
+        or thread_source in {"subagent", "worker", "reviewer", "rereviewer"}
+        or source_kind == "subagent"
+    )
+
+
 def _apply_parent_thread_lineage_to_ranked_candidates(
     *,
     query: str,
@@ -5343,6 +5478,7 @@ def _scan_session_file_after_anchor(
     target_window: dict | None = None,
     status_as_of_boundary: dict | None = None,
     audit_run_requested: bool = False,
+    interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
 ) -> dict:
     activity = _empty_activity_counts()
     first_ref = None
@@ -5417,7 +5553,7 @@ def _scan_session_file_after_anchor(
                 codex_home=codex_home,
                 target_window=target_window,
             )
-            if len(chronological_entries) < POST_ANCHOR_INTERVAL_ENTRY_LIMIT:
+            if len(chronological_entries) < interval_entry_limit:
                 chronological_entries.append(entry)
             else:
                 omitted_count += 1
@@ -5456,6 +5592,7 @@ def _scan_session_file_after_anchor(
             path=path,
             codex_home=codex_home,
             cwd=cwd,
+            interval_entry_limit=interval_entry_limit,
         ),
         "next_reads": next_reads,
     }
@@ -5548,6 +5685,7 @@ def _omitted_interval_ranges(
     path: Path,
     codex_home: Path,
     cwd: Path,
+    interval_entry_limit: int = POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
 ) -> list[dict]:
     if omitted_count <= 0:
         return []
@@ -5568,7 +5706,7 @@ def _omitted_interval_ranges(
                 "--mode",
                 "next",
                 "--next-count",
-                str(min(omitted_count, POST_ANCHOR_INTERVAL_ENTRY_LIMIT)),
+                str(min(omitted_count, interval_entry_limit)),
             ]
         )
     return [
@@ -5646,8 +5784,12 @@ def _post_anchor_interval_reconstruction(
     artifacts: dict,
     cwd: Path,
     codex_home: Path | None,
+    complete_interval: bool = False,
 ) -> dict:
     coverage = _post_anchor_interval_coverage(session_activity)
+    coverage["chronological_entry_limit"] = (
+        COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT
+    )
     chronological_entries = list(session_activity.get("chronological_activity_after_anchor") or [])
     secondary_joins = _post_anchor_secondary_joins(artifacts)
     boundary = (
@@ -5688,6 +5830,8 @@ def _post_anchor_interval_reconstruction(
         "anchor": anchor,
         "boundary": boundary,
         "coverage": coverage,
+        "complete_interval_requested": complete_interval,
+        "complete_interval_entry_hard_cap": COMPLETE_INTERVAL_ENTRY_HARD_CAP if complete_interval else POST_ANCHOR_INTERVAL_ENTRY_LIMIT,
         "chronological_activity": chronological_entries,
         "chronological_entry_count": len(chronological_entries),
         "spawned_session_launch_refs": [

@@ -516,6 +516,20 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     )
     status_anchor.add_argument("query", nargs="?", default=DEFAULT_STATUS_QUERY)
     add_common_args(status_anchor)
+    for action in status_anchor._actions:
+        if action.dest == "format":
+            action.choices = ("text", "json", "markdown", "answer")
+            break
+    status_anchor.add_argument(
+        "--parent-thread",
+        action="store_true",
+        help="Require a proven parent-thread anchor/boundary before answer-mode promotion.",
+    )
+    status_anchor.add_argument(
+        "--complete-interval",
+        action="store_true",
+        help="Collect post-anchor interval activity up to the complete-interval hard cap before answer-mode rendering.",
+    )
     status_anchor.add_argument(
         "--limit",
         type=int,
@@ -10649,6 +10663,25 @@ def _latest_status_post_anchor_interval_final_proof_gate(
         for item in opened
         if _latest_status_opened_answer_support_role(item) == "selected_parent_thread_raw_user_row"
     ]
+    if contract.get("coverage_complete") is not True:
+        return {
+            "schema_version": 1,
+            "status": "incomplete_post_anchor_interval_coverage",
+            "selected_anchor_ref_count": len(opened_anchor),
+            "post_anchor_interval_ref_count": len(opened_interval),
+            "required_post_anchor_interval_read_count": len(required_reads),
+            "coverage_status": contract.get("coverage_status"),
+            "coverage_complete": contract.get("coverage_complete"),
+            "next_read_guidance": contract.get("next_read_guidance"),
+            "required_next_reads": required_reads[:6],
+            "summary_lines": [
+                "latest-status coverage_complete=false; opened post-anchor refs are partial leads, not final proof."
+            ],
+            "required_next_proof": (
+                "Follow post_anchor_interval_reconstruction.next_read_guidance until coverage_complete=true, "
+                "or fail closed without synthesizing status prose."
+            ),
+        }
     if opened_interval:
         return {
             "schema_version": 1,
