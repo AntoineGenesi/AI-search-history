@@ -5879,6 +5879,13 @@ def render_semantic_debug_text(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if report.get("bm25_escalation"):
+        escalation = report["bm25_escalation"]
+        command = (escalation.get("command") or {}).get("shell")
+        reasons = ", ".join(str(item) for item in escalation.get("trigger_reasons", []))
+        lines.append(f"BM25 escalation: {escalation.get('status')} ({reasons})")
+        if command:
+            lines.append(f"BM25 retry command: {command}")
     if spawned_session_resolution and spawned_session_resolution.get("applies"):
         lines.extend(render_spawned_session_resolution_text(spawned_session_resolution))
     if orchestration_role_bundle:
@@ -6207,6 +6214,13 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if report.get("bm25_escalation"):
+        escalation = report["bm25_escalation"]
+        command = (escalation.get("command") or {}).get("shell")
+        reasons = ", ".join(str(item) for item in escalation.get("trigger_reasons", []))
+        lines.extend(["", "## BM25 Escalation", "", f"- Status: `{escalation.get('status')}`", f"- Reasons: `{reasons}`"])
+        if command:
+            lines.extend(["", "```bash", command, "```"])
     if spawned_session_resolution and spawned_session_resolution.get("applies"):
         lines.extend(render_spawned_session_resolution_markdown(spawned_session_resolution))
     if orchestration_role_bundle:
@@ -8302,6 +8316,13 @@ def render_agent_find_text(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.append(f"Cap hit: {', '.join(cap_hit.get('caps_hit', []))}")
+    if report.get("bm25_escalation"):
+        escalation = report["bm25_escalation"]
+        command = (escalation.get("command") or {}).get("shell")
+        reasons = ", ".join(str(item) for item in escalation.get("trigger_reasons", []))
+        lines.append(f"BM25 escalation: {escalation.get('status')} ({reasons})")
+        if command:
+            lines.append(f"BM25 retry command: {command}")
     if report.get("source_locator_handoff"):
         lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", [])[:8]:
@@ -8376,6 +8397,13 @@ def render_agent_find_markdown(payload: dict) -> str:
         )
     if cap_hit.get("hit"):
         lines.extend(["", f"**Cap hit:** {', '.join(cap_hit.get('caps_hit', []))}"])
+    if report.get("bm25_escalation"):
+        escalation = report["bm25_escalation"]
+        command = (escalation.get("command") or {}).get("shell")
+        reasons = ", ".join(str(item) for item in escalation.get("trigger_reasons", []))
+        lines.extend(["", f"**BM25 escalation:** {escalation.get('status')} ({reasons})"])
+        if command:
+            lines.extend(["", "```bash", command, "```"])
     if report.get("source_locator_handoff"):
         lines.extend(["", "## Source Locator Handoff", ""])
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
