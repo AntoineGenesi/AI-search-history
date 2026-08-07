@@ -83,6 +83,7 @@ def install_agent_skill(
     shutil.copytree(assets.references, references_root)
     _copy_executable(assets.search_helper, scripts_root / "search_jsonl_history.py")
     _copy_executable(assets.ask_first_helper, scripts_root / "jsonl_ask_first.py")
+    route_note = _route_note(agent, target_home)
 
     return {
         "agent_skill_install": {
@@ -101,6 +102,7 @@ def install_agent_skill(
                 "optional": True,
                 "path": str(skill_root),
                 "asset_source": assets.source,
+                "route_note": route_note,
             },
             "agent_alias_skill": {
                 "status": "installed",
@@ -133,6 +135,7 @@ def render_agent_skill_install(payload: dict[str, Any], output_format: str) -> s
         f"  {cli['detail']}",
         f"Optional {agent_label} skill install: INSTALLED",
         f"  Path: {skill['path']}",
+        f"  Route: {skill.get('route_note')}",
         "Optional Convo alias skill install: INSTALLED",
         f"  Path: {alias.get('path')}",
         f"  Asset source: {skill['asset_source']}",
@@ -141,6 +144,18 @@ def render_agent_skill_install(payload: dict[str, Any], output_format: str) -> s
     ]
     lines.extend(f"  {command}" for command in install["next_commands"])
     return "\n".join(lines)
+
+
+def _route_note(agent: str, target_home: Path) -> str:
+    if agent == "codex":
+        return (
+            f"Package compatibility route under {target_home}/skills; current Codex docs may describe "
+            ".agents/skills or plugin distribution separately."
+        )
+    return (
+        f"Claude Code skill route under {target_home}/skills; use --agent-home with a project .claude "
+        "directory for project-scoped skills."
+    )
 
 
 def _validation_command(agent: str, target_home: Path) -> str:

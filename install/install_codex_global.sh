@@ -6,6 +6,8 @@ SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/jsonl-history-search"
 
 echo "SKILL-ONLY INSTALLER: this does not install the Python CLI."
 echo "It will not create the jsonl-history-search or convo console commands."
+echo "Codex skill route: package compatibility path CODEX_HOME/skills or ~/.codex/skills."
+echo "Current Codex docs may describe .agents/skills or plugins; this helper does not install those."
 echo "Install the CLI first with pipx, then prefer: jsonl-history-search install-codex-skill"
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m jsonl_history_search.cli \
   install-codex-skill --codex-home "${CODEX_HOME:-$HOME/.codex}" --format text
