@@ -51,6 +51,7 @@ from .retrieval_modes import (
     run_retrieval_mode,
 )
 from .scanner import search
+from .spawned_sessions import resolve_spawned_session_transcripts
 from .tool_events import build_tool_events_payload
 
 
@@ -478,6 +479,48 @@ def build_semantic_debug_payload(
                 provenance_direct_evidence_facet_ledger
             )
         )
+    spawned_session_resolution = resolve_spawned_session_transcripts(
+        query=agent_find["query"]["original"],
+        plan=plan,
+        candidates=source_selection_candidates,
+        next_reads=list(source_locator_handoff.get("next_reads") or next_reads),
+        default_tz=default_tz,
+        expansion_action_context=expansion_action_context,
+        include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
+    )
+    if spawned_session_resolution.get("applies"):
+        spawned_reads = list(spawned_session_resolution.get("next_reads") or [])
+        if spawned_reads:
+            next_reads = dedupe_dicts(spawned_reads + list(source_locator_handoff.get("next_reads") or next_reads))[:12]
+            source_locator_handoff["next_reads"] = next_reads
+            source_handle_routing = build_source_handle_routing(
+                agent_find["query"]["original"],
+                candidates=source_selection_candidates,
+                next_reads=next_reads,
+            )
+            source_locator_handoff["source_handle_routing"] = source_handle_routing
+            decision_context["next_reads"] = next_reads[:12]
+            decision_context["next_commands"] = build_next_commands(
+                next_reads,
+                hints=hints,
+                include_semantic_debug_replay=False,
+            )
+            decision_context["source_handle_routing"] = source_handle_routing
+            decision_context["route_guidance"] = decision_context_route_guidance(source_handle_routing)
+            audit_plan["resume_from"] = resume_from(next_reads, audit_plan.get("route_order", []))
+            audit_plan["replay_commands"] = build_next_commands(
+                next_reads,
+                hints=hints,
+                include_semantic_debug_replay=True,
+            )
+            audit_plan["next_commands"] = decision_context["next_commands"]
+            audit_plan["source_handle_routing"] = audit_source_handle_guidance(source_handle_routing)
+            audit_plan["checkpoint_plan"] = source_handle_checkpoint_plan(
+                audit_plan.get("checkpoint_plan", []),
+                source_handle_routing,
+            )
+        source_locator_handoff["spawned_session_resolution"] = spawned_session_resolution
+        source_locator_handoff["spawned_session_diagnostics"] = spawned_session_resolution.get("diagnostics")
     historical_orchestration_plan = build_historical_orchestration_provenance_final_support_plan(
         list(source_locator_handoff.get("next_reads") or next_reads),
         candidates=source_selection_candidates,
@@ -921,6 +964,30 @@ def build_semantic_debug_payload(
             ),
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
         }
+    if spawned_session_resolution.get("applies"):
+        spawned_summary = spawned_session_resolution_summary(spawned_session_resolution)
+        answer_ready_handoff["spawned_session_resolution"] = spawned_summary
+        answer_ready_handoff["links"]["spawned_session_resolution"] = (
+            "semantic_debug.spawned_session_resolution"
+        )
+        answer_ready_handoff["source_use_summary"]["spawned_session_resolution"] = {
+            "link": "semantic_debug.spawned_session_resolution",
+            "status": spawned_summary.get("status"),
+            "diagnostics": spawned_summary.get("diagnostics"),
+            "child_ref_count": spawned_summary.get("child_ref_count", 0),
+            "edge_source_counts": spawned_summary.get("edge_source_counts"),
+        }
+        final_answer_contract["evidence_inputs"]["spawned_session_resolution"] = spawned_summary
+        final_answer_contract["required_actions"] = dedupe(
+            [
+                (
+                    "For spawned worker/reviewer/subagent provenance, inspect "
+                    "semantic_debug.spawned_session_resolution child transcript refs first; "
+                    "state missing or omitted children explicitly."
+                )
+            ]
+            + list(final_answer_contract.get("required_actions") or [])
+        )
     longitudinal_phase_source_plan = build_longitudinal_phase_source_plan(
         query=agent_find["query"]["original"],
         source_locator_handoff=source_locator_handoff,
@@ -1176,6 +1243,7 @@ def build_semantic_debug_payload(
         "process_actual_use_final_support_read_plan": process_actual_use_read_plan,
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
+        "spawned_session_resolution": spawned_session_resolution,
         "historical_orchestration_role_evidence_bundle": historical_orchestration_role_evidence_bundle,
         "historical_orchestration_role_coverage_source_plan": historical_orchestration_plan,
         "historical_orchestration_provenance_final_support_plan": historical_orchestration_plan,
@@ -2382,6 +2450,29 @@ def historical_orchestration_role_evidence_bundle_summary(bundle: dict[str, Any]
         ],
         "answer_ready_claim_allowed": bool(bundle.get("answer_ready_claim_allowed")),
         "claim_boundaries": bundle.get("claim_boundaries"),
+    }
+
+
+def spawned_session_resolution_summary(resolution: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = resolution.get("diagnostics") if isinstance(resolution.get("diagnostics"), dict) else {}
+    caps = resolution.get("caps") if isinstance(resolution.get("caps"), dict) else {}
+    observed = resolution.get("observed") if isinstance(resolution.get("observed"), dict) else {}
+    return {
+        "schema_version": resolution.get("schema_version", 1),
+        "status": resolution.get("status"),
+        "applies": bool(resolution.get("applies")),
+        "diagnostics": {
+            "spawn_detected": int(diagnostics.get("spawn_detected", 0) or 0),
+            "child_transcript_inspected": int(diagnostics.get("child_transcript_inspected", 0) or 0),
+            "child_transcript_missing": int(diagnostics.get("child_transcript_missing", 0) or 0),
+            "child_scope_omitted": int(diagnostics.get("child_scope_omitted", 0) or 0),
+        },
+        "child_ref_count": int(observed.get("child_ref_count", 0) or 0),
+        "edge_source_counts": observed.get("edge_source_counts") or {},
+        "caps_hit": list(caps.get("caps_hit") or []),
+        "raw_private_text_included": False,
+        "raw_session_ids_included": False,
+        "raw_rollout_ids_included": False,
     }
 
 
@@ -12854,6 +12945,7 @@ def build_final_answer_source_use_contract(
     historical_orchestration_role_evidence_bundle = source_locator_handoff.get(
         "historical_orchestration_role_evidence_bundle"
     ) or {}
+    spawned_session_resolution = source_locator_handoff.get("spawned_session_resolution") or {}
     if historical_orchestration_plan:
         evidence_inputs["historical_orchestration_provenance_final_support_plan"] = (
             historical_orchestration_plan_summary(historical_orchestration_plan)
@@ -12863,6 +12955,10 @@ def build_final_answer_source_use_contract(
             historical_orchestration_role_evidence_bundle_summary(
                 historical_orchestration_role_evidence_bundle
             )
+        )
+    if spawned_session_resolution.get("applies"):
+        evidence_inputs["spawned_session_resolution"] = spawned_session_resolution_summary(
+            spawned_session_resolution
         )
     if status == "no_evidence":
         required_actions.insert(0, "Answer with `not_found_in_searched_scope`, not global absence.")
@@ -12877,6 +12973,14 @@ def build_final_answer_source_use_contract(
                 (
                     "For historical orchestration/provenance, use only promoted pre-existing raw JSONL refs "
                     "as final support; treat current-run/current-task/same-loop echoes as diagnostics."
+                ),
+            )
+        if spawned_session_resolution.get("applies"):
+            required_actions.insert(
+                1,
+                (
+                    "When spawned child transcript refs are surfaced, inspect them as primary source evidence "
+                    "before relying on parent coordinator summaries."
                 ),
             )
         if tool_proof.get("events"):
@@ -12953,6 +13057,24 @@ def build_final_answer_source_use_contract(
         }
         contract["claim_boundaries"]["historical_orchestration_current_run_support"] = (
             "current-run/current-task/same-loop refs do not count as final historical orchestration support"
+        )
+    if spawned_session_resolution.get("applies"):
+        contract["spawned_session_resolution_contract"] = {
+            **spawned_session_resolution_summary(spawned_session_resolution),
+            "required_diagnostics": [
+                "spawn_detected",
+                "child_transcript_inspected",
+                "child_transcript_missing",
+                "child_scope_omitted",
+            ],
+            "source_hierarchy": {
+                "final_support": "spawned_child_transcript_source_refs",
+                "parent_summary": "secondary_context_until_child_refs_are_inspected_or_missing",
+                "missing_or_omitted_children": "explicit_gap_to_state_before_answer",
+            },
+        }
+        contract["claim_boundaries"]["spawned_child_parent_summary_support"] = (
+            "parent summaries do not replace surfaced child transcript refs"
         )
     return contract
 

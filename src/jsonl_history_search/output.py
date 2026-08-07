@@ -5799,6 +5799,12 @@ def render_semantic_debug_text(payload: dict) -> str:
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
+    spawned_session_resolution = (
+        report.get("spawned_session_resolution")
+        or handoff.get("spawned_session_resolution")
+        or (report.get("source_locator_handoff") or {}).get("spawned_session_resolution")
+        or {}
+    )
     in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
     in_depth_followthrough = (
         report.get("in_depth_audit_followthrough")
@@ -5873,6 +5879,8 @@ def render_semantic_debug_text(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if spawned_session_resolution and spawned_session_resolution.get("applies"):
+        lines.extend(render_spawned_session_resolution_text(spawned_session_resolution))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_text(orchestration_role_bundle))
     if orchestration_role_plan:
@@ -6127,6 +6135,12 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         report.get("source_locator_handoff") or {}
     ).get("process_actual_use_final_support_read_plan")
     source_followthrough_plan = report.get("source_followthrough_plan") or {}
+    spawned_session_resolution = (
+        report.get("spawned_session_resolution")
+        or handoff.get("spawned_session_resolution")
+        or (report.get("source_locator_handoff") or {}).get("spawned_session_resolution")
+        or {}
+    )
     in_depth_coverage = report.get("in_depth_audit_coverage") or handoff.get("in_depth_audit_coverage") or {}
     in_depth_followthrough = (
         report.get("in_depth_audit_followthrough")
@@ -6193,6 +6207,8 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    if spawned_session_resolution and spawned_session_resolution.get("applies"):
+        lines.extend(render_spawned_session_resolution_markdown(spawned_session_resolution))
     if orchestration_role_bundle:
         lines.extend(render_historical_orchestration_role_evidence_bundle_markdown(orchestration_role_bundle))
     if longitudinal_plan and longitudinal_plan.get("applies"):
@@ -7889,6 +7905,68 @@ HISTORICAL_ORCHESTRATION_ROLE_LABELS = {
     "reviewer": "reviewer/rereviewer",
     "secondary_task_review_commit_support": "secondary task/review/commit support",
 }
+
+
+def render_spawned_session_resolution_text(resolution: dict) -> list[str]:
+    diagnostics = resolution.get("diagnostics") or {}
+    caps = resolution.get("caps") or {}
+    observed = resolution.get("observed") or {}
+    lines = [
+        "Spawned session transcript resolution:",
+        f"- status: {resolution.get('status')}",
+        (
+            "- diagnostics: "
+            f"spawn_detected={diagnostics.get('spawn_detected', 0)} "
+            f"child_transcript_inspected={diagnostics.get('child_transcript_inspected', 0)} "
+            f"child_transcript_missing={diagnostics.get('child_transcript_missing', 0)} "
+            f"child_scope_omitted={diagnostics.get('child_scope_omitted', 0)}"
+        ),
+        (
+            "- traversal: "
+            f"depth={observed.get('max_depth_seen', 0)} "
+            f"child_refs={observed.get('child_ref_count', 0)} "
+            f"caps_hit={','.join(caps.get('caps_hit') or []) or 'none'}"
+        ),
+    ]
+    for read in list(resolution.get("next_reads") or [])[:4]:
+        lines.append(f"- child transcript ref: {read.get('target')}")
+    if resolution.get("missing_children"):
+        lines.append(f"- missing child transcripts: {len(resolution.get('missing_children') or [])}")
+    if caps.get("omitted_reasons"):
+        lines.append(f"- omitted child scope: {', '.join(caps.get('omitted_reasons') or [])}")
+    return lines
+
+
+def render_spawned_session_resolution_markdown(resolution: dict) -> list[str]:
+    diagnostics = resolution.get("diagnostics") or {}
+    caps = resolution.get("caps") or {}
+    observed = resolution.get("observed") or {}
+    lines = [
+        "",
+        "## Spawned Session Transcript Resolution",
+        "",
+        f"- `status`: `{resolution.get('status')}`",
+        (
+            "- `diagnostics`: "
+            f"`spawn_detected={diagnostics.get('spawn_detected', 0)}` "
+            f"`child_transcript_inspected={diagnostics.get('child_transcript_inspected', 0)}` "
+            f"`child_transcript_missing={diagnostics.get('child_transcript_missing', 0)}` "
+            f"`child_scope_omitted={diagnostics.get('child_scope_omitted', 0)}`"
+        ),
+        (
+            "- `traversal`: "
+            f"`depth={observed.get('max_depth_seen', 0)}` "
+            f"`child_refs={observed.get('child_ref_count', 0)}` "
+            f"`caps_hit={','.join(caps.get('caps_hit') or []) or 'none'}`"
+        ),
+    ]
+    for read in list(resolution.get("next_reads") or [])[:4]:
+        lines.append(f"- Child transcript ref: `{read.get('target')}`")
+    if resolution.get("missing_children"):
+        lines.append(f"- Missing child transcripts: `{len(resolution.get('missing_children') or [])}`")
+    if caps.get("omitted_reasons"):
+        lines.append(f"- Omitted child scope: `{', '.join(caps.get('omitted_reasons') or [])}`")
+    return lines
 
 
 def render_historical_orchestration_role_evidence_bundle_text(bundle: dict) -> list[str]:
