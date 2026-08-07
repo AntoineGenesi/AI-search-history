@@ -124,9 +124,23 @@ def _fielded_bm25_index_dir_from_args(args: Any) -> str | None:
         RETRIEVAL_MODE_RRF_FUSION,
     }:
         return None
+    return str(_default_fielded_bm25_index_dir())
+
+
+def _default_fielded_bm25_index_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME")
     root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
-    return str(root / "jsonl-history-search" / "fielded-bm25")
+    return root / "jsonl-history-search" / "fielded-bm25"
+
+
+def _rrf_fusion_materialization_dir_from_args(args: Any) -> str | None:
+    if getattr(args, "rrf_fusion_storage", "file") == "memory":
+        return None
+    if getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE) != RETRIEVAL_MODE_RRF_FUSION:
+        return None
+    fielded_index_dir = _fielded_bm25_index_dir_from_args(args)
+    root = Path(fielded_index_dir) if fielded_index_dir else _default_fielded_bm25_index_dir()
+    return str(root / "rrf-materializations")
 
 
 def build_semantic_debug_payload(
@@ -153,6 +167,8 @@ def build_semantic_debug_payload(
         mask_context=mask_context,
         use_rg_prefilter=getattr(args, "rg_prefilter", False),
         fielded_bm25_index_dir=_fielded_bm25_index_dir_from_args(args),
+        rrf_fusion_storage=getattr(args, "rrf_fusion_storage", "memory"),
+        rrf_fusion_materialization_dir=_rrf_fusion_materialization_dir_from_args(args),
         query_plan_mode=getattr(args, "query_plan", "auto"),
         continuation_ledger=getattr(args, "continuation_ledger", False),
     )
