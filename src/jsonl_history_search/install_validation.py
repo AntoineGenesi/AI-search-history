@@ -185,8 +185,9 @@ def _agent_preflight(
                 "required": False,
                 "install_command": "jsonl-history-search install-codex-skill",
                 "detail": (
-                    "The optional Codex skill adds agent routing guidance through this package's "
-                    "CODEX_HOME/skills or ~/.codex/skills compatibility route; it does not provide the CLI."
+                    "The optional Codex skill adds agent routing guidance under the public "
+                    "$HOME/.agents/skills route; it does not provide the CLI. Explicit "
+                    "CODEX_HOME/skills or ~/.codex/skills compatibility routes are legacy."
                 ),
             },
             "claude_skill": {
@@ -198,18 +199,18 @@ def _agent_preflight(
         },
         "refresh_command": "jsonl-history-search install-codex-skill",
         "validate_global_command": (
-            "jsonl-history-search validate-install --codex-home ~/.codex --format text"
+            "jsonl-history-search validate-install --codex-home ~/.agents --format text"
         ),
         "validate_agent_commands": {
-            "codex": "jsonl-history-search validate-install --codex-home ~/.codex --format text",
+            "codex": "jsonl-history-search validate-install --codex-home ~/.agents --format text",
             "claude": "jsonl-history-search validate-install --claude-home ~/.claude --format text",
         },
         "agent_skill_routes": {
             "codex": {
-                "implemented_route": "CODEX_HOME/skills or ~/.codex/skills",
+                "implemented_route": "$HOME/.agents/skills",
                 "boundary": (
-                    "Compatibility route implemented by this package; current official Codex docs may "
-                    "describe .agents/skills and plugin distribution separately."
+                    "An explicit --agent-home or --codex-home can select a project or legacy "
+                    "compatibility root; .codex/skills is not the public default."
                 ),
             },
             "claude": {
@@ -1621,8 +1622,7 @@ def _check_global_backup_skill_dirs(codex_home: Path) -> ValidationCheck:
         recovery=[
             (
                 "Move backup directories out of the immediate Codex skills directory, "
-                "for example into `$CODEX_HOME/skills/.disabled-backups/`, then rerun "
-                "`jsonl-history-search validate-install --codex-home ~/.codex --format text`."
+                "then rerun validation against the same explicit --codex-home root."
             )
         ],
         metadata={

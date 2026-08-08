@@ -26,9 +26,10 @@ class AgentSkillAssets:
 
 def default_agent_home(agent: str) -> Path:
     _require_agent(agent)
-    env_name = "CODEX_HOME" if agent == "codex" else "CLAUDE_HOME"
-    configured = os.environ.get(env_name)
-    return Path(configured).expanduser() if configured else Path.home() / f".{agent}"
+    if agent == "codex":
+        return Path.home() / ".agents"
+    configured = os.environ.get("CLAUDE_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
 
 
 def resolve_agent_skill_assets(
@@ -149,8 +150,9 @@ def render_agent_skill_install(payload: dict[str, Any], output_format: str) -> s
 def _route_note(agent: str, target_home: Path) -> str:
     if agent == "codex":
         return (
-            f"Package compatibility route under {target_home}/skills; current Codex docs may describe "
-            ".agents/skills or plugin distribution separately."
+            f"Codex skill route under {target_home}/skills. The public user default is "
+            "$HOME/.agents/skills; an explicit --agent-home or --codex-home selects a custom "
+            "or legacy compatibility root."
         )
     return (
         f"Claude Code skill route under {target_home}/skills; use --agent-home with a project .claude "

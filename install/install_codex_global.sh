@@ -2,18 +2,26 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/jsonl-history-search"
+if [[ -n "${CODEX_HOME:-}" ]]; then
+  AGENT_HOME="$CODEX_HOME"
+  ROUTE_NOTE="Legacy package compatibility path CODEX_HOME/skills or ~/.codex/skills selected explicitly through CODEX_HOME."
+else
+  AGENT_HOME="$HOME/.agents"
+  ROUTE_NOTE="Public Codex user route: $HOME/.agents/skills."
+fi
+SKILL_DIR="$AGENT_HOME/skills/jsonl-history-search"
 
 echo "SKILL-ONLY INSTALLER: this does not install the Python CLI."
 echo "It will not create the jsonl-history-search or convo console commands."
-echo "Codex skill route: package compatibility path CODEX_HOME/skills or ~/.codex/skills."
-echo "Current Codex docs may describe .agents/skills or plugins; this helper does not install those."
-echo "Install the CLI first with pipx, then prefer: jsonl-history-search install-codex-skill"
+echo "$ROUTE_NOTE"
+echo "Codex plugins or connectors: this helper does not install those."
+echo "Install the CLI first with pipx, then prefer: jsonl-history-search install-agent-skill --agent codex"
+echo "Legacy alias: jsonl-history-search install-codex-skill --codex-home /path/to/legacy-home"
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m jsonl_history_search.cli \
-  install-codex-skill --codex-home "${CODEX_HOME:-$HOME/.codex}" --format text
+  install-agent-skill --agent codex --agent-home "$AGENT_HOME" --format text
 
 echo "Validate with:"
-echo "  env -u PYTHONPATH jsonl-history-search validate-install --codex-home \"${CODEX_HOME:-$HOME/.codex}\" --format text"
+echo "  env -u PYTHONPATH jsonl-history-search validate-install --codex-home \"$AGENT_HOME\" --format text"
 echo "  env -u PYTHONPATH convo --help"
 echo "  env -u PYTHONPATH jsonl-history-search ask \"which prior conversation mentioned the router?\" --format text"
 echo "  (cd \"$ROOT\" && python3 \"$SKILL_DIR/scripts/jsonl_ask_first.py\" \"which prior conversation mentioned the router?\" --format text)"
