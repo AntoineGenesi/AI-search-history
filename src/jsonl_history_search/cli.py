@@ -866,6 +866,15 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             "semantic-debug retrieval diagnostics. Defaults stay unchanged."
         ),
     )
+    semantic_debug.add_argument(
+        "--spawn-max-children",
+        type=int,
+        default=8,
+        help=(
+            "Maximum spawned child/session transcript refs to resolve for semantic-debug provenance. "
+            "Continuation commands may raise this when the previous run hit the child cap."
+        ),
+    )
     private_mine = subparsers.add_parser("private-benchmark-mine")
     add_common_args(private_mine)
     private_mine.add_argument("--query-family", action="append", default=[])

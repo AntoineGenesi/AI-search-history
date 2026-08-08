@@ -53,7 +53,7 @@ from .retrieval_modes import (
 )
 from .records import parse_record
 from .scanner import search
-from .spawned_sessions import resolve_spawned_session_transcripts
+from .spawned_sessions import SpawnResolverLimits, resolve_spawned_session_transcripts
 from .tool_events import build_tool_events_payload
 
 
@@ -505,6 +505,9 @@ def build_semantic_debug_payload(
         default_tz=default_tz,
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
+        limits=SpawnResolverLimits(
+            max_children=max(1, int(getattr(args, "spawn_max_children", 8) or 8)),
+        ),
     )
     if spawned_session_resolution.get("applies"):
         spawned_reads = list(spawned_session_resolution.get("next_reads") or [])
@@ -2588,16 +2591,70 @@ def build_scope_aware_no_evidence_workflow(
     }
 
 
-def semantic_debug_scope_continuation_argv(*, query: str, args: Any = None) -> list[str]:
+def semantic_debug_scope_continuation_argv(
+    *,
+    query: str,
+    args: Any = None,
+    audit_depth: str = "in-depth",
+    spawn_max_children: int | None = None,
+) -> list[str]:
     argv = ["jsonl-history-search", "semantic-debug", query]
     cwd = getattr(args, "cwd", None) if args is not None else None
     if cwd:
         argv.extend(["--cwd", str(cwd)])
     for root in list(getattr(args, "root", []) or []) if args is not None else []:
         argv.extend(["--root", str(root)])
+    for name, flag in (
+        ("codex_home", "--codex-home"),
+        ("claude_home", "--claude-home"),
+        ("role", "--role"),
+        ("task", "--task"),
+        ("path", "--path"),
+        ("commit", "--commit"),
+        ("branch", "--branch"),
+        ("around", "--around"),
+        ("max_files", "--max-files"),
+        ("max_bytes", "--max-bytes"),
+        ("max_matches", "--max-matches"),
+        ("max_elapsed", "--max-elapsed"),
+        ("bm25_max_candidate_rows", "--bm25-max-candidate-rows"),
+        ("bm25_query_timeout", "--bm25-query-timeout"),
+        ("hard_cap_files", "--hard-cap-files"),
+        ("hard_cap_bytes", "--hard-cap-bytes"),
+        ("timezone", "--timezone"),
+        ("timezone_offset", "--timezone-offset"),
+        ("now", "--now"),
+        ("since", "--since"),
+        ("until", "--until"),
+        ("retrieval_mode", "--retrieval-mode"),
+        ("query_plan", "--query-plan"),
+        ("fielded_bm25_index_dir", "--fielded-bm25-index-dir"),
+        ("fielded_bm25_storage", "--fielded-bm25-storage"),
+        ("rrf_fusion_storage", "--rrf-fusion-storage"),
+    ):
+        value = getattr(args, name, None) if args is not None else None
+        if value is not None and value != "":
+            argv.extend([flag, str(value)])
+    for watchlist in list(getattr(args, "watchlist", []) or []) if args is not None else []:
+        argv.extend(["--watchlist", str(watchlist)])
     if args is not None and bool(getattr(args, "allow_arbitrary_root", False)):
         argv.append("--allow-arbitrary-root")
-    argv.extend(["--audit-depth", "in-depth", "--format", "json"])
+    if args is not None and bool(getattr(args, "rg_prefilter", False)):
+        argv.append("--rg-prefilter")
+    if args is not None and bool(getattr(args, "fielded_bm25_ephemeral", False)):
+        argv.append("--fielded-bm25-ephemeral")
+    resolved_audit_depth = audit_depth or getattr(args, "audit_depth", None) or "in-depth"
+    argv.extend(["--audit-depth", str(resolved_audit_depth)])
+    resolved_spawn_max_children = (
+        spawn_max_children
+        if spawn_max_children is not None
+        else getattr(args, "spawn_max_children", None)
+        if args is not None
+        else None
+    )
+    if resolved_spawn_max_children is not None:
+        argv.extend(["--spawn-max-children", str(max(1, int(resolved_spawn_max_children)))])
+    argv.extend(["--format", "json"])
     return argv
 
 
@@ -2903,6 +2960,33 @@ def build_cap_aware_subagent_provenance_workflow(
     ]
     child_refs_required = bool(child_dependent_roles or resolution.get("applies"))
     child_refs = list(resolution.get("child_transcript_refs") or [])
+    child_ref_identities = {
+        identity
+        for item in child_refs
+        if isinstance(item, dict)
+        for identity in source_identity_variants(
+            str(
+                item.get("target")
+                or source_ref_target(
+                    item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
+                )
+            )
+        )
+    }
+    role_child_refs = {
+        role: []
+        for role in child_dependent_roles
+    }
+    for read in list(plan.get("primary_historical_final_support_reads") or []):
+        read_identities = source_identity_variants(historical_orchestration_read_identity(read))
+        if not child_ref_identities.intersection(read_identities):
+            continue
+        for role in read.get("orchestration_roles") or []:
+            if role in role_child_refs:
+                role_child_refs[role].append(read)
+    missing_child_role_refs = [
+        role for role, refs in role_child_refs.items() if not refs
+    ]
     diagnostics = resolution.get("diagnostics") or {}
     caps = resolution.get("caps") or {}
     missing_children = [
@@ -2922,6 +3006,13 @@ def build_cap_aware_subagent_provenance_workflow(
         blockers.append({"kind": "missing_required_roles", "roles": missing_roles})
     if child_refs_required and not child_refs:
         blockers.append({"kind": "required_child_session_refs_missing", "count": 1})
+    if missing_child_role_refs:
+        blockers.append(
+            {
+                "kind": "required_role_child_session_refs_missing",
+                "roles": missing_child_role_refs,
+            }
+        )
     if missing_children:
         blockers.append({"kind": "child_transcripts_missing", "count": len(missing_children)})
     if caps.get("hit") or omitted_children:
@@ -2955,7 +3046,12 @@ def build_cap_aware_subagent_provenance_workflow(
         if isinstance(item, dict) and item.get("command")
     ]
     if not answer_ready and (caps.get("hit") or missing_children or not child_refs):
-        argv = semantic_debug_scope_continuation_argv(query=query, args=args)
+        max_children = safe_count((resolution.get("limits") or {}).get("max_children")) or 8
+        argv = semantic_debug_scope_continuation_argv(
+            query=query,
+            args=args,
+            spawn_max_children=max(max_children + 1, max_children * 2),
+        )
         continuation_commands.append(
             {
                 "command_id": "continue_child_session_provenance",
@@ -2975,6 +3071,10 @@ def build_cap_aware_subagent_provenance_workflow(
         "missing_roles": missing_roles,
         "child_refs_required": child_refs_required,
         "child_dependent_roles": child_dependent_roles,
+        "role_child_ref_counts": {
+            role: len(refs) for role, refs in role_child_refs.items()
+        },
+        "missing_child_role_refs": missing_child_role_refs,
         "child_ref_count": len(child_refs),
         "missing_or_omitted_child_refs": missing_children + omitted_children,
         "missing_or_omitted_child_ref_count": len(missing_children) + len(omitted_children),
@@ -2993,6 +3093,17 @@ def build_cap_aware_subagent_provenance_workflow(
             "avoid_subagents_policy": False,
         },
     }
+
+
+def source_identity_variants(target: str) -> set[str]:
+    text = str(target or "")
+    if not text:
+        return set()
+    variants = {text}
+    path, sep, line = text.rpartition(":")
+    if sep and line.isdigit() and path:
+        variants.add(path)
+    return variants
 
 
 def historical_orchestration_select_required_role_reads(
