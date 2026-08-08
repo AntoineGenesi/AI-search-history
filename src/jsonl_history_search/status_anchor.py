@@ -433,7 +433,7 @@ def status_anchor_report(
         anchor_decision=anchor_decision,
     )
     selected_anchor, anchor_decision, parent_main_anchor_shortlist = _apply_parent_main_anchor_shortlist_contract(
-        query=query,
+        query=effective_query,
         selected_anchor=selected_anchor,
         anchor_decision=anchor_decision,
         anchor_candidates=anchor_candidates,
@@ -2853,7 +2853,9 @@ def _append_rejection_rationale(rationale: Any, reason: str) -> str:
 def _lineage_rejected_anchor(candidate: dict, lineage: dict, reason: str) -> dict:
     return {
         "source_ref": candidate.get("source_ref"),
+        "source_identifier": candidate.get("source_identifier"),
         "timestamp_utc": candidate.get("timestamp_utc"),
+        "line": candidate.get("line"),
         "classification": candidate.get("classification"),
         "decision": "rejected",
         "rationale": _append_rejection_rationale(candidate.get("rationale"), reason),
@@ -4948,8 +4950,10 @@ def _parent_main_shortlist_item(
     item = {
         "source_ref": candidate.get("source_ref"),
         "source_kind": candidate.get("source_kind"),
+        "source_identifier": candidate.get("source_identifier"),
         "source_scope": candidate.get("source_scope") or source_scope,
         "timestamp_utc": candidate.get("timestamp_utc"),
+        "line": candidate.get("line"),
         "classification": candidate.get("classification"),
         "decision": decision,
         "confidence_label": confidence_label,
@@ -7466,6 +7470,7 @@ def _parent_main_anchor_freshness(
     if not selected_anchor:
         return {"status": "missing_selected_anchor", "current": False, "newer_candidate_count": 0}
     selected_ref = str(selected_anchor.get("source_ref") or "")
+    selected_identifier = str(selected_anchor.get("source_identifier") or "")
     selected_time = parse_datetime(str(selected_anchor.get("timestamp_utc") or ""), timezone.utc)
     if selected_time is None:
         return {
@@ -7484,12 +7489,17 @@ def _parent_main_anchor_freshness(
             continue
         if candidate.get("source_kind") != "codex_history":
             continue
+        same_canonical_parent_session = bool(
+            selected_identifier
+            and candidate.get("source_identifier") == selected_identifier
+            and candidate.get("lineage_rejection_reason") == "candidate_session_metadata_not_found"
+        )
         if candidate.get("source_scope") not in {
             "canonical_parent_main_history",
             "canonical_history_rejected_or_boundary",
-        }:
+        } and not same_canonical_parent_session:
             continue
-        if candidate.get("lineage_rejection_reason"):
+        if candidate.get("lineage_rejection_reason") and not same_canonical_parent_session:
             continue
         if candidate.get("classification") in {
             "worker_or_reviewer_prompt",
@@ -7505,7 +7515,13 @@ def _parent_main_anchor_freshness(
         if candidate_time is None or candidate_time.astimezone(timezone.utc) <= selected_time:
             continue
         newer_candidates.append(candidate)
-    newer_candidates.sort(key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)
+    newer_candidates.sort(
+        key=lambda item: (
+            str(item.get("timestamp_utc") or ""),
+            int(item.get("line") or 0),
+        ),
+        reverse=True,
+    )
     if not newer_candidates:
         return {
             "status": "current",
