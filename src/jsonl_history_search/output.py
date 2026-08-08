@@ -598,6 +598,9 @@ def render_ask_execute_text(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    latest_status_contract = _ask_execute_latest_status_contract(
+        action, report.get("executed_output") or {}
+    )
     first_command = route.get("first_command")
     single_flight = _ask_execute_single_flight_contract(action)
     if (
@@ -655,7 +658,7 @@ def render_ask_execute_text(payload: dict) -> str:
     )
     _append_latest_status_followthrough_contract(
         lines,
-        _ask_execute_latest_status_contract(action, report.get("executed_output") or {}),
+        latest_status_contract,
     )
     if action.get("stop") != single_flight.get("stop_rule"):
         lines.append(f"Stop condition: {action.get('stop')}")
@@ -667,7 +670,13 @@ def render_ask_execute_text(payload: dict) -> str:
     if not _append_remembered_user_missing_evidence_contract(lines, action):
         _append_scoped_no_evidence_contract(lines, action, report.get("executed_output") or {})
     lines.append("Read/action contract:")
-    _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
+    if latest_status_contract.get("navigation_only"):
+        lines.append(
+            "- Canonical follow-through path: "
+            f"{latest_status_contract.get('canonical_follow_through_path')}"
+        )
+    else:
+        _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
     only_continue = action.get("only_continue_if")
     if only_continue:
         lines.append("Only continue if:")
@@ -736,6 +745,9 @@ def render_ask_execute_markdown(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    latest_status_contract = _ask_execute_latest_status_contract(
+        action, report.get("executed_output") or {}
+    )
     first_command = route.get("first_command")
     single_flight = _ask_execute_single_flight_contract(action)
     if (
@@ -782,7 +794,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     )
     _append_latest_status_followthrough_contract(
         lines,
-        _ask_execute_latest_status_contract(action, report.get("executed_output") or {}),
+        latest_status_contract,
         markdown=True,
     )
     if action.get("stop") != single_flight.get("stop_rule"):
@@ -818,7 +830,13 @@ def render_ask_execute_markdown(payload: dict) -> str:
                 lines.append(f"  Inspect: {item.get('inspect_next')}")
     else:
         lines.append("- Read/action:")
-        _append_compact_read_contract(lines, action.get("read"), markdown=True, cli_prefix=cli_prefix)
+        if latest_status_contract.get("navigation_only"):
+            lines.append(
+                "- Canonical follow-through path: "
+                f"`{latest_status_contract.get('canonical_follow_through_path')}`"
+            )
+        else:
+            _append_compact_read_contract(lines, action.get("read"), markdown=True, cli_prefix=cli_prefix)
     if route.get("route_family") == "semantic_wrapup":
         _append_semantic_wrapup_execute_markdown(
             lines,
@@ -891,8 +909,21 @@ def _append_latest_status_followthrough_contract(
                     "- Required post-anchor interval refs: "
                     f"`{contract.get('post_anchor_interval_read_count', 0)}`"
                 ),
+                f"- Navigation only: `{contract.get('navigation_only')}`",
+                f"- Answer from report allowed: `{contract.get('answer_from_report_allowed')}`",
+                (
+                    "- Required primary windows opened: "
+                    f"`{contract.get('required_primary_windows_opened')}` "
+                    f"(`{contract.get('opened_required_primary_window_count', 0)}`/"
+                    f"`{contract.get('required_primary_window_count', 0)}`)"
+                ),
             ]
         )
+        if contract.get("canonical_follow_through_path"):
+            lines.append(
+                "- Canonical follow-through path: "
+                f"`{contract.get('canonical_follow_through_path')}`"
+            )
         if guidance:
             lines.append(
                 "- `post_anchor_interval_reconstruction.next_read_guidance`: "
@@ -911,6 +942,19 @@ def _append_latest_status_followthrough_contract(
     if read_order:
         lines.append(f"Required read order: {read_order}")
     lines.append(f"Required post-anchor interval refs: {contract.get('post_anchor_interval_read_count', 0)}")
+    lines.append(
+        "Generated report boundary: "
+        f"navigation_only={contract.get('navigation_only')} "
+        f"answer_from_report_allowed={contract.get('answer_from_report_allowed')} "
+        f"required_primary_windows_opened={contract.get('required_primary_windows_opened')} "
+        f"opened={contract.get('opened_required_primary_window_count', 0)}/"
+        f"{contract.get('required_primary_window_count', 0)}"
+    )
+    if contract.get("canonical_follow_through_path"):
+        lines.append(
+            "Canonical follow-through path: "
+            f"{contract.get('canonical_follow_through_path')}"
+        )
     if guidance:
         lines.append(
             "post_anchor_interval_reconstruction.next_read_guidance: "
@@ -4762,8 +4806,91 @@ def render_latest_user_messages_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _status_anchor_navigation_only(report: dict) -> bool:
+    contract = report.get("generated_report_contract") or {}
+    return bool(
+        contract.get("navigation_only")
+        and contract.get("answer_from_report_allowed") is False
+    )
+
+
+def _render_status_anchor_navigation_only_text(report: dict) -> str:
+    contract = report.get("generated_report_contract") or {}
+    selected = report.get("selected_anchor") or {}
+    readiness = report.get("answer_readiness") or {}
+    freshness = readiness.get("parent_main_anchor_freshness") or {}
+    interval = report.get("post_anchor_interval_reconstruction") or {}
+    coverage = interval.get("coverage") or {}
+    summary = report.get("summary") or {}
+    return "\n".join(
+        [
+            "Status Anchor",
+            f"Status: {report.get('status')}",
+            "Answer status: not-ready/required-primary-followthrough",
+            "Navigation only: true",
+            "Answer from report allowed: false",
+            "Required primary windows opened: "
+            f"false (0/{contract.get('required_primary_window_count', 0)})",
+            (
+                "Selected parent history row: "
+                f"{selected.get('timestamp_utc')} {selected.get('source_ref')}"
+            ),
+            (
+                "Parent/main anchor freshness: "
+                f"status={freshness.get('status')} current={freshness.get('current')}"
+            ),
+            (
+                "Scanner coverage: "
+                f"status={coverage.get('status')} complete={coverage.get('complete')} "
+                f"records_after_anchor={coverage.get('records_after_anchor')} "
+                f"retained_entries={summary.get('post_anchor_interval_entry_count', 0)} "
+                f"omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}"
+            ),
+            "Canonical follow-through path: "
+            f"{contract.get('canonical_follow_through_path')}",
+            f"STOP: {contract.get('stop')}",
+        ]
+    )
+
+
+def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
+    contract = report.get("generated_report_contract") or {}
+    selected = report.get("selected_anchor") or {}
+    readiness = report.get("answer_readiness") or {}
+    freshness = readiness.get("parent_main_anchor_freshness") or {}
+    interval = report.get("post_anchor_interval_reconstruction") or {}
+    coverage = interval.get("coverage") or {}
+    summary = report.get("summary") or {}
+    return "\n".join(
+        [
+            "# Status Anchor",
+            "",
+            f"- Status: `{report.get('status')}`",
+            "- Answer status: `not-ready/required-primary-followthrough`",
+            "- Navigation only: `true`",
+            "- Answer from report allowed: `false`",
+            "- Required primary windows opened: "
+            f"`false` (`0/{contract.get('required_primary_window_count', 0)}`)",
+            "- Selected parent history row: "
+            f"`{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`",
+            "- Parent/main anchor freshness: "
+            f"`status={freshness.get('status')}` `current={freshness.get('current')}`",
+            "- Scanner coverage: "
+            f"`status={coverage.get('status')}` `complete={coverage.get('complete')}` "
+            f"`records_after_anchor={coverage.get('records_after_anchor')}` "
+            f"`retained_entries={summary.get('post_anchor_interval_entry_count', 0)}` "
+            f"`omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}`",
+            "- Canonical follow-through path: "
+            f"`{contract.get('canonical_follow_through_path')}`",
+            f"- **STOP:** {contract.get('stop')}",
+        ]
+    )
+
+
 def render_status_anchor_text(payload: dict) -> str:
     report = payload["status_anchor"]
+    if _status_anchor_navigation_only(report):
+        return _render_status_anchor_navigation_only_text(report)
     summary = report["summary"]
     reads = report.get("next_reads") or []
     source_tiers = report.get("source_tiers") or {}
@@ -5042,6 +5169,8 @@ def _status_anchor_answer_timeline_entries(entries: list[dict], *, limit: int) -
 
 def _status_anchor_answer_format_ready(report: dict) -> bool:
     readiness = report.get("answer_readiness") or {}
+    if readiness.get("answer_from_report_allowed") is False:
+        return False
     interval = report.get("post_anchor_interval_reconstruction") or {}
     coverage = interval.get("coverage") or {}
     selected = report.get("selected_anchor") or {}
@@ -5064,6 +5193,9 @@ def _status_anchor_canonical_continuation_command(report: dict) -> str:
         return str(freshness["canonical_continuation_command"])
     if _status_anchor_parent_main_complete_interval_recovery_required(report):
         return _status_anchor_rerun_answer_command(report)
+    generated_contract = report.get("generated_report_contract") or {}
+    if generated_contract.get("canonical_follow_through_path"):
+        return str(generated_contract["canonical_follow_through_path"])
     interval = report.get("post_anchor_interval_reconstruction") or {}
     guidance = interval.get("next_read_guidance") or {}
     commands = [str(command) for command in guidance.get("commands") or [] if command]
@@ -5316,6 +5448,8 @@ def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict)
 
 def render_status_anchor_markdown(payload: dict) -> str:
     report = payload["status_anchor"]
+    if _status_anchor_navigation_only(report):
+        return _render_status_anchor_navigation_only_markdown(report)
     summary = report["summary"]
     reads = report.get("next_reads") or []
     source_tiers = report.get("source_tiers") or {}

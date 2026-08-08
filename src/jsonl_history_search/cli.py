@@ -5449,26 +5449,22 @@ def _answer_action_contract_from_executed_output(
         source_tiers = compact.get("source_tiers") or {}
         answer_readiness = compact.get("answer_readiness") or {}
         latest_followthrough = _latest_status_followthrough_contract(compact)
-        interval_reads = latest_followthrough.get("required_post_anchor_interval_reads") or []
-        boundary_reads = latest_followthrough.get("status_boundary_reads") or []
-        answer_allowed = bool(answer_readiness.get("answer_allowed"))
-        read_contract = (
-            (latest_followthrough.get("selected_anchor_reads") or [])[:2]
-            + interval_reads[:4]
-            + boundary_reads[:2]
+        answer_allowed = bool(
+            answer_readiness.get("scanner_coverage_answer_allowed", answer_readiness.get("answer_allowed"))
         )
+        read_contract = list(latest_followthrough.get("required_primary_reads") or [])
         if not read_contract:
-            read_contract = (source_tiers.get("required_primary") or [])[:6]
+            read_contract = list(source_tiers.get("required_primary") or [])
         if not read_contract:
             read_contract = (compact.get("follow_through_plan") or {}).get("open_first") or compact.get("next_reads", [])[:4]
         return {
             "answer_status": (
-                "status-package-ready-after-required-reads"
+                "follow-required-primary-refs-before-answer"
                 if answer_allowed
                 else "not-ready/needs-more-proof"
             ),
             "promotion_status": (
-                "latest_status_ready_after_post_anchor_interval_reads"
+                "latest_status_navigation_only_until_required_primary_reads"
                 if answer_allowed
                 else compact.get("status")
             ),
@@ -5477,6 +5473,9 @@ def _answer_action_contract_from_executed_output(
                 "and post-anchor interval raw JSONL refs before any secondary task/report/git joins."
             ),
             "read": read_contract,
+            "navigation_only": latest_followthrough.get("navigation_only"),
+            "answer_from_report_allowed": False,
+            "required_primary_windows_opened": False,
             "latest_status_followthrough_contract": latest_followthrough,
             "then_confirm": (compact.get("follow_through_plan") or {}).get("then_confirm") or [],
             "diagnostics_after": (compact.get("follow_through_plan") or {}).get("do_not_open_by_default") or [],
@@ -5484,11 +5483,12 @@ def _answer_action_contract_from_executed_output(
             "anchor_decision": compact.get("anchor_decision"),
             "anchor_candidates": (compact.get("anchor_candidates") or [])[:8],
             "answer_readiness": answer_readiness,
-            "answer_brief": compact.get("answer_brief"),
-            "session_activity": compact.get("session_activity"),
-            "work_products": {
-                "commits": ((compact.get("work_products") or {}).get("commits") or [])[:6],
+            "answer_brief": [],
+            "session_activity": {
+                "status": (compact.get("session_activity") or {}).get("status"),
+                "summary": (compact.get("session_activity") or {}).get("summary") or {},
             },
+            "work_products": {"commits": []},
             "source_tiers": {
                 "required_primary": (source_tiers.get("required_primary") or [])[:6],
                 "required_secondary": (source_tiers.get("required_secondary") or [])[:6],
@@ -5500,7 +5500,8 @@ def _answer_action_contract_from_executed_output(
             "post_anchor_interval_reconstruction": latest_followthrough.get("post_anchor_interval_reconstruction"),
             "evidence_modes": (compact.get("evidence_contract") or {}).get("source_modes"),
             "source_role_labels": (compact.get("evidence_contract") or {}).get("source_role_labels"),
-            "stop": (compact.get("follow_through_plan") or {}).get("stop_condition")
+            "stop": latest_followthrough.get("stop")
+            or (compact.get("follow_through_plan") or {}).get("stop_condition")
             or selected_route.get("stop_guidance"),
             "only_continue_if": selected_route.get("manual_search_guidance"),
             "saved_report": compact.get("report_written"),
@@ -9162,6 +9163,8 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "message": "Artifact-currentness executed with a bounded cleanup-causality handoff.",
         }
     if output_key == "status_anchor":
+        source_tiers = compact.get("source_tiers") or {}
+        generated_contract = compact.get("generated_report_contract") or {}
         return {
             "schema_version": compact.get("schema_version"),
             "status": compact.get("status"),
@@ -9172,24 +9175,31 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
             "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "answer_readiness": compact.get("answer_readiness"),
+            "generated_report_contract": generated_contract,
             "post_anchor_interval_reconstruction": _compact_post_anchor_interval_for_ask(
                 compact.get("post_anchor_interval_reconstruction") or {}
             ),
             "latest_status_followthrough_contract": _latest_status_followthrough_contract(compact),
             "source_tiers": {
-                "tier_order": (compact.get("source_tiers") or {}).get("tier_order"),
-                "counts": (compact.get("source_tiers") or {}).get("counts"),
-                "required_primary": ((compact.get("source_tiers") or {}).get("required_primary") or [])[:6],
-                "required_secondary": ((compact.get("source_tiers") or {}).get("required_secondary") or [])[:6],
-                "diagnostic_optional": ((compact.get("source_tiers") or {}).get("diagnostic_optional") or [])[:6],
-                "source_mode_order": (compact.get("source_tiers") or {}).get("source_mode_order"),
-                "source_role_labels": (compact.get("source_tiers") or {}).get("source_role_labels"),
+                "tier_order": source_tiers.get("tier_order"),
+                "counts": source_tiers.get("counts"),
+                "required_primary": [],
+                "required_primary_count": len(source_tiers.get("required_primary") or []),
+                "required_secondary": [],
+                "required_secondary_count": len(source_tiers.get("required_secondary") or []),
+                "diagnostic_optional": [],
+                "diagnostic_optional_count": len(source_tiers.get("diagnostic_optional") or []),
+                "navigation_only": bool(generated_contract.get("navigation_only")),
+                "canonical_follow_through_path": generated_contract.get("canonical_follow_through_path"),
+                "source_mode_order": source_tiers.get("source_mode_order"),
+                "source_role_labels": source_tiers.get("source_role_labels"),
             },
-            "answer_brief": compact.get("answer_brief"),
-            "session_activity": compact.get("session_activity"),
-            "work_products": {
-                "commits": ((compact.get("work_products") or {}).get("commits") or [])[:6],
+            "answer_brief": [],
+            "session_activity": {
+                "status": (compact.get("session_activity") or {}).get("status"),
+                "summary": (compact.get("session_activity") or {}).get("summary") or {},
             },
+            "work_products": {"commits": []},
             "clarification_request": compact.get("clarification_request"),
             "follow_through_plan": compact.get("follow_through_plan"),
             "evidence_contract": compact.get("evidence_contract"),
@@ -10724,11 +10734,25 @@ def _latest_status_followthrough_contract(compact: dict) -> dict:
         in {"current_user_message_boundary", "status_query_boundary"}
     ]
     complete = coverage.get("complete") is True
+    generated_contract = compact.get("generated_report_contract") or {}
+    scanner_ready = bool(
+        (compact.get("answer_readiness") or {}).get(
+            "scanner_coverage_answer_allowed",
+            (compact.get("answer_readiness") or {}).get("answer_allowed"),
+        )
+    )
     return {
         "schema_version": "latest_status_followthrough_contract.v1",
-        "status": "post_anchor_interval_ready" if complete else "post_anchor_interval_not_ready",
+        "status": "required_primary_followthrough" if complete else "post_anchor_interval_not_ready",
+        "navigation_only": bool(generated_contract.get("navigation_only")),
+        "answer_from_report_allowed": False,
+        "required_primary_windows_opened": False,
+        "opened_required_primary_window_count": 0,
+        "required_primary_window_count": len(required_primary),
+        "canonical_follow_through_path": generated_contract.get("canonical_follow_through_path")
+        or "status_anchor.source_tiers.required_primary",
         "answer_promotion_requires_opened_post_anchor_interval_refs": True,
-        "answer_promotion_allowed_after_contract": bool((compact.get("answer_readiness") or {}).get("answer_allowed")),
+        "answer_promotion_allowed_after_contract": scanner_ready,
         "required_read_order": [
             "selected_anchor_raw_session_row",
             "post_anchor_interval_activity_raw_session_refs",
@@ -10736,18 +10760,19 @@ def _latest_status_followthrough_contract(compact: dict) -> dict:
         ],
         "selected_anchor_read_count": len(selected_anchor_reads),
         "post_anchor_interval_read_count": len(interval_reads),
-        "required_post_anchor_interval_reads": interval_reads[:6],
-        "selected_anchor_reads": selected_anchor_reads[:2],
-        "status_boundary_reads": boundary_reads[:2],
+        "required_primary_reads": required_primary,
+        "required_post_anchor_interval_reads": interval_reads,
+        "selected_anchor_reads": selected_anchor_reads,
+        "status_boundary_reads": boundary_reads,
         "post_anchor_interval_reconstruction": interval,
         "coverage_status": coverage.get("status"),
         "coverage_complete": coverage.get("complete"),
         "omitted_activity_entry_count": coverage.get("omitted_activity_entry_count", 0),
         "next_read_guidance": guidance,
         "stop": (
-            "Do not answer from the selected anchor, task/report/git joins, visible context, or latest surfaced topic alone. "
-            "Open post_anchor_interval_activity raw refs first; if coverage is partial or missing, follow "
-            "post_anchor_interval_reconstruction.next_read_guidance or fail closed."
+            "Do not answer from this generated report, its selected anchor, task/report/git joins, visible context, "
+            "or a subset of the required windows. Open every required_primary raw ref first; if coverage is partial "
+            "or missing, follow post_anchor_interval_reconstruction.next_read_guidance or fail closed."
         ),
     }
 
@@ -10781,7 +10806,11 @@ def _latest_status_post_anchor_interval_final_proof_gate(
             "status": "not_applied",
             "reason": "latest_status_followthrough_contract_absent",
         }
-    required_reads = list(contract.get("required_post_anchor_interval_reads") or [])
+    required_reads = list(
+        contract.get("required_primary_reads")
+        or contract.get("required_post_anchor_interval_reads")
+        or []
+    )
     opened_interval = [
         item
         for item in opened
@@ -10791,6 +10820,21 @@ def _latest_status_post_anchor_interval_final_proof_gate(
         item
         for item in opened
         if _latest_status_opened_answer_support_role(item) == "selected_parent_thread_raw_user_row"
+    ]
+    required_by_identity = {
+        identity: read
+        for read in required_reads
+        if (identity := _latest_status_required_read_identity(read))
+    }
+    opened_identities = {
+        identity
+        for item in opened
+        if (identity := _latest_status_opened_read_identity(item))
+    }
+    missing_reads = [
+        read
+        for identity, read in required_by_identity.items()
+        if identity not in opened_identities
     ]
     if contract.get("coverage_complete") is not True:
         return {
@@ -10811,12 +10855,16 @@ def _latest_status_post_anchor_interval_final_proof_gate(
                 "or fail closed without synthesizing status prose."
             ),
         }
-    if opened_interval:
+    if required_by_identity and not missing_reads:
         return {
             "schema_version": 1,
             "status": "answer_allowed",
+            "required_primary_windows_opened": True,
+            "answer_from_report_allowed": False,
             "selected_anchor_ref_count": len(opened_anchor),
             "post_anchor_interval_ref_count": len(opened_interval),
+            "required_primary_window_count": len(required_by_identity),
+            "opened_required_primary_window_count": len(required_by_identity),
             "coverage_status": contract.get("coverage_status"),
             "coverage_complete": contract.get("coverage_complete"),
             "summary_lines": [
@@ -10826,21 +10874,29 @@ def _latest_status_post_anchor_interval_final_proof_gate(
         }
     return {
         "schema_version": 1,
-        "status": "missing_post_anchor_interval_refs",
+        "status": "missing_required_primary_windows",
+        "required_primary_windows_opened": False,
+        "answer_from_report_allowed": False,
         "selected_anchor_ref_count": len(opened_anchor),
-        "post_anchor_interval_ref_count": 0,
-        "required_post_anchor_interval_read_count": len(required_reads),
+        "post_anchor_interval_ref_count": len(opened_interval),
+        "required_primary_window_count": len(required_by_identity),
+        "opened_required_primary_window_count": len(required_by_identity) - len(missing_reads),
+        "missing_required_primary_window_count": len(missing_reads),
+        "required_post_anchor_interval_read_count": len(
+            contract.get("required_post_anchor_interval_reads") or []
+        ),
         "coverage_status": contract.get("coverage_status"),
         "coverage_complete": contract.get("coverage_complete"),
         "next_read_guidance": contract.get("next_read_guidance"),
-        "required_next_reads": required_reads[:6],
+        "required_next_reads": missing_reads[:6],
         "summary_lines": [
-            "No opened ref had answer_support_role=post_anchor_interval_activity; selected-anchor, "
-            "secondary task/report/git, or visible-context evidence cannot support latest-status prose."
+            f"Opened {len(required_by_identity) - len(missing_reads)} of {len(required_by_identity)} required "
+            "primary windows; generated report detail, selected-anchor-only evidence, and secondary "
+            "task/report/git evidence cannot support latest-status prose."
         ],
         "required_next_proof": (
-            "Open at least one required raw post-anchor interval ref, and if coverage is partial/missing "
-            "follow post_anchor_interval_reconstruction.next_read_guidance before answering."
+            "Open every remaining required primary raw window, and if coverage is partial/missing follow "
+            "post_anchor_interval_reconstruction.next_read_guidance before answering."
         ),
     }
 
@@ -10856,6 +10912,24 @@ def _latest_status_opened_answer_support_role(item: dict) -> str:
         if str(container.get("source_role") or "") == "raw_session_activity":
             return "post_anchor_interval_activity"
     return ""
+
+
+def _latest_status_required_read_identity(read: dict) -> str:
+    source_ref = read.get("source_ref")
+    if isinstance(source_ref, dict):
+        source_ref = f"{source_ref.get('path') or ''}:{source_ref.get('line') or ''}"
+    return str(
+        source_ref
+        or read.get("openable_target")
+        or read.get("target")
+        or read.get("path")
+        or ""
+    )
+
+
+def _latest_status_opened_read_identity(item: dict) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else item
+    return _latest_status_required_read_identity(ref)
 
 
 def _opened_target_label(item: dict) -> str:
@@ -12621,7 +12695,16 @@ def _collect_ask_answer_proof_refs(action: dict) -> list[dict]:
         for item in group if isinstance(group, list) else []:
             if isinstance(item, dict):
                 refs.append(item)
-    return _dedupe_ask_answer_proof_refs(refs)
+    latest_contract = (
+        action.get("latest_status_followthrough_contract")
+        if isinstance(action.get("latest_status_followthrough_contract"), dict)
+        else {}
+    )
+    required_primary_count = len(latest_contract.get("required_primary_reads") or [])
+    return _dedupe_ask_answer_proof_refs(
+        refs,
+        limit=max(_ASK_ANSWER_MAX_REFS, required_primary_count),
+    )
 
 
 def _dedupe_ask_answer_proof_refs(refs: list[dict], *, limit: int = _ASK_ANSWER_MAX_REFS) -> list[dict]:
@@ -16090,7 +16173,8 @@ def _redact_local_paths_for_final_answer(text: str) -> str:
 def _compose_latest_status_answer(*, query: str, action: dict, opened: list[dict]) -> str | None:
     selected_anchor = action.get("selected_anchor") if isinstance(action.get("selected_anchor"), dict) else {}
     readiness = action.get("answer_readiness") if isinstance(action.get("answer_readiness"), dict) else {}
-    if not selected_anchor or readiness.get("answer_allowed") is not True:
+    scanner_ready = readiness.get("scanner_coverage_answer_allowed", readiness.get("answer_allowed"))
+    if not selected_anchor or scanner_ready is not True:
         return None
     anchor_text = str(selected_anchor.get("snippet") or selected_anchor.get("text") or "").strip()
     anchor_time = str(selected_anchor.get("timestamp_utc") or selected_anchor.get("local_timestamp") or "").strip()

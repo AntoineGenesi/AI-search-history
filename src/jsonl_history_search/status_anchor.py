@@ -551,7 +551,7 @@ def status_anchor_report(
     if not artifacts["commits"]:
         blind_spots.append("No secondary git commits were found; do not substitute git history for the raw JSONL trace.")
     elapsed = None if started is None else round(time.monotonic() - started, 6)
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok" if selected_anchor else "anchor_ambiguous",
         "query": original_query,
@@ -674,6 +674,309 @@ def status_anchor_report(
         },
         "latest_user_messages_summary": latest.get("summary", {}),
         "warnings": latest.get("sources", {}).get("warnings", []),
+    }
+    if (
+        complete_interval
+        and selected_anchor
+        and answer_readiness.get("parent_main_status_answer")
+        and (answer_readiness.get("parent_main_anchor_freshness") or {}).get("current") is not False
+    ):
+        return _latest_status_navigation_only_report(report)
+    return report
+
+
+def _latest_status_navigation_only_report(report: dict) -> dict:
+    source_tiers = report.get("source_tiers") or {}
+    required_primary = list(source_tiers.get("required_primary") or [])
+    canonical_path = "status_anchor.source_tiers.required_primary"
+    contract = {
+        "schema_version": "latest_status_generated_report_contract.v1",
+        "navigation_only": True,
+        "answer_from_report_allowed": False,
+        "required_primary_windows_opened": False,
+        "required_primary_window_count": len(required_primary),
+        "opened_required_primary_window_count": 0,
+        "canonical_follow_through_path": canonical_path,
+        "stop": (
+            "Do not synthesize status or tail details from this generated report. Open every required primary "
+            f"raw window at {canonical_path}, or use an automatic follow-through path that proves all of them."
+        ),
+    }
+
+    sanitized_tiers = dict(source_tiers)
+    for tier in ("required_primary", "required_secondary", "diagnostic_optional"):
+        sanitized_tiers[tier] = [
+            _navigation_only_status_read(read)
+            for read in source_tiers.get(tier) or []
+            if isinstance(read, dict)
+        ]
+
+    readiness = dict(report.get("answer_readiness") or {})
+    scanner_ready = bool(readiness.get("answer_allowed"))
+    facet_status = dict(readiness.get("facet_status") or {})
+    facet_status["required_primary_windows_opened"] = False
+    missing = list(readiness.get("missing_required_answer_facets") or [])
+    if "required_primary_windows_opened" not in missing:
+        missing.append("required_primary_windows_opened")
+    readiness.update(
+        {
+            "status": "fail_closed_required_primary_followthrough",
+            "answer_allowed": False,
+            "scanner_coverage_answer_allowed": scanner_ready,
+            "required_primary_windows_opened": False,
+            "answer_from_report_allowed": False,
+            "navigation_only": True,
+            "facet_status": facet_status,
+            "missing_required_answer_facets": missing,
+            "stop_condition": contract["stop"],
+        }
+    )
+
+    summary = dict(report.get("summary") or {})
+    summary.update(
+        {
+            "answer_allowed": False,
+            "scanner_coverage_answer_allowed": scanner_ready,
+            "answer_readiness_status": readiness["status"],
+            "answer_from_report_allowed": False,
+            "required_primary_windows_opened": False,
+            "required_primary_window_count": len(required_primary),
+            "missing_required_answer_facet_count": len(missing),
+        }
+    )
+
+    follow_through = _navigation_only_follow_through_plan(report.get("follow_through_plan") or {})
+    follow_through.update(contract)
+    session_activity = _navigation_only_session_activity(report.get("session_activity") or {})
+    interval = _navigation_only_post_anchor_interval(report.get("post_anchor_interval_reconstruction") or {})
+    work_products = {
+        key: []
+        for key in ("tasks", "reports", "reviews", "commits")
+    }
+    work_product_counts = {
+        key: len((report.get("work_products") or {}).get(key) or [])
+        for key in work_products
+    }
+    anchor_decision = dict(report.get("anchor_decision") or {})
+    anchor_decision["rejected_anchor_alternatives"] = [
+        _navigation_only_anchor_candidate(candidate)
+        for candidate in anchor_decision.get("rejected_anchor_alternatives") or []
+        if isinstance(candidate, dict)
+    ]
+    shortlist = dict(report.get("parent_main_anchor_shortlist") or {})
+    shortlist["candidates"] = [
+        _navigation_only_anchor_candidate(candidate)
+        for candidate in shortlist.get("candidates") or []
+        if isinstance(candidate, dict)
+    ]
+    canonical_interval = dict(report.get("canonical_parent_main_status_interval") or {})
+    for key in ("anchor_candidates", "rejected_anchor_alternatives"):
+        canonical_interval[key] = [
+            _navigation_only_anchor_candidate(candidate)
+            for candidate in canonical_interval.get(key) or []
+            if isinstance(candidate, dict)
+        ]
+    return {
+        **report,
+        "summary": summary,
+        "session_activity": session_activity,
+        "post_anchor_interval_reconstruction": interval,
+        "next_reads": [
+            _navigation_only_status_read(read)
+            for read in report.get("next_reads") or []
+            if isinstance(read, dict)
+        ],
+        "source_tiers": sanitized_tiers,
+        "follow_through_plan": follow_through,
+        "answer_readiness": readiness,
+        "generated_report_contract": contract,
+        "anchor_candidates": [
+            _navigation_only_anchor_candidate(candidate)
+            for candidate in report.get("anchor_candidates") or []
+            if isinstance(candidate, dict)
+        ],
+        "anchor_decision": anchor_decision,
+        "parent_main_anchor_shortlist": shortlist,
+        "canonical_parent_main_status_interval": canonical_interval,
+        "answer_brief": [],
+        "behavior_deltas": [],
+        "non_deltas": [],
+        "diagnostic_optional_work_products": [],
+        "unresolved_blockers": [],
+        "work_products": work_products,
+        "work_product_counts": work_product_counts,
+        "fail_closed_guidance": {
+            "mode": "required_primary_raw_followthrough",
+            "answer_allowed": False,
+            "navigation_only": True,
+            "answer_from_report_allowed": False,
+            "required_primary_windows_opened": False,
+            "guidance": contract["stop"],
+            "canonical_follow_through_path": canonical_path,
+        },
+    }
+
+
+def _navigation_only_anchor_candidate(candidate: dict) -> dict:
+    sanitized = dict(candidate)
+    for key in ("snippet", "text", "summary", "rationale", "reason"):
+        sanitized.pop(key, None)
+    sanitized.update(
+        {
+            "navigation_only": True,
+            "answer_from_report_allowed": False,
+        }
+    )
+    return sanitized
+
+
+def _navigation_only_status_read(read: dict) -> dict:
+    sanitized = dict(read)
+    for key in (
+        "snippet",
+        "summary",
+        "text",
+        "extracted_text",
+        "reason",
+        "rationale",
+        "timestamp_utc",
+        "local_timestamp",
+        "committed_at",
+        "evidence_timestamp_utc",
+    ):
+        sanitized.pop(key, None)
+    sanitized.update(
+        {
+            "navigation_only": True,
+            "answer_from_report_allowed": False,
+            "opened": False,
+        }
+    )
+    return sanitized
+
+
+def _navigation_only_follow_through_plan(plan: dict) -> dict:
+    sanitized = dict(plan)
+    sanitized["open_first"] = [
+        _navigation_only_status_read(read)
+        for read in plan.get("open_first") or []
+        if isinstance(read, dict)
+    ]
+    groups = []
+    for group in plan.get("then_confirm") or []:
+        if not isinstance(group, dict):
+            continue
+        groups.append(
+            {
+                **group,
+                "refs": [
+                    _navigation_only_status_read(read)
+                    for read in group.get("refs") or []
+                    if isinstance(read, dict)
+                ],
+                "navigation_only": True,
+                "answer_from_report_allowed": False,
+            }
+        )
+    sanitized["then_confirm"] = groups
+    sanitized["do_not_open_by_default"] = [
+        _navigation_only_status_read(read)
+        for read in plan.get("do_not_open_by_default") or []
+        if isinstance(read, dict)
+    ]
+    return sanitized
+
+
+def _navigation_only_session_activity(session_activity: dict) -> dict:
+    sanitized = dict(session_activity)
+    chronological = list(session_activity.get("chronological_activity_after_anchor") or [])
+    sanitized["chronological_activity_after_anchor"] = []
+    sanitized["material_activity_suppressed_count"] = len(chronological)
+    sanitized["next_reads"] = [
+        _navigation_only_status_read(read)
+        for read in session_activity.get("next_reads") or []
+        if isinstance(read, dict)
+    ]
+    sanitized["session_followups"] = [
+        {
+            **{
+                key: value
+                for key, value in followup.items()
+                if key
+                in {
+                    "role",
+                    "session_id_hash",
+                    "parent_thread_id_hash",
+                    "raw_thread_id_hash",
+                    "session_file",
+                    "session_source_ref",
+                    "logical_message_id",
+                    "records_after_anchor",
+                    "raw_jsonl_primary_evidence",
+                }
+            },
+            "navigation_only": True,
+            "answer_from_report_allowed": False,
+        }
+        for followup in session_activity.get("session_followups") or []
+        if isinstance(followup, dict)
+    ]
+    sanitized["omitted_activity_ranges"] = [
+        _navigation_only_omitted_range(item)
+        for item in session_activity.get("omitted_activity_ranges") or []
+        if isinstance(item, dict)
+    ]
+    return sanitized
+
+
+def _navigation_only_post_anchor_interval(interval: dict) -> dict:
+    sanitized = dict(interval)
+    chronological = list(interval.get("chronological_activity") or [])
+    joins = interval.get("secondary_evidence_joins") or {}
+    boundary = dict(interval.get("boundary") or {})
+    boundary.pop("timestamp_utc", None)
+    boundary.update({"navigation_only": True, "answer_from_report_allowed": False})
+    sanitized.update(
+        {
+            "navigation_only": True,
+            "answer_from_report_allowed": False,
+            "required_primary_windows_opened": False,
+            "boundary": boundary,
+            "chronological_activity": [],
+            "material_activity_suppressed_count": len(chronological),
+            "secondary_evidence_joins": {key: [] for key in joins},
+            "secondary_evidence_join_counts": {
+                key: len(value or [])
+                for key, value in joins.items()
+            },
+            "omitted_ranges": [
+                _navigation_only_omitted_range(item)
+                for item in interval.get("omitted_ranges") or []
+                if isinstance(item, dict)
+            ],
+            "omitted_range_warning": "",
+        }
+    )
+    return sanitized
+
+
+def _navigation_only_omitted_range(item: dict) -> dict:
+    return {
+        **{
+            key: value
+            for key, value in item.items()
+            if key
+            in {
+                "session_source_ref",
+                "omitted_count",
+                "after_ref",
+                "last_ref",
+                "blocking",
+                "read_next_command",
+            }
+        },
+        "navigation_only": True,
+        "answer_from_report_allowed": False,
     }
 
 
