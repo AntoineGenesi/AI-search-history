@@ -51,6 +51,7 @@ from .retrieval_modes import (
     RETRIEVAL_MODE_RRF_FUSION,
     run_retrieval_mode,
 )
+from .records import parse_record
 from .scanner import search
 from .spawned_sessions import resolve_spawned_session_transcripts
 from .tool_events import build_tool_events_payload
@@ -1187,6 +1188,8 @@ def build_semantic_debug_payload(
             coverage=in_depth_audit_coverage,
             scope_boundary_summary=scope_boundary_summary,
             next_reads=next_reads,
+            now_utc=parse_source_plan_now(source_plan),
+            default_tz=default_tz,
         )
         source_locator_handoff["next_reads"] = next_reads
         source_handle_routing = build_source_handle_routing(
@@ -1227,6 +1230,18 @@ def build_semantic_debug_payload(
             answer_ready_handoff,
             followthrough=in_depth_audit_followthrough,
         )
+        final_answer_contract = apply_deep_audit_live_tail_contract_gate(
+            final_answer_contract,
+            followthrough=in_depth_audit_followthrough,
+        )
+        answer_readiness = apply_deep_audit_live_tail_answer_readiness_gate(
+            answer_readiness,
+            followthrough=in_depth_audit_followthrough,
+        )
+        answer_ready_handoff = apply_deep_audit_live_tail_handoff_gate(
+            answer_ready_handoff,
+            followthrough=in_depth_audit_followthrough,
+        )
         agent_instruction = apply_in_depth_audit_agent_instruction_gate(
             agent_instruction,
             coverage=in_depth_audit_coverage,
@@ -1236,6 +1251,10 @@ def build_semantic_debug_payload(
             followthrough=in_depth_audit_followthrough,
         )
         agent_instruction = apply_deep_audit_target_persistence_instruction_gate(
+            agent_instruction,
+            followthrough=in_depth_audit_followthrough,
+        )
+        agent_instruction = apply_deep_audit_live_tail_instruction_gate(
             agent_instruction,
             followthrough=in_depth_audit_followthrough,
         )
@@ -1354,6 +1373,11 @@ def build_semantic_debug_payload(
             "semantic_linter_runtime_dependency": False,
             "default_embeddings_or_sidecars": False,
             "native_scanner_default": False,
+            "terminal_session_conclusion": (
+                "not_allowed_while_terminal_state_unproven"
+                if deep_audit_live_tail_caveat_applies(in_depth_audit_followthrough)
+                else "requires_terminal_evidence"
+            ),
         },
     }
     if result.get("retrieval_diagnostics"):
@@ -14026,6 +14050,8 @@ def apply_in_depth_audit_read_promotion_safety(
 
 IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT = 4
 IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT = 8
+IN_DEPTH_AUDIT_LIVE_TAIL_MAX_AGE_SECONDS = 300
+IN_DEPTH_AUDIT_LIVE_TAIL_MAX_LINE_DISTANCE = 8
 
 
 def build_in_depth_audit_followthrough_plan(
@@ -14035,12 +14061,19 @@ def build_in_depth_audit_followthrough_plan(
     coverage: dict[str, Any],
     scope_boundary_summary: dict[str, Any],
     next_reads: list[dict[str, Any]],
+    now_utc: datetime | None = None,
+    default_tz: Any = timezone.utc,
 ) -> dict[str, Any]:
     if not coverage.get("applies"):
         return {}
 
     target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=next_reads)
     selected_reads = select_in_depth_audit_primary_reads_for_query(next_reads, query=query)
+    live_tail_caveat = build_deep_audit_live_tail_caveat(
+        selected_reads,
+        now_utc=now_utc,
+        default_tz=default_tz,
+    )
     continuation_commands = in_depth_audit_continuation_commands(
         query=query,
         args=args,
@@ -14065,6 +14098,8 @@ def build_in_depth_audit_followthrough_plan(
             "commands for the pending date/path slices that affect the requested facets, then either answer with "
             "the remaining gaps named or report the blocked/capped windows."
         )
+    if live_tail_caveat.get("applies"):
+        stop_rule += " " + str(live_tail_caveat.get("required_caveat"))
     if not target_persistence_ready and not continuation_commands:
         continuation = in_depth_audit_target_refocus_command(
             query=query,
@@ -14101,6 +14136,8 @@ def build_in_depth_audit_followthrough_plan(
         ),
         "target_persistence_contract": target_contract,
         "target_mismatch_answer_block": target_answer_block,
+        "live_tail_caveat": live_tail_caveat,
+        "answer_ready_for_terminal_state_claims": not live_tail_caveat.get("applies"),
     }
     return {
         "schema_version": 1,
@@ -14114,6 +14151,8 @@ def build_in_depth_audit_followthrough_plan(
         "ordered_primary_ref_count": len(selected_reads),
         "target_persistence_contract": target_contract,
         "target_mismatch_answer_block": target_answer_block,
+        "live_tail_caveat": live_tail_caveat,
+        "answer_ready_for_terminal_state_claims": not live_tail_caveat.get("applies"),
         "primary_read_limit": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
         "coverage_state": {
             "status": coverage.get("status"),
@@ -14134,6 +14173,7 @@ def build_in_depth_audit_followthrough_plan(
             "keep expanding read-more after selected refs cover the asked facets",
             "claim full-history completeness from capped or top-N candidate samples",
             "answer from previous-lane/eval artifacts when target_persistence_contract.target_persistence_ready is false",
+            "infer that a session ended or that missing closeout was the failure from an in-flight/live transcript tail",
         ],
         "artifact_and_local_evidence_boundary": {
             "committed_public_export_surface": "refs_and_commands_without_raw_transcript_text",
@@ -14152,6 +14192,147 @@ def build_in_depth_audit_followthrough_plan(
         "continuation_commands": continuation_commands,
         "audit_continuation_workflow": workflow,
     }
+
+
+def build_deep_audit_live_tail_caveat(
+    selected_reads: list[dict[str, Any]],
+    *,
+    now_utc: datetime | None,
+    default_tz: Any = timezone.utc,
+) -> dict[str, Any]:
+    now = _aware_utc(now_utc or datetime.now(timezone.utc))
+    inspected_sources: list[dict[str, Any]] = []
+    live_tail_sources: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    for read in selected_reads:
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        raw_path = str(source_ref.get("path") or "")
+        if not raw_path or raw_path in seen_paths or not raw_path.lower().endswith(".jsonl"):
+            continue
+        seen_paths.add(raw_path)
+        path = Path(raw_path).expanduser()
+        try:
+            before_stat = path.stat()
+        except OSError:
+            continue
+
+        try:
+            last_record = _last_jsonl_record(path, default_tz=default_tz)
+        except OSError:
+            continue
+        if last_record is None:
+            continue
+        try:
+            after_stat = path.stat()
+        except OSError:
+            after_stat = before_stat
+
+        selected_line = _safe_positive_int(source_ref.get("line"))
+        last_record_line = _safe_positive_int(last_record.line)
+        lines_from_tail = (
+            max(0, last_record_line - selected_line)
+            if selected_line is not None and last_record_line is not None
+            else None
+        )
+        near_tail = lines_from_tail is not None and lines_from_tail <= IN_DEPTH_AUDIT_LIVE_TAIL_MAX_LINE_DISTANCE
+        mtime = datetime.fromtimestamp(after_stat.st_mtime, tz=timezone.utc)
+        last_timestamp = _aware_utc(last_record.timestamp) if last_record.timestamp else None
+        mtime_age_seconds = round((now - mtime).total_seconds(), 3)
+        last_record_age_seconds = (
+            round((now - last_timestamp).total_seconds(), 3) if last_timestamp is not None else None
+        )
+        mtime_near_query = _age_is_near_query(mtime_age_seconds)
+        last_record_near_query = _age_is_near_query(last_record_age_seconds)
+        changed_during_assessment = (
+            before_stat.st_size != after_stat.st_size
+            or before_stat.st_mtime_ns != after_stat.st_mtime_ns
+        )
+        in_flight_or_live_tail = bool(
+            near_tail and (mtime_near_query or last_record_near_query or changed_during_assessment)
+        )
+        source_summary = {
+            "source_hash_12": hashlib.sha256(raw_path.encode("utf-8", errors="replace")).hexdigest()[:12],
+            "selected_line": selected_line,
+            "observed_last_record_line": last_record_line,
+            "lines_from_observed_tail": lines_from_tail,
+            "near_observed_tail": near_tail,
+            "file_mtime_utc": mtime.isoformat(),
+            "file_mtime_age_seconds": mtime_age_seconds,
+            "last_record_timestamp_utc": last_timestamp.isoformat() if last_timestamp else None,
+            "last_record_age_seconds": last_record_age_seconds,
+            "mtime_near_query_time": mtime_near_query,
+            "last_record_timestamp_near_query_time": last_record_near_query,
+            "file_changed_during_assessment": changed_during_assessment,
+            "in_flight_or_live_tail": in_flight_or_live_tail,
+            "raw_path_included": False,
+            "raw_text_included": False,
+        }
+        inspected_sources.append(source_summary)
+        if in_flight_or_live_tail:
+            live_tail_sources.append(source_summary)
+
+    applies = bool(live_tail_sources)
+    required_caveat = (
+        "LIVE-TAIL CAVEAT: absence of a closeout/final response proves only that it was not present in this "
+        "inspected window at query time. The transcript may still have been in flight; this does not prove "
+        "the session ended or that missing closeout was the actual failure."
+    )
+    return {
+        "schema_version": 1,
+        "applies": applies,
+        "status": "in_flight_or_live_tail" if applies else "no_live_tail_detected",
+        "terminal_state_status": "terminal_state_unproven" if applies else "not_flagged",
+        "query_time_utc": now.isoformat(),
+        "freshness_threshold_seconds": IN_DEPTH_AUDIT_LIVE_TAIL_MAX_AGE_SECONDS,
+        "tail_line_distance_threshold": IN_DEPTH_AUDIT_LIVE_TAIL_MAX_LINE_DISTANCE,
+        "inspected_source_count": len(inspected_sources),
+        "live_tail_source_count": len(live_tail_sources),
+        "live_tail_sources": live_tail_sources,
+        "required_caveat": required_caveat if applies else None,
+        "claim_boundaries": {
+            "absence_of_closeout_or_final_response": (
+                "not_present_in_inspected_window_at_query_time_only" if applies else "not_assessed"
+            ),
+            "session_ended": "not_proven" if applies else "not_assessed",
+            "missing_closeout_is_actual_failure": "not_proven" if applies else "not_assessed",
+            "positive_facts_in_inspected_window": "allowed_with_source_support",
+        },
+        "committed_safe": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def _safe_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _last_jsonl_record(path: Path, *, default_tz: Any) -> Any | None:
+    last_line_number = 0
+    last_line = ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if line.strip():
+                last_line_number = line_number
+                last_line = line
+    if not last_line:
+        return None
+    return parse_record(last_line, path=path, line=last_line_number, default_tz=default_tz)
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _age_is_near_query(age_seconds: float | None) -> bool:
+    return age_seconds is not None and -60 <= age_seconds <= IN_DEPTH_AUDIT_LIVE_TAIL_MAX_AGE_SECONDS
 
 
 def select_in_depth_audit_primary_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -14668,6 +14849,141 @@ def deep_audit_target_persistence_blocked(followthrough: dict[str, Any]) -> bool
         return True
     contract = followthrough.get("target_persistence_contract") or {}
     return bool(contract.get("target_persistence_required")) and not bool(contract.get("target_persistence_ready"))
+
+
+def deep_audit_live_tail_caveat_applies(followthrough: dict[str, Any]) -> bool:
+    if not isinstance(followthrough, dict) or not followthrough.get("applies"):
+        return False
+    return bool((followthrough.get("live_tail_caveat") or {}).get("applies"))
+
+
+def apply_deep_audit_live_tail_contract_gate(
+    contract: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_live_tail_caveat_applies(followthrough):
+        return contract
+    caveat = followthrough.get("live_tail_caveat") or {}
+    row = dict(contract)
+    row.setdefault("evidence_inputs", {})
+    row["evidence_inputs"] = {
+        **row["evidence_inputs"],
+        "live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
+    }
+    row["required_actions"] = dedupe(
+        [
+            str(caveat.get("required_caveat")),
+            "Obtain separate terminal-state evidence before claiming the session ended or diagnosing missing closeout as the actual failure.",
+        ]
+        + list(row.get("required_actions") or [])
+    )
+    row.setdefault("claim_boundaries", {})
+    row["claim_boundaries"] = {
+        **row["claim_boundaries"],
+        "in_flight_or_live_tail": True,
+        "terminal_state_unproven": True,
+        "terminal_session_conclusion": "not_allowed_from_inspected_live_tail_window",
+        "absence_of_closeout_or_final_response": "not_present_in_inspected_window_at_query_time_only",
+        "missing_closeout_is_actual_failure": "not_proven",
+    }
+    return row
+
+
+def apply_deep_audit_live_tail_answer_readiness_gate(
+    readiness: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_live_tail_caveat_applies(followthrough):
+        return readiness
+    caveat = followthrough.get("live_tail_caveat") or {}
+    row = dict(readiness)
+    row["answer_ready_for_terminal_state_claims"] = False
+    row["terminal_state_status"] = "terminal_state_unproven"
+    row["allowed_terminal_claim_scope"] = "not_present_in_inspected_window_at_query_time_only"
+    row["required_before_answer"] = dedupe(
+        [str(caveat.get("required_caveat"))] + list(row.get("required_before_answer") or [])
+    )[:12]
+    row.setdefault("basis", {})
+    row["basis"] = {
+        **row["basis"],
+        "live_tail_status": caveat.get("status"),
+        "live_tail_source_count": caveat.get("live_tail_source_count", 0),
+        "terminal_state_unproven": True,
+    }
+    row.setdefault("source_use_contract", {})
+    row["source_use_contract"] = {
+        **row["source_use_contract"],
+        "live_tail_caveat": {
+            "status": caveat.get("status"),
+            "terminal_state_unproven": True,
+            "terminal_session_conclusion_allowed": False,
+            "positive_window_facts_allowed": True,
+            "link": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
+        },
+    }
+    return row
+
+
+def apply_deep_audit_live_tail_handoff_gate(
+    handoff: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_live_tail_caveat_applies(followthrough):
+        return handoff
+    caveat = followthrough.get("live_tail_caveat") or {}
+    row = dict(handoff)
+    row["live_tail_caveat"] = caveat
+    row["answer_ready_for_terminal_state_claims"] = False
+    row["terminal_state_status"] = "terminal_state_unproven"
+    row["do_not_answer_until"] = dedupe(
+        [
+            "Do not make a terminal-session or actual-failure conclusion from this live tail; obtain separate terminal evidence or keep the conclusion explicitly unproven."
+        ]
+        + list(row.get("do_not_answer_until") or [])
+    )[:8]
+    row.setdefault("links", {})
+    row["links"] = {
+        **row["links"],
+        "live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
+    }
+    row.setdefault("source_use_summary", {})
+    row["source_use_summary"] = {
+        **row["source_use_summary"],
+        "live_tail_caveat": {
+            "status": caveat.get("status"),
+            "terminal_state_status": caveat.get("terminal_state_status"),
+            "live_tail_source_count": caveat.get("live_tail_source_count", 0),
+            "terminal_session_conclusion_allowed": False,
+        },
+    }
+    return row
+
+
+def apply_deep_audit_live_tail_instruction_gate(
+    instruction: dict[str, Any],
+    *,
+    followthrough: dict[str, Any],
+) -> dict[str, Any]:
+    if not deep_audit_live_tail_caveat_applies(followthrough):
+        return instruction
+    caveat = followthrough.get("live_tail_caveat") or {}
+    row = dict(instruction)
+    row["live_tail_caveat"] = caveat
+    row["answer_ready_for_terminal_state_claims"] = False
+    row["terminal_state_status"] = "terminal_state_unproven"
+    row.setdefault("source_action_guidance", {})
+    row["source_action_guidance"] = {
+        **row["source_action_guidance"],
+        "live_tail_caveat": {
+            "status": caveat.get("status"),
+            "terminal_state_unproven": True,
+            "required_caveat": caveat.get("required_caveat"),
+        },
+    }
+    return row
 
 
 def apply_deep_audit_target_persistence_contract_gate(

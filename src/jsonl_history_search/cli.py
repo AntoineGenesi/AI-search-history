@@ -18703,7 +18703,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if payload["semantic_wrapup"]["status"] in {"found", "no_failure_modes_found"} else 1
     if args.command == "read-more":
         args.query = args.target
-        _source_plan, _intent, plan = payload_from_args(args)
+        source_plan, _intent, plan = payload_from_args(args)
         projection = args.projection or (
             "compact" if args.format == "text" and args.mode == "window" else "full"
         )
@@ -18722,6 +18722,7 @@ def main(argv: list[str] | None = None) -> int:
             plan=plan,
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=Path(args.cwd).expanduser().resolve(),
+            now_utc=parse_datetime(source_plan.get("now"), timezone.utc),
         )
         print(render(payload, args.format))
         return 0 if payload["source_expansion"]["status"] == "expanded" else 1

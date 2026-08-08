@@ -2080,6 +2080,16 @@ def render_in_depth_audit_followthrough_text(
         drift_reads = list(target_contract.get("target_drift_risk_reads") or [])
         if drift_reads:
             lines.append(f"- quarantined drift-risk refs: {len(drift_reads)} diagnostic-only hashes retained in JSON")
+    live_tail_caveat = plan.get("live_tail_caveat") or workflow.get("live_tail_caveat") or {}
+    if live_tail_caveat.get("applies"):
+        lines.append(
+            f"- LIVE-TAIL CAVEAT: status={live_tail_caveat.get('status')} "
+            f"terminal_state={live_tail_caveat.get('terminal_state_status')} "
+            f"live_tail_sources={live_tail_caveat.get('live_tail_source_count', 0)} "
+            "answer_ready_for_terminal_state_claims=False"
+        )
+        lines.append(f"- terminal claim boundary: {live_tail_caveat.get('required_caveat')}")
+        lines.append("- positive facts present in the inspected window remain usable with source support")
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.append("- pending coverage slices:")
@@ -2184,6 +2194,16 @@ def render_in_depth_audit_followthrough_markdown(
         drift_reads = list(target_contract.get("target_drift_risk_reads") or [])
         if drift_reads:
             lines.append(f"- `quarantined_drift_risk_refs`: `{len(drift_reads)}` diagnostic-only hashes retained in JSON")
+    live_tail_caveat = plan.get("live_tail_caveat") or workflow.get("live_tail_caveat") or {}
+    if live_tail_caveat.get("applies"):
+        lines.append(
+            f"- **LIVE-TAIL CAVEAT:** `status={live_tail_caveat.get('status')}` "
+            f"`terminal_state={live_tail_caveat.get('terminal_state_status')}` "
+            f"`live_tail_sources={live_tail_caveat.get('live_tail_source_count', 0)}` "
+            "`answer_ready_for_terminal_state_claims=False`"
+        )
+        lines.append(f"- **Terminal claim boundary:** {live_tail_caveat.get('required_caveat')}")
+        lines.append("- Positive facts present in the inspected window remain usable with source support.")
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.extend(["", "### Pending Coverage Slices", ""])
@@ -4370,6 +4390,13 @@ def render_source_expansion_text(payload: dict) -> str:
             f"{counts.get('included_count', 0)} included, "
             f"{counts.get('omitted_count', 0)} omitted"
         )
+    live_tail_caveat = report.get("live_tail_caveat") or {}
+    if live_tail_caveat.get("applies"):
+        lines.append(
+            f"LIVE-TAIL CAVEAT: status={live_tail_caveat.get('status')} "
+            f"terminal_state={live_tail_caveat.get('terminal_state_status')}"
+        )
+        lines.append(f"Terminal claim boundary: {live_tail_caveat.get('required_caveat')}")
     for record in report.get("records", []):
         lines.append(f"- {record.get('target')}: {record.get('role') or '(role unknown)'}")
         text = str(record.get("text") or "")
@@ -4395,6 +4422,13 @@ def render_source_expansion_markdown(payload: dict) -> str:
     counts = report.get("counts") or {}
     if counts:
         lines.append(f"- Records: `{counts.get('included_count', 0)}` included, `{counts.get('omitted_count', 0)}` omitted")
+    live_tail_caveat = report.get("live_tail_caveat") or {}
+    if live_tail_caveat.get("applies"):
+        lines.append(
+            f"- **LIVE-TAIL CAVEAT:** `status={live_tail_caveat.get('status')}` "
+            f"`terminal_state={live_tail_caveat.get('terminal_state_status')}`"
+        )
+        lines.append(f"- **Terminal claim boundary:** {live_tail_caveat.get('required_caveat')}")
     for record in report.get("records", []):
         lines.extend(["", f"## {record.get('target')}", "", str(record.get("text") or "")])
     return "\n".join(lines)
