@@ -19006,6 +19006,11 @@ def _agent_find_is_no_evidence_report(report: dict) -> bool:
 
 
 def _semantic_debug_is_scoped_no_evidence(packet: dict) -> bool:
+    workflow = (
+        packet.get("scope_aware_no_evidence_workflow")
+        if isinstance(packet.get("scope_aware_no_evidence_workflow"), dict)
+        else {}
+    )
     answer_ready = packet.get("answer_ready_handoff") if isinstance(packet.get("answer_ready_handoff"), dict) else {}
     agent_instruction = packet.get("agent_instruction") if isinstance(packet.get("agent_instruction"), dict) else {}
     source_action = (
@@ -19018,7 +19023,9 @@ def _semantic_debug_is_scoped_no_evidence(packet: dict) -> bool:
         else {}
     )
     return (
-        answer_ready.get("decision") == "scoped_no_evidence"
+        bool(workflow.get("applies"))
+        or packet.get("status") == "no_evidence"
+        or answer_ready.get("decision") == "scoped_no_evidence"
         or source_action.get("decision") == "answer_scoped_no_evidence_now"
     )
 
@@ -19048,6 +19055,11 @@ def _short_no_evidence_report_written_payload(payload: dict, report_output: str)
 def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, report_output: str) -> dict:
     no_evidence = packet.get("no_evidence") if isinstance(packet.get("no_evidence"), dict) else {}
     answer_ready = packet.get("answer_ready_handoff") if isinstance(packet.get("answer_ready_handoff"), dict) else {}
+    workflow = (
+        packet.get("scope_aware_no_evidence_workflow")
+        if isinstance(packet.get("scope_aware_no_evidence_workflow"), dict)
+        else {}
+    )
     agent_instruction = packet.get("agent_instruction") if isinstance(packet.get("agent_instruction"), dict) else {}
     source_action = (
         packet.get("source_action_guidance")
@@ -19067,6 +19079,15 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
         answer_ready=answer_ready,
         source_action=source_action,
     )
+    if workflow and not workflow.get("answer_ready"):
+        boundary["read_more_policy"] = {
+            "required_before_scoped_no_evidence_answer": True,
+            "actionability": "scope_refinement_or_continuation_required",
+            "diagnostic_policy": (
+                "Do not answer no-evidence from optional diagnostics; resolve the workflow blockers "
+                "with its exact continuation or required scope refinement."
+            ),
+        }
     return {
         "semantic_debug": {
             "schema_version": packet["schema_version"],
@@ -19078,6 +19099,9 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "candidate_count": len(packet.get("strongest_candidates") or []),
             "event_count": (packet.get("tool_action_proof") or {}).get("event_count"),
             "answer_ready_decision": answer_ready.get("decision"),
+            "scope_aware_no_evidence_workflow": _compact_scope_aware_no_evidence_workflow(
+                workflow
+            ),
             "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
             "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
@@ -19087,6 +19111,37 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
             "message": "Full semantic-debug scoped no-evidence report written to report_output; stdout is a scoped summary.",
         }
     }
+
+
+def _compact_scope_aware_no_evidence_workflow(workflow: dict) -> dict:
+    if not workflow:
+        return {}
+    compact = {
+        "status": workflow.get("status"),
+        "answer_ready": bool(workflow.get("answer_ready")),
+        "hard_stop": bool(workflow.get("hard_stop")),
+        "answer_scope": workflow.get("answer_scope"),
+        "searched_scope_names": list(workflow.get("searched_scope_names") or []),
+        "searched_file_count": int(workflow.get("searched_file_count") or 0),
+        "global_absence_allowed": False,
+        "blockers": list(workflow.get("blockers") or []),
+        "optional_diagnostic_suppressed_count": int(
+            workflow.get("optional_diagnostic_next_reads_suppressed") or 0
+        ),
+    }
+    continuation = workflow.get("continuation") or {}
+    if continuation.get("required"):
+        compact["continuation"] = {
+            "required": True,
+            "exact_continuation": [
+                item.get("command")
+                for item in continuation.get("exact_commands") or []
+                if isinstance(item, dict) and item.get("command")
+            ],
+            "required_scope_refinement": continuation.get("required_scope_refinement"),
+            "missing_root_precondition": continuation.get("missing_root_precondition"),
+        }
+    return compact
 
 
 def _no_evidence_searched_scope_summary(

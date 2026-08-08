@@ -561,6 +561,41 @@ def build_semantic_debug_payload(
         source_locator_handoff["historical_orchestration_role_evidence_bundle"] = (
             historical_orchestration_role_evidence_bundle
         )
+    subagent_provenance_workflow = build_cap_aware_subagent_provenance_workflow(
+        query=agent_find["query"]["original"],
+        historical_orchestration_plan=historical_orchestration_plan,
+        spawned_session_resolution=spawned_session_resolution,
+        args=args,
+    )
+    if subagent_provenance_workflow:
+        source_locator_handoff["subagent_provenance_workflow"] = subagent_provenance_workflow
+    scope_aware_no_evidence_workflow = build_scope_aware_no_evidence_workflow(
+        query=agent_find["query"]["original"],
+        no_evidence=no_evidence,
+        source_scope=source_scope,
+        next_reads=list(source_locator_handoff.get("next_reads") or next_reads),
+        family=family,
+        args=args,
+        subagent_provenance_workflow=subagent_provenance_workflow,
+    )
+    if scope_aware_no_evidence_workflow:
+        next_reads, suppressed_count = suppress_optional_no_evidence_next_reads(
+            list(source_locator_handoff.get("next_reads") or next_reads)
+        )
+        scope_aware_no_evidence_workflow["optional_diagnostic_next_reads_suppressed"] = (
+            suppressed_count
+        )
+        source_locator_handoff["next_reads"] = next_reads
+        if not next_reads:
+            decision_context["next_reads"] = []
+            decision_context["next_commands"] = []
+            audit_plan["resume_from"] = resume_from([], audit_plan.get("route_order", []))
+            audit_plan["replay_commands"] = []
+            audit_plan["next_commands"] = []
+        no_evidence["scope_aware_workflow"] = scope_aware_no_evidence_workflow
+        source_locator_handoff["scope_aware_no_evidence_workflow"] = (
+            scope_aware_no_evidence_workflow
+        )
     process_actual_use_read_plan = (
         build_process_actual_use_final_support_read_plan(
             list(source_locator_handoff.get("next_reads") or next_reads),
@@ -837,6 +872,53 @@ def build_semantic_debug_payload(
         action_proof_plan=action_proof_plan,
         scope_boundary_summary=scope_boundary_summary,
     )
+    if scope_aware_no_evidence_workflow:
+        answer_ready_handoff["links"]["scope_aware_no_evidence_workflow"] = (
+            "semantic_debug.scope_aware_no_evidence_workflow"
+        )
+        answer_ready_handoff["source_use_summary"]["scope_aware_no_evidence_workflow"] = {
+            "status": scope_aware_no_evidence_workflow.get("status"),
+            "answer_ready": scope_aware_no_evidence_workflow.get("answer_ready"),
+            "blocker_count": len(scope_aware_no_evidence_workflow.get("blockers") or []),
+        }
+        if not scope_aware_no_evidence_workflow.get("answer_ready"):
+            continuation = scope_aware_no_evidence_workflow.get("continuation") or {}
+            commands = list(continuation.get("exact_commands") or [])
+            answer_ready_handoff["decision"] = "no_evidence_scope_continuation"
+            answer_ready_handoff["do_next"] = "refine_or_continue_named_scope_before_answering"
+            answer_ready_handoff["copy_paste_commands"] = commands
+            agent_instruction["decision"] = "no_evidence_scope_continuation"
+            agent_instruction["required_next_action"] = (
+                "Refine ambiguous/global scope or run the exact named-scope continuation before answering."
+            )
+            agent_instruction["commands"] = commands
+    if subagent_provenance_workflow:
+        answer_ready_handoff["links"]["subagent_provenance_workflow"] = (
+            "semantic_debug.subagent_provenance_workflow"
+        )
+        answer_ready_handoff["source_use_summary"]["subagent_provenance_workflow"] = {
+            "status": subagent_provenance_workflow.get("status"),
+            "answer_ready": subagent_provenance_workflow.get("answer_ready"),
+            "required_roles": subagent_provenance_workflow.get("required_roles"),
+            "covered_roles": subagent_provenance_workflow.get("covered_roles"),
+            "missing_roles": subagent_provenance_workflow.get("missing_roles"),
+            "child_ref_count": subagent_provenance_workflow.get("child_ref_count", 0),
+            "missing_or_omitted_child_ref_count": subagent_provenance_workflow.get(
+                "missing_or_omitted_child_ref_count", 0
+            ),
+            "cap_status": subagent_provenance_workflow.get("cap_status"),
+        }
+        if not subagent_provenance_workflow.get("answer_ready"):
+            commands = list(subagent_provenance_workflow.get("continuation_commands") or [])
+            answer_ready_handoff["decision"] = "subagent_provenance_continuation"
+            answer_ready_handoff["do_next"] = "open_child_refs_and_continue_missing_or_capped_roles"
+            answer_ready_handoff["copy_paste_commands"] = commands[:ANSWER_READY_HANDOFF_COMMAND_CAP]
+            agent_instruction["decision"] = "subagent_provenance_continuation"
+            agent_instruction["required_next_action"] = (
+                "Open child/session refs and run missing-role or cap continuation commands before answering."
+            )
+            agent_instruction["commands"] = commands
+    no_evidence.pop("scope_aware_workflow", None)
     if provenance_direct_evidence_facet_ledger.get("applies"):
         direct_ledger_summary = public_provenance_direct_evidence_facet_ledger(
             provenance_direct_evidence_facet_ledger
@@ -1150,7 +1232,11 @@ def build_semantic_debug_payload(
         answer_ready_handoff["links"]["provenance_complete_proof_handoff"] = (
             "semantic_debug.provenance_complete_proof_handoff"
         )
-        if provenance_complete_proof_handoff.get("active"):
+        if (
+            provenance_complete_proof_handoff.get("active")
+            and not scope_aware_no_evidence_workflow.get("hard_stop")
+            and not subagent_provenance_workflow.get("hard_stop")
+        ):
             answer_ready_handoff["decision"] = "answer_after_selected_direct_reads"
             answer_ready_handoff["do_next"] = (
                 "Open only the selected direct reads, then answer from those correlated events."
@@ -1373,6 +1459,7 @@ def build_semantic_debug_payload(
         "agent_instruction": agent_instruction,
         "candidate_causes": candidate_causes,
         "no_evidence": no_evidence,
+        "scope_aware_no_evidence_workflow": scope_aware_no_evidence_workflow,
         "uncertainty": uncertainty,
         "guided_audit_flow": guided_audit_flow,
         "next_reads": next_reads,
@@ -1385,6 +1472,7 @@ def build_semantic_debug_payload(
         "process_actual_use_bucket_evidence_bundle": process_actual_use_bucket_evidence_bundle,
         "historical_provenance_self_echo_policy": historical_provenance_self_echo_policy,
         "spawned_session_resolution": spawned_session_resolution,
+        "subagent_provenance_workflow": subagent_provenance_workflow,
         "historical_orchestration_role_evidence_bundle": historical_orchestration_role_evidence_bundle,
         "historical_orchestration_role_coverage_source_plan": historical_orchestration_plan,
         "historical_orchestration_provenance_final_support_plan": historical_orchestration_plan,
@@ -1418,6 +1506,10 @@ def build_semantic_debug_payload(
         packet.pop("in_depth_audit_coverage", None)
         packet.pop("in_depth_audit_followthrough", None)
         packet.pop("audit_continuation_workflow", None)
+    if not scope_aware_no_evidence_workflow:
+        packet.pop("scope_aware_no_evidence_workflow", None)
+    if not subagent_provenance_workflow:
+        packet.pop("subagent_provenance_workflow", None)
     if source_locator_handoff.get("stage_diagnostics") and packet.get("retrieval_pressure"):
         packet["retrieval_pressure"]["stage_diagnostics"] = source_locator_handoff["stage_diagnostics"]
     if getattr(args, "compact_provenance_handoff", False):
@@ -2356,6 +2448,170 @@ HISTORICAL_ORCHESTRATION_ROLE_LABELS = {
 }
 
 
+def build_scope_aware_no_evidence_workflow(
+    *,
+    query: str,
+    no_evidence: dict[str, Any],
+    source_scope: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    family: dict[str, Any],
+    args: Any = None,
+    subagent_provenance_workflow: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not no_evidence.get("needed"):
+        return {}
+    broad_absence_requested = "exhaustive_all_history_absence" in set(
+        family.get("detected_unsupported") or []
+    ) or bool(
+        re.search(
+            r"\b(?:all chats?|all sessions?|system[- ]wide|system[- ]level|across all (?:history|logs?))\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
+    explicit_no_evidence_question = bool(
+        re.search(
+            r"\b(?:is there evidence|any evidence|no evidence|not found|discussed in (?:this|the) "
+            r"(?:bounded|searched|selected)?\s*(?:scope|session|root)|did we ever discuss)\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
+    no_evidence_question = (
+        family.get("primary") == "no_evidence"
+        or broad_absence_requested
+        or explicit_no_evidence_question
+    )
+    if not no_evidence_question:
+        return {}
+
+    searched = source_scope.get("searched_scope") or {}
+    not_searched = source_scope.get("not_searched_scope") or {}
+    excluded = source_scope.get("excluded_scope") or {}
+    source_plan = not_searched.get("source_plan") or {}
+    caps = source_scope.get("cap_hit") or {}
+    searched_scope_names = dedupe(
+        [
+            ":".join(
+                part
+                for part in (str(root.get("kind") or ""), str(root.get("scope_label") or ""))
+                if part
+            )
+            for root in searched.get("roots") or []
+            if isinstance(root, dict)
+        ]
+    )
+    actionable_reads = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and read_is_required_surface_actionable(read)
+    ]
+    blockers: list[dict[str, Any]] = []
+    if broad_absence_requested:
+        blockers.append({"kind": "broad_or_global_absence_scope", "count": 1})
+    if not searched_scope_names:
+        blockers.append({"kind": "searched_scope_not_named", "count": 1})
+    if safe_count(searched.get("searched_files")) == 0:
+        blockers.append({"kind": "no_files_searched", "count": 1})
+    if caps.get("hit"):
+        blockers.append(
+            {
+                "kind": "cap_limited_scope",
+                "count": len(caps.get("caps_hit") or []) or 1,
+                "labels": list(caps.get("caps_hit") or []),
+            }
+        )
+    missing_root_count = safe_count(not_searched.get("missing_root_count"))
+    if missing_root_count:
+        blockers.append({"kind": "missing_selected_roots", "count": missing_root_count})
+    rejected_root_count = safe_count(excluded.get("rejected_root_count"))
+    if rejected_root_count:
+        blockers.append({"kind": "rejected_selected_roots", "count": rejected_root_count})
+    deferred_count = safe_count(source_plan.get("sources_deferred_budget"))
+    if deferred_count:
+        blockers.append({"kind": "deferred_source_plan_files", "count": deferred_count})
+    if actionable_reads:
+        blockers.append({"kind": "required_primary_reads_present", "count": len(actionable_reads)})
+    subagent_workflow = subagent_provenance_workflow or {}
+    if subagent_workflow.get("applies") and not subagent_workflow.get("answer_ready"):
+        blockers.append({"kind": "subagent_provenance_incomplete", "count": 1})
+
+    answer_ready = not blockers
+    exact_commands: list[dict[str, Any]] = []
+    if not answer_ready and not broad_absence_requested:
+        argv = semantic_debug_scope_continuation_argv(query=query, args=args)
+        exact_commands.append(
+            {
+                "command_id": "continue_in_named_scope",
+                "argv": argv,
+                "command": shell_command(argv),
+                "purpose": (
+                    "Continue the same named source scope with in-depth slice/cap accounting; "
+                    "do not treat this rerun as all-history coverage."
+                ),
+            }
+        )
+    refinement = (
+        "Name one bounded project, session, date window, or root scope before rerunning; "
+        "a broad/all-history absence request is not answerable from this packet."
+        if broad_absence_requested or not searched_scope_names
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "answer_ready_named_searched_scope" if answer_ready else "not_answerable_yet",
+        "answer_ready": answer_ready,
+        "hard_stop": not answer_ready,
+        "answer_scope": "not_found_in_searched_scope",
+        "searched_scope_names": searched_scope_names,
+        "searched_file_count": safe_count(searched.get("searched_files")),
+        "global_absence_allowed": False,
+        "blockers": blockers,
+        "optional_diagnostic_next_read_count": len(next_reads) - len(actionable_reads),
+        "optional_diagnostic_next_reads_suppressed": 0,
+        "continuation": {
+            "required": not answer_ready,
+            "exact_commands": exact_commands,
+            "required_scope_refinement": refinement,
+            "missing_root_precondition": (
+                "Restore or correct the named missing roots before running the continuation command."
+                if missing_root_count
+                else None
+            ),
+        },
+        "claim_boundaries": {
+            "answer_ready_only_for_named_searched_scope": True,
+            "global_or_all_history_absence_claim_allowed": False,
+            "caps_missing_roots_or_ambiguous_scope_fail_closed": True,
+        },
+    }
+
+
+def semantic_debug_scope_continuation_argv(*, query: str, args: Any = None) -> list[str]:
+    argv = ["jsonl-history-search", "semantic-debug", query]
+    cwd = getattr(args, "cwd", None) if args is not None else None
+    if cwd:
+        argv.extend(["--cwd", str(cwd)])
+    for root in list(getattr(args, "root", []) or []) if args is not None else []:
+        argv.extend(["--root", str(root)])
+    if args is not None and bool(getattr(args, "allow_arbitrary_root", False)):
+        argv.append("--allow-arbitrary-root")
+    argv.extend(["--audit-depth", "in-depth", "--format", "json"])
+    return argv
+
+
+def suppress_optional_no_evidence_next_reads(
+    next_reads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    retained = [
+        read
+        for read in next_reads
+        if isinstance(read, dict) and read_is_required_surface_actionable(read)
+    ]
+    return retained, len(next_reads) - len(retained)
+
+
 def build_historical_orchestration_provenance_final_support_plan(
     next_reads: list[dict[str, Any]],
     *,
@@ -2624,6 +2880,118 @@ def spawned_session_resolution_summary(resolution: dict[str, Any]) -> dict[str, 
         "raw_private_text_included": False,
         "raw_session_ids_included": False,
         "raw_rollout_ids_included": False,
+    }
+
+
+def build_cap_aware_subagent_provenance_workflow(
+    *,
+    query: str,
+    historical_orchestration_plan: dict[str, Any],
+    spawned_session_resolution: dict[str, Any],
+    args: Any = None,
+) -> dict[str, Any]:
+    plan = historical_orchestration_plan or {}
+    resolution = spawned_session_resolution or {}
+    if not plan and not resolution.get("applies"):
+        return {}
+
+    required_roles = list(plan.get("required_roles") or [])
+    covered_roles = list(plan.get("covered_roles") or [])
+    missing_roles = list(plan.get("missing_roles") or [])
+    child_dependent_roles = [
+        role for role in required_roles if role in {"worker", "reviewer"}
+    ]
+    child_refs_required = bool(child_dependent_roles or resolution.get("applies"))
+    child_refs = list(resolution.get("child_transcript_refs") or [])
+    diagnostics = resolution.get("diagnostics") or {}
+    caps = resolution.get("caps") or {}
+    missing_children = [
+        {
+            "diagnostic": item.get("diagnostic"),
+            "source": item.get("source"),
+        }
+        for item in resolution.get("missing_children") or []
+        if isinstance(item, dict)
+    ]
+    omitted_children = [
+        {"diagnostic": "child_scope_omitted", "reason": reason}
+        for reason in dedupe(list(caps.get("caps_hit") or []) + list(caps.get("omitted_reasons") or []))
+    ]
+    blockers: list[dict[str, Any]] = []
+    if missing_roles:
+        blockers.append({"kind": "missing_required_roles", "roles": missing_roles})
+    if child_refs_required and not child_refs:
+        blockers.append({"kind": "required_child_session_refs_missing", "count": 1})
+    if missing_children:
+        blockers.append({"kind": "child_transcripts_missing", "count": len(missing_children)})
+    if caps.get("hit") or omitted_children:
+        blockers.append(
+            {
+                "kind": "child_scope_capped_or_omitted",
+                "count": len(omitted_children) or safe_count(diagnostics.get("child_scope_omitted")) or 1,
+            }
+        )
+    plan_answer_ready = plan.get("status") == "answer_ready" if plan else bool(child_refs)
+    answer_ready = bool(plan_answer_ready and not blockers and (child_refs or not child_refs_required))
+
+    continuation_reads = [
+        {
+            "kind": "spawned_child_transcript_source_ref",
+            "target": item.get("target"),
+            "source_ref": item.get("source_ref"),
+        }
+        for item in child_refs
+        if isinstance(item, dict) and item.get("target")
+    ][:HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP]
+    recovery_refs = list(plan.get("missing_role_recovery_refs") or [])
+    continuation_commands = [
+        {
+            "command_id": f"recover_missing_role_{index}",
+            "role": item.get("role"),
+            "argv": item.get("argv"),
+            "command": item.get("command"),
+        }
+        for index, item in enumerate(recovery_refs, 1)
+        if isinstance(item, dict) and item.get("command")
+    ]
+    if not answer_ready and (caps.get("hit") or missing_children or not child_refs):
+        argv = semantic_debug_scope_continuation_argv(query=query, args=args)
+        continuation_commands.append(
+            {
+                "command_id": "continue_child_session_provenance",
+                "argv": argv,
+                "command": shell_command(argv),
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "applies": True,
+        "status": "answer_ready" if answer_ready else "not_answerable_yet",
+        "answer_ready": answer_ready,
+        "hard_stop": not answer_ready,
+        "required_roles": required_roles,
+        "covered_roles": covered_roles,
+        "missing_roles": missing_roles,
+        "child_refs_required": child_refs_required,
+        "child_dependent_roles": child_dependent_roles,
+        "child_ref_count": len(child_refs),
+        "missing_or_omitted_child_refs": missing_children + omitted_children,
+        "missing_or_omitted_child_ref_count": len(missing_children) + len(omitted_children),
+        "cap_status": {
+            "hit": bool(caps.get("hit")),
+            "caps_hit": list(caps.get("caps_hit") or []),
+            "omitted_reasons": list(caps.get("omitted_reasons") or []),
+        },
+        "blockers": blockers,
+        "continuation_read_plan": continuation_reads,
+        "continuation_commands": continuation_commands,
+        "claim_boundaries": {
+            "child_session_refs_required_when_ask_depends_on_children": True,
+            "parent_coordinator_summary_replaces_child_refs": False,
+            "capped_or_missing_child_scope_can_be_answer_ready": False,
+            "avoid_subagents_policy": False,
+        },
     }
 
 
@@ -6141,6 +6509,8 @@ def build_answer_ready_handoff(
     readiness_status = answer_readiness.get("status")
     readiness_decision = answer_readiness.get("decision")
     no_evidence_needed = bool(no_evidence.get("needed"))
+    no_evidence_workflow = no_evidence.get("scope_aware_workflow") or {}
+    no_evidence_answer_ready = bool(no_evidence_workflow.get("answer_ready", True))
 
     if readiness_decision == "answer_now":
         decision = "answerable"
@@ -6178,7 +6548,9 @@ def build_answer_ready_handoff(
             allow_action_proof_plan=True,
         )
     )
-    scoped_no_evidence_answer = no_evidence_needed and not has_primary_followthrough_source
+    scoped_no_evidence_answer = (
+        no_evidence_needed and no_evidence_answer_ready and not has_primary_followthrough_source
+    )
     bounded_next_reads = [] if scoped_no_evidence_answer else candidate_bounded_next_reads
     primary_question_family = guided_audit_flow.get("primary_question_family")
     allow_action_proof_followthrough = (
@@ -13277,22 +13649,45 @@ def build_answer_readiness(
     historical_orchestration_contract = final_answer_contract.get(
         "historical_orchestration_provenance_contract"
     ) or {}
+    scope_aware_no_evidence_workflow = source_locator_handoff.get(
+        "scope_aware_no_evidence_workflow"
+    ) or {}
+    subagent_provenance_workflow = source_locator_handoff.get("subagent_provenance_workflow") or {}
+    no_evidence_answer_ready = bool(
+        scope_aware_no_evidence_workflow.get("answer_ready", True)
+    )
     historical_orchestration_plan = source_locator_handoff.get(
         "historical_orchestration_provenance_final_support_plan"
     ) or {}
     historical_orchestration_answer_ready = (
         historical_orchestration_plan.get("status") == "answer_ready"
         and bool(historical_orchestration_plan.get("primary_historical_final_support_reads"))
+        and (
+            not subagent_provenance_workflow.get("applies")
+            or bool(subagent_provenance_workflow.get("answer_ready"))
+        )
     )
     historical_orchestration_fail_closed = (
-        bool(historical_orchestration_plan)
+        bool(historical_orchestration_plan or subagent_provenance_workflow.get("applies"))
         and not historical_orchestration_answer_ready
     )
-    if no_evidence.get("needed"):
+    if no_evidence.get("needed") and no_evidence_answer_ready:
         readiness_status = "scoped_no_evidence_ready"
         decision = "state_scoped_no_evidence"
         allowed_answer_scope = "searched_scope_no_evidence"
         required_before_answer = list(scope_ready_required_actions(no_evidence))
+    elif no_evidence.get("needed"):
+        readiness_status = "no_evidence_scope_incomplete"
+        decision = "inspect_recovery_reads"
+        allowed_answer_scope = "not_answerable_yet_incomplete_searched_scope"
+        continuation = scope_aware_no_evidence_workflow.get("continuation") or {}
+        required_before_answer = [
+            "Do not answer no-evidence yet; resolve the named scope/cap blockers first.",
+        ]
+        if continuation.get("required_scope_refinement"):
+            required_before_answer.append(str(continuation["required_scope_refinement"]))
+        if continuation.get("missing_root_precondition"):
+            required_before_answer.append(str(continuation["missing_root_precondition"]))
     elif explicit_correction_window_ready and final_answer_contract.get("source_use_required"):
         readiness_status = "answer_ready"
         decision = "answer_now"
@@ -13330,12 +13725,17 @@ def build_answer_readiness(
         decision = "inspect_recovery_reads"
         allowed_answer_scope = "historical_orchestration_provenance_incomplete_non_final_reads"
         missing = ", ".join(historical_orchestration_contract.get("missing_roles") or [])
-        required_before_answer = [
-            (
+        required_before_answer = []
+        if subagent_provenance_workflow.get("applies"):
+            required_before_answer.append(
+                "Open surfaced child/session refs and run the compact continuation plan before answering; "
+                "missing or capped child coverage remains an explicit gap."
+            )
+        if historical_orchestration_contract.get("missing_roles"):
+            required_before_answer.append(
                 "Run the exact missing_role_recovery_refs before answering; they are gap checks, "
                 "not final support, and missing roles remain explicit gaps."
-            ),
-        ]
+            )
         if missing:
             required_before_answer.append(f"State missing requested orchestration roles before any answer: {missing}.")
     elif audit_route_required:
@@ -16197,6 +16597,8 @@ def investigation_source_boundary_reminders(
 
 
 def investigation_recommended_next_step(answer_readiness: dict[str, Any]) -> str:
+    if answer_readiness.get("status") == "no_evidence_scope_incomplete":
+        return "refine_or_continue_named_scope_before_answering"
     decision = answer_readiness.get("decision")
     if decision == "answer_now":
         return "answer_from_source_backed_packet"
@@ -16364,6 +16766,9 @@ def guided_status(
     recovery: dict[str, Any],
     no_evidence: dict[str, Any],
 ) -> str:
+    no_evidence_workflow = no_evidence.get("scope_aware_workflow") or {}
+    if no_evidence.get("needed") and no_evidence_workflow.get("hard_stop"):
+        return "no_evidence_scope_incomplete"
     if no_evidence.get("needed"):
         return "scoped_no_evidence_ready"
     if recovery.get("status") == "available":
