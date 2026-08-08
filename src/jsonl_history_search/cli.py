@@ -5735,6 +5735,12 @@ def _answer_action_contract_from_executed_output(
         route_first_reads = (
             provenance_reads
             if provenance_applies
+            else source_followthrough_required
+            if (
+                route_family == "orchestration_provenance"
+                and orchestration_bundle.get("status") == "answer_ready"
+                and source_followthrough_required
+            )
             else orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")

@@ -570,8 +570,23 @@ def build_semantic_debug_payload(
         spawned_session_resolution=spawned_session_resolution,
         args=args,
     )
+    subagent_required_role_child_targets: list[str] = []
     if subagent_provenance_workflow:
+        next_reads, subagent_read_budget = apply_subagent_provenance_read_budget(
+            list(source_locator_handoff.get("next_reads") or next_reads),
+            subagent_provenance_workflow=subagent_provenance_workflow,
+            historical_orchestration_plan=historical_orchestration_plan,
+            historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+        )
+        if subagent_provenance_workflow.get("answer_ready"):
+            subagent_required_role_child_targets = list(
+                subagent_provenance_workflow.get("_required_role_child_targets") or []
+            )
+        subagent_provenance_workflow.pop("_required_role_child_targets", None)
+        if subagent_read_budget.get("demoted_read_count"):
+            subagent_provenance_workflow["read_budget"] = subagent_read_budget
         source_locator_handoff["subagent_provenance_workflow"] = subagent_provenance_workflow
+        source_locator_handoff["next_reads"] = next_reads
     scope_aware_no_evidence_workflow = build_scope_aware_no_evidence_workflow(
         query=agent_find["query"]["original"],
         no_evidence=no_evidence,
@@ -1196,6 +1211,7 @@ def build_semantic_debug_payload(
         process_actual_use_read_plan=process_actual_use_read_plan,
         historical_orchestration_plan=historical_orchestration_plan,
         historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+        subagent_required_role_child_targets=subagent_required_role_child_targets,
         longitudinal_phase_source_plan=longitudinal_phase_source_plan,
         no_evidence=no_evidence,
         scope_boundary_summary=scope_boundary_summary,
@@ -1393,6 +1409,7 @@ def build_semantic_debug_payload(
             process_actual_use_read_plan=process_actual_use_read_plan,
             historical_orchestration_plan=historical_orchestration_plan,
             historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+            subagent_required_role_child_targets=subagent_required_role_child_targets,
             longitudinal_phase_source_plan=longitudinal_phase_source_plan,
             no_evidence=no_evidence,
             scope_boundary_summary=scope_boundary_summary,
@@ -2987,6 +3004,13 @@ def build_cap_aware_subagent_provenance_workflow(
     missing_child_role_refs = [
         role for role, refs in role_child_refs.items() if not refs
     ]
+    required_role_child_targets = dedupe(
+        [
+            historical_orchestration_read_identity(refs[0])
+            for role in child_dependent_roles
+            if (refs := role_child_refs.get(role))
+        ]
+    )
     diagnostics = resolution.get("diagnostics") or {}
     caps = resolution.get("caps") or {}
     missing_children = [
@@ -3074,6 +3098,7 @@ def build_cap_aware_subagent_provenance_workflow(
         "role_child_ref_counts": {
             role: len(refs) for role, refs in role_child_refs.items()
         },
+        "_required_role_child_targets": required_role_child_targets,
         "missing_child_role_refs": missing_child_role_refs,
         "child_ref_count": len(child_refs),
         "missing_or_omitted_child_refs": missing_children + omitted_children,
@@ -3104,6 +3129,128 @@ def source_identity_variants(target: str) -> set[str]:
     if sep and line.isdigit() and path:
         variants.add(path)
     return variants
+
+
+def apply_subagent_provenance_read_budget(
+    next_reads: list[dict[str, Any]],
+    *,
+    subagent_provenance_workflow: dict[str, Any],
+    historical_orchestration_plan: dict[str, Any],
+    historical_orchestration_role_evidence_bundle: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    workflow = subagent_provenance_workflow or {}
+    if not workflow.get("applies"):
+        return next_reads, {}
+    if not workflow.get("answer_ready"):
+        return next_reads, {
+            "applies": True,
+            "status": "deferred_incomplete_provenance",
+            "selected_read_count": 0,
+            "demoted_read_count": 0,
+            "claim_boundaries": {
+                "incomplete_or_capped_reads_remain_available": True,
+                "demotion_does_not_make_incomplete_provenance_answer_ready": True,
+            },
+        }
+
+    selected_reads = list(historical_orchestration_role_evidence_bundle.get("required_role_reads") or [])
+    selected_identities = {
+        historical_orchestration_read_identity(read)
+        for read in selected_reads
+        if isinstance(read, dict)
+        and historical_orchestration_read_identity(read)
+    }
+    selected_identities.update(
+        str(target)
+        for target in workflow.get("_required_role_child_targets") or []
+        if target
+    )
+    if not selected_identities:
+        return next_reads, {
+            "applies": True,
+            "status": "no_role_selected_reads_available",
+            "selected_read_count": 0,
+            "demoted_read_count": 0,
+        }
+
+    plan = historical_orchestration_plan or {}
+    budget_candidate_identities = {
+        historical_orchestration_read_identity(read)
+        for key in (
+            "primary_historical_final_support_reads",
+            "secondary_task_review_commit_support_reads",
+            "bounded_non_final_required_reads",
+        )
+        for read in plan.get(key) or []
+        if isinstance(read, dict) and historical_orchestration_read_identity(read)
+    }
+    rows: list[dict[str, Any]] = []
+    demoted = 0
+    retained = 0
+    for read in next_reads:
+        if not isinstance(read, dict):
+            rows.append(read)
+            continue
+        read_identity = historical_orchestration_read_identity(read)
+        if read_identity in selected_identities:
+            if read_is_required_surface_actionable(read):
+                retained += 1
+            rows.append(read)
+            continue
+        if (
+            read_identity in budget_candidate_identities
+            and read_is_required_surface_actionable(read)
+            and not subagent_budget_independently_required_proof(read)
+        ):
+            demoted += 1
+            demoted_read = dict(read)
+            demoted_read["read_more_actionable"] = False
+            demoted_read["followthrough_actionable"] = False
+            demoted_read["diagnostic_only"] = True
+            demoted_read["provenance_read_budget"] = {
+                "selection": "demoted_after_role_or_continuation_budget",
+                "reason": (
+                    "Role-specific child/session or continuation reads are already selected; "
+                    "this read remains a diagnostic lead but should not generate read-more churn."
+                ),
+            }
+            rows.append(demoted_read)
+        else:
+            rows.append(read)
+
+    return rows, {
+        "applies": True,
+        "status": "applied",
+        "mode": "answer_ready_role_reads",
+        "selected_read_count": len(selected_identities),
+        "retained_actionable_read_count": retained,
+        "demoted_read_count": demoted,
+        "claim_boundaries": {
+            "demoted_reads_are_diagnostic_leads": True,
+            "demotion_does_not_make_incomplete_provenance_answer_ready": True,
+        },
+    }
+
+
+def subagent_budget_independently_required_proof(read: dict[str, Any]) -> bool:
+    if read.get("read_role") == "required_primary_proof":
+        return True
+    if any(
+        read.get(key)
+        for key in (
+            "direct_evidence_facets",
+            "provenance_direct_evidence",
+            "action_proof_source_selection",
+            "provenance_original_user_request_evidence",
+        )
+    ):
+        return True
+    if read.get("read_type") == "required_primary_proof_read":
+        return True
+    return bool(
+        read.get("required") is True
+        and not list(read.get("orchestration_roles") or [])
+    )
 
 
 def historical_orchestration_select_required_role_reads(
@@ -6930,6 +7077,7 @@ def build_source_followthrough_plan(
     process_actual_use_read_plan: dict[str, Any] | None = None,
     historical_orchestration_plan: dict[str, Any] | None = None,
     historical_orchestration_role_evidence_bundle: dict[str, Any] | None = None,
+    subagent_required_role_child_targets: list[str] | None = None,
     longitudinal_phase_source_plan: dict[str, Any] | None = None,
     no_evidence: dict[str, Any] | None = None,
     scope_boundary_summary: dict[str, Any] | None = None,
@@ -6987,7 +7135,32 @@ def build_source_followthrough_plan(
             reason_fallback="primary raw process actual-use proof",
         )
     )
+    historical_plan = historical_orchestration_plan or {}
+    child_target_identities = {
+        identity
+        for target in subagent_required_role_child_targets or []
+        for identity in source_identity_variants(str(target))
+    }
+    if child_target_identities:
+        required_candidates.extend(
+            _source_followthrough_summaries(
+                [
+                    read
+                    for read in next_reads
+                    if source_identity_variants(historical_orchestration_read_identity(read))
+                    & child_target_identities
+                ],
+                read_role="required_primary_proof",
+                selection_source="subagent_provenance_workflow.required_role_child_targets",
+                reason_fallback="role-specific child-session proof for orchestration provenance",
+            )
+        )
     historical_bundle = historical_orchestration_role_evidence_bundle or {}
+    historical_bundle_answer_ready = bool(
+        historical_bundle.get("status") == "answer_ready"
+        and historical_bundle.get("answer_ready_claim_allowed")
+        and historical_bundle.get("required_role_reads")
+    )
     required_candidates.extend(
         _source_followthrough_summaries(
             historical_bundle.get("required_role_reads") or [],
@@ -6996,15 +7169,15 @@ def build_source_followthrough_plan(
             reason_fallback="primary role evidence for orchestration provenance",
         )
     )
-    historical_plan = historical_orchestration_plan or {}
-    required_candidates.extend(
-        _source_followthrough_summaries(
-            historical_plan.get("primary_historical_final_support_reads") or [],
-            read_role="required_primary_proof",
-            selection_source="historical_orchestration_provenance_final_support_plan",
-            reason_fallback="primary pre-existing raw orchestration proof",
+    if not historical_bundle_answer_ready:
+        required_candidates.extend(
+            _source_followthrough_summaries(
+                historical_plan.get("primary_historical_final_support_reads") or [],
+                read_role="required_primary_proof",
+                selection_source="historical_orchestration_provenance_final_support_plan",
+                reason_fallback="primary pre-existing raw orchestration proof",
+            )
         )
-    )
     conditional_candidates.extend(
         _source_followthrough_summaries(
             historical_plan.get("bounded_non_final_required_reads") or [],
