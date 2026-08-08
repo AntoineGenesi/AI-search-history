@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,12 @@ DEFAULT_NEXT_COUNT = 3
 DEFAULT_MAX_RECORDS = 20
 LIVE_TAIL_MAX_AGE_SECONDS = 300
 LIVE_TAIL_MAX_LINE_DISTANCE = 8
+TERMINAL_TAIL_FOLLOWUP_WINDOW = 24
+TERMINAL_CLAIM_CUE_RE = re.compile(
+    r"\b(?:closeout|completion|completed|failed|failure|final answer|final response|final result|"
+    r"final rerun|focused checks?|missing final|no closeout|session ended|terminal state|commit(?:ted)?)\b",
+    re.IGNORECASE,
+)
 SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery"}
 RECOVERY_USABILITY_STATUSES = {
     "private_reviewed_usable",
@@ -771,6 +778,12 @@ def build_source_expansion_payload(
             observed_range_end=range_end,
             now_utc=now_utc,
         ),
+        "source_continuation": build_source_expansion_terminal_tail_followup(
+            source_path=source_path,
+            selected_records=selected,
+            observed_range_end=range_end,
+            total_records=total_records,
+        ),
         "continuation": build_expansion_continuation(
             source_path=str(source_path),
             anchor_line=parsed.line,
@@ -808,7 +821,92 @@ def build_source_expansion_payload(
             "terminal_state_unproven": True,
             "terminal_session_conclusion": "not_allowed_from_inspected_live_tail_window",
         }
+    source_continuation = payload["source_continuation"]
+    if source_continuation.get("terminal_claim_requires_tail_followup"):
+        payload["claim_boundaries"] = {
+            **payload["claim_boundaries"],
+            **source_continuation["claim_boundaries"],
+            "source_continues_beyond_opened_window": True,
+            "terminal_claim_requires_tail_followup": True,
+            "terminal_session_conclusion": "not_allowed_until_current_tail_is_inspected",
+        }
     return {"source_expansion": payload}
+
+
+def build_source_expansion_terminal_tail_followup(
+    *,
+    source_path: Path,
+    selected_records: list[Any],
+    observed_range_end: int | None,
+    total_records: int,
+) -> dict[str, Any]:
+    lines_beyond_window = (
+        max(0, total_records - observed_range_end) if observed_range_end is not None else 0
+    )
+    source_continues = lines_beyond_window > LIVE_TAIL_MAX_LINE_DISTANCE
+    terminal_contract = source_expansion_window_has_terminal_claim_contract(selected_records)
+    requires_followup = bool(source_continues and terminal_contract)
+    tail_target = f"{source_path}:{total_records}" if total_records else None
+    command = None
+    if requires_followup and tail_target:
+        before = min(TERMINAL_TAIL_FOLLOWUP_WINDOW, max(0, total_records - 1))
+        try:
+            hard_cap_bytes = max(20_000, source_path.stat().st_size + 1024)
+        except OSError:
+            hard_cap_bytes = 20_000
+        command = (
+            "jsonl-history-search read-more "
+            f"{shlex.quote(tail_target)} --mode window --before {before} --after 0 "
+            f"--max-records {before + 1} --projection compact --format text "
+            f"--root {shlex.quote(str(source_path.parent))} --allow-arbitrary-root "
+            f"--hard-cap-files 1 --hard-cap-bytes {hard_cap_bytes}"
+        )
+    return {
+        "schema_version": 1,
+        "applies": requires_followup,
+        "status": (
+            "source_continues_beyond_opened_window"
+            if requires_followup
+            else "no_terminal_tail_followup_required"
+        ),
+        "terminal_claim_status": (
+            "terminal_claim_requires_tail_followup" if requires_followup else "not_flagged"
+        ),
+        "terminal_claim_requires_tail_followup": requires_followup,
+        "terminal_claim_contract_detected": terminal_contract,
+        "opened_window_end_line": observed_range_end,
+        "observed_current_tail_line": total_records,
+        "lines_beyond_opened_window": lines_beyond_window,
+        "tail_distance_threshold": LIVE_TAIL_MAX_LINE_DISTANCE,
+        "exact_next_read_more_command": command,
+        "tail_target": tail_target if requires_followup else None,
+        "required_before_terminal_claim": (
+            "Open the current transcript tail with exact_next_read_more_command before using absence of a "
+            "closeout/final response to support a terminal-session or actual-failure conclusion."
+            if requires_followup
+            else None
+        ),
+        "claim_boundaries": {
+            "absence_of_closeout_or_final_response": (
+                "not_proof_while_source_continues_beyond_opened_window"
+                if requires_followup
+                else "not_assessed"
+            ),
+            "session_ended": "not_proven" if requires_followup else "not_assessed",
+            "missing_closeout_is_actual_failure": "not_proven" if requires_followup else "not_assessed",
+            "positive_facts_in_inspected_window": "allowed_with_source_support",
+        },
+        "signal_committed_safe": True,
+        "raw_text_included": False,
+        "local_runtime_action_contains_source_ref": bool(command),
+    }
+
+
+def source_expansion_window_has_terminal_claim_contract(records: list[Any]) -> bool:
+    return any(
+        TERMINAL_CLAIM_CUE_RE.search(str(getattr(record, "text", "") or ""))
+        for record in records
+    )
 
 
 def build_source_expansion_live_tail_caveat(

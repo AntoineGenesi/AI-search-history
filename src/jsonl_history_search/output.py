@@ -2090,6 +2090,24 @@ def render_in_depth_audit_followthrough_text(
         )
         lines.append(f"- terminal claim boundary: {live_tail_caveat.get('required_caveat')}")
         lines.append("- positive facts present in the inspected window remain usable with source support")
+    source_continuation = plan.get("source_continuation") or workflow.get("source_continuation") or {}
+    if source_continuation.get("terminal_claim_requires_tail_followup"):
+        lines.append(
+            f"- SOURCE CONTINUES: status={source_continuation.get('status')} "
+            f"terminal_claim={source_continuation.get('terminal_claim_status')} "
+            f"sources={source_continuation.get('source_count', 0)} "
+            "answer_ready_for_terminal_state_claims=False"
+        )
+        lines.append(
+            f"- required current-tail read: {source_continuation.get('exact_next_read_more_command')}"
+        )
+        lines.append("- positive facts present in the inspected window remain usable with source support")
+    post_hoc_count = plan.get("post_hoc_diagnostic_source_count", 0)
+    if post_hoc_count:
+        lines.append(
+            f"- post-hoc diagnostic sources: {post_hoc_count}; final_support_allowed=False; "
+            "may guide target-primary reads only"
+        )
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.append("- pending coverage slices:")
@@ -2106,7 +2124,7 @@ def render_in_depth_audit_followthrough_text(
     for read in reads:
         _append_text_read(lines, read, command_by_target=command_by_target)
     lines.append(f"- stop rule: {plan.get('stop_rule')}")
-    continuations = list(plan.get("continuation_commands") or [])[:8]
+    continuations = list(plan.get("continuation_commands") or [])[:12]
     if continuations:
         lines.append("- scoped continuation commands if selected refs leave coverage incomplete:")
         for continuation in continuations:
@@ -2204,6 +2222,24 @@ def render_in_depth_audit_followthrough_markdown(
         )
         lines.append(f"- **Terminal claim boundary:** {live_tail_caveat.get('required_caveat')}")
         lines.append("- Positive facts present in the inspected window remain usable with source support.")
+    source_continuation = plan.get("source_continuation") or workflow.get("source_continuation") or {}
+    if source_continuation.get("terminal_claim_requires_tail_followup"):
+        lines.append(
+            f"- **SOURCE CONTINUES:** `status={source_continuation.get('status')}` "
+            f"`terminal_claim={source_continuation.get('terminal_claim_status')}` "
+            f"`sources={source_continuation.get('source_count', 0)}` "
+            "`answer_ready_for_terminal_state_claims=False`"
+        )
+        lines.append(
+            f"- **Required current-tail read:** `{source_continuation.get('exact_next_read_more_command')}`"
+        )
+        lines.append("- Positive facts present in the inspected window remain usable with source support.")
+    post_hoc_count = plan.get("post_hoc_diagnostic_source_count", 0)
+    if post_hoc_count:
+        lines.append(
+            f"- `post_hoc_diagnostic_sources`: `{post_hoc_count}`; "
+            "`final_support_allowed=False`; may guide target-primary reads only."
+        )
     pending_slices = list(workflow.get("pending_slices") or [])[:8]
     if pending_slices:
         lines.extend(["", "### Pending Coverage Slices", ""])
@@ -2220,7 +2256,7 @@ def render_in_depth_audit_followthrough_markdown(
     for read in reads:
         _append_markdown_read(lines, read, command_by_target=command_by_target)
     lines.extend(["", "### Stop / Continue Rule", "", f"- Stop rule: {plan.get('stop_rule')}"])
-    continuations = list(plan.get("continuation_commands") or [])[:8]
+    continuations = list(plan.get("continuation_commands") or [])[:12]
     if continuations:
         lines.append("- Scoped continuation commands if selected refs leave coverage incomplete:")
         for continuation in continuations:
@@ -4397,6 +4433,19 @@ def render_source_expansion_text(payload: dict) -> str:
             f"terminal_state={live_tail_caveat.get('terminal_state_status')}"
         )
         lines.append(f"Terminal claim boundary: {live_tail_caveat.get('required_caveat')}")
+    source_continuation = report.get("source_continuation") or {}
+    if source_continuation.get("terminal_claim_requires_tail_followup"):
+        lines.append(
+            "SOURCE CONTINUES: "
+            f"status={source_continuation.get('status')} "
+            f"terminal_claim={source_continuation.get('terminal_claim_status')} "
+            f"opened_end={source_continuation.get('opened_window_end_line')} "
+            f"current_tail={source_continuation.get('observed_current_tail_line')}"
+        )
+        lines.append(
+            "Required tail read: "
+            f"{source_continuation.get('exact_next_read_more_command')}"
+        )
     for record in report.get("records", []):
         lines.append(f"- {record.get('target')}: {record.get('role') or '(role unknown)'}")
         text = str(record.get("text") or "")
@@ -4429,6 +4478,17 @@ def render_source_expansion_markdown(payload: dict) -> str:
             f"`terminal_state={live_tail_caveat.get('terminal_state_status')}`"
         )
         lines.append(f"- **Terminal claim boundary:** {live_tail_caveat.get('required_caveat')}")
+    source_continuation = report.get("source_continuation") or {}
+    if source_continuation.get("terminal_claim_requires_tail_followup"):
+        lines.append(
+            f"- **SOURCE CONTINUES:** `status={source_continuation.get('status')}` "
+            f"`terminal_claim={source_continuation.get('terminal_claim_status')}` "
+            f"`opened_end={source_continuation.get('opened_window_end_line')}` "
+            f"`current_tail={source_continuation.get('observed_current_tail_line')}`"
+        )
+        lines.append(
+            f"- **Required tail read:** `{source_continuation.get('exact_next_read_more_command')}`"
+        )
     for record in report.get("records", []):
         lines.extend(["", f"## {record.get('target')}", "", str(record.get("text") or "")])
     return "\n".join(lines)
@@ -6825,9 +6885,16 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     ])
     for item in report.get("strongest_candidates", [])[:8]:
         ref = item.get("source_ref") or {}
+        classification = item.get("post_hoc_source_classification") or {}
+        evidence_role = (
+            " evidence_role=diagnostic_post_hoc_not_target_proof final_support_allowed=False"
+            if classification.get("likely_post_hoc_diagnostic")
+            else ""
+        )
         lines.append(
             f"- `{item.get('candidate_id')}` {source_ref_target(ref) or ''} "
             f"confidence={item.get('confidence')} stages={','.join(item.get('stages', []))}"
+            f"{evidence_role}"
         )
     lines.append("")
     lines.append("## Next Reads")
@@ -8273,6 +8340,14 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
                 f"score={_format_handoff_score(candidate)}",
                 f"reasons={_format_handoff_reason_codes(candidate)}",
             ]
+            classification = candidate.get("post_hoc_source_classification") or {}
+            if classification.get("likely_post_hoc_diagnostic"):
+                bits.extend(
+                    [
+                        "evidence_role=diagnostic_post_hoc_not_target_proof",
+                        "final_support_allowed=False",
+                    ]
+                )
             lines.append(f"- top candidate: {' '.join(bits)}")
     if followthrough_plan:
         lines.append("- next_reads: preserved in JSON/report; default open order is semantic_debug.source_followthrough_plan")

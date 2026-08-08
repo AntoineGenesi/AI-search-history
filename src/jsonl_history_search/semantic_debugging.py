@@ -1182,6 +1182,22 @@ def build_semantic_debug_payload(
             coverage=in_depth_audit_coverage,
             query=agent_find["query"]["original"],
         )
+        source_selection_candidates = [
+            apply_deep_audit_post_hoc_diagnostic_classification(
+                candidate,
+                query=agent_find["query"]["original"],
+            )
+            for candidate in source_selection_candidates
+        ]
+        classified_candidates_by_id = {
+            candidate.get("candidate_id"): candidate
+            for candidate in source_selection_candidates
+            if candidate.get("candidate_id")
+        }
+        candidates = [
+            classified_candidates_by_id.get(candidate.get("candidate_id"), candidate)
+            for candidate in candidates
+        ]
         in_depth_audit_followthrough = build_in_depth_audit_followthrough_plan(
             query=agent_find["query"]["original"],
             args=args,
@@ -1192,6 +1208,15 @@ def build_semantic_debug_payload(
             default_tz=default_tz,
         )
         source_locator_handoff["next_reads"] = next_reads
+        candidate_ordering = source_locator_handoff.get("candidate_ordering") or {}
+        candidate_ordering["top_candidates"] = [
+            apply_deep_audit_post_hoc_diagnostic_classification(
+                candidate,
+                query=agent_find["query"]["original"],
+            )
+            for candidate in candidate_ordering.get("top_candidates") or []
+        ]
+        source_locator_handoff["candidate_ordering"] = candidate_ordering
         source_handle_routing = build_source_handle_routing(
             agent_find["query"]["original"],
             candidates=source_selection_candidates,
@@ -1375,7 +1400,7 @@ def build_semantic_debug_payload(
             "native_scanner_default": False,
             "terminal_session_conclusion": (
                 "not_allowed_while_terminal_state_unproven"
-                if deep_audit_live_tail_caveat_applies(in_depth_audit_followthrough)
+                if deep_audit_terminal_claim_followup_applies(in_depth_audit_followthrough)
                 else "requires_terminal_evidence"
             ),
         },
@@ -13526,6 +13551,20 @@ DEEP_AUDIT_DRIFT_MARKERS = (
     "same-run",
     "same run",
 )
+DEEP_AUDIT_TERMINAL_CLAIM_RE = re.compile(
+    r"\b(?:closeout|completion|completed|failed|failure|final answer|final response|final result|"
+    r"missing final|no closeout|session ended|terminal state|actual failure|durable closeout)\b",
+    re.IGNORECASE,
+)
+DEEP_AUDIT_POST_HOC_TASK_RE = re.compile(
+    r"\b(?:independent review(?:er)?|review findings?|post[- ]?fix|fix(?:ing)? (?:the|a|this) .{0,50}"
+    r"(?:gap|finding|defect|bug)|regression tests?|rerun (?:the )?(?:evaluation|eval|benchmark)|"
+    r"implementation worker .{0,50}(?:review|fix)|audit review)\b",
+    re.IGNORECASE,
+)
+DEEP_AUDIT_TAIL_FOLLOWUP_WINDOW = 24
+DEEP_AUDIT_SESSION_IDENTITY_MAX_LINES = 48
+DEEP_AUDIT_SESSION_IDENTITY_MAX_BYTES = 512_000
 
 
 def build_in_depth_semantic_debug_audit_coverage(
@@ -13984,7 +14023,7 @@ def apply_in_depth_audit_read_promotion_safety(
     for read in next_reads:
         if not isinstance(read, dict):
             continue
-        row = dict(read)
+        row = apply_deep_audit_post_hoc_diagnostic_classification(read, query=query)
         stale_adjacent = semantic_debug_read_is_stale_adjacent_ref(row, query=query)
         self_echo = semantic_debug_read_is_self_echo_or_current_run(row, query=query)
         target_alignment = deep_audit_read_target_alignment(row, query=query)
@@ -14048,6 +14087,153 @@ def apply_in_depth_audit_read_promotion_safety(
     return rows
 
 
+def apply_deep_audit_post_hoc_diagnostic_classification(
+    read: dict[str, Any],
+    *,
+    query: str,
+) -> dict[str, Any]:
+    row = dict(read)
+    classification = deep_audit_post_hoc_session_classification(row, query=query)
+    if not classification.get("likely_post_hoc_diagnostic"):
+        return row
+    row["post_hoc_source_classification"] = classification
+    row["source_chronology_role"] = "same_loop_post_hoc_diagnostic"
+    row["target_source_role"] = "diagnostic_or_post_hoc"
+    row["diagnostic_only"] = True
+    row["read_more_actionable"] = False
+    row["followthrough_actionable"] = False
+    row["final_support_allowed"] = False
+    row["diagnostic_open_policy"] = (
+        "same-loop/post-hoc review, fix, or eval session; it may guide a target-primary read but "
+        "must not prove the target audit conclusion"
+    )
+    return row
+
+
+def deep_audit_post_hoc_session_classification(
+    read: dict[str, Any],
+    *,
+    query: str,
+) -> dict[str, Any]:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    raw_path = str(source_ref.get("path") or "")
+    path = Path(raw_path).expanduser() if raw_path else None
+    base = {
+        "schema_version": 1,
+        "likely_post_hoc_diagnostic": False,
+        "evidence_role": "not_classified_post_hoc",
+        "final_support_allowed": True,
+        "source_hash_12": (
+            hashlib.sha256(raw_path.encode("utf-8", errors="replace")).hexdigest()[:12]
+            if raw_path
+            else None
+        ),
+        "raw_path_included": False,
+        "raw_text_included": False,
+    }
+    if path is None or path.suffix.casefold() != ".jsonl" or not path.is_file():
+        return base
+    identity = deep_audit_jsonl_session_identity(path)
+    task_text = str(identity.get("user_task_text") or "")
+    cwd_text = str(identity.get("cwd") or "")
+    query_terms = deep_audit_target_terms(query)
+    target_terms = [
+        term
+        for term in query_terms
+        if term not in {"actual", "failed", "failure", "jsonl", "reviewer", "search", "said", "workers"}
+    ]
+    normalized_task = deep_audit_normalize_text(task_text)
+    normalized_cwd = deep_audit_normalize_text(Path(cwd_text).name if cwd_text else "")
+    task_overlap = [term for term in target_terms if term in normalized_task]
+    cwd_overlap = [term for term in target_terms if term in normalized_cwd]
+    explicit_post_hoc_task = bool(DEEP_AUDIT_POST_HOC_TASK_RE.search(task_text))
+    worker_or_reviewer_role = bool(
+        re.search(r"\b(?:isolated implementation worker|independent reviewer|review worker)\b", task_text, re.IGNORECASE)
+    )
+    remediation_task = bool(
+        re.search(r"\b(?:task\s*:\s*)?(?:fix|review|rerun|verify|audit)\b", task_text, re.IGNORECASE)
+    )
+    review_loop_context = bool(
+        re.search(
+            r"\b(?:review findings?|post[- ]?fix|same[- ]loop|under review|audit review|"
+            r"partial verification|verification issue|regression tests?)\b",
+            task_text,
+            re.IGNORECASE,
+        )
+    )
+    task_role_match = bool(
+        explicit_post_hoc_task
+        or (worker_or_reviewer_role and remediation_task and review_loop_context)
+    )
+    target_discussed = len(task_overlap) >= min(2, max(1, len(target_terms)))
+    target_project_match = len(cwd_overlap) >= min(2, max(1, len(target_terms)))
+    likely = bool(task_role_match and target_discussed and not target_project_match)
+    return {
+        **base,
+        "likely_post_hoc_diagnostic": likely,
+        "evidence_role": (
+            "diagnostic_post_hoc_not_target_proof" if likely else "not_classified_post_hoc"
+        ),
+        "final_support_allowed": not likely,
+        "classification_reasons": [
+            reason
+            for reason, applies in (
+                ("review_fix_or_eval_task_cues", task_role_match),
+                ("target_terms_discussed", target_discussed),
+                ("target_project_not_matched_by_session_cwd", not target_project_match),
+            )
+            if applies
+        ],
+        "target_term_overlap_count": len(task_overlap),
+        "target_project_term_overlap_count": len(cwd_overlap),
+        "worker_or_reviewer_role_detected": worker_or_reviewer_role,
+        "remediation_task_detected": remediation_task,
+        "review_loop_context_detected": review_loop_context,
+        "session_thread_source": identity.get("thread_source"),
+    }
+
+
+def deep_audit_jsonl_session_identity(path: Path) -> dict[str, Any]:
+    cwd = None
+    thread_source = None
+    user_messages: list[str] = []
+    bytes_read = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if line_number > DEEP_AUDIT_SESSION_IDENTITY_MAX_LINES:
+                    break
+                bytes_read += len(line.encode("utf-8", errors="replace"))
+                if bytes_read > DEEP_AUDIT_SESSION_IDENTITY_MAX_BYTES:
+                    break
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "session_meta" and isinstance(payload.get("payload"), dict):
+                    metadata = payload["payload"]
+                    cwd = metadata.get("cwd") or cwd
+                    thread_source = metadata.get("thread_source") or thread_source
+                    continue
+                body = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                if body.get("type") != "message" or body.get("role") != "user":
+                    continue
+                for item in body.get("content") or []:
+                    if isinstance(item, dict) and item.get("type") in {"input_text", "text"}:
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            user_messages.append(text.strip())
+                if len(user_messages) >= 3:
+                    break
+    except OSError:
+        pass
+    return {
+        "cwd": cwd,
+        "thread_source": thread_source,
+        "user_task_text": "\n".join(user_messages),
+    }
+
+
 IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT = 4
 IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT = 8
 IN_DEPTH_AUDIT_LIVE_TAIL_MAX_AGE_SECONDS = 300
@@ -14067,19 +14253,36 @@ def build_in_depth_audit_followthrough_plan(
     if not coverage.get("applies"):
         return {}
 
-    target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=next_reads)
-    selected_reads = select_in_depth_audit_primary_reads_for_query(next_reads, query=query)
+    classified_reads = [
+        apply_deep_audit_post_hoc_diagnostic_classification(read, query=query)
+        for read in next_reads
+        if isinstance(read, dict)
+    ]
+    post_hoc_diagnostics = [
+        read
+        for read in classified_reads
+        if (read.get("post_hoc_source_classification") or {}).get("likely_post_hoc_diagnostic")
+    ]
+    target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=classified_reads)
+    selected_reads = select_in_depth_audit_primary_reads_for_query(classified_reads, query=query)
     live_tail_caveat = build_deep_audit_live_tail_caveat(
         selected_reads,
         now_utc=now_utc,
         default_tz=default_tz,
     )
-    continuation_commands = in_depth_audit_continuation_commands(
+    source_continuation = build_deep_audit_terminal_tail_followup(
+        selected_reads,
+        query=query,
+        default_tz=default_tz,
+    )
+    cap_continuation_commands = in_depth_audit_continuation_commands(
         query=query,
         args=args,
         coverage=coverage,
         target_contract=target_contract,
     )
+    tail_followup_actions = list(source_continuation.get("tail_followup_actions") or [])
+    continuation_commands = tail_followup_actions + cap_continuation_commands
     target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
     coverage_complete = bool(coverage.get("answer_promotion_allowed")) and target_persistence_ready
     searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
@@ -14100,6 +14303,8 @@ def build_in_depth_audit_followthrough_plan(
         )
     if live_tail_caveat.get("applies"):
         stop_rule += " " + str(live_tail_caveat.get("required_caveat"))
+    if source_continuation.get("applies"):
+        stop_rule += " " + str(source_continuation.get("required_before_terminal_claim"))
     if not target_persistence_ready and not continuation_commands:
         continuation = in_depth_audit_target_refocus_command(
             query=query,
@@ -14137,7 +14342,11 @@ def build_in_depth_audit_followthrough_plan(
         "target_persistence_contract": target_contract,
         "target_mismatch_answer_block": target_answer_block,
         "live_tail_caveat": live_tail_caveat,
-        "answer_ready_for_terminal_state_claims": not live_tail_caveat.get("applies"),
+        "source_continuation": source_continuation,
+        "post_hoc_diagnostic_sources": post_hoc_diagnostics,
+        "answer_ready_for_terminal_state_claims": not (
+            live_tail_caveat.get("applies") or source_continuation.get("applies")
+        ),
     }
     return {
         "schema_version": 1,
@@ -14152,7 +14361,12 @@ def build_in_depth_audit_followthrough_plan(
         "target_persistence_contract": target_contract,
         "target_mismatch_answer_block": target_answer_block,
         "live_tail_caveat": live_tail_caveat,
-        "answer_ready_for_terminal_state_claims": not live_tail_caveat.get("applies"),
+        "source_continuation": source_continuation,
+        "post_hoc_diagnostic_sources": post_hoc_diagnostics,
+        "post_hoc_diagnostic_source_count": len(post_hoc_diagnostics),
+        "answer_ready_for_terminal_state_claims": not (
+            live_tail_caveat.get("applies") or source_continuation.get("applies")
+        ),
         "primary_read_limit": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
         "coverage_state": {
             "status": coverage.get("status"),
@@ -14174,6 +14388,8 @@ def build_in_depth_audit_followthrough_plan(
             "claim full-history completeness from capped or top-N candidate samples",
             "answer from previous-lane/eval artifacts when target_persistence_contract.target_persistence_ready is false",
             "infer that a session ended or that missing closeout was the failure from an in-flight/live transcript tail",
+            "infer terminal state or actual failure from a mid-file window while source_continues_beyond_opened_window",
+            "use same-loop/post-hoc review, fix, or eval sessions as proof of the target audit conclusion",
         ],
         "artifact_and_local_evidence_boundary": {
             "committed_public_export_surface": "refs_and_commands_without_raw_transcript_text",
@@ -14184,8 +14400,15 @@ def build_in_depth_audit_followthrough_plan(
         "target_drift_policy": target_contract.get("target_drift_policy"),
         "continuation_policy": {
             "status": "scoped_continuations_available" if continuation_commands else "no_bounded_continuation_available",
-            "emit_only_when_coverage_incomplete": not coverage_complete,
-            "max_continuation_commands": IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT,
+            "cap_continuations_emit_only_when_coverage_incomplete": True,
+            "terminal_tail_followup_overrides_coverage_complete": bool(tail_followup_actions),
+            "tail_followup_action_count": len(tail_followup_actions),
+            "cap_continuation_command_count": len(cap_continuation_commands),
+            "max_continuation_commands": (
+                IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT + IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT
+            ),
+            "max_cap_continuation_commands": IN_DEPTH_AUDIT_CONTINUATION_COMMAND_LIMIT,
+            "max_tail_followup_actions": IN_DEPTH_AUDIT_PRIMARY_READ_LIMIT,
             "broad_search_recovery_allowed": False,
         },
         "pending_slice_count": len(workflow["pending_slices"]),
@@ -14301,6 +14524,115 @@ def build_deep_audit_live_tail_caveat(
         "committed_safe": True,
         "raw_paths_included": False,
         "raw_text_included": False,
+    }
+
+
+def build_deep_audit_terminal_tail_followup(
+    selected_reads: list[dict[str, Any]],
+    *,
+    query: str,
+    default_tz: Any = timezone.utc,
+) -> dict[str, Any]:
+    terminal_contract = bool(DEEP_AUDIT_TERMINAL_CLAIM_RE.search(str(query or "")))
+    selected_by_path: dict[str, int] = {}
+    for read in selected_reads:
+        source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+        raw_path = str(source_ref.get("path") or "")
+        selected_line = _safe_positive_int(source_ref.get("line"))
+        if not raw_path or selected_line is None or not raw_path.lower().endswith(".jsonl"):
+            continue
+        selected_by_path[raw_path] = max(selected_line, selected_by_path.get(raw_path, 0))
+
+    sources: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    if terminal_contract:
+        for raw_path, selected_line in selected_by_path.items():
+            path = Path(raw_path).expanduser()
+            try:
+                last_record = _last_jsonl_record(path, default_tz=default_tz)
+            except OSError:
+                continue
+            last_line = _safe_positive_int(last_record.line) if last_record is not None else None
+            if last_line is None:
+                continue
+            lines_beyond_window = max(0, last_line - selected_line)
+            if lines_beyond_window <= IN_DEPTH_AUDIT_LIVE_TAIL_MAX_LINE_DISTANCE:
+                continue
+            source_hash = hashlib.sha256(raw_path.encode("utf-8", errors="replace")).hexdigest()[:12]
+            tail_target = f"{raw_path}:{last_line}"
+            before = min(DEEP_AUDIT_TAIL_FOLLOWUP_WINDOW, max(0, last_line - 1))
+            try:
+                hard_cap_bytes = max(20_000, path.stat().st_size + 1024)
+            except OSError:
+                hard_cap_bytes = 20_000
+            command = (
+                "jsonl-history-search read-more "
+                f"{shlex.quote(tail_target)} --mode window --before {before} --after 0 "
+                f"--max-records {before + 1} --projection compact --format text "
+                f"--root {shlex.quote(str(path.parent))} --allow-arbitrary-root "
+                f"--hard-cap-files 1 --hard-cap-bytes {hard_cap_bytes}"
+            )
+            source = {
+                "source_hash_12": source_hash,
+                "selected_line": selected_line,
+                "observed_current_tail_line": last_line,
+                "lines_beyond_opened_window": lines_beyond_window,
+                "status": "source_continues_beyond_opened_window",
+                "terminal_claim_status": "terminal_claim_requires_tail_followup",
+                "exact_next_read_more_command": command,
+                "raw_path_included": False,
+                "raw_text_included": False,
+            }
+            sources.append(source)
+            actions.append(
+                {
+                    "command_family": "read_more",
+                    "coverage_label": "terminal_claim_requires_tail_followup",
+                    "status": "source_continues_beyond_opened_window",
+                    "priority": "before_terminal_or_actual_failure_conclusion",
+                    "source_hash_12": source_hash,
+                    "target": tail_target,
+                    "command": command,
+                    "cap_labels": [],
+                    "final_support_allowed_after_read": True,
+                }
+            )
+
+    applies = bool(sources)
+    return {
+        "schema_version": 1,
+        "applies": applies,
+        "status": (
+            "source_continues_beyond_opened_window" if applies else "no_terminal_tail_followup_required"
+        ),
+        "terminal_claim_status": (
+            "terminal_claim_requires_tail_followup" if applies else "not_flagged"
+        ),
+        "terminal_claim_requires_tail_followup": applies,
+        "terminal_claim_contract_detected": terminal_contract,
+        "source_count": len(sources),
+        "sources": sources,
+        "tail_followup_actions": actions,
+        "exact_next_read_more_command": actions[0]["command"] if actions else None,
+        "required_before_terminal_claim": (
+            "TERMINAL TAIL FOLLOWUP: the selected primary transcript continues beyond the opened window. "
+            "Run exact_next_read_more_command to inspect the current tail before treating absent closeout/final "
+            "response as terminal state or the actual failure."
+            if applies
+            else None
+        ),
+        "claim_boundaries": {
+            "absence_of_closeout_or_final_response": (
+                "not_proof_while_source_continues_beyond_opened_window" if applies else "not_assessed"
+            ),
+            "session_ended": "not_proven" if applies else "not_assessed",
+            "missing_closeout_is_actual_failure": "not_proven" if applies else "not_assessed",
+            "positive_facts_in_inspected_window": "allowed_with_source_support",
+        },
+        "signal_committed_safe": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+        "local_runtime_actions_contain_source_refs": bool(actions),
     }
 
 
@@ -14857,35 +15189,72 @@ def deep_audit_live_tail_caveat_applies(followthrough: dict[str, Any]) -> bool:
     return bool((followthrough.get("live_tail_caveat") or {}).get("applies"))
 
 
+def deep_audit_terminal_claim_followup_applies(followthrough: dict[str, Any]) -> bool:
+    if not isinstance(followthrough, dict) or not followthrough.get("applies"):
+        return False
+    return deep_audit_live_tail_caveat_applies(followthrough) or bool(
+        (followthrough.get("source_continuation") or {}).get("terminal_claim_requires_tail_followup")
+    )
+
+
 def apply_deep_audit_live_tail_contract_gate(
     contract: dict[str, Any],
     *,
     followthrough: dict[str, Any],
 ) -> dict[str, Any]:
-    if not deep_audit_live_tail_caveat_applies(followthrough):
+    if not deep_audit_terminal_claim_followup_applies(followthrough):
         return contract
     caveat = followthrough.get("live_tail_caveat") or {}
+    source_continuation = followthrough.get("source_continuation") or {}
     row = dict(contract)
     row.setdefault("evidence_inputs", {})
     row["evidence_inputs"] = {
         **row["evidence_inputs"],
-        "live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
+        **(
+            {"live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat"}
+            if caveat.get("applies")
+            else {}
+        ),
+        **(
+            {"source_continuation": "semantic_debug.in_depth_audit_followthrough.source_continuation"}
+            if source_continuation.get("applies")
+            else {}
+        ),
     }
     row["required_actions"] = dedupe(
         [
-            str(caveat.get("required_caveat")),
-            "Obtain separate terminal-state evidence before claiming the session ended or diagnosing missing closeout as the actual failure.",
+            str(value)
+            for value in (
+                caveat.get("required_caveat"),
+                source_continuation.get("required_before_terminal_claim"),
+                source_continuation.get("exact_next_read_more_command"),
+            )
+            if value
+        ]
+        + [
+            "Obtain terminal-state evidence before claiming the session ended or diagnosing missing closeout as the actual failure."
         ]
         + list(row.get("required_actions") or [])
     )
     row.setdefault("claim_boundaries", {})
     row["claim_boundaries"] = {
         **row["claim_boundaries"],
-        "in_flight_or_live_tail": True,
+        "in_flight_or_live_tail": bool(caveat.get("applies")),
+        "source_continues_beyond_opened_window": bool(source_continuation.get("applies")),
+        "terminal_claim_requires_tail_followup": bool(source_continuation.get("applies")),
         "terminal_state_unproven": True,
-        "terminal_session_conclusion": "not_allowed_from_inspected_live_tail_window",
-        "absence_of_closeout_or_final_response": "not_present_in_inspected_window_at_query_time_only",
+        "terminal_session_conclusion": (
+            "not_allowed_until_current_tail_is_inspected"
+            if source_continuation.get("applies")
+            else "not_allowed_from_inspected_live_tail_window"
+        ),
+        "absence_of_closeout_or_final_response": (
+            "not_proof_while_source_continues_beyond_opened_window"
+            if source_continuation.get("applies")
+            else "not_present_in_inspected_window_at_query_time_only"
+        ),
         "missing_closeout_is_actual_failure": "not_proven",
+        "positive_facts_in_inspected_window": "allowed_with_source_support",
     }
     return row
 
@@ -14895,21 +15264,37 @@ def apply_deep_audit_live_tail_answer_readiness_gate(
     *,
     followthrough: dict[str, Any],
 ) -> dict[str, Any]:
-    if not deep_audit_live_tail_caveat_applies(followthrough):
+    if not deep_audit_terminal_claim_followup_applies(followthrough):
         return readiness
     caveat = followthrough.get("live_tail_caveat") or {}
+    source_continuation = followthrough.get("source_continuation") or {}
     row = dict(readiness)
     row["answer_ready_for_terminal_state_claims"] = False
     row["terminal_state_status"] = "terminal_state_unproven"
-    row["allowed_terminal_claim_scope"] = "not_present_in_inspected_window_at_query_time_only"
+    row["allowed_terminal_claim_scope"] = (
+        "not_proof_while_source_continues_beyond_opened_window"
+        if source_continuation.get("applies")
+        else "not_present_in_inspected_window_at_query_time_only"
+    )
     row["required_before_answer"] = dedupe(
-        [str(caveat.get("required_caveat"))] + list(row.get("required_before_answer") or [])
+        [
+            str(value)
+            for value in (
+                caveat.get("required_caveat"),
+                source_continuation.get("required_before_terminal_claim"),
+                source_continuation.get("exact_next_read_more_command"),
+            )
+            if value
+        ]
+        + list(row.get("required_before_answer") or [])
     )[:12]
     row.setdefault("basis", {})
     row["basis"] = {
         **row["basis"],
         "live_tail_status": caveat.get("status"),
         "live_tail_source_count": caveat.get("live_tail_source_count", 0),
+        "source_continuation_status": source_continuation.get("status"),
+        "tail_followup_source_count": source_continuation.get("source_count", 0),
         "terminal_state_unproven": True,
     }
     row.setdefault("source_use_contract", {})
@@ -14922,6 +15307,13 @@ def apply_deep_audit_live_tail_answer_readiness_gate(
             "positive_window_facts_allowed": True,
             "link": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
         },
+        "source_continuation": {
+            "status": source_continuation.get("status"),
+            "terminal_claim_requires_tail_followup": bool(source_continuation.get("applies")),
+            "exact_next_read_more_command": source_continuation.get("exact_next_read_more_command"),
+            "positive_window_facts_allowed": True,
+            "link": "semantic_debug.in_depth_audit_followthrough.source_continuation",
+        },
     }
     return row
 
@@ -14931,23 +15323,40 @@ def apply_deep_audit_live_tail_handoff_gate(
     *,
     followthrough: dict[str, Any],
 ) -> dict[str, Any]:
-    if not deep_audit_live_tail_caveat_applies(followthrough):
+    if not deep_audit_terminal_claim_followup_applies(followthrough):
         return handoff
     caveat = followthrough.get("live_tail_caveat") or {}
+    source_continuation = followthrough.get("source_continuation") or {}
     row = dict(handoff)
-    row["live_tail_caveat"] = caveat
+    if caveat.get("applies"):
+        row["live_tail_caveat"] = caveat
+    if source_continuation.get("applies"):
+        row["source_continuation"] = source_continuation
     row["answer_ready_for_terminal_state_claims"] = False
     row["terminal_state_status"] = "terminal_state_unproven"
     row["do_not_answer_until"] = dedupe(
         [
-            "Do not make a terminal-session or actual-failure conclusion from this live tail; obtain separate terminal evidence or keep the conclusion explicitly unproven."
+            (
+                "Run the exact current-tail read before making a terminal-session or actual-failure conclusion."
+                if source_continuation.get("applies")
+                else "Do not make a terminal-session or actual-failure conclusion from this live tail; obtain separate terminal evidence or keep the conclusion explicitly unproven."
+            )
         ]
         + list(row.get("do_not_answer_until") or [])
     )[:8]
     row.setdefault("links", {})
     row["links"] = {
         **row["links"],
-        "live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat",
+        **(
+            {"live_tail_caveat": "semantic_debug.in_depth_audit_followthrough.live_tail_caveat"}
+            if caveat.get("applies")
+            else {}
+        ),
+        **(
+            {"source_continuation": "semantic_debug.in_depth_audit_followthrough.source_continuation"}
+            if source_continuation.get("applies")
+            else {}
+        ),
     }
     row.setdefault("source_use_summary", {})
     row["source_use_summary"] = {
@@ -14956,6 +15365,13 @@ def apply_deep_audit_live_tail_handoff_gate(
             "status": caveat.get("status"),
             "terminal_state_status": caveat.get("terminal_state_status"),
             "live_tail_source_count": caveat.get("live_tail_source_count", 0),
+            "terminal_session_conclusion_allowed": False,
+        },
+        "source_continuation": {
+            "status": source_continuation.get("status"),
+            "terminal_claim_status": source_continuation.get("terminal_claim_status"),
+            "source_count": source_continuation.get("source_count", 0),
+            "exact_next_read_more_command": source_continuation.get("exact_next_read_more_command"),
             "terminal_session_conclusion_allowed": False,
         },
     }
@@ -14967,11 +15383,15 @@ def apply_deep_audit_live_tail_instruction_gate(
     *,
     followthrough: dict[str, Any],
 ) -> dict[str, Any]:
-    if not deep_audit_live_tail_caveat_applies(followthrough):
+    if not deep_audit_terminal_claim_followup_applies(followthrough):
         return instruction
     caveat = followthrough.get("live_tail_caveat") or {}
+    source_continuation = followthrough.get("source_continuation") or {}
     row = dict(instruction)
-    row["live_tail_caveat"] = caveat
+    if caveat.get("applies"):
+        row["live_tail_caveat"] = caveat
+    if source_continuation.get("applies"):
+        row["source_continuation"] = source_continuation
     row["answer_ready_for_terminal_state_claims"] = False
     row["terminal_state_status"] = "terminal_state_unproven"
     row.setdefault("source_action_guidance", {})
@@ -14981,6 +15401,11 @@ def apply_deep_audit_live_tail_instruction_gate(
             "status": caveat.get("status"),
             "terminal_state_unproven": True,
             "required_caveat": caveat.get("required_caveat"),
+        },
+        "source_continuation": {
+            "status": source_continuation.get("status"),
+            "terminal_claim_requires_tail_followup": bool(source_continuation.get("applies")),
+            "exact_next_read_more_command": source_continuation.get("exact_next_read_more_command"),
         },
     }
     return row
