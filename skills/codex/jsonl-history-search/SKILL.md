@@ -41,9 +41,7 @@ Start exactly one installed route before repo search, Git, or visible-context sy
 `what has happened since my last message? use the convo tool`: run `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `use the convo tool`/`convo CLI`: `jsonl-history-search`; no
 connector discovery/plugin install/`convo --help`. old-context decisions
 like `before compaction`, `outside visible context`, or `earlier in the thread`
-use `semantic-debug`. For explicit all-chats/agent-history audit wording,
-including long-running coordinator/session audits through chatlogs/convo/history
-that ask what was accepted, committed, reviewed, or claimed complete, run:
+use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
 ```bash
 jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
@@ -109,11 +107,5 @@ direct `semantic-debug`. Read one matching file under `references/`:
    only for a named missing facet. If primary evidence is absent/capped,
    ambiguous, or contradictory, fail closed and say what remains unproved.
 7. Full/deep history audits preserve CLI audit-depth coverage caveats;
-   ordinary prompts and status/local questions stay quick. If output includes
-   `audit_continuation_workflow`, treat `answer_ready=false` as a hard stop:
-   open the ordered primary refs, run the emitted scoped continuation/
-   refinement commands for pending cap/coverage slices, and only then answer
-   or fail closed with the remaining gaps named. Do not abandon JSONL/convo for
-   broad Git/rg/task artifact inspection unless the user explicitly asks for
-   local artifacts.
+   ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.
