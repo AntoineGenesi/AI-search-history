@@ -4,7 +4,7 @@ import json
 import hashlib
 import shlex
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,8 @@ DEFAULT_WINDOW_BEFORE = 2
 DEFAULT_WINDOW_AFTER = 2
 DEFAULT_NEXT_COUNT = 3
 DEFAULT_MAX_RECORDS = 20
+LIVE_TAIL_MAX_AGE_SECONDS = 300
+LIVE_TAIL_MAX_LINE_DISTANCE = 8
 SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery"}
 RECOVERY_USABILITY_STATUSES = {
     "private_reviewed_usable",
@@ -607,6 +609,7 @@ def build_source_expansion_payload(
     plan: SourcePlan,
     default_tz,
     cwd: Path,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     parsed = parse_expansion_target(request.target, request.source_ref)
     warnings = list(plan.warnings)
@@ -762,6 +765,12 @@ def build_source_expansion_payload(
             "start_of_candidate_range_reached": bool(range_start == selection["candidate_start"]),
             "end_of_candidate_range_reached": bool(range_end == selection["candidate_end"]),
         },
+        "live_tail_caveat": build_source_expansion_live_tail_caveat(
+            source_path=source_path,
+            records=records,
+            observed_range_end=range_end,
+            now_utc=now_utc,
+        ),
         "continuation": build_expansion_continuation(
             source_path=str(source_path),
             anchor_line=parsed.line,
@@ -790,7 +799,92 @@ def build_source_expansion_payload(
         ],
         "scope": source_scope(plan),
     }
+    live_tail_caveat = payload["live_tail_caveat"]
+    if live_tail_caveat.get("applies"):
+        payload["claim_boundaries"] = {
+            **payload["claim_boundaries"],
+            **live_tail_caveat["claim_boundaries"],
+            "in_flight_or_live_tail": True,
+            "terminal_state_unproven": True,
+            "terminal_session_conclusion": "not_allowed_from_inspected_live_tail_window",
+        }
     return {"source_expansion": payload}
+
+
+def build_source_expansion_live_tail_caveat(
+    *,
+    source_path: Path,
+    records: list[Any],
+    observed_range_end: int | None,
+    now_utc: datetime | None,
+) -> dict[str, Any]:
+    now = _source_expansion_aware_utc(now_utc or datetime.now(timezone.utc))
+    last_record = records[-1] if records else None
+    total_records = len(records)
+    lines_from_tail = (
+        max(0, total_records - observed_range_end) if observed_range_end is not None else None
+    )
+    near_tail = lines_from_tail is not None and lines_from_tail <= LIVE_TAIL_MAX_LINE_DISTANCE
+    try:
+        mtime = datetime.fromtimestamp(source_path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        mtime = None
+    last_timestamp = (
+        _source_expansion_aware_utc(last_record.timestamp)
+        if last_record is not None and last_record.timestamp
+        else None
+    )
+    mtime_age_seconds = round((now - mtime).total_seconds(), 3) if mtime else None
+    last_record_age_seconds = (
+        round((now - last_timestamp).total_seconds(), 3) if last_timestamp else None
+    )
+    mtime_near_query = _source_expansion_age_is_near_query(mtime_age_seconds)
+    last_record_near_query = _source_expansion_age_is_near_query(last_record_age_seconds)
+    applies = bool(near_tail and (mtime_near_query or last_record_near_query))
+    required_caveat = (
+        "LIVE-TAIL CAVEAT: absence of a closeout/final response proves only that it was not present in this "
+        "inspected window at query time. The transcript may still have been in flight; this does not prove "
+        "the session ended or that missing closeout was the actual failure."
+    )
+    return {
+        "schema_version": 1,
+        "applies": applies,
+        "status": "in_flight_or_live_tail" if applies else "no_live_tail_detected",
+        "terminal_state_status": "terminal_state_unproven" if applies else "not_flagged",
+        "query_time_utc": now.isoformat(),
+        "freshness_threshold_seconds": LIVE_TAIL_MAX_AGE_SECONDS,
+        "tail_line_distance_threshold": LIVE_TAIL_MAX_LINE_DISTANCE,
+        "lines_from_observed_tail": lines_from_tail,
+        "near_observed_tail": near_tail,
+        "file_mtime_utc": mtime.isoformat() if mtime else None,
+        "file_mtime_age_seconds": mtime_age_seconds,
+        "last_record_timestamp_utc": last_timestamp.isoformat() if last_timestamp else None,
+        "last_record_age_seconds": last_record_age_seconds,
+        "mtime_near_query_time": mtime_near_query,
+        "last_record_timestamp_near_query_time": last_record_near_query,
+        "required_caveat": required_caveat if applies else None,
+        "claim_boundaries": {
+            "absence_of_closeout_or_final_response": (
+                "not_present_in_inspected_window_at_query_time_only" if applies else "not_assessed"
+            ),
+            "session_ended": "not_proven" if applies else "not_assessed",
+            "missing_closeout_is_actual_failure": "not_proven" if applies else "not_assessed",
+            "positive_facts_in_inspected_window": "allowed_with_source_support",
+        },
+        "committed_safe": True,
+        "raw_paths_included": False,
+        "raw_text_included": False,
+    }
+
+
+def _source_expansion_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _source_expansion_age_is_near_query(age_seconds: float | None) -> bool:
+    return age_seconds is not None and -60 <= age_seconds <= LIVE_TAIL_MAX_AGE_SECONDS
 
 
 def detect_follow_packet(report: Any) -> dict[str, Any]:
