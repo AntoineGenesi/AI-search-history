@@ -537,6 +537,10 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         help="Collect post-anchor interval activity up to the complete-interval hard cap before answer-mode rendering.",
     )
     status_anchor.add_argument(
+        "--anchor-ref",
+        help="Use an exact canonical codex_history:history.jsonl:<line> parent-thread anchor.",
+    )
+    status_anchor.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -3016,6 +3020,8 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
             argv.append("--parent-thread")
         if getattr(args, "complete_interval", False):
             argv.append("--complete-interval")
+        if getattr(args, "anchor_ref", None):
+            argv.extend(["--anchor-ref", str(args.anchor_ref)])
     argv.extend(["--report-output", args.report_output])
     return argv
 
