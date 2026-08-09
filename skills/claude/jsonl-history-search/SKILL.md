@@ -9,14 +9,10 @@ metadata:
 
 ## Activation Gate
 
-Trigger for prior conversation history:
-
-- what the user previously said;
-- old decisions before/outside visible context;
-- cleanup or multi-step process was deferred, repeated, or failed;
-- `what happened since my last message?`; and
-- the exact automatic trigger `what has happened since my last message in the
-  parent thread?`.
+Trigger for prior conversation history: what the user previously said; old decisions before/outside visible context; cleanup or multi-step process was
+deferred, repeated, or failed; `what happened since my last message?`; and the
+exact automatic trigger `what has happened since my last message in the parent
+thread?`.
 
 The trigger is intentionally narrow. Do not trigger for bare `what happened?`,
 `what changed in this task file?`, ordinary branch/cleanliness/local-status
@@ -25,25 +21,22 @@ generic questions not anchored to prior conversation history, or
 writing/editing/summarizing prompts. Ask one short clarifying question and use
 zero tools.
 
-If `JSONL activation mode: explicit-only` is set, natural wording is a
-non-trigger; require an explicit history-tool alias such as leading `convo` or
-`use the convo tool`.
+With `JSONL activation mode: explicit-only`, natural wording is a non-trigger;
+require an explicit history-tool alias such as `convo` or `use the convo tool`.
 
 ## First Move
 
 For named `tasks`/`...md`, decide scope before any tool: checkout/HEAD/current-Git
-intent -> add exactly `--evidence-source local`; conversation/source-session
-intent -> add exactly `--evidence-source conversation-history`; unresolved
-scope -> ask "Do you want current local Git/task evidence or prior conversation
-history?" and use zero tools.
+intent -> exactly `--evidence-source local`; conversation/source-session intent
+-> exactly `--evidence-source conversation-history`; unresolved scope -> ask
+"Do you want current local Git/task evidence or prior conversation history?"
+and use zero tools.
 
 Start exactly one installed route before repo search, Git, or visible-context synthesis.
 Latest-message aliases, including parent/main wording, use `what-happened-since`;
-preserve the question and remove only the alias: `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `convo tool`/`convo CLI`/`jsonl-search-history`/
-`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the
-canonical CLI; no connector discovery/plugin install/`convo --help`. old-context decisions
-like `before compaction`, `outside visible context`, or `earlier in the thread`
-use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
+preserve the question and remove only the alias: `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `convo tool`/`convo CLI`/`jsonl-search-history`/`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+old-context decisions (`before compaction`, `outside visible context`, or
+`earlier in the thread`) use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
 ```bash
 jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
@@ -57,17 +50,18 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
 Wait for that command to exit. While it is running, do not start another `ask`,
-`ask --execute`, direct `semantic-debug`, or source-checkout
-fallback. Only if
-the installed command exits with command-not-found (126/127) or a clear
-install/import failure, and cwd contains `src/jsonl_history_search/cli.py`, run
-recovery once:
+direct `semantic-debug`, or source-checkout
+fallback. Interrupt/no packet: report liveness failure; last stderr
+`jsonl_history_search.phase` marker (or none); terminal means no other `ask`,
+direct `semantic-debug`, manual transcript/history search, or recovery.
+Only if the installed command exits with command-not-found (126/127) or a clear
+install/import failure, and cwd has `src/jsonl_history_search/cli.py`, recover once:
 
 ```bash
 PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
-The source command is failure recovery, never a parallel or equivalent route.
+Source use is failure recovery, never a parallel or equivalent route.
 If neither command is available, report the installation failure.
 
 ## Follow The Route
@@ -91,25 +85,22 @@ direct `semantic-debug`. Read one matching file under `references/`:
 ## Source And Stop Rules
 
 1. Treat CLI summaries as navigation, not as primary proof. Use its selected refs
-   or `source_locator_handoff`/`next_reads`, except a `terminal_answer_and_stop`
-   contract: answer its searched scope immediately and run no other command.
+   or `source_locator_handoff`/`next_reads`; for `terminal_answer_and_stop`,
+   answer searched scope; run no command.
 2. Use the emitted command, or open a source window with:
 
    ```bash
    jsonl-history-search read-more <source-ref> --mode window --before 2 --after 2 --cwd "$PWD" --format text
    ```
 
-3. Prefer original user turns for wording and tool calls, outputs, diffs, or
-   commits for action claims. Later summaries are leads.
+3. Prefer original user turns for wording; tool calls/outputs/diffs/commits
+   prove actions. Later summaries are leads.
 4. Exact screenshot/OCR/source phrases: use `bulk-line-match` with
-   `--phrase`/`--phrases-file`; rows are leads, not proof. Validate refs with
+   `--phrase`/`--phrases-file`; rows are leads, not proof. Validate refs via
    `read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage`.
-5. State the searched scope and uncertainty. `not_found_in_searched_scope`
-   never means the evidence does not exist anywhere.
+5. State scope/uncertainty. `not_found_in_searched_scope` never means absent everywhere.
 6. Stop when inspected primary sources answer the question. Widen for a
-   named gap. If evidence is absent/capped/ambiguous or a command fails, use an
-   emitted JSONL continuation or fail closed; never `sed`/`rg`/`jq` transcript
-   homes.
-7. Full/deep history audits preserve CLI audit-depth coverage caveats;
-   ordinary prompts and status/local questions stay quick.
+   named gap. If absent/capped/ambiguous or a command fails, use an emitted
+   JSONL continuation or fail closed; never `sed`/`rg`/`jq` transcript homes.
+7. Full/deep audits preserve audit-depth caveats; ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.
