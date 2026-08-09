@@ -684,6 +684,7 @@ def render_ask_execute_text(payload: dict) -> str:
         _append_compact_read_contract(
             lines,
             action.get("conditional_required"),
+            max_items=None,
             cli_prefix=cli_prefix,
         )
     only_continue = action.get("only_continue_if")
@@ -854,6 +855,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
                 lines,
                 action.get("conditional_required"),
                 markdown=True,
+                max_items=None,
                 cli_prefix=cli_prefix,
             )
     if route.get("route_family") == "semantic_wrapup":
@@ -1171,7 +1173,7 @@ def _append_semantic_wrapup_execute_text(
     conditional_required = action.get("conditional_required") or executed.get("conditional_required")
     if conditional_required:
         lines.append("- conditional_required:")
-        _append_compact_read_contract(lines, conditional_required, cli_prefix=cli_prefix)
+        _append_compact_read_contract(lines, conditional_required, max_items=None, cli_prefix=cli_prefix)
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- diagnostics_after:")
@@ -1218,7 +1220,13 @@ def _append_semantic_wrapup_execute_markdown(
     conditional_required = action.get("conditional_required") or executed.get("conditional_required")
     if conditional_required:
         lines.append("- Conditional required:")
-        _append_compact_read_contract(lines, conditional_required, markdown=True, cli_prefix=cli_prefix)
+        _append_compact_read_contract(
+            lines,
+            conditional_required,
+            markdown=True,
+            max_items=None,
+            cli_prefix=cli_prefix,
+        )
     diagnostics = action.get("diagnostics_after")
     if diagnostics:
         lines.append("- Diagnostics after:")
@@ -1532,6 +1540,7 @@ def _append_compact_read_contract(
     value: object,
     *,
     markdown: bool = False,
+    max_items: int | None = 5,
     cli_prefix: str = "jsonl-history-search",
 ) -> None:
     bullet = "- " if markdown else "- "
@@ -1554,7 +1563,8 @@ def _append_compact_read_contract(
             lines.append(f"{bullet}{value}")
         return
     if isinstance(value, list):
-        for item in value[:5]:
+        items = value if max_items is None else value[:max_items]
+        for item in items:
             if isinstance(item, dict):
                 command = item.get("command")
                 target = item.get("target")
