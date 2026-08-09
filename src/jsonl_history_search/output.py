@@ -1589,6 +1589,11 @@ def _append_compact_read_contract(
                 reason = item.get("reason") or item.get("purpose")
                 rendered = _with_cli_prefix(str(command), cli_prefix) if command else target or source_target or reason or str(item)
                 lines.append(f"{bullet}{rendered}")
+                for source_ref_id in _reviewed_source_ref_ids(item):
+                    if markdown:
+                        lines.append(f"  - Required final source ref: `{source_ref_id}`")
+                    else:
+                        lines.append(f"  required final source ref: {source_ref_id}")
                 inspection_command = (
                     None
                     if command
@@ -1771,6 +1776,17 @@ def _source_target(item: dict) -> str:
     if source_ref:
         return str(source_ref)
     return ""
+
+
+def _reviewed_source_ref_ids(item: dict) -> list[str]:
+    pointer = (
+        item.get("reviewed_source_packet_pointer")
+        if isinstance(item.get("reviewed_source_packet_pointer"), dict)
+        else {}
+    )
+    values = list(item.get("required_final_source_ref_ids") or [])
+    values.extend([item.get("source_ref_id"), pointer.get("source_ref_id")])
+    return list(dict.fromkeys(str(value) for value in values if value))
 
 
 def _command_from_argv(argv: list | tuple | None) -> str | None:
@@ -2409,6 +2425,8 @@ def render_source_followthrough_plan_text(plan: dict, *, command_by_target: dict
         for read in required[:5]:
             prefix = "default" if read.get("default_actionable") else "non-default"
             lines.append(f"- {prefix}: {_source_target(read) or '(no source ref)'}")
+            for source_ref_id in _reviewed_source_ref_ids(read):
+                lines.append(f"  required final source ref: {source_ref_id}")
             reason = read.get("reason")
             if reason:
                 lines.append(f"  reason: {reason}")
@@ -2461,6 +2479,8 @@ def render_source_followthrough_plan_markdown(plan: dict, *, command_by_target: 
         for read in required[:5]:
             prefix = "default" if read.get("default_actionable") else "non-default"
             lines.append(f"- `{prefix}` `{_source_target(read) or '(no source ref)'}`")
+            for source_ref_id in _reviewed_source_ref_ids(read):
+                lines.append(f"  - Required final source ref: `{source_ref_id}`")
             if read.get("reason"):
                 lines.append(f"  - Reason: {read.get('reason')}")
             if read.get("default_actionable"):
@@ -2500,6 +2520,8 @@ def _append_text_read(lines: list[str], item: dict, *, command_by_target: dict[s
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- {target}{f': {reason}' if reason else ''}")
+    for source_ref_id in _reviewed_source_ref_ids(item):
+        lines.append(f"  required final source ref: {source_ref_id}")
     if item.get("verification_or_rerun_only"):
         policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
         lines.append(f"  verification/rerun-only: {policy}")
@@ -2526,6 +2548,8 @@ def _append_markdown_read(lines: list[str], item: dict, *, command_by_target: di
     target = _source_target(item) or "(no source ref)"
     reason = item.get("reason") or item.get("instruction") or item.get("proof_role") or item.get("relationship")
     lines.append(f"- `{target}`{f': {reason}' if reason else ''}")
+    for source_ref_id in _reviewed_source_ref_ids(item):
+        lines.append(f"  - Required final source ref: `{source_ref_id}`")
     if item.get("verification_or_rerun_only"):
         policy = item.get("diagnostic_open_policy") or "verification/rerun material only; not answer support"
         lines.append(f"  - Verification/rerun-only: {policy}")
@@ -7003,6 +7027,10 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
     elif primary_command:
         lines.append(f"- Primary source window command: `{primary_command}`")
+        for source_ref_id in list(followthrough.get("required_final_source_ref_ids") or [])[:3]:
+            lines.append(f"- Required final source ref: `{source_ref_id}`")
+        for facet in list(followthrough.get("required_answer_facets") or [])[:6]:
+            lines.append(f"- Required answer facet: {facet}")
         lines.append("- Fallback individual refs are listed later only if this window leaves a named answer facet missing.")
     elif required_reads:
         for read in required_reads[:5]:

@@ -5238,6 +5238,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
                 packet.get("historical_orchestration_role_coverage_source_plan")
             ),
             "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
+            "action_proof_plan": packet.get("action_proof_plan"),
             "longitudinal_phase_source_plan": packet.get("longitudinal_phase_source_plan"),
             "expectation_mismatch_plan": packet.get("expectation_mismatch_plan"),
             "process_actual_use_final_support_read_plan": packet.get(
@@ -6030,7 +6031,12 @@ def _answer_action_contract_from_executed_output(
             "core_convo_first_read_plan": core_plan,
             "action_proof_plan": (
                 compact.get("action_proof_plan")
-                if route_family in {"action_proof", "semantic_debug", "provenance"}
+                if route_family in {
+                    "action_proof",
+                    "semantic_debug",
+                    "provenance",
+                    "source_window_semantic_debug",
+                }
                 and isinstance(compact.get("action_proof_plan"), dict)
                 else None
             ),
@@ -6092,6 +6098,15 @@ def _answer_action_contract_from_executed_output(
                 "default_read_policy": source_followthrough_plan.get("default_read_policy"),
             }
             contract["stop"] = source_followthrough_plan.get("stop_condition") or contract["stop"]
+        target_conditional_reads = list(
+            target_proof_handoff.get("conditional_primary_after_source_inspection") or []
+        )
+        if route_family in {"action_proof", "source_window_semantic_debug"} and (
+            target_conditional_reads or source_followthrough_conditional
+        ):
+            contract["conditional_required"] = _dedupe_action_contract_rows(
+                target_conditional_reads + source_followthrough_conditional
+            )[:_ASK_ANSWER_MAX_REFS]
         if route_family == "orchestration_provenance" and source_followthrough_required:
             contract["conditional_required"] = (
                 source_followthrough_conditional
@@ -6109,6 +6124,7 @@ def _answer_action_contract_from_executed_output(
                 target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch"
                 and not merge_artifact_handoff
                 and not raw_worker_chronology_handoff
+                and not named_task_action_proof
             ):
                 contract["read"] = target_proof_handoff.get("read") or []
             contract["diagnostics_after"] = (
@@ -6586,7 +6602,13 @@ def _unpromoted_semantic_debug_answer_status(internal_status: object) -> str:
 
 
 _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES = frozenset(
-    {"remembered_user_wording", "semantic_debug", "provenance"}
+    {
+        "action_proof",
+        "remembered_user_wording",
+        "semantic_debug",
+        "provenance",
+        "source_window_semantic_debug",
+    }
 )
 
 
@@ -6601,6 +6623,24 @@ def _semantic_debug_target_single_flight_contract(
     do_not_rerun = ["ask --execute", "direct semantic-debug"]
     if not suppress_broad_fallback_labels:
         do_not_rerun.extend(["broad rg/find", "report archaeology"])
+    required_final_source_ref_ids = _unique_preserving_order(
+        [
+            str(source_ref_id)
+            for read in selected_primary
+            for source_ref_id in (
+                list(read.get("required_final_source_ref_ids") or [])
+                or [
+                    read.get("source_ref_id")
+                    or (
+                        read.get("reviewed_source_packet_pointer")
+                        if isinstance(read.get("reviewed_source_packet_pointer"), dict)
+                        else {}
+                    ).get("source_ref_id")
+                ]
+            )
+            if source_ref_id
+        ]
+    )
     return {
         "schema_version": 1,
         "status": "route_executed_selected_primary_reads_first",
@@ -6610,6 +6650,7 @@ def _semantic_debug_target_single_flight_contract(
         "secondary_context_count": len(secondary_context),
         "diagnostic_ref_count": len(diagnostics),
         "selected_primary_reads": selected_primary[:_ASK_ANSWER_MAX_REFS],
+        "required_final_source_ref_ids": required_final_source_ref_ids,
         "diagnostics_default_actionable": False,
         "secondary_context_default_actionable": False,
         "do_not_rerun": do_not_rerun,
@@ -6690,6 +6731,19 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
         }
     if target_gate.get("applies"):
         primary_raw = list(target_gate.get("allowed_refs") or primary_raw)
+    reviewed_primary = [
+        read
+        for read in primary_raw
+        if isinstance(read.get("reviewed_source_packet_pointer"), dict)
+        or read.get("source_ref_id")
+    ]
+    conditional_primary = []
+    if reviewed_primary:
+        reviewed_target = str(reviewed_primary[0].get("target") or "")
+        conditional_primary = [
+            read for read in primary_raw if str(read.get("target") or "") != reviewed_target
+        ]
+        primary_raw = [reviewed_primary[0]]
     secondary_context = [
         read
         for read in reads
@@ -6706,6 +6760,7 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
         "route_family": route_family,
         "answer_readiness_decision": "answer_after_source_inspection",
         "required_primary_proof": primary_raw[:6],
+        "conditional_primary_after_source_inspection": conditional_primary,
         "secondary_context_after_source_inspection": secondary_context,
         "diagnostics_after": diagnostics_after,
         "source_boundaries": {
@@ -6811,6 +6866,11 @@ def _target_episode_ref_match_text(item: dict) -> str:
         if isinstance(ref.get("historical_provenance_selection"), dict)
         else {}
     )
+    reviewed_pointer = (
+        ref.get("reviewed_source_packet_pointer")
+        if isinstance(ref.get("reviewed_source_packet_pointer"), dict)
+        else {}
+    )
     values = [
         item.get("target"),
         item.get("path"),
@@ -6831,6 +6891,10 @@ def _target_episode_ref_match_text(item: dict) -> str:
         ref.get("proof_role"),
         ref.get("target_source_role"),
         ref.get("source_role"),
+        ref.get("source_ref_id"),
+        ref.get("reviewed_source_case_handle"),
+        reviewed_pointer.get("handle"),
+        reviewed_pointer.get("source_ref_id"),
         source_ref.get("path"),
         metadata.get("payload_type"),
         metadata.get("top_role"),
@@ -9443,6 +9507,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "core_convo_first_read_plan": compact.get("core_convo_first_read_plan"),
             "longitudinal_phase_source_plan": compact.get("longitudinal_phase_source_plan"),
             "expectation_mismatch_plan": compact.get("expectation_mismatch_plan"),
+            "action_proof_plan": compact.get("action_proof_plan"),
             "process_actual_use_final_support_read_plan": compact.get(
                 "process_actual_use_final_support_read_plan"
             ),
