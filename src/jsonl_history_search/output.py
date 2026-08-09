@@ -2131,6 +2131,14 @@ def render_in_depth_audit_followthrough_text(
         lines.append("- metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle")
     if workflow.get("do_not_abandon_jsonl_guidance"):
         lines.append(f"- do not abandon JSONL: {workflow.get('do_not_abandon_jsonl_guidance')}")
+    lines.append(
+        "- continuation protocol: manual_history_fallback_allowed=False; use only emitted "
+        "jsonl-history-search read-more, semantic-debug, follow-next-reads, or audit-coverage commands"
+    )
+    lines.append(
+        "- command failure: do not open transcript homes with sed/rg/jq; run an emitted scoped "
+        "JSONL continuation, or report the exact blocker and fail closed"
+    )
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
@@ -2263,6 +2271,14 @@ def render_in_depth_audit_followthrough_markdown(
         lines.append("- Metadata-only handoff is an efficiency/public-artifact mode, not the core retrieval principle.")
     if workflow.get("do_not_abandon_jsonl_guidance"):
         lines.append(f"- `do_not_abandon_jsonl`: {workflow.get('do_not_abandon_jsonl_guidance')}")
+    lines.append(
+        "- `continuation_protocol`: `manual_history_fallback_allowed=False`; use only emitted "
+        "`jsonl-history-search read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage` commands."
+    )
+    lines.append(
+        "- `command_failure`: do not open transcript homes with `sed`/`rg`/`jq`; run an emitted scoped "
+        "JSONL continuation, or report the exact blocker and fail closed."
+    )
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
@@ -4976,8 +4992,47 @@ def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
     )
 
 
+def _status_anchor_needs_clarification(report: dict) -> bool:
+    return report.get("status") == "anchor_ambiguous" and not report.get("selected_anchor")
+
+
+def _render_status_anchor_clarification_text(report: dict) -> str:
+    clarification = report.get("clarification_request") or {}
+    request = clarification.get("request") or (
+        "I cannot safely identify the intended anchor. Please provide a quoted message, "
+        "an exact timestamp, or a thread/session boundary."
+    )
+    return "\n".join(
+        [
+            "NOT ANSWERABLE YET",
+            "Status: anchor_ambiguous",
+            f"Clarification required: {request}",
+            "STOP: Do not inspect transcript files or synthesize an answer until the user supplies the anchor.",
+        ]
+    )
+
+
+def _render_status_anchor_clarification_markdown(report: dict) -> str:
+    clarification = report.get("clarification_request") or {}
+    request = clarification.get("request") or (
+        "I cannot safely identify the intended anchor. Please provide a quoted message, "
+        "an exact timestamp, or a thread/session boundary."
+    )
+    return "\n".join(
+        [
+            "# Not Answerable Yet",
+            "",
+            "- Status: `anchor_ambiguous`",
+            f"- Clarification required: {request}",
+            "- **STOP:** Do not inspect transcript files or synthesize an answer until the user supplies the anchor.",
+        ]
+    )
+
+
 def render_status_anchor_text(payload: dict) -> str:
     report = payload["status_anchor"]
+    if _status_anchor_needs_clarification(report):
+        return _render_status_anchor_clarification_text(report)
     if _status_anchor_navigation_only(report):
         return _render_status_anchor_navigation_only_text(report)
     summary = report["summary"]
@@ -5147,6 +5202,8 @@ def render_status_anchor_text(payload: dict) -> str:
 
 def render_status_anchor_answer(payload: dict) -> str:
     report = payload["status_anchor"]
+    if _status_anchor_needs_clarification(report):
+        return _render_status_anchor_clarification_text(report)
     if not _status_anchor_answer_format_ready(report):
         lines = ["NOT ANSWERABLE YET", _status_anchor_canonical_continuation_command(report)]
         freshness = (report.get("answer_readiness") or {}).get("parent_main_anchor_freshness") or {}
@@ -5537,6 +5594,8 @@ def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict)
 
 def render_status_anchor_markdown(payload: dict) -> str:
     report = payload["status_anchor"]
+    if _status_anchor_needs_clarification(report):
+        return _render_status_anchor_clarification_markdown(report)
     if _status_anchor_navigation_only(report):
         return _render_status_anchor_navigation_only_markdown(report)
     summary = report["summary"]

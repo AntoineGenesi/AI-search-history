@@ -105,9 +105,10 @@ direct `semantic-debug`. Read one matching file under `references/`:
    `read-more`, `semantic-debug`, `follow-next-reads`, or `audit-coverage`.
 5. State the searched scope and uncertainty. `not_found_in_searched_scope`
    never means the evidence does not exist anywhere.
-6. Stop when inspected primary sources answer the question. Widen/escalate
-   only for a named missing facet. If primary evidence is absent/capped,
-   ambiguous, or contradictory, fail closed and say what remains unproved.
+6. Stop when inspected primary sources answer the question. Widen for a
+   named gap. If evidence is absent/capped/ambiguous or a command fails, use an
+   emitted JSONL continuation or fail closed; never `sed`/`rg`/`jq` transcript
+   homes.
 7. Full/deep history audits preserve CLI audit-depth coverage caveats;
    ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.
