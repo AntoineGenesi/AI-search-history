@@ -69,6 +69,10 @@ LABELED_HANDLE_RE = re.compile(
     r"\b(?:reviewed\s+source\s+case|source\s+case|source\s+handle|case\s+handle|case\s+id|task\s+handle|task\s+case|source\s+ref)\s*:?\s*`?([A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+)`?",
     re.IGNORECASE,
 )
+REVIEWED_SOURCE_LABELED_HANDLE_RE = re.compile(
+    r"\b(?:reviewed\s+source\s+case|source\s+case|source\s+handle|case\s+handle|case\s+id|source\s+ref)\s*:?\s*`?[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+`?",
+    re.IGNORECASE,
+)
 EMBEDDED_JSONL_SOURCE_REF_RE = re.compile(r"(?P<path>/(?:(?!\.jsonl)[^`\"'\n\r])+?\.jsonl):(?P<line>\d+)(?!\d)")
 CODEX_SESSION_DATE_RE = re.compile(r"/\.codex/sessions/(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})/")
 CODEX_ROLLOUT_DATE_RE = re.compile(r"/rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})t", re.IGNORECASE)
@@ -2338,6 +2342,7 @@ def apply_historical_provenance_self_echo_policy(
     handles = historical_provenance_handles(query)
     policy_wanted = historical_provenance_self_echo_policy_wanted(query, family=family, handles=handles)
     orchestration_wanted = historical_orchestration_provenance_plan_wanted(query, family=family)
+    source_match_handles = handles if TASKISH_HANDLE_RE.search(query or "") else []
     if not policy_wanted and not orchestration_wanted:
         if handles and (
             historical_provenance_current_scope_requested(query)
@@ -2379,10 +2384,6 @@ def apply_historical_provenance_self_echo_policy(
             (policy_wanted or orchestration_wanted)
             and historical_provenance_current_run_or_self_echo_candidate(text, query=query)
         )
-        current_day_jsonl_echo = (
-            (policy_wanted or orchestration_wanted)
-            and historical_provenance_current_day_jsonl_echo_candidate(row, query=query)
-        )
         current_task_same_loop = (
             (policy_wanted or orchestration_wanted)
             and historical_orchestration_current_task_same_loop_candidate(
@@ -2395,8 +2396,8 @@ def apply_historical_provenance_self_echo_policy(
             row,
             candidate=candidate,
             query=query,
-            handles=handles,
-            current_run_echo=current_run_echo or current_day_jsonl_echo,
+            handles=source_match_handles,
+            current_run_echo=current_run_echo,
             current_task_same_loop=current_task_same_loop,
         )
         if category["diagnostic_only"]:
@@ -3910,7 +3911,8 @@ def historical_provenance_self_echo_policy_wanted(
     if historical_provenance_current_scope_requested(query) or historical_provenance_prior_answer_or_report_audit_requested(query):
         return False
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
-    if not TASKISH_HANDLE_RE.search(query or ""):
+    reviewed_source_handle = bool(REVIEWED_SOURCE_LABELED_HANDLE_RE.search(query or ""))
+    if not TASKISH_HANDLE_RE.search(query or "") and not reviewed_source_handle:
         return False
     primary = str((family or {}).get("primary") or "")
     if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"}:
@@ -4042,27 +4044,19 @@ def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query
         "lane prompt",
         "jsonl lane",
         "manual lane",
+        "manual comparator",
+        "manual comparison lane",
+        "comparator lane",
+        "current evaluation",
+        "current eval",
+        "current-evaluation",
+        "evaluation prompt echo",
         "current-run prompt",
         "current run prompt",
         "original token count",
         "process exited with code",
     )
     return any(marker in lowered for marker in current_tool_markers)
-
-
-def historical_provenance_current_day_jsonl_echo_candidate(read: dict[str, Any], *, query: str) -> bool:
-    if historical_provenance_current_scope_requested(query):
-        return False
-    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
-    target = str(read.get("target") or "")
-    path = str(source_ref.get("path") or source_target_path_part(target) or "")
-    if not path.endswith(".jsonl"):
-        return False
-    source_date = codex_session_path_date(path)
-    if source_date is None:
-        return False
-    today = {datetime.now().date(), datetime.now(timezone.utc).date()}
-    return source_date in today
 
 
 def codex_session_path_date(path: str) -> Any:

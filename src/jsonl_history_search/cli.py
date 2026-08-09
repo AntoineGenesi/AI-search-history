@@ -2387,9 +2387,9 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             args.cwd,
             "--format",
             "json",
-            "--report-output",
-            report_output,
         ]
+        _append_structured_source_contract(argv, args)
+        argv.extend(["--report-output", report_output])
     contract["ask_execute"]["execution"].update(
         {
             "status": "executed",
@@ -2408,6 +2408,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         query=args.query,
         cwd=cwd,
     )
+    _finalize_terminal_ask_execute_route(contract)
     if (
         output_key == "artifact_currentness"
         and compact.get("detected_intent") == "worktree_cleanup_currentness"
@@ -3002,18 +3003,7 @@ def _extract_bounded_auto_execute_hard_cap(query: str, kind: str) -> int | None:
 
 def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
     argv = ["jsonl-history-search", args.command, args.query, "--cwd", args.cwd, "--format", "json"]
-    for root in getattr(args, "root", []) or []:
-        argv.extend(["--root", root])
-    if getattr(args, "allow_arbitrary_root", False):
-        argv.append("--allow-arbitrary-root")
-    if getattr(args, "hard_cap_files", None) is not None:
-        argv.extend(["--hard-cap-files", str(args.hard_cap_files)])
-    if getattr(args, "hard_cap_bytes", None) is not None:
-        argv.extend(["--hard-cap-bytes", str(args.hard_cap_bytes)])
-    if getattr(args, "since", None):
-        argv.extend(["--since", str(args.since)])
-    if getattr(args, "until", None):
-        argv.extend(["--until", str(args.until)])
+    _append_structured_source_contract(argv, args)
     if getattr(args, "audit_depth", None):
         argv.extend(["--audit-depth", str(args.audit_depth)])
     if args.command == "what-happened-since":
@@ -3023,6 +3013,41 @@ def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
             argv.append("--complete-interval")
     argv.extend(["--report-output", args.report_output])
     return argv
+
+
+def _append_structured_source_contract(argv: list[str], args: argparse.Namespace) -> None:
+    for root in getattr(args, "root", []) or []:
+        argv.extend(["--root", root])
+    if getattr(args, "allow_arbitrary_root", False):
+        argv.append("--allow-arbitrary-root")
+    for name, flag in (
+        ("codex_home", "--codex-home"),
+        ("claude_home", "--claude-home"),
+        ("max_files", "--max-files"),
+        ("max_bytes", "--max-bytes"),
+        ("max_matches", "--max-matches"),
+        ("max_elapsed", "--max-elapsed"),
+        ("hard_cap_files", "--hard-cap-files"),
+        ("hard_cap_bytes", "--hard-cap-bytes"),
+        ("since", "--since"),
+        ("until", "--until"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None and value != "":
+            argv.extend([flag, str(value)])
+
+
+def _finalize_terminal_ask_execute_route(contract: dict) -> None:
+    ask_execute = contract.get("ask_execute") or {}
+    action = ask_execute.get("answer_action_contract") or {}
+    terminal = action.get("terminal_answer_and_stop_contract") or {}
+    if terminal.get("status") != "terminal_answer_and_stop":
+        return
+    selected_route = ask_execute.get("selected_route") or {}
+    selected_route["first_command"] = None
+    selected_route["next_commands"] = []
+    selected_route["manual_search_guidance"] = None
+    selected_route["route_instruction_status"] = "already_executed_terminal"
 
 
 def _normalize_ask_route_text(text: str) -> str:
@@ -6191,29 +6216,53 @@ def _answer_action_contract_from_executed_output(
             or (compact.get("context_budget") or {}).get("report_written"),
         }
     if _promotable_bounded_no_evidence_contract(compact=compact, selected_route=selected_route):
+        diagnostic_reads = list(compact.get("source_locator_handoff", {}).get("next_reads") or [])
         return {
             "answer_status": "answer-scoped-no-evidence-now",
             "promotion_status": "promoted_scoped_no_evidence",
             "promotion_scope": "not_found_in_searched_scope",
             "scoped_no_evidence_contract": _scoped_no_evidence_contract(compact),
-            "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
-            "stop": selected_route.get("stop_guidance"),
-            "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
-            or selected_route.get("manual_search_guidance"),
+            "read": [],
+            "conditional_required": [],
+            "diagnostics_after": [],
+            "suppressed_weak_candidate_read_count": len(diagnostic_reads),
+            "terminal_answer_and_stop_contract": {
+                "schema_version": 1,
+                "status": "terminal_answer_and_stop",
+                "answer_now": True,
+                "stop_now": True,
+                "required_read_count": 0,
+                "actionable_command_count": 0,
+                "weak_candidate_commands_actionable": False,
+                "instruction": (
+                    "Answer from this searched scope now. Do not open weak candidates, rerun retrieval, "
+                    "or fall back to manual search."
+                ),
+                "only_reopen_if": (
+                    "The user asks for diagnostic context or identifies a missing root, cap, contradiction, "
+                    "positive-evidence conflict, or other named scope defect."
+                ),
+            },
+            "stop": (
+                "ANSWER NOW from the complete searched-scope no-evidence result and stop. Do not open weak "
+                "candidates, rerun retrieval, or fall back to manual search."
+            ),
             "saved_report": compact.get("report_written"),
         }
     if _bounded_no_evidence_scoped_answer_ready(compact=compact, selected_route=selected_route):
         return {
-            "answer_status": "answer-scoped-no-evidence-now",
+            "answer_status": "not-ready/needs-more-proof",
             "promotion_status": "unpromoted",
             "promotion_reason": (
-                "Scoped no-evidence is answer-ready for the searched scope, but caps "
-                "or other promotion boundaries prevent stronger promotion or all-history absence."
+                "Scoped no-evidence coverage is incomplete because one or more declared caps were hit; "
+                "inspect the bounded result and resolve the named coverage gap before answering."
             ),
             "promotion_scope": "not_found_in_searched_scope",
             "scoped_no_evidence_contract": _scoped_no_evidence_contract(compact),
             "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
-            "stop": selected_route.get("stop_guidance"),
+            "stop": (
+                "Do not issue a terminal no-evidence answer while declared scope coverage is incomplete."
+            ),
             "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
             or selected_route.get("manual_search_guidance"),
             "saved_report": compact.get("report_written"),
