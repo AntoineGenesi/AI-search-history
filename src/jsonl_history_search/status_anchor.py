@@ -319,6 +319,7 @@ def build_status_anchor_payload(args: Any) -> dict:
     query = getattr(args, "query", None) or DEFAULT_STATUS_QUERY
     parent_thread_mode = bool(getattr(args, "parent_thread", False))
     complete_interval = bool(getattr(args, "complete_interval", False))
+    anchor_ref = getattr(args, "anchor_ref", None)
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
     snippet_chars = max(0, getattr(args, "snippet_chars", 280))
     latest = latest_user_messages(
@@ -339,6 +340,7 @@ def build_status_anchor_payload(args: Any) -> dict:
             started=time.monotonic(),
             parent_thread_mode=parent_thread_mode,
             complete_interval=complete_interval,
+            anchor_ref=anchor_ref,
             command_options={
                 "query": query,
                 "cwd": str(cwd),
@@ -346,6 +348,7 @@ def build_status_anchor_payload(args: Any) -> dict:
                 "max_matches": limit,
                 "parent_thread": parent_thread_mode,
                 "complete_interval": complete_interval,
+                "anchor_ref": anchor_ref,
             },
         )
     }
@@ -360,6 +363,7 @@ def status_anchor_report(
     started: float | None = None,
     parent_thread_mode: bool = False,
     complete_interval: bool = False,
+    anchor_ref: str | None = None,
     command_options: dict | None = None,
 ) -> dict:
     original_query = query
@@ -411,6 +415,7 @@ def status_anchor_report(
         prior_request_occurrence=prior_request_occurrence,
         canonical_parent_main_interval=canonical_parent_main_interval,
         canonical_parent_main_fallback=canonical_parent_main_fallback,
+        anchor_ref=anchor_ref,
     )
     if anchor_decision.get("selected_anchor"):
         anchor_decision["selected_anchor"] = _attach_logical_message_identity(
@@ -535,6 +540,10 @@ def status_anchor_report(
         anchor_decision=anchor_decision,
         answer_readiness=answer_readiness,
         fail_closed_guidance=fail_closed_guidance,
+        structured_continuation_available=any(
+            read.get("read_more_command")
+            for read in source_tiers.get("required_primary") or []
+        ),
     )
     suppressed_support = _suppressed_answer_facing_support(
         cwd,
@@ -1177,6 +1186,7 @@ def _select_anchor_with_boundary(
     prior_request_occurrence: dict | None = None,
     canonical_parent_main_interval: dict | None = None,
     canonical_parent_main_fallback: dict | None = None,
+    anchor_ref: str | None = None,
 ) -> dict:
     base = {
         "context_boundary": "none",
@@ -1196,6 +1206,30 @@ def _select_anchor_with_boundary(
             "status_question",
         ],
     }
+    structured_authority = _structured_anchor_ref_authority_resolution(
+        anchor_ref=anchor_ref,
+        query=query,
+        codex_home=codex_home,
+        cwd=cwd,
+        latest_messages=messages,
+    )
+    if structured_authority.get("status") == "selected":
+        selected = structured_authority["selected_anchor"]
+        return _with_rejected_alternatives(
+            {
+                **base,
+                "context_boundary": "explicit_parent_main_structured_anchor_ref",
+                "anchor_scope": "parent_thread",
+                "anchor_reason": "exact_canonical_history_source_ref",
+                "anchor_ref": selected.get("source_ref"),
+                "selected_anchor": _selected_with_reason(
+                    selected,
+                    "; selected by the exact canonical source ref carried by the continuation",
+                ),
+                "structured_anchor_authority": structured_authority,
+            },
+            candidates,
+        )
     explicit_authority = _explicit_anchor_authority_resolution(
         query=query,
         candidates=candidates,
@@ -4212,6 +4246,53 @@ def _explicit_anchor_authority_resolution(
     }
 
 
+def _structured_anchor_ref_authority_resolution(
+    *,
+    anchor_ref: str | None,
+    query: str,
+    codex_home: Path | None,
+    cwd: Path | None,
+    latest_messages: list[dict],
+) -> dict:
+    if not anchor_ref:
+        return {"status": "not_applicable"}
+    if not re.fullmatch(r"codex_history:history\.jsonl:[1-9][0-9]*", anchor_ref):
+        return {"status": "unavailable", "reason": "structured_anchor_ref_is_not_canonical_history_line"}
+    if codex_home is None:
+        return {"status": "unavailable", "reason": "codex_history_root_unavailable"}
+    history_path = codex_home / "history.jsonl"
+    rows = _attach_latest_correlation_to_canonical_rows(
+        _canonical_history_human_rows(history_path, query=query),
+        latest_messages,
+    )
+    matches = [row for row in rows if row.get("source_ref") == anchor_ref]
+    if len(matches) != 1:
+        return {
+            "status": "unavailable",
+            "reason": "structured_anchor_ref_did_not_resolve_to_one_canonical_human_row",
+        }
+    selected = dict(matches[0])
+    if _is_never_anchor(selected) or not _is_eligible_anchor(selected):
+        return {"status": "rejected", "reason": "structured_anchor_ref_is_not_an_eligible_human_anchor"}
+    lineage_rejection = _explicit_anchor_child_control_lineage_rejection(
+        selected,
+        codex_home=codex_home,
+        cwd=cwd,
+    )
+    if lineage_rejection:
+        return {
+            "status": "rejected",
+            "reason": lineage_rejection.get("lineage_rejection_reason"),
+        }
+    selected["explicit_anchor_reason"] = "exact_canonical_history_source_ref"
+    selected["score"] = max(int(selected.get("score") or 0), 140)
+    return {
+        "status": "selected",
+        "selection_scope": "exact_canonical_history_source_ref",
+        "selected_anchor": selected,
+    }
+
+
 def _explicit_anchor_child_control_lineage_rejection(
     candidate: dict,
     *,
@@ -4995,12 +5076,21 @@ def _apply_parent_main_anchor_shortlist_contract(
         literal_parent_contract_anchor
         and selected_ref == literal_parent_contract_anchor.get("source_ref")
     )
+    structured_ref_selected = (
+        anchor_decision.get("context_boundary") == "explicit_parent_main_structured_anchor_ref"
+        and bool(selected_ref)
+    )
     unique_selected = (
         bool(selected_anchor)
         and _is_proven_parent_main_history_anchor(selected_anchor)
-        and selected_ref in high_confidence_refs
-        and len(high_confidence_refs) == 1
-        and literal_parent_contract_selected
+        and (
+            structured_ref_selected
+            or (
+                selected_ref in high_confidence_refs
+                and len(high_confidence_refs) == 1
+                and literal_parent_contract_selected
+            )
+        )
     )
     diagnostic_candidates = _parent_main_diagnostic_shortlist_candidates(
         anchor_candidates=anchor_candidates,
@@ -7847,7 +7937,7 @@ def _parent_main_anchor_freshness(
         },
         "canonical_continuation_command": _explicit_parent_anchor_rerun_command(
             query=str(command_options.get("query") or DEFAULT_STATUS_QUERY),
-            timestamp_utc=str(newest.get("timestamp_utc") or ""),
+            anchor_ref=str(newest.get("source_ref") or ""),
             cwd=str(command_options.get("cwd") or "."),
             codex_home=str(command_options.get("codex_home") or ""),
             max_matches=command_options.get("max_matches"),
@@ -7862,22 +7952,21 @@ def _parent_main_anchor_freshness(
 def _explicit_parent_anchor_rerun_command(
     *,
     query: str,
-    timestamp_utc: str,
+    anchor_ref: str,
     cwd: str,
     codex_home: str,
     max_matches: Any,
 ) -> str:
-    anchored_query = f"{query.rstrip()} Use {timestamp_utc} as the parent-thread anchor."
     parts = [
         "jsonl-history-search",
         "what-happened-since",
-        anchored_query,
+        query,
         "--cwd",
         cwd or ".",
     ]
     if codex_home:
         parts.extend(["--codex-home", codex_home])
-    parts.extend(["--parent-thread", "--complete-interval", "--format", "answer"])
+    parts.extend(["--parent-thread", "--complete-interval", "--anchor-ref", anchor_ref, "--format", "answer"])
     if max_matches:
         parts.extend(["--max-matches", str(max_matches)])
     return " ".join(shlex.quote(part) for part in parts)
@@ -8271,8 +8360,11 @@ def _clarification_request(
     anchor_decision: dict,
     answer_readiness: dict,
     fail_closed_guidance: dict,
+    structured_continuation_available: bool = False,
 ) -> dict | None:
     if selected_anchor or answer_readiness.get("answer_allowed") is not False:
+        return None
+    if structured_continuation_available:
         return None
     if anchor_decision.get("anchor_scope") == "current_user_message_chronology":
         return {
