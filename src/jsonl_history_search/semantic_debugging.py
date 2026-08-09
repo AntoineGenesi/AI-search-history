@@ -4049,11 +4049,6 @@ def historical_provenance_report_requested(query: str) -> bool:
             r"(?:the )?(?:[a-z0-9-]+ )*report\b",
             lowered,
         )
-        or re.search(
-            r"\b(?:prior|previous|earlier|saved|post-merge|adjudication|pressure|runner|review|evaluation|benchmark) "
-            r"(?:[a-z0-9-]+ )*report\b",
-            lowered,
-        )
         or re.search(r"\b(?:the|this|that) report\b", lowered)
         or re.search(r"\breport (?:artifact|file|output|row)\b", lowered)
         or re.search(r"(?:^|\s)(?:\.?/?reports)/\S+", lowered)
