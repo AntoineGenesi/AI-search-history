@@ -5034,7 +5034,16 @@ def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
 
 
 def _status_anchor_needs_clarification(report: dict) -> bool:
-    return report.get("status") == "anchor_ambiguous" and not report.get("selected_anchor")
+    source_tiers = report.get("source_tiers") or {}
+    structured_continuation_available = any(
+        read.get("read_more_command")
+        for read in source_tiers.get("required_primary") or []
+    )
+    return (
+        report.get("status") == "anchor_ambiguous"
+        and not report.get("selected_anchor")
+        and not structured_continuation_available
+    )
 
 
 def _render_status_anchor_clarification_text(report: dict) -> str:
@@ -5380,6 +5389,10 @@ def _status_anchor_canonical_continuation_command(report: dict) -> str:
         return str(freshness["canonical_continuation_command"])
     if _status_anchor_parent_main_complete_interval_recovery_required(report):
         return _status_anchor_rerun_answer_command(report)
+    source_tiers = report.get("source_tiers") or {}
+    for read in source_tiers.get("required_primary") or []:
+        if read.get("read_more_command"):
+            return str(read["read_more_command"])
     generated_contract = report.get("generated_report_contract") or {}
     if generated_contract.get("canonical_follow_through_path"):
         return str(generated_contract["canonical_follow_through_path"])
@@ -5413,6 +5426,8 @@ def _status_anchor_rerun_answer_command(report: dict) -> str:
         parts.extend(["--codex-home", str(command_options["codex_home"])])
     if parent_thread:
         parts.append("--parent-thread")
+    if command_options.get("anchor_ref"):
+        parts.extend(["--anchor-ref", str(command_options["anchor_ref"])])
     parts.extend(["--complete-interval", "--format", "answer"])
     if command_options.get("max_matches"):
         parts.extend(["--max-matches", str(command_options["max_matches"])])
