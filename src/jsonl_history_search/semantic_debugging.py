@@ -2357,12 +2357,6 @@ def apply_historical_provenance_self_echo_policy(
     orchestration_wanted = historical_orchestration_provenance_plan_wanted(query, family=family)
     source_match_handles = handles if TASKISH_HANDLE_RE.search(query or "") else []
     if not policy_wanted and not orchestration_wanted:
-        if handles and (
-            historical_provenance_current_scope_requested(query)
-            or historical_provenance_prior_answer_or_report_audit_requested(query)
-            or historical_provenance_report_or_manifest_requested(query)
-        ):
-            return ensure_read_more_actionability_defaults(next_reads), {}
         return next_reads, {}
 
     candidate_by_id = {
@@ -2466,6 +2460,11 @@ def apply_historical_provenance_self_echo_policy(
                 "raw_text_included": False,
             }
         elif policy_wanted or orchestration_wanted:
+            if category["source_chronology_role"].startswith("explicit_requested_"):
+                row["diagnostic_only"] = False
+                row["read_more_actionable"] = True
+                row["followthrough_actionable"] = True
+                row.pop("diagnostic_open_policy", None)
             row.setdefault("historical_provenance_selection", {
                 "schema_version": 1,
                 "source_chronology_role": category["source_chronology_role"],
@@ -3934,14 +3933,18 @@ def historical_provenance_self_echo_policy_wanted(
 ) -> bool:
     if not handles:
         return False
-    if historical_provenance_current_scope_requested(query) or historical_provenance_prior_answer_or_report_audit_requested(query):
-        return False
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
     reviewed_source_handle = bool(REVIEWED_SOURCE_LABELED_HANDLE_RE.search(query or ""))
-    if not TASKISH_HANDLE_RE.search(query or "") and not reviewed_source_handle:
-        return False
     primary = str((family or {}).get("primary") or "")
     if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"}:
+        return False
+    if (
+        historical_provenance_current_scope_requested(query)
+        or historical_provenance_prior_answer_or_report_audit_requested(query)
+        or historical_provenance_report_or_manifest_requested(query)
+    ):
+        return True
+    if not TASKISH_HANDLE_RE.search(query or "") and not reviewed_source_handle:
         return False
     return any(
         term in lowered
@@ -4010,7 +4013,15 @@ def historical_provenance_current_scope_requested(query: str) -> bool:
 
 def historical_provenance_prior_answer_or_report_audit_requested(query: str) -> bool:
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
-    prior_or_report = any(
+    audit = any(term in lowered for term in ("audit", "check", "inspect", "verify", "did it", "did the answer"))
+    return historical_provenance_prior_answer_audit_requested(query) or (
+        historical_provenance_report_requested(query) and audit
+    )
+
+
+def historical_provenance_prior_answer_audit_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    prior_answer = any(
         term in lowered
         for term in (
             "prior answer",
@@ -4020,25 +4031,49 @@ def historical_provenance_prior_answer_or_report_audit_requested(query: str) -> 
             "final answer",
             "prior final",
             "previous final",
-            "that report",
-            "this report",
-            "prior report",
-            "previous report",
-            "adjudication report",
         )
     )
     audit = any(term in lowered for term in ("audit", "check", "inspect", "verify", "did it", "did the answer"))
-    return prior_or_report and audit
+    return prior_answer and audit
 
 
 def historical_provenance_report_or_manifest_requested(query: str) -> bool:
+    return historical_provenance_report_requested(query) or historical_provenance_manifest_requested(query)
+
+
+def historical_provenance_report_requested(query: str) -> bool:
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
-    artifact = any(term in lowered for term in ("report", "manifest"))
-    explicit = any(
-        term in lowered
-        for term in ("audit", "check", "inspect", "verify", "use", "from", "open", "read")
+    return bool(
+        re.search(
+            r"\b(?:audit|check|inspect|verify|use|open|read|find|locate|recover|quote|show|summarize) "
+            r"(?:the )?report\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:the|this|that|prior|previous|earlier|saved|post-merge|adjudication|pressure|runner|review|evaluation|benchmark) "
+            r"(?:[a-z0-9-]+ )*report\b",
+            lowered,
+        )
+        or re.search(r"\breport (?:artifact|file|output|row)\b", lowered)
+        or re.search(r"(?:^|\s)(?:\.?/?reports)/\S+", lowered)
     )
-    return artifact and explicit
+
+
+def historical_provenance_manifest_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    return bool(
+        re.search(
+            r"\b(?:audit|check|inspect|verify|use|open|read|find|locate|recover|quote|show|summarize) "
+            r"(?:the )?manifest\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:the|this|that|a|an|prior|previous|earlier|saved|reviewed|sanitized|benchmark) "
+            r"(?:[a-z0-9-]+ )*manifest\b",
+            lowered,
+        )
+        or re.search(r"\bmanifest (?:artifact|file|output|row|entry)\b", lowered)
+    )
 
 
 def ensure_read_more_actionability_defaults(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4178,20 +4213,42 @@ def historical_provenance_source_category(
     current_run_echo: bool,
     current_task_same_loop: bool,
 ) -> dict[str, Any]:
-    if current_task_same_loop and not current_run_echo:
-        return historical_provenance_category_row("current_task_same_loop_diagnostic", final=False, diagnostic=True)
-    if current_run_echo:
-        return historical_provenance_category_row("current_run_self_echo_diagnostic", final=False, diagnostic=True)
-    text = historical_provenance_read_text(read, candidate)
-    if historical_provenance_post_hoc_answer_key_candidate(text, query=query):
-        return historical_provenance_category_row("post_hoc_answer_key_diagnostic", final=False, diagnostic=True)
-    if (
-        historical_provenance_broad_report_or_manifest_candidate(read, candidate)
-        and not historical_provenance_report_or_manifest_requested(query)
-    ):
+    artifact_types = historical_provenance_broad_report_or_manifest_types(read, candidate)
+    requested_artifact_types = {
+        artifact_type
+        for artifact_type, requested in (
+            ("report", historical_provenance_report_requested(query)),
+            ("manifest", historical_provenance_manifest_requested(query)),
+        )
+        if requested
+    }
+    if artifact_types:
+        if artifact_types & requested_artifact_types:
+            return historical_provenance_category_row(
+                "explicit_requested_report_or_manifest_artifact", final=True, diagnostic=False
+            )
         return historical_provenance_category_row(
             "broad_report_or_manifest_diagnostic", final=False, diagnostic=True
         )
+    if current_task_same_loop and not current_run_echo:
+        if historical_provenance_current_scope_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_current_task_same_loop", final=True, diagnostic=False
+            )
+        return historical_provenance_category_row("current_task_same_loop_diagnostic", final=False, diagnostic=True)
+    if current_run_echo:
+        if historical_provenance_current_scope_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_current_run_or_tool_output", final=True, diagnostic=False
+            )
+        return historical_provenance_category_row("current_run_self_echo_diagnostic", final=False, diagnostic=True)
+    text = historical_provenance_read_text(read, candidate)
+    if historical_provenance_post_hoc_answer_key_candidate(text, query=query):
+        if historical_provenance_prior_answer_audit_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_prior_answer", final=True, diagnostic=False
+            )
+        return historical_provenance_category_row("post_hoc_answer_key_diagnostic", final=False, diagnostic=True)
     target = str(read.get("target") or "")
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     path = str(source_ref.get("path") or target.split(":", 1)[0] or "")
@@ -4233,8 +4290,6 @@ def historical_provenance_matches_requested_handle(text: str, handles: list[str]
 
 
 def historical_provenance_post_hoc_answer_key_candidate(text: str, *, query: str | None = None) -> bool:
-    if historical_provenance_prior_answer_or_report_audit_requested(query or ""):
-        return False
     lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
     return any(
         marker in lowered
@@ -4265,6 +4320,13 @@ def historical_provenance_broad_report_or_manifest_candidate(
     read: dict[str, Any],
     candidate: dict[str, Any],
 ) -> bool:
+    return bool(historical_provenance_broad_report_or_manifest_types(read, candidate))
+
+
+def historical_provenance_broad_report_or_manifest_types(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+) -> set[str]:
     read_source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
     candidate_source_ref = (
         candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
@@ -4278,9 +4340,12 @@ def historical_provenance_broad_report_or_manifest_candidate(
         )
     )
     normalized = path_text.casefold().replace("\\", "/")
-    return "/reports/" in normalized or bool(
-        re.search(r"(?:^|[/_.-])manifest(?:[/_.-]|$)", normalized)
-    )
+    artifact_types: set[str] = set()
+    if "/reports/" in normalized:
+        artifact_types.add("report")
+    if re.search(r"(?:^|[/_.-])manifest(?:[/_.-]|$)", normalized):
+        artifact_types.add("manifest")
+    return artifact_types
 
 
 def historical_provenance_secondary_task_review_commit_ref(

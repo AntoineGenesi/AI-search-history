@@ -5652,7 +5652,7 @@ def _answer_action_contract_from_executed_output(
                 for item in source_followthrough_plan.get("conditional_required") or []
                 if isinstance(item, dict)
             ]
-        )[:_ASK_ANSWER_MAX_REFS]
+        )
         source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
         provenance_ledger = compact.get("provenance_direct_evidence_facet_ledger") or {}
         provenance_handoff = compact.get("provenance_complete_proof_handoff") or {}
@@ -6106,7 +6106,7 @@ def _answer_action_contract_from_executed_output(
         ):
             contract["conditional_required"] = _dedupe_action_contract_rows(
                 target_conditional_reads + source_followthrough_conditional
-            )[:_ASK_ANSWER_MAX_REFS]
+            )
         if route_family == "orchestration_provenance" and source_followthrough_required:
             contract["conditional_required"] = (
                 source_followthrough_conditional
