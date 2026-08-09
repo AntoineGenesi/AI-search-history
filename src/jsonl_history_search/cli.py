@@ -5600,6 +5600,13 @@ def _answer_action_contract_from_executed_output(
         longitudinal_phase_source_plan = compact.get("longitudinal_phase_source_plan") or {}
         source_followthrough_plan = compact.get("source_followthrough_plan") or {}
         source_followthrough_required = _source_followthrough_contract_reads(source_followthrough_plan)
+        source_followthrough_conditional = _dedupe_action_contract_rows(
+            [
+                item
+                for item in source_followthrough_plan.get("conditional_required") or []
+                if isinstance(item, dict)
+            ]
+        )[:_ASK_ANSWER_MAX_REFS]
         source_followthrough_diagnostics = list(source_followthrough_plan.get("optional_diagnostic") or [])[:5]
         provenance_ledger = compact.get("provenance_direct_evidence_facet_ledger") or {}
         provenance_handoff = compact.get("provenance_complete_proof_handoff") or {}
@@ -5634,10 +5641,16 @@ def _answer_action_contract_from_executed_output(
         core_plan = compact.get("core_convo_first_read_plan") or handoff.get("core_convo_first_read_plan") or {}
         orchestration_bundle = compact.get("historical_orchestration_role_evidence_bundle") or {}
         orchestration_plan = compact.get("historical_orchestration_provenance_final_support_plan") or {}
+        orchestration_recovery_reads = (
+            orchestration_bundle.get("missing_role_recovery_refs")
+            or orchestration_plan.get("missing_role_recovery_refs")
+            or orchestration_plan.get("bounded_non_final_required_reads")
+            or []
+        )
         orchestration_reads = (
             orchestration_bundle.get("required_role_reads")
             if orchestration_bundle.get("status") == "answer_ready"
-            else orchestration_bundle.get("missing_role_recovery_refs")
+            else orchestration_recovery_reads
             or (
                 orchestration_plan.get("primary_historical_final_support_reads")
                 if orchestration_plan.get("status") == "answer_ready"
@@ -5736,11 +5749,7 @@ def _answer_action_contract_from_executed_output(
             provenance_reads
             if provenance_applies
             else source_followthrough_required
-            if (
-                route_family == "orchestration_provenance"
-                and orchestration_bundle.get("status") == "answer_ready"
-                and source_followthrough_required
-            )
+            if route_family == "orchestration_provenance" and source_followthrough_required
             else orchestration_reads
             if route_family == "orchestration_provenance" and orchestration_reads
             else expectation_mismatch_plan.get("read")
@@ -6038,6 +6047,11 @@ def _answer_action_contract_from_executed_output(
                 "default_read_policy": source_followthrough_plan.get("default_read_policy"),
             }
             contract["stop"] = source_followthrough_plan.get("stop_condition") or contract["stop"]
+        if route_family == "orchestration_provenance" and source_followthrough_required:
+            contract["conditional_required"] = (
+                source_followthrough_conditional
+                or _dedupe_action_contract_rows(list(orchestration_recovery_reads))[:_ASK_ANSWER_MAX_REFS]
+            )
         if provenance_applies:
             contract["provenance_direct_evidence_facet_ledger"] = provenance_ledger
             contract["provenance_complete_proof_handoff"] = provenance_handoff
