@@ -6411,28 +6411,49 @@ def _render_semantic_debug_missing_primary_evidence(
     report: dict, *, markdown: bool
 ) -> str | None:
     handoff = report.get("answer_ready_handoff") or {}
-    if handoff.get("decision") != "missing_primary_evidence":
+    target_mismatch_block = handoff.get("target_mismatch_answer_block") or {}
+    target_mismatch = (
+        handoff.get("answer_readiness_status") == "target_mismatch_detected"
+        and target_mismatch_block.get("blocked") is True
+    )
+    if handoff.get("decision") != "missing_primary_evidence" and not target_mismatch:
         return None
     guidance = handoff.get("source_action_guidance") or {}
     commands = []
-    for item in guidance.get("exact_jsonl_continuation_commands") or []:
+    command_items = guidance.get("exact_jsonl_continuation_commands") or []
+    if target_mismatch:
+        command_items = (
+            (report.get("in_depth_audit_followthrough") or {}).get("continuation_commands")
+            or command_items
+        )
+    for item in command_items:
         command = item.get("command") or item.get("shell") if isinstance(item, dict) else None
         if command:
             commands.append(str(command))
     blocker = (
-        "Primary conversation-history evidence was not found in the searched scope, "
+        "Target-matching primary conversation-history evidence was not found in the searched scope, "
         "so the historical/provenance question cannot be answered."
     )
     prohibition = (
         "STOP: Repository task, report, review, documentation, and learning artifacts are "
         "post-hoc context, not substitutes for missing primary history evidence. Do not search "
-        "or cite them to answer this question."
+        "or cite them to answer this question, and do not use broad repository or manual transcript "
+        + (
+            "searches outside the exact JSONL continuation below."
+            if commands
+            else "searches; request a narrower history scope instead."
+        )
+    )
+    status = (
+        "target_mismatch_detected / missing_primary_evidence"
+        if target_mismatch
+        else "missing_primary_evidence"
     )
     if markdown:
         lines = [
             "# Not Answerable",
             "",
-            "- Status: `missing_primary_evidence`",
+            f"- Status: `{status}`",
             f"- {blocker}",
             f"- **{prohibition}**",
         ]
@@ -6450,7 +6471,7 @@ def _render_semantic_debug_missing_primary_evidence(
         return "\n".join(lines)
     lines = [
         "NOT ANSWERABLE",
-        "Status: missing_primary_evidence",
+        f"Status: {status}",
         blocker,
         prohibition,
     ]
