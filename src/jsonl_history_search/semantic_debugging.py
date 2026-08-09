@@ -4046,14 +4046,15 @@ def historical_provenance_report_requested(query: str) -> bool:
     return bool(
         re.search(
             r"\b(?:audit|check|inspect|verify|use|open|read|find|locate|recover|quote|show|summarize) "
-            r"(?:the )?report\b",
+            r"(?:the )?(?:[a-z0-9-]+ )*report\b",
             lowered,
         )
         or re.search(
-            r"\b(?:the|this|that|prior|previous|earlier|saved|post-merge|adjudication|pressure|runner|review|evaluation|benchmark) "
+            r"\b(?:prior|previous|earlier|saved|post-merge|adjudication|pressure|runner|review|evaluation|benchmark) "
             r"(?:[a-z0-9-]+ )*report\b",
             lowered,
         )
+        or re.search(r"\b(?:the|this|that) report\b", lowered)
         or re.search(r"\breport (?:artifact|file|output|row)\b", lowered)
         or re.search(r"(?:^|\s)(?:\.?/?reports)/\S+", lowered)
     )
@@ -4221,6 +4222,12 @@ def historical_provenance_source_category(
             ("manifest", historical_provenance_manifest_requested(query)),
         )
         if requested
+        and historical_provenance_requested_artifact_matches(
+            query,
+            read,
+            candidate,
+            artifact_type=artifact_type,
+        )
     }
     if artifact_types:
         if artifact_types & requested_artifact_types:
@@ -4346,6 +4353,44 @@ def historical_provenance_broad_report_or_manifest_types(
     if re.search(r"(?:^|[/_.-])manifest(?:[/_.-]|$)", normalized):
         artifact_types.add("manifest")
     return artifact_types
+
+
+def historical_provenance_requested_artifact_matches(
+    query: str,
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    artifact_type: str,
+) -> bool:
+    normalized_query = re.sub(r"[^a-z0-9]+", " ", str(query or "").casefold()).strip()
+    read_source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    candidate_source_ref = (
+        candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+    )
+    paths = (
+        str(read.get("target") or ""),
+        str(read_source_ref.get("path") or ""),
+        str(candidate_source_ref.get("path") or ""),
+    )
+    for raw_path in paths:
+        path = re.sub(r":\d+(?::\d+)?$", "", raw_path).replace("\\", "/")
+        basename = path.rsplit("/", 1)[-1]
+        if not basename:
+            continue
+        normalized_basename = re.sub(r"[^a-z0-9]+", " ", basename.casefold()).strip()
+        if normalized_basename and re.search(
+            rf"(?:^| ){re.escape(normalized_basename)}(?: |$)", normalized_query
+        ):
+            return True
+        stem = basename.rsplit(".", 1)[0]
+        identity = re.sub(r"[^a-z0-9]+", " ", stem.casefold()).strip()
+        identity = re.sub(rf"(?:^| ){re.escape(artifact_type)}$", "", identity).strip()
+        if identity and re.search(
+            rf"(?:^| ){re.escape(identity)} {re.escape(artifact_type)}(?: |$)",
+            normalized_query,
+        ):
+            return True
+    return False
 
 
 def historical_provenance_secondary_task_review_commit_ref(
