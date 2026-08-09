@@ -598,6 +598,7 @@ def render_ask_execute_text(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    terminal_answer_and_stop = action.get("terminal_answer_and_stop_contract") or {}
     latest_status_contract = _ask_execute_latest_status_contract(
         action, report.get("executed_output") or {}
     )
@@ -621,7 +622,7 @@ def render_ask_execute_text(payload: dict) -> str:
             "Route already executed: selected semantic-debug route completed by ask --execute; "
             "do not run it again by default."
         )
-    elif first_command:
+    elif first_command and terminal_answer_and_stop.get("status") != "terminal_answer_and_stop":
         lines.append(f"First command: {first_command}")
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
     packet = route.get("method_selection_packet") or {}
@@ -755,6 +756,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
     cli_prefix = resolution.get("command_prefix") or "jsonl-history-search"
     execution = report.get("execution") or {}
     action = report.get("answer_action_contract") or {}
+    terminal_answer_and_stop = action.get("terminal_answer_and_stop_contract") or {}
     latest_status_contract = _ask_execute_latest_status_contract(
         action, report.get("executed_output") or {}
     )
@@ -779,7 +781,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
             "- Route already executed: selected `semantic-debug` route completed by `ask --execute`; "
             "do not run it again by default."
         )
-    elif first_command:
+    elif first_command and terminal_answer_and_stop.get("status") != "terminal_answer_and_stop":
         lines.append(f"- First command: `{first_command}`")
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
     packet = route.get("method_selection_packet") or {}
@@ -1406,6 +1408,7 @@ def _append_scoped_no_evidence_contract(
             "saved_report": executed.get("report_written"),
         }
     answer_now = action.get("answer_status") == "answer-scoped-no-evidence-now"
+    terminal = action.get("terminal_answer_and_stop_contract") or {}
     if markdown:
         lines.extend(
             [
@@ -1432,6 +1435,13 @@ def _append_scoped_no_evidence_contract(
                 f"- Saved report: `{contract.get('saved_report') or action.get('saved_report')}`",
             ]
         )
+        if terminal.get("status") == "terminal_answer_and_stop":
+            lines.extend(
+                [
+                    "- **TERMINAL ANSWER-AND-STOP:** answer from this searched scope now.",
+                    "- Do not open weak candidates, rerun retrieval, or fall back to manual search.",
+                ]
+            )
         return
     lines.extend(
         [
@@ -1456,6 +1466,13 @@ def _append_scoped_no_evidence_contract(
             f"- saved_report: {contract.get('saved_report') or action.get('saved_report')}",
         ]
     )
+    if terminal.get("status") == "terminal_answer_and_stop":
+        lines.extend(
+            [
+                "TERMINAL ANSWER-AND-STOP: answer from this searched scope now.",
+                "Do not open weak candidates, rerun retrieval, or fall back to manual search.",
+            ]
+        )
 
 
 def _append_remembered_user_missing_evidence_contract(
