@@ -677,6 +677,15 @@ def render_ask_execute_text(payload: dict) -> str:
         )
     else:
         _append_compact_read_contract(lines, action.get("read"), cli_prefix=cli_prefix)
+    if action.get("conditional_required") and route.get("route_family") != "semantic_wrapup":
+        lines.append(
+            "Conditional required (secondary; run only if bounded reads leave required coverage incomplete):"
+        )
+        _append_compact_read_contract(
+            lines,
+            action.get("conditional_required"),
+            cli_prefix=cli_prefix,
+        )
     only_continue = action.get("only_continue_if")
     if only_continue:
         lines.append("Only continue if:")
@@ -837,6 +846,16 @@ def render_ask_execute_markdown(payload: dict) -> str:
             )
         else:
             _append_compact_read_contract(lines, action.get("read"), markdown=True, cli_prefix=cli_prefix)
+        if action.get("conditional_required") and route.get("route_family") != "semantic_wrapup":
+            lines.append(
+                "- Conditional required (secondary; run only if bounded reads leave required coverage incomplete):"
+            )
+            _append_compact_read_contract(
+                lines,
+                action.get("conditional_required"),
+                markdown=True,
+                cli_prefix=cli_prefix,
+            )
     if route.get("route_family") == "semantic_wrapup":
         _append_semantic_wrapup_execute_markdown(
             lines,
