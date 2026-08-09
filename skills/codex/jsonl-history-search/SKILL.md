@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Trigger even without JSONL or `convo` for prior conversation history; cleanup/process was deferred or failed; `what has happened since my last message in the parent thread?`. For named `tasks`/`...md`: `--evidence-source local` for checkout/HEAD/current-Git intent, `--evidence-source conversation-history` for conversation/source-session intent, or zero tools for unresolved scope. Non-triggers: bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, repo/Git history prompts, local repo/task/artifact status prompts, generic questions not anchored to prior conversation history, and writing/editing/summarizing prompts. A leading `convo` explicitly triggers the skill, not itself an executable command; aliases `convo tool`, `convo CLI`, `jsonl-search-history`, `jsonl-history-search`, `JSONL tool`, `the skill`, or `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`.
+description: Trigger even without JSONL or `convo` for prior conversation history: `what has happened since my last message in the parent thread?`, old context before compaction, deferred/failed work, provenance, or action proof. `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`. Non-triggers: bare `what happened?`, local repo/task/Git status, or writing/editing. Clarify ambiguous named-task scope.
 metadata:
   short-description: History
 ---
@@ -37,9 +37,11 @@ intent -> add exactly `--evidence-source conversation-history`; unresolved
 scope -> ask "Do you want current local Git/task evidence or prior conversation
 history?" and use zero tools.
 
-Start exactly one installed route before repo search, Git, or visible-context synthesis. Alias
-`what has happened since my last message? use the convo tool`: run `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `use the convo tool`/`convo CLI`: `jsonl-history-search`; no
-connector discovery/plugin install/`convo --help`. old-context decisions
+Start exactly one installed route before repo search, Git, or visible-context synthesis.
+Latest-message aliases, including parent/main wording, use `what-happened-since`;
+preserve the question and remove only the alias: `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `convo tool`/`convo CLI`/`jsonl-search-history`/
+`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the
+canonical CLI; no connector discovery/plugin install/`convo --help`. old-context decisions
 like `before compaction`, `outside visible context`, or `earlier in the thread`
 use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
