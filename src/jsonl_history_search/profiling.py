@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TextIO
 
 try:
     import resource
@@ -18,6 +19,75 @@ class PhaseToken:
     started: float
     rss_start_max_bytes: int | None
     rss_unavailable_reason: str | None
+
+
+ASK_EXECUTE_PHASE_EVENT = "jsonl_history_search.phase"
+ASK_EXECUTE_PHASES = (
+    "source_planning",
+    "retrieval",
+    "tool_event_scanning",
+    "packet_assembly",
+    "rendering",
+    "report_writing",
+)
+
+
+@dataclass(frozen=True)
+class AskExecutePhaseToken:
+    name: str
+    started_monotonic_ns: int
+
+
+class AskExecutePhaseEmitter:
+    """Emit privacy-safe JSONL liveness records without touching stdout."""
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream
+        self._command_started_monotonic_ns = time.monotonic_ns()
+
+    def start(self, name: str) -> AskExecutePhaseToken:
+        if name not in ASK_EXECUTE_PHASES:
+            raise ValueError(f"unsupported ask-execute phase: {name}")
+        now = time.monotonic_ns()
+        self._write(name=name, state="start", now=now)
+        return AskExecutePhaseToken(name=name, started_monotonic_ns=now)
+
+    def complete(self, token: AskExecutePhaseToken) -> None:
+        now = time.monotonic_ns()
+        self._write(
+            name=token.name,
+            state="complete",
+            now=now,
+            phase_elapsed_ms=round((now - token.started_monotonic_ns) / 1_000_000, 3),
+        )
+
+    def _write(
+        self,
+        *,
+        name: str,
+        state: str,
+        now: int,
+        phase_elapsed_ms: float | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "schema_version": 1,
+            "event": ASK_EXECUTE_PHASE_EVENT,
+            "command": "ask_execute",
+            "phase": name,
+            "state": state,
+            "monotonic_ns": now,
+            "command_elapsed_ms": round(
+                (now - self._command_started_monotonic_ns) / 1_000_000,
+                3,
+            ),
+        }
+        if phase_elapsed_ms is not None:
+            record["phase_elapsed_ms"] = phase_elapsed_ms
+        print(
+            json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+            file=self._stream if self._stream is not None else sys.stderr,
+            flush=True,
+        )
 
 
 def start_phase_profile(name: str) -> PhaseToken:

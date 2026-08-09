@@ -43,6 +43,7 @@ from .conversation_records import (
 from .forensics import build_forensics_payload
 from .latest_user_messages import latest_user_messages
 from .prompt_echo import clearly_intends_current_session, setup_echo_classification
+from .profiling import AskExecutePhaseEmitter
 from .query import infer_query
 from .real_history_gold import validate_manifest_file
 from .retrieval_modes import (
@@ -158,12 +159,14 @@ def build_semantic_debug_payload(
     default_tz: Any,
     mask_context: Any = None,
     configuration_warnings: list[str] | None = None,
+    phase_emitter: AskExecutePhaseEmitter | None = None,
 ) -> dict[str, Any]:
     audit_depth = resolve_audit_depth(
         getattr(args, "query", ""),
         getattr(args, "audit_depth", None),
     )
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
+    retrieval_phase = phase_emitter.start("retrieval") if phase_emitter else None
     result = run_retrieval_mode(
         retrieval_mode=getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
         plan=plan,
@@ -178,6 +181,8 @@ def build_semantic_debug_payload(
         query_plan_mode=getattr(args, "query_plan", "auto"),
         continuation_ledger=getattr(args, "continuation_ledger", False),
     )
+    if phase_emitter and retrieval_phase:
+        phase_emitter.complete(retrieval_phase)
     result["warnings"] = sorted(
         set(result.get("warnings", []) + intent.warnings + (configuration_warnings or []))
     )
@@ -193,6 +198,7 @@ def build_semantic_debug_payload(
     )
     agent_find = agent_payload["agent_find"]
 
+    tool_event_phase = phase_emitter.start("tool_event_scanning") if phase_emitter else None
     tool_payload = build_tool_events_payload(
         source_plan=source_plan,
         plan=plan,
@@ -204,7 +210,11 @@ def build_semantic_debug_payload(
         output_format=getattr(args, "format", "json"),
         report_output=None,
     )
+    if phase_emitter and tool_event_phase:
+        phase_emitter.complete(tool_event_phase)
     tool_report = tool_payload["structured_tool_events"]
+
+    packet_phase = phase_emitter.start("packet_assembly") if phase_emitter else None
 
     hints = {
         "task": getattr(args, "task", None),
@@ -1617,11 +1627,14 @@ def build_semantic_debug_payload(
             packet["compact_provenance_handoff"]["stage_diagnostics_summary"] = compact_stage_diagnostics_summary(
                 compact_stage_diagnostics
             )
-    return {
+    payload = {
         "semantic_debug": packet,
         "warnings": sorted(set(result.get("warnings", []) + tool_payload.get("warnings", []) + (forensics_payload or {}).get("warnings", []))),
         "blind_spots": sorted(set(result.get("blind_spots", []) + tool_payload.get("blind_spots", []) + (forensics_payload or {}).get("blind_spots", []))),
     }
+    if phase_emitter and packet_phase:
+        phase_emitter.complete(packet_phase)
+    return payload
 
 
 def semantic_debug_command_status(agent_find_status: Any) -> str:

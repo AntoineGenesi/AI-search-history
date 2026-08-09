@@ -106,7 +106,7 @@ from .prompt_echo import setup_echo_classification
 from .output import render
 from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
-from .profiling import finish_phase_profile, start_phase_profile
+from .profiling import AskExecutePhaseEmitter, finish_phase_profile, start_phase_profile
 from .query import infer_query
 from .redaction import RedactionContext
 from .real_history_impact import DEFAULT_MANIFEST as DEFAULT_REAL_HISTORY_IMPACT_MANIFEST
@@ -2299,6 +2299,8 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         )
         return contract
 
+    phase_emitter = AskExecutePhaseEmitter() if execution_kind == "semantic-debug" else None
+
     report_output = _ask_execute_report_output(args, execution_kind)
     execution_args = _execution_args_from_ask(
         args,
@@ -2338,7 +2340,10 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
             executed_payload = _build_status_anchor_report_output_payload(execution_args)
             output_key = "status_anchor"
         elif execution_kind == "semantic-debug":
-            executed_payload = _build_semantic_debug_report_output_payload(execution_args)
+            executed_payload = _build_semantic_debug_report_output_payload(
+                execution_args,
+                phase_emitter=phase_emitter,
+            )
             output_key = "semantic_debug"
         elif execution_kind == "no-evidence-report":
             executed_payload = _build_repo_source_no_evidence_report_output_payload(execution_args)
@@ -5019,8 +5024,15 @@ def _devlog_read_is_diagnostic(read: dict) -> bool:
     return any(marker in text for marker in diagnostic_markers)
 
 
-def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dict:
+def _build_semantic_debug_report_output_payload(
+    args: argparse.Namespace,
+    *,
+    phase_emitter: AskExecutePhaseEmitter | None = None,
+) -> dict:
+    source_phase = phase_emitter.start("source_planning") if phase_emitter else None
     source_plan, intent, plan = payload_from_args(args)
+    if phase_emitter and source_phase:
+        phase_emitter.complete(source_phase)
     payload = build_semantic_debug_payload(
         args,
         source_plan=source_plan,
@@ -5029,8 +5041,10 @@ def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dic
         default_tz=timezone_from_args(args.timezone, args.timezone_offset),
         mask_context=_mask_context_from_args(args),
         configuration_warnings=_configuration_warnings(source_plan),
+        phase_emitter=phase_emitter,
     )
     output_profile_token = start_phase_profile("semantic_debug_output_report")
+    rendering_phase = phase_emitter.start("rendering") if phase_emitter else None
     rendered = render(payload, "json")
     output_profile = finish_phase_profile(
         output_profile_token,
@@ -5047,7 +5061,13 @@ def _build_semantic_debug_report_output_payload(args: argparse.Namespace) -> dic
         report_output=args.report_output,
         report_written=True,
     )
-    Path(args.report_output).expanduser().write_text(render(payload, "json"), encoding="utf-8")
+    report_rendered = render(payload, "json")
+    if phase_emitter and rendering_phase:
+        phase_emitter.complete(rendering_phase)
+    report_phase = phase_emitter.start("report_writing") if phase_emitter else None
+    Path(args.report_output).expanduser().write_text(report_rendered, encoding="utf-8")
+    if phase_emitter and report_phase:
+        phase_emitter.complete(report_phase)
     packet = payload["semantic_debug"]
     if _semantic_debug_is_scoped_no_evidence(packet):
         return _short_semantic_debug_no_evidence_report_written_payload(packet, args.report_output)
