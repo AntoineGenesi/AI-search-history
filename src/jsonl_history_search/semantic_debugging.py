@@ -2382,7 +2382,12 @@ def apply_historical_provenance_self_echo_policy(
         text = historical_provenance_read_text(row, candidate)
         current_run_echo = (
             (policy_wanted or orchestration_wanted)
-            and historical_provenance_current_run_or_self_echo_candidate(text, query=query)
+            and historical_provenance_current_run_or_self_echo_candidate(
+                text,
+                query=query,
+                read=row,
+                candidate=candidate,
+            )
         )
         current_task_same_loop = (
             (policy_wanted or orchestration_wanted)
@@ -3734,6 +3739,8 @@ def historical_orchestration_read_plan_row(
     current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(
         text,
         query=query,
+        read=read,
+        candidate=candidate,
     )
     current_task_same_loop = historical_orchestration_current_task_same_loop_candidate(
         read,
@@ -4017,10 +4024,19 @@ def ensure_read_more_actionability_defaults(next_reads: list[dict[str, Any]]) ->
     return result
 
 
-def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query: str | None = None) -> bool:
+def historical_provenance_current_run_or_self_echo_candidate(
+    text: str,
+    *,
+    query: str | None = None,
+    read: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+) -> bool:
     lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
     echo = setup_echo_classification(text, query=query or "")
-    if echo.get("is_setup_echo"):
+    current_eval_source = historical_provenance_current_eval_source_context(read or {}, candidate or {})
+    echo_markers = {str(marker) for marker in echo.get("markers") or []}
+    content_only_comparator_echo = bool(echo_markers) and echo_markers <= {"manual comparator"}
+    if echo.get("is_setup_echo") and (not content_only_comparator_echo or current_eval_source):
         return True
     normalized_query = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
     if normalized_query and normalized_query in lowered:
@@ -4044,6 +4060,14 @@ def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query
         "lane prompt",
         "jsonl lane",
         "manual lane",
+        "current-run prompt",
+        "current run prompt",
+        "original token count",
+        "process exited with code",
+    )
+    if any(marker in lowered for marker in current_tool_markers):
+        return True
+    eval_markers = (
         "manual comparator",
         "manual comparison lane",
         "comparator lane",
@@ -4051,12 +4075,52 @@ def historical_provenance_current_run_or_self_echo_candidate(text: str, *, query
         "current eval",
         "current-evaluation",
         "evaluation prompt echo",
-        "current-run prompt",
-        "current run prompt",
-        "original token count",
-        "process exited with code",
     )
-    return any(marker in lowered for marker in current_tool_markers)
+    return any(marker in lowered for marker in eval_markers) and current_eval_source
+
+
+def historical_provenance_current_eval_source_context(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    read_source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    candidate_source_ref = (
+        candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+    )
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    source_context = " ".join(
+        str(part or "")
+        for part in (
+            read.get("target"),
+            read_source_ref.get("path"),
+            candidate_source_ref.get("path"),
+            read.get("candidate_id"),
+            candidate.get("candidate_id"),
+            read.get("source_role"),
+            candidate.get("source_role"),
+            candidate.get("role"),
+            selection.get("source_chronology_role"),
+            " ".join(str(item) for item in read.get("reason_codes") or []),
+            " ".join(str(item) for item in candidate.get("reason_codes") or []),
+        )
+    )
+    normalized = re.sub(r"[\\/_.-]+", " ", source_context.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return any(
+        marker in normalized
+        for marker in (
+            "current eval",
+            "current evaluation",
+            "evaluation prompt echo",
+            "manual comparator",
+            "manual comparison lane",
+            "comparator lane",
+        )
+    )
 
 
 def codex_session_path_date(path: str) -> Any:
@@ -4222,7 +4286,17 @@ def embedded_source_ref_next_reads(
             {"kind": "jsonl_source_ref", "target": candidate_target, "source_ref": source_ref},
             candidate,
         )
-        if not historical_provenance_current_run_or_self_echo_candidate(text, query=query):
+        if not historical_provenance_current_run_or_self_echo_candidate(
+            text,
+            query=query,
+            read={
+                "kind": "jsonl_source_ref",
+                "target": candidate_target,
+                "candidate_id": candidate.get("candidate_id"),
+                "source_ref": source_ref,
+            },
+            candidate=candidate,
+        ):
             continue
         for embedded_ref in embedded_jsonl_source_refs(text):
             target = source_ref_target(embedded_ref)

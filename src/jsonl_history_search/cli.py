@@ -9024,6 +9024,8 @@ def _bounded_no_evidence_scoped_answer_ready(*, compact: dict, selected_route: d
     )
     if not scoped_root_counts_present:
         return False
+    if _positive_int(scope_counts.get("excluded_root_count")) != 0 and not repo_source_committed:
+        return False
     if _positive_int(scope_counts.get("missing_root_count")) != 0:
         return False
     return True
