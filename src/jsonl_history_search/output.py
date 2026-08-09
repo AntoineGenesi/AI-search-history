@@ -6407,8 +6407,67 @@ def render_scope_boundary_summary_markdown(summary: dict) -> list[str]:
     ]
 
 
+def _render_semantic_debug_missing_primary_evidence(
+    report: dict, *, markdown: bool
+) -> str | None:
+    handoff = report.get("answer_ready_handoff") or {}
+    if handoff.get("decision") != "missing_primary_evidence":
+        return None
+    guidance = handoff.get("source_action_guidance") or {}
+    commands = []
+    for item in guidance.get("exact_jsonl_continuation_commands") or []:
+        command = item.get("command") or item.get("shell") if isinstance(item, dict) else None
+        if command:
+            commands.append(str(command))
+    blocker = (
+        "Primary conversation-history evidence was not found in the searched scope, "
+        "so the historical/provenance question cannot be answered."
+    )
+    prohibition = (
+        "STOP: Repository task, report, review, documentation, and learning artifacts are "
+        "post-hoc context, not substitutes for missing primary history evidence. Do not search "
+        "or cite them to answer this question."
+    )
+    if markdown:
+        lines = [
+            "# Not Answerable",
+            "",
+            "- Status: `missing_primary_evidence`",
+            f"- {blocker}",
+            f"- **{prohibition}**",
+        ]
+        if commands:
+            lines.extend(["", "## Exact JSONL Continuation", ""])
+            for command in commands[:1]:
+                lines.extend(["```bash", command, "```"])
+        else:
+            lines.extend(
+                [
+                    "",
+                    "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root.",
+                ]
+            )
+        return "\n".join(lines)
+    lines = [
+        "NOT ANSWERABLE",
+        "Status: missing_primary_evidence",
+        blocker,
+        prohibition,
+    ]
+    if commands:
+        lines.extend(["Exact JSONL continuation:", commands[0]])
+    else:
+        lines.append(
+            "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+        )
+    return "\n".join(lines)
+
+
 def render_semantic_debug_text(payload: dict) -> str:
     report = payload["semantic_debug"]
+    missing_primary = _render_semantic_debug_missing_primary_evidence(report, markdown=False)
+    if missing_primary is not None:
+        return missing_primary
     direct_projection = _render_provenance_direct_proof_projection(report, markdown=False)
     if direct_projection is not None:
         return direct_projection
@@ -6758,6 +6817,9 @@ def render_semantic_debug_text(payload: dict) -> str:
 
 def render_semantic_debug_markdown(payload: dict) -> str:
     report = payload["semantic_debug"]
+    missing_primary = _render_semantic_debug_missing_primary_evidence(report, markdown=True)
+    if missing_primary is not None:
+        return missing_primary
     direct_projection = _render_provenance_direct_proof_projection(report, markdown=True)
     if direct_projection is not None:
         return direct_projection

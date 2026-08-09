@@ -890,6 +890,55 @@ def build_semantic_debug_payload(
         action_proof_plan=action_proof_plan,
         scope_boundary_summary=scope_boundary_summary,
     )
+    if answer_ready_handoff.get("decision") == "missing_primary_evidence":
+        guidance = answer_ready_handoff["source_action_guidance"]
+        exact_commands = list(guidance.get("exact_jsonl_continuation_commands") or [])
+        blocker = (
+            "Primary conversation-history evidence is required; repository task, report, review, "
+            "documentation, and learning artifacts cannot substitute for it."
+        )
+        answer_readiness.update(
+            {
+                "status": "missing_primary_evidence",
+                "decision": "missing_primary_evidence",
+                "allowed_answer_scope": "none",
+                "required_before_answer": [blocker],
+            }
+        )
+        guided_audit_flow["answer_gate"].update(
+            {
+                "status": "blocked_missing_primary_evidence",
+                "answer_readiness_status": "missing_primary_evidence",
+                "answer_readiness_decision": "missing_primary_evidence",
+                "answer_readiness_scope": "none",
+                "source_use_required": True,
+                "required_before_answer": [blocker],
+            }
+        )
+        investigation_state.update(
+            {
+                "status": "missing_primary_evidence",
+                "recommended_next_step": answer_ready_handoff["do_next"],
+            }
+        )
+        agent_instruction.update(
+            {
+                "decision": "fail_closed_missing_primary_evidence",
+                "required_next_action": answer_ready_handoff["do_next"],
+                "commands": exact_commands,
+                "do_not_answer_until": [blocker],
+                "source_action_guidance": guidance,
+            }
+        )
+        agent_instruction["answer_gate"] = guided_audit_flow["answer_gate"]
+        agent_instruction["answer_readiness_decision"] = "missing_primary_evidence"
+        final_answer_contract.update(
+            {
+                "answer_scope": "not_answerable_without_primary_history_evidence",
+                "source_use_required": True,
+                "required_actions": [blocker],
+            }
+        )
     if scope_aware_no_evidence_workflow:
         answer_ready_handoff["links"]["scope_aware_no_evidence_workflow"] = (
             "semantic_debug.scope_aware_no_evidence_workflow"
@@ -6893,13 +6942,50 @@ def build_answer_ready_handoff(
         discipline_summary=discipline_summary,
         source_window_action_proof=source_window_action_proof or {},
     )
+    missing_primary_evidence = (
+        scoped_no_evidence_answer and answer_support.get("current") == "read_more_required"
+    )
+    if missing_primary_evidence:
+        exact_continuations = list(
+            source_action_guidance.get("optional_retrieval_escalation_commands") or []
+        )[:1]
+        decision = "missing_primary_evidence"
+        readiness_status = "missing_primary_evidence"
+        do_next = (
+            "run_exact_jsonl_refinement_or_ask_for_narrowed_scope_then_fail_closed"
+        )
+        do_not_answer_until = [
+            "Primary conversation-history evidence is opened and supports the answer.",
+            "Do not substitute repository task, report, review, documentation, or learning artifacts for missing primary history evidence.",
+        ]
+        source_action_guidance = {
+            "schema_version": 1,
+            "decision": "fail_closed_missing_primary_evidence",
+            "answer_promotion_allowed": False,
+            "post_hoc_artifact_substitution_allowed": False,
+            "exact_jsonl_continuation_commands": exact_continuations,
+            "narrowed_scope_request": (
+                "Ask for a session/thread, date range, quoted phrase, or history root when no exact JSONL continuation remains."
+            ),
+            "stop_condition": (
+                "Do not answer the historical/provenance question until primary conversation-history evidence is found."
+            ),
+        }
+        source_use_summary["source_use_required"] = True
+        source_use_summary["missing_primary_evidence_fail_closed"] = True
     source_use_summary["answer_support_classification"] = answer_support
     return {
         "schema_version": 1,
         "decision": decision,
         "answer_support_classification": answer_support,
         "answer_readiness_status": readiness_status,
-        "answer_gate_status": answer_gate.get("status") or "active",
+        "answer_gate_status": (
+            "blocked_missing_primary_evidence"
+            if missing_primary_evidence
+            else answer_gate.get("status") or "active"
+        ),
+        "answer_promotion_allowed": not missing_primary_evidence,
+        "post_hoc_artifact_substitution_allowed": not missing_primary_evidence,
         "do_next": do_next,
         "do_not_answer_until": do_not_answer_until,
         "primary_source_followthrough": primary_followthrough,
@@ -6909,6 +6995,9 @@ def build_answer_ready_handoff(
             "bounded_next_reads": ANSWER_READY_HANDOFF_READ_CAP,
             "copy_paste_commands": ANSWER_READY_HANDOFF_COMMAND_CAP,
             "deterministic_order": (
+                "run the one exact JSONL refinement if emitted; otherwise request narrowed scope and fail closed"
+                if missing_primary_evidence
+                else
                 "saved follow-next-reads bundle first when recovery reads are present; "
                 "individual jsonl read-more commands are fallback in semantic_debug.next_reads order"
                 if report_output and decision == "recovery_first"
