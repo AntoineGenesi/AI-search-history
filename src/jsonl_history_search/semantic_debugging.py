@@ -2357,11 +2357,6 @@ def apply_historical_provenance_self_echo_policy(
     orchestration_wanted = historical_orchestration_provenance_plan_wanted(query, family=family)
     source_match_handles = handles if TASKISH_HANDLE_RE.search(query or "") else []
     if not policy_wanted and not orchestration_wanted:
-        if handles and (
-            historical_provenance_current_scope_requested(query)
-            or historical_provenance_prior_answer_or_report_audit_requested(query)
-        ):
-            return ensure_read_more_actionability_defaults(next_reads), {}
         return next_reads, {}
 
     candidate_by_id = {
@@ -2439,6 +2434,11 @@ def apply_historical_provenance_self_echo_policy(
                     "post-hoc answer-key/adjudication/final/report diagnostic; prefer target "
                     "historical raw JSONL or historical task/review/commit refs as proof"
                 )
+            elif category["source_chronology_role"] == "broad_report_or_manifest_diagnostic":
+                row["reason"] = (
+                    "broad report/manifest diagnostic; prefer the reviewed target raw source and "
+                    "open this artifact only when explicitly requested"
+                )
             elif category["source_chronology_role"] == "unrelated_high_lexical_diagnostic":
                 row["reason"] = (
                     "high-lexical diagnostic that does not match the requested task handle; "
@@ -2460,6 +2460,11 @@ def apply_historical_provenance_self_echo_policy(
                 "raw_text_included": False,
             }
         elif policy_wanted or orchestration_wanted:
+            if category["source_chronology_role"].startswith("explicit_requested_"):
+                row["diagnostic_only"] = False
+                row["read_more_actionable"] = True
+                row["followthrough_actionable"] = True
+                row.pop("diagnostic_open_policy", None)
             row.setdefault("historical_provenance_selection", {
                 "schema_version": 1,
                 "source_chronology_role": category["source_chronology_role"],
@@ -3928,14 +3933,18 @@ def historical_provenance_self_echo_policy_wanted(
 ) -> bool:
     if not handles:
         return False
-    if historical_provenance_current_scope_requested(query) or historical_provenance_prior_answer_or_report_audit_requested(query):
-        return False
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
     reviewed_source_handle = bool(REVIEWED_SOURCE_LABELED_HANDLE_RE.search(query or ""))
-    if not TASKISH_HANDLE_RE.search(query or "") and not reviewed_source_handle:
-        return False
     primary = str((family or {}).get("primary") or "")
     if primary not in {"provenance", "claimed_action", "why_did_this_happen", "semantic_debug"}:
+        return False
+    if (
+        historical_provenance_current_scope_requested(query)
+        or historical_provenance_prior_answer_or_report_audit_requested(query)
+        or historical_provenance_report_or_manifest_requested(query)
+    ):
+        return True
+    if not TASKISH_HANDLE_RE.search(query or "") and not reviewed_source_handle:
         return False
     return any(
         term in lowered
@@ -4004,7 +4013,15 @@ def historical_provenance_current_scope_requested(query: str) -> bool:
 
 def historical_provenance_prior_answer_or_report_audit_requested(query: str) -> bool:
     lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
-    prior_or_report = any(
+    audit = any(term in lowered for term in ("audit", "check", "inspect", "verify", "did it", "did the answer"))
+    return historical_provenance_prior_answer_audit_requested(query) or (
+        historical_provenance_report_requested(query) and audit
+    )
+
+
+def historical_provenance_prior_answer_audit_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    prior_answer = any(
         term in lowered
         for term in (
             "prior answer",
@@ -4014,15 +4031,45 @@ def historical_provenance_prior_answer_or_report_audit_requested(query: str) -> 
             "final answer",
             "prior final",
             "previous final",
-            "that report",
-            "this report",
-            "prior report",
-            "previous report",
-            "adjudication report",
         )
     )
     audit = any(term in lowered for term in ("audit", "check", "inspect", "verify", "did it", "did the answer"))
-    return prior_or_report and audit
+    return prior_answer and audit
+
+
+def historical_provenance_report_or_manifest_requested(query: str) -> bool:
+    return historical_provenance_report_requested(query) or historical_provenance_manifest_requested(query)
+
+
+def historical_provenance_report_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    return bool(
+        re.search(
+            r"\b(?:audit|check|inspect|verify|use|open|read|find|locate|recover|quote|show|summarize) "
+            r"(?:the )?(?:[a-z0-9-]+ )*report\b",
+            lowered,
+        )
+        or re.search(r"\b(?:the|this|that) report\b", lowered)
+        or re.search(r"\breport (?:artifact|file|output|row)\b", lowered)
+        or re.search(r"(?:^|\s)(?:\.?/?reports)/\S+", lowered)
+    )
+
+
+def historical_provenance_manifest_requested(query: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    return bool(
+        re.search(
+            r"\b(?:audit|check|inspect|verify|use|open|read|find|locate|recover|quote|show|summarize) "
+            r"(?:the )?manifest\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:the|this|that|a|an|prior|previous|earlier|saved|reviewed|sanitized|benchmark) "
+            r"(?:[a-z0-9-]+ )*manifest\b",
+            lowered,
+        )
+        or re.search(r"\bmanifest (?:artifact|file|output|row|entry)\b", lowered)
+    )
 
 
 def ensure_read_more_actionability_defaults(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4162,12 +4209,47 @@ def historical_provenance_source_category(
     current_run_echo: bool,
     current_task_same_loop: bool,
 ) -> dict[str, Any]:
+    artifact_types = historical_provenance_broad_report_or_manifest_types(read, candidate)
+    requested_artifact_types = {
+        artifact_type
+        for artifact_type, requested in (
+            ("report", historical_provenance_report_requested(query)),
+            ("manifest", historical_provenance_manifest_requested(query)),
+        )
+        if requested
+        and historical_provenance_requested_artifact_matches(
+            query,
+            read,
+            candidate,
+            artifact_type=artifact_type,
+        )
+    }
+    if artifact_types:
+        if artifact_types & requested_artifact_types:
+            return historical_provenance_category_row(
+                "explicit_requested_report_or_manifest_artifact", final=True, diagnostic=False
+            )
+        return historical_provenance_category_row(
+            "broad_report_or_manifest_diagnostic", final=False, diagnostic=True
+        )
     if current_task_same_loop and not current_run_echo:
+        if historical_provenance_current_scope_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_current_task_same_loop", final=True, diagnostic=False
+            )
         return historical_provenance_category_row("current_task_same_loop_diagnostic", final=False, diagnostic=True)
     if current_run_echo:
+        if historical_provenance_current_scope_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_current_run_or_tool_output", final=True, diagnostic=False
+            )
         return historical_provenance_category_row("current_run_self_echo_diagnostic", final=False, diagnostic=True)
     text = historical_provenance_read_text(read, candidate)
     if historical_provenance_post_hoc_answer_key_candidate(text, query=query):
+        if historical_provenance_prior_answer_audit_requested(query):
+            return historical_provenance_category_row(
+                "explicit_requested_prior_answer", final=True, diagnostic=False
+            )
         return historical_provenance_category_row("post_hoc_answer_key_diagnostic", final=False, diagnostic=True)
     target = str(read.get("target") or "")
     source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
@@ -4210,8 +4292,6 @@ def historical_provenance_matches_requested_handle(text: str, handles: list[str]
 
 
 def historical_provenance_post_hoc_answer_key_candidate(text: str, *, query: str | None = None) -> bool:
-    if historical_provenance_prior_answer_or_report_audit_requested(query or ""):
-        return False
     lowered = re.sub(r"\s+", " ", str(text or "").lower().replace("_", " ")).strip()
     return any(
         marker in lowered
@@ -4236,6 +4316,76 @@ def historical_provenance_post_hoc_answer_key_candidate(text: str, *, query: str
             "value gate",
         )
     )
+
+
+def historical_provenance_broad_report_or_manifest_candidate(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    return bool(historical_provenance_broad_report_or_manifest_types(read, candidate))
+
+
+def historical_provenance_broad_report_or_manifest_types(
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+) -> set[str]:
+    read_source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    candidate_source_ref = (
+        candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+    )
+    path_text = " ".join(
+        str(value or "")
+        for value in (
+            read.get("target"),
+            read_source_ref.get("path"),
+            candidate_source_ref.get("path"),
+        )
+    )
+    normalized = path_text.casefold().replace("\\", "/")
+    artifact_types: set[str] = set()
+    if "/reports/" in normalized:
+        artifact_types.add("report")
+    if re.search(r"(?:^|[/_.-])manifest(?:[/_.-]|$)", normalized):
+        artifact_types.add("manifest")
+    return artifact_types
+
+
+def historical_provenance_requested_artifact_matches(
+    query: str,
+    read: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    artifact_type: str,
+) -> bool:
+    normalized_query = re.sub(r"[^a-z0-9]+", " ", str(query or "").casefold()).strip()
+    read_source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    candidate_source_ref = (
+        candidate.get("source_ref") if isinstance(candidate.get("source_ref"), dict) else {}
+    )
+    paths = (
+        str(read.get("target") or ""),
+        str(read_source_ref.get("path") or ""),
+        str(candidate_source_ref.get("path") or ""),
+    )
+    for raw_path in paths:
+        path = re.sub(r":\d+(?::\d+)?$", "", raw_path).replace("\\", "/")
+        basename = path.rsplit("/", 1)[-1]
+        if not basename:
+            continue
+        normalized_basename = re.sub(r"[^a-z0-9]+", " ", basename.casefold()).strip()
+        if normalized_basename and re.search(
+            rf"(?:^| ){re.escape(normalized_basename)}(?: |$)", normalized_query
+        ):
+            return True
+        stem = basename.rsplit(".", 1)[0]
+        identity = re.sub(r"[^a-z0-9]+", " ", stem.casefold()).strip()
+        identity = re.sub(rf"(?:^| ){re.escape(artifact_type)}$", "", identity).strip()
+        if identity and re.search(
+            rf"(?:^| ){re.escape(identity)} {re.escape(artifact_type)}(?: |$)",
+            normalized_query,
+        ):
+            return True
+    return False
 
 
 def historical_provenance_secondary_task_review_commit_ref(
@@ -7288,6 +7438,16 @@ def build_source_followthrough_plan(
                         "read_more_command": first_command.get("command"),
                         "direct_evidence_facets": list(first_command.get("direct_evidence_facets") or []),
                         "provenance_direct_evidence": first_command.get("provenance_direct_evidence"),
+                        "source_ref_id": first_command.get("source_ref_id"),
+                        "reviewed_source_packet_pointer": first_command.get(
+                            "reviewed_source_packet_pointer"
+                        ),
+                        "reviewed_source_case_handle": first_command.get(
+                            "reviewed_source_case_handle"
+                        ),
+                        "required_final_source_ref_ids": list(
+                            first_command.get("required_final_source_ref_ids") or []
+                        ),
                     }
                 ],
                 read_role="required_primary_proof",
@@ -7406,7 +7566,14 @@ def build_source_followthrough_plan(
         if direct_evidence_complete and target in direct_selected_targets:
             role = "required_primary_proof"
         elif primary_followthrough_first:
-            role = "optional_diagnostic"
+            same_as_first = target == str(first_command.get("target") or "")
+            has_named_required_facets = bool(primary_followthrough.get("required_answer_facets"))
+            if same_as_first or not read_is_required_surface_actionable(read):
+                role = "optional_diagnostic"
+            elif has_named_required_facets:
+                role = "conditional_required"
+            else:
+                role = "optional_diagnostic"
         else:
             role = source_followthrough_read_role(read, no_evidence=no_evidence or {})
         row = _source_followthrough_summary(
@@ -7560,6 +7727,12 @@ def _source_followthrough_summary(
     target = read.get("target") or source_ref_target(source_ref)
     if not target and not source_ref:
         return {}
+    reviewed_pointer = (
+        read.get("reviewed_source_packet_pointer")
+        if isinstance(read.get("reviewed_source_packet_pointer"), dict)
+        else {}
+    )
+    source_ref_id = read.get("source_ref_id") or reviewed_pointer.get("source_ref_id")
     row = {
         "read_role": read_role,
         "target": target,
@@ -7568,10 +7741,16 @@ def _source_followthrough_summary(
         "reason": read.get("reason") or reason_fallback,
         "selection_source": selection_source,
         "source_ref": guided_source_ref(source_ref) if source_ref else None,
-        "read_more_actionable": read.get("read_more_actionable", read_role == "required_primary_proof"),
-        "followthrough_actionable": read.get("followthrough_actionable", read_role == "required_primary_proof"),
+        "read_more_actionable": read.get("read_more_actionable", read_role != "optional_diagnostic"),
+        "followthrough_actionable": read.get("followthrough_actionable", read_role != "optional_diagnostic"),
         "diagnostic_only": read.get("diagnostic_only") is True or read_role == "optional_diagnostic",
         "conditional_required": read_role == "conditional_required" or read.get("conditional_required") is True,
+        "source_ref_id": source_ref_id,
+        "reviewed_source_packet_pointer": reviewed_pointer or None,
+        "reviewed_source_case_handle": read.get("reviewed_source_case_handle")
+        or reviewed_pointer.get("handle"),
+        "required_final_source_ref_ids": list(read.get("required_final_source_ref_ids") or [])
+        or ([str(source_ref_id)] if source_ref_id else []),
     }
     for key in (
         "source_chronology_role",
@@ -10659,6 +10838,8 @@ def build_primary_source_followthrough(
     if required_final_source_ref_ids:
         command["required_final_source_ref_ids"] = required_final_source_ref_ids
         command["reviewed_source_case_handle"] = reviewed_pointer.get("handle")
+        command["source_ref_id"] = required_final_source_ref_ids[0]
+        command["reviewed_source_packet_pointer"] = reviewed_pointer
     target_privacy = classify_command_target_privacy(target)
     command["target_local_path_like"] = target_privacy["local_path_like"]
     command["target_absolute_path_like"] = target_privacy["absolute_path_like"]
@@ -12627,6 +12808,12 @@ def action_proof_primary_refs(
 
 def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str, Any]:
     selection = read.get("action_proof_source_selection") if isinstance(read.get("action_proof_source_selection"), dict) else {}
+    reviewed_pointer = (
+        read.get("reviewed_source_packet_pointer")
+        if isinstance(read.get("reviewed_source_packet_pointer"), dict)
+        else {}
+    )
+    source_ref_id = read.get("source_ref_id") or reviewed_pointer.get("source_ref_id")
     row = {
         "target": read.get("target"),
         "kind": read.get("kind"),
@@ -12647,6 +12834,12 @@ def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str,
         "provenance_direct_evidence": read.get("provenance_direct_evidence")
         if isinstance(read.get("provenance_direct_evidence"), dict)
         else None,
+        "source_ref_id": source_ref_id,
+        "reviewed_source_packet_pointer": reviewed_pointer or None,
+        "reviewed_source_case_handle": read.get("reviewed_source_case_handle")
+        or reviewed_pointer.get("handle"),
+        "required_final_source_ref_ids": list(read.get("required_final_source_ref_ids") or [])
+        or ([str(source_ref_id)] if source_ref_id else []),
     }
     return {key: value for key, value in row.items() if value not in (None, [], {})}
 
