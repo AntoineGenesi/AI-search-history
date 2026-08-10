@@ -1591,9 +1591,9 @@ def _append_compact_read_contract(
                 lines.append(f"{bullet}{rendered}")
                 for source_ref_id in _reviewed_source_ref_ids(item):
                     if markdown:
-                        lines.append(f"  - Required final source ref: `{source_ref_id}`")
+                        lines.append(f"  - Required final provenance: `{source_ref_id}`")
                     else:
-                        lines.append(f"  required final source ref: {source_ref_id}")
+                        lines.append(f"  required final provenance: {source_ref_id}")
                 inspection_command = (
                     None
                     if command
@@ -6821,6 +6821,11 @@ def render_semantic_debug_text(payload: dict) -> str:
         lines.append("Final Answer Contract:")
         lines.append(f"- answer_scope: {contract.get('answer_scope')}")
         lines.append(f"- source_use_required: {contract.get('source_use_required')}")
+        reviewed_provenance = contract.get("required_final_provenance") or {}
+        for source_ref_id in reviewed_provenance.get("required_source_ref_ids") or []:
+            lines.append(f"- required final provenance: {source_ref_id}")
+        if reviewed_provenance.get("fail_closed_when_missing"):
+            lines.append("- final answer validation: fail closed when required reviewed provenance is missing")
         for action in contract.get("required_actions", [])[:5]:
             lines.append(f"- {action}")
         process_contract = contract.get("process_actual_use_contract") or {}
@@ -7207,6 +7212,11 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"- `answer_scope`: `{contract.get('answer_scope')}`",
             f"- `source_use_required`: `{contract.get('source_use_required')}`",
         ])
+        reviewed_provenance = contract.get("required_final_provenance") or {}
+        for source_ref_id in reviewed_provenance.get("required_source_ref_ids") or []:
+            lines.append(f"- Required final provenance: `{source_ref_id}`")
+        if reviewed_provenance.get("fail_closed_when_missing"):
+            lines.append("- Final answer validation: fail closed when required reviewed provenance is missing.")
         for action in contract.get("required_actions", [])[:6]:
             lines.append(f"- {action}")
         process_contract = contract.get("process_actual_use_contract") or {}

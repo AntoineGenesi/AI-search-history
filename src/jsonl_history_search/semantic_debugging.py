@@ -5172,6 +5172,8 @@ def empty_source_handle_routing() -> dict[str, Any]:
         "route_guidance": "No reviewed/source/case handle was detected in the query; use normal semantic-debug retrieval order.",
         "matched_next_reads": [],
         "matched_candidate_refs": [],
+        "required_final_provenance": [],
+        "required_final_source_ref_ids": [],
         "unresolved_handles": [],
         "claim_boundaries": source_handle_claim_boundaries(),
         "privacy_boundaries": source_handle_privacy_boundaries(),
@@ -5310,6 +5312,87 @@ def source_handle_item_matches(handle: dict[str, Any], item: dict[str, Any], *, 
     return any(needle in normalize_source_handle(text) for text in source_handle_match_texts(item))
 
 
+def reviewed_source_canonical_ref(
+    read: dict[str, Any],
+    *,
+    handle: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    pointer = read.get("reviewed_source_packet_pointer")
+    if not isinstance(pointer, dict):
+        return None
+    source_ref_id = str(pointer.get("source_ref_id") or "").strip()
+    pointer_handle = str(pointer.get("handle") or "").strip()
+    if not source_ref_id or not pointer_handle:
+        return None
+    normalized_pointer_handle = normalize_source_handle(pointer_handle)
+    if handle and normalized_pointer_handle != str(handle.get("normalized") or ""):
+        return None
+    target = read.get("target") or source_ref_target(read.get("source_ref") or {})
+    if not target:
+        return None
+    return {
+        "source_ref_id": source_ref_id,
+        "handle": pointer_handle,
+        "target": target,
+        "source_role": "target_historical_raw",
+        "requirement": "cite_exact_ref_in_final_answer_after_source_inspection",
+        "provenance_basis": "reviewed_source_packet_pointer",
+    }
+
+
+def reviewed_final_provenance_contract(
+    source_handle_routing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    routing = source_handle_routing or empty_source_handle_routing()
+    required = [
+        item
+        for item in routing.get("required_final_provenance") or []
+        if isinstance(item, dict) and item.get("source_ref_id") and item.get("target")
+    ]
+    source_ref_ids = dedupe([str(item["source_ref_id"]) for item in required])
+    reviewed_handles = [
+        str(item.get("handle") or item.get("normalized") or "")
+        for item in routing.get("detected_handles") or []
+        if normalize_source_handle(item.get("normalized") or item.get("handle")).startswith("real-jsh")
+    ]
+    requested = bool(reviewed_handles)
+    resolved = bool(source_ref_ids)
+    return {
+        "schema_version": 1,
+        "applies": resolved,
+        "reviewed_source_requested": requested,
+        "resolved": resolved,
+        "status": (
+            "required_in_final_answer"
+            if resolved
+            else "reviewed_source_packet_pointer_unresolved"
+            if requested
+            else "not_requested"
+        ),
+        "reviewed_handles": reviewed_handles,
+        "required_source_ref_ids": source_ref_ids,
+        "required_sources": required[:8],
+        "final_answer_must_include_all": resolved,
+        "fail_closed_when_missing": resolved,
+        "missing_provenance_result": "do_not_finalize_answer" if resolved else None,
+        "exact_continuation": (
+            "After opening the target primary raw source, include the exact reviewed source ref in final provenance: "
+            + ", ".join(source_ref_ids)
+            + "."
+            if resolved
+            else (
+                "Resolve the retained reviewed packet pointer for "
+                + ", ".join(reviewed_handles)
+                + ", open its mapped target primary raw source first, and preserve the packet-provided ref ID; "
+                "do not derive a ref ID from the query."
+            )
+            if requested
+            else None
+        ),
+        "claim_boundary": "required refs are opaque packet-provided values from matching reviewed pointers; never infer, normalize, suffix, or fabricate a ref id",
+    }
+
+
 def build_source_handle_routing(
     query: str,
     *,
@@ -5322,6 +5405,7 @@ def build_source_handle_routing(
         return empty_source_handle_routing()
     matched_reads: list[dict[str, Any]] = []
     matched_candidates: list[dict[str, Any]] = []
+    required_final_provenance: list[dict[str, Any]] = []
     resolved: set[str] = set()
     for handle in handles:
         handle_read_count = 0
@@ -5330,16 +5414,20 @@ def build_source_handle_routing(
                 continue
             resolved.add(handle["normalized"])
             handle_read_count += 1
-            matched_reads.append(
-                {
-                    "handle": handle["handle"],
-                    "target": read.get("target"),
-                    "kind": read.get("kind"),
-                    "reason": "matching handle evidence already exists in semantic_debug.next_reads",
-                    "priority": "before_broad_search",
-                    "original_order": index,
-                }
-            )
+            canonical_ref = reviewed_source_canonical_ref(read, handle=handle)
+            matched_read = {
+                "handle": handle["handle"],
+                "target": read.get("target"),
+                "kind": read.get("kind"),
+                "reason": "matching handle evidence already exists in semantic_debug.next_reads",
+                "priority": "target_primary_raw_first" if canonical_ref else "before_broad_search",
+                "original_order": index,
+            }
+            if canonical_ref:
+                matched_read["source_ref_id"] = canonical_ref["source_ref_id"]
+                matched_read["target_source_role"] = "target_historical_raw"
+                required_final_provenance.append(canonical_ref)
+            matched_reads.append(matched_read)
         for candidate in candidates[:INLINE_CANDIDATE_LIMIT]:
             if not source_handle_item_matches(handle, candidate, query=query):
                 continue
@@ -5387,6 +5475,10 @@ def build_source_handle_routing(
         "route_guidance": guidance,
         "matched_next_reads": dedupe_dicts(matched_reads)[:8],
         "matched_candidate_refs": dedupe_dicts(matched_candidates)[:8],
+        "required_final_provenance": dedupe_dicts(required_final_provenance)[:8],
+        "required_final_source_ref_ids": dedupe(
+            [str(item["source_ref_id"]) for item in required_final_provenance]
+        ),
         "unresolved_handles": unresolved,
         "claim_boundaries": source_handle_claim_boundaries(),
         "privacy_boundaries": source_handle_privacy_boundaries(),
@@ -5405,6 +5497,7 @@ def prioritize_source_handle_next_reads(
     }
     if not matched_targets:
         return next_reads
+    promoted_primary: list[dict[str, Any]] = []
     promoted: list[dict[str, Any]] = []
     remaining: list[dict[str, Any]] = []
     for read in next_reads:
@@ -5413,11 +5506,21 @@ def prioritize_source_handle_next_reads(
             reasons = list(row.get("routing_reasons") or [])
             reasons.append("source_handle_match")
             row["routing_reasons"] = dedupe(reasons)
-            row["source_handle_priority"] = "before_broad_search"
-            promoted.append(row)
+            canonical_ref = reviewed_source_canonical_ref(row)
+            if canonical_ref:
+                row["source_handle_priority"] = "target_primary_raw_first"
+                row["target_source_role"] = "target_historical_raw"
+                row["source_ref_id"] = canonical_ref["source_ref_id"]
+                row["required_final_source_ref_ids"] = [canonical_ref["source_ref_id"]]
+                promoted_primary.append(row)
+            elif row.get("diagnostic_only") or row.get("read_more_actionable") is False:
+                remaining.append(row)
+            else:
+                row["source_handle_priority"] = "before_broad_search"
+                promoted.append(row)
         else:
             remaining.append(row)
-    return dedupe_dicts(promoted + remaining)[:12]
+    return dedupe_dicts(promoted_primary + promoted + remaining)[:12]
 
 
 def inferred_anchor_next_reads(
@@ -5525,6 +5628,9 @@ def inferred_reviewed_source_packet_next_reads(
             "broad_private_artifact_search_discouraged": True,
             "claim_boundary": "retained_packet_pointer_guides_source_inspection_not_final_answer",
         }
+        read["target_source_role"] = "target_historical_raw"
+        read["source_ref_id"] = pointer["source_ref_id"]
+        read["required_final_source_ref_ids"] = [pointer["source_ref_id"]]
         reads.append(read)
     return reads
 
@@ -6285,6 +6391,8 @@ def source_handle_handoff_summary(source_handle_routing: dict[str, Any] | None) 
         "matched_next_read_targets": [
             item.get("target") for item in list(routing.get("matched_next_reads") or [])[:5] if item.get("target")
         ],
+        "required_final_source_ref_ids": list(routing.get("required_final_source_ref_ids") or [])[:8],
+        "required_final_provenance": list(routing.get("required_final_provenance") or [])[:8],
         "claim_boundaries": routing.get("claim_boundaries") or source_handle_claim_boundaries(),
     }
 
@@ -7076,6 +7184,9 @@ def build_answer_ready_handoff(
         do_not_answer_until.append(
             "Resolve/open matching source refs for detected source handles first, or state no matching source ref was found in searched scope."
         )
+    reviewed_provenance = final_answer_contract.get("required_final_provenance") or {}
+    if reviewed_provenance.get("applies"):
+        do_not_answer_until.insert(0, str(reviewed_provenance.get("exact_continuation")))
     do_not_answer_until = dedupe(do_not_answer_until)[:8]
 
     candidate_bounded_next_reads = bounded_answer_ready_next_reads(next_reads)
@@ -7176,6 +7287,9 @@ def build_answer_ready_handoff(
     missing_primary_evidence = (
         scoped_no_evidence_answer and answer_support.get("current") == "read_more_required"
     )
+    reviewed_provenance_unresolved = bool(
+        reviewed_provenance.get("applies") and not reviewed_provenance.get("resolved")
+    )
     if missing_primary_evidence:
         exact_continuations = list(
             source_action_guidance.get("optional_retrieval_escalation_commands") or []
@@ -7213,10 +7327,12 @@ def build_answer_ready_handoff(
         "answer_gate_status": (
             "blocked_missing_primary_evidence"
             if missing_primary_evidence
+            else "blocked_unresolved_reviewed_source_pointer"
+            if reviewed_provenance_unresolved
             else answer_gate.get("status") or "active"
         ),
-        "answer_promotion_allowed": not missing_primary_evidence,
-        "post_hoc_artifact_substitution_allowed": not missing_primary_evidence,
+        "answer_promotion_allowed": not missing_primary_evidence and not reviewed_provenance_unresolved,
+        "post_hoc_artifact_substitution_allowed": not missing_primary_evidence and not reviewed_provenance_unresolved,
         "do_next": do_next,
         "do_not_answer_until": do_not_answer_until,
         "primary_source_followthrough": primary_followthrough,
@@ -7239,6 +7355,7 @@ def build_answer_ready_handoff(
         },
         "scope_boundary_summary": scope_boundary_summary or {},
         "source_use_summary": source_use_summary,
+        "required_final_provenance": reviewed_provenance,
         "source_action_guidance": source_action_guidance,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
         "claim_boundaries": answer_readiness.get("claim_boundaries"),
@@ -11461,6 +11578,9 @@ def build_agent_instruction(
             0,
             "For detected reviewed/source/case handles, first open matching source refs from source_handle_routing or state that no matching source ref exists in searched scope.",
         )
+    reviewed_provenance = reviewed_final_provenance_contract(source_handle_routing)
+    if reviewed_provenance.get("applies"):
+        constraints.insert(0, str(reviewed_provenance.get("exact_continuation")))
 
     return {
         "schema_version": 1,
@@ -11478,6 +11598,7 @@ def build_agent_instruction(
         "source_action_guidance": source_action_guidance,
         "do_not_answer_until": constraints,
         "source_handle_routing": source_handle_handoff_summary(source_handle_routing),
+        "required_final_provenance": reviewed_provenance,
         "workflow_layers": [
             {"layer": "evidence_packet", "surface": "semantic_debug", "status": "current_packet"},
             {
@@ -11641,13 +11762,7 @@ def build_core_convo_first_read_plan(
             sequence_index += 1
 
     deduped = core_convo_dedupe_role_reads(rows)
-    ordered = sorted(
-        deduped,
-        key=lambda item: (
-            int(item.get("target_source_role_order", 99)),
-            int(item.get("core_convo_sequence_index", 0)),
-        ),
-    )
+    ordered = sorted(deduped, key=core_convo_read_sort_tuple)
     actionable = [
         item for item in ordered if item.get("target_source_role") != "diagnostic_or_post_hoc"
     ][:limit]
@@ -12078,9 +12193,10 @@ def core_convo_dedupe_role_reads(reads: list[dict[str, Any]]) -> list[dict[str, 
     return list(by_identity.values())
 
 
-def core_convo_read_sort_tuple(read: dict[str, Any]) -> tuple[int, int]:
+def core_convo_read_sort_tuple(read: dict[str, Any]) -> tuple[int, int, int]:
     return (
         int(read.get("target_source_role_order", 99)),
+        0 if reviewed_source_packet_pointer_read(read) else 1,
         int(read.get("core_convo_sequence_index", 0)),
     )
 
@@ -14066,6 +14182,7 @@ def build_final_answer_source_use_contract(
     source_scope: dict[str, Any],
     source_handle_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    reviewed_provenance = reviewed_final_provenance_contract(source_handle_routing)
     candidate_refs = [
         candidate.get("source_ref")
         for candidate in candidates[:5]
@@ -14091,6 +14208,8 @@ def build_final_answer_source_use_contract(
             0,
             "Resolve/open matching source refs for detected reviewed/source/case handles before broad answer claims, or state no matching source ref was found in searched scope.",
         )
+    if reviewed_provenance.get("applies"):
+        required_actions.insert(0, str(reviewed_provenance["exact_continuation"]))
     if process_actual_use:
         required_actions.insert(
             0,
@@ -14166,6 +14285,7 @@ def build_final_answer_source_use_contract(
         "required_actions": required_actions,
         "hint_obligations": hint_obligations,
         "evidence_inputs": evidence_inputs,
+        "required_final_provenance": reviewed_provenance,
         "no_evidence_scope": {
             "answer_scope": no_evidence.get("answer_scope"),
             "searched_scope": no_evidence.get("searched_scope"),
@@ -14178,6 +14298,9 @@ def build_final_answer_source_use_contract(
             "jsonl_value_speed_or_token_efficiency_claim": "not_allowed_without_separate_reviewed_evidence",
             "evidence_vs_inference_required": True,
             "support_precision_claim": "counts_only_not_artifact_content_correctness",
+            "reviewed_source_ref_identity": (
+                "final answer must preserve every required reviewed source ref id after inspecting its target raw source"
+            ),
         },
     }
     if process_actual_use:
@@ -14418,6 +14541,17 @@ def build_answer_readiness(
         required_before_answer.append(
             "Resolve/open matching source refs for detected source handles first, or state no matching source ref was found in searched scope."
         )
+    reviewed_provenance = final_answer_contract.get("required_final_provenance") or {}
+    if reviewed_provenance.get("applies"):
+        required_before_answer.insert(0, str(reviewed_provenance.get("exact_continuation")))
+        if reviewed_provenance.get("resolved"):
+            readiness_status = "inspect_reviewed_source_primary"
+            decision = "inspect_recovery_reads"
+            allowed_answer_scope = "reviewed_source_primary_unopened"
+        else:
+            readiness_status = "reviewed_source_packet_pointer_unresolved"
+            decision = "gather_more_evidence"
+            allowed_answer_scope = "not_answerable_without_reviewed_source_mapping"
     process_actual_use_contract = final_answer_contract.get("process_actual_use_contract") or {}
     if process_actual_use_contract:
         required_before_answer.insert(
@@ -14473,6 +14607,9 @@ def build_answer_readiness(
             "forensics_join_count": int((forensics_workflow.get("summary") or {}).get("join_count", 0) or 0),
             "source_handle_count": len((source_handle_routing or {}).get("detected_handles") or []),
             "source_handle_matching_next_read_count": len((source_handle_routing or {}).get("matched_next_reads") or []),
+            "required_final_reviewed_source_ref_count": len(
+                reviewed_provenance.get("required_source_ref_ids") or []
+            ),
             "process_actual_use_bucket_count": len(process_actual_use_contract.get("bucket_requirements") or []),
             "historical_orchestration_required_role_count": len(
                 historical_orchestration_contract.get("required_roles") or []
@@ -17661,6 +17798,9 @@ def guided_answer_gate(
         completion_criteria.append("Candidate-only and unsupported-extra handles are not used as final support.")
         if (discipline_summary.get("missing_proof_buckets") or []):
             completion_criteria.append("Missing proof/action buckets are stated as gaps before synthesis.")
+    reviewed_provenance = final_answer_contract.get("required_final_provenance") or {}
+    if reviewed_provenance.get("applies"):
+        completion_criteria.append(str(reviewed_provenance.get("exact_continuation")))
     process_contract = final_answer_contract.get("process_actual_use_contract") or {}
     if process_contract:
         completion_criteria.extend(
@@ -17706,6 +17846,7 @@ def guided_answer_gate(
             process_contract.get("repo_task_review_artifacts_secondary_unless_linked", False)
         ),
         "answer_source_discipline": discipline_summary,
+        "required_final_provenance": reviewed_provenance,
         "forbidden_claims": forbidden_claims,
         "claim_boundaries": final_answer_contract.get("claim_boundaries", {}),
     }

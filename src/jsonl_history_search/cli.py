@@ -5221,6 +5221,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "candidate_count": len(packet["strongest_candidates"]),
             "event_count": packet["tool_action_proof"]["event_count"],
             "source_locator_handoff": packet["source_locator_handoff"],
+            "source_handle_routing": packet.get("source_handle_routing"),
             "audit_continuation_workflow": packet.get("audit_continuation_workflow"),
             "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
             "source_followthrough_plan": packet.get("source_followthrough_plan"),
@@ -6096,6 +6097,11 @@ def _answer_action_contract_from_executed_output(
             ),
             "saved_report": compact.get("report_written"),
         }
+        reviewed_provenance = (
+            compact.get("final_answer_source_use_contract") or {}
+        ).get("required_final_provenance") or {}
+        if reviewed_provenance.get("applies"):
+            contract["required_final_provenance"] = reviewed_provenance
         if source_followthrough_plan:
             contract["source_followthrough_plan"] = {
                 "status": source_followthrough_plan.get("status"),
@@ -6677,6 +6683,108 @@ def _semantic_debug_target_single_flight_contract(
     }
 
 
+def _reviewed_source_authoritative_reads(compact: dict, primary_raw: list[dict]) -> list[dict]:
+    routing = compact.get("source_handle_routing") or {}
+    required = [
+        item
+        for item in routing.get("required_final_provenance") or []
+        if isinstance(item, dict) and item.get("target") and item.get("source_ref_id")
+    ]
+    if not required:
+        return []
+    candidates = _dedupe_action_contract_rows(
+        primary_raw
+        + list(compact.get("next_reads") or [])
+        + list((compact.get("source_locator_handoff") or {}).get("next_reads") or [])
+    )
+    selected: list[dict] = []
+    for requirement in required:
+        target = str(requirement.get("target") or "")
+        source_ref_id = str(requirement.get("source_ref_id") or "")
+        match = next(
+            (
+                read
+                for read in candidates
+                if str(read.get("target") or "") == target
+                and isinstance(read.get("reviewed_source_packet_pointer"), dict)
+                and str(read["reviewed_source_packet_pointer"].get("source_ref_id") or "")
+                == source_ref_id
+            ),
+            None,
+        )
+        if match:
+            selected.append(match)
+    return _dedupe_action_contract_rows(selected)
+
+
+def _reviewed_source_route_requested(compact: dict, route_family: str) -> bool:
+    routing = compact.get("source_handle_routing") or {}
+    if routing.get("required_final_provenance"):
+        return True
+    reads = (
+        list((compact.get("core_convo_first_read_plan") or {}).get("read") or [])
+        + list(compact.get("next_reads") or [])
+    )
+    if any(
+        isinstance(read, dict)
+        and (read.get("explicit_correction_window_bundle") or read.get("correction_window_source_selection"))
+        for read in reads
+    ):
+        return False
+    if route_family == "source_window_semantic_debug":
+        return True
+    return any(
+        str(item.get("normalized") or item.get("handle") or "").casefold().startswith("real-jsh")
+        for item in routing.get("detected_handles") or []
+        if isinstance(item, dict)
+    )
+
+
+def _reviewed_source_unresolved_target_handoff(
+    compact: dict,
+    *,
+    route_family: str,
+    rejected: list[dict],
+) -> dict:
+    routing = compact.get("source_handle_routing") or {}
+    handles = [
+        str(item.get("handle") or item.get("normalized") or "")
+        for item in routing.get("detected_handles") or []
+        if isinstance(item, dict)
+    ]
+    return {
+        "schema_version": 1,
+        "status": "target_primary_proof_refs_mismatch",
+        "mismatch_reason": "reviewed_source_packet_pointer_unresolved",
+        "route_family": route_family,
+        "answer_readiness_decision": "resolve_reviewed_source_packet_pointer",
+        "required_target_ids": handles,
+        "required_primary_proof": [],
+        "rejected_primary_proof": rejected[:6],
+        "rejected_primary_proof_count": len(rejected),
+        "source_boundaries": {
+            "required_primary_proof": "the reviewed packet-mapped target raw source must be first",
+            "wrong_target_refs": "unmapped raw candidates are diagnostics, not substitutes for the reviewed mapping",
+            "diagnostics": "generated reports, current-eval echoes, manifests, and unrelated raw refs are non-actionable",
+        },
+        "read": [
+            {
+                "kind": "targeted_fail_closed_boundary",
+                "reason": (
+                    "Reviewed source handle did not resolve to an authoritative packet pointer and mapped target."
+                ),
+                "required_target_ids": handles,
+                "required_source_roles": ["reviewed_packet_mapped_target_historical_raw"],
+            }
+        ],
+        "only_continue_if": [
+            "resolve the retained reviewed packet pointer for the exact opaque handle",
+            "open only the packet-mapped target raw source first and preserve its packet-provided ref ID",
+            "do not derive a ref ID from the query or substitute generated/current-eval/report/manifest evidence",
+        ],
+    }
+
+
 def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, query: str = "") -> dict:
     if route_family not in _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES:
         return {}
@@ -6690,13 +6798,27 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
         and read.get("read_more_actionable") is not False
         and read.get("followthrough_actionable") is not False
     ]
+    reviewed_route = _reviewed_source_route_requested(compact, route_family)
+    reviewed_primary = _reviewed_source_authoritative_reads(compact, primary_raw)
+    routing = compact.get("source_handle_routing") or {}
+    required_reviewed = list(routing.get("required_final_provenance") or [])
+    if reviewed_route and (not required_reviewed or len(reviewed_primary) != len(required_reviewed)):
+        return _reviewed_source_unresolved_target_handoff(
+            compact,
+            route_family=route_family,
+            rejected=primary_raw,
+        )
     if not primary_raw:
         return {}
-    target_gate = _target_episode_refs_gate(
-        query=query,
-        route_family=route_family,
-        refs=primary_raw,
-        required_source_role="target_historical_raw",
+    target_gate = (
+        {"schema_version": 1, "applies": False, "status": "not_applicable"}
+        if reviewed_primary
+        else _target_episode_refs_gate(
+            query=query,
+            route_family=route_family,
+            refs=primary_raw,
+            required_source_role="target_historical_raw",
+        )
     )
     if target_gate.get("applies") and target_gate.get("status") != "answer_allowed":
         return {
@@ -6737,29 +6859,43 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
         }
     if target_gate.get("applies"):
         primary_raw = list(target_gate.get("allowed_refs") or primary_raw)
-    reviewed_primary = [
-        read
-        for read in primary_raw
-        if isinstance(read.get("reviewed_source_packet_pointer"), dict)
-        or read.get("source_ref_id")
-    ]
     conditional_primary = []
+    demoted_unmapped_raw: list[dict] = []
     if reviewed_primary:
         reviewed_target = str(reviewed_primary[0].get("target") or "")
+        matched_targets = {
+            str(item.get("target") or "")
+            for item in routing.get("matched_next_reads") or []
+            if isinstance(item, dict) and item.get("target")
+        }
         conditional_primary = [
-            read for read in primary_raw if str(read.get("target") or "") != reviewed_target
+            read
+            for read in primary_raw
+            if str(read.get("target") or "") != reviewed_target
+            and str(read.get("target") or "") in matched_targets
         ]
+        for read in primary_raw:
+            target = str(read.get("target") or "")
+            if target == reviewed_target or target in matched_targets:
+                continue
+            row = dict(read)
+            row["target_source_role"] = "diagnostic_or_post_hoc"
+            row["diagnostic_only"] = True
+            row["read_more_actionable"] = False
+            row["followthrough_actionable"] = False
+            row["diagnostic_open_policy"] = "unmapped_raw_candidate_after_authoritative_reviewed_source"
+            demoted_unmapped_raw.append(row)
         primary_raw = [reviewed_primary[0]]
     secondary_context = [
         read
         for read in reads
         if read.get("target_source_role") in {"target_historical_artifact", "legitimate_context"}
     ][:6]
-    diagnostics_after = [
+    diagnostics_after = _dedupe_action_contract_rows(demoted_unmapped_raw + [
         read
         for read in (core_plan.get("diagnostics_after") or [])
         if isinstance(read, dict)
-    ][:6]
+    ])[:6]
     return {
         "schema_version": 1,
         "status": "target_primary_proof_refs_available",
@@ -9504,6 +9640,10 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             or (compact.get("answer_ready_handoff") or {}).get("decision"),
             "answer_readiness_summary": compact.get("answer_readiness_summary")
             or summarize_answer_readiness(compact.get("answer_readiness") or {}),
+            "source_handle_routing": compact.get("source_handle_routing"),
+            "required_final_provenance": (
+                compact.get("final_answer_source_use_contract") or {}
+            ).get("required_final_provenance"),
             "historical_orchestration_provenance_final_support_plan": compact.get(
                 "historical_orchestration_provenance_final_support_plan"
             ),
