@@ -511,11 +511,20 @@ def build_semantic_debug_payload(
                 provenance_direct_evidence_facet_ledger
             )
         )
+    spawned_resolution_reads = list(source_locator_handoff.get("next_reads") or next_reads)
+    spawned_resolution_candidates = source_selection_candidates
+    reviewed_resolution_reads = reviewed_source_authoritative_next_reads(
+        spawned_resolution_reads,
+        source_handle_routing,
+    )
+    if reviewed_resolution_reads:
+        spawned_resolution_reads = reviewed_resolution_reads
+        spawned_resolution_candidates = []
     spawned_session_resolution = resolve_spawned_session_transcripts(
         query=agent_find["query"]["original"],
         plan=plan,
-        candidates=source_selection_candidates,
-        next_reads=list(source_locator_handoff.get("next_reads") or next_reads),
+        candidates=spawned_resolution_candidates,
+        next_reads=spawned_resolution_reads,
         default_tz=default_tz,
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
@@ -5391,6 +5400,40 @@ def reviewed_final_provenance_contract(
         ),
         "claim_boundary": "required refs are opaque packet-provided values from matching reviewed pointers; never infer, normalize, suffix, or fabricate a ref id",
     }
+
+
+def reviewed_source_authoritative_next_reads(
+    next_reads: list[dict[str, Any]],
+    source_handle_routing: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    routing = source_handle_routing or {}
+    required = [
+        item
+        for item in routing.get("required_final_provenance") or []
+        if isinstance(item, dict) and item.get("target") and item.get("source_ref_id")
+    ]
+    if not required:
+        return []
+    selected: list[dict[str, Any]] = []
+    for requirement in required:
+        target = str(requirement["target"])
+        source_ref_id = str(requirement["source_ref_id"])
+        match = next(
+            (
+                read
+                for read in next_reads
+                if isinstance(read, dict)
+                and str(read.get("target") or "") == target
+                and isinstance(read.get("reviewed_source_packet_pointer"), dict)
+                and str(read["reviewed_source_packet_pointer"].get("source_ref_id") or "")
+                == source_ref_id
+            ),
+            None,
+        )
+        if match is None:
+            return []
+        selected.append(match)
+    return dedupe_dicts(selected)
 
 
 def build_source_handle_routing(
