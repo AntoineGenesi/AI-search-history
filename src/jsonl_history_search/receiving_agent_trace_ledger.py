@@ -68,7 +68,7 @@ PROTECTED_EVALUATION_ARTIFACT_RE = re.compile(
     r"(?:benchmarks?|reports?|evals?|evaluators?)[/\\][^\s'\"`;&|]+|"
     r"codex[/\\]state[/\\]reviews[/\\][^\s'\"`;&|]+|"
     r"[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
-    r"source[-_]?map|case[-_]?packet)[^\s'\"`;&|/\\]*\.(?:json|jsonl|md|txt|yaml|yml)"
+    r"source[-_]?map|case[-_]?packet|expected[-_]?facets?)[^\s'\"`;&|/\\]*\.(?:json|jsonl|md|txt|yaml|yml)"
     r")"
 )
 RAW_HISTORY_PATH_RE = re.compile(
@@ -80,6 +80,12 @@ RAW_HISTORY_PATH_RE = re.compile(
 )
 FILE_ACCESS_RE = re.compile(
     r"(?:^|[\s;&|('\"`])(?:cat|sed|nl|head|tail|less|more|rg|grep|find|ls|jq|awk)(?:[\s'\"`]|$)|"
+    r"\bopen\s*\(",
+    re.IGNORECASE,
+)
+PRIMARY_CONTENT_ACCESS_RE = re.compile(
+    r"(?:^|[\s;&|('\"`])(?:cat|sed|nl|head|tail|less|more|rg|grep|jq|awk)(?:[\s'\"`]|$)|"
+    r"(?:^|[\s;&|('\"`])git\s+(?:grep|show)(?:[\s'\"`]|$)|"
     r"\bopen\s*\(",
     re.IGNORECASE,
 )
@@ -245,14 +251,33 @@ def _is_provenance_source_family(expected_route_family: str | None) -> bool:
 
 
 def _has_primary_raw_history_path(text: str) -> bool:
-    return any(
-        match.group(0).rstrip(":#0123456789").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-        not in NON_PRIMARY_JSONL_NAMES
-        for match in RAW_HISTORY_PATH_RE.finditer(text)
-    )
+    for match in RAW_HISTORY_PATH_RE.finditer(text):
+        matched_path = match.group(0)
+        if any(marker in matched_path for marker in "*?[]{}"):
+            continue
+        basename = matched_path.rstrip(":#0123456789").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if basename not in NON_PRIMARY_JSONL_NAMES:
+            return True
+    return False
 
 
-def _evidence_access_roles(command: str, output: str, command_kind: str) -> list[str]:
+def _event_command_succeeded(event: dict[str, Any]) -> bool:
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return False
+    exit_code = item.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return exit_code == 0
+    return str(item.get("status") or "").lower() == "completed"
+
+
+def _evidence_access_roles(
+    command: str,
+    output: str,
+    command_kind: str,
+    *,
+    command_succeeded: bool,
+) -> list[str]:
     read_capable = command_kind in {
         "file_read",
         "broad_search_or_listing",
@@ -263,15 +288,33 @@ def _evidence_access_roles(command: str, output: str, command_kind: str) -> list
         return []
 
     command_has_primary = _has_primary_raw_history_path(command)
+    output_has_evidence = bool(output.strip())
     protected_probe = command
     primary_probe = command
-    if command_kind == "broad_search_or_listing" and not command_has_primary:
+    output_discovery = (
+        command_kind in {"broad_search_or_listing", "git"}
+        and command_succeeded
+        and output_has_evidence
+    )
+    if output_discovery:
         protected_probe = f"{command}\n{output}"
-        primary_probe = protected_probe
+        if not command_has_primary:
+            primary_probe = protected_probe
     roles: list[str] = []
     if PROTECTED_EVALUATION_ARTIFACT_RE.search(protected_probe):
         roles.append("protected_evaluation_artifact")
-    if command_kind == "jsonl_read_more" or _has_primary_raw_history_path(primary_probe):
+    primary_evidence_returned = (
+        command_succeeded
+        and output_has_evidence
+        and (
+            command_kind == "jsonl_read_more"
+            or (
+                bool(PRIMARY_CONTENT_ACCESS_RE.search(command))
+                and _has_primary_raw_history_path(primary_probe)
+            )
+        )
+    )
+    if primary_evidence_returned:
         roles.append("primary_raw_evidence")
     return roles
 
@@ -283,20 +326,37 @@ def _contamination_chronology(
     parse_errors: int,
 ) -> dict[str, Any]:
     applies = _is_provenance_source_family(expected_route_family)
-    primary_indexes = [
-        entry["completed_index"]
+    primary_entries = [
+        entry
         for entry in completed_order
         if "primary_raw_evidence" in entry["evidence_roles"]
     ]
-    protected_indexes = [
-        entry["completed_index"]
+    protected_entries = [
+        entry
         for entry in completed_order
         if "protected_evaluation_artifact" in entry["evidence_roles"]
     ]
-    first_primary = primary_indexes[0] if primary_indexes else None
-    first_protected = protected_indexes[0] if protected_indexes else None
-    protected_before_primary = first_protected is not None and (
-        first_primary is None or first_protected <= first_primary
+    uncorrelated_evidence_count = sum(
+        1 for entry in primary_entries + protected_entries if entry["started_index"] is None
+    )
+    primary_entries.sort(
+        key=lambda entry: (
+            entry["started_index"] is None,
+            entry["started_index"] if entry["started_index"] is not None else entry["completed_index"],
+        )
+    )
+    protected_entries.sort(
+        key=lambda entry: (
+            entry["started_index"] is None,
+            entry["started_index"] if entry["started_index"] is not None else entry["completed_index"],
+        )
+    )
+    first_primary_entry = primary_entries[0] if primary_entries else None
+    first_protected_entry = protected_entries[0] if protected_entries else None
+    first_primary_start = first_primary_entry["started_index"] if first_primary_entry else None
+    first_protected_start = first_protected_entry["started_index"] if first_protected_entry else None
+    protected_before_primary = first_protected_start is not None and (
+        first_primary_start is None or first_protected_start <= first_primary_start
     )
 
     if not applies:
@@ -305,14 +365,17 @@ def _contamination_chronology(
     elif parse_errors:
         route_cleanliness = "unadjudicable"
         classification = "unadjudicable_event_parse_errors"
+    elif uncorrelated_evidence_count:
+        route_cleanliness = "unadjudicable"
+        classification = "unadjudicable_evidence_start_correlation"
     elif protected_before_primary:
         route_cleanliness = "fail"
         classification = (
             "protected_artifact_without_primary_raw_evidence"
-            if first_primary is None
+            if first_primary_entry is None
             else "protected_artifact_before_or_with_first_primary_raw_evidence"
         )
-    elif first_protected is not None:
+    elif first_protected_entry is not None:
         route_cleanliness = "pass"
         classification = "protected_artifact_only_after_primary_raw_evidence"
     else:
@@ -323,10 +386,17 @@ def _contamination_chronology(
         "applies_to_provenance_source_family": applies,
         "route_cleanliness": route_cleanliness,
         "classification": classification,
-        "first_primary_raw_evidence_completed_index": first_primary,
-        "first_protected_artifact_completed_index": first_protected,
-        "primary_raw_evidence_access_count": len(primary_indexes),
-        "protected_artifact_access_count": len(protected_indexes),
+        "first_primary_raw_evidence_started_index": first_primary_start,
+        "first_protected_artifact_started_index": first_protected_start,
+        "first_primary_raw_evidence_completed_index": (
+            first_primary_entry["completed_index"] if first_primary_entry else None
+        ),
+        "first_protected_artifact_completed_index": (
+            first_protected_entry["completed_index"] if first_protected_entry else None
+        ),
+        "primary_raw_evidence_access_count": len(primary_entries),
+        "protected_artifact_access_count": len(protected_entries),
+        "uncorrelated_evidence_access_count": uncorrelated_evidence_count,
         "protected_artifact_before_primary": protected_before_primary,
     }
 
@@ -450,6 +520,9 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     chronology: list[dict[str, Any]] = []
     completed_order: list[dict[str, Any]] = []
     completed_commands: list[str] = []
+    pending_starts_by_id: dict[str, dict[str, int]] = {}
+    pending_starts_by_command: dict[str, list[dict[str, int]]] = {}
+    started_order = 0
     command_started = 0
     command_completed = 0
     surface_counts = {
@@ -485,9 +558,27 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         command_kind_counts[command_kind] = command_kind_counts.get(command_kind, 0) + 1
         if event_type == "item.started":
             command_started += 1
+            start_ref = {"started_index": started_order, "started_event_index": event_index}
+            started_order += 1
+            item = event.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if isinstance(item_id, str) and item_id:
+                pending_starts_by_id[item_id] = start_ref
+            pending_starts_by_command.setdefault(command, []).append(start_ref)
+        else:
+            start_ref = None
         if event_type == "item.completed":
             command_completed += 1
             completed_commands.append(command)
+            item = event.get("item")
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if isinstance(item_id, str) and item_id:
+                start_ref = pending_starts_by_id.pop(item_id, None)
+            if start_ref is None:
+                pending = pending_starts_by_command.get(command, [])
+                start_ref = pending.pop(0) if pending else None
+            elif start_ref in pending_starts_by_command.get(command, []):
+                pending_starts_by_command[command].remove(start_ref)
         if JSONL_CLI_RE.search(command):
             surface_counts["jsonl_cli"] += 1
         if JSONL_PACKAGE_RE.search(command):
@@ -505,7 +596,16 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         output_text = _event_command_output(event)
         partial_packet_signal = event_type == "item.completed" and bool(PARTIAL_PACKET_RE.search(output_text))
         manual_fallback_candidate = _is_broad_search(command) or command_kind == "file_read"
-        evidence_roles = _evidence_access_roles(command, output_text, command_kind)
+        evidence_roles = (
+            _evidence_access_roles(
+                command,
+                output_text,
+                command_kind,
+                command_succeeded=_event_command_succeeded(event),
+            )
+            if event_type == "item.completed"
+            else []
+        )
         command_entry = {
             "event_index": event_index,
             "lifecycle_event": event_type,
@@ -517,6 +617,8 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             "partial_packet_signal": partial_packet_signal,
             "manual_fallback_candidate": manual_fallback_candidate,
             "evidence_roles": evidence_roles,
+            "started_index": start_ref["started_index"] if start_ref else None,
+            "started_event_index": start_ref["started_event_index"] if start_ref else None,
         }
         chronology.append(command_entry)
         if event_type == "item.completed":
@@ -530,6 +632,8 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
                     "partial_packet_signal": command_entry["partial_packet_signal"],
                     "manual_fallback_candidate": command_entry["manual_fallback_candidate"],
                     "evidence_roles": command_entry["evidence_roles"],
+                    "started_index": command_entry["started_index"],
+                    "started_event_index": command_entry["started_event_index"],
                 }
             )
 
@@ -724,7 +828,7 @@ def build_receiving_agent_trace_ledger(
     }
     payload = {
         "receiving_agent_trace_ledger": {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "privacy_boundary": (
                 "committed-safe: raw prompts, final prose, stderr, command arguments, "
                 "absolute paths, thread/session ids, and runtime/auth paths are omitted"
@@ -809,7 +913,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
                 f"- Deep-audit target persistence: workflow `{audit_target['audit_continuation_workflow_seen']}`, target-persistence `{audit_target['target_persistence_signal_seen']}`, target-drift `{audit_target['target_drift_signal_seen']}`, target-mismatch `{audit_target['target_mismatch_signal_seen']}`",
                 f"- Source follow-through: `{lane['source_follow_through']['status']}`; primary-ref signal `{lane['source_follow_through']['primary_ref_use']}`",
                 f"- Route cleanliness: `{contamination['route_cleanliness']}` (`{contamination['classification']}`)",
-                f"- First primary/protected completed index: `{contamination['first_primary_raw_evidence_completed_index']}` / `{contamination['first_protected_artifact_completed_index']}`",
+                f"- First primary/protected started index: `{contamination['first_primary_raw_evidence_started_index']}` / `{contamination['first_protected_artifact_started_index']}`",
                 f"- Final answer: `{final['status']}`, bytes `{final['bytes']}`, correctness `{final['final_correctness']}`",
                 f"- Cap/coverage language: `{final['cap_or_coverage_language_present']}`; source-grounding language: `{final['source_grounding_language_present']}`",
                 "- Private handles:",
