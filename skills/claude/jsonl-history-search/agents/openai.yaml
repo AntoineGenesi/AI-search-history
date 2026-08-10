@@ -1,0 +1,6 @@
+interface:
+  display_name: "JSONL History Search"
+  short_description: "Resolve dependencies on prior conversation history"
+  default_prompt: "Use $jsonl-history-search to resolve the current task's dependency on earlier local conversation or agent history before answering or asking the user to repeat information."
+policy:
+  allow_implicit_invocation: true

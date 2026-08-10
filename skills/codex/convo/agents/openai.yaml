@@ -1,0 +1,6 @@
+interface:
+  display_name: "Convo"
+  short_description: "Explicit alias for JSONL history search"
+  default_prompt: "Use $convo to route this explicit local conversation-history request through jsonl-history-search."
+policy:
+  allow_implicit_invocation: false

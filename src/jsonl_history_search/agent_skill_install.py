@@ -17,7 +17,9 @@ SUPPORTED_AGENTS = ("codex", "claude")
 class AgentSkillAssets:
     root: Path
     skill: Path
+    policy: Path
     alias_skill: Path
+    alias_policy: Path
     references: Path
     search_helper: Path
     ask_first_helper: Path
@@ -74,11 +76,20 @@ def install_agent_skill(
     alias_root = target_home / "skills" / "convo"
     scripts_root = skill_root / "scripts"
     references_root = skill_root / "references"
+    policy_root = skill_root / "agents"
+    alias_policy_root = alias_root / "agents"
 
     scripts_root.mkdir(parents=True, exist_ok=True)
     alias_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(assets.skill, skill_root / "SKILL.md")
     shutil.copy2(assets.alias_skill, alias_root / "SKILL.md")
+    for source, target in (
+        (assets.policy.parent, policy_root),
+        (assets.alias_policy.parent, alias_policy_root),
+    ):
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
     if references_root.exists():
         shutil.rmtree(references_root)
     shutil.copytree(assets.references, references_root)
@@ -102,6 +113,7 @@ def install_agent_skill(
                 "status": "installed",
                 "optional": True,
                 "path": str(skill_root),
+                "policy_path": str(policy_root / "openai.yaml"),
                 "asset_source": assets.source,
                 "route_note": route_note,
             },
@@ -109,6 +121,7 @@ def install_agent_skill(
                 "status": "installed",
                 "optional": True,
                 "path": str(alias_root),
+                "policy_path": str(alias_policy_root / "openai.yaml"),
                 "asset_source": assets.source,
             },
             "privacy": {
@@ -170,7 +183,9 @@ def _source_checkout_assets(root: Path, *, agent: str, source: str) -> AgentSkil
     assets = AgentSkillAssets(
         root=skill_root,
         skill=skill_root / "SKILL.md",
+        policy=skill_root / "agents" / "openai.yaml",
         alias_skill=root / "skills" / agent / "convo" / "SKILL.md",
+        alias_policy=root / "skills" / agent / "convo" / "agents" / "openai.yaml",
         references=skill_root / "references",
         search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
@@ -180,10 +195,13 @@ def _source_checkout_assets(root: Path, *, agent: str, source: str) -> AgentSkil
 
 
 def _assets_from_root(root: Path, *, agent: str, source: str) -> AgentSkillAssets:
+    alias_skill = _installed_alias_skill(agent) or root.parent / f"{agent}-convo-skill" / "SKILL.md"
     return AgentSkillAssets(
         root=root,
         skill=root / "SKILL.md",
-        alias_skill=_installed_alias_skill(agent) or root.parent / f"{agent}-convo-skill" / "SKILL.md",
+        policy=root / "agents" / "openai.yaml",
+        alias_skill=alias_skill,
+        alias_policy=alias_skill.parent / "agents" / "openai.yaml",
         references=root / "references",
         search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
@@ -194,7 +212,9 @@ def _assets_from_root(root: Path, *, agent: str, source: str) -> AgentSkillAsset
 def _assets_complete(assets: AgentSkillAssets) -> bool:
     return (
         assets.skill.is_file()
+        and assets.policy.is_file()
         and assets.alias_skill.is_file()
+        and assets.alias_policy.is_file()
         and assets.references.is_dir()
         and any(assets.references.glob("*.md"))
         and assets.search_helper.is_file()

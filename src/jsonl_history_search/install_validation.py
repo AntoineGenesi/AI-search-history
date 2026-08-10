@@ -1287,6 +1287,8 @@ def _check_global_codex_install(
 ) -> list[ValidationCheck]:
     skill_root = codex_home / "skills" / "jsonl-history-search"
     alias_skill = codex_home / "skills" / "convo" / "SKILL.md"
+    policy = skill_root / "agents" / "openai.yaml"
+    alias_policy = alias_skill.parent / "agents" / "openai.yaml"
     skill = skill_root / "SKILL.md"
     references = skill_root / "references"
     helper = skill_root / "scripts" / "search_jsonl_history.py"
@@ -1294,6 +1296,12 @@ def _check_global_codex_install(
     package_skill_root = assets.root if assets is not None else package_root / "skills" / "codex" / "jsonl-history-search"
     package_skill = assets.skill if assets is not None else package_skill_root / "SKILL.md"
     package_alias_skill = assets.alias_skill if assets is not None else package_root / "skills" / "codex" / "convo" / "SKILL.md"
+    package_policy = assets.policy if assets is not None else package_skill_root / "agents" / "openai.yaml"
+    package_alias_policy = (
+        assets.alias_policy
+        if assets is not None
+        else package_alias_skill.parent / "agents" / "openai.yaml"
+    )
     package_references = assets.references if assets is not None else package_skill_root / "references"
     package_helper = assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py"
     package_ask_first_launcher = assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py"
@@ -1313,6 +1321,15 @@ def _check_global_codex_install(
                 recovery=["Run `jsonl-history-search install-codex-skill`."],
             )
         )
+    checks.append(
+        _agent_policy_check(
+            "global_policy",
+            "Global Codex implicit-invocation policy",
+            policy,
+            package_policy,
+            compare_packaged=compare_packaged,
+        )
+    )
     if alias_skill.is_file():
         checks.append(
             _global_copy_check(
@@ -1334,6 +1351,15 @@ def _check_global_codex_install(
                 recovery=["Run `jsonl-history-search install-codex-skill`."],
             )
         )
+    checks.append(
+        _agent_policy_check(
+            "global_convo_alias_policy",
+            "Global Codex Convo alias invocation policy",
+            alias_policy,
+            package_alias_policy,
+            compare_packaged=compare_packaged,
+        )
+    )
     if references.is_dir():
         checks.append(
             _global_tree_check(
@@ -1409,7 +1435,17 @@ def _check_global_agent_install(
     package_alias_skill = assets.alias_skill if assets is not None else package_root / "skills" / agent / "convo" / "SKILL.md"
     targets = {
         "skill": (skill_root / "SKILL.md", package_skill_root / "SKILL.md"),
+        "policy": (
+            skill_root / "agents" / "openai.yaml",
+            assets.policy if assets is not None else package_skill_root / "agents" / "openai.yaml",
+        ),
         "convo_alias_skill": (alias_skill, package_alias_skill),
+        "convo_alias_policy": (
+            alias_skill.parent / "agents" / "openai.yaml",
+            assets.alias_policy
+            if assets is not None
+            else package_alias_skill.parent / "agents" / "openai.yaml",
+        ),
         "references": (skill_root / "references", package_skill_root / "references"),
         "helper": (
             skill_root / "scripts" / "search_jsonl_history.py",
@@ -1456,6 +1492,16 @@ def _check_global_agent_install(
                 recovery=[f"Run `{install_command}`."],
             )
         )
+    checks.append(
+        _agent_policy_check(
+            f"{id_prefix}policy",
+            f"Global {label} implicit-invocation policy",
+            *targets["policy"],
+            compare_packaged=compare_packaged,
+            recovery_command=install_command,
+            agent_label=label,
+        )
+    )
     installed, packaged = targets["convo_alias_skill"]
     if installed.is_file():
         checks.append(
@@ -1480,6 +1526,16 @@ def _check_global_agent_install(
                 recovery=[f"Run `{install_command}`."],
             )
         )
+    checks.append(
+        _agent_policy_check(
+            f"{id_prefix}convo_alias_policy",
+            f"Global {label} Convo alias invocation policy",
+            *targets["convo_alias_policy"],
+            compare_packaged=compare_packaged,
+            recovery_command=install_command,
+            agent_label=label,
+        )
+    )
     installed, packaged = targets["references"]
     if installed.is_dir():
         checks.append(
@@ -1629,6 +1685,36 @@ def _check_global_backup_skill_dirs(codex_home: Path) -> ValidationCheck:
             "backup_dir_names": [path.name for path in backup_dirs],
             "active_skill_dir": str(skills_dir / "jsonl-history-search"),
         },
+    )
+
+
+def _agent_policy_check(
+    check_id: str,
+    name: str,
+    installed: Path,
+    packaged: Path,
+    *,
+    compare_packaged: bool,
+    recovery_command: str = "jsonl-history-search install-codex-skill",
+    agent_label: str = "Codex",
+) -> ValidationCheck:
+    if installed.is_file():
+        return _global_copy_check(
+            check_id,
+            name,
+            installed,
+            packaged,
+            compare_packaged=compare_packaged,
+            recovery_command=recovery_command,
+            agent_label=agent_label,
+        )
+    return ValidationCheck(
+        id=check_id,
+        name=name,
+        status="fail",
+        detail=f"{name} is missing.",
+        paths=[str(installed)],
+        recovery=[f"Run `{recovery_command}` to install the invocation policy."],
     )
 
 
