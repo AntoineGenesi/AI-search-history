@@ -34,6 +34,10 @@ REQUIRED_SCENARIOS = {
     "negative_local_status",
     "negative_bare_ambiguity",
     "negative_named_task_ambiguity",
+    "ambiguous_prior_referent",
+    "repeated_question_history_exists",
+    "conflicting_history",
+    "negative_file_history",
 }
 CLARIFICATION_POLICIES = {"forbidden", "required", "allowed_after_product_use"}
 REQUIRED_ADJUDICATION_FIELDS = {
@@ -103,6 +107,8 @@ def validate_manifest(payload: dict[str, Any]) -> None:
             errors.append(f"{label}.expected.exact_source_refs must be a list of non-empty strings")
         if refs and (not isinstance(case.get("source_fixture"), str) or not case["source_fixture"]):
             errors.append(f"{label}.source_fixture is required for exact source refs")
+        if not isinstance(expected.get("partial_packet_continuation", False), bool):
+            errors.append(f"{label}.expected.partial_packet_continuation must be boolean")
 
     missing = sorted(REQUIRED_SCENARIOS - scenarios)
     if missing:
@@ -260,6 +266,19 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
             if not no_history_pass:
                 failures.append("missing_history_resolution_failed")
 
+        partial_packet_path_pass = True
+        manual_fallback_after_partial = bool(observation.get("manual_fallback_after_partial_packet"))
+        if expected.get("partial_packet_continuation", False):
+            partial_packet_path_pass = observation.get("partial_packet_detected") is True
+            if not partial_packet_path_pass:
+                failures.append("partial_packet_signal_missing")
+            if observation.get("continuation_detected") is not True:
+                partial_packet_path_pass = False
+                failures.append("partial_packet_continuation_missing")
+            if manual_fallback_after_partial:
+                partial_packet_path_pass = False
+                failures.append("manual_fallback_after_partial_packet")
+
         case_results.append(
             {
                 "case_id": case_id,
@@ -273,6 +292,8 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
                 "source_grounding_pass": source_grounding_pass,
                 "exact_source_refs_pass": exact_refs_pass,
                 "no_history_outcome_pass": no_history_pass,
+                "partial_packet_path_pass": partial_packet_path_pass,
+                "manual_fallback_after_partial_packet": manual_fallback_after_partial,
                 "unnecessary_clarification": unnecessary_clarification,
                 "required_clarification_missing": required_clarification_missing,
                 "false_history_guess": false_history_guess,
@@ -288,6 +309,11 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
     source_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["source_grounding"]]
     exact_ref_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["exact_source_refs"]]
     missing_history_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["no_history_outcome"]]
+    partial_packet_cases = [
+        result
+        for result, case in zip(case_results, manifest["cases"])
+        if case["expected"].get("partial_packet_continuation", False)
+    ]
     errors = (["unexpected observations: " + ", ".join(extra_ids)] if extra_ids else [])
     passed_count = sum(1 for result in case_results if result["passed"])
     summary = {
@@ -306,6 +332,11 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
         "exact_source_refs_total": len(exact_ref_cases),
         "missing_history_resolution_pass_count": sum(1 for result in missing_history_cases if result["no_history_outcome_pass"]),
         "missing_history_resolution_total": len(missing_history_cases),
+        "partial_packet_path_pass_count": sum(1 for result in partial_packet_cases if result["partial_packet_path_pass"]),
+        "partial_packet_path_total": len(partial_packet_cases),
+        "manual_fallback_after_partial_packet_count": sum(
+            1 for result in partial_packet_cases if result["manual_fallback_after_partial_packet"]
+        ),
         "unnecessary_clarification_count": sum(1 for result in case_results if result["unnecessary_clarification"]),
         "required_clarification_missing_count": sum(1 for result in case_results if result["required_clarification_missing"]),
         "false_history_guess_count": sum(1 for result in case_results if result["false_history_guess"]),
@@ -317,8 +348,8 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
             "errors": errors,
             "cases": case_results,
             "claim_boundary": (
-                "Trigger, product-use, and route signals come from trace evidence; semantic final correctness, "
-                "source grounding, clarification, and guessing require explicit adjudication."
+                "Trigger, product-use, route, and partial-packet path signals come from trace evidence; "
+                "semantic final correctness, source grounding, clarification, and guessing require explicit adjudication."
             ),
         }
     }
@@ -343,6 +374,18 @@ def observations_from_trace_ledger(
         if adjudication is None:
             raise ValueError(f"Missing semantic adjudication for {case_id!r}")
         routes = (lane.get("route_selection") or {}).get("route_families_detected") or []
+        command_order = lane.get("command_order") or []
+        first_product_index = next(
+            (index for index, entry in enumerate(command_order) if entry.get("jsonl_product_surface")),
+            None,
+        )
+        after_first_product = command_order[first_product_index + 1 :] if first_product_index is not None else []
+        audit_signals = lane.get("deep_audit_target_persistence") or {}
+        latest_signals = lane.get("latest_status_freshness") or {}
+        partial_packet_detected = bool(
+            audit_signals.get("audit_continuation_workflow_seen")
+            or latest_signals.get("not_answerable_yet_seen")
+        )
         observations.append(
             {
                 **adjudication,
@@ -350,6 +393,12 @@ def observations_from_trace_ledger(
                 "trigger_detected": skill_seen or product_use,
                 "product_use_detected": product_use,
                 "detected_route_families": routes,
+                "partial_packet_detected": partial_packet_detected,
+                "continuation_detected": any(
+                    entry.get("jsonl_product_surface") for entry in after_first_product
+                ),
+                "manual_fallback_after_partial_packet": partial_packet_detected
+                and any(entry.get("broad_search_or_listing") for entry in after_first_product),
             }
         )
     return observations
