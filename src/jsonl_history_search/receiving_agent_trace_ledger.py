@@ -295,6 +295,7 @@ def _evidence_access_roles(
         command_kind in {"broad_search_or_listing", "git"}
         and command_succeeded
         and output_has_evidence
+        and not command_has_primary
     )
     if output_discovery:
         protected_probe = f"{command}\n{output}"
