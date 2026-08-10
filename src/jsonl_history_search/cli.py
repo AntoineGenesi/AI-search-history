@@ -6139,6 +6139,12 @@ def _answer_action_contract_from_executed_output(
                 and not named_task_action_proof
             ):
                 contract["read"] = target_proof_handoff.get("read") or []
+                if target_proof_handoff.get("mismatch_reason") == (
+                    "reviewed_source_packet_pointer_unresolved"
+                ):
+                    contract["only_continue_if"] = (
+                        target_proof_handoff.get("only_continue_if") or []
+                    )
             contract["diagnostics_after"] = (
                 target_proof_handoff.get("secondary_context_after_source_inspection")
                 or []
@@ -6778,9 +6784,11 @@ def _reviewed_source_unresolved_target_handoff(
             }
         ],
         "only_continue_if": [
-            "resolve the retained reviewed packet pointer for the exact opaque handle",
-            "open only the packet-mapped target raw source first and preserve its packet-provided ref ID",
-            "do not derive a ref ID from the query or substitute generated/current-eval/report/manifest evidence",
+            (
+                "resolve the retained reviewed packet pointer for the exact opaque handle, then open only "
+                "its mapped primary raw source and preserve the packet-provided ref ID; do not substitute "
+                "generated/current-eval/report/manifest evidence"
+            )
         ],
     }
 
@@ -19399,28 +19407,42 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
                 "with its exact continuation or required scope refinement."
             ),
         }
+    compact = {
+        "schema_version": packet["schema_version"],
+        "status": packet["status"],
+        "query": packet["query"],
+        "audit_depth": packet.get("audit_depth"),
+        "question_family": packet.get("question_family"),
+        "report_written": str(Path(report_output).expanduser()),
+        "candidate_count": len(packet.get("strongest_candidates") or []),
+        "event_count": (packet.get("tool_action_proof") or {}).get("event_count"),
+        "answer_ready_decision": answer_ready.get("decision"),
+        "scope_aware_no_evidence_workflow": _compact_scope_aware_no_evidence_workflow(
+            workflow
+        ),
+        "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
+        "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
+        "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
+        "scope_counts": _no_evidence_scope_counts(no_evidence),
+        "cap_hit": _no_evidence_cap_hit(no_evidence),
+        "no_evidence": boundary,
+        "message": "Full semantic-debug scoped no-evidence report written to report_output; stdout is a scoped summary.",
+    }
+    routing = packet.get("source_handle_routing") or {}
+    if routing.get("required_final_provenance"):
+        compact.update(
+            {
+                "source_locator_handoff": packet.get("source_locator_handoff"),
+                "source_handle_routing": routing,
+                "source_followthrough_plan": packet.get("source_followthrough_plan"),
+                "answer_ready_handoff": packet.get("answer_ready_handoff"),
+                "final_answer_source_use_contract": packet.get("final_answer_source_use_contract"),
+                "action_proof_plan": packet.get("action_proof_plan"),
+                "next_reads": packet.get("next_reads"),
+            }
+        )
     return {
-        "semantic_debug": {
-            "schema_version": packet["schema_version"],
-            "status": packet["status"],
-            "query": packet["query"],
-            "audit_depth": packet.get("audit_depth"),
-            "question_family": packet.get("question_family"),
-            "report_written": str(Path(report_output).expanduser()),
-            "candidate_count": len(packet.get("strongest_candidates") or []),
-            "event_count": (packet.get("tool_action_proof") or {}).get("event_count"),
-            "answer_ready_decision": answer_ready.get("decision"),
-            "scope_aware_no_evidence_workflow": _compact_scope_aware_no_evidence_workflow(
-                workflow
-            ),
-            "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
-            "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
-            "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
-            "scope_counts": _no_evidence_scope_counts(no_evidence),
-            "cap_hit": _no_evidence_cap_hit(no_evidence),
-            "no_evidence": boundary,
-            "message": "Full semantic-debug scoped no-evidence report written to report_output; stdout is a scoped summary.",
-        }
+        "semantic_debug": compact,
     }
 
 

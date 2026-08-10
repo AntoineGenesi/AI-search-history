@@ -8,10 +8,12 @@ import shlex
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from importlib import metadata
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 from statistics import median
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .agent_contract import (
@@ -5688,6 +5690,9 @@ def reviewed_packet_roots(cwd: Path) -> list[Path]:
             candidates.append(parent_repo / ".private" / "jsh-935")
     for parent in cwd.parents:
         candidates.append(parent / ".private" / "jsh-935")
+    installed_source = installed_source_checkout_root()
+    if installed_source is not None:
+        candidates.append(installed_source / ".private" / "jsh-935")
     roots: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -5701,6 +5706,19 @@ def reviewed_packet_roots(cwd: Path) -> list[Path]:
         seen.add(key)
         roots.append(candidate)
     return roots[:4]
+
+
+def installed_source_checkout_root() -> Path | None:
+    try:
+        distribution = metadata.distribution("jsonl-history-search")
+        payload = json.loads(distribution.read_text("direct_url.json") or "{}")
+        parsed = urlparse(str(payload.get("url") or ""))
+        if parsed.scheme != "file":
+            return None
+        path = Path(unquote(parsed.path))
+        return path if path.is_dir() else None
+    except (metadata.PackageNotFoundError, AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def find_reviewed_source_packet_pointer(
