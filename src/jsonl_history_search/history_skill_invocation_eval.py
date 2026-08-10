@@ -12,11 +12,13 @@ from jsonl_history_search.receiving_agent_trace_ledger import (
 )
 
 
-SCHEMA_VERSION = "history-skill-invocation-cases.v1"
+LEGACY_SCHEMA_VERSION = "history-skill-invocation-cases.v1"
+SCHEMA_VERSION = "history-skill-invocation-cases.v2"
 REPORT_SCHEMA_VERSION = "history-skill-invocation-eval.v1"
-REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v1"
+LEGACY_REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v1"
+REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v2"
 DEFAULT_MANIFEST = Path("benchmarks/history_skill_invocation/cases.json")
-REQUIRED_SCENARIOS = {
+LEGACY_REQUIRED_SCENARIOS = {
     "explicit_alias",
     "implicit_prior_dependency",
     "latest_status",
@@ -34,6 +36,8 @@ REQUIRED_SCENARIOS = {
     "negative_local_status",
     "negative_bare_ambiguity",
     "negative_named_task_ambiguity",
+}
+REQUIRED_SCENARIOS = LEGACY_REQUIRED_SCENARIOS | {
     "ambiguous_prior_referent",
     "repeated_question_history_exists",
     "conflicting_history",
@@ -60,8 +64,11 @@ def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
 
 def validate_manifest(payload: dict[str, Any]) -> None:
     errors: list[str] = []
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        errors.append(f"schema_version must be {SCHEMA_VERSION!r}")
+    schema_version = payload.get("schema_version")
+    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+        errors.append(
+            f"schema_version must be {LEGACY_SCHEMA_VERSION!r} or {SCHEMA_VERSION!r}"
+        )
     cases = payload.get("cases")
     if not isinstance(cases, list) or not cases:
         errors.append("cases must be a non-empty list")
@@ -110,7 +117,10 @@ def validate_manifest(payload: dict[str, Any]) -> None:
         if not isinstance(expected.get("partial_packet_continuation", False), bool):
             errors.append(f"{label}.expected.partial_packet_continuation must be boolean")
 
-    missing = sorted(REQUIRED_SCENARIOS - scenarios)
+    required_scenarios = (
+        REQUIRED_SCENARIOS if schema_version == SCHEMA_VERSION else LEGACY_REQUIRED_SCENARIOS
+    )
+    missing = sorted(required_scenarios - scenarios)
     if missing:
         errors.append("missing required scenarios: " + ", ".join(missing))
     if errors:
@@ -375,16 +385,14 @@ def observations_from_trace_ledger(
             raise ValueError(f"Missing semantic adjudication for {case_id!r}")
         routes = (lane.get("route_selection") or {}).get("route_families_detected") or []
         command_order = lane.get("command_order") or []
-        first_product_index = next(
-            (index for index, entry in enumerate(command_order) if entry.get("jsonl_product_surface")),
-            None,
-        )
-        after_first_product = command_order[first_product_index + 1 :] if first_product_index is not None else []
-        audit_signals = lane.get("deep_audit_target_persistence") or {}
-        latest_signals = lane.get("latest_status_freshness") or {}
-        partial_packet_detected = bool(
-            audit_signals.get("audit_continuation_workflow_seen")
-            or latest_signals.get("not_answerable_yet_seen")
+        partial_packet_indices = [
+            index
+            for index, entry in enumerate(command_order)
+            if entry.get("jsonl_product_surface") and entry.get("partial_packet_signal")
+        ]
+        partial_packet_detected = bool(partial_packet_indices)
+        after_partial_packet = (
+            command_order[partial_packet_indices[-1] + 1 :] if partial_packet_indices else []
         )
         observations.append(
             {
@@ -395,10 +403,10 @@ def observations_from_trace_ledger(
                 "detected_route_families": routes,
                 "partial_packet_detected": partial_packet_detected,
                 "continuation_detected": any(
-                    entry.get("jsonl_product_surface") for entry in after_first_product
+                    entry.get("jsonl_product_surface") for entry in after_partial_packet
                 ),
                 "manual_fallback_after_partial_packet": partial_packet_detected
-                and any(entry.get("broad_search_or_listing") for entry in after_first_product),
+                and any(entry.get("manual_fallback_candidate") for entry in after_partial_packet),
             }
         )
     return observations
@@ -407,8 +415,17 @@ def observations_from_trace_ledger(
 def evaluate_replay_fixture(
     manifest: dict[str, Any], replay_payload: dict[str, Any], *, work_root: Path
 ) -> dict[str, Any]:
-    if replay_payload.get("schema_version") != REPLAY_SCHEMA_VERSION:
-        raise ValueError(f"Replay schema_version must be {REPLAY_SCHEMA_VERSION!r}")
+    replay_schema = replay_payload.get("schema_version")
+    manifest_schema = manifest.get("schema_version")
+    compatible_replay_schema = {
+        LEGACY_SCHEMA_VERSION: LEGACY_REPLAY_SCHEMA_VERSION,
+        SCHEMA_VERSION: REPLAY_SCHEMA_VERSION,
+    }.get(manifest_schema)
+    if replay_schema != compatible_replay_schema:
+        raise ValueError(
+            f"Replay schema_version {replay_schema!r} is incompatible with manifest {manifest_schema!r}; "
+            f"expected {compatible_replay_schema!r}"
+        )
     lanes = replay_payload.get("lanes")
     if not isinstance(lanes, list):
         raise ValueError("Replay fixture lanes must be a list")

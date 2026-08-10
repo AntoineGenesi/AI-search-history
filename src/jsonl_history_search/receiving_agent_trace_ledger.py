@@ -45,6 +45,11 @@ STALE_SELECTED_ANCHOR_RE = re.compile(r"\bstale_selected_anchor\b", re.IGNORECAS
 SELECTED_ANCHOR_FRESHNESS_RE = re.compile(r"\bselected_anchor_freshness\b", re.IGNORECASE)
 PARENT_MAIN_ANCHOR_FRESHNESS_RE = re.compile(r"\bparent_main_anchor_freshness\b", re.IGNORECASE)
 AUDIT_CONTINUATION_WORKFLOW_RE = re.compile(r"\bAUDIT CONTINUATION WORKFLOW\b|\baudit_continuation_workflow\b", re.IGNORECASE)
+PARTIAL_PACKET_RE = re.compile(
+    r"\b(?:cap[_ -]?hit|partial[_ -]?packet)\b|\bNOT ANSWERABLE YET\b|"
+    r"\bAUDIT CONTINUATION WORKFLOW\b|\baudit_continuation_workflow\b",
+    re.IGNORECASE,
+)
 TARGET_PERSISTENCE_RE = re.compile(r"\btarget[_ -]persistence\b", re.IGNORECASE)
 TARGET_DRIFT_RE = re.compile(r"\btarget[_ -]drift\b|\bdrift_risk_reads\b|\btarget_drift_risk\b", re.IGNORECASE)
 TARGET_MISMATCH_RE = re.compile(
@@ -375,6 +380,9 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             for reason in _wrong_command_reasons(command, expected_route_family=expected_route_family):
                 wrong_reasons.append(reason)
 
+        output_text = _event_command_output(event)
+        partial_packet_signal = event_type == "item.completed" and bool(PARTIAL_PACKET_RE.search(output_text))
+        manual_fallback_candidate = _is_broad_search(command) or command_kind == "file_read"
         command_entry = {
             "event_index": event_index,
             "lifecycle_event": event_type,
@@ -383,6 +391,8 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             "jsonl_product_surface": command_kind
             in {"jsonl_read_more", "jsonl_semantic_debug", "jsonl_ask_execute", "jsonl_cli_other", "jsonl_package_import_or_module", "convo_alias"},
             "broad_search_or_listing": _is_broad_search(command),
+            "partial_packet_signal": partial_packet_signal,
+            "manual_fallback_candidate": manual_fallback_candidate,
         }
         chronology.append(command_entry)
         if event_type == "item.completed":
@@ -393,10 +403,11 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
                     "command_hash_12": command_entry["command_hash_12"],
                     "jsonl_product_surface": command_entry["jsonl_product_surface"],
                     "broad_search_or_listing": command_entry["broad_search_or_listing"],
+                    "partial_packet_signal": command_entry["partial_packet_signal"],
+                    "manual_fallback_candidate": command_entry["manual_fallback_candidate"],
                 }
             )
 
-        output_text = _event_command_output(event)
         if output_text:
             freshness_signal_texts.append(output_text)
             route_families.extend(ROUTE_FAMILY_RE.findall(output_text))
