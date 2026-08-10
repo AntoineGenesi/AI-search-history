@@ -98,6 +98,7 @@ def validate_install(
                 assets=skill_assets,
             )
         )
+        checks.append(_check_codex_cross_root_active_skills(codex_home.expanduser()))
     if claude_home is not None:
         checks.extend(
             _check_global_agent_install(
@@ -1416,6 +1417,100 @@ def _check_global_codex_install(
             )
         )
     return checks
+
+
+def _check_codex_cross_root_active_skills(codex_home: Path) -> ValidationCheck:
+    user_home = Path.home().expanduser().resolve()
+    canonical_home = user_home / ".agents"
+    legacy_home = user_home / ".codex"
+    selected_home = codex_home.resolve()
+    default_homes = {canonical_home.resolve(), legacy_home.resolve()}
+
+    if selected_home not in default_homes:
+        return ValidationCheck(
+            id="global_cross_root_active_skills",
+            name="Cross-root active Codex JSH skills",
+            status="skip",
+            detail=(
+                "Cross-root duplicate checking is not applicable because the explicit "
+                "--codex-home is a custom root."
+            ),
+            paths=[str(codex_home / "skills")],
+            metadata={
+                "applicable": False,
+                "selected_codex_home": str(codex_home),
+                "canonical_codex_home": str(canonical_home),
+                "legacy_codex_home": str(legacy_home),
+            },
+        )
+
+    roots = {
+        "canonical": canonical_home,
+        "legacy": legacy_home,
+    }
+    active_skills: dict[str, list[str]] = {}
+    skill_paths: dict[str, dict[str, str]] = {}
+    policy_paths: dict[str, dict[str, str | None]] = {}
+    for label, root in roots.items():
+        active_skills[label] = []
+        skill_paths[label] = {}
+        policy_paths[label] = {}
+        for skill_name in ("jsonl-history-search", "convo"):
+            skill = root / "skills" / skill_name / "SKILL.md"
+            policy = root / "skills" / skill_name / "agents" / "openai.yaml"
+            if skill.is_file():
+                active_skills[label].append(skill_name)
+                skill_paths[label][skill_name] = str(skill)
+                policy_paths[label][skill_name] = str(policy) if policy.is_file() else None
+
+    duplicate_names = sorted(set(active_skills["canonical"]) & set(active_skills["legacy"]))
+    metadata = {
+        "applicable": True,
+        "selected_codex_home": str(codex_home),
+        "canonical_codex_home": str(canonical_home),
+        "legacy_codex_home": str(legacy_home),
+        "active_skills": active_skills,
+        "skill_paths": skill_paths,
+        "policy_paths": policy_paths,
+        "duplicate_skill_names": duplicate_names,
+    }
+    if not duplicate_names:
+        return ValidationCheck(
+            id="global_cross_root_active_skills",
+            name="Cross-root active Codex JSH skills",
+            status="pass",
+            detail=(
+                "The canonical $HOME/.agents/skills and legacy $HOME/.codex/skills roots "
+                "do not contain duplicate active JSH skill names."
+            ),
+            paths=[str(canonical_home / "skills"), str(legacy_home / "skills")],
+            metadata=metadata,
+        )
+
+    duplicate_paths = [
+        skill_paths[label][skill_name]
+        for skill_name in duplicate_names
+        for label in ("canonical", "legacy")
+    ]
+    return ValidationCheck(
+        id="global_cross_root_active_skills",
+        name="Cross-root active Codex JSH skills",
+        status="fail",
+        detail=(
+            "Duplicate active JSH skills are discoverable in both the canonical "
+            f"$HOME/.agents/skills and legacy $HOME/.codex/skills roots: {', '.join(duplicate_names)}. "
+            "Codex may receive duplicate catalog descriptions."
+        ),
+        paths=duplicate_paths,
+        recovery=[
+            (
+                "Keep the canonical copies under `$HOME/.agents/skills`. Manually move or remove "
+                "the matching legacy copies from `$HOME/.codex/skills`, then validate again; "
+                "validate-install does not modify either root."
+            )
+        ],
+        metadata=metadata,
+    )
 
 
 def _check_global_agent_install(
