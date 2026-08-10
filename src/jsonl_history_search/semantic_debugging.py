@@ -5712,13 +5712,13 @@ def installed_source_checkout_root() -> Path | None:
     try:
         distribution = metadata.distribution("jsonl-history-search")
         payload = json.loads(distribution.read_text("direct_url.json") or "{}")
+        parsed = urlparse(str(payload.get("url") or ""))
+        if parsed.scheme != "file":
+            return None
+        path = Path(unquote(parsed.path))
+        return path if path.is_dir() else None
     except (metadata.PackageNotFoundError, AttributeError, OSError, TypeError, ValueError):
         return None
-    parsed = urlparse(str(payload.get("url") or ""))
-    if parsed.scheme != "file":
-        return None
-    path = Path(unquote(parsed.path))
-    return path if path.is_dir() else None
 
 
 def find_reviewed_source_packet_pointer(
