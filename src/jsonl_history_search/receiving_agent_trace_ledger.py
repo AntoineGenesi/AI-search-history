@@ -21,6 +21,7 @@ JSONL_PACKAGE_RE = re.compile(
     r")"
 )
 JSONL_SKILL_RE = re.compile(r"(?:^|[/\\])skills[/\\]jsonl-history-search(?:[/\\]|$)")
+CONVO_SKILL_RE = re.compile(r"(?:^|[/\\])skills[/\\]convo(?:[/\\]|$)")
 CONVO_ALIAS_RE = re.compile(r"(?:^|[\s;&|('\"`])convo(?:[\s'\"`]|$)")
 READ_MORE_RE = re.compile(r"(?:^|[\s;&|('\"`])jsonl-history-search\s+read-more(?:[\s'\"`]|$)")
 SEMANTIC_DEBUG_RE = re.compile(r"(?:^|[\s;&|('\"`])jsonl-history-search\s+semantic-debug(?:[\s'\"`]|$)")
@@ -190,6 +191,8 @@ def _command_kind(command: str) -> str:
         return "convo_alias"
     if JSONL_SKILL_RE.search(command):
         return "jsonl_skill_file_read"
+    if CONVO_SKILL_RE.search(command):
+        return "convo_skill_file_read"
     if "git " in lowered:
         return "git"
     if any(pattern.search(command) for pattern in BROAD_SEARCH_PATTERNS):
@@ -326,6 +329,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         "jsonl_cli": 0,
         "jsonl_package_import": 0,
         "jsonl_skill_file": 0,
+        "convo_skill_file": 0,
         "convo_alias": 0,
     }
     command_kind_counts: dict[str, int] = {}
@@ -363,6 +367,8 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             surface_counts["jsonl_package_import"] += 1
         if JSONL_SKILL_RE.search(command):
             surface_counts["jsonl_skill_file"] += 1
+        if CONVO_SKILL_RE.search(command):
+            surface_counts["convo_skill_file"] += 1
         if CONVO_ALIAS_RE.search(command):
             surface_counts["convo_alias"] += 1
         if event_type == "item.completed":
@@ -401,7 +407,8 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     product_surface_count = (
         surface_counts["jsonl_cli"] + surface_counts["jsonl_package_import"] + surface_counts["convo_alias"]
     )
-    skill_only_mentions = surface_counts["jsonl_skill_file"] > 0 and product_surface_count == 0
+    skill_file_mention_count = surface_counts["jsonl_skill_file"] + surface_counts["convo_skill_file"]
+    skill_only_mentions = skill_file_mention_count > 0 and product_surface_count == 0
     activated = product_surface_count > 0
     read_more_completed = sum(1 for command in completed_commands if READ_MORE_RE.search(command))
     semantic_debug_completed = sum(1 for command in completed_commands if SEMANTIC_DEBUG_RE.search(command))
@@ -464,7 +471,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         "activation": {
             "status": activation_status,
             "jsonl_product_surface_count": product_surface_count,
-            "skill_file_mention_count": surface_counts["jsonl_skill_file"],
+            "skill_file_mention_count": skill_file_mention_count,
             "surface_counts": surface_counts,
             "first_product_command": first_product,
         },
@@ -523,7 +530,14 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     return lane_report
 
 
-def build_receiving_agent_trace_ledger(lanes: Iterable[LaneSpec], *, repo_root: Path | None = None) -> dict[str, Any]:
+def build_receiving_agent_trace_ledger(
+    lanes: Iterable[LaneSpec],
+    *,
+    repo_root: Path | None = None,
+    trace_origin: str = "offline_replay",
+) -> dict[str, Any]:
+    if trace_origin not in {"offline_replay", "live_no_hint"}:
+        raise ValueError(f"Unsupported trace origin: {trace_origin}")
     lane_reports = [classify_lane(lane.lane_id, lane.path, repo_root=repo_root) for lane in lanes]
     summary = {
         "lane_count": len(lane_reports),
@@ -565,8 +579,9 @@ def build_receiving_agent_trace_ledger(lanes: Iterable[LaneSpec], *, repo_root: 
             "summary": summary,
             "lanes": lane_reports,
             "claim_boundaries": {
-                "offline_replay_only": True,
-                "live_model_send_run": False,
+                "trace_origin": trace_origin,
+                "offline_replay_only": trace_origin == "offline_replay",
+                "live_model_send_run": trace_origin == "live_no_hint",
                 "benchmark_suite_claimed": False,
                 "final_answer_quality_claim_supported": False,
             },
