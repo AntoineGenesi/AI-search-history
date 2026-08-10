@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -90,6 +91,27 @@ PRIMARY_CONTENT_ACCESS_RE = re.compile(
     re.IGNORECASE,
 )
 NON_PRIMARY_JSONL_NAMES = {"events.jsonl", "session_index.jsonl"}
+RG_OPTIONS_WITH_VALUE = {
+    "-A",
+    "--after-context",
+    "-B",
+    "--before-context",
+    "-C",
+    "--context",
+    "-e",
+    "--regexp",
+    "-f",
+    "--file",
+    "-g",
+    "--glob",
+    "--iglob",
+    "-m",
+    "--max-count",
+    "-t",
+    "--type",
+    "-T",
+    "--type-not",
+}
 PROVENANCE_SOURCE_FAMILY_MARKERS = (
     "provenance",
     "source",
@@ -271,6 +293,45 @@ def _event_command_succeeded(event: dict[str, Any]) -> bool:
     return str(item.get("status") or "").lower() == "completed"
 
 
+def _rg_targets_are_primary_raw_history_only(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv or argv[0] != "rg" or any(token in {";", "&&", "||", "|"} for token in argv):
+        return False
+
+    targets: list[str] = []
+    pattern_supplied = False
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            remaining = argv[index + 1 :]
+            if not pattern_supplied and remaining:
+                pattern_supplied = True
+                remaining = remaining[1:]
+            targets.extend(remaining)
+            break
+        if token in RG_OPTIONS_WITH_VALUE:
+            index += 1
+            if token in {"-e", "--regexp", "-f", "--file"}:
+                pattern_supplied = True
+        elif token.startswith(("--regexp=", "--file=")) or (
+            token.startswith(("-e", "-f")) and len(token) > 2
+        ):
+            pattern_supplied = True
+        elif token.startswith("-"):
+            pass
+        elif not pattern_supplied:
+            pattern_supplied = True
+        else:
+            targets.append(token)
+        index += 1
+
+    return bool(targets) and all(_has_primary_raw_history_path(target) for target in targets)
+
+
 def _evidence_access_roles(
     command: str,
     output: str,
@@ -295,7 +356,7 @@ def _evidence_access_roles(
         command_kind in {"broad_search_or_listing", "git"}
         and command_succeeded
         and output_has_evidence
-        and not command_has_primary
+        and not _rg_targets_are_primary_raw_history_only(command)
     )
     if output_discovery:
         protected_probe = f"{command}\n{output}"
