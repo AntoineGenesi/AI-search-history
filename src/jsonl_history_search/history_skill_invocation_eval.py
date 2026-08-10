@@ -12,11 +12,13 @@ from jsonl_history_search.receiving_agent_trace_ledger import (
 )
 
 
-SCHEMA_VERSION = "history-skill-invocation-cases.v1"
+LEGACY_SCHEMA_VERSION = "history-skill-invocation-cases.v1"
+SCHEMA_VERSION = "history-skill-invocation-cases.v2"
 REPORT_SCHEMA_VERSION = "history-skill-invocation-eval.v1"
-REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v1"
+LEGACY_REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v1"
+REPLAY_SCHEMA_VERSION = "history-skill-invocation-replay.v2"
 DEFAULT_MANIFEST = Path("benchmarks/history_skill_invocation/cases.json")
-REQUIRED_SCENARIOS = {
+LEGACY_REQUIRED_SCENARIOS = {
     "explicit_alias",
     "implicit_prior_dependency",
     "latest_status",
@@ -34,6 +36,12 @@ REQUIRED_SCENARIOS = {
     "negative_local_status",
     "negative_bare_ambiguity",
     "negative_named_task_ambiguity",
+}
+REQUIRED_SCENARIOS = LEGACY_REQUIRED_SCENARIOS | {
+    "ambiguous_prior_referent",
+    "repeated_question_history_exists",
+    "conflicting_history",
+    "negative_file_history",
 }
 CLARIFICATION_POLICIES = {"forbidden", "required", "allowed_after_product_use"}
 REQUIRED_ADJUDICATION_FIELDS = {
@@ -56,8 +64,11 @@ def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
 
 def validate_manifest(payload: dict[str, Any]) -> None:
     errors: list[str] = []
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        errors.append(f"schema_version must be {SCHEMA_VERSION!r}")
+    schema_version = payload.get("schema_version")
+    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+        errors.append(
+            f"schema_version must be {LEGACY_SCHEMA_VERSION!r} or {SCHEMA_VERSION!r}"
+        )
     cases = payload.get("cases")
     if not isinstance(cases, list) or not cases:
         errors.append("cases must be a non-empty list")
@@ -103,8 +114,13 @@ def validate_manifest(payload: dict[str, Any]) -> None:
             errors.append(f"{label}.expected.exact_source_refs must be a list of non-empty strings")
         if refs and (not isinstance(case.get("source_fixture"), str) or not case["source_fixture"]):
             errors.append(f"{label}.source_fixture is required for exact source refs")
+        if not isinstance(expected.get("partial_packet_continuation", False), bool):
+            errors.append(f"{label}.expected.partial_packet_continuation must be boolean")
 
-    missing = sorted(REQUIRED_SCENARIOS - scenarios)
+    required_scenarios = (
+        REQUIRED_SCENARIOS if schema_version == SCHEMA_VERSION else LEGACY_REQUIRED_SCENARIOS
+    )
+    missing = sorted(required_scenarios - scenarios)
     if missing:
         errors.append("missing required scenarios: " + ", ".join(missing))
     if errors:
@@ -260,6 +276,19 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
             if not no_history_pass:
                 failures.append("missing_history_resolution_failed")
 
+        partial_packet_path_pass = True
+        manual_fallback_after_partial = bool(observation.get("manual_fallback_after_partial_packet"))
+        if expected.get("partial_packet_continuation", False):
+            partial_packet_path_pass = observation.get("partial_packet_detected") is True
+            if not partial_packet_path_pass:
+                failures.append("partial_packet_signal_missing")
+            if observation.get("continuation_detected") is not True:
+                partial_packet_path_pass = False
+                failures.append("partial_packet_continuation_missing")
+            if manual_fallback_after_partial:
+                partial_packet_path_pass = False
+                failures.append("manual_fallback_after_partial_packet")
+
         case_results.append(
             {
                 "case_id": case_id,
@@ -273,6 +302,8 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
                 "source_grounding_pass": source_grounding_pass,
                 "exact_source_refs_pass": exact_refs_pass,
                 "no_history_outcome_pass": no_history_pass,
+                "partial_packet_path_pass": partial_packet_path_pass,
+                "manual_fallback_after_partial_packet": manual_fallback_after_partial,
                 "unnecessary_clarification": unnecessary_clarification,
                 "required_clarification_missing": required_clarification_missing,
                 "false_history_guess": false_history_guess,
@@ -288,6 +319,11 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
     source_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["source_grounding"]]
     exact_ref_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["exact_source_refs"]]
     missing_history_cases = [result for result, case in zip(case_results, manifest["cases"]) if case["expected"]["no_history_outcome"]]
+    partial_packet_cases = [
+        result
+        for result, case in zip(case_results, manifest["cases"])
+        if case["expected"].get("partial_packet_continuation", False)
+    ]
     errors = (["unexpected observations: " + ", ".join(extra_ids)] if extra_ids else [])
     passed_count = sum(1 for result in case_results if result["passed"])
     summary = {
@@ -306,6 +342,11 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
         "exact_source_refs_total": len(exact_ref_cases),
         "missing_history_resolution_pass_count": sum(1 for result in missing_history_cases if result["no_history_outcome_pass"]),
         "missing_history_resolution_total": len(missing_history_cases),
+        "partial_packet_path_pass_count": sum(1 for result in partial_packet_cases if result["partial_packet_path_pass"]),
+        "partial_packet_path_total": len(partial_packet_cases),
+        "manual_fallback_after_partial_packet_count": sum(
+            1 for result in partial_packet_cases if result["manual_fallback_after_partial_packet"]
+        ),
         "unnecessary_clarification_count": sum(1 for result in case_results if result["unnecessary_clarification"]),
         "required_clarification_missing_count": sum(1 for result in case_results if result["required_clarification_missing"]),
         "false_history_guess_count": sum(1 for result in case_results if result["false_history_guess"]),
@@ -317,8 +358,8 @@ def evaluate_cases(manifest: dict[str, Any], observations: Iterable[dict[str, An
             "errors": errors,
             "cases": case_results,
             "claim_boundary": (
-                "Trigger, product-use, and route signals come from trace evidence; semantic final correctness, "
-                "source grounding, clarification, and guessing require explicit adjudication."
+                "Trigger, product-use, route, and partial-packet path signals come from trace evidence; "
+                "semantic final correctness, source grounding, clarification, and guessing require explicit adjudication."
             ),
         }
     }
@@ -343,6 +384,16 @@ def observations_from_trace_ledger(
         if adjudication is None:
             raise ValueError(f"Missing semantic adjudication for {case_id!r}")
         routes = (lane.get("route_selection") or {}).get("route_families_detected") or []
+        command_order = lane.get("command_order") or []
+        partial_packet_indices = [
+            index
+            for index, entry in enumerate(command_order)
+            if entry.get("jsonl_product_surface") and entry.get("partial_packet_signal")
+        ]
+        partial_packet_detected = bool(partial_packet_indices)
+        after_partial_packet = (
+            command_order[partial_packet_indices[-1] + 1 :] if partial_packet_indices else []
+        )
         observations.append(
             {
                 **adjudication,
@@ -350,6 +401,12 @@ def observations_from_trace_ledger(
                 "trigger_detected": skill_seen or product_use,
                 "product_use_detected": product_use,
                 "detected_route_families": routes,
+                "partial_packet_detected": partial_packet_detected,
+                "continuation_detected": any(
+                    entry.get("jsonl_product_surface") for entry in after_partial_packet
+                ),
+                "manual_fallback_after_partial_packet": partial_packet_detected
+                and any(entry.get("manual_fallback_candidate") for entry in after_partial_packet),
             }
         )
     return observations
@@ -358,8 +415,17 @@ def observations_from_trace_ledger(
 def evaluate_replay_fixture(
     manifest: dict[str, Any], replay_payload: dict[str, Any], *, work_root: Path
 ) -> dict[str, Any]:
-    if replay_payload.get("schema_version") != REPLAY_SCHEMA_VERSION:
-        raise ValueError(f"Replay schema_version must be {REPLAY_SCHEMA_VERSION!r}")
+    replay_schema = replay_payload.get("schema_version")
+    manifest_schema = manifest.get("schema_version")
+    compatible_replay_schema = {
+        LEGACY_SCHEMA_VERSION: LEGACY_REPLAY_SCHEMA_VERSION,
+        SCHEMA_VERSION: REPLAY_SCHEMA_VERSION,
+    }.get(manifest_schema)
+    if replay_schema != compatible_replay_schema:
+        raise ValueError(
+            f"Replay schema_version {replay_schema!r} is incompatible with manifest {manifest_schema!r}; "
+            f"expected {compatible_replay_schema!r}"
+        )
     lanes = replay_payload.get("lanes")
     if not isinstance(lanes, list):
         raise ValueError("Replay fixture lanes must be a list")
