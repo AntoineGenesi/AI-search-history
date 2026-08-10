@@ -6139,6 +6139,12 @@ def _answer_action_contract_from_executed_output(
                 and not named_task_action_proof
             ):
                 contract["read"] = target_proof_handoff.get("read") or []
+                if target_proof_handoff.get("mismatch_reason") == (
+                    "reviewed_source_packet_pointer_unresolved"
+                ):
+                    contract["only_continue_if"] = (
+                        target_proof_handoff.get("only_continue_if") or []
+                    )
             contract["diagnostics_after"] = (
                 target_proof_handoff.get("secondary_context_after_source_inspection")
                 or []
@@ -6778,9 +6784,11 @@ def _reviewed_source_unresolved_target_handoff(
             }
         ],
         "only_continue_if": [
-            "resolve the retained reviewed packet pointer for the exact opaque handle",
-            "open only the packet-mapped target raw source first and preserve its packet-provided ref ID",
-            "do not derive a ref ID from the query or substitute generated/current-eval/report/manifest evidence",
+            (
+                "resolve the retained reviewed packet pointer for the exact opaque handle, then open only "
+                "its mapped primary raw source and preserve the packet-provided ref ID; do not substitute "
+                "generated/current-eval/report/manifest evidence"
+            )
         ],
     }
 
