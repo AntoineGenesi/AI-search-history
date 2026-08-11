@@ -255,6 +255,13 @@ def build_semantic_debug_payload(
         expansion_action_context=expansion_action_context,
         include_context_actions=bool(getattr(args, "compact_provenance_handoff", False)),
         suppress_action_proof=process_actual_use,
+        mark_action_proof_original_provenance=(
+            family.get("primary") in {"claimed_action", "expectation_mismatch"}
+            or (
+                family.get("primary") == "provenance"
+                and "claimed_action" in set(family.get("detected_supported") or [])
+            )
+        ),
     )
     next_reads = dedupe_dicts(
         inferred_anchor_next_reads(
@@ -4274,16 +4281,45 @@ def historical_provenance_self_echo_policy_wanted(
 
 def dedupe_historical_provenance_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     for read in next_reads:
         source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
         key = str(read.get("target") or source_ref_target(source_ref) or source_ref.get("path") or "")
         if key and key in seen:
+            retained_index = seen[key]
+            result[retained_index] = preserve_action_proof_selection_on_retained_read(
+                result[retained_index],
+                read,
+            )
             continue
         if key:
-            seen.add(key)
+            seen[key] = len(result)
         result.append(read)
     return result
+
+
+def preserve_action_proof_selection_on_retained_read(
+    retained: dict[str, Any],
+    duplicate: dict[str, Any],
+) -> dict[str, Any]:
+    action_selection = duplicate.get("action_proof_source_selection")
+    local_pair = duplicate.get("action_proof_local_pair")
+    historical_selection = duplicate.get("historical_provenance_selection")
+    if not (
+        isinstance(action_selection, dict)
+        and isinstance(local_pair, dict)
+        and isinstance(historical_selection, dict)
+        and historical_selection.get("source_chronology_role")
+        == "target_historical_raw_action_source"
+        and historical_selection.get("final_support_allowed") is True
+        and historical_selection.get("diagnostic_only") is False
+    ):
+        return retained
+    row = dict(retained)
+    row["action_proof_source_selection"] = dict(action_selection)
+    row["action_proof_local_pair"] = dict(local_pair)
+    row["historical_provenance_selection"] = dict(historical_selection)
+    return row
 
 
 def historical_provenance_current_scope_requested(query: str) -> bool:
@@ -6335,6 +6371,17 @@ def inferred_known_action_case_next_reads(
             "source_window_verification_required": True,
             "claim_boundary": "inferred_known_case_anchor_not_final_answer",
         }
+        read["historical_provenance_selection"] = {
+            "schema_version": 1,
+            "source_chronology_role": "target_historical_raw_known_action_source",
+            "selection_reason": "known_action_case_anchor",
+            "final_support_allowed": True,
+            "diagnostic_only": False,
+            "raw_text_included": False,
+        }
+        local_pair = action_proof_local_pair_for_path(Path(str(source_ref["path"])))
+        if local_pair:
+            read["action_proof_local_pair"] = local_pair
         reads.append(read)
     return reads
 
@@ -10645,18 +10692,46 @@ def build_source_window_action_proof(
         item["primary_action_proof"] = False
         item["proof_role"] = "assistant_claim_not_tool_proof"
 
-    tool_events = list(tool_proof.get("events") or [])
-    call_records = [
-        tool_event_action_record(event, proof_role="command_or_tool_call", primary=True)
-        for event in tool_events
-        if is_action_call_event(event)
-    ][:ACTION_PROOF_BUCKET_RECORD_CAP]
-    output_records = [
-        tool_event_action_record(event, proof_role="command_or_tool_output", primary=True)
-        for event in tool_events
-        if is_output_evidence_event(event)
-    ][:ACTION_PROOF_BUCKET_RECORD_CAP]
-    change_records = changed_check_review_commit_records(tool_events, joins)
+    tool_events = classify_action_proof_tool_events(
+        list(tool_proof.get("events") or []),
+        selected_original_source_paths=action_proof_selected_original_source_paths(
+            source_locator_handoff,
+            next_reads,
+        ),
+    )
+    paired_original_event_ids = action_proof_paired_original_event_ids(tool_events)
+    local_call_records, local_output_records = action_proof_selected_local_pair_records(
+        next_reads
+    )
+    call_records = prioritize_action_proof_records(
+        [
+            tool_event_action_record(
+                event,
+                proof_role="command_or_tool_call",
+                primary=str(event.get("event_id") or "") in paired_original_event_ids,
+            )
+            for event in tool_events
+            if is_action_call_event(event)
+        ]
+        + local_call_records
+    )
+    output_records = prioritize_action_proof_records(
+        [
+            tool_event_action_record(
+                event,
+                proof_role="command_or_tool_output",
+                primary=str(event.get("event_id") or "") in paired_original_event_ids,
+            )
+            for event in tool_events
+            if is_output_evidence_event(event)
+        ]
+        + local_output_records
+    )
+    change_records = changed_check_review_commit_records(
+        tool_events,
+        joins,
+        paired_original_event_ids=paired_original_event_ids,
+    )
     adjacent_records = adjacent_artifact_records(joins, next_reads)
     verification_reads = [
         read
@@ -10675,11 +10750,13 @@ def build_source_window_action_proof(
             "command_tool_call",
             call_records,
             missing_label="missing_structured_command_or_tool_call",
+            requires_primary=True,
         ),
         "command_tool_output": action_bucket(
             "command_tool_output",
             output_records,
             missing_label="missing_structured_command_or_tool_output",
+            requires_primary=True,
         ),
         "changed_check_review_commit_evidence": action_bucket(
             "changed_check_review_commit_evidence",
@@ -10708,8 +10785,8 @@ def build_source_window_action_proof(
     discipline_gate = answer_source_discipline.get("answer_gate") or {}
     status = (
         "action_proof_available"
-        if buckets["command_tool_call"]["status"] == "present"
-        and buckets["command_tool_output"]["status"] == "present"
+        if buckets["command_tool_call"].get("primary_record_count", 0) > 0
+        and buckets["command_tool_output"].get("primary_record_count", 0) > 0
         else "partial_action_proof"
         if primary_count
         else "missing_action_proof"
@@ -10732,12 +10809,22 @@ def build_source_window_action_proof(
             "answer_source_discipline_blocked_facets": list(discipline_gate.get("blocked_facets") or [])[:8],
             "source_window_verification_required": bool(verification_reads),
             "verification_required_next_read_count": len(verification_reads),
+            "diagnostic_or_unselected_tool_record_count": sum(
+                1
+                for bucket in buckets.values()
+                for record in bucket.get("records") or []
+                if record.get("execution_proof_eligible") is False
+            ),
         },
         "guidance": {
             "use_for_claimed_action_questions": True,
             "assistant_claim_boundary": "final_assistant_answer_claim records show what was claimed, not whether the action happened",
             "missing_evidence_policy": "missing buckets are labeled explicitly; do not infer action proof from adjacent artifacts or assistant prose",
             "source_window_boundary": "action-proof next_reads are candidate source windows; verify the opened window is the requested original source window before answering",
+            "source_provenance_boundary": (
+                "Positive promotion requires upstream target/original source selection plus a "
+                "locally coherent command or call and outcome pair."
+            ),
         },
         "links": {
             "source_locator_handoff": "semantic_debug.source_locator_handoff",
@@ -10750,7 +10837,10 @@ def build_source_window_action_proof(
             "records_per_bucket": ACTION_PROOF_BUCKET_RECORD_CAP,
             "source_windows": ACTION_PROOF_BUCKET_RECORD_CAP,
             "text_excerpt_chars": ACTION_PROOF_TEXT_LIMIT,
-            "deterministic_order": "candidate/timeline order, then structured tool-event order, then join/next-read order",
+            "deterministic_order": (
+                "candidate/timeline order, then eligible paired tool events before diagnostic "
+                "tool events, then join/next-read order"
+            ),
         },
         "privacy_boundaries": {
             "raw_transcript_dump_included": False,
@@ -10764,6 +10854,9 @@ def build_source_window_action_proof(
             "adjacent_artifact_satisfies_primary_action_proof": False,
             "missing_output_inferred_from_call": False,
             "candidate_next_read_proves_original_source_window": False,
+            "generic_source_ref_satisfies_action_proof": False,
+            "fixture_generated_evaluator_row_satisfies_action_proof": False,
+            "unpaired_original_call_or_output_satisfies_action_proof": False,
         },
     }
 
@@ -10880,6 +10973,8 @@ def candidate_action_record(item: dict[str, Any], *, source: str) -> dict[str, A
 
 
 def tool_event_action_record(event: dict[str, Any], *, proof_role: str, primary: bool) -> dict[str, Any]:
+    provenance = action_proof_event_source_provenance(event)
+    eligible = bool(primary and provenance["original_execution_source"])
     record = {
         "record_type": event.get("event_type") or "tool_event",
         "record_source": "semantic_debug.tool_action_proof.events",
@@ -10895,18 +10990,188 @@ def tool_event_action_record(event: dict[str, Any], *, proof_role: str, primary:
         "output_paths": list(event.get("output_paths") or [])[:4],
         "confidence": event.get("confidence"),
         "evidence_basis": list(event.get("evidence_basis") or [])[:6],
-        "primary_action_proof": primary,
-        "proof_role": proof_role,
+        "primary_action_proof": eligible,
+        "execution_proof_eligible": eligible,
+        "proof_role": proof_role if eligible else "diagnostic_tool_row_not_execution_proof",
+        "source_provenance": provenance,
     }
     return {key: value for key, value in record.items() if value not in (None, [], {})}
 
 
-def changed_check_review_commit_records(tool_events: list[dict[str, Any]], joins: dict[str, Any]) -> list[dict[str, Any]]:
+def action_proof_event_source_key(event: dict[str, Any]) -> str:
+    source_ref = event.get("source_ref") if isinstance(event.get("source_ref"), dict) else {}
+    return str(source_ref.get("path") or source_ref.get("session") or "")
+
+
+def classify_action_proof_tool_events(
+    tool_events: list[dict[str, Any]],
+    *,
+    selected_original_source_paths: set[str],
+) -> list[dict[str, Any]]:
+    classified = []
+    for event in tool_events:
+        row = dict(event)
+        path = action_proof_event_source_key(row)
+        selected = bool(
+            path
+            and action_proof_source_path_identity(path) in selected_original_source_paths
+        )
+        row["_action_proof_source_provenance"] = {
+            "role": "target_original_source" if selected else "unselected_or_diagnostic_source",
+            "original_execution_source": selected,
+            "creator_artifact_not_execution_proof": not selected,
+            "classification_basis": (
+                "explicit_upstream_target_original_selection"
+                if selected
+                else "no_explicit_upstream_target_original_selection"
+            ),
+        }
+        classified.append(row)
+    return classified
+
+
+def action_proof_event_source_provenance(event: dict[str, Any]) -> dict[str, Any]:
+    classified = event.get("_action_proof_source_provenance")
+    if isinstance(classified, dict):
+        return classified
+    return {
+        "role": "unselected_or_diagnostic_source",
+        "original_execution_source": False,
+        "creator_artifact_not_execution_proof": True,
+        "classification_basis": "no_explicit_upstream_target_original_selection",
+    }
+
+
+def action_proof_selected_original_source_paths(
+    source_locator_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> set[str]:
+    reads = [
+        *next_reads,
+        *[
+            read
+            for read in source_locator_handoff.get("next_reads") or []
+            if isinstance(read, dict)
+        ],
+    ]
+    return {
+        action_proof_source_path_identity(action_proof_read_source_path(read))
+        for read in reads
+        if isinstance(read, dict)
+        and action_proof_read_source_path(read)
+        and action_proof_read_has_original_source_provenance(read)
+    }
+
+
+def action_proof_source_path_identity(path_value: str) -> str:
+    return os.path.normcase(os.path.normpath(str(Path(path_value).expanduser())))
+
+
+def prioritize_action_proof_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    eligible = [record for record in records if record.get("primary_action_proof") is True]
+    diagnostic = [record for record in records if record.get("primary_action_proof") is not True]
+    result: list[dict[str, Any]] = []
+    seen_source_refs: set[str] = set()
+    for record in eligible + diagnostic:
+        source_ref = record.get("source_ref") if isinstance(record.get("source_ref"), dict) else {}
+        key = action_source_ref_key(source_ref) if source_ref else str(record.get("event_id") or "")
+        if key and key in seen_source_refs:
+            continue
+        if key:
+            seen_source_refs.add(key)
+        result.append(record)
+    return result[:ACTION_PROOF_BUCKET_RECORD_CAP]
+
+
+def action_proof_paired_original_event_ids(tool_events: list[dict[str, Any]]) -> set[str]:
+    pending_calls: dict[str, dict[str, Any]] = {}
+    paired: set[str] = set()
+    for event in tool_events:
+        source = action_proof_event_source_key(event)
+        if not source or not action_proof_event_source_provenance(event)["original_execution_source"]:
+            continue
+        if is_action_call_event(event):
+            pending_calls[source] = event
+            continue
+        if not is_output_evidence_event(event) or source not in pending_calls:
+            continue
+        call = pending_calls.pop(source)
+        call_ref = call.get("source_ref") if isinstance(call.get("source_ref"), dict) else {}
+        output_ref = event.get("source_ref") if isinstance(event.get("source_ref"), dict) else {}
+        call_line = int(call_ref.get("line") or 0)
+        output_line = int(output_ref.get("line") or 0)
+        if call_line and output_line and output_line <= call_line:
+            continue
+        paired.update(
+            str(item.get("event_id"))
+            for item in (call, event)
+            if item.get("event_id")
+        )
+    return paired
+
+
+def action_proof_selected_local_pair_records(
+    next_reads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    calls: list[dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
+    for read in next_reads:
+        if not action_proof_read_has_original_source_provenance(read):
+            continue
+        pair = (
+            read.get("action_proof_local_pair")
+            if isinstance(read.get("action_proof_local_pair"), dict)
+            else {}
+        )
+        for key, proof_role, destination in (
+            ("call_source_ref", "command_or_tool_call", calls),
+            ("output_source_ref", "command_or_tool_output", outputs),
+        ):
+            source_ref = pair.get(key) if isinstance(pair.get(key), dict) else {}
+            if not source_ref:
+                continue
+            destination.append(
+                {
+                    "record_type": "raw_source_window_record",
+                    "record_source": "semantic_debug.next_reads.action_proof_local_pair",
+                    "event_id": (
+                        f"raw-pair:{source_ref.get('path')}:{source_ref.get('line')}"
+                    ),
+                    "source_ref": compact_action_source_ref(source_ref),
+                    "source_status": "present",
+                    "primary_action_proof": True,
+                    "execution_proof_eligible": True,
+                    "proof_role": proof_role,
+                    "source_provenance": {
+                        "role": "target_original_source",
+                        "original_execution_source": True,
+                        "creator_artifact_not_execution_proof": False,
+                        "classification_basis": (
+                            "explicit_upstream_target_selection_with_local_raw_pair"
+                        ),
+                    },
+                }
+            )
+    return dedupe_action_records(calls), dedupe_action_records(outputs)
+
+
+def changed_check_review_commit_records(
+    tool_events: list[dict[str, Any]],
+    joins: dict[str, Any],
+    *,
+    paired_original_event_ids: set[str],
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for event in tool_events:
         if not is_change_check_review_commit_event(event):
             continue
-        records.append(tool_event_action_record(event, proof_role="changed_check_or_commit_evidence", primary=True))
+        records.append(
+            tool_event_action_record(
+                event,
+                proof_role="changed_check_or_commit_evidence",
+                primary=str(event.get("event_id") or "") in paired_original_event_ids,
+            )
+        )
     if joins.get("commit"):
         records.append(
             {
@@ -10914,8 +11179,8 @@ def changed_check_review_commit_records(tool_events: list[dict[str, Any]], joins
                 "record_source": "semantic_debug.task_review_commit_joins.commit",
                 "source_status": "join_metadata_no_transcript_source_ref",
                 "commit": joins.get("commit"),
-                "primary_action_proof": True,
-                "proof_role": "commit_evidence",
+                "primary_action_proof": False,
+                "proof_role": "secondary_commit_confirmation",
             }
         )
     if joins.get("path_last_change"):
@@ -10925,8 +11190,8 @@ def changed_check_review_commit_records(tool_events: list[dict[str, Any]], joins
                 "record_source": "semantic_debug.task_review_commit_joins.path_last_change",
                 "source_status": "join_metadata_no_transcript_source_ref",
                 "path_last_change": joins.get("path_last_change"),
-                "primary_action_proof": True,
-                "proof_role": "changed_file_evidence",
+                "primary_action_proof": False,
+                "proof_role": "secondary_changed_file_confirmation",
             }
         )
     for item in list(joins.get("review_evidence") or [])[:ACTION_PROOF_BUCKET_RECORD_CAP]:
@@ -10941,8 +11206,8 @@ def changed_check_review_commit_records(tool_events: list[dict[str, Any]], joins
                 "claim_action": item.get("claim_action"),
                 "support_status": item.get("support_status"),
                 "support_basis_kind": item.get("support_basis_kind"),
-                "primary_action_proof": True,
-                "proof_role": "review_evidence",
+                "primary_action_proof": False,
+                "proof_role": "secondary_review_confirmation",
             }
         )
     return dedupe_action_records(records)[:ACTION_PROOF_BUCKET_RECORD_CAP]
@@ -10991,13 +11256,20 @@ def action_bucket(
     *,
     missing_label: str,
     adjacent_only: bool = False,
+    requires_primary: bool = False,
 ) -> dict[str, Any]:
     clean_records = [
         {key: value for key, value in record.items() if value not in (None, [], {})}
         for record in records[:ACTION_PROOF_BUCKET_RECORD_CAP]
     ]
-    status = "present" if clean_records else "not_present"
     primary_count = sum(1 for record in clean_records if record.get("primary_action_proof") is True)
+    status = (
+        "present"
+        if clean_records and (not requires_primary or primary_count)
+        else "non_execution_artifact_only"
+        if clean_records
+        else "not_present"
+    )
     return {
         "bucket": name,
         "status": status,
@@ -11005,7 +11277,7 @@ def action_bucket(
         "record_count": len(clean_records),
         "primary_record_count": 0 if adjacent_only else primary_count,
         "adjacent_evidence_only": adjacent_only,
-        "missing_labels": [] if clean_records else [missing_label],
+        "missing_labels": [] if status == "present" else [missing_label],
     }
 
 
@@ -13233,12 +13505,14 @@ def action_proof_primary_refs(
     next_reads: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
+    paired_original_paths = action_proof_primary_record_paths(source_window_action_proof)
     for read in list(next_reads or []):
-        if read_is_required_surface_actionable(read) and reviewed_source_packet_pointer_read(read):
+        if (
+            read_is_required_surface_actionable(read)
+            and reviewed_source_packet_pointer_read(read)
+            and action_proof_read_has_original_source_provenance(read)
+        ):
             refs.append(action_proof_read_ref(read, proof_role="reviewed_source_packet_pointer"))
-    for read in [item for item in action_reads if read_is_required_surface_actionable(item)][:4]:
-        refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
-
     direct_source_session_refs = [
         ref
         for ref in refs
@@ -13256,7 +13530,61 @@ def action_proof_primary_refs(
             ref = action_proof_record_ref(record, bucket_name=bucket_name)
             if ref:
                 refs.append(ref)
+    for read in [
+        item
+        for item in action_reads
+        if read_is_required_surface_actionable(item)
+        and action_proof_read_has_original_source_provenance(item)
+        and action_proof_read_source_path(item) in paired_original_paths
+    ][:4]:
+        refs.append(action_proof_read_ref(read, proof_role="candidate_action_source_window"))
     return dedupe_dicts(refs)[:6]
+
+
+def action_proof_primary_record_paths(source_window_action_proof: dict[str, Any]) -> set[str]:
+    buckets = source_window_action_proof.get("buckets") or {}
+    return {
+        str((record.get("source_ref") or {}).get("path"))
+        for bucket in buckets.values()
+        for record in bucket.get("records") or []
+        if record.get("primary_action_proof") is True
+        and isinstance(record.get("source_ref"), dict)
+        and (record.get("source_ref") or {}).get("path")
+    }
+
+
+def action_proof_read_source_path(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    return str(source_ref.get("path") or source_target_path_part(str(read.get("target") or "")))
+
+
+def action_proof_read_has_original_source_provenance(read: dict[str, Any]) -> bool:
+    if core_convo_read_is_diagnostic_or_post_hoc(read):
+        return False
+    if reviewed_source_packet_pointer_read(read):
+        return True
+    action_selection = (
+        read.get("action_proof_source_selection")
+        if isinstance(read.get("action_proof_source_selection"), dict)
+        else {}
+    )
+    selection = (
+        read.get("historical_provenance_selection")
+        if isinstance(read.get("historical_provenance_selection"), dict)
+        else {}
+    )
+    return bool(
+        action_selection
+        and selection.get("source_chronology_role")
+        in {
+            "target_historical_raw_action_source",
+            "target_historical_raw_known_action_source",
+            "target_historical_raw_direct_event_source_ref",
+            "target_historical_raw_worker_completion_source_ref",
+        }
+        and selection.get("final_support_allowed") is True
+        and selection.get("diagnostic_only") is False
+    )
 
 
 def action_proof_read_ref(read: dict[str, Any], *, proof_role: str) -> dict[str, Any]:
@@ -13942,6 +14270,7 @@ def build_next_reads(
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
     suppress_action_proof: bool = False,
+    mark_action_proof_original_provenance: bool = True,
 ) -> list[dict[str, str]]:
     reads: list[dict[str, Any]] = []
     for candidate in candidates[:5]:
@@ -14023,6 +14352,7 @@ def build_next_reads(
             tool_proof=tool_proof,
             expansion_action_context=expansion_action_context,
             include_context_actions=include_context_actions,
+            mark_original_provenance=mark_action_proof_original_provenance,
         )
     )
     return dedupe_dicts(correction_reads + promoted_reads + reads)[:12]
@@ -14259,6 +14589,7 @@ def action_proof_source_next_reads(
     tool_proof: dict[str, Any],
     expansion_action_context: dict[str, Any] | None = None,
     include_context_actions: bool = False,
+    mark_original_provenance: bool = True,
 ) -> list[dict[str, Any]]:
     if not action_proof_source_selection_wanted(query):
         return []
@@ -14275,9 +14606,17 @@ def action_proof_source_next_reads(
     }
     scored: list[dict[str, Any]] = []
     for path in source_paths[:ACTION_PROOF_SCAN_FILE_LIMIT]:
-        scored.extend(action_proof_records_for_path(path, query_terms=query_terms, tool_proof_paths=tool_proof_paths))
+        scored.extend(
+            action_proof_records_for_path(
+                path,
+                query=query,
+                query_terms=query_terms,
+                tool_proof_paths=tool_proof_paths,
+            )
+        )
     scored.sort(
         key=lambda item: (
+            bool((item.get("historical_provenance_selection") or {}).get("diagnostic_only")),
             -float(item["score"]),
             str(item.get("timestamp_utc") or ""),
             str((item.get("source_ref") or {}).get("path") or ""),
@@ -14311,6 +14650,19 @@ def action_proof_source_next_reads(
                 expansion_action_context=expansion_action_context,
             ),
         }
+        if mark_original_provenance:
+            selection = dict(item["historical_provenance_selection"])
+            read["historical_provenance_selection"] = selection
+            if item.get("action_proof_local_pair"):
+                read["action_proof_local_pair"] = dict(item["action_proof_local_pair"])
+            if selection.get("diagnostic_only") is True:
+                read["diagnostic_only"] = True
+                read["read_more_actionable"] = False
+                read["followthrough_actionable"] = False
+            else:
+                read["diagnostic_only"] = False
+                read["read_more_actionable"] = True
+                read["followthrough_actionable"] = True
         if include_context_actions:
             read["context_actions"] = context_actions_for_source_ref(
                 source_ref,
@@ -14377,12 +14729,19 @@ def action_proof_candidate_paths(candidates: list[dict[str, Any]], tool_proof: d
 def action_proof_records_for_path(
     path: Path,
     *,
+    query: str,
     query_terms: set[str],
     tool_proof_paths: set[str],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
         records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+        source_selection = action_proof_source_selection_provenance(
+            path,
+            records=records,
+            query=query,
+        )
+        local_pair = action_proof_local_pair_from_records(path, records)
         for index, record in enumerate(records):
             score, matched_terms, selection_reason = score_action_proof_record(
                 text=record.text,
@@ -14405,11 +14764,130 @@ def action_proof_records_for_path(
                     "score": score,
                     "matched_query_terms": sorted(matched_terms),
                     "selection_reason": selection_reason,
+                    "historical_provenance_selection": source_selection,
+                    "action_proof_local_pair": local_pair,
                 }
             )
     except (AdapterReadError, OSError, ValueError):
         return []
     return rows
+
+
+def action_proof_local_pair_for_path(path: Path) -> dict[str, Any]:
+    try:
+        records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+    except (AdapterReadError, OSError, ValueError):
+        return {}
+    return action_proof_local_pair_from_records(path, records)
+
+
+def action_proof_local_pair_from_records(
+    path: Path,
+    records: list[Any],
+) -> dict[str, Any]:
+    pending_call = None
+    for record in records:
+        role = str(record.role or "").casefold()
+        if "function_call_output" in role or "tool_output" in role:
+            if pending_call is None:
+                continue
+            return {
+                "schema_version": 1,
+                "call_source_ref": {
+                    "path": str(path),
+                    "line": int(pending_call.line),
+                },
+                "output_source_ref": {
+                    "path": str(path),
+                    "line": int(record.line),
+                },
+                "pairing_basis": "same_source_next_structured_call_output",
+                "raw_text_included": False,
+            }
+        if "function_call" in role or role in {"tool", "tool_call"}:
+            pending_call = record
+    return {}
+
+
+def action_proof_source_selection_provenance(
+    path: Path,
+    *,
+    records: list[Any],
+    query: str,
+) -> dict[str, Any]:
+    diagnostic_reason = action_proof_diagnostic_source_reason(
+        path,
+        records=records,
+        query=query,
+    ) or "candidate_action_window_lacks_independent_target_identity"
+    return {
+        "schema_version": 1,
+        "source_chronology_role": "current_loop_action_diagnostic",
+        "selection_reason": diagnostic_reason,
+        "final_support_allowed": False,
+        "diagnostic_only": True,
+        "raw_text_included": False,
+    }
+
+
+def action_proof_diagnostic_source_reason(
+    path: Path,
+    *,
+    records: list[Any],
+    query: str,
+) -> str | None:
+    path_parts = {
+        part.casefold()
+        for part in path.as_posix().split("/")
+        if part
+    }
+    if path_parts & {
+        "fixtures",
+        "fixture",
+        "generated",
+        "evaluator",
+        "evaluators",
+        "evaluation",
+        "evaluations",
+        "gold",
+        "reports",
+    }:
+        return "source_surface_is_generated_evaluator_fixture_or_report"
+
+    for record in records:
+        role = str(record.role or "").casefold()
+        if not any(token in role for token in ("user", "human")):
+            continue
+        text = re.sub(r"\s+", " ", str(record.text or "").casefold()).strip()
+        if setup_echo_classification(text, query=query).get("is_setup_echo"):
+            return "source_request_is_current_loop_setup_or_evaluator_material"
+        if action_proof_evaluator_or_fixture_request(text):
+            return "source_request_is_evaluator_or_fixture_material"
+    return None
+
+
+def action_proof_evaluator_or_fixture_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+    if any(
+        marker in normalized
+        for marker in (
+            "independent evaluator",
+            "current evaluator",
+            "prepare synthetic",
+            "synthetic evidence",
+            "fixture evidence",
+            "answer key",
+            "gold response",
+        )
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:you are )?(?:reviewing|review|evaluate|evaluating|determine|assess) "
+            r"whether (?:the )?(?:worker|agent|assistant)\b",
+            normalized,
+        )
+    )
 
 
 def action_proof_neighborhood_bonus(records: list[Any], index: int) -> tuple[float, str]:
