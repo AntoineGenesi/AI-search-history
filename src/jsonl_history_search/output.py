@@ -2175,6 +2175,8 @@ def render_in_depth_audit_followthrough_text(
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
+        requested_failure_class = target_contract.get("requested_failure_class") or {}
+        time_scope_intent = target_contract.get("time_scope_intent") or {}
         lines.append(
             f"- target persistence: required={target_contract.get('target_persistence_required')} "
             f"ready={target_contract.get('target_persistence_ready')} "
@@ -2182,6 +2184,18 @@ def render_in_depth_audit_followthrough_text(
             f"target_matched_reads={target_contract.get('target_matched_read_count', 0)} "
             f"drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}"
         )
+        lines.append(
+            f"- target contract: failure_class={requested_failure_class.get('normalized_label') or 'unspecified'} "
+            f"scope={time_scope_intent.get('scope') or 'unspecified'} "
+            f"required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}"
+        )
+        lines.append(
+            "- forbidden nearby substitutes: "
+            + (",".join(target_contract.get("forbidden_nearby_substitutes") or []) or "none")
+        )
+        missing_evidence = list(target_contract.get("missing_required_evidence_classes") or [])
+        if missing_evidence:
+            lines.append(f"- missing required evidence: {','.join(missing_evidence)}")
         if target_block.get("blocked"):
             lines.append(
                 "- answer blocked: target_mismatch_detected; primary_answer_material_allowed=False; "
@@ -2315,6 +2329,8 @@ def render_in_depth_audit_followthrough_markdown(
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
+        requested_failure_class = target_contract.get("requested_failure_class") or {}
+        time_scope_intent = target_contract.get("time_scope_intent") or {}
         lines.append(
             f"- `target_persistence`: `required={target_contract.get('target_persistence_required')}` "
             f"`ready={target_contract.get('target_persistence_ready')}` "
@@ -2322,6 +2338,19 @@ def render_in_depth_audit_followthrough_markdown(
             f"`target_matched_reads={target_contract.get('target_matched_read_count', 0)}` "
             f"`drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}`"
         )
+        lines.append(
+            f"- `target_contract`: `failure_class={requested_failure_class.get('normalized_label') or 'unspecified'}` "
+            f"`scope={time_scope_intent.get('scope') or 'unspecified'}` "
+            f"`required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}`"
+        )
+        lines.append(
+            "- `forbidden_nearby_substitutes`: `"
+            + (",".join(target_contract.get("forbidden_nearby_substitutes") or []) or "none")
+            + "`"
+        )
+        missing_evidence = list(target_contract.get("missing_required_evidence_classes") or [])
+        if missing_evidence:
+            lines.append(f"- `missing_required_evidence`: `{','.join(missing_evidence)}`")
         if target_block.get("blocked"):
             lines.append(
                 "- `answer_blocked`: `target_mismatch_detected` `primary_answer_material_allowed=False` "
@@ -6477,6 +6506,8 @@ def _render_semantic_debug_missing_primary_evidence(
     if handoff.get("decision") != "missing_primary_evidence" and not target_mismatch:
         return None
     guidance = handoff.get("source_action_guidance") or {}
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    target_contract = followthrough.get("target_persistence_contract") or {}
     commands = []
     command_items = guidance.get("exact_jsonl_continuation_commands") or []
     if target_mismatch:
@@ -6491,6 +6522,16 @@ def _render_semantic_debug_missing_primary_evidence(
     blocker = (
         "Target-matching primary conversation-history evidence was not found in the searched scope, "
         "so the historical/provenance question cannot be answered."
+    )
+    requested_failure_class = target_contract.get("requested_failure_class") or {}
+    time_scope_intent = target_contract.get("time_scope_intent") or {}
+    target_contract_summary = (
+        f"Target contract: failure_class={requested_failure_class.get('normalized_label') or 'unspecified'}; "
+        f"scope={time_scope_intent.get('scope') or 'unspecified'}; "
+        f"required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}; "
+        f"forbidden_substitutes={','.join(target_contract.get('forbidden_nearby_substitutes') or []) or 'none'}."
+        if target_mismatch and target_contract
+        else None
     )
     prohibition = (
         "STOP: Repository task, report, review, documentation, and learning artifacts are "
@@ -6515,6 +6556,8 @@ def _render_semantic_debug_missing_primary_evidence(
             f"- {blocker}",
             f"- **{prohibition}**",
         ]
+        if target_contract_summary:
+            lines.append(f"- {target_contract_summary}")
         if commands:
             lines.extend(["", "## Exact JSONL Continuation", ""])
             for command in commands[:1]:
@@ -6523,7 +6566,11 @@ def _render_semantic_debug_missing_primary_evidence(
             lines.extend(
                 [
                     "",
-                    "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root.",
+                    (
+                        "- No bounded target-preserving continuation is available; fail closed."
+                        if target_mismatch
+                        else "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+                    ),
                 ]
             )
         return "\n".join(lines)
@@ -6533,11 +6580,15 @@ def _render_semantic_debug_missing_primary_evidence(
         blocker,
         prohibition,
     ]
+    if target_contract_summary:
+        lines.append(target_contract_summary)
     if commands:
         lines.extend(["Exact JSONL continuation:", commands[0]])
     else:
         lines.append(
-            "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+            "No bounded target-preserving continuation is available; fail closed."
+            if target_mismatch
+            else "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
         )
     return "\n".join(lines)
 
