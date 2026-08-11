@@ -11,15 +11,17 @@ Use this alias only for explicit local conversation-history retrieval.
 
 ## First Move
 
-For any latest-message ask paired with an explicit alias, including
-parent/main-thread variants, remove only the alias and run the matching
+For a parent/main latest-message ask paired with an explicit alias, remove only
+the alias, preserve parent scope with `--parent-thread`, and run the matching
 `what-happened-since` command before repo search,
 `which/command -v`, `convo --help`, connector discovery, plugin install, Git,
 or visible-context synthesis:
 
 ```bash
-jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text
+jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --format text
 ```
+
+For unscoped latest-message wording, omit `--parent-thread`.
 
 For explicit history-tool aliases that are not latest-message asks, immediately
 run:

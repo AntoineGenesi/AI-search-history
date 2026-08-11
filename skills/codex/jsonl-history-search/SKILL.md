@@ -33,8 +33,7 @@ Resolve before asking: search once after named-task scope; ask only on
 absent/capped/ambiguous/unavailable.
 
 Start exactly one installed route before repo search, Git, or visible-context synthesis.
-Latest-message aliases, including parent/main wording, use `what-happened-since`;
-preserve the question and remove only the alias: `jsonl-history-search what-happened-since "what has happened since my last message?" --cwd "$PWD" --format text`. `convo tool`/`convo CLI`/`jsonl-search-history`/`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --format text`; unscoped wording omits `--parent-thread`. `convo tool`/`convo CLI`/`jsonl-search-history`/`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
 old-context decisions (`before compaction`, `outside visible context`, or
 `earlier in the thread`) use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
