@@ -222,11 +222,17 @@ def build_agent_find_payload(
     agent_find["source_locator_handoff"] = handoff
     if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
         agent_find["retrieval_pressure"]["stage_diagnostics"] = handoff["stage_diagnostics"]
+    if deep_audit_target_contract:
+        apply_deep_audit_find_target_contract(
+            agent_find,
+            contract=deep_audit_target_contract,
+            source_plan=source_plan,
+        )
     if compact_provenance_handoff:
         agent_find["compact_provenance_handoff"] = build_compact_provenance_handoff(
-            status=status,
+            status=agent_find["status"],
             command_surface="find",
-            candidates=candidate_dicts,
+            candidates=agent_find["find_candidates"],
             source_locator_handoff=handoff,
             next_reads=handoff["next_reads"],
             no_evidence=agent_find["no_evidence_report"],
@@ -254,12 +260,6 @@ def build_agent_find_payload(
             agent_find["compact_provenance_handoff"]["stage_diagnostics_summary"] = compact_stage_diagnostics_summary(
                 compact_stage_diagnostics
             )
-    if deep_audit_target_contract:
-        apply_deep_audit_find_target_contract(
-            agent_find,
-            contract=deep_audit_target_contract,
-            source_plan=source_plan,
-        )
     return {"agent_find": agent_find}
 
 
@@ -586,34 +586,40 @@ def compact_provenance_source_window_summaries(source_windows: list[dict[str, An
         source_ref = window.get("source_ref") or {}
         next_read = window.get("next_read") if isinstance(window.get("next_read"), dict) else {}
         omitted_fields = window.get("omitted_fields") if isinstance(window.get("omitted_fields"), dict) else {}
-        summaries.append(
-            {
-                "schema_version": 1,
-                "summary_kind": "compact_source_window_ref",
-                "candidate_id": window.get("candidate_id"),
-                "source_ref": source_ref,
-                "target": window.get("target") or source_ref_target(source_ref),
-                "intent": window.get("intent"),
-                "window_kind": window.get("window_kind"),
-                "role": window.get("role"),
-                "timestamp_utc": window.get("timestamp_utc"),
-                "selection_reason_code": window.get("selection_reason_code"),
-                "next_read": compact_next_read_ref(next_read),
-                "searched_scope_boundary": window.get("searched_scope_boundary", {}),
-                "omitted_fields": {
-                    "context_actions": bool(window.get("context_actions")),
-                    "expansion_actions": bool(window.get("expansion_actions"))
-                    or bool(omitted_fields.get("expansion_actions")),
-                    "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
-                    "text_or_snippets": False,
-                },
-                "privacy": {
-                    "raw_text_included": False,
-                    "raw_paths_included": False,
-                    "source_window_text_included": False,
-                },
-            }
-        )
+        summary = {
+            "schema_version": 1,
+            "summary_kind": "compact_source_window_ref",
+            "candidate_id": window.get("candidate_id"),
+            "source_ref": source_ref,
+            "target": window.get("target") or source_ref_target(source_ref),
+            "intent": window.get("intent"),
+            "window_kind": window.get("window_kind"),
+            "role": window.get("role"),
+            "timestamp_utc": window.get("timestamp_utc"),
+            "selection_reason_code": window.get("selection_reason_code"),
+            "searched_scope_boundary": window.get("searched_scope_boundary", {}),
+            "omitted_fields": {
+                "context_actions": bool(window.get("context_actions")),
+                "expansion_actions": bool(window.get("expansion_actions"))
+                or bool(omitted_fields.get("expansion_actions")),
+                "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
+                "text_or_snippets": False,
+            },
+            "privacy": {
+                "raw_text_included": False,
+                "raw_paths_included": False,
+                "source_window_text_included": False,
+            },
+        }
+        if next_read:
+            summary["next_read"] = compact_next_read_ref(next_read)
+        if "deep_audit_target_match" in window:
+            summary["deep_audit_target_match"] = window["deep_audit_target_match"]
+        if window.get("diagnostic_only") is True:
+            summary["actionability"] = window.get("actionability")
+            summary["diagnostic_only"] = True
+            summary["read_more_actionable"] = bool(window.get("read_more_actionable", False))
+        summaries.append(summary)
     return summaries
 
 
