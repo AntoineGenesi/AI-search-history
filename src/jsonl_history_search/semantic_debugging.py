@@ -3075,36 +3075,78 @@ def build_cap_aware_subagent_provenance_workflow(
     if not plan and not resolution.get("applies"):
         return {}
 
-    required_roles = list(plan.get("required_roles") or [])
-    covered_roles = list(plan.get("covered_roles") or [])
-    missing_roles = list(plan.get("missing_roles") or [])
+    current_scope_child_roles = [
+        role
+        for role in historical_orchestration_roles_from_text(query)
+        if role in {"worker", "reviewer"}
+    ]
+    explicit_current_child_scope = bool(
+        historical_provenance_current_scope_requested(query)
+        and resolution.get("applies")
+        and current_scope_child_roles
+    )
+    required_roles = (
+        current_scope_child_roles
+        if explicit_current_child_scope
+        else list(plan.get("required_roles") or [])
+    )
+    covered_roles = (
+        [] if explicit_current_child_scope else list(plan.get("covered_roles") or [])
+    )
+    missing_roles = (
+        [] if explicit_current_child_scope else list(plan.get("missing_roles") or [])
+    )
     child_dependent_roles = [
         role for role in required_roles if role in {"worker", "reviewer"}
     ]
     child_refs_required = bool(child_dependent_roles or resolution.get("applies"))
     child_refs = list(resolution.get("child_transcript_refs") or [])
-    child_ref_identities = {
-        identity
-        for item in child_refs
-        if isinstance(item, dict)
-        for identity in source_identity_variants(
-            str(
-                item.get("target")
-                or source_ref_target(
-                    item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
-                )
+    child_refs_by_identity: dict[str, list[dict[str, Any]]] = {}
+    for item in child_refs:
+        if not isinstance(item, dict):
+            continue
+        target = str(
+            item.get("target")
+            or source_ref_target(
+                item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
             )
         )
-    }
+        for identity in source_identity_variants(target):
+            child_refs_by_identity.setdefault(identity, []).append(item)
+    child_ref_identities = set(child_refs_by_identity)
     role_child_refs = {
         role: []
         for role in child_dependent_roles
     }
-    for read in list(plan.get("primary_historical_final_support_reads") or []):
+    role_evidence_reads = list(plan.get("primary_historical_final_support_reads") or [])
+    known_role_evidence_targets = {
+        historical_orchestration_read_identity(read) for read in role_evidence_reads
+    }
+    role_evidence_reads.extend(
+        item
+        for item in child_refs
+        if isinstance(item, dict)
+        and historical_orchestration_read_identity(item) not in known_role_evidence_targets
+    )
+    for read in role_evidence_reads:
         read_identities = source_identity_variants(historical_orchestration_read_identity(read))
         if not child_ref_identities.intersection(read_identities):
             continue
-        for role in read.get("orchestration_roles") or []:
+        matching_child_refs = dedupe_dicts(
+            [
+                child_ref
+                for identity in read_identities
+                for child_ref in child_refs_by_identity.get(identity, [])
+            ]
+        )
+        explicit_owner_roles = dedupe(
+            [
+                role
+                for item in [read, *matching_child_refs]
+                for role in historical_orchestration_explicit_source_owner_roles(item)
+            ]
+        )
+        for role in explicit_owner_roles:
             if role in role_child_refs:
                 role_child_refs[role].append(read)
     missing_child_role_refs = [
@@ -3119,11 +3161,13 @@ def build_cap_aware_subagent_provenance_workflow(
     )
     primary_reads = list(plan.get("primary_historical_final_support_reads") or [])
     secondary_reads = list(plan.get("secondary_task_review_commit_support_reads") or [])
+    historical_parent_applicable = not explicit_current_child_scope
     parent_target = next(
         (
             historical_orchestration_read_identity(read)
             for read in primary_reads
-            if "parent_or_coordinator" in set(read.get("orchestration_roles") or [])
+            if historical_parent_applicable
+            and "parent_or_coordinator" in set(read.get("orchestration_roles") or [])
             and not child_ref_identities.intersection(
                 source_identity_variants(historical_orchestration_read_identity(read))
             )
@@ -3173,6 +3217,8 @@ def build_cap_aware_subagent_provenance_workflow(
                 "count": len(omitted_children) or safe_count(diagnostics.get("child_scope_omitted")) or 1,
             }
         )
+    if explicit_current_child_scope:
+        covered_roles = [role for role in required_roles if role_child_refs.get(role)]
     facet_status: dict[str, bool] = {
         "parent_coordinator_prompt": (
             "parent_or_coordinator" in covered_roles and bool(parent_target)
@@ -3190,7 +3236,7 @@ def build_cap_aware_subagent_provenance_workflow(
         ),
     }
     required_facets = [
-        "parent_coordinator_prompt",
+        *(["parent_coordinator_prompt"] if historical_parent_applicable else []),
         *(["spawned_worker_ids"] if child_refs_required else []),
         *(["worker_events_or_final"] if "worker" in required_roles else []),
         *(["reviewer_events_or_final"] if "reviewer" in required_roles else []),
@@ -3202,7 +3248,13 @@ def build_cap_aware_subagent_provenance_workflow(
     ]
     completed_facets = [facet for facet in required_facets if facet_status[facet]]
     missing_facets = [facet for facet in required_facets if not facet_status[facet]]
-    plan_answer_ready = plan.get("status") == "answer_ready" if plan else bool(child_refs)
+    plan_answer_ready = (
+        bool(child_refs)
+        if explicit_current_child_scope
+        else plan.get("status") == "answer_ready"
+        if plan
+        else bool(child_refs)
+    )
     answer_ready = bool(
         plan_answer_ready
         and not blockers
@@ -3278,6 +3330,17 @@ def build_cap_aware_subagent_provenance_workflow(
         "required_provenance_facets": required_facets,
         "completed_provenance_facets": completed_facets,
         "missing_provenance_facets": missing_facets,
+        "not_applicable_provenance_facets": (
+            ["parent_coordinator_prompt"] if not historical_parent_applicable else []
+        ),
+        "historical_parent_provenance": {
+            "applicable": historical_parent_applicable,
+            "reason": (
+                "required_for_historical_orchestration_scope"
+                if historical_parent_applicable
+                else "explicit_current_run_worker_or_subagent_scope"
+            ),
+        },
         "traversal_order": [
             {
                 "stage": facet,
@@ -3317,6 +3380,8 @@ def build_cap_aware_subagent_provenance_workflow(
             "avoid_subagents_policy": False,
             "inspect_every_subagent_by_default": False,
             "stop_when_required_provenance_facets_complete": True,
+            "source_role_mentions_can_satisfy_other_role_facets": False,
+            "explicit_current_run_child_scope_requires_historical_parent": False,
         },
     }
 
@@ -3688,7 +3753,22 @@ def historical_orchestration_requested_secondary_roles(query: str) -> list[str]:
         re.search(
             r"\b(?:task (?:file|status|artifact)|report (?:artifact|file|output)|"
             r"review (?:artifact|file|verdict|report)|commit|merge|merged|merge proof|"
-            r"git show|git log|validation|validated|fix(?:ed)?|rereview)\b",
+            r"git show|git log)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:review(?:er)?|rereview|validation|fix(?:ed)?|merge(?:d)?) "
+            r"(?:proof|evidence|artifact|report|verdict)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:proof|evidence) (?:of |for )?(?:the )?"
+            r"(?:review|rereview|validation|fix|merge)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:proof|evidence) (?:proves?|shows?|demonstrates?|confirms?) "
+            r"(?:the )?(?:review|rereview|validation|fix|merge)\b",
             lowered,
         )
     )
@@ -3706,6 +3786,44 @@ def historical_orchestration_role_facet(role: str) -> str:
         "reviewer": "reviewer_events_or_final",
         "secondary_task_review_commit_support": "review_fix_merge_proof",
     }.get(role, role)
+
+
+def historical_orchestration_explicit_source_owner_roles(read: dict[str, Any]) -> list[str]:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    provenance = (
+        read.get("spawned_session_resolution")
+        if isinstance(read.get("spawned_session_resolution"), dict)
+        else {}
+    )
+    values: list[Any] = []
+    for row in (read, source_ref, provenance):
+        values.extend(
+            [
+                row.get("source_owner_role"),
+                row.get("source_owner_roles"),
+                row.get("agent_role"),
+                row.get("orchestration_owner_role"),
+            ]
+        )
+    roles: list[str] = []
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            role = historical_orchestration_normalized_owner_role(item)
+            if role:
+                roles.append(role)
+    return dedupe(roles)
+
+
+def historical_orchestration_normalized_owner_role(value: Any) -> str | None:
+    normalized = re.sub(r"[^a-z]+", "_", str(value or "").casefold()).strip("_")
+    if normalized in {"worker", "implementer", "implementation"}:
+        return "worker"
+    if normalized in {"reviewer", "rereviewer", "re_reviewer"}:
+        return "reviewer"
+    if normalized in {"parent", "coordinator", "orchestrator"}:
+        return "parent_or_coordinator"
+    return None
 
 
 def historical_orchestration_roles_from_text(text: str) -> list[str]:
@@ -3912,6 +4030,12 @@ def historical_orchestration_read_plan_row(
     if historical_orchestration_secondary_support_from_ref(read, candidate, text=text):
         roles.append("secondary_task_review_commit_support")
         roles = dedupe(roles)
+    explicit_owner_roles = dedupe(
+        historical_orchestration_explicit_source_owner_roles(read)
+        + historical_orchestration_explicit_source_owner_roles(candidate)
+    )
+    roles = dedupe(roles + explicit_owner_roles)
+    source_owner_roles = explicit_owner_roles
     role = str(selection.get("source_chronology_role") or "candidate_or_original_source_ref")
     current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(
         text,
@@ -3938,6 +4062,7 @@ def historical_orchestration_read_plan_row(
         "source_ref": guided_source_ref(source_ref) if source_ref else None,
         "source_chronology_role": role,
         "orchestration_roles": roles,
+        "source_owner_roles": source_owner_roles,
         "final_support_allowed": final_support_allowed,
         "required_final_support_read": final_support_allowed,
         "read_more_actionable": bool(read.get("read_more_actionable", True))
