@@ -9,14 +9,12 @@ metadata:
 
 ## Activation Gate
 
-Trigger for prior conversation history: what the user previously said; old decisions before/outside visible context;
-cleanup or multi-step process was deferred, repeated, or failed; `what happened since my last message?`; and the exact automatic trigger `what has happened since my last message in the parent thread?`.
+Trigger for prior conversation history: what the user previously said; old decisions before/outside visible context; cleanup or multi-step process was deferred, repeated, or failed; `what happened since my last message?`; and the exact automatic trigger `what has happened since my last message in the parent thread?`.
 
-The trigger is intentionally narrow. Do not trigger for bare `what happened?`,
-`what changed in this task file?`, ordinary branch/cleanliness/local-status
-prompts, repo/Git history prompts, local repo/task/artifact status prompts,
-generic questions not anchored to prior conversation history, or self-contained
-writing/editing/summarizing prompts. History-dependent
+Do not trigger for bare `what happened?`, `what changed in this task file?`,
+ordinary branch/cleanliness/local-status prompts, repo/Git history prompts,
+local repo/task/artifact status prompts, generic questions not anchored to prior conversation history,
+or self-contained writing/editing/summarizing prompts. History-dependent
 writing/editing remains a trigger. Ask one short clarifying question and use zero tools.
 
 `JSONL activation mode: explicit-only` requires `convo`/`use the convo tool`.
@@ -52,8 +50,7 @@ Blank/unset query fails closed; use original wording.
 Action/provenance: inline `--query-origin original`; summary
 `--query-origin summary --original-query-file <prompt-file>` (hash).
 
-Wait for that command to exit. While running, do not start another `ask` or
-source-checkout
+Wait for that command to exit. While running, do not start another `ask` or source-checkout
 fallback. A `jsonl_history_search.phase` start means live; do not interrupt or
 impose a timeout. Interrupt/no packet: report liveness failure; last phase
 marker (or none); terminal means no other `ask`,
