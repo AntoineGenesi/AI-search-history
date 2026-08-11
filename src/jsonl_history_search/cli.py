@@ -18428,6 +18428,14 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
+        if not args.query.strip():
+            print(
+                "ask requires the original user wording; retry: "
+                'jsonl-history-search ask --execute "<original-user-wording>" '
+                '--cwd "$PWD" --format text',
+                file=sys.stderr,
+            )
+            return 2
         cwd = str(Path(args.cwd).expanduser().resolve())
         payload = build_ask_router_payload(
             args.query,
