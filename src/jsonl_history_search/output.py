@@ -1409,6 +1409,7 @@ def _append_scoped_no_evidence_contract(
         }
     answer_now = action.get("answer_status") == "answer-scoped-no-evidence-now"
     terminal = action.get("terminal_answer_and_stop_contract") or {}
+    cap_disposition = action.get("cap_hit_disposition") or {}
     if markdown:
         lines.extend(
             [
@@ -1428,6 +1429,8 @@ def _append_scoped_no_evidence_contract(
                 ),
                 f"- Cap status: hit=`{contract.get('cap_hit')}`, caps_hit=`{contract.get('caps_hit')}`",
                 f"- not_all_history_absence: `{contract.get('not_all_history_absence')}`",
+                f"- Source boundary: {contract.get('source_boundary')}",
+                f"- Blind spots: `{contract.get('blind_spots')}`",
                 (
                     "- read_more_required_before_scoped_no_evidence_answer: "
                     f"`{contract.get('read_more_required_before_scoped_no_evidence_answer')}`"
@@ -1440,6 +1443,14 @@ def _append_scoped_no_evidence_contract(
                 [
                     "- **TERMINAL ANSWER-AND-STOP:** answer from this searched scope now.",
                     "- Do not open weak candidates, rerun retrieval, or fall back to manual search.",
+                ]
+            )
+        elif cap_disposition.get("status") == "scoped_fail_closed":
+            lines.extend(
+                [
+                    "- **CAP DISPOSITION: scoped_fail_closed**",
+                    "- Partial candidates and snippets are withheld because hidden evidence may remain.",
+                    "- No canonical continuation is available; do not improvise with manual history search.",
                 ]
             )
         return
@@ -1459,6 +1470,8 @@ def _append_scoped_no_evidence_contract(
             ),
             f"- cap_status: hit={contract.get('cap_hit')} caps_hit={contract.get('caps_hit')}",
             f"- not_all_history_absence: {contract.get('not_all_history_absence')}",
+            f"- source_boundary: {contract.get('source_boundary')}",
+            f"- blind_spots: {contract.get('blind_spots')}",
             (
                 "- read_more_required_before_scoped_no_evidence_answer: "
                 f"{contract.get('read_more_required_before_scoped_no_evidence_answer')}"
@@ -1471,6 +1484,14 @@ def _append_scoped_no_evidence_contract(
             [
                 "TERMINAL ANSWER-AND-STOP: answer from this searched scope now.",
                 "Do not open weak candidates, rerun retrieval, or fall back to manual search.",
+            ]
+        )
+    elif cap_disposition.get("status") == "scoped_fail_closed":
+        lines.extend(
+            [
+                "CAP DISPOSITION: scoped_fail_closed",
+                "Partial candidates and snippets are withheld because hidden evidence may remain.",
+                "No canonical continuation is available; do not improvise with manual history search.",
             ]
         )
 
@@ -6542,11 +6563,75 @@ def _render_semantic_debug_missing_primary_evidence(
     return "\n".join(lines)
 
 
+def _render_semantic_debug_cap_hit_disposition(
+    report: dict, *, markdown: bool
+) -> str | None:
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    disposition = followthrough.get("cap_hit_disposition") or {}
+    status = disposition.get("status")
+    if status not in {"canonical_continuation", "scoped_fail_closed"}:
+        return None
+
+    coverage = followthrough.get("coverage_state") or {}
+    searched = coverage.get("searched_scope") or {}
+    not_searched = coverage.get("not_searched_scope") or {}
+    caps = coverage.get("caps") or coverage.get("search_cap_hit") or {}
+    cap_labels = ", ".join(str(item) for item in caps.get("caps_hit") or []) or "unspecified"
+    boundary = "selected history roots and reported searched windows only; hidden evidence may remain"
+    canonical = disposition.get("canonical_continuation") or {}
+    command = canonical.get("command") if isinstance(canonical, dict) else None
+
+    if markdown:
+        lines = [
+            "# Cap-Hit Disposition",
+            "",
+            f"- Status: `{status}`",
+            "- Answer ready: `false`",
+            f"- Searched scope: files=`{searched.get('searched_files', 0)}`, bytes=`{searched.get('searched_bytes', 0)}`",
+            (
+                f"- Blind spots: caps_hit=`{cap_labels}`, missing_roots=`{not_searched.get('missing_root_count', 0)}`, "
+                f"deferred_files=`{not_searched.get('source_plan_deferred_files', 0)}`"
+            ),
+            f"- Source boundary: {boundary}.",
+            "- Partial candidates and snippets are withheld until coverage is complete.",
+            "- Manual history fallback: `false`",
+        ]
+        if status == "canonical_continuation" and command:
+            lines.extend(["", "## Canonical Continuation", "", "```bash", str(command), "```"])
+        else:
+            reason = (disposition.get("scoped_fail_closed") or {}).get("reason")
+            lines.extend(["", f"- **FAIL CLOSED:** {reason or 'No safe canonical continuation is available.'}"])
+        return "\n".join(lines)
+
+    lines = [
+        "CAP-HIT DISPOSITION",
+        f"Status: {status}",
+        "Answer ready: false",
+        f"Searched scope: files={searched.get('searched_files', 0)} bytes={searched.get('searched_bytes', 0)}",
+        (
+            f"Blind spots: caps_hit={cap_labels} missing_roots={not_searched.get('missing_root_count', 0)} "
+            f"deferred_files={not_searched.get('source_plan_deferred_files', 0)}"
+        ),
+        f"Source boundary: {boundary}.",
+        "Partial candidates and snippets are withheld until coverage is complete.",
+        "Manual history fallback: false",
+    ]
+    if status == "canonical_continuation" and command:
+        lines.extend(["Canonical continuation:", str(command)])
+    else:
+        reason = (disposition.get("scoped_fail_closed") or {}).get("reason")
+        lines.append(f"FAIL CLOSED: {reason or 'No safe canonical continuation is available.'}")
+    return "\n".join(lines)
+
+
 def render_semantic_debug_text(payload: dict) -> str:
     report = payload["semantic_debug"]
     missing_primary = _render_semantic_debug_missing_primary_evidence(report, markdown=False)
     if missing_primary is not None:
         return missing_primary
+    cap_hit_projection = _render_semantic_debug_cap_hit_disposition(report, markdown=False)
+    if cap_hit_projection is not None:
+        return cap_hit_projection
     direct_projection = _render_provenance_direct_proof_projection(report, markdown=False)
     if direct_projection is not None:
         return direct_projection
@@ -6904,6 +6989,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     missing_primary = _render_semantic_debug_missing_primary_evidence(report, markdown=True)
     if missing_primary is not None:
         return missing_primary
+    cap_hit_projection = _render_semantic_debug_cap_hit_disposition(report, markdown=True)
+    if cap_hit_projection is not None:
+        return cap_hit_projection
     direct_projection = _render_provenance_direct_proof_projection(report, markdown=True)
     if direct_projection is not None:
         return direct_projection

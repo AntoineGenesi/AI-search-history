@@ -15527,7 +15527,7 @@ def build_in_depth_audit_followthrough_plan(
         target_contract=target_contract,
     )
     tail_followup_actions = list(source_continuation.get("tail_followup_actions") or [])
-    continuation_commands = tail_followup_actions + cap_continuation_commands
+    continuation_candidates = tail_followup_actions + cap_continuation_commands
     target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
     coverage_complete = bool(coverage.get("answer_promotion_allowed")) and target_persistence_ready
     searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
@@ -15550,15 +15550,51 @@ def build_in_depth_audit_followthrough_plan(
         stop_rule += " " + str(live_tail_caveat.get("required_caveat"))
     if source_continuation.get("applies"):
         stop_rule += " " + str(source_continuation.get("required_before_terminal_claim"))
-    if not target_persistence_ready and not continuation_commands:
+    if not target_persistence_ready and not continuation_candidates:
         continuation = in_depth_audit_target_refocus_command(
             query=query,
             args=args,
             target_contract=target_contract,
         )
         if continuation:
-            continuation_commands.append(continuation)
+            continuation_candidates.append(continuation)
     answer_ready = bool(coverage_complete)
+    search_cap_hit = bool((coverage.get("search_cap_hit") or {}).get("hit") or caps.get("hit"))
+    cap_hit_disposition: dict[str, Any] = {}
+    if search_cap_hit:
+        canonical_continuation = continuation_candidates[0] if len(continuation_candidates) == 1 else None
+        fail_closed_reason = (
+            "Search caps blocked complete coverage and no deterministic JSONL continuation was available."
+            if not continuation_candidates
+            else "Multiple independent coverage slices remain; no single continuation covers them all without risking hidden evidence."
+        )
+        cap_hit_disposition = {
+            "schema_version": 1,
+            "status": "canonical_continuation" if canonical_continuation else "scoped_fail_closed",
+            "answer_ready": False,
+            "canonical_continuation": canonical_continuation,
+            "scoped_fail_closed": (
+                None
+                if canonical_continuation
+                else {
+                    "reason": fail_closed_reason,
+                    "searched_scope": searched_scope,
+                    "not_searched_scope": not_searched_scope,
+                    "caps": caps or coverage.get("search_cap_hit") or {},
+                    "source_boundary": "selected history roots and reported searched windows only",
+                }
+            ),
+            "partial_evidence_rendering_allowed": False,
+            "manual_history_fallback_allowed": False,
+            "pending_continuation_candidate_count": len(continuation_candidates),
+        }
+    continuation_commands = (
+        [cap_hit_disposition["canonical_continuation"]]
+        if cap_hit_disposition.get("status") == "canonical_continuation"
+        else continuation_candidates
+        if not search_cap_hit
+        else []
+    )
     target_answer_block = deep_audit_target_persistence_answer_block(target_contract)
     workflow = {
         "schema_version": 1,
@@ -15575,6 +15611,7 @@ def build_in_depth_audit_followthrough_plan(
         "ordered_primary_refs_to_open_first": selected_reads,
         "pending_slices": in_depth_audit_pending_slice_labels(coverage),
         "continuation_commands": continuation_commands,
+        "cap_hit_disposition": cap_hit_disposition,
         "do_not_abandon_jsonl_guidance": (
             "Do not abandon JSONL/convo for broad git/rg/task artifact inspection after a cap. Continue with "
             "these scoped semantic-debug commands first; use local task/review/git artifacts only when the user "
@@ -15658,6 +15695,7 @@ def build_in_depth_audit_followthrough_plan(
         },
         "pending_slice_count": len(workflow["pending_slices"]),
         "continuation_commands": continuation_commands,
+        "cap_hit_disposition": cap_hit_disposition,
         "audit_continuation_workflow": workflow,
     }
 
