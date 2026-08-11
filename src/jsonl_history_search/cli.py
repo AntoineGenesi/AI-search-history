@@ -19364,8 +19364,23 @@ def main(argv: list[str] | None = None) -> int:
         print(render(payload, args.format))
         return 0
     if args.command == "what-happened-since":
+        phase_emitter = (
+            AskExecutePhaseEmitter(command=args.command)
+            if args.parent_thread and args.complete_interval
+            else None
+        )
+        source_phase = phase_emitter.start("source_planning") if phase_emitter else None
+        if phase_emitter and source_phase:
+            phase_emitter.complete(source_phase)
+        retrieval_phase = phase_emitter.start("retrieval") if phase_emitter else None
         payload = build_status_anchor_payload(args)
-        print(render(payload, args.format))
+        if phase_emitter and retrieval_phase:
+            phase_emitter.complete(retrieval_phase)
+        rendering_phase = phase_emitter.start("rendering") if phase_emitter else None
+        rendered = render(payload, args.format)
+        if phase_emitter and rendering_phase:
+            phase_emitter.complete(rendering_phase)
+        print(rendered)
         return 0 if payload["status_anchor"]["status"] == "ok" else 1
     if args.command == "artifact-currentness":
         from .artifact_currentness import build_artifact_currentness_payload

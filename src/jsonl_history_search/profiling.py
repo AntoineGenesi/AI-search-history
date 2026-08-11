@@ -41,8 +41,9 @@ class AskExecutePhaseToken:
 class AskExecutePhaseEmitter:
     """Emit privacy-safe JSONL liveness records without touching stdout."""
 
-    def __init__(self, stream: TextIO | None = None) -> None:
+    def __init__(self, stream: TextIO | None = None, *, command: str = "ask_execute") -> None:
         self._stream = stream
+        self._command = command
         self._command_started_monotonic_ns = time.monotonic_ns()
 
     def start(self, name: str) -> AskExecutePhaseToken:
@@ -72,7 +73,7 @@ class AskExecutePhaseEmitter:
         record: dict[str, Any] = {
             "schema_version": 1,
             "event": ASK_EXECUTE_PHASE_EVENT,
-            "command": "ask_execute",
+            "command": self._command,
             "phase": name,
             "state": state,
             "monotonic_ns": now,

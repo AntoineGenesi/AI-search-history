@@ -18,10 +18,11 @@ the alias, preserve parent scope with `--parent-thread`, and run the matching
 or visible-context synthesis:
 
 ```bash
-jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --format text
+jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer
 ```
 
-For unscoped latest-message wording, omit `--parent-thread`.
+For unscoped latest-message wording, omit `--parent-thread` and
+`--complete-interval`, and use `--format text`.
 
 For explicit history-tool aliases that are not latest-message asks, immediately
 run:

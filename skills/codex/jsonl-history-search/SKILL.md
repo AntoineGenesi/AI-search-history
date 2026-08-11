@@ -29,11 +29,10 @@ intent -> `--evidence-source local`; conversation/source-session intent ->
 "Do you want current local Git/task evidence or prior conversation history?"
 and use zero tools.
 
-Resolve before asking: search once after named-task scope; ask only on
-absent/capped/ambiguous/unavailable.
+Resolve after named-task scope; ask only on absent/capped/ambiguous/unavailable.
 
 Start exactly one installed route before repo search, Git, or visible-context synthesis.
-Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --format text`; unscoped wording omits `--parent-thread`. `convo tool`/`convo CLI`/`jsonl-search-history`/`jsonl-history-search`/`JSONL tool`/`the skill`/`use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI, not connector discovery/plugin install/`convo --help`.
 old-context decisions (`before compaction`, `outside visible context`, or
 `earlier in the thread`) use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
 
@@ -53,10 +52,11 @@ Blank/unset query fails closed; use original wording.
 Action/provenance: inline `--query-origin original`; summary
 `--query-origin summary --original-query-file <prompt-file>` (hash).
 
-Wait for that command to exit. While it is running, do not start another `ask`,
-direct `semantic-debug`, or source-checkout
-fallback. Interrupt/no packet: report liveness failure; last stderr
-`jsonl_history_search.phase` marker (or none); terminal means no other `ask`,
+Wait for that command to exit. While running, do not start another `ask` or
+source-checkout
+fallback. A `jsonl_history_search.phase` start means live; do not interrupt or
+impose a timeout. Interrupt/no packet: report liveness failure; last phase
+marker (or none); terminal means no other `ask`,
 direct `semantic-debug`, manual transcript/history search, or recovery.
 Only if the installed command exits with command-not-found (126/127) or a clear
 install/import failure, and cwd has `src/jsonl_history_search/cli.py`, recover once:
