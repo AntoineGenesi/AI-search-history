@@ -5266,6 +5266,7 @@ def render_status_anchor_answer(payload: dict) -> str:
                 f"newest_ref={newest.get('source_ref') or '(unknown)'} "
                 f"newest_timestamp={newest.get('timestamp_utc') or '(unknown)'}"
             )
+        lines.append("answer_ready=false")
         return "\n".join(lines)
 
     selected = report.get("selected_anchor") or {}
@@ -5281,6 +5282,7 @@ def render_status_anchor_answer(payload: dict) -> str:
     parent_hash = selected.get("session_id_hash") or selected.get("source_identifier")
     lines = [
         "ANSWER READY",
+        "answer_ready=true",
         (
             "Selected parent history row: "
             f"{selected.get('timestamp_utc')} {selected.get('source_ref')} "

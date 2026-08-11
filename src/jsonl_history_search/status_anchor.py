@@ -320,6 +320,7 @@ def build_status_anchor_payload(args: Any) -> dict:
     parent_thread_mode = bool(getattr(args, "parent_thread", False))
     complete_interval = bool(getattr(args, "complete_interval", False))
     anchor_ref = getattr(args, "anchor_ref", None)
+    output_format = str(getattr(args, "format", "json") or "json")
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
     snippet_chars = max(0, getattr(args, "snippet_chars", 280))
     latest = latest_user_messages(
@@ -349,6 +350,7 @@ def build_status_anchor_payload(args: Any) -> dict:
                 "parent_thread": parent_thread_mode,
                 "complete_interval": complete_interval,
                 "anchor_ref": anchor_ref,
+                "format": output_format,
             },
         )
     }
@@ -650,6 +652,7 @@ def status_anchor_report(
         "next_reads": next_reads,
         "source_tiers": source_tiers,
         "follow_through_plan": follow_through_plan,
+        "answer_ready": answer_readiness["answer_ready"],
         "answer_readiness": answer_readiness,
         "required_answer_facets": answer_readiness["required_answer_facets"],
         "target_window": target_window,
@@ -689,6 +692,7 @@ def status_anchor_report(
         and selected_anchor
         and answer_readiness.get("parent_main_status_answer")
         and (answer_readiness.get("parent_main_anchor_freshness") or {}).get("current") is not False
+        and (command_options or {}).get("format") != "answer"
     ):
         return _latest_status_navigation_only_report(report)
     return report
@@ -730,6 +734,7 @@ def _latest_status_navigation_only_report(report: dict) -> dict:
     readiness.update(
         {
             "status": "fail_closed_required_primary_followthrough",
+            "answer_ready": False,
             "answer_allowed": False,
             "scanner_coverage_answer_allowed": scanner_ready,
             "required_primary_windows_opened": False,
@@ -787,6 +792,7 @@ def _latest_status_navigation_only_report(report: dict) -> dict:
         ]
     return {
         **report,
+        "answer_ready": False,
         "summary": summary,
         "session_activity": session_activity,
         "post_anchor_interval_reconstruction": interval,
@@ -4284,6 +4290,8 @@ def _structured_anchor_ref_authority_resolution(
             "status": "rejected",
             "reason": lineage_rejection.get("lineage_rejection_reason"),
         }
+    selected.pop("session_activity_location", None)
+    selected["correlation_status"] = "structured_canonical_ref_authority"
     selected["explicit_anchor_reason"] = "exact_canonical_history_source_ref"
     selected["score"] = max(int(selected.get("score") or 0), 140)
     return {
@@ -8018,7 +8026,11 @@ def _answer_readiness_contract(
         read.get("parent_main_anchor_recovery_candidate") or read.get("prior_request_occurrence_candidate")
         for read in (source_tiers.get("required_primary") or [])
     )
-    if recovery_material and "selected_anchor_and_boundary" not in missing:
+    structured_anchor_selected = bool(
+        selected_anchor
+        and anchor_decision.get("context_boundary") == "explicit_parent_main_structured_anchor_ref"
+    )
+    if recovery_material and not structured_anchor_selected and "selected_anchor_and_boundary" not in missing:
         missing.append("selected_anchor_and_boundary")
     answer_allowed = not missing
     if parent_main_status:
@@ -8042,13 +8054,14 @@ def _answer_readiness_contract(
             "history.jsonl parent/main user row exists before the status boundary; rerun with the newer "
             "timestamp or quoted message before synthesizing a status answer."
         )
-    if recovery_material or not selected_anchor:
+    if (recovery_material and not structured_anchor_selected) or not selected_anchor:
         stop_condition = (
             "Fail closed before answer: recovery candidates are verification/rerun material only. "
             "Rerun with a proven timestamp or quoted-message anchor before synthesizing a factual status answer."
         )
     return {
         "status": status,
+        "answer_ready": answer_allowed,
         "answer_allowed": answer_allowed,
         "selected_anchor_answer_ready": bool(
             selected_anchor
