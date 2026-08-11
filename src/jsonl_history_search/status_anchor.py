@@ -1003,7 +1003,12 @@ def is_status_question(query: str) -> bool:
 def _query_with_parent_thread_mode(query: str, parent_thread_mode: bool) -> str:
     if not parent_thread_mode or _requires_raw_parent_thread_boundary(query):
         return query
-    return f"{query.rstrip()} in the parent thread"
+    stripped = query.rstrip()
+    punctuation = ""
+    while stripped and stripped[-1] in ".?!":
+        punctuation = stripped[-1] + punctuation
+        stripped = stripped[:-1].rstrip()
+    return f"{stripped} in the parent thread{punctuation}"
 
 
 def _rank_anchor_candidates(
@@ -2533,7 +2538,12 @@ def _recover_parent_thread_side_boundary_without_direct_edge(
                 _lineage_rejected_anchor(candidate, lineage, "candidate_session_metadata_not_found")
             )
             continue
-        rejection = _no_edge_parent_candidate_rejection_reason(lineage)
+        rejection = _no_edge_parent_candidate_rejection_reason(
+            lineage,
+            allow_unrelated_user_root=side_lineage.get("status") != "ok",
+            candidate_classification=str(candidate.get("classification") or ""),
+            candidate_has_ambiguous_session_mirror=_has_ambiguous_session_mirror(candidate),
+        )
         if rejection:
             rejected.append(_lineage_rejected_anchor(candidate, lineage, rejection))
             continue
@@ -3173,8 +3183,20 @@ def _parent_thread_lineage_rejection_reason(lineage: dict) -> str | None:
     return None
 
 
-def _no_edge_parent_candidate_rejection_reason(lineage: dict) -> str | None:
+def _no_edge_parent_candidate_rejection_reason(
+    lineage: dict,
+    *,
+    allow_unrelated_user_root: bool = False,
+    candidate_classification: str = "",
+    candidate_has_ambiguous_session_mirror: bool = False,
+) -> str | None:
     rejection = _parent_thread_lineage_rejection_reason(lineage)
+    if rejection == "unrelated_project_or_workspace_root" and allow_unrelated_user_root:
+        rejection = _unrelated_root_recovery_rejection_reason(
+            lineage,
+            candidate_classification=candidate_classification,
+            candidate_has_ambiguous_session_mirror=candidate_has_ambiguous_session_mirror,
+        )
     if rejection:
         return rejection
     parent_thread_id_hash = str(lineage.get("parent_thread_id_hash") or "")
@@ -3184,6 +3206,28 @@ def _no_edge_parent_candidate_rejection_reason(lineage: dict) -> str | None:
     } - {""}
     if parent_thread_id_hash and parent_thread_id_hash not in candidate_thread_hashes:
         return "candidate_session_has_distinct_parent_thread_id"
+    return None
+
+
+def _unrelated_root_recovery_rejection_reason(
+    lineage: dict,
+    *,
+    candidate_classification: str,
+    candidate_has_ambiguous_session_mirror: bool,
+) -> str | None:
+    role = str(lineage.get("agent_role") or "").casefold()
+    thread_source = str(lineage.get("thread_source") or "").casefold()
+    source_kind = str(lineage.get("source_kind") or "").casefold()
+    if candidate_classification != "substantive_work_anchor" and not candidate_has_ambiguous_session_mirror:
+        return "unrelated_project_or_workspace_root"
+    if thread_source in {"subagent", "worker", "reviewer"} or source_kind == "subagent" or role in {
+        "worker",
+        "reviewer",
+        "rereviewer",
+    }:
+        return "child_worker_reviewer_or_control_session"
+    if thread_source and thread_source != "user":
+        return "non_user_thread_source_not_parent_thread_anchor"
     return None
 
 
@@ -3311,8 +3355,6 @@ def _canonical_row_matches_exact_status_query_boundary(row: dict, *, query: str)
         return True
     if not _requires_raw_parent_thread_boundary(query):
         return False
-    if _prefers_parent_main_anchor(normalized_text):
-        return False
     for suffix in (
         " in the parent thread",
         " in parent thread",
@@ -3329,11 +3371,35 @@ def _canonical_row_matches_exact_status_query_boundary(row: dict, *, query: str)
     ):
         if normalized_query.endswith(suffix):
             unscoped_query = normalized_query[: -len(suffix)].rstrip()
-            return bool(
-                unscoped_query == normalized_text
-                and _relative_status_requires_history_first_anchor(unscoped_query)
-            )
+            if not _relative_status_requires_history_first_anchor(unscoped_query):
+                return False
+            if unscoped_query == normalized_text:
+                return True
+            return _parent_scoped_boundary_extends_base_status_query(normalized_text, unscoped_query)
     return False
+
+
+def _parent_scoped_boundary_extends_base_status_query(normalized_text: str, unscoped_query: str) -> bool:
+    if not normalized_text.startswith(unscoped_query):
+        return False
+    tail = normalized_text[len(unscoped_query) :].strip(" .?!")
+    return any(
+        tail.startswith(marker)
+        for marker in (
+            "in the parent thread",
+            "in parent thread",
+            "in the parent-thread",
+            "in parent-thread",
+            "in the main thread",
+            "in main thread",
+            "in the main-thread",
+            "in main-thread",
+            "in the parent/main thread",
+            "in parent/main thread",
+            "in the main/parent thread",
+            "in main/parent thread",
+        )
+    )
 
 
 def _canonical_parent_main_boundary(row: dict) -> dict:
@@ -5803,7 +5869,7 @@ def _merge_activity_counts(target: dict, source: dict) -> None:
 
 
 def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -> list[dict]:
-    if str(anchor.get("correlation_status") or "").startswith("ambiguous_"):
+    if str(anchor.get("correlation_status") or "").startswith("ambiguous_") and not _has_ambiguous_session_mirror(anchor):
         return []
     contexts = []
     activity_location = anchor.get("session_activity_location")
@@ -5838,6 +5904,15 @@ def _session_contexts_for_anchor(anchor: dict, codex_home: Path, *, role: str) -
             if context:
                 contexts.append(context)
     return contexts
+
+
+def _has_ambiguous_session_mirror(anchor: dict) -> bool:
+    if not str(anchor.get("correlation_status") or "").startswith("ambiguous_"):
+        return False
+    return any(
+        isinstance(mirror, dict) and mirror.get("source_kind") == "codex_sessions"
+        for mirror in anchor.get("mirror_sources") or []
+    )
 
 
 def _linked_worker_reviewer_session_contexts(
