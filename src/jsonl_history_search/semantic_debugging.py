@@ -821,6 +821,14 @@ def build_semantic_debug_payload(
     if action_proof_plan.get("applies"):
         investigation_state["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
         guided_audit_flow["action_proof_plan_summary"] = summarize_action_proof_plan(action_proof_plan)
+    if (
+        action_proof_plan.get("applies")
+        and action_proof_plan.get("status") == "primary_proof_refs_missing"
+    ):
+        next_reads = demote_action_proof_evaluator_source_reads(
+            next_reads,
+            query=agent_find["query"]["original"],
+        )
     core_convo_first_read_plan = build_core_convo_first_read_plan(
         target_reads=dedupe_dicts(
             list(action_proof_plan.get("primary_proof_refs") or [])
@@ -14903,6 +14911,31 @@ def demote_action_proof_unsafe_source_peers(
     return rows
 
 
+def demote_action_proof_evaluator_source_reads(
+    next_reads: list[dict[str, Any]],
+    *,
+    query: str,
+) -> list[dict[str, Any]]:
+    unsafe_paths: dict[str, str] = {}
+    paths = {action_proof_read_source_path(read) for read in next_reads if isinstance(read, dict)}
+    for path_text in paths:
+        if not path_text:
+            continue
+        path = Path(path_text)
+        if not path.is_file():
+            continue
+        try:
+            records = list(iter_records_for_file(path, "unknown_jsonl", timezone.utc))
+        except (AdapterReadError, OSError, ValueError):
+            continue
+        reason = action_proof_diagnostic_source_reason(path, records=records, query=query)
+        if reason in ACTION_PROOF_UNSAFE_TARGET_IDENTITY_REASONS:
+            unsafe_paths[path_text] = reason
+    if not unsafe_paths:
+        return next_reads
+    return demote_action_proof_unsafe_source_peers(next_reads, unsafe_paths=unsafe_paths)
+
+
 def action_proof_diagnostic_source_reason(
     path: Path,
     *,
@@ -14951,6 +14984,9 @@ def action_proof_evaluator_or_fixture_request(text: str) -> bool:
             "fixture evidence",
             "answer key",
             "gold response",
+            "audit judge",
+            "audit reproduction",
+            "trace proves",
         )
     ):
         return True
