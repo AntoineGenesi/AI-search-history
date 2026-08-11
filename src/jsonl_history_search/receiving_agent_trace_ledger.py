@@ -330,22 +330,56 @@ def _current_loop_answer_artifact_seen(text: str, markers: tuple[str, ...]) -> b
     return False
 
 
+def _clearly_pre_existing_evaluation_artifacts_only(
+    text: str,
+    current_loop_markers: tuple[str, ...],
+) -> bool:
+    current_ids = {
+        int(match)
+        for marker in current_loop_markers
+        for match in CURRENT_LOOP_ID_RE.findall(marker)
+    }
+    artifact_matches = [
+        match.group(0)
+        for pattern in (
+            PROTECTED_EVALUATION_ARTIFACT_RE,
+            BENCHMARK_EVALUATION_PATH_RE,
+            CURRENT_LOOP_LANE_ARTIFACT_RE,
+        )
+        for match in pattern.finditer(text)
+    ]
+    if not current_ids or not artifact_matches:
+        return False
+
+    artifact_ids = [
+        {int(match) for match in CURRENT_LOOP_ID_RE.findall(artifact)}
+        for artifact in artifact_matches
+    ]
+    return all(ids and max(ids) < min(current_ids) for ids in artifact_ids)
+
+
 def _raw_window_contains_current_loop_answer_access(
     output: str,
     markers: tuple[str, ...],
 ) -> bool:
-    labels = {label.lower() for label in RAW_WINDOW_RECORD_LABEL_RE.findall(output)}
-    tool_event_seen = bool(labels & {"custom_tool_call", "custom_tool_call_output", "tool"})
-    answer_artifact_seen = bool(
-        PROTECTED_EVALUATION_ARTIFACT_RE.search(output)
-        or BENCHMARK_EVALUATION_PATH_RE.search(output)
-        or CURRENT_LOOP_LANE_ARTIFACT_RE.search(output)
-    )
-    return (
-        tool_event_seen
-        and answer_artifact_seen
-        and _contains_current_loop_marker(output, markers)
-    )
+    record_matches = list(RAW_WINDOW_RECORD_LABEL_RE.finditer(output))
+    for index, match in enumerate(record_matches):
+        if match.group(1).lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
+            continue
+        block_end = record_matches[index + 1].start() if index + 1 < len(record_matches) else len(output)
+        block = output[match.start() : block_end]
+        answer_artifact_seen = bool(
+            PROTECTED_EVALUATION_ARTIFACT_RE.search(block)
+            or BENCHMARK_EVALUATION_PATH_RE.search(block)
+            or CURRENT_LOOP_LANE_ARTIFACT_RE.search(block)
+        )
+        if (
+            answer_artifact_seen
+            and _contains_current_loop_marker(block, markers)
+            and not _clearly_pre_existing_evaluation_artifacts_only(block, markers)
+        ):
+            return True
+    return False
 
 
 def _has_primary_raw_history_path(text: str) -> bool:
@@ -443,14 +477,28 @@ def _evidence_access_classes(
         if not command_has_primary:
             primary_probe = f"{command}\n{output}"
 
-    command_current_loop = (
+    command_has_answer_artifact = (
         bool(BENCHMARK_EVALUATION_PATH_RE.search(command))
         or (not command_has_primary and bool(ANSWER_KEY_ARTIFACT_RE.search(command)))
+    )
+    command_pre_existing = _clearly_pre_existing_evaluation_artifacts_only(
+        command,
+        current_loop_markers,
+    )
+    command_current_loop = (
+        command_has_answer_artifact and not command_pre_existing
     ) or _current_loop_answer_artifact_seen(command, current_loop_markers)
+    output_pre_existing = _clearly_pre_existing_evaluation_artifacts_only(
+        output,
+        current_loop_markers,
+    )
     output_current_loop = (
-        output_discovery and bool(ANSWER_KEY_ARTIFACT_RE.search(output))
-    ) or _current_loop_answer_artifact_seen(
-        output, current_loop_markers
+        output_discovery
+        and not output_pre_existing
+        and (
+            bool(ANSWER_KEY_ARTIFACT_RE.search(output))
+            or _current_loop_answer_artifact_seen(output, current_loop_markers)
+        )
     ) or _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
     current_loop_from_raw_output = (
         command_has_primary
@@ -478,7 +526,9 @@ def _evidence_access_classes(
         classes.append("primary_raw_evidence")
 
     if not classes and command_succeeded:
-        if SECONDARY_CONTEXT_PATH_RE.search(command):
+        if command_pre_existing or (output_discovery and output_pre_existing):
+            classes.append("legitimate_pre_existing_secondary_context")
+        elif SECONDARY_CONTEXT_PATH_RE.search(command):
             classes.append("legitimate_pre_existing_secondary_context")
         elif UNCLEAR_SOURCE_PATH_RE.search(command):
             classes.append("unclear_chronology")
