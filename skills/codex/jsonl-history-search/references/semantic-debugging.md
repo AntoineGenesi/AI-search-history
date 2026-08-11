@@ -1,21 +1,24 @@
 # Semantic Debugging And Provenance
 
-Use for historical cause/decision/failure/source-provenance, `long_range_history`, `deep_history_audit`, `provenance`, or `orchestration_provenance`.
+Use for `long_range_history`, `deep_history_audit`, `provenance`, or
+`orchestration_provenance` cause/decision/failure questions.
 
-```bash
-jsonl-history-search semantic-debug "<question>" --cwd "$PWD" --format text
-```
-
-Default is quick. Use `--audit-depth in-depth` for explicit deep audits. Use `--audit-depth exhaustive` for scoped full asks like "fully
+Default is quick. Use `--audit-depth in-depth` for deep audits;
+`--audit-depth exhaustive` is for scoped full asks like "fully
 audit everything" or "audit every subagent"; capped/top-N samples cannot close.
 
-Open `source_locator_handoff`/`next_reads` refs before summaries. Separate observed evidence from inference; say `candidate`/`likely` when incomplete. Fail closed when primary refs are missing/unopened/capped/ambiguous/contradicted.
+Open `source_locator_handoff`/`next_reads` before summaries. Separate observed evidence from
+inference. Fail closed on missing/unopened/capped/ambiguous refs.
 
-Inspect `audit_continuation_workflow`/`in_depth_audit_coverage`: cap statuses, trace counts, omitted windows, `answer_promotion_allowed`, residual uncertainty.
-`answer_ready=false`: hard stop. Use emitted `read-more`, `semantic-debug`,
-`follow-next-reads`, or the `audit-coverage` command. If one fails, report the
-blocker; never `sed`/`rg`/`jq` transcript homes; treat task/report/review outputs as
-manual leads only after raw refs. Capped/top-N samples do not
+Inspect `in_depth_audit_coverage`: cap statuses, trace counts, omitted windows,
+`answer_promotion_allowed`, residual uncertainty. `answer_ready=false`: stop.
+Run its emitted `audit-coverage` command; report blockers. Never `sed`/`rg`/`jq`
+transcript homes. Treat task/report/review outputs as manual leads only after raw
+refs. Capped/top-N samples do not
 claim completeness.
 
-Method packets: `required_surfaces`/`read_order`; raw refs before artifacts/echoes/recaps. Continue only for packet-named gaps/caps/omissions/contradictions.
+For broad/pre-compaction history, run its target-preserving continuation first;
+if absent, return a searched-scope/missing-facet fail-closed packet without a user question.
+
+Method packets: `required_surfaces`/`read_order`; raw refs before artifacts.
+Continue only for named gaps/caps/omissions/contradictions.

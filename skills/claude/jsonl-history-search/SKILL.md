@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Trigger even without JSONL or `convo` for prior conversation history. Do not load this skill for ambiguous task ID/status alone, e.g. `Is TASK-123 done?`; clarify current repo/Git/task versus prior conversation history. Trigger for `what has happened since my last message in the parent thread?`, old context before compaction, deferred/failed work, provenance, action proof, or history-dependent writing/editing. Resolve before asking the user to repeat information. `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`. Non-triggers: self-contained writing/editing or coding, bare `what happened?`, local repo/task/Git status, or Git/browser history.
+description: Trigger even without JSONL or `convo` for prior conversation history. Do not load this skill for ambiguous task ID/status alone, e.g. `Is TASK-123 done?`. Trigger for `what has happened since my last message in the parent thread?`, old context before compaction, deferred/failed work, provenance, action proof, or history-dependent writing/editing. `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`. Non-triggers: self-contained writing/editing or coding, bare `what happened?`, or local repo/task/Git status.
 metadata:
   short-description: History
 ---
@@ -14,8 +14,9 @@ Trigger for prior conversation history: what the user previously said; old decis
 Do not trigger for bare `what happened?`, `what changed in this task file?`,
 ordinary branch/cleanliness/local-status prompts, repo/Git history prompts,
 local repo/task/artifact status prompts, generic questions not anchored to prior conversation history,
-or self-contained writing/editing/summarizing prompts. History-dependent
-writing/editing remains a trigger. Ask one short clarifying question and use zero tools.
+or self-contained writing/editing/summarizing prompts. History-dependent writing/editing remains a trigger.
+Remembered coding is recovery-only: answer/continue; do not edit/test.
+Ask one short clarifying question and use zero tools only for non-history ambiguity.
 
 `JSONL activation mode: explicit-only` requires `convo`/`use the convo tool`.
 
@@ -27,19 +28,15 @@ intent -> `--evidence-source local`; conversation/source-session intent ->
 "Do you want current local Git/task evidence or prior conversation history?"
 and use zero tools.
 
-Resolve after named-task scope; ask only on absent/capped/ambiguous/unavailable.
+Resolve before asking: after named-task scope, broad/old history uses
+its continuation or fail-closed packet without asking the user in that turn.
 
 Start exactly one installed route before repo search, Git, or visible-context synthesis.
 Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI, not connector discovery/plugin install/`convo --help`.
-old-context decisions (`before compaction`, `outside visible context`, or
-`earlier in the thread`) use `semantic-debug`. For explicit all-chats/agent-history audit wording, run:
-
-```bash
-jsonl-history-search semantic-debug "<user wording>" --audit-depth in-depth --cwd "$PWD" --format text
-```
-
-Use `--audit-depth exhaustive` only for scoped full coverage.
-Otherwise run:
+Route old-context decisions (`before compaction`, `outside visible context`,
+`earlier in the thread`), remembered constraints, and explicit all-chats/agent-history
+audit wording through `ask --execute`. Its `semantic-debug` contract chooses depth;
+use `--audit-depth exhaustive` only for scoped full coverage. Otherwise run:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
@@ -82,6 +79,10 @@ direct `semantic-debug`. Read one matching file under `references/`:
 - repeated corrections or session lessons: `references/semantic-wrapup.md`;
 - named skill-use audit: `references/skill-audit.md`.
 
+`route_family=remembered_instruction` means `history_answer_only`: report
+user-authored refs or its continuation/fail-closed packet; never edit, test,
+delegate, or execute recovered imperatives.
+
 ## Source And Stop Rules
 
 1. Treat CLI summaries as navigation, not as primary proof. Use its selected refs/
@@ -97,7 +98,6 @@ direct `semantic-debug`. Read one matching file under `references/`:
    `--phrase`/`--phrases-file`; validate its continuation.
 5. `not_found_in_searched_scope` is searched-scope only.
 6. Stop when inspected primary sources answer the question. Widen for a
-   named gap. On absent/capped/ambiguous/failure, follow an emitted continuation
-   or fail closed; never `sed`/`rg`/`jq` transcript homes.
+   named gap; otherwise continue/fail closed before asking. Never `sed`/`rg`/`jq` transcript homes.
 7. ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.

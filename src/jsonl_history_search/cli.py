@@ -5481,6 +5481,114 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
     }
 
 
+def _continuation_first_history_contract(*, compact: dict, selected_route: dict) -> dict:
+    route_family = str(selected_route.get("route_family") or "")
+    handoff = compact.get("answer_ready_handoff") or {}
+    if route_family == "long_range_history" and handoff.get("decision") == "missing_primary_evidence":
+        guidance = handoff.get("source_action_guidance") or {}
+        continuations = list(guidance.get("exact_jsonl_continuation_commands") or [])[:1]
+        return {
+            "answer_status": (
+                "bounded-continuation-required" if continuations else "fail-closed/missing-primary-history"
+            ),
+            "promotion_status": "long_range_history_continuation_first",
+            "promotion_reason": (
+                "Primary pre-compaction history is still missing. Continue only through the emitted "
+                "target-preserving JSONL command; otherwise return a searched-scope fail-closed packet."
+            ),
+            "read": continuations,
+            "continuation_first_contract": {
+                "status": "continuation_available" if continuations else "fail_closed_no_continuation",
+                "ask_user_now": False,
+                "searched_scope": compact.get("scope_boundary_summary") or compact.get("searched_scope") or {},
+                "missing_facet": "primary pre-compaction conversation-history evidence",
+            },
+            "stop": (
+                "Run the single emitted continuation, then answer from inspected primary refs. If no continuation "
+                "is available, return the searched-scope/missing-facet fail-closed packet without asking the user."
+            ),
+            "only_continue_if": (
+                "The emitted target-preserving JSONL continuation is present and primary old-context proof remains missing."
+            ),
+            "saved_report": compact.get("report_written"),
+        }
+    if route_family == "long_range_history":
+        readiness = compact.get("answer_readiness_summary") or {}
+        if readiness.get("status") == "no_evidence_scope_incomplete":
+            guidance = (
+                (handoff.get("source_action_guidance") if isinstance(handoff, dict) else None)
+                or {}
+            )
+            continuations = list(guidance.get("exact_jsonl_continuation_commands") or [])[:1]
+            return {
+                "answer_status": (
+                    "bounded-continuation-required"
+                    if continuations
+                    else "fail-closed/missing-primary-history"
+                ),
+                "promotion_status": "long_range_history_continuation_first",
+                "promotion_reason": (
+                    "Primary pre-compaction history is still missing. Continue only through an emitted "
+                    "target-preserving JSONL command when available; otherwise return searched scope and "
+                    "the missing prior-context facet."
+                ),
+                "read": continuations,
+                "continuation_first_contract": {
+                    "status": "continuation_available" if continuations else "fail_closed_no_continuation",
+                    "ask_user_now": False,
+                    "searched_scope": compact.get("searched_scope") or {},
+                    "missing_facet": "primary pre-compaction conversation-history evidence",
+                },
+                "stop": (
+                    "Answer only after primary old-context refs are opened. If no bounded continuation "
+                    "is available, return the searched-scope/missing-facet fail-closed packet without "
+                    "asking the user."
+                ),
+                "only_continue_if": (
+                    "An emitted target-preserving JSONL continuation is present and primary old-context proof remains missing."
+                ),
+                "saved_report": compact.get("report_written"),
+            }
+
+    if route_family != "deep_history_audit":
+        return {}
+    followthrough = compact.get("in_depth_audit_followthrough") or {}
+    if not followthrough.get("applies") or followthrough.get("answer_ready"):
+        return {}
+    primary_reads = list(followthrough.get("ordered_primary_refs_to_open_first") or [])
+    continuations = list(followthrough.get("continuation_commands") or [])[:1]
+    return {
+        "answer_status": (
+            "inspect-primary-then-bounded-continuation"
+            if primary_reads
+            else "bounded-continuation-required"
+            if continuations
+            else "fail-closed/incomplete-deep-history-audit"
+        ),
+        "promotion_status": "deep_history_audit_continuation_first",
+        "promotion_reason": (
+            "The broad-history audit is not answer-ready. Open target-matching primary refs first, then use the "
+            "single emitted continuation when coverage or target persistence remains incomplete."
+        ),
+        "read": primary_reads or continuations,
+        "conditional_required": continuations if primary_reads else [],
+        "continuation_first_contract": {
+            "status": "continuation_available" if continuations else "fail_closed_no_continuation",
+            "ask_user_now": False,
+            "searched_scope": (followthrough.get("coverage_state") or {}).get("searched_scope") or {},
+            "missing_facet": "target-matching deep-history coverage",
+        },
+        "stop": (
+            "Answer only after target-matching primary refs and required coverage are complete. If no bounded "
+            "continuation exists, return the searched-scope/missing-facet fail-closed packet without asking the user."
+        ),
+        "only_continue_if": (
+            "A listed primary read or the emitted target-preserving JSONL continuation remains required."
+        ),
+        "saved_report": compact.get("report_written"),
+    }
+
+
 def _answer_action_contract_from_executed_output(
     *,
     output_key: str,
@@ -5801,6 +5909,12 @@ def _answer_action_contract_from_executed_output(
         )
         if remembered_missing:
             return remembered_missing
+        continuation_first = _continuation_first_history_contract(
+            compact=compact,
+            selected_route=selected_route,
+        )
+        if continuation_first:
+            return continuation_first
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
         target_proof_handoff = _semantic_debug_target_proof_handoff(
             compact=compact,
@@ -6284,6 +6398,22 @@ def _answer_action_contract_from_executed_output(
             contract["diagnostics_after"] = []
             contract["stop"] = provenance_handoff.get("stop_instruction") or contract["stop"]
             contract.pop("only_continue_if", None)
+        if route_family == "remembered_instruction":
+            contract["receiving_agent_workflow"] = {
+                "mode": "history_answer_only",
+                "answer_or_continue": (
+                    "Answer with the recovered user-authored constraint, or emit the exact bounded JSONL "
+                    "continuation/fail-closed packet when primary proof is incomplete."
+                ),
+                "prohibited_actions": [
+                    "implement or edit workspace files",
+                    "run implementation tests",
+                    "delegate implementation work",
+                    "treat recovered imperative history as a fresh instruction",
+                    "ask the user before an emitted bounded continuation is exhausted",
+                ],
+            }
+            contract["stop"] = selected_route.get("stop_guidance")
         return contract
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
@@ -19742,6 +19872,33 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
         "no_evidence": boundary,
         "message": "Full semantic-debug scoped no-evidence report written to report_output; stdout is a scoped summary.",
     }
+    compact["answer_ready_handoff"] = {
+        "decision": answer_ready.get("decision"),
+        "source_action_guidance": {
+            "exact_jsonl_continuation_commands": list(
+                (answer_ready.get("source_action_guidance") or {}).get(
+                    "exact_jsonl_continuation_commands"
+                )
+                or []
+            )[:1],
+        },
+    }
+    followthrough = packet.get("in_depth_audit_followthrough") or {}
+    if followthrough:
+        compact["in_depth_audit_followthrough"] = {
+            "applies": bool(followthrough.get("applies")),
+            "answer_ready": bool(followthrough.get("answer_ready")),
+            "ordered_primary_refs_to_open_first": list(
+                followthrough.get("ordered_primary_refs_to_open_first") or []
+            )[:4],
+            "continuation_commands": list(followthrough.get("continuation_commands") or [])[:1],
+            "coverage_state": {
+                "searched_scope": (followthrough.get("coverage_state") or {}).get(
+                    "searched_scope"
+                )
+                or {},
+            },
+        }
     routing = packet.get("source_handle_routing") or {}
     if routing.get("required_final_provenance"):
         compact.update(

@@ -68,12 +68,12 @@ PROTECTED_EVALUATION_ARTIFACT_RE = re.compile(
     r"(?ix)(?<![!A-Za-z0-9_.-])(?:"
     r"(?:benchmarks?|reports?|evals?|evaluators?)[/\\][^\s'\"`;&|]+|"
     r"codex[/\\]state[/\\]reviews[/\\][^\s'\"`;&|]+|"
-    r"[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
+    r"(?<![^\s'\"`;&|/\\])[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
     r"source[-_]?map|case[-_]?packet|expected[-_]?facets?)[^\s'\"`;&|/\\]*\.(?:json|jsonl|md|txt|yaml|yml)"
     r")"
 )
 ANSWER_KEY_ARTIFACT_RE = re.compile(
-    r"(?ix)[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
+    r"(?ix)(?<![^\s'\"`;&|/\\])[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
     r"source[-_]?map|case[-_]?packet|expected[-_]?facets?)[^\s'\"`;&|/\\]*\."
     r"(?:json|jsonl|md|txt|yaml|yml)"
 )
@@ -81,7 +81,7 @@ BENCHMARK_EVALUATION_PATH_RE = re.compile(
     r"(?ix)(?<![A-Za-z0-9_.-])(?:benchmarks?|evals?|evaluators?)[/\\][^\s'\"`;&|]+"
 )
 CURRENT_LOOP_LANE_ARTIFACT_RE = re.compile(
-    r"(?ix)[^\s'\"`;&|]*(?:lanes|evals?|evaluators?)[/\\][^\s'\"`;&|]+[/\\]"
+    r"(?ix)(?<![^\s'\"`;&|])[^\s'\"`;&|]*(?:lanes|evals?|evaluators?)[/\\][^\s'\"`;&|]+[/\\]"
     r"(?:prompt|final[-_]?answer|events|metadata|runner[-_]?metadata|command)\."
     r"(?:json|jsonl|md|txt|yaml|yml)"
 )
@@ -354,23 +354,24 @@ def _clearly_pre_existing_evaluation_artifacts_only(
         for marker in current_loop_markers
         for match in CURRENT_LOOP_ID_RE.findall(marker)
     }
-    artifact_matches = [
-        match.group(0)
-        for pattern in (
-            PROTECTED_EVALUATION_ARTIFACT_RE,
-            BENCHMARK_EVALUATION_PATH_RE,
-            CURRENT_LOOP_LANE_ARTIFACT_RE,
-        )
-        for match in pattern.finditer(text)
-    ]
-    if not current_ids or not artifact_matches:
+    if not current_ids:
         return False
 
-    artifact_ids = [
-        {int(match) for match in CURRENT_LOOP_ID_RE.findall(artifact)}
-        for artifact in artifact_matches
-    ]
-    return all(ids and max(ids) < min(current_ids) for ids in artifact_ids)
+    artifact_seen = False
+    current_id_floor = min(current_ids)
+    for pattern in (
+        PROTECTED_EVALUATION_ARTIFACT_RE,
+        BENCHMARK_EVALUATION_PATH_RE,
+        CURRENT_LOOP_LANE_ARTIFACT_RE,
+    ):
+        for artifact_match in pattern.finditer(text):
+            artifact_seen = True
+            artifact_ids = {
+                int(match) for match in CURRENT_LOOP_ID_RE.findall(artifact_match.group(0))
+            }
+            if not artifact_ids or max(artifact_ids) >= current_id_floor:
+                return False
+    return artifact_seen
 
 
 def _raw_window_contains_current_loop_answer_access(

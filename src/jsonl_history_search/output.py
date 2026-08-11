@@ -786,6 +786,17 @@ def render_ask_execute_text(payload: dict) -> str:
             f"Promotion status: {action.get('promotion_status')}",
         ]
     )
+    workflow = action.get("receiving_agent_workflow") or {}
+    if workflow:
+        lines.append(f"Receiving-agent workflow: {workflow.get('mode')}")
+        lines.append(f"Answer/continue boundary: {workflow.get('answer_or_continue')}")
+        for item in workflow.get("prohibited_actions") or []:
+            lines.append(f"- Prohibited: {item}")
+    continuation_first = action.get("continuation_first_contract") or {}
+    if continuation_first:
+        lines.append(f"Continuation-first status: {continuation_first.get('status')}")
+        lines.append(f"Ask user now: {str(bool(continuation_first.get('ask_user_now'))).lower()}")
+        lines.append(f"Missing facet: {continuation_first.get('missing_facet')}")
     _append_latest_status_followthrough_contract(
         lines,
         latest_status_contract,
@@ -934,6 +945,19 @@ def render_ask_execute_markdown(payload: dict) -> str:
             f"- Promotion status: `{action.get('promotion_status')}`",
         ]
     )
+    workflow = action.get("receiving_agent_workflow") or {}
+    if workflow:
+        lines.append(f"- Receiving-agent workflow: `{workflow.get('mode')}`")
+        lines.append(f"- Answer/continue boundary: {workflow.get('answer_or_continue')}")
+        for item in workflow.get("prohibited_actions") or []:
+            lines.append(f"- Prohibited: {item}")
+    continuation_first = action.get("continuation_first_contract") or {}
+    if continuation_first:
+        lines.append(f"- Continuation-first status: `{continuation_first.get('status')}`")
+        lines.append(
+            f"- Ask user now: `{str(bool(continuation_first.get('ask_user_now'))).lower()}`"
+        )
+        lines.append(f"- Missing facet: {continuation_first.get('missing_facet')}")
     _append_latest_status_followthrough_contract(
         lines,
         latest_status_contract,
@@ -6699,7 +6723,7 @@ def _render_semantic_debug_missing_primary_evidence(
         + (
             "searches outside the exact JSONL continuation below."
             if commands
-            else "searches; request a narrower history scope instead."
+            else "searches. Return the bounded fail-closed packet below instead of asking the user in this turn."
         )
     )
     status = (
@@ -6726,9 +6750,11 @@ def _render_semantic_debug_missing_primary_evidence(
                 [
                     "",
                     (
-                        "- No bounded target-preserving continuation is available; fail closed."
+                        "- FAIL-CLOSED PACKET: no bounded target-preserving continuation is available. "
+                        "Report searched scope and the missing target facet; do not ask the user in this turn."
                         if target_mismatch
-                        else "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+                        else "- FAIL-CLOSED PACKET: no bounded continuation is available. Report searched scope "
+                        "and the missing primary facet; do not ask the user in this turn."
                     ),
                 ]
             )
@@ -6745,9 +6771,11 @@ def _render_semantic_debug_missing_primary_evidence(
         lines.extend(["Exact JSONL continuation:", commands[0]])
     else:
         lines.append(
-            "No bounded target-preserving continuation is available; fail closed."
+            "FAIL-CLOSED PACKET: no bounded target-preserving continuation is available. Report searched scope "
+            "and the missing target facet; do not ask the user in this turn."
             if target_mismatch
-            else "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+            else "FAIL-CLOSED PACKET: no bounded continuation is available. Report searched scope and the "
+            "missing primary facet; do not ask the user in this turn."
         )
     return "\n".join(lines)
 
