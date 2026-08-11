@@ -20,7 +20,103 @@ from .real_run_gate import render_real_run_gate_report, render_real_run_gate_tex
 
 
 def render_json(payload: dict) -> str:
-    return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
+    safe_payload = _semantic_debug_cap_hit_json_projection(payload)
+    return json.dumps(safe_payload or payload, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def _semantic_debug_cap_hit_json_projection(payload: dict) -> dict | None:
+    report = payload.get("semantic_debug")
+    if not isinstance(report, dict):
+        return None
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    disposition = followthrough.get("cap_hit_disposition") or {}
+    if disposition.get("status") not in {"canonical_continuation", "scoped_fail_closed"}:
+        return None
+    if disposition.get("answer_ready") is not False:
+        return None
+
+    canonical = disposition.get("canonical_continuation")
+    safe_canonical = _semantic_debug_safe_continuation(canonical) if isinstance(canonical, dict) else None
+    safe_disposition = {
+        "schema_version": disposition.get("schema_version"),
+        "status": disposition.get("status"),
+        "answer_ready": False,
+        "canonical_continuation": safe_canonical,
+        "scoped_fail_closed": disposition.get("scoped_fail_closed"),
+        "partial_evidence_rendering_allowed": False,
+        "manual_history_fallback_allowed": False,
+        "pending_continuation_candidate_count": disposition.get("pending_continuation_candidate_count", 0),
+        "cap_continuation_count": disposition.get("cap_continuation_count", 0),
+        "tail_followup_count": disposition.get("tail_followup_count", 0),
+        "unresolved_cap_slice_count": disposition.get("unresolved_cap_slice_count", 0),
+        "covered_unresolved_cap_slice_count": disposition.get(
+            "covered_unresolved_cap_slice_count", 0
+        ),
+        "canonical_scope_coverage_complete": bool(
+            disposition.get("canonical_scope_coverage_complete")
+        ),
+    }
+    workflow = report.get("audit_continuation_workflow") or followthrough.get(
+        "audit_continuation_workflow"
+    ) or {}
+    safe_workflow = {
+        "schema_version": workflow.get("schema_version"),
+        "applies": bool(workflow.get("applies")),
+        "answer_ready": False,
+        "hard_stop": True,
+        "answer_status": workflow.get("answer_status") or "not_answerable_yet",
+        "hard_stop_semantics": workflow.get("hard_stop_semantics"),
+        "pending_slices": list(workflow.get("pending_slices") or []),
+        "continuation_commands": [safe_canonical] if safe_canonical else [],
+        "cap_hit_disposition": safe_disposition,
+        "do_not_abandon_jsonl_guidance": workflow.get("do_not_abandon_jsonl_guidance"),
+    }
+    return {
+        "semantic_debug": {
+            "schema_version": report.get("schema_version"),
+            "status": report.get("status"),
+            "audit_depth": report.get("audit_depth"),
+            "question_family": report.get("question_family"),
+            "answer_gate": {
+                "status": "not_answerable_yet",
+                "answer_ready": False,
+                "hard_stop": True,
+                "partial_evidence_rendering_allowed": False,
+                "manual_history_fallback_allowed": False,
+            },
+            "cap_hit_disposition": safe_disposition,
+            "coverage_state": followthrough.get("coverage_state") or {},
+            "audit_continuation_workflow": safe_workflow,
+            "suppressed_evidence": {
+                "strongest_candidate_count": len(report.get("strongest_candidates") or []),
+                "timeline_event_count": len(report.get("timeline") or []),
+                "next_read_count": len(report.get("next_reads") or []),
+                "fields": ["strongest_candidates", "timeline", "next_reads"],
+                "snippet_material_included": False,
+            },
+            "message": (
+                "Cap-hit evidence is withheld until the exact continuation covers all unresolved "
+                "capped scope, or the scoped failure is resolved."
+            ),
+        }
+    }
+
+
+def _semantic_debug_safe_continuation(action: dict) -> dict:
+    safe_keys = (
+        "command_id",
+        "slice",
+        "missing_or_capped_window",
+        "status",
+        "coverage_label",
+        "cap_labels",
+        "retry_guidance",
+        "target_fingerprint_12",
+        "target_persistence_required",
+        "argv",
+        "command",
+    )
+    return {key: action.get(key) for key in safe_keys if key in action}
 
 
 def render_text(payload: dict) -> str:

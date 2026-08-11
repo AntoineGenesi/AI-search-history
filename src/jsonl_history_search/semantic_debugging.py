@@ -15562,11 +15562,34 @@ def build_in_depth_audit_followthrough_plan(
     search_cap_hit = bool((coverage.get("search_cap_hit") or {}).get("hit") or caps.get("hit"))
     cap_hit_disposition: dict[str, Any] = {}
     if search_cap_hit:
-        canonical_continuation = continuation_candidates[0] if len(continuation_candidates) == 1 else None
+        unresolved_cap_slices = {
+            str(row.get("slice"))
+            for row in in_depth_audit_pending_slice_labels(coverage)
+            if row.get("slice")
+        }
+        covered_cap_slices = {
+            str(command.get("slice"))
+            for command in cap_continuation_commands
+            if command.get("slice")
+        }
+        canonical_scope_coverage_complete = bool(unresolved_cap_slices) and (
+            covered_cap_slices == unresolved_cap_slices
+        )
+        canonical_continuation = (
+            cap_continuation_commands[0]
+            if len(cap_continuation_commands) == 1
+            and not tail_followup_actions
+            and canonical_scope_coverage_complete
+            else None
+        )
         fail_closed_reason = (
             "Search caps blocked complete coverage and no deterministic JSONL continuation was available."
             if not continuation_candidates
-            else "Multiple independent coverage slices remain; no single continuation covers them all without risking hidden evidence."
+            else (
+                "Available follow-up does not cover every unresolved capped slice; no command is canonical."
+                if not canonical_scope_coverage_complete
+                else "Multiple independent coverage actions remain; no single continuation covers them all without risking hidden evidence."
+            )
         )
         cap_hit_disposition = {
             "schema_version": 1,
@@ -15587,6 +15610,11 @@ def build_in_depth_audit_followthrough_plan(
             "partial_evidence_rendering_allowed": False,
             "manual_history_fallback_allowed": False,
             "pending_continuation_candidate_count": len(continuation_candidates),
+            "cap_continuation_count": len(cap_continuation_commands),
+            "tail_followup_count": len(tail_followup_actions),
+            "unresolved_cap_slice_count": len(unresolved_cap_slices),
+            "covered_unresolved_cap_slice_count": len(covered_cap_slices & unresolved_cap_slices),
+            "canonical_scope_coverage_complete": canonical_scope_coverage_complete,
         }
     continuation_commands = (
         [cap_hit_disposition["canonical_continuation"]]
