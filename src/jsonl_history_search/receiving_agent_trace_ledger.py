@@ -97,6 +97,7 @@ CURRENT_LOOP_ID_RE = re.compile(r"(?i)\bjsh[-_]?([0-9]+)")
 RAW_WINDOW_RECORD_LABEL_RE = re.compile(
     r"(?im)^-\s+[^\n]+\.jsonl:\d+:\s+([a-z_][a-z0-9_]*)\s*$"
 )
+RAW_WINDOW_RECORD_COUNT_RE = re.compile(r"(?im)^Records:\s+(\d+)\s+included\b")
 RAW_SETUP_ONLY_RECORD_LABELS = {
     "developer",
     "session_meta",
@@ -363,9 +364,18 @@ def _raw_window_contains_current_loop_answer_access(
     markers: tuple[str, ...],
 ) -> bool:
     record_matches = list(RAW_WINDOW_RECORD_LABEL_RE.finditer(output))
-    for index, match in enumerate(record_matches):
+    if not record_matches:
+        return False
+
+    count_match = RAW_WINDOW_RECORD_COUNT_RE.search(output)
+    trusted_matches = record_matches[:1]
+    if count_match and int(count_match.group(1)) == len(record_matches):
+        trusted_matches = record_matches
+
+    for match in trusted_matches:
         if match.group(1).lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
             continue
+        index = record_matches.index(match)
         block_end = record_matches[index + 1].start() if index + 1 < len(record_matches) else len(output)
         block = output[match.start() : block_end]
         answer_artifact_seen = bool(
@@ -447,6 +457,30 @@ def _rg_targets_are_primary_raw_history_only(command: str) -> bool:
     return bool(targets) and all(_has_primary_raw_history_path(target) for target in targets)
 
 
+def _git_show_targets_primary_raw_history_only(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if (
+        len(argv) >= 3
+        and argv[0].rsplit("/", 1)[-1] in {"bash", "sh"}
+        and argv[1] in {"-c", "-lc"}
+    ):
+        try:
+            argv = shlex.split(argv[2])
+        except ValueError:
+            return False
+    if len(argv) < 3 or argv[:2] != ["git", "show"]:
+        return False
+    targets = [token for token in argv[2:] if not token.startswith("-")]
+    return (
+        len(targets) == 1
+        and ":" in targets[0]
+        and _has_primary_raw_history_path(targets[0].split(":", 1)[1])
+    )
+
+
 def _evidence_access_classes(
     command: str,
     output: str,
@@ -472,6 +506,7 @@ def _evidence_access_classes(
         and command_succeeded
         and output_has_evidence
         and not _rg_targets_are_primary_raw_history_only(command)
+        and not _git_show_targets_primary_raw_history_only(command)
     )
     if output_discovery:
         if not command_has_primary:
@@ -499,7 +534,10 @@ def _evidence_access_classes(
             bool(ANSWER_KEY_ARTIFACT_RE.search(output))
             or _current_loop_answer_artifact_seen(output, current_loop_markers)
         )
-    ) or _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
+    ) or (
+        command_kind == "jsonl_read_more"
+        and _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
+    )
     current_loop_from_raw_output = (
         command_has_primary
         and not command_current_loop
