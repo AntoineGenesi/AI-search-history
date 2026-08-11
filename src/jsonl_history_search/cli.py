@@ -6304,6 +6304,7 @@ def _answer_action_contract_from_executed_output(
             "saved_report": compact.get("report_written"),
         }
     if _bounded_no_evidence_scoped_answer_ready(compact=compact, selected_route=selected_route):
+        scoped_contract = _scoped_no_evidence_contract(compact)
         return {
             "answer_status": "not-ready/needs-more-proof",
             "promotion_status": "unpromoted",
@@ -6312,16 +6313,22 @@ def _answer_action_contract_from_executed_output(
                 "inspect the bounded result and resolve the named coverage gap before answering."
             ),
             "promotion_scope": "not_found_in_searched_scope",
-            "scoped_no_evidence_contract": _scoped_no_evidence_contract(compact),
-            "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
+            "scoped_no_evidence_contract": scoped_contract,
+            "cap_hit_disposition": _bounded_no_evidence_cap_hit_disposition(scoped_contract),
+            "read": [],
+            "conditional_required": [],
+            "diagnostics_after": [],
+            "partial_evidence_rendering_allowed": False,
             "stop": (
-                "Do not issue a terminal no-evidence answer while declared scope coverage is incomplete."
+                "FAIL CLOSED for this scoped no-evidence claim. The named cap leaves hidden evidence possible; "
+                "do not summarize partial candidates or fall back to manual history search."
             ),
-            "only_continue_if": compact.get("no_evidence", {}).get("read_more_policy")
-            or selected_route.get("manual_search_guidance"),
+            "only_continue_if": None,
             "saved_report": compact.get("report_written"),
         }
     no_evidence = compact.get("no_evidence") if isinstance(compact.get("no_evidence"), dict) else {}
+    scoped_contract = _scoped_no_evidence_contract(compact) if no_evidence else None
+    cap_hit = bool(scoped_contract and scoped_contract.get("cap_hit") is True)
     return {
         "answer_status": "not-ready/needs-more-proof",
         "promotion_status": "unpromoted",
@@ -6329,12 +6336,24 @@ def _answer_action_contract_from_executed_output(
             "Executed output did not satisfy bounded scoped no-evidence promotion requirements."
         ),
         "internal_answer_status": compact.get("status"),
-        "scoped_no_evidence_contract": (
-            _scoped_no_evidence_contract(compact) if isinstance(compact.get("no_evidence"), dict) else None
+        "scoped_no_evidence_contract": scoped_contract,
+        "cap_hit_disposition": (
+            _bounded_no_evidence_cap_hit_disposition(scoped_contract) if cap_hit else None
         ),
-        "read": compact.get("source_locator_handoff", {}).get("next_reads") or [],
-        "stop": selected_route.get("stop_guidance"),
-        "only_continue_if": no_evidence.get("read_more_policy") or selected_route.get("manual_search_guidance"),
+        "read": [] if cap_hit else compact.get("source_locator_handoff", {}).get("next_reads") or [],
+        "diagnostics_after": [],
+        "partial_evidence_rendering_allowed": not cap_hit,
+        "stop": (
+            "FAIL CLOSED for this scoped no-evidence claim. The named cap leaves hidden evidence possible; "
+            "do not summarize partial candidates or fall back to manual history search."
+            if cap_hit
+            else selected_route.get("stop_guidance")
+        ),
+        "only_continue_if": (
+            None
+            if cap_hit
+            else no_evidence.get("read_more_policy") or selected_route.get("manual_search_guidance")
+        ),
         "saved_report": compact.get("report_written"),
     }
 
@@ -9292,6 +9311,16 @@ def _scoped_no_evidence_contract(compact: dict) -> dict:
         "cap_hit": cap_hit.get("hit"),
         "caps_hit": cap_hit.get("caps_hit", []),
         "outside_selected_roots": no_evidence.get("outside_selected_roots"),
+        "source_boundary": (
+            "only the selected roots and searched files/bytes were evaluated; outside selected roots "
+            "and all-history absence remain unproven"
+        ),
+        "blind_spots": {
+            "caps_hit": cap_hit.get("caps_hit", []),
+            "excluded_root_count": scope_counts.get("excluded_root_count"),
+            "missing_root_count": scope_counts.get("missing_root_count"),
+            "outside_selected_roots": no_evidence.get("outside_selected_roots"),
+        },
         "not_all_history_absence": no_evidence.get("not_all_history_absence"),
         "candidate_interpretation": no_evidence.get("candidate_interpretation"),
         "read_more_required_before_scoped_no_evidence_answer": read_more_policy.get(
@@ -9299,6 +9328,27 @@ def _scoped_no_evidence_contract(compact: dict) -> dict:
         ),
         "read_more_actionability": read_more_policy.get("actionability"),
         "saved_report": compact.get("report_written"),
+    }
+
+
+def _bounded_no_evidence_cap_hit_disposition(scoped_contract: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "scoped_fail_closed",
+        "answer_ready": False,
+        "canonical_continuation": None,
+        "scoped_fail_closed": {
+            "reason": "The declared cap prevented a complete searched-scope absence claim.",
+            "searched_scope": {
+                "searched_files": scoped_contract.get("searched_files"),
+                "searched_bytes": scoped_contract.get("searched_bytes"),
+                "searched_root_kinds": scoped_contract.get("searched_root_kinds") or [],
+            },
+            "blind_spots": scoped_contract.get("blind_spots") or {},
+            "source_boundary": scoped_contract.get("source_boundary"),
+        },
+        "partial_evidence_rendering_allowed": False,
+        "manual_history_fallback_allowed": False,
     }
 
 
@@ -11878,6 +11928,18 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> 
     if root_kind_text:
         text += f" across {root_label} ({root_kind_text})"
     text += "."
+    caps_hit = [str(item) for item in scoped.get("caps_hit") or [] if str(item).strip()]
+    text += (
+        " Source boundary: "
+        f"{scoped.get('source_boundary') or 'selected searched roots only; all-history absence remains unproven'}."
+    )
+    text += (
+        " Blind spots: "
+        f"caps_hit={','.join(caps_hit) if caps_hit else 'none'}, "
+        f"missing_roots={scoped.get('missing_root_count')}, "
+        f"excluded_roots={scoped.get('excluded_root_count')}, "
+        "outside_selected_roots=not searched."
+    )
     if scoped.get("scope_mode"):
         text += f" Scope mode: {scoped.get('scope_mode')}."
     excluded_roots = [str(item) for item in scoped.get("excluded_roots") or [] if str(item).strip()]
@@ -11898,7 +11960,7 @@ def _ask_answer_scoped_no_evidence(answer: dict, scoped: dict, *, cwd: Path) -> 
     if repo_boundary:
         text += f" {repo_boundary}"
     if scoped.get("cap_hit") is True:
-        caps_text = ", ".join(str(item) for item in (scoped.get("caps_hit") or [])[:4] if str(item).strip())
+        caps_text = ", ".join(caps_hit[:4])
         text += " Cap boundary: search or retention caps were hit"
         if caps_text:
             text += f" ({caps_text})"
