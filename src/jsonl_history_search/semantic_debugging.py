@@ -4281,16 +4281,45 @@ def historical_provenance_self_echo_policy_wanted(
 
 def dedupe_historical_provenance_reads(next_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     for read in next_reads:
         source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
         key = str(read.get("target") or source_ref_target(source_ref) or source_ref.get("path") or "")
         if key and key in seen:
+            retained_index = seen[key]
+            result[retained_index] = preserve_action_proof_selection_on_retained_read(
+                result[retained_index],
+                read,
+            )
             continue
         if key:
-            seen.add(key)
+            seen[key] = len(result)
         result.append(read)
     return result
+
+
+def preserve_action_proof_selection_on_retained_read(
+    retained: dict[str, Any],
+    duplicate: dict[str, Any],
+) -> dict[str, Any]:
+    action_selection = duplicate.get("action_proof_source_selection")
+    local_pair = duplicate.get("action_proof_local_pair")
+    historical_selection = duplicate.get("historical_provenance_selection")
+    if not (
+        isinstance(action_selection, dict)
+        and isinstance(local_pair, dict)
+        and isinstance(historical_selection, dict)
+        and historical_selection.get("source_chronology_role")
+        == "target_historical_raw_action_source"
+        and historical_selection.get("final_support_allowed") is True
+        and historical_selection.get("diagnostic_only") is False
+    ):
+        return retained
+    row = dict(retained)
+    row["action_proof_source_selection"] = dict(action_selection)
+    row["action_proof_local_pair"] = dict(local_pair)
+    row["historical_provenance_selection"] = dict(historical_selection)
+    return row
 
 
 def historical_provenance_current_scope_requested(query: str) -> bool:
@@ -14794,6 +14823,8 @@ def action_proof_source_selection_provenance(
             records=records,
             query=query,
         )
+        if not diagnostic_reason and not action_proof_has_explicit_original_request(records):
+            diagnostic_reason = "source_request_is_not_explicit_original_action"
     if diagnostic_reason:
         return {
             "schema_version": 1,
@@ -14811,6 +14842,28 @@ def action_proof_source_selection_provenance(
         "diagnostic_only": False,
         "raw_text_included": False,
     }
+
+
+def action_proof_has_explicit_original_request(records: list[Any]) -> bool:
+    for record in records:
+        role = str(record.role or "").casefold()
+        if not any(token in role for token in ("user", "human")):
+            continue
+        text = re.sub(r"\s+", " ", str(record.text or "").casefold()).strip()
+        if (
+            re.match(
+                r"^(?:please )?(?:run|execute|test|check|verify|inspect|edit|update|"
+                r"create|write|save|commit|review)\b",
+                text,
+            )
+            or re.match(
+                r"^(?:can|could|would|will) you (?:please )?(?:run|execute|test|"
+                r"check|verify|inspect|edit|update|create|write|save|commit|review)\b",
+                text,
+            )
+        ):
+            return True
+    return False
 
 
 def action_proof_diagnostic_source_reason(
