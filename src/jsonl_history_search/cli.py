@@ -6040,6 +6040,21 @@ def _answer_action_contract_from_executed_output(
                 "required_primary_proof_source": "missing_current_named_task_review_commit_refs",
                 "diagnostics_default_final_support": False,
             }
+        elif target_proof_handoff.get("status") == "target_primary_proof_refs_missing":
+            answer_status = "not-ready/action-proof-target-identity-missing"
+            promotion_status = "semantic_debug_action_proof_target_identity_fail_closed"
+            promotion_reason = (
+                "The action-proof plan has no primary proof refs because the target episode is not established. "
+                "Do not promote generic current, evaluator, reviewer, benchmark, or diagnostic refs."
+            )
+            source_inspection_boundary = {
+                "decision": "recover_action_proof_target_identity",
+                "answer_allowed": False,
+                "inspect_required_primary_proof_before_answer": False,
+                "required_primary_proof_source": "explicit_target_historical_raw_action_source",
+                "secondary_context_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
         elif target_proof_handoff.get("status") == "target_primary_proof_refs_available":
             answer_status = "answer-ready-after-source-inspection"
             promotion_status = "semantic_debug_target_proof_ready_after_source_inspection"
@@ -6204,15 +6219,14 @@ def _answer_action_contract_from_executed_output(
         if target_proof_handoff:
             contract["target_proof_handoff"] = target_proof_handoff
             if (
-                target_proof_handoff.get("status") == "target_primary_proof_refs_mismatch"
+                target_proof_handoff.get("status")
+                in {"target_primary_proof_refs_mismatch", "target_primary_proof_refs_missing"}
                 and not merge_artifact_handoff
                 and not raw_worker_chronology_handoff
                 and not named_task_action_proof
             ):
                 contract["read"] = target_proof_handoff.get("read") or []
-                if target_proof_handoff.get("mismatch_reason") == (
-                    "reviewed_source_packet_pointer_unresolved"
-                ):
+                if target_proof_handoff.get("only_continue_if"):
                     contract["only_continue_if"] = (
                         target_proof_handoff.get("only_continue_if") or []
                     )
@@ -6888,6 +6902,49 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
         return {}
     core_plan = compact.get("core_convo_first_read_plan") or {}
     reads = [read for read in core_plan.get("read") or [] if isinstance(read, dict)]
+    action_proof_plan = compact.get("action_proof_plan") or {}
+    unsafe_target_identity_demoted = any(
+        isinstance(read, dict) and read.get("action_proof_target_identity_peer_demoted") is True
+        for read in core_plan.get("diagnostics_after") or []
+    )
+    if (
+        route_family == "action_proof"
+        and action_proof_plan.get("applies") is True
+        and action_proof_plan.get("status") == "primary_proof_refs_missing"
+        and unsafe_target_identity_demoted
+    ):
+        return {
+            "schema_version": 1,
+            "status": "target_primary_proof_refs_missing",
+            "mismatch_reason": "action_proof_target_identity_missing",
+            "route_family": route_family,
+            "answer_readiness_decision": "recover_action_proof_target_identity",
+            "required_primary_proof": [],
+            "source_boundaries": {
+                "required_primary_proof": (
+                    "establish the claimed-action target episode before opening primary proof"
+                ),
+                "generic_raw_refs": (
+                    "unmapped current, evaluator, reviewer, benchmark, and diagnostic refs are not primary proof"
+                ),
+            },
+            "read": [
+                {
+                    "kind": "targeted_fail_closed_boundary",
+                    "reason": (
+                        "Action-proof target identity is missing; provide or recover an explicit reviewed "
+                        "source handle, task ID, branch or commit, session, or timestamp before selecting proof."
+                    ),
+                    "required_source_roles": ["target_historical_raw_action_source"],
+                }
+            ],
+            "only_continue_if": [
+                (
+                    "establish the target episode from an explicit reviewed source handle, task ID, branch or "
+                    "commit, session, or timestamp, then open its raw action/tool evidence"
+                )
+            ],
+        }
     primary_raw = [
         read
         for read in reads

@@ -263,6 +263,11 @@ def build_semantic_debug_payload(
             )
         ),
     )
+    unsafe_action_proof_source_paths: dict[str, str] = {}
+    next_reads = demote_action_proof_unsafe_source_peers(
+        next_reads,
+        unsafe_paths=unsafe_action_proof_source_paths,
+    )
     next_reads = dedupe_dicts(
         inferred_anchor_next_reads(
             query=agent_find["query"]["original"],
@@ -287,6 +292,10 @@ def build_semantic_debug_payload(
             joins=joins,
             query=agent_find["query"]["original"],
         )
+    next_reads = demote_action_proof_unsafe_source_peers(
+        next_reads,
+        unsafe_paths=unsafe_action_proof_source_paths,
+    )
     next_reads = compact_text_semantic_read_more_actions(next_reads)
     next_reads = mark_scoped_no_evidence_diagnostic_reads(next_reads, no_evidence)
     source_handle_routing = build_source_handle_routing(
@@ -796,6 +805,10 @@ def build_semantic_debug_payload(
     )
     guided_audit_flow["links"]["investigation_state"] = "semantic_debug.investigation_state"
     guided_audit_flow["investigation_state_summary"] = summarize_investigation_state(investigation_state)
+    next_reads = demote_action_proof_unsafe_source_peers(
+        next_reads,
+        unsafe_paths=unsafe_action_proof_source_paths,
+    )
     action_proof_plan = build_action_proof_plan(
         query=agent_find["query"]["original"],
         family=family,
@@ -14828,6 +14841,66 @@ def action_proof_source_selection_provenance(
         "diagnostic_only": True,
         "raw_text_included": False,
     }
+
+
+ACTION_PROOF_UNSAFE_TARGET_IDENTITY_REASONS = frozenset(
+    {
+        "source_surface_is_generated_evaluator_fixture_or_report",
+        "source_request_is_current_loop_setup_or_evaluator_material",
+        "source_request_is_evaluator_or_fixture_material",
+    }
+)
+
+
+def demote_action_proof_unsafe_source_peers(
+    next_reads: list[dict[str, Any]],
+    *,
+    unsafe_paths: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    unsafe_paths = unsafe_paths if unsafe_paths is not None else {}
+    for read in next_reads:
+        selection = (
+            read.get("historical_provenance_selection")
+            if isinstance(read.get("historical_provenance_selection"), dict)
+            else {}
+        )
+        reason = str(selection.get("selection_reason") or "")
+        if reason in ACTION_PROOF_UNSAFE_TARGET_IDENTITY_REASONS:
+            path = action_proof_read_source_path(read)
+            if path:
+                unsafe_paths[path] = reason
+    if not unsafe_paths:
+        return next_reads
+
+    rows: list[dict[str, Any]] = []
+    for read in next_reads:
+        path = action_proof_read_source_path(read)
+        if path not in unsafe_paths or reviewed_source_packet_pointer_read(read):
+            rows.append(read)
+            continue
+        row = dict(read)
+        selection = (
+            dict(row.get("historical_provenance_selection"))
+            if isinstance(row.get("historical_provenance_selection"), dict)
+            else {}
+        )
+        selection.update(
+            {
+                "source_chronology_role": "current_loop_action_diagnostic",
+                "selection_reason": unsafe_paths[path],
+                "final_support_allowed": False,
+                "diagnostic_only": True,
+            }
+        )
+        row["historical_provenance_selection"] = selection
+        row["action_proof_target_identity_peer_demoted"] = True
+        row["target_source_role"] = "diagnostic_or_post_hoc"
+        row["final_support_allowed"] = False
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        rows.append(row)
+    return rows
 
 
 def action_proof_diagnostic_source_reason(
