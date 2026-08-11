@@ -2292,6 +2292,8 @@ def render_in_depth_audit_followthrough_text(
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
+        requested_failure_class = target_contract.get("requested_failure_class") or {}
+        time_scope_intent = target_contract.get("time_scope_intent") or {}
         lines.append(
             f"- target persistence: required={target_contract.get('target_persistence_required')} "
             f"ready={target_contract.get('target_persistence_ready')} "
@@ -2299,6 +2301,18 @@ def render_in_depth_audit_followthrough_text(
             f"target_matched_reads={target_contract.get('target_matched_read_count', 0)} "
             f"drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}"
         )
+        lines.append(
+            f"- target contract: failure_class={requested_failure_class.get('normalized_label') or 'unspecified'} "
+            f"scope={time_scope_intent.get('scope') or 'unspecified'} "
+            f"required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}"
+        )
+        lines.append(
+            "- forbidden nearby substitutes: "
+            + (",".join(target_contract.get("forbidden_nearby_substitutes") or []) or "none")
+        )
+        missing_evidence = list(target_contract.get("missing_required_evidence_classes") or [])
+        if missing_evidence:
+            lines.append(f"- missing required evidence: {','.join(missing_evidence)}")
         if target_block.get("blocked"):
             lines.append(
                 "- answer blocked: target_mismatch_detected; primary_answer_material_allowed=False; "
@@ -2432,6 +2446,8 @@ def render_in_depth_audit_followthrough_markdown(
     target_contract = plan.get("target_persistence_contract") or workflow.get("target_persistence_contract") or {}
     target_block = plan.get("target_mismatch_answer_block") or workflow.get("target_mismatch_answer_block") or {}
     if target_contract:
+        requested_failure_class = target_contract.get("requested_failure_class") or {}
+        time_scope_intent = target_contract.get("time_scope_intent") or {}
         lines.append(
             f"- `target_persistence`: `required={target_contract.get('target_persistence_required')}` "
             f"`ready={target_contract.get('target_persistence_ready')}` "
@@ -2439,6 +2455,19 @@ def render_in_depth_audit_followthrough_markdown(
             f"`target_matched_reads={target_contract.get('target_matched_read_count', 0)}` "
             f"`drift_risk_reads={target_contract.get('target_drift_risk_count', 0)}`"
         )
+        lines.append(
+            f"- `target_contract`: `failure_class={requested_failure_class.get('normalized_label') or 'unspecified'}` "
+            f"`scope={time_scope_intent.get('scope') or 'unspecified'}` "
+            f"`required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}`"
+        )
+        lines.append(
+            "- `forbidden_nearby_substitutes`: `"
+            + (",".join(target_contract.get("forbidden_nearby_substitutes") or []) or "none")
+            + "`"
+        )
+        missing_evidence = list(target_contract.get("missing_required_evidence_classes") or [])
+        if missing_evidence:
+            lines.append(f"- `missing_required_evidence`: `{','.join(missing_evidence)}`")
         if target_block.get("blocked"):
             lines.append(
                 "- `answer_blocked`: `target_mismatch_detected` `primary_answer_material_allowed=False` "
@@ -6594,6 +6623,8 @@ def _render_semantic_debug_missing_primary_evidence(
     if handoff.get("decision") != "missing_primary_evidence" and not target_mismatch:
         return None
     guidance = handoff.get("source_action_guidance") or {}
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    target_contract = followthrough.get("target_persistence_contract") or {}
     commands = []
     command_items = guidance.get("exact_jsonl_continuation_commands") or []
     if target_mismatch:
@@ -6608,6 +6639,16 @@ def _render_semantic_debug_missing_primary_evidence(
     blocker = (
         "Target-matching primary conversation-history evidence was not found in the searched scope, "
         "so the historical/provenance question cannot be answered."
+    )
+    requested_failure_class = target_contract.get("requested_failure_class") or {}
+    time_scope_intent = target_contract.get("time_scope_intent") or {}
+    target_contract_summary = (
+        f"Target contract: failure_class={requested_failure_class.get('normalized_label') or 'unspecified'}; "
+        f"scope={time_scope_intent.get('scope') or 'unspecified'}; "
+        f"required_evidence={','.join(target_contract.get('required_evidence_classes') or []) or 'none'}; "
+        f"forbidden_substitutes={','.join(target_contract.get('forbidden_nearby_substitutes') or []) or 'none'}."
+        if target_mismatch and target_contract
+        else None
     )
     prohibition = (
         "STOP: Repository task, report, review, documentation, and learning artifacts are "
@@ -6632,6 +6673,8 @@ def _render_semantic_debug_missing_primary_evidence(
             f"- {blocker}",
             f"- **{prohibition}**",
         ]
+        if target_contract_summary:
+            lines.append(f"- {target_contract_summary}")
         if commands:
             lines.extend(["", "## Exact JSONL Continuation", ""])
             for command in commands[:1]:
@@ -6640,7 +6683,11 @@ def _render_semantic_debug_missing_primary_evidence(
             lines.extend(
                 [
                     "",
-                    "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root.",
+                    (
+                        "- No bounded target-preserving continuation is available; fail closed."
+                        if target_mismatch
+                        else "- Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+                    ),
                 ]
             )
         return "\n".join(lines)
@@ -6650,11 +6697,15 @@ def _render_semantic_debug_missing_primary_evidence(
         blocker,
         prohibition,
     ]
+    if target_contract_summary:
+        lines.append(target_contract_summary)
     if commands:
         lines.extend(["Exact JSONL continuation:", commands[0]])
     else:
         lines.append(
-            "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
+            "No bounded target-preserving continuation is available; fail closed."
+            if target_mismatch
+            else "Narrowed scope required: ask for a session/thread, date range, quoted phrase, or history root."
         )
     return "\n".join(lines)
 
@@ -8848,6 +8899,15 @@ def _format_handoff_score(candidate: dict) -> str:
     return str(score)
 
 
+def _format_deep_audit_target_use(candidate: dict) -> str:
+    target_match = candidate.get("deep_audit_target_match") or {}
+    if not target_match:
+        return ""
+    if target_match.get("eligible_as_prompt_history_lead"):
+        return "eligible-prompt-history-lead"
+    return "diagnostic-only/non-actionable"
+
+
 def render_source_locator_handoff_text(handoff: dict) -> list[str]:
     not_searched = handoff.get("not_searched_scope", {})
     candidate_ordering = handoff.get("candidate_ordering", {})
@@ -8909,6 +8969,9 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
                         "final_support_allowed=False",
                     ]
                 )
+            target_use = _format_deep_audit_target_use(candidate)
+            if target_use:
+                bits.append(f"target_use={target_use}")
             lines.append(f"- top candidate: {' '.join(bits)}")
     if followthrough_plan:
         lines.append("- next_reads: preserved in JSON/report; default open order is semantic_debug.source_followthrough_plan")
@@ -9264,8 +9327,27 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
     if top_candidates and _source_followthrough_direct_evidence_complete(followthrough_plan):
         lines.append(f"- Top candidates: `{len(top_candidates[:5])}` diagnostic candidates suppressed after complete direct evidence.")
     elif top_candidates:
-        lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
+        include_target_use = any(_format_deep_audit_target_use(candidate) for candidate in top_candidates[:5])
+        if include_target_use:
+            lines.extend(
+                [
+                    "",
+                    "| ID | Source | Confidence | Stage | Score | Target use | Reason codes |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "| ID | Source | Confidence | Stage | Score | Reason codes |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                ]
+            )
         for candidate in top_candidates[:5]:
+            target_use_cell = ""
+            if include_target_use:
+                target_use_cell = f"{_escape_markdown_table(_format_deep_audit_target_use(candidate))} | "
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(candidate.get('candidate_id') or ''))} | "
@@ -9273,6 +9355,7 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(str(candidate.get('confidence') or ''))} | "
                 f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
                 f"{_escape_markdown_table(_format_handoff_score(candidate))} | "
+                f"{target_use_cell}"
                 f"{_escape_markdown_table(_format_handoff_reason_codes(candidate))} |"
             )
     next_reads = [] if followthrough_plan else handoff.get("next_reads", [])[:5]
@@ -9348,12 +9431,14 @@ def render_agent_find_text(payload: dict) -> str:
         lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", [])[:8]:
         ref = candidate.get("source_ref", {})
+        target_use = _format_deep_audit_target_use(candidate)
+        target_use_text = f" target_use={target_use}" if target_use else ""
         lines.append(
             "- "
             f"{candidate.get('candidate_id')} {candidate.get('confidence')} "
             f"{source_ref_target(ref) or ''} "
             f"{candidate.get('timestamp') or '(no timestamp)'} "
-            f"{candidate.get('role') or ''}: {candidate.get('snippet')}"
+            f"{candidate.get('role') or ''}{target_use_text}: {candidate.get('snippet')}"
         )
     if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):
         no_evidence = report.get("no_evidence_report", {})
@@ -9390,6 +9475,8 @@ def render_agent_find_markdown(payload: dict) -> str:
     plan_sources = report.get("plan_sources", {})
     source_scope = plan_sources.get("source_scope", {})
     cap_hit = plan_sources.get("cap_hit", {})
+    candidates = list(report.get("find_candidates") or [])
+    include_target_use = any(_format_deep_audit_target_use(candidate) for candidate in candidates)
     lines = [
         "# JSONL Find",
         "",
@@ -9406,8 +9493,16 @@ def render_agent_find_markdown(payload: dict) -> str:
         "",
         "## Candidates",
         "",
-        "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        (
+            "| ID | Confidence | Source | Timestamp | Role | Stage | Target use | Snippet |"
+            if include_target_use
+            else "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |"
+        ),
+        (
+            "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            if include_target_use
+            else "| --- | --- | --- | --- | --- | --- | --- |"
+        ),
     ]
     if source_scope:
         lines.insert(
@@ -9439,9 +9534,11 @@ def render_agent_find_markdown(payload: dict) -> str:
     if report.get("source_locator_handoff"):
         lines.extend(["", "## Source Locator Handoff", ""])
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
-    for candidate in report.get("find_candidates", []):
+    for candidate in candidates:
         ref = candidate.get("source_ref", {})
         source = source_ref_target(ref) or ""
+        target_use = _format_deep_audit_target_use(candidate)
+        target_use_cell = f"{_escape_markdown_table(target_use)} | " if include_target_use else ""
         lines.append(
             "| "
             f"{_escape_markdown_table(str(candidate.get('candidate_id', '')))} | "
@@ -9450,6 +9547,7 @@ def render_agent_find_markdown(payload: dict) -> str:
             f"{_escape_markdown_table(str(candidate.get('timestamp') or ''))} | "
             f"{_escape_markdown_table(str(candidate.get('role') or ''))} | "
             f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
+            f"{target_use_cell}"
             f"{_escape_markdown_table(str(candidate.get('snippet') or ''))} |"
         )
     if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):

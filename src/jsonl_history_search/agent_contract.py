@@ -102,6 +102,7 @@ def build_agent_find_payload(
     compact_provenance_handoff: bool = False,
     evidence_context_window: int = 0,
     no_evidence_mode: bool = False,
+    deep_audit_target_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     candidates = build_candidate_rows(search_result)
@@ -221,11 +222,17 @@ def build_agent_find_payload(
     agent_find["source_locator_handoff"] = handoff
     if handoff.get("stage_diagnostics") and agent_find.get("retrieval_pressure"):
         agent_find["retrieval_pressure"]["stage_diagnostics"] = handoff["stage_diagnostics"]
+    if deep_audit_target_contract:
+        apply_deep_audit_find_target_contract(
+            agent_find,
+            contract=deep_audit_target_contract,
+            source_plan=source_plan,
+        )
     if compact_provenance_handoff:
         agent_find["compact_provenance_handoff"] = build_compact_provenance_handoff(
-            status=status,
+            status=agent_find["status"],
             command_surface="find",
-            candidates=candidate_dicts,
+            candidates=agent_find["find_candidates"],
             source_locator_handoff=handoff,
             next_reads=handoff["next_reads"],
             no_evidence=agent_find["no_evidence_report"],
@@ -254,6 +261,127 @@ def build_agent_find_payload(
                 compact_stage_diagnostics
             )
     return {"agent_find": agent_find}
+
+
+def apply_deep_audit_find_target_contract(
+    agent_find: dict[str, Any],
+    *,
+    contract: dict[str, Any],
+    source_plan: dict[str, Any],
+) -> None:
+    requested = contract.get("requested_failure_class")
+    requested_terms = [
+        str(term).casefold()
+        for term in (requested.get("terms") if isinstance(requested, dict) else [])
+        if str(term).strip()
+    ]
+    query = source_plan.get("query") if isinstance(source_plan.get("query"), dict) else {}
+    query_terms = [str(term).casefold() for term in query.get("base_terms") or []]
+    required_classes = list(contract.get("required_evidence_classes") or [])
+    forbidden_substitutes = list(contract.get("forbidden_nearby_substitutes") or [])
+    contract_shape_valid = bool(
+        contract.get("target_fingerprint_12")
+        and requested_terms
+        and isinstance(contract.get("time_scope_intent"), dict)
+        and required_classes
+        and forbidden_substitutes
+    )
+    query_enforced = bool(
+        contract_shape_valid
+        and query.get("role") == "user"
+        and set(query_terms) == set(requested_terms)
+    )
+    eligible_candidate_ids: list[str] = []
+    for candidate in agent_find.get("find_candidates") or []:
+        haystack = " ".join(
+            [
+                str(candidate.get("snippet") or ""),
+                " ".join(str(term) for term in candidate.get("matched_terms") or []),
+            ]
+        ).casefold()
+        matched_terms = [term for term in requested_terms if term in haystack]
+        candidate["deep_audit_target_match"] = {
+            "matched_failure_class_terms": matched_terms,
+            "eligible_as_prompt_history_lead": query_enforced and set(matched_terms) == set(requested_terms),
+            "eligible_as_final_audit_evidence": False,
+        }
+        if candidate["deep_audit_target_match"]["eligible_as_prompt_history_lead"]:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if candidate_id:
+                eligible_candidate_ids.append(candidate_id)
+    agent_find["deep_audit_target_continuation"] = {
+        "schema_version": 1,
+        "status": "target_contract_enforced" if query_enforced else "target_contract_mismatch",
+        "target_contract": contract,
+        "query_role_enforced": query.get("role") == "user",
+        "failure_class_query_enforced": set(query_terms) == set(requested_terms),
+        "eligible_prompt_history_candidate_ids": eligible_candidate_ids,
+        "candidate_use": "prompt_history_leads_only",
+        "answer_promotion_allowed": False,
+        "required_before_answer": required_classes,
+        "forbidden_nearby_substitutes": forbidden_substitutes,
+        "continuation_rule": (
+            "Open only eligible user-prompt refs, then continue the original historical/systemic audit; "
+            "nearby incidents and post-hoc artifacts cannot replace the requested failure class."
+        ),
+    }
+    agent_find["next_search_suggestions"] = [
+        "Continue only with the preserved target contract and its requested failure-class terms."
+    ]
+    if query_enforced:
+        handoff = agent_find.get("source_locator_handoff")
+        if isinstance(handoff, dict):
+            eligible_candidate_id_set = set(eligible_candidate_ids)
+            handoff["next_reads"] = [
+                read
+                for read in handoff.get("next_reads") or []
+                if str(read.get("candidate_id") or "") in eligible_candidate_id_set
+            ]
+            target_match_by_candidate_id = {
+                str(candidate.get("candidate_id") or ""): candidate.get("deep_audit_target_match")
+                for candidate in agent_find.get("find_candidates") or []
+                if candidate.get("candidate_id")
+            }
+            for candidate in (handoff.get("candidate_ordering") or {}).get("top_candidates") or []:
+                candidate_id = str(candidate.get("candidate_id") or "")
+                target_match = target_match_by_candidate_id.get(candidate_id)
+                if isinstance(target_match, dict):
+                    candidate["deep_audit_target_match"] = dict(target_match)
+                    candidate["actionability"] = (
+                        "prompt_history_lead"
+                        if candidate_id in eligible_candidate_id_set
+                        else "diagnostic_only"
+                    )
+            for window in handoff.get("source_windows") or []:
+                candidate_id = str(window.get("candidate_id") or "")
+                target_match = target_match_by_candidate_id.get(candidate_id)
+                if isinstance(target_match, dict):
+                    window["deep_audit_target_match"] = dict(target_match)
+                if candidate_id in eligible_candidate_id_set:
+                    continue
+                removed_actions = [
+                    field
+                    for field in ("next_read", "open_instruction", "expansion_actions", "context_actions")
+                    if window.pop(field, None) is not None
+                ]
+                omitted_fields = window.setdefault("omitted_fields", {})
+                omitted_fields.pop("exact_actions_preserved_in", None)
+                omitted_fields["target_contract_actions_removed"] = removed_actions
+                window["actionability"] = "diagnostic_only"
+                window["diagnostic_only"] = True
+                window["read_more_actionable"] = False
+                window["reason"] = "diagnostic-only partial target match; do not open as prompt-history guidance"
+        return
+    agent_find["status"] = "failed_closed_target_contract_mismatch"
+    agent_find["find_candidates"] = []
+    agent_find["timeline"] = []
+    agent_find["cluster_candidates"] = []
+    agent_find["evidence_bundles"] = []
+    handoff = agent_find.get("source_locator_handoff")
+    if isinstance(handoff, dict):
+        handoff["next_reads"] = []
+        handoff["source_windows"] = []
+        handoff["evidence_packets"] = []
 
 
 def derive_agent_find_status(*, search_result: dict[str, Any], candidates: list[CandidateRow]) -> str:
@@ -458,34 +586,40 @@ def compact_provenance_source_window_summaries(source_windows: list[dict[str, An
         source_ref = window.get("source_ref") or {}
         next_read = window.get("next_read") if isinstance(window.get("next_read"), dict) else {}
         omitted_fields = window.get("omitted_fields") if isinstance(window.get("omitted_fields"), dict) else {}
-        summaries.append(
-            {
-                "schema_version": 1,
-                "summary_kind": "compact_source_window_ref",
-                "candidate_id": window.get("candidate_id"),
-                "source_ref": source_ref,
-                "target": window.get("target") or source_ref_target(source_ref),
-                "intent": window.get("intent"),
-                "window_kind": window.get("window_kind"),
-                "role": window.get("role"),
-                "timestamp_utc": window.get("timestamp_utc"),
-                "selection_reason_code": window.get("selection_reason_code"),
-                "next_read": compact_next_read_ref(next_read),
-                "searched_scope_boundary": window.get("searched_scope_boundary", {}),
-                "omitted_fields": {
-                    "context_actions": bool(window.get("context_actions")),
-                    "expansion_actions": bool(window.get("expansion_actions"))
-                    or bool(omitted_fields.get("expansion_actions")),
-                    "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
-                    "text_or_snippets": False,
-                },
-                "privacy": {
-                    "raw_text_included": False,
-                    "raw_paths_included": False,
-                    "source_window_text_included": False,
-                },
-            }
-        )
+        summary = {
+            "schema_version": 1,
+            "summary_kind": "compact_source_window_ref",
+            "candidate_id": window.get("candidate_id"),
+            "source_ref": source_ref,
+            "target": window.get("target") or source_ref_target(source_ref),
+            "intent": window.get("intent"),
+            "window_kind": window.get("window_kind"),
+            "role": window.get("role"),
+            "timestamp_utc": window.get("timestamp_utc"),
+            "selection_reason_code": window.get("selection_reason_code"),
+            "searched_scope_boundary": window.get("searched_scope_boundary", {}),
+            "omitted_fields": {
+                "context_actions": bool(window.get("context_actions")),
+                "expansion_actions": bool(window.get("expansion_actions"))
+                or bool(omitted_fields.get("expansion_actions")),
+                "nested_next_read_expansion_actions": bool(next_read.get("expansion_actions")),
+                "text_or_snippets": False,
+            },
+            "privacy": {
+                "raw_text_included": False,
+                "raw_paths_included": False,
+                "source_window_text_included": False,
+            },
+        }
+        if next_read:
+            summary["next_read"] = compact_next_read_ref(next_read)
+        if "deep_audit_target_match" in window:
+            summary["deep_audit_target_match"] = window["deep_audit_target_match"]
+        if window.get("diagnostic_only") is True:
+            summary["actionability"] = window.get("actionability")
+            summary["diagnostic_only"] = True
+            summary["read_more_actionable"] = bool(window.get("read_more_actionable", False))
+        summaries.append(summary)
     return summaries
 
 

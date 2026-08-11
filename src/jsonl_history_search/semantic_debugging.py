@@ -14796,6 +14796,53 @@ DEEP_AUDIT_DRIFT_MARKERS = (
     "same-run",
     "same run",
 )
+DEEP_AUDIT_SYSTEMIC_SCOPE_RE = re.compile(
+    r"\b(?:repeat(?:ed|ing)?|recurr(?:ed|ence|ent|ing)?|systemic|pattern|across (?:chats?|sessions?|time)|"
+    r"multiple (?:chats?|sessions?|incidents?|episodes?))\b",
+    re.IGNORECASE,
+)
+DEEP_AUDIT_ALL_HISTORY_SCOPE_RE = re.compile(
+    r"\b(?:all prior|all previous|all (?:chats?|history|sessions?)|every (?:chat|session)|entire history)\b",
+    re.IGNORECASE,
+)
+DEEP_AUDIT_HISTORICAL_SCOPE_RE = re.compile(
+    r"\b(?:prior|previous|earlier|histor(?:y|ical)|chatlogs?|all chats?|over time|recurr|repeat)\w*\b",
+    re.IGNORECASE,
+)
+DEEP_AUDIT_FAILURE_CLASS_SCOPE_TERMS = {
+    "all",
+    "chats",
+    "decide",
+    "determine",
+    "find",
+    "earlier",
+    "every",
+    "historical",
+    "in-depth",
+    "multiple",
+    "pattern",
+    "please",
+    "prior",
+    "previous",
+    "read",
+    "recurrence",
+    "recurrent",
+    "recurring",
+    "repeated",
+    "repeating",
+    "systemic",
+    "whether",
+}
+DEEP_AUDIT_GENERIC_FAILURE_CLASS_TERMS = {
+    "coordinator",
+    "failure",
+    "failed",
+    "incident",
+    "issue",
+    "problem",
+    "system",
+    "workflow",
+}
 DEEP_AUDIT_TERMINAL_CLAIM_RE = re.compile(
     r"\b(?:closeout|completion|completed|failed|failure|final answer|final response|final result|"
     r"missing final|no closeout|session ended|terminal state|actual failure|durable closeout)\b",
@@ -15509,7 +15556,12 @@ def build_in_depth_audit_followthrough_plan(
         if (read.get("post_hoc_source_classification") or {}).get("likely_post_hoc_diagnostic")
     ]
     target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=classified_reads)
-    selected_reads = select_in_depth_audit_primary_reads_for_query(classified_reads, query=query)
+    target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
+    selected_reads = (
+        select_in_depth_audit_primary_reads_for_query(classified_reads, query=query)
+        if target_persistence_ready
+        else []
+    )
     live_tail_caveat = build_deep_audit_live_tail_caveat(
         selected_reads,
         now_utc=now_utc,
@@ -15527,8 +15579,15 @@ def build_in_depth_audit_followthrough_plan(
         target_contract=target_contract,
     )
     tail_followup_actions = list(source_continuation.get("tail_followup_actions") or [])
-    continuation_candidates = tail_followup_actions + cap_continuation_commands
-    target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
+    if target_persistence_ready:
+        continuation_candidates = tail_followup_actions + cap_continuation_commands
+    else:
+        refocus = in_depth_audit_target_refocus_command(
+            query=query,
+            args=args,
+            target_contract=target_contract,
+        )
+        continuation_candidates = [refocus] if refocus else []
     coverage_complete = bool(coverage.get("answer_promotion_allowed")) and target_persistence_ready
     searched_scope = scope_boundary_summary.get("searched_scope") if isinstance(scope_boundary_summary, dict) else {}
     not_searched_scope = scope_boundary_summary.get("not_searched_scope") if isinstance(scope_boundary_summary, dict) else {}
@@ -15991,7 +16050,7 @@ def select_in_depth_audit_primary_reads_for_query(next_reads: list[dict[str, Any
         if read.get("diagnostic_only") or read.get("read_more_actionable") is False:
             continue
         alignment = deep_audit_read_target_alignment(read, query=query)
-        if alignment.get("target_drift_risk") and not alignment.get("target_match"):
+        if not alignment.get("target_match") or alignment.get("target_drift_risk"):
             continue
         target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
         if not target or target in seen_targets:
@@ -16010,8 +16069,30 @@ def select_in_depth_audit_primary_reads_for_query(next_reads: list[dict[str, Any
 
 def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list[dict[str, Any]]) -> dict[str, Any]:
     terms = deep_audit_target_terms(query)
+    requested_failure_class = deep_audit_requested_failure_class(query)
+    time_scope_intent = deep_audit_time_scope_intent(query)
+    required_evidence_classes = [
+        "primary_raw_conversation_history",
+        "requested_failure_class_match",
+    ]
+    if time_scope_intent["systemic_or_repeated"]:
+        required_evidence_classes.extend(
+            [
+                "multiple_distinct_historical_episodes",
+                "recurrence_or_pattern_evidence",
+            ]
+        )
+    forbidden_nearby_substitutes = [
+        "post_hoc_task_report_review_or_evaluator_artifact",
+        "nearby_incident_missing_requested_failure_class",
+    ]
+    if time_scope_intent["systemic_or_repeated"]:
+        forbidden_nearby_substitutes.append(
+            "single_recent_related_incident_without_historical_spread"
+        )
     drift_risk_reads = []
     target_matched_reads = []
+    primary_raw_read_count = 0
     actionable_read_count = 0
     for read in next_reads:
         if not isinstance(read, dict):
@@ -16024,13 +16105,19 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             continue
         if not nonactionable:
             actionable_read_count += 1
+            if alignment.get("primary_raw_conversation_history"):
+                primary_raw_read_count += 1
         target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
         row = {
             "target_hash_12": hashlib.sha256(target.encode("utf-8", errors="replace")).hexdigest()[:12] if target else None,
             "target_match": alignment.get("target_match"),
             "target_drift_risk": alignment.get("target_drift_risk"),
             "matched_terms": alignment.get("matched_terms"),
+            "matched_failure_class_terms": alignment.get("matched_failure_class_terms"),
             "drift_markers": alignment.get("drift_markers"),
+            "evidence_classes": alignment.get("evidence_classes"),
+            "source_identity_hash_12": alignment.get("source_identity_hash_12"),
+            "historical_period": alignment.get("historical_period"),
             "final_support_allowed": (
                 bool(alignment.get("target_match")) and not alignment.get("target_drift_risk") and not nonactionable
             ),
@@ -16040,17 +16127,47 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             target_matched_reads.append(row)
         if alignment.get("target_drift_risk"):
             drift_risk_reads.append(row)
-    target_fingerprint = hashlib.sha256(deep_audit_normalize_text(query).encode("utf-8", errors="replace")).hexdigest()[:12]
-    target_persistence_ready = len(target_matched_reads) > 0 and not any(
-        read.get("target_drift_risk") and read.get("target_match") for read in drift_risk_reads
+    matched_historical_periods = dedupe(
+        str(read.get("historical_period"))
+        for read in target_matched_reads
+        if read.get("historical_period")
     )
+    matched_distinct_episode_count = len(matched_historical_periods)
+    satisfied_evidence_classes = []
+    if primary_raw_read_count:
+        satisfied_evidence_classes.append("primary_raw_conversation_history")
+    if target_matched_reads:
+        satisfied_evidence_classes.append("requested_failure_class_match")
+    if matched_distinct_episode_count >= 2:
+        satisfied_evidence_classes.extend(
+            [
+                "multiple_distinct_historical_episodes",
+                "recurrence_or_pattern_evidence",
+            ]
+        )
+    missing_required_evidence_classes = [
+        evidence_class
+        for evidence_class in required_evidence_classes
+        if evidence_class not in satisfied_evidence_classes
+    ]
+    target_fingerprint = hashlib.sha256(deep_audit_normalize_text(query).encode("utf-8", errors="replace")).hexdigest()[:12]
+    target_persistence_ready = bool(target_matched_reads) and not missing_required_evidence_classes
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "target_fingerprint_12": target_fingerprint,
         "target_terms": terms[:12],
         "target_term_count": len(terms),
+        "requested_failure_class": requested_failure_class,
+        "time_scope_intent": time_scope_intent,
+        "required_evidence_classes": required_evidence_classes,
+        "satisfied_evidence_classes": satisfied_evidence_classes,
+        "missing_required_evidence_classes": missing_required_evidence_classes,
+        "forbidden_nearby_substitutes": forbidden_nearby_substitutes,
+        "prompt_history_source_terms": requested_failure_class["terms"][:8],
         "target_persistence_required": True,
         "target_matched_read_count": len(target_matched_reads),
+        "primary_raw_read_count": primary_raw_read_count,
+        "matched_distinct_episode_count": matched_distinct_episode_count,
         "actionable_read_count": actionable_read_count,
         "target_drift_risk_count": len(drift_risk_reads),
         "target_persistence_ready": target_persistence_ready,
@@ -16066,9 +16183,10 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             "raw_text_included": False,
         },
         "canonical_target_reminder": (
-            "Keep the original audit target fixed across caps and continuations; do not pivot to previous "
-            "receiving-agent lanes, same-run eval artifacts, or adjacent task reports unless they are explicitly "
-            "the requested audit subject."
+            "Keep the original failure class and historical/systemic scope fixed across caps, source-term "
+            "refinement, and narrowing. Recent related incidents may support the audit but cannot replace "
+            "required historical spread; post-hoc task/report/review/eval artifacts remain diagnostic-only "
+            "unless explicitly requested."
         ),
     }
 
@@ -16115,8 +16233,48 @@ def deep_audit_target_terms(query: str) -> list[str]:
     return dedupe(terms)
 
 
+def deep_audit_requested_failure_class(query: str) -> dict[str, Any]:
+    terms = []
+    for term in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", deep_audit_normalize_text(query)):
+        if term in DEEP_AUDIT_FAILURE_CLASS_SCOPE_TERMS:
+            continue
+        if term in DEEP_AUDIT_TARGET_STOPWORDS and term != "failure":
+            continue
+        if len(term) <= 3 and not any(char.isdigit() for char in term):
+            continue
+        terms.append(term)
+    terms = dedupe(terms)
+    return {
+        "terms": terms[:12],
+        "normalized_label": " ".join(terms[:12]),
+        "match_policy": "distinctive_term_or_explicit_raw_target_with_generic_failure_class",
+    }
+
+
+def deep_audit_time_scope_intent(query: str) -> dict[str, Any]:
+    normalized = deep_audit_normalize_text(query)
+    systemic = bool(DEEP_AUDIT_SYSTEMIC_SCOPE_RE.search(normalized))
+    historical = bool(DEEP_AUDIT_HISTORICAL_SCOPE_RE.search(normalized)) or systemic
+    all_available_history = bool(DEEP_AUDIT_ALL_HISTORY_SCOPE_RE.search(normalized))
+    return {
+        "historical": historical,
+        "all_available_history": all_available_history,
+        "systemic_or_repeated": systemic,
+        "scope": "historical_systemic" if systemic else "historical_incident" if historical else "incident",
+        "minimum_historical_spread": (
+            "multiple_distinct_episodes" if systemic else "one_target_episode"
+        ),
+        "recent_incident_role": (
+            "supporting_only_until_historical_spread_satisfied"
+            if systemic
+            else "eligible_if_failure_class_and_primary_evidence_match"
+        ),
+    }
+
+
 def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dict[str, Any]:
     terms = deep_audit_target_terms(query)
+    requested_failure_class = deep_audit_requested_failure_class(query)
     haystack = deep_audit_normalize_text(
         " ".join(
             str(value or "")
@@ -16130,22 +16288,60 @@ def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dic
         )
     )
     matched_terms = [term for term in terms if term in haystack]
+    failure_class_terms = list(requested_failure_class.get("terms") or [])
+    matched_failure_class_terms = [term for term in failure_class_terms if term in haystack]
     drift_markers = [marker for marker in DEEP_AUDIT_DRIFT_MARKERS if marker in haystack]
     role = str(read.get("target_source_role") or "")
     target = str(read.get("target") or source_ref_target(read.get("source_ref") or {}) or "")
-    drift_risk = bool(drift_markers)
-    strong_match_terms = [term for term in matched_terms if term not in {"jsonl", "search", "coordinator"}]
-    target_match = bool(strong_match_terms) or (
-        not terms and (role == "target_historical_raw" or target.endswith(".jsonl") or ".jsonl:" in target)
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    source_path = str(source_ref.get("path") or (target.rsplit(":", 1)[0] if re.search(r":\d+$", target) else target))
+    primary_raw = bool(
+        role == "target_historical_raw"
+        or source_path.casefold().endswith((".jsonl", ".jsonl.gz"))
     )
+    drift_risk = bool(drift_markers)
+    distinctive_failure_terms = [
+        term
+        for term in failure_class_terms
+        if term not in DEEP_AUDIT_GENERIC_FAILURE_CLASS_TERMS
+    ]
+    distinctive_match = any(term in matched_failure_class_terms for term in distinctive_failure_terms)
+    generic_explicit_raw_match = bool(
+        primary_raw
+        and not distinctive_failure_terms
+        and matched_failure_class_terms
+        and all(term in matched_failure_class_terms for term in failure_class_terms)
+    )
+    target_match = bool(primary_raw and (distinctive_match or generic_explicit_raw_match))
     if drift_risk:
         target_match = False
+    source_identity_hash = (
+        hashlib.sha256(source_path.encode("utf-8", errors="replace")).hexdigest()[:12]
+        if source_path
+        else None
+    )
+    timestamp = str(source_ref.get("timestamp_utc") or read.get("timestamp_utc") or "")
+    historical_period_match = re.search(
+        r"(?<!\d)(\d{4})[-/](\d{2})[-/](\d{2})(?!\d)",
+        timestamp or source_path,
+    )
+    historical_period = "-".join(historical_period_match.groups()) if historical_period_match else None
+    evidence_classes = []
+    if primary_raw:
+        evidence_classes.append("primary_raw_conversation_history")
+    if target_match:
+        evidence_classes.append("requested_failure_class_match")
     return {
         "target_match": target_match,
         "target_drift_risk": drift_risk,
         "matched_terms": matched_terms[:8],
+        "matched_failure_class_terms": matched_failure_class_terms[:8],
         "drift_markers": drift_markers[:8],
         "target_term_count": len(terms),
+        "primary_raw_conversation_history": primary_raw,
+        "evidence_classes": evidence_classes,
+        "source_identity_hash_12": source_identity_hash,
+        "historical_period": historical_period,
         "raw_text_included": False,
     }
 
@@ -16237,6 +16433,7 @@ def in_depth_audit_continuation_command_for_slice(
         "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
         "target_persistence_required": True,
         "target_reminder": target_contract.get("canonical_target_reminder"),
+        **deep_audit_target_contract_continuation_fields(target_contract),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
     }
@@ -16248,13 +16445,11 @@ def in_depth_audit_target_refocus_command(
     args: Any,
     target_contract: dict[str, Any],
 ) -> dict[str, Any] | None:
-    argv = [
-        "jsonl-history-search",
-        "semantic-debug",
-        query,
-        "--audit-depth",
-        "in-depth",
-    ]
+    source_terms = list(target_contract.get("prompt_history_source_terms") or [])
+    if not source_terms:
+        return None
+    source_query = " ".join(str(term) for term in source_terms)
+    argv = ["jsonl-history-search", "find", source_query, "--role", "user"]
     for root in getattr(args, "root", None) or []:
         argv.extend(["--root", str(root)])
     cwd = getattr(args, "cwd", None)
@@ -16262,6 +16457,26 @@ def in_depth_audit_target_refocus_command(
         argv.extend(["--cwd", str(cwd)])
     if getattr(args, "allow_arbitrary_root", False):
         argv.append("--allow-arbitrary-root")
+    for name, flag in (
+        ("max_files", "--max-files"),
+        ("max_bytes", "--max-bytes"),
+        ("max_matches", "--max-matches"),
+        ("max_elapsed", "--max-elapsed"),
+        ("hard_cap_files", "--hard-cap-files"),
+        ("hard_cap_bytes", "--hard-cap-bytes"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            argv.extend([flag, str(value)])
+    executable_target_contract = deep_audit_executable_target_contract(target_contract)
+    argv.extend(
+        [
+            "--deep-audit-target-contract",
+            json.dumps(executable_target_contract, sort_keys=True, separators=(",", ":")),
+            "--format",
+            "json",
+        ]
+    )
     return {
         "command_id": "refocus_original_audit_target_01",
         "slice": "target_persistence_refocus",
@@ -16269,13 +16484,42 @@ def in_depth_audit_target_refocus_command(
         "status": "target_mismatch_detected",
         "coverage_label": "target_mismatch_detected",
         "cap_labels": [],
-        "retry_guidance": "rerun the original audit query and require target-matching raw transcript refs before answering",
-        "reason": "target persistence incomplete; previous-lane/eval artifacts were diagnostic-only and cannot support the answer",
+        "retry_guidance": (
+            "search bounded user prompt-history terms, then apply the preserved target contract to surfaced raw refs"
+        ),
+        "reason": (
+            "target persistence incomplete; search the requested failure class in user prompt history instead of "
+            "expanding or summarizing the nearby incident"
+        ),
         "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
         "target_persistence_required": True,
         "target_reminder": target_contract.get("canonical_target_reminder"),
+        **deep_audit_target_contract_continuation_fields(target_contract),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
+    }
+
+
+def deep_audit_target_contract_continuation_fields(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_contract": contract,
+        "requested_failure_class": contract.get("requested_failure_class"),
+        "time_scope_intent": contract.get("time_scope_intent"),
+        "required_evidence_classes": list(contract.get("required_evidence_classes") or []),
+        "forbidden_nearby_substitutes": list(contract.get("forbidden_nearby_substitutes") or []),
+        "prompt_history_source_terms": list(contract.get("prompt_history_source_terms") or []),
+    }
+
+
+def deep_audit_executable_target_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "target_fingerprint_12": contract.get("target_fingerprint_12"),
+        "requested_failure_class": contract.get("requested_failure_class"),
+        "time_scope_intent": contract.get("time_scope_intent"),
+        "required_evidence_classes": list(contract.get("required_evidence_classes") or []),
+        "forbidden_nearby_substitutes": list(contract.get("forbidden_nearby_substitutes") or []),
+        "canonical_target_reminder": contract.get("canonical_target_reminder"),
     }
 
 
