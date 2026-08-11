@@ -72,6 +72,42 @@ PROTECTED_EVALUATION_ARTIFACT_RE = re.compile(
     r"source[-_]?map|case[-_]?packet|expected[-_]?facets?)[^\s'\"`;&|/\\]*\.(?:json|jsonl|md|txt|yaml|yml)"
     r")"
 )
+ANSWER_KEY_ARTIFACT_RE = re.compile(
+    r"(?ix)[^\s'\"`;&|/\\]*(?:gold|answer[-_]?key|evaluator|adjudicat(?:or|ion)|"
+    r"source[-_]?map|case[-_]?packet|expected[-_]?facets?)[^\s'\"`;&|/\\]*\."
+    r"(?:json|jsonl|md|txt|yaml|yml)"
+)
+BENCHMARK_EVALUATION_PATH_RE = re.compile(
+    r"(?ix)(?<![A-Za-z0-9_.-])(?:benchmarks?|evals?|evaluators?)[/\\][^\s'\"`;&|]+"
+)
+CURRENT_LOOP_LANE_ARTIFACT_RE = re.compile(
+    r"(?ix)[^\s'\"`;&|]*(?:lanes|evals?|evaluators?)[/\\][^\s'\"`;&|]+[/\\]"
+    r"(?:prompt|final[-_]?answer|events|metadata|runner[-_]?metadata|command)\."
+    r"(?:json|jsonl|md|txt|yaml|yml)"
+)
+SECONDARY_CONTEXT_PATH_RE = re.compile(
+    r"(?ix)(?:^|[\s'\"`])(?:[^\s'\"`;&|]+[/\\])?"
+    r"(?:tasks|docs|reports|scripts|src|tests|skills|reviews|codex[/\\]state)[/\\]"
+    r"[^\s'\"`;&|]+"
+)
+UNCLEAR_SOURCE_PATH_RE = re.compile(
+    r"(?ix)[^\s'\"`;&|]+\.(?:json|jsonl|md|txt|yaml|yml)(?::\d+(?:-\d+)?)?"
+)
+CURRENT_LOOP_ID_RE = re.compile(r"(?i)\bjsh[-_]?([0-9]+)")
+RAW_WINDOW_RECORD_LABEL_RE = re.compile(
+    r"(?im)^-\s+(?P<path>[^\n]+\.jsonl):(?P<line>\d+):\s+"
+    r"(?P<role>[a-z_][a-z0-9_]*)\s*$"
+)
+RAW_WINDOW_RECORD_COUNT_RE = re.compile(r"(?im)^Records:\s+(\d+)\s+included\b")
+RAW_WINDOW_LINE_RANGE_RE = re.compile(
+    r"(?im)^Lines:\s+(\d+)\.\.(\d+)\s+\(anchor\s+\d+\)\s*$"
+)
+RAW_SETUP_ONLY_RECORD_LABELS = {
+    "developer",
+    "session_meta",
+    "task_started",
+    "turn_context",
+}
 RAW_HISTORY_PATH_RE = re.compile(
     r"(?ix)(?:"
     r"(?:^|[/\\])(?:sessions|archived_sessions)[/\\][^\s'\"`;&|]+\.jsonl(?:[:#]\d+)?|"
@@ -111,6 +147,16 @@ RG_OPTIONS_WITH_VALUE = {
     "--type",
     "-T",
     "--type-not",
+}
+GIT_GLOBAL_OPTIONS_WITH_VALUE = {
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
 }
 PROVENANCE_SOURCE_FAMILY_MARKERS = (
     "provenance",
@@ -272,6 +318,147 @@ def _is_provenance_source_family(expected_route_family: str | None) -> bool:
     return any(marker in family for marker in PROVENANCE_SOURCE_FAMILY_MARKERS)
 
 
+def _normalized_marker(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _current_loop_markers(lane_path: Path, metadata: dict[str, Any]) -> tuple[str, ...]:
+    markers = {f"jsh{match}" for match in CURRENT_LOOP_ID_RE.findall(lane_path.as_posix())}
+    configured = metadata.get("current_loop_markers")
+    if isinstance(configured, list):
+        for value in configured:
+            if isinstance(value, str) and len(_normalized_marker(value)) >= 5:
+                markers.add(_normalized_marker(value))
+    return tuple(sorted(markers))
+
+
+def _contains_current_loop_marker(text: str, markers: tuple[str, ...]) -> bool:
+    normalized = _normalized_marker(text)
+    return any(marker in normalized for marker in markers)
+
+
+def _current_loop_answer_artifact_seen(text: str, markers: tuple[str, ...]) -> bool:
+    for pattern in (PROTECTED_EVALUATION_ARTIFACT_RE, CURRENT_LOOP_LANE_ARTIFACT_RE):
+        for match in pattern.finditer(text):
+            if _contains_current_loop_marker(match.group(0), markers):
+                return True
+    return False
+
+
+def _clearly_pre_existing_evaluation_artifacts_only(
+    text: str,
+    current_loop_markers: tuple[str, ...],
+) -> bool:
+    current_ids = {
+        int(match)
+        for marker in current_loop_markers
+        for match in CURRENT_LOOP_ID_RE.findall(marker)
+    }
+    artifact_matches = [
+        match.group(0)
+        for pattern in (
+            PROTECTED_EVALUATION_ARTIFACT_RE,
+            BENCHMARK_EVALUATION_PATH_RE,
+            CURRENT_LOOP_LANE_ARTIFACT_RE,
+        )
+        for match in pattern.finditer(text)
+    ]
+    if not current_ids or not artifact_matches:
+        return False
+
+    artifact_ids = [
+        {int(match) for match in CURRENT_LOOP_ID_RE.findall(artifact)}
+        for artifact in artifact_matches
+    ]
+    return all(ids and max(ids) < min(current_ids) for ids in artifact_ids)
+
+
+def _raw_window_contains_current_loop_answer_access(
+    output: str,
+    markers: tuple[str, ...],
+) -> bool:
+    record_matches = list(RAW_WINDOW_RECORD_LABEL_RE.finditer(output))
+    if not record_matches:
+        return False
+
+    count_match = RAW_WINDOW_RECORD_COUNT_RE.search(output)
+    trusted_matches = record_matches[:1]
+    if count_match:
+        included_count = int(count_match.group(1))
+        range_match = RAW_WINDOW_LINE_RANGE_RE.search(output)
+        if range_match and included_count == int(range_match.group(2)) - int(range_match.group(1)) + 1:
+            source_path = record_matches[0].group("path")
+            expected_lines = range(int(range_match.group(1)), int(range_match.group(2)) + 1)
+            rendered_matches = []
+            search_start = 0
+            for expected_line in expected_lines:
+                rendered_match = next(
+                    (
+                        match
+                        for match in record_matches[search_start:]
+                        if match.group("path") == source_path
+                        and int(match.group("line")) == expected_line
+                    ),
+                    None,
+                )
+                if rendered_match is None:
+                    rendered_matches = []
+                    break
+                rendered_matches.append(rendered_match)
+                search_start = record_matches.index(rendered_match) + 1
+            if len(rendered_matches) == included_count:
+                trusted_matches = rendered_matches
+        elif included_count == len(record_matches):
+            trusted_matches = record_matches
+        elif 1 < included_count < len(record_matches):
+            # Legacy captures without line metadata preserve the first and trailing rendered headers.
+            trusted_matches = [record_matches[0], *record_matches[-(included_count - 1) :]]
+
+    for index, match in enumerate(trusted_matches):
+        if match.group("role").lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
+            continue
+        block_end = trusted_matches[index + 1].start() if index + 1 < len(trusted_matches) else len(output)
+        block = output[match.start() : block_end]
+        answer_artifact_seen = bool(
+            PROTECTED_EVALUATION_ARTIFACT_RE.search(block)
+            or BENCHMARK_EVALUATION_PATH_RE.search(block)
+            or CURRENT_LOOP_LANE_ARTIFACT_RE.search(block)
+        )
+        if (
+            answer_artifact_seen
+            and _contains_current_loop_marker(block, markers)
+            and not _clearly_pre_existing_evaluation_artifacts_only(block, markers)
+        ):
+            return True
+    return False
+
+
+def _raw_window_has_ambiguous_record_boundaries(output: str) -> bool:
+    record_matches = list(RAW_WINDOW_RECORD_LABEL_RE.finditer(output))
+    count_match = RAW_WINDOW_RECORD_COUNT_RE.search(output)
+    range_match = RAW_WINDOW_LINE_RANGE_RE.search(output)
+    if not record_matches or not count_match or not range_match:
+        return False
+
+    included_count = int(count_match.group(1))
+    range_start = int(range_match.group(1))
+    range_end = int(range_match.group(2))
+    if included_count != range_end - range_start + 1:
+        return False
+
+    source_path = record_matches[0].group("path")
+    expected_lines = set(range(range_start, range_end + 1))
+    seen: set[tuple[str, int]] = set()
+    for match in record_matches:
+        key = (match.group("path"), int(match.group("line")))
+        if key[0] != source_path or key[1] not in expected_lines:
+            continue
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
 def _has_primary_raw_history_path(text: str) -> bool:
     for match in RAW_HISTORY_PATH_RE.finditer(text):
         matched_path = match.group(0)
@@ -291,6 +478,11 @@ def _event_command_succeeded(event: dict[str, Any]) -> bool:
     if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         return exit_code == 0
     return str(item.get("status") or "").lower() == "completed"
+
+
+def _raw_window_is_setup_only(output: str) -> bool:
+    labels = [match.group("role") for match in RAW_WINDOW_RECORD_LABEL_RE.finditer(output)]
+    return bool(labels) and all(label.lower() in RAW_SETUP_ONLY_RECORD_LABELS for label in labels)
 
 
 def _rg_targets_are_primary_raw_history_only(command: str) -> bool:
@@ -332,12 +524,66 @@ def _rg_targets_are_primary_raw_history_only(command: str) -> bool:
     return bool(targets) and all(_has_primary_raw_history_path(target) for target in targets)
 
 
-def _evidence_access_roles(
+def _git_show_targets_primary_raw_history_only(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if (
+        len(argv) >= 3
+        and argv[0].rsplit("/", 1)[-1] in {"bash", "sh"}
+        and argv[1] in {"-c", "-lc"}
+    ):
+        try:
+            argv = shlex.split(argv[2])
+        except ValueError:
+            return False
+    if not argv or argv[0].rsplit("/", 1)[-1] != "git":
+        return False
+
+    index = 1
+    while index < len(argv) and argv[index] != "show":
+        token = argv[index]
+        if token in GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith(("-C", "-c")) and token not in {"-C", "-c"}:
+            index += 1
+            continue
+        if token.startswith(
+            (
+                "--config-env=",
+                "--exec-path=",
+                "--git-dir=",
+                "--namespace=",
+                "--super-prefix=",
+                "--work-tree=",
+            )
+        ):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False
+    if index >= len(argv):
+        return False
+
+    targets = [token for token in argv[index + 1 :] if not token.startswith("-")]
+    return (
+        len(targets) == 1
+        and ":" in targets[0]
+        and _has_primary_raw_history_path(targets[0].split(":", 1)[1])
+    )
+
+
+def _evidence_access_classes(
     command: str,
     output: str,
     command_kind: str,
     *,
     command_succeeded: bool,
+    current_loop_markers: tuple[str, ...],
 ) -> list[str]:
     read_capable = command_kind in {
         "file_read",
@@ -350,33 +596,89 @@ def _evidence_access_roles(
 
     command_has_primary = _has_primary_raw_history_path(command)
     output_has_evidence = bool(output.strip())
-    protected_probe = command
     primary_probe = command
+    git_show_targets_primary = _git_show_targets_primary_raw_history_only(command)
     output_discovery = (
         command_kind in {"broad_search_or_listing", "git"}
         and command_succeeded
         and output_has_evidence
         and not _rg_targets_are_primary_raw_history_only(command)
+        and not git_show_targets_primary
     )
     if output_discovery:
-        protected_probe = f"{command}\n{output}"
         if not command_has_primary:
-            primary_probe = protected_probe
-    roles: list[str] = []
-    if PROTECTED_EVALUATION_ARTIFACT_RE.search(protected_probe):
-        roles.append("protected_evaluation_artifact")
+            primary_probe = f"{command}\n{output}"
+
+    command_has_answer_artifact = (
+        bool(BENCHMARK_EVALUATION_PATH_RE.search(command))
+        or (not command_has_primary and bool(ANSWER_KEY_ARTIFACT_RE.search(command)))
+    )
+    command_pre_existing = _clearly_pre_existing_evaluation_artifacts_only(
+        command,
+        current_loop_markers,
+    )
+    command_current_loop = (
+        command_has_answer_artifact and not command_pre_existing
+    ) or _current_loop_answer_artifact_seen(command, current_loop_markers)
+    output_pre_existing = _clearly_pre_existing_evaluation_artifacts_only(
+        output,
+        current_loop_markers,
+    )
+    output_current_loop = (
+        output_discovery
+        and not output_pre_existing
+        and (
+            bool(ANSWER_KEY_ARTIFACT_RE.search(output))
+            or _current_loop_answer_artifact_seen(output, current_loop_markers)
+        )
+    ) or (
+        command_kind == "jsonl_read_more"
+        and (
+            _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
+            or _raw_window_has_ambiguous_record_boundaries(output)
+        )
+    )
+    current_loop_from_raw_output = (
+        command_has_primary
+        and not command_current_loop
+        and not output_discovery
+        and output_current_loop
+    )
+
+    classes: list[str] = []
+    if command_current_loop or output_current_loop:
+        classes.append("current_loop_evaluator_gold_report_review_material")
     primary_evidence_returned = (
         command_succeeded
         and output_has_evidence
+        and not _raw_window_is_setup_only(output)
         and (
             command_kind == "jsonl_read_more"
+            or git_show_targets_primary
             or (
                 bool(PRIMARY_CONTENT_ACCESS_RE.search(command))
                 and _has_primary_raw_history_path(primary_probe)
             )
         )
     )
-    if primary_evidence_returned:
+    if primary_evidence_returned and not current_loop_from_raw_output:
+        classes.append("primary_raw_evidence")
+
+    if not classes and command_succeeded:
+        if command_pre_existing or (output_discovery and output_pre_existing):
+            classes.append("legitimate_pre_existing_secondary_context")
+        elif SECONDARY_CONTEXT_PATH_RE.search(command):
+            classes.append("legitimate_pre_existing_secondary_context")
+        elif UNCLEAR_SOURCE_PATH_RE.search(command):
+            classes.append("unclear_chronology")
+    return classes
+
+
+def _evidence_access_roles(classes: list[str]) -> list[str]:
+    roles: list[str] = []
+    if "current_loop_evaluator_gold_report_review_material" in classes:
+        roles.append("protected_evaluation_artifact")
+    if "primary_raw_evidence" in classes:
         roles.append("primary_raw_evidence")
     return roles
 
@@ -385,21 +687,23 @@ def _contamination_chronology(
     completed_order: list[dict[str, Any]],
     *,
     expected_route_family: str | None,
+    positive_benchmark_lane: bool,
     parse_errors: int,
 ) -> dict[str, Any]:
-    applies = _is_provenance_source_family(expected_route_family)
+    provenance_source_family = _is_provenance_source_family(expected_route_family)
+    applies = positive_benchmark_lane
     primary_entries = [
         entry
         for entry in completed_order
-        if "primary_raw_evidence" in entry["evidence_roles"]
+        if "primary_raw_evidence" in entry["evidence_classes"]
     ]
-    protected_entries = [
+    current_loop_entries = [
         entry
         for entry in completed_order
-        if "protected_evaluation_artifact" in entry["evidence_roles"]
+        if "current_loop_evaluator_gold_report_review_material" in entry["evidence_classes"]
     ]
     uncorrelated_evidence_count = sum(
-        1 for entry in primary_entries + protected_entries if entry["started_index"] is None
+        1 for entry in primary_entries + current_loop_entries if entry["started_index"] is None
     )
     primary_entries.sort(
         key=lambda entry: (
@@ -407,59 +711,81 @@ def _contamination_chronology(
             entry["started_index"] if entry["started_index"] is not None else entry["completed_index"],
         )
     )
-    protected_entries.sort(
+    current_loop_entries.sort(
         key=lambda entry: (
             entry["started_index"] is None,
             entry["started_index"] if entry["started_index"] is not None else entry["completed_index"],
         )
     )
     first_primary_entry = primary_entries[0] if primary_entries else None
-    first_protected_entry = protected_entries[0] if protected_entries else None
+    first_current_loop_entry = current_loop_entries[0] if current_loop_entries else None
     first_primary_start = first_primary_entry["started_index"] if first_primary_entry else None
-    first_protected_start = first_protected_entry["started_index"] if first_protected_entry else None
-    protected_before_primary = first_protected_start is not None and (
-        first_primary_start is None or first_protected_start <= first_primary_start
+    first_current_loop_start = (
+        first_current_loop_entry["started_index"] if first_current_loop_entry else None
+    )
+    current_loop_before_primary = first_current_loop_start is not None and (
+        first_primary_start is None or first_current_loop_start <= first_primary_start
     )
 
     if not applies:
         route_cleanliness = "not_required"
-        classification = "not_applicable_non_provenance_source_family"
+        classification = "not_applicable_negative_control"
     elif parse_errors:
         route_cleanliness = "unadjudicable"
         classification = "unadjudicable_event_parse_errors"
     elif uncorrelated_evidence_count:
         route_cleanliness = "unadjudicable"
         classification = "unadjudicable_evidence_start_correlation"
-    elif protected_before_primary:
+    elif current_loop_before_primary:
         route_cleanliness = "fail"
         classification = (
-            "protected_artifact_without_primary_raw_evidence"
+            "current_loop_material_without_primary_raw_evidence"
             if first_primary_entry is None
-            else "protected_artifact_before_or_with_first_primary_raw_evidence"
+            else "current_loop_material_before_or_with_first_primary_raw_evidence"
         )
-    elif first_protected_entry is not None:
+    elif first_current_loop_entry is not None:
         route_cleanliness = "pass"
-        classification = "protected_artifact_only_after_primary_raw_evidence"
+        classification = "current_loop_material_only_after_primary_raw_evidence"
     else:
         route_cleanliness = "pass"
-        classification = "no_protected_artifact_access_before_primary_raw_evidence"
+        classification = "no_current_loop_material_access_before_primary_raw_evidence"
+
+    evidence_class_counts = {
+        evidence_class: sum(
+            evidence_class in entry["evidence_classes"] for entry in completed_order
+        )
+        for evidence_class in (
+            "primary_raw_evidence",
+            "legitimate_pre_existing_secondary_context",
+            "current_loop_evaluator_gold_report_review_material",
+            "unclear_chronology",
+        )
+    }
 
     return {
-        "applies_to_provenance_source_family": applies,
+        "applies_to_provenance_source_family": provenance_source_family,
+        "applies_to_positive_benchmark_lane": applies,
         "route_cleanliness": route_cleanliness,
         "classification": classification,
         "first_primary_raw_evidence_started_index": first_primary_start,
-        "first_protected_artifact_started_index": first_protected_start,
+        "first_current_loop_material_started_index": first_current_loop_start,
+        "first_protected_artifact_started_index": first_current_loop_start,
         "first_primary_raw_evidence_completed_index": (
             first_primary_entry["completed_index"] if first_primary_entry else None
         ),
-        "first_protected_artifact_completed_index": (
-            first_protected_entry["completed_index"] if first_protected_entry else None
+        "first_current_loop_material_completed_index": (
+            first_current_loop_entry["completed_index"] if first_current_loop_entry else None
         ),
+        "first_protected_artifact_completed_index": (
+            first_current_loop_entry["completed_index"] if first_current_loop_entry else None
+        ),
+        "evidence_class_counts": evidence_class_counts,
         "primary_raw_evidence_access_count": len(primary_entries),
-        "protected_artifact_access_count": len(protected_entries),
+        "current_loop_material_access_count": len(current_loop_entries),
+        "protected_artifact_access_count": len(current_loop_entries),
         "uncorrelated_evidence_access_count": uncorrelated_evidence_count,
-        "protected_artifact_before_primary": protected_before_primary,
+        "current_loop_material_before_primary": current_loop_before_primary,
+        "protected_artifact_before_primary": current_loop_before_primary,
     }
 
 
@@ -575,6 +901,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     metadata = _load_metadata(metadata_path)
     expected_route_family = _route_family_from_metadata(lane_id, metadata)
     expected_activation = _expected_jsonl_activation(lane_id, metadata)
+    current_loop_markers = _current_loop_markers(lane_path, metadata)
     parsed = parse_lf_delimited_json(events_path)
     final_text = final_path.read_text(encoding="utf-8", errors="replace") if final_path.exists() else ""
 
@@ -658,16 +985,18 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
         output_text = _event_command_output(event)
         partial_packet_signal = event_type == "item.completed" and bool(PARTIAL_PACKET_RE.search(output_text))
         manual_fallback_candidate = _is_broad_search(command) or command_kind == "file_read"
-        evidence_roles = (
-            _evidence_access_roles(
+        evidence_classes = (
+            _evidence_access_classes(
                 command,
                 output_text,
                 command_kind,
                 command_succeeded=_event_command_succeeded(event),
+                current_loop_markers=current_loop_markers,
             )
             if event_type == "item.completed"
             else []
         )
+        evidence_roles = _evidence_access_roles(evidence_classes)
         command_entry = {
             "event_index": event_index,
             "lifecycle_event": event_type,
@@ -678,6 +1007,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
             "broad_search_or_listing": _is_broad_search(command),
             "partial_packet_signal": partial_packet_signal,
             "manual_fallback_candidate": manual_fallback_candidate,
+            "evidence_classes": evidence_classes,
             "evidence_roles": evidence_roles,
             "started_index": start_ref["started_index"] if start_ref else None,
             "started_event_index": start_ref["started_event_index"] if start_ref else None,
@@ -693,6 +1023,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
                     "broad_search_or_listing": command_entry["broad_search_or_listing"],
                     "partial_packet_signal": command_entry["partial_packet_signal"],
                     "manual_fallback_candidate": command_entry["manual_fallback_candidate"],
+                    "evidence_classes": command_entry["evidence_classes"],
                     "evidence_roles": command_entry["evidence_roles"],
                     "started_index": command_entry["started_index"],
                     "started_event_index": command_entry["started_event_index"],
@@ -748,6 +1079,7 @@ def classify_lane(lane_id: str, lane_path: Path, *, repo_root: Path | None = Non
     contamination_chronology = _contamination_chronology(
         completed_order,
         expected_route_family=expected_route_family,
+        positive_benchmark_lane=expected_activation,
         parse_errors=parsed.parse_errors,
     )
     lane_report = {
@@ -890,7 +1222,7 @@ def build_receiving_agent_trace_ledger(
     }
     payload = {
         "receiving_agent_trace_ledger": {
-            "schema_version": "1.2",
+            "schema_version": "1.3",
             "privacy_boundary": (
                 "committed-safe: raw prompts, final prose, stderr, command arguments, "
                 "absolute paths, thread/session ids, and runtime/auth paths are omitted"
@@ -975,7 +1307,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
                 f"- Deep-audit target persistence: workflow `{audit_target['audit_continuation_workflow_seen']}`, target-persistence `{audit_target['target_persistence_signal_seen']}`, target-drift `{audit_target['target_drift_signal_seen']}`, target-mismatch `{audit_target['target_mismatch_signal_seen']}`",
                 f"- Source follow-through: `{lane['source_follow_through']['status']}`; primary-ref signal `{lane['source_follow_through']['primary_ref_use']}`",
                 f"- Route cleanliness: `{contamination['route_cleanliness']}` (`{contamination['classification']}`)",
-                f"- First primary/protected started index: `{contamination['first_primary_raw_evidence_started_index']}` / `{contamination['first_protected_artifact_started_index']}`",
+                f"- First primary/current-loop started index: `{contamination['first_primary_raw_evidence_started_index']}` / `{contamination['first_current_loop_material_started_index']}`",
                 f"- Final answer: `{final['status']}`, bytes `{final['bytes']}`, correctness `{final['final_correctness']}`",
                 f"- Cap/coverage language: `{final['cap_or_coverage_language_present']}`; source-grounding language: `{final['source_grounding_language_present']}`",
                 "- Private handles:",
@@ -988,7 +1320,7 @@ def render_receiving_agent_trace_ledger_markdown(payload: dict[str, Any]) -> str
         lines.append("- Command order:")
         for entry in lane["command_order"]:
             lines.append(
-                f"  - `{entry['completed_index']}` `{entry['command_kind']}` hash `{entry['command_hash_12']}` roles `{', '.join(entry['evidence_roles']) or 'none'}`"
+                f"  - `{entry['completed_index']}` `{entry['command_kind']}` hash `{entry['command_hash_12']}` classes `{', '.join(entry['evidence_classes']) or 'none'}`"
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

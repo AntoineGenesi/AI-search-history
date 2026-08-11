@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from pathlib import PurePosixPath
 
@@ -17,6 +18,11 @@ from .real_history_post_jsh763_date_timeline_diagnostic import (
     render_post_jsh763_date_timeline_diagnostic_text,
 )
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
+
+
+SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE = re.compile(
+    r"(?i)^-\s+[^\n]+\.jsonl:\d+:\s+[a-z_][a-z0-9_]*\s*$"
+)
 
 
 def render_json(payload: dict) -> str:
@@ -4685,6 +4691,13 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _escape_source_expansion_record_headers(text: str) -> str:
+    return "\n".join(
+        f"  {line}" if SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE.fullmatch(line) else line
+        for line in text.split("\n")
+    )
+
+
 def render_source_expansion_text(payload: dict) -> str:
     report = payload["source_expansion"]
     lines = [
@@ -4726,7 +4739,7 @@ def render_source_expansion_text(payload: dict) -> str:
         lines.append(f"- {record.get('target')}: {record.get('role') or '(role unknown)'}")
         text = str(record.get("text") or "")
         if text:
-            lines.append(text)
+            lines.append(_escape_source_expansion_record_headers(text))
     for warning in report.get("warnings", []):
         lines.append(f"Warning: {warning}")
     return "\n".join(lines)
