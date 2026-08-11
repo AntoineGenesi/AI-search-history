@@ -14815,55 +14815,19 @@ def action_proof_source_selection_provenance(
     records: list[Any],
     query: str,
 ) -> dict[str, Any]:
-    if action_proof_diagnostic_material_requested(query):
-        diagnostic_reason = None
-    else:
-        diagnostic_reason = action_proof_diagnostic_source_reason(
-            path,
-            records=records,
-            query=query,
-        )
-        if not diagnostic_reason and not action_proof_has_explicit_original_request(records):
-            diagnostic_reason = "source_request_is_not_explicit_original_action"
-    if diagnostic_reason:
-        return {
-            "schema_version": 1,
-            "source_chronology_role": "current_loop_action_diagnostic",
-            "selection_reason": diagnostic_reason,
-            "final_support_allowed": False,
-            "diagnostic_only": True,
-            "raw_text_included": False,
-        }
+    diagnostic_reason = action_proof_diagnostic_source_reason(
+        path,
+        records=records,
+        query=query,
+    ) or "candidate_action_window_lacks_independent_target_identity"
     return {
         "schema_version": 1,
-        "source_chronology_role": "target_historical_raw_action_source",
-        "selection_reason": "action_source_request_selected_upstream",
-        "final_support_allowed": True,
-        "diagnostic_only": False,
+        "source_chronology_role": "current_loop_action_diagnostic",
+        "selection_reason": diagnostic_reason,
+        "final_support_allowed": False,
+        "diagnostic_only": True,
         "raw_text_included": False,
     }
-
-
-def action_proof_has_explicit_original_request(records: list[Any]) -> bool:
-    for record in records:
-        role = str(record.role or "").casefold()
-        if not any(token in role for token in ("user", "human")):
-            continue
-        text = re.sub(r"\s+", " ", str(record.text or "").casefold()).strip()
-        if (
-            re.match(
-                r"^(?:please )?(?:run|execute|test|check|verify|inspect|edit|update|"
-                r"create|write|save|commit|review)\b",
-                text,
-            )
-            or re.match(
-                r"^(?:can|could|would|will) you (?:please )?(?:run|execute|test|"
-                r"check|verify|inspect|edit|update|create|write|save|commit|review)\b",
-                text,
-            )
-        ):
-            return True
-    return False
 
 
 def action_proof_diagnostic_source_reason(
@@ -14900,23 +14864,6 @@ def action_proof_diagnostic_source_reason(
         if action_proof_evaluator_or_fixture_request(text):
             return "source_request_is_evaluator_or_fixture_material"
     return None
-
-
-def action_proof_diagnostic_material_requested(query: str) -> bool:
-    normalized = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
-    return bool(
-        re.search(
-            r"\b(?:did|does|was|is|were|what did|whether) (?:the )?"
-            r"(?:evaluator|evaluation|fixture|synthetic fixture|gold response|"
-            r"answer key|generated report|evaluation report)\b",
-            normalized,
-        )
-        or re.search(
-            r"\b(?:evaluator|evaluation|fixture|synthetic fixture|gold response|"
-            r"answer key|generated report|evaluation report) itself\b",
-            normalized,
-        )
-    )
 
 
 def action_proof_evaluator_or_fixture_request(text: str) -> bool:
