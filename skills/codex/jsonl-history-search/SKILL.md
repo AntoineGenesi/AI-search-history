@@ -50,6 +50,8 @@ Otherwise run:
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
+Blank/unset query fails closed; use original wording.
+
 Wait for that command to exit. While it is running, do not start another `ask`,
 direct `semantic-debug`, or source-checkout
 fallback. Interrupt/no packet: report liveness failure; last stderr

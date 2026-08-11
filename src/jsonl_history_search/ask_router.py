@@ -143,6 +143,7 @@ METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
         "forbidden_first_moves": [
             "artifact-currentness or current Git status before historical source refs",
             "TODO/task/review/report sweeps before semantic-debug",
+            "opening current-loop/evaluator/benchmark/report material before original source evidence",
             "answering from current-run echoes or post-hoc answer-key artifacts",
             "broad repo rg as chronology reconstruction",
         ],
@@ -153,14 +154,15 @@ METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
             "diagnostic-only current-run/prior-final/adjudication/report rows demoted until target reads are opened",
         ],
         "read_order": [
-            "Run first_command once.",
-            "Open target historical raw session/tool refs before repo artifacts.",
+            "Run first_command once with the original user wording.",
+            "Open target original historical raw session/tool refs before repo artifacts or diagnostics.",
             "Then inspect historical task/review/branch/commit refs for chronology roles.",
-            "Use current-run echoes, reports, and adjudication artifacts only as diagnostics.",
+            "Only after original source evidence is opened, use current-loop/evaluator/benchmark/report material as diagnostics, never final support.",
         ],
         "secondary_policy": (
             "Historical task/review/commit refs can support chronology after raw source refs; later recaps, "
-            "same-loop output, final-answer artifacts, and answer-key-adjacent rows are diagnostics only."
+            "current-loop/evaluator/benchmark/report material, same-loop output, final-answer artifacts, and "
+            "answer-key-adjacent rows are diagnostics only and stay deferred until original source evidence is opened."
         ),
         "stop_rule": (
             "Stop when opened raw refs plus legitimate historical artifacts distinguish the requested task, "
@@ -221,6 +223,7 @@ METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
             "answering from assistant claims or later summaries",
             "repo grep before conversation tool/action refs",
             "task/review/report artifact proof before tool outputs",
+            "opening current-loop/evaluator/benchmark/report material before original source evidence",
             "rerunning broad discovery after primary action proof answers",
         ],
         "required_surfaces": [
@@ -230,14 +233,17 @@ METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
             "source_locator_handoff.next_reads for exact source follow-through",
         ],
         "read_order": [
-            "Run first_command once.",
+            "Run first_command once with the original user wording.",
+            "Open an independently identified original raw/session/tool source ref before any diagnostic artifact.",
             "Inspect source_window_action_proof and tool_action_proof.",
             "Open primary tool/action refs and their outputs before assistant prose.",
-            "Use diffs, commits, tests, and reviews only after tying them to primary action evidence.",
+            "Only after original source evidence is opened, use current-loop/evaluator/benchmark/report material as diagnostics, never final support.",
+            "Use diffs, commits, tests, and historical reviews only after tying them to primary action evidence.",
         ],
         "secondary_policy": (
-            "Assistant prose, task/review/report summaries, and later recaps are leads only; they do not prove "
-            "the agent actually ran, changed, tested, read, or followed something."
+            "Assistant prose, task/review/report summaries, current-loop/evaluator/benchmark material, and later "
+            "recaps are diagnostic leads only and stay deferred until original source evidence is opened; they do "
+            "not prove the agent actually ran, changed, tested, read, or followed something."
         ),
         "stop_rule": (
             "Stop when inspected primary tool/action refs answer the named action claim; report weak/no evidence "
@@ -249,8 +255,8 @@ METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
         ),
         "cap_language_required": True,
         "single_flight_policy": (
-            "Run exactly one semantic-debug action-proof command first; do not run broad rg or artifact sweeps "
-            "before primary action refs."
+            "Run exactly one semantic-debug action-proof command with the original user wording first; an empty "
+            "query must fail closed. Do not run broad rg or artifact sweeps before primary action refs."
         ),
     },
 }
