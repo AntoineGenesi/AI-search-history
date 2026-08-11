@@ -8715,6 +8715,15 @@ def _format_handoff_score(candidate: dict) -> str:
     return str(score)
 
 
+def _format_deep_audit_target_use(candidate: dict) -> str:
+    target_match = candidate.get("deep_audit_target_match") or {}
+    if not target_match:
+        return ""
+    if target_match.get("eligible_as_prompt_history_lead"):
+        return "eligible-prompt-history-lead"
+    return "diagnostic-only/non-actionable"
+
+
 def render_source_locator_handoff_text(handoff: dict) -> list[str]:
     not_searched = handoff.get("not_searched_scope", {})
     candidate_ordering = handoff.get("candidate_ordering", {})
@@ -8776,6 +8785,9 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
                         "final_support_allowed=False",
                     ]
                 )
+            target_use = _format_deep_audit_target_use(candidate)
+            if target_use:
+                bits.append(f"target_use={target_use}")
             lines.append(f"- top candidate: {' '.join(bits)}")
     if followthrough_plan:
         lines.append("- next_reads: preserved in JSON/report; default open order is semantic_debug.source_followthrough_plan")
@@ -9131,8 +9143,27 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
     if top_candidates and _source_followthrough_direct_evidence_complete(followthrough_plan):
         lines.append(f"- Top candidates: `{len(top_candidates[:5])}` diagnostic candidates suppressed after complete direct evidence.")
     elif top_candidates:
-        lines.extend(["", "| ID | Source | Confidence | Stage | Score | Reason codes |", "| --- | --- | --- | --- | --- | --- |"])
+        include_target_use = any(_format_deep_audit_target_use(candidate) for candidate in top_candidates[:5])
+        if include_target_use:
+            lines.extend(
+                [
+                    "",
+                    "| ID | Source | Confidence | Stage | Score | Target use | Reason codes |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "| ID | Source | Confidence | Stage | Score | Reason codes |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                ]
+            )
         for candidate in top_candidates[:5]:
+            target_use_cell = ""
+            if include_target_use:
+                target_use_cell = f"{_escape_markdown_table(_format_deep_audit_target_use(candidate))} | "
             lines.append(
                 "| "
                 f"{_escape_markdown_table(str(candidate.get('candidate_id') or ''))} | "
@@ -9140,6 +9171,7 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(str(candidate.get('confidence') or ''))} | "
                 f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
                 f"{_escape_markdown_table(_format_handoff_score(candidate))} | "
+                f"{target_use_cell}"
                 f"{_escape_markdown_table(_format_handoff_reason_codes(candidate))} |"
             )
     next_reads = [] if followthrough_plan else handoff.get("next_reads", [])[:5]
@@ -9215,12 +9247,14 @@ def render_agent_find_text(payload: dict) -> str:
         lines.extend(render_source_locator_handoff_text(report["source_locator_handoff"]))
     for candidate in report.get("find_candidates", [])[:8]:
         ref = candidate.get("source_ref", {})
+        target_use = _format_deep_audit_target_use(candidate)
+        target_use_text = f" target_use={target_use}" if target_use else ""
         lines.append(
             "- "
             f"{candidate.get('candidate_id')} {candidate.get('confidence')} "
             f"{source_ref_target(ref) or ''} "
             f"{candidate.get('timestamp') or '(no timestamp)'} "
-            f"{candidate.get('role') or ''}: {candidate.get('snippet')}"
+            f"{candidate.get('role') or ''}{target_use_text}: {candidate.get('snippet')}"
         )
     if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):
         no_evidence = report.get("no_evidence_report", {})
@@ -9257,6 +9291,8 @@ def render_agent_find_markdown(payload: dict) -> str:
     plan_sources = report.get("plan_sources", {})
     source_scope = plan_sources.get("source_scope", {})
     cap_hit = plan_sources.get("cap_hit", {})
+    candidates = list(report.get("find_candidates") or [])
+    include_target_use = any(_format_deep_audit_target_use(candidate) for candidate in candidates)
     lines = [
         "# JSONL Find",
         "",
@@ -9273,8 +9309,16 @@ def render_agent_find_markdown(payload: dict) -> str:
         "",
         "## Candidates",
         "",
-        "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        (
+            "| ID | Confidence | Source | Timestamp | Role | Stage | Target use | Snippet |"
+            if include_target_use
+            else "| ID | Confidence | Source | Timestamp | Role | Stage | Snippet |"
+        ),
+        (
+            "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            if include_target_use
+            else "| --- | --- | --- | --- | --- | --- | --- |"
+        ),
     ]
     if source_scope:
         lines.insert(
@@ -9306,9 +9350,11 @@ def render_agent_find_markdown(payload: dict) -> str:
     if report.get("source_locator_handoff"):
         lines.extend(["", "## Source Locator Handoff", ""])
         lines.extend(render_source_locator_handoff_markdown(report["source_locator_handoff"]))
-    for candidate in report.get("find_candidates", []):
+    for candidate in candidates:
         ref = candidate.get("source_ref", {})
         source = source_ref_target(ref) or ""
+        target_use = _format_deep_audit_target_use(candidate)
+        target_use_cell = f"{_escape_markdown_table(target_use)} | " if include_target_use else ""
         lines.append(
             "| "
             f"{_escape_markdown_table(str(candidate.get('candidate_id', '')))} | "
@@ -9317,6 +9363,7 @@ def render_agent_find_markdown(payload: dict) -> str:
             f"{_escape_markdown_table(str(candidate.get('timestamp') or ''))} | "
             f"{_escape_markdown_table(str(candidate.get('role') or ''))} | "
             f"{_escape_markdown_table(str(candidate.get('stage') or ''))} | "
+            f"{target_use_cell}"
             f"{_escape_markdown_table(str(candidate.get('snippet') or ''))} |"
         )
     if report.get("status") == "no_evidence" or report.get("no_evidence_report", {}).get("needed"):

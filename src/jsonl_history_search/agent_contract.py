@@ -337,6 +337,40 @@ def apply_deep_audit_find_target_contract(
                 for read in handoff.get("next_reads") or []
                 if str(read.get("candidate_id") or "") in eligible_candidate_id_set
             ]
+            target_match_by_candidate_id = {
+                str(candidate.get("candidate_id") or ""): candidate.get("deep_audit_target_match")
+                for candidate in agent_find.get("find_candidates") or []
+                if candidate.get("candidate_id")
+            }
+            for candidate in (handoff.get("candidate_ordering") or {}).get("top_candidates") or []:
+                candidate_id = str(candidate.get("candidate_id") or "")
+                target_match = target_match_by_candidate_id.get(candidate_id)
+                if isinstance(target_match, dict):
+                    candidate["deep_audit_target_match"] = dict(target_match)
+                    candidate["actionability"] = (
+                        "prompt_history_lead"
+                        if candidate_id in eligible_candidate_id_set
+                        else "diagnostic_only"
+                    )
+            for window in handoff.get("source_windows") or []:
+                candidate_id = str(window.get("candidate_id") or "")
+                target_match = target_match_by_candidate_id.get(candidate_id)
+                if isinstance(target_match, dict):
+                    window["deep_audit_target_match"] = dict(target_match)
+                if candidate_id in eligible_candidate_id_set:
+                    continue
+                removed_actions = [
+                    field
+                    for field in ("next_read", "open_instruction", "expansion_actions", "context_actions")
+                    if window.pop(field, None) is not None
+                ]
+                omitted_fields = window.setdefault("omitted_fields", {})
+                omitted_fields.pop("exact_actions_preserved_in", None)
+                omitted_fields["target_contract_actions_removed"] = removed_actions
+                window["actionability"] = "diagnostic_only"
+                window["diagnostic_only"] = True
+                window["read_more_actionable"] = False
+                window["reason"] = "diagnostic-only partial target match; do not open as prompt-history guidance"
         return
     agent_find["status"] = "failed_closed_target_contract_mismatch"
     agent_find["find_candidates"] = []
