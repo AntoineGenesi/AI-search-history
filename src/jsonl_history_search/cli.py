@@ -5361,6 +5361,32 @@ def _cleanup_answer_operational_records(records: list[dict]) -> list[dict]:
     return selected
 
 
+def _compact_cleanup_facet_coverage(coverage: object) -> dict:
+    if not isinstance(coverage, dict):
+        return {}
+    facets = coverage.get("facets") if isinstance(coverage.get("facets"), dict) else {}
+    return {
+        "complete": bool(coverage.get("complete")),
+        "proven_count": coverage.get("proven_count"),
+        "total_count": coverage.get("total_count"),
+        "facets": {
+            name: item.get("status")
+            for name, item in facets.items()
+            if isinstance(item, dict)
+        },
+    }
+
+
+def _compact_cleanup_chronology_gate(gate: object) -> dict:
+    if not isinstance(gate, dict):
+        return {}
+    return {
+        "status": gate.get("status"),
+        "current_workspace_scan": gate.get("current_workspace_scan"),
+        "order": "original_chronology_then_current_workspace",
+    }
+
+
 def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_family: str) -> dict:
     if route_family != "remembered_user_wording":
         return {}
@@ -5447,6 +5473,7 @@ def _answer_action_contract_from_executed_output(
     if output_key == "artifact_currentness":
         worktree = compact.get("worktree_currentness") or {}
         cleanup = worktree.get("cleanup_causality") or {}
+        facet_coverage = cleanup.get("facet_coverage") or {}
         operational_records = _cleanup_answer_operational_records(
             cleanup.get("operational_records") or []
         )
@@ -5494,13 +5521,13 @@ def _answer_action_contract_from_executed_output(
         return {
             "answer_status": (
                 "answer-ready-after-source-inspection"
-                if compact.get("status") == "ok" and cleanup.get("debt_status")
+                if compact.get("status") == "ok" and facet_coverage.get("complete")
                 else "not-ready/needs-more-proof"
             ),
             "promotion_status": cleanup.get("debt_status") or compact.get("status"),
             "promotion_reason": (
-                "Operational cleanup records and git state are the answer-leading evidence for "
-                "worktree cleanup currentness; inspect those refs before using the causal summary."
+                "Original cleanup chronology is answer-leading evidence. Current Git/worktree state is a "
+                "separate later phase and cannot substitute for missing defer, preservation, or cleanup proof."
             ),
             "read": operational_records or next_reads,
             "then_use": {
@@ -5511,7 +5538,15 @@ def _answer_action_contract_from_executed_output(
                 "source_roles_present": worktree.get("source_roles_present"),
                 "worktree_classifications": (worktree.get("classifications") or [])[:8],
             },
-            "diagnostics_after": next_reads if operational_records else [],
+            "diagnostics_after": (
+                [
+                    item
+                    for item in next_reads
+                    if str(item.get("phase") or "").startswith("current_state_after_chronology")
+                ]
+                if operational_records
+                else []
+            ),
             "source_role_order": worktree.get("source_role_order"),
             "source_roles_present": worktree.get("source_roles_present"),
             "stop": (
@@ -9532,6 +9567,16 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "physical_worktree_count": cleanup.get("physical_worktree_count"),
                 "target_selection_note": cleanup.get("target_selection_note"),
                 "target_binding": cleanup.get("target_binding"),
+                "chronology_gate": _compact_cleanup_chronology_gate(
+                    cleanup.get("chronology_gate")
+                ),
+                "facet_coverage": _compact_cleanup_facet_coverage(
+                    cleanup.get("facet_coverage")
+                ),
+                "causality_currentness_boundary": {
+                    "status": "historical_causality_first_current_state_second",
+                    "current_state_is_not_causal_proof": True,
+                },
             },
             "cleanup_causal_role_order": worktree.get("cleanup_causal_role_order"),
             "source_role_order": worktree.get("source_role_order"),
@@ -10266,6 +10311,7 @@ def _ask_answer_worktree_cleanup_currentness(
         else {}
     )
     debt_status = str(cleanup.get("debt_status") or "")
+    facet_coverage = cleanup.get("facet_coverage") if isinstance(cleanup.get("facet_coverage"), dict) else {}
     action_reads = action.get("read") if isinstance(action.get("read"), list) else []
     normalized: list[dict] = []
     rejected: list[dict] = []
@@ -10333,29 +10379,37 @@ def _ask_answer_worktree_cleanup_currentness(
     opened = _open_ask_answer_proof_refs(normalized, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
     relationships = {str(item.get("relationship") or "") for item in normalized}
-    has_prior_debt = bool(
-        relationships
-        & {
-            "report_only_preserve_then_remove_candidates",
-            "report_only_preserve_then_remove",
-            "report_only_preserve_then_prune",
-            "report_only_cleanup_audit",
-            "handoff_deferred_cleanup",
-        }
+    causal_roles = {
+        str(item.get("causal_source_role") or "") for item in normalized
+    }
+    required_original_roles = {
+        "report_only_audit",
+        "deferred_handoff",
+        "cleanup_learning_policy",
+        "private_retention",
+    }
+    has_later_outcome = bool(
+        relationships & {"cleanup_execution_report", "report_only_cleanup_audit"}
     )
-    has_execution_closure = "cleanup_execution_report" in relationships
     if (
         rejected
         or len(usable) != len(normalized)
         or not usable
-        or debt_status != "closed_by_cleanup_execution_report"
-        or not has_prior_debt
-        or not has_execution_closure
+        or debt_status not in {"closed_by_cleanup_execution_report", "open_cleanup_debt"}
+        or not required_original_roles <= causal_roles
+        or not has_later_outcome
+        or not facet_coverage.get("complete")
     ):
         gate = {
             "status": "blocked_missing_or_unreadable_worktree_cleanup_proof",
             "required_source_role": "operational_record",
-            "required_relationships": ["report_only_or_deferred_cleanup", "cleanup_execution_report"],
+            "required_causal_roles": sorted(required_original_roles),
+            "required_later_outcome": "cleanup_execution_report_or_explicit_non_execution",
+            "facet_coverage": {
+                "complete": bool(facet_coverage.get("complete")),
+                "proven_count": facet_coverage.get("proven_count"),
+                "total_count": facet_coverage.get("total_count"),
+            },
             "debt_status": debt_status or None,
             "opened_ref_count": len(usable),
             "rejected_refs": rejected,
@@ -10398,6 +10452,11 @@ def _ask_answer_worktree_cleanup_currentness(
             for item in normalized
             if item.get("causal_source_role")
         ],
+        "facet_coverage": {
+            "complete": bool(facet_coverage.get("complete")),
+            "proven_count": facet_coverage.get("proven_count"),
+            "total_count": facet_coverage.get("total_count"),
+        },
         "boundary": "read-only cleanup causality; no cleanup, branch deletion, worktree removal, or storage action",
     }
     return {"ask_answer": answer}
