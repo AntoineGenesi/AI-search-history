@@ -16043,6 +16043,7 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             "drift_markers": alignment.get("drift_markers"),
             "evidence_classes": alignment.get("evidence_classes"),
             "source_identity_hash_12": alignment.get("source_identity_hash_12"),
+            "historical_period": alignment.get("historical_period"),
             "final_support_allowed": (
                 bool(alignment.get("target_match")) and not alignment.get("target_drift_risk") and not nonactionable
             ),
@@ -16052,12 +16053,12 @@ def build_deep_audit_target_persistence_contract(*, query: str, next_reads: list
             target_matched_reads.append(row)
         if alignment.get("target_drift_risk"):
             drift_risk_reads.append(row)
-    matched_episode_hashes = dedupe(
-        str(read.get("source_identity_hash_12"))
+    matched_historical_periods = dedupe(
+        str(read.get("historical_period"))
         for read in target_matched_reads
-        if read.get("source_identity_hash_12")
+        if read.get("historical_period")
     )
-    matched_distinct_episode_count = len(matched_episode_hashes)
+    matched_distinct_episode_count = len(matched_historical_periods)
     satisfied_evidence_classes = []
     if primary_raw_read_count:
         satisfied_evidence_classes.append("primary_raw_conversation_history")
@@ -16234,7 +16235,8 @@ def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dic
     generic_explicit_raw_match = bool(
         primary_raw
         and not distinctive_failure_terms
-        and (matched_failure_class_terms or role == "target_historical_raw")
+        and matched_failure_class_terms
+        and all(term in matched_failure_class_terms for term in failure_class_terms)
     )
     target_match = bool(primary_raw and (distinctive_match or generic_explicit_raw_match))
     if drift_risk:
@@ -16244,6 +16246,12 @@ def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dic
         if source_path
         else None
     )
+    timestamp = str(source_ref.get("timestamp_utc") or read.get("timestamp_utc") or "")
+    historical_period_match = re.search(
+        r"(?<!\d)(\d{4})[-/](\d{2})[-/](\d{2})(?!\d)",
+        timestamp or source_path,
+    )
+    historical_period = "-".join(historical_period_match.groups()) if historical_period_match else None
     evidence_classes = []
     if primary_raw:
         evidence_classes.append("primary_raw_conversation_history")
@@ -16259,6 +16267,7 @@ def deep_audit_read_target_alignment(read: dict[str, Any], *, query: str) -> dic
         "primary_raw_conversation_history": primary_raw,
         "evidence_classes": evidence_classes,
         "source_identity_hash_12": source_identity_hash,
+        "historical_period": historical_period,
         "raw_text_included": False,
     }
 
@@ -16379,11 +16388,21 @@ def in_depth_audit_target_refocus_command(
         ("max_bytes", "--max-bytes"),
         ("max_matches", "--max-matches"),
         ("max_elapsed", "--max-elapsed"),
+        ("hard_cap_files", "--hard-cap-files"),
+        ("hard_cap_bytes", "--hard-cap-bytes"),
     ):
         value = getattr(args, name, None)
         if value is not None:
             argv.extend([flag, str(value)])
-    argv.extend(["--format", "text"])
+    executable_target_contract = deep_audit_executable_target_contract(target_contract)
+    argv.extend(
+        [
+            "--deep-audit-target-contract",
+            json.dumps(executable_target_contract, sort_keys=True, separators=(",", ":")),
+            "--format",
+            "json",
+        ]
+    )
     return {
         "command_id": "refocus_original_audit_target_01",
         "slice": "target_persistence_refocus",
@@ -16415,6 +16434,18 @@ def deep_audit_target_contract_continuation_fields(contract: dict[str, Any]) -> 
         "required_evidence_classes": list(contract.get("required_evidence_classes") or []),
         "forbidden_nearby_substitutes": list(contract.get("forbidden_nearby_substitutes") or []),
         "prompt_history_source_terms": list(contract.get("prompt_history_source_terms") or []),
+    }
+
+
+def deep_audit_executable_target_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "target_fingerprint_12": contract.get("target_fingerprint_12"),
+        "requested_failure_class": contract.get("requested_failure_class"),
+        "time_scope_intent": contract.get("time_scope_intent"),
+        "required_evidence_classes": list(contract.get("required_evidence_classes") or []),
+        "forbidden_nearby_substitutes": list(contract.get("forbidden_nearby_substitutes") or []),
+        "canonical_target_reminder": contract.get("canonical_target_reminder"),
     }
 
 

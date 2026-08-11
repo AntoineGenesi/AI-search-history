@@ -448,6 +448,12 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
                 "retrieval diagnostics. Defaults stay unchanged."
             ),
         )
+        find.add_argument(
+            "--deep-audit-target-contract",
+            type=_json_object_argument,
+            default=None,
+            help=argparse.SUPPRESS,
+        )
     structural_hybrid = subparsers.add_parser(
         "find-structural-hybrid-budgeted",
         description=(
@@ -2033,6 +2039,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="JSON profile for read-only snippet redaction of common PII/secrets and custom regexes",
     )
+
+
+def _json_object_argument(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("expected a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return parsed
 
 
 def _history_home_from_args(
@@ -5168,6 +5184,7 @@ def _build_agent_find_report_output_payload(args: argparse.Namespace) -> dict:
         compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
         evidence_context_window=getattr(args, "evidence_context_window", 0),
         no_evidence_mode=True,
+        deep_audit_target_contract=getattr(args, "deep_audit_target_contract", None),
     )
     output_profile_token = start_phase_profile("agent_find_output_report")
     rendered = render(payload, "json")
@@ -19243,6 +19260,7 @@ def main(argv: list[str] | None = None) -> int:
             compact_provenance_handoff=getattr(args, "compact_provenance_handoff", False),
             evidence_context_window=getattr(args, "evidence_context_window", 0),
             no_evidence_mode=args.command == "no-evidence-report",
+            deep_audit_target_contract=getattr(args, "deep_audit_target_contract", None),
         )
     elif args.command == "plan":
         payload = {

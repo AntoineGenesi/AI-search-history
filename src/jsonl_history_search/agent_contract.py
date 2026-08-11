@@ -102,6 +102,7 @@ def build_agent_find_payload(
     compact_provenance_handoff: bool = False,
     evidence_context_window: int = 0,
     no_evidence_mode: bool = False,
+    deep_audit_target_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expansion_action_context = expansion_action_context_from_source_plan(source_plan)
     candidates = build_candidate_rows(search_result)
@@ -253,7 +254,90 @@ def build_agent_find_payload(
             agent_find["compact_provenance_handoff"]["stage_diagnostics_summary"] = compact_stage_diagnostics_summary(
                 compact_stage_diagnostics
             )
+    if deep_audit_target_contract:
+        apply_deep_audit_find_target_contract(
+            agent_find,
+            contract=deep_audit_target_contract,
+            source_plan=source_plan,
+        )
     return {"agent_find": agent_find}
+
+
+def apply_deep_audit_find_target_contract(
+    agent_find: dict[str, Any],
+    *,
+    contract: dict[str, Any],
+    source_plan: dict[str, Any],
+) -> None:
+    requested = contract.get("requested_failure_class")
+    requested_terms = [
+        str(term).casefold()
+        for term in (requested.get("terms") if isinstance(requested, dict) else [])
+        if str(term).strip()
+    ]
+    query = source_plan.get("query") if isinstance(source_plan.get("query"), dict) else {}
+    query_terms = [str(term).casefold() for term in query.get("base_terms") or []]
+    required_classes = list(contract.get("required_evidence_classes") or [])
+    forbidden_substitutes = list(contract.get("forbidden_nearby_substitutes") or [])
+    contract_shape_valid = bool(
+        contract.get("target_fingerprint_12")
+        and requested_terms
+        and isinstance(contract.get("time_scope_intent"), dict)
+        and required_classes
+        and forbidden_substitutes
+    )
+    query_enforced = bool(
+        contract_shape_valid
+        and query.get("role") == "user"
+        and set(query_terms) == set(requested_terms)
+    )
+    eligible_candidate_ids = []
+    for candidate in agent_find.get("find_candidates") or []:
+        haystack = " ".join(
+            [
+                str(candidate.get("snippet") or ""),
+                " ".join(str(term) for term in candidate.get("matched_terms") or []),
+            ]
+        ).casefold()
+        matched_terms = [term for term in requested_terms if term in haystack]
+        candidate["deep_audit_target_match"] = {
+            "matched_failure_class_terms": matched_terms,
+            "eligible_as_prompt_history_lead": query_enforced and set(matched_terms) == set(requested_terms),
+            "eligible_as_final_audit_evidence": False,
+        }
+        if candidate["deep_audit_target_match"]["eligible_as_prompt_history_lead"]:
+            eligible_candidate_ids.append(candidate.get("candidate_id"))
+    agent_find["deep_audit_target_continuation"] = {
+        "schema_version": 1,
+        "status": "target_contract_enforced" if query_enforced else "target_contract_mismatch",
+        "target_contract": contract,
+        "query_role_enforced": query.get("role") == "user",
+        "failure_class_query_enforced": set(query_terms) == set(requested_terms),
+        "eligible_prompt_history_candidate_ids": eligible_candidate_ids,
+        "candidate_use": "prompt_history_leads_only",
+        "answer_promotion_allowed": False,
+        "required_before_answer": required_classes,
+        "forbidden_nearby_substitutes": forbidden_substitutes,
+        "continuation_rule": (
+            "Open only eligible user-prompt refs, then continue the original historical/systemic audit; "
+            "nearby incidents and post-hoc artifacts cannot replace the requested failure class."
+        ),
+    }
+    agent_find["next_search_suggestions"] = [
+        "Continue only with the preserved target contract and its requested failure-class terms."
+    ]
+    if query_enforced:
+        return
+    agent_find["status"] = "failed_closed_target_contract_mismatch"
+    agent_find["find_candidates"] = []
+    agent_find["timeline"] = []
+    agent_find["cluster_candidates"] = []
+    agent_find["evidence_bundles"] = []
+    handoff = agent_find.get("source_locator_handoff")
+    if isinstance(handoff, dict):
+        handoff["next_reads"] = []
+        handoff["source_windows"] = []
+        handoff["evidence_packets"] = []
 
 
 def derive_agent_find_status(*, search_result: dict[str, Any], candidates: list[CandidateRow]) -> str:
