@@ -144,6 +144,16 @@ RG_OPTIONS_WITH_VALUE = {
     "-T",
     "--type-not",
 }
+GIT_GLOBAL_OPTIONS_WITH_VALUE = {
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+}
 PROVENANCE_SOURCE_FAMILY_MARKERS = (
     "provenance",
     "source",
@@ -371,12 +381,16 @@ def _raw_window_contains_current_loop_answer_access(
     trusted_matches = record_matches[:1]
     if count_match and int(count_match.group(1)) == len(record_matches):
         trusted_matches = record_matches
+    elif count_match:
+        included_count = int(count_match.group(1))
+        if 1 < included_count < len(record_matches):
+            # Quoted headers belong to earlier raw text; later rendered records remain the trailing headers.
+            trusted_matches = [record_matches[0], *record_matches[-(included_count - 1) :]]
 
-    for match in trusted_matches:
+    for index, match in enumerate(trusted_matches):
         if match.group(1).lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
             continue
-        index = record_matches.index(match)
-        block_end = record_matches[index + 1].start() if index + 1 < len(record_matches) else len(output)
+        block_end = trusted_matches[index + 1].start() if index + 1 < len(trusted_matches) else len(output)
         block = output[match.start() : block_end]
         answer_artifact_seen = bool(
             PROTECTED_EVALUATION_ARTIFACT_RE.search(block)
@@ -471,9 +485,38 @@ def _git_show_targets_primary_raw_history_only(command: str) -> bool:
             argv = shlex.split(argv[2])
         except ValueError:
             return False
-    if len(argv) < 3 or argv[:2] != ["git", "show"]:
+    if not argv or argv[0].rsplit("/", 1)[-1] != "git":
         return False
-    targets = [token for token in argv[2:] if not token.startswith("-")]
+
+    index = 1
+    while index < len(argv) and argv[index] != "show":
+        token = argv[index]
+        if token in GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if token.startswith(("-C", "-c")) and token not in {"-C", "-c"}:
+            index += 1
+            continue
+        if token.startswith(
+            (
+                "--config-env=",
+                "--exec-path=",
+                "--git-dir=",
+                "--namespace=",
+                "--super-prefix=",
+                "--work-tree=",
+            )
+        ):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False
+    if index >= len(argv):
+        return False
+
+    targets = [token for token in argv[index + 1 :] if not token.startswith("-")]
     return (
         len(targets) == 1
         and ":" in targets[0]
@@ -501,12 +544,13 @@ def _evidence_access_classes(
     command_has_primary = _has_primary_raw_history_path(command)
     output_has_evidence = bool(output.strip())
     primary_probe = command
+    git_show_targets_primary = _git_show_targets_primary_raw_history_only(command)
     output_discovery = (
         command_kind in {"broad_search_or_listing", "git"}
         and command_succeeded
         and output_has_evidence
         and not _rg_targets_are_primary_raw_history_only(command)
-        and not _git_show_targets_primary_raw_history_only(command)
+        and not git_show_targets_primary
     )
     if output_discovery:
         if not command_has_primary:
@@ -554,6 +598,7 @@ def _evidence_access_classes(
         and not _raw_window_is_setup_only(output)
         and (
             command_kind == "jsonl_read_more"
+            or git_show_targets_primary
             or (
                 bool(PRIMARY_CONTENT_ACCESS_RE.search(command))
                 and _has_primary_raw_history_path(primary_probe)
