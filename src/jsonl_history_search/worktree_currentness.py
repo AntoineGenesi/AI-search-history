@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from datetime import date
 from pathlib import Path
 
 
@@ -20,6 +21,8 @@ CLASSIFICATIONS = (
 ID_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+[A-Z0-9]*)\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w./-])((?:worktrees|task|tasks|tickets|issues|branches)/[A-Za-z0-9._/-]+)")
 BRANCH_RE = re.compile(r"(?<![\w./-])((?:task|feature|bugfix|fix|branches)/[A-Za-z0-9._/-]+)")
+ISO_DATE_RE = re.compile(r"(?<!\d)(20\d{2})-(\d{2})-(\d{2})(?!\d)")
+COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
 LABELED_TARGET_RE = re.compile(
     r"\b(?P<kind>branch|task)\b(?:\s*[:=]\s*|\s+)"
     r"(?:(?:named|called)\b(?:\s*[:=]\s*|\s+))?"
@@ -171,6 +174,7 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
     # Historical causality is resolved or declared missing before live Git and
     # worktree state can be inspected as a separate currentness layer.
     worktrees = _discover_worktrees(cwd)
+    branch_state = _discover_branch_state(cwd)
     if cleanup_causality.get("is_cleanup_causality_query") and not named:
         selected = _select_cleanup_causality_targets(worktrees, cwd)
     else:
@@ -185,7 +189,13 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         )
         for target in selected
     ]
-    cleanup_causality = _finish_cleanup_causality_report(cleanup_causality, items, worktrees, cwd)
+    cleanup_causality = _finish_cleanup_causality_report(
+        cleanup_causality,
+        items,
+        worktrees,
+        branch_state,
+        cwd,
+    )
     return {
         "status": "ok",
         "intent": "worktree_cleanup_currentness",
@@ -315,6 +325,24 @@ def _git_worktree_list(cwd: Path) -> list[dict]:
         current["relative_path"] = _rel(path, cwd) if str(path) else ""
         items.append(current)
     return items
+
+
+def _discover_branch_state(cwd: Path) -> dict:
+    result = _run(
+        ["git", "-C", str(cwd), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return {
+            "status": "unavailable",
+            "source": "git_for_each_ref",
+            "branch_count": 0,
+        }
+    return {
+        "status": "ok",
+        "source": "git_for_each_ref",
+        "branch_count": len([line for line in result.stdout.splitlines() if line.strip()]),
+    }
 
 
 def _select_targets(named: list[dict], worktrees: list[dict]) -> list[dict]:
@@ -580,7 +608,13 @@ def _cleanup_causality_report(
     }
 
 
-def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees: list[dict], cwd: Path) -> dict:
+def _finish_cleanup_causality_report(
+    report: dict,
+    items: list[dict],
+    worktrees: list[dict],
+    branch_state: dict,
+    cwd: Path,
+) -> dict:
     if not report.get("is_cleanup_causality_query"):
         return report
     report["physical_worktree_count"] = len(worktrees)
@@ -628,6 +662,7 @@ def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees:
                     "source_role": "git_state",
                     "evidence_scope": "current_workspace_state_only",
                     "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
+                    "branch_state": branch_state,
                     "classified_targets": [
                         item.get("path") or item.get("identifier") for item in items
                     ],
@@ -682,6 +717,7 @@ def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees:
                 "source_role": "git_state",
                 "evidence_scope": "current_workspace_state_only",
                 "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
+                "branch_state": branch_state,
                 "classified_targets": [item.get("path") or item.get("identifier") for item in items],
             },
             "causality_currentness_boundary": _cleanup_causality_currentness_boundary(),
@@ -721,12 +757,20 @@ def _cleanup_facet_coverage(report: dict) -> dict:
         if item.get("relationship") == "report_only_cleanup_audit"
         and "no worktrees" in _normalize(item.get("snippet", ""))
     ]
-    later_outcome = by_role["cleanup_execution"] or non_execution
-    branch_refs = [
+    chronology_records = [
         item
-        for item in original
-        if "branch refs retained" in _normalize(item.get("snippet", ""))
-        or "branch refs were removed" in _normalize(item.get("snippet", ""))
+        for item in by_role["report_only_audit"] + by_role["deferred_handoff"]
+        if item not in non_execution
+    ]
+    chronology_dates = [_cleanup_record_date(item) for item in chronology_records]
+    chronology_is_dated = bool(chronology_dates) and all(chronology_dates)
+    latest_chronology_date = max(chronology_dates) if chronology_is_dated else None
+    later_outcome = [
+        item
+        for item in by_role["cleanup_execution"] + non_execution
+        if latest_chronology_date
+        and (outcome_date := _cleanup_record_date(item))
+        and outcome_date > latest_chronology_date
     ]
     instruction_refs = (
         by_role["report_only_audit"]
@@ -741,13 +785,33 @@ def _cleanup_facet_coverage(report: dict) -> dict:
     current_scan_complete = (
         chronology_gate.get("current_workspace_scan") == "completed_after_chronology_gate"
     )
+    git_state = report.get("git_state") or {}
+    current_worktrees = [
+        item
+        for item in git_state.get("discovered_worktrees") or []
+        if item.get("source") == "git_worktree_list" and item.get("path") and item.get("head")
+    ]
+    worktree_refs = [
+        {"source_ref": f"git_worktree_list:{item['path']}"}
+        for item in current_worktrees
+    ]
+    branch_state = git_state.get("branch_state") or {}
+    branch_current = (
+        branch_state.get("status") == "ok"
+        and branch_state.get("source") == "git_for_each_ref"
+    )
+    branch_refs = (
+        [{"source_ref": "git_for_each_ref:refs/heads"}]
+        if branch_current
+        else []
+    )
     distinction = bool(report.get("causality_currentness_boundary")) and current_scan_complete
     checks = {
         "original_defer_or_preserve_instruction": (instruction_complete, instruction_refs),
         "preservation_evidence": (bool(by_role["private_retention"]), by_role["private_retention"]),
         "later_cleanup_execution_or_non_execution": (bool(later_outcome), later_outcome),
-        "branch_currentness": (bool(branch_refs), branch_refs),
-        "worktree_currentness": (current_scan_complete, []),
+        "branch_currentness": (branch_current, branch_refs),
+        "worktree_currentness": (bool(current_worktrees), worktree_refs),
         "current_state_vs_historical_causality": (distinction, []),
     }
     facets = {
@@ -765,6 +829,20 @@ def _cleanup_facet_coverage(report: dict) -> dict:
         "total_count": len(CLEANUP_REQUIRED_FACETS),
         "complete": proven_count == len(CLEANUP_REQUIRED_FACETS),
     }
+
+
+def _cleanup_record_date(record: dict) -> date | None:
+    for value in (record.get("event_date"), record.get("source_ref"), record.get("snippet")):
+        text = str(value or "")
+        for pattern in (ISO_DATE_RE, COMPACT_DATE_RE):
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                return date(*(int(part) for part in match.groups()))
+            except ValueError:
+                continue
+    return None
 
 
 def _is_cleanup_causality_query(query: str) -> bool:
