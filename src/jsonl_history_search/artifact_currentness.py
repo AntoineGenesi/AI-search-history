@@ -1053,6 +1053,7 @@ def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]
                 {
                     "source_ref": command.get("command"),
                     "source_role": "git_state",
+                    "phase": "current_state_after_chronology_declared_missing",
                     "reason": (
                         f"Run target-bound {command.get('kind')} proof, then stop if the exact "
                         "named target remains absent."
@@ -1065,6 +1066,7 @@ def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]
             {
                 "source_ref": ref.get("source_ref"),
                 "source_role": ref.get("source_role") or "operational_record",
+                "phase": "historical_causality",
                 "relationship": ref.get("relationship"),
                 "reason": f"Inspect {ref.get('relationship')} operational record before worktree commands.",
             }
@@ -1075,6 +1077,7 @@ def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]
                 {
                     "source_ref": item.get("source_ref"),
                     "source_role": item.get("source_role") or "operational_record",
+                    "phase": "historical_causality",
                     "relationship": item.get("relationship"),
                     "reason": f"Inspect {item.get('relationship')} evidence.",
                 }
@@ -1084,6 +1087,7 @@ def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]
             {
                 "source_ref": command.get("command"),
                 "source_role": "git_state" if command.get("kind", "").startswith(("worktree", "git")) else "operational_record",
+                "phase": "current_state_after_chronology",
                 "reason": f"Run {command.get('kind')} for worktree currentness inspection after operational records.",
             }
         )
@@ -1093,6 +1097,7 @@ def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]
                 {
                     "source_ref": command.get("command"),
                     "source_role": "git_state" if command.get("kind", "").startswith(("worktree", "status", "branch", "git")) else "private_retention_evidence",
+                    "phase": "current_state_after_chronology",
                     "reason": f"{item.get('identifier')}: {command.get('kind')}",
                 }
             )

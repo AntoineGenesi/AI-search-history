@@ -123,6 +123,15 @@ CLEANUP_CAUSAL_ROLE_ORDER = (
     "private_retention",
 )
 
+CLEANUP_REQUIRED_FACETS = (
+    "original_defer_or_preserve_instruction",
+    "preservation_evidence",
+    "later_cleanup_execution_or_non_execution",
+    "branch_currentness",
+    "worktree_currentness",
+    "current_state_vs_historical_causality",
+)
+
 EVIDENCE_ROOTS = (
     "codex/state",
     "tasks",
@@ -152,15 +161,16 @@ def is_answer_ready_worktree_cleanup_causality_query(query: str) -> bool:
 
 def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
     named = extract_named_worktree_targets(query)
-    worktrees = _discover_worktrees(cwd)
     evidence_files = _discover_evidence_files(cwd)
     cleanup_causality = _cleanup_causality_report(
         query,
         cwd,
         evidence_files,
-        worktrees,
         named_targets=named,
     )
+    # Historical causality is resolved or declared missing before live Git and
+    # worktree state can be inspected as a separate currentness layer.
+    worktrees = _discover_worktrees(cwd)
     if cleanup_causality.get("is_cleanup_causality_query") and not named:
         selected = _select_cleanup_causality_targets(worktrees, cwd)
     else:
@@ -185,8 +195,8 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         "cleanup_causal_role_order": list(CLEANUP_CAUSAL_ROLE_ORDER),
         "source_role_order": [
             "operational_record",
-            "git_state",
             "private_retention_evidence",
+            "git_state",
             "raw_agent_behavior",
         ],
         "source_roles_present": _source_roles_present(cleanup_causality, items),
@@ -527,7 +537,6 @@ def _cleanup_causality_report(
     query: str,
     cwd: Path,
     evidence_files: list[Path],
-    worktrees: list[dict],
     *,
     named_targets: list[dict],
 ) -> dict:
@@ -537,20 +546,47 @@ def _cleanup_causality_report(
         if causal and not named_targets
         else []
     )
+    original_records = [
+        item
+        for item in operational_records
+        if item.get("source_authority") == "original_role_source"
+    ]
+    if not causal:
+        chronology_status = "not_applicable"
+    elif named_targets:
+        chronology_status = "declared_missing_target_specific_chronology"
+    elif original_records:
+        chronology_status = "original_chronology_found"
+    else:
+        chronology_status = "original_chronology_declared_missing"
     return {
         "is_cleanup_causality_query": causal,
         "debt_status": "unknown",
         "causal_summary": "",
         "operational_records": operational_records,
         "record_count": len(operational_records),
-        "physical_worktree_count": len(worktrees),
+        "physical_worktree_count": 0,
         "named_targets": named_targets,
+        "chronology_gate": {
+            "status": chronology_status,
+            "original_role_source_count": len(original_records),
+            "current_workspace_scan_allowed": bool(causal),
+            "scan_sequence": [
+                "original_cleanup_chronology",
+                "chronology_found_or_declared_missing",
+                "current_workspace_state",
+            ],
+        },
     }
 
 
 def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees: list[dict], cwd: Path) -> dict:
     if not report.get("is_cleanup_causality_query"):
         return report
+    report["physical_worktree_count"] = len(worktrees)
+    chronology_gate = report.get("chronology_gate") or {}
+    chronology_gate["current_workspace_scan"] = "completed_after_chronology_gate"
+    report["chronology_gate"] = chronology_gate
     named_targets = report.get("named_targets") or []
     if named_targets:
         target_values = list(
@@ -590,6 +626,7 @@ def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees:
                 ),
                 "git_state": {
                     "source_role": "git_state",
+                    "evidence_scope": "current_workspace_state_only",
                     "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
                     "classified_targets": [
                         item.get("path") or item.get("identifier") for item in items
@@ -597,6 +634,8 @@ def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees:
                 },
             }
         )
+        report["causality_currentness_boundary"] = _cleanup_causality_currentness_boundary()
+        report["facet_coverage"] = _cleanup_facet_coverage(report)
         return report
     records = report.get("operational_records") or []
     relationships = {item.get("relationship") for item in records}
@@ -641,12 +680,91 @@ def _finish_cleanup_causality_report(report: dict, items: list[dict], worktrees:
             ),
             "git_state": {
                 "source_role": "git_state",
+                "evidence_scope": "current_workspace_state_only",
                 "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
                 "classified_targets": [item.get("path") or item.get("identifier") for item in items],
             },
+            "causality_currentness_boundary": _cleanup_causality_currentness_boundary(),
         }
     )
+    report["facet_coverage"] = _cleanup_facet_coverage(report)
     return report
+
+
+def _cleanup_causality_currentness_boundary() -> dict:
+    return {
+        "historical_causality": (
+            "Derived only from original-role defer/preserve, retention, policy, and later-cleanup records."
+        ),
+        "current_state": (
+            "Derived only after the chronology gate from live Git/worktree and private-artifact inspection."
+        ),
+        "current_state_cannot_establish": (
+            "Present filesystem state alone cannot establish why cleanup was deferred, whether preservation "
+            "occurred, or whether a later cleanup step ran."
+        ),
+    }
+
+
+def _cleanup_facet_coverage(report: dict) -> dict:
+    records = report.get("operational_records") or []
+    original = [
+        item for item in records if item.get("source_authority") == "original_role_source"
+    ]
+    by_role = {
+        role: [item for item in original if item.get("causal_source_role") == role]
+        for role in CLEANUP_CAUSAL_ROLE_ORDER
+    }
+    non_execution = [
+        item
+        for item in original
+        if item.get("relationship") == "report_only_cleanup_audit"
+        and "no worktrees" in _normalize(item.get("snippet", ""))
+    ]
+    later_outcome = by_role["cleanup_execution"] or non_execution
+    branch_refs = [
+        item
+        for item in original
+        if "branch refs retained" in _normalize(item.get("snippet", ""))
+        or "branch refs were removed" in _normalize(item.get("snippet", ""))
+    ]
+    instruction_refs = (
+        by_role["report_only_audit"]
+        + by_role["deferred_handoff"]
+        + by_role["cleanup_learning_policy"]
+    )
+    instruction_complete = all(
+        by_role[role]
+        for role in ("report_only_audit", "deferred_handoff", "cleanup_learning_policy")
+    )
+    chronology_gate = report.get("chronology_gate") or {}
+    current_scan_complete = (
+        chronology_gate.get("current_workspace_scan") == "completed_after_chronology_gate"
+    )
+    distinction = bool(report.get("causality_currentness_boundary")) and current_scan_complete
+    checks = {
+        "original_defer_or_preserve_instruction": (instruction_complete, instruction_refs),
+        "preservation_evidence": (bool(by_role["private_retention"]), by_role["private_retention"]),
+        "later_cleanup_execution_or_non_execution": (bool(later_outcome), later_outcome),
+        "branch_currentness": (bool(branch_refs), branch_refs),
+        "worktree_currentness": (current_scan_complete, []),
+        "current_state_vs_historical_causality": (distinction, []),
+    }
+    facets = {
+        name: {
+            "status": "proven" if proven else "missing",
+            "source_refs": [item.get("source_ref") for item in refs if item.get("source_ref")],
+        }
+        for name, (proven, refs) in checks.items()
+    }
+    proven_count = sum(item["status"] == "proven" for item in facets.values())
+    return {
+        "required_facets": list(CLEANUP_REQUIRED_FACETS),
+        "facets": facets,
+        "proven_count": proven_count,
+        "total_count": len(CLEANUP_REQUIRED_FACETS),
+        "complete": proven_count == len(CLEANUP_REQUIRED_FACETS),
+    }
 
 
 def _is_cleanup_causality_query(query: str) -> bool:
@@ -716,6 +834,9 @@ def _cleanup_operational_relationship(rel: str, line: str) -> str:
             "pre-existing",
             "not audited",
             "branch refs retained",
+            ".private",
+            "private evidence",
+            "preservation evidence",
             "handoff_clean",
             "survivor reason",
         )
@@ -793,6 +914,10 @@ def _cleanup_source_authority(rel: str, causal_source_role: str) -> str:
         causal_source_role == "cleanup_learning_policy" and lowered.startswith("docs/")
     ) or (
         causal_source_role == "cleanup_execution" and lowered.startswith("reports/stale-worktree-cleanup")
+    ) or (
+        causal_source_role == "private_retention"
+        and lowered.startswith("reports/")
+        and ("audit" in lowered or "stale-worktree-cleanup" in lowered)
     )
     return "original_role_source" if original else "consolidated_or_derived_context"
 
