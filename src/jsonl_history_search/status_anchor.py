@@ -7282,8 +7282,15 @@ def _next_reads(
                 target_window,
             )
         _copy_openable_fields(read, selected_anchor)
-        if read.get("openable_target") and not read.get("read_more_command"):
-            read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+        if read.get("openable_target"):
+            read["read_more_command"] = _read_more_command(
+                str(read["openable_target"]),
+                cwd=cwd,
+                codex_home=codex_home,
+                mode="record",
+                output_format="text",
+            )
+            read["primary_record_only"] = True
         reads.append(read)
     boundary_read = _prior_request_boundary_read(status_as_of_boundary, cwd=cwd, codex_home=codex_home)
     if boundary_read:
@@ -7404,8 +7411,15 @@ def _prior_request_boundary_read(status_as_of_boundary: dict | None, *, cwd: Pat
         "logical_message_id": status_as_of_boundary.get("logical_message_id"),
     }
     _copy_openable_fields(read, status_as_of_boundary)
-    if read.get("openable_target") and not read.get("read_more_command"):
-        read["read_more_command"] = _read_more_command(str(read["openable_target"]), cwd=cwd, codex_home=codex_home)
+    if read.get("openable_target"):
+        read["read_more_command"] = _read_more_command(
+            str(read["openable_target"]),
+            cwd=cwd,
+            codex_home=codex_home,
+            mode="record",
+            output_format="text",
+        )
+        read["primary_record_only"] = True
     return read
 
 
@@ -8350,7 +8364,14 @@ def _with_read_more_command(anchor: dict | None, *, cwd: Path, codex_home: Path 
     target = selected.get("openable_target")
     if target:
         selected["openable_target"] = str(target)
-        selected["read_more_command"] = _read_more_command(str(target), cwd=cwd, codex_home=codex_home)
+        selected["read_more_command"] = _read_more_command(
+            str(target),
+            cwd=cwd,
+            codex_home=codex_home,
+            mode="record",
+            output_format="text",
+        )
+        selected["primary_record_only"] = True
     return selected
 
 
@@ -8506,6 +8527,7 @@ def _read_more_command(
     codex_home: Path | None,
     before: int = 2,
     after: int = 8,
+    mode: str = "window",
     output_format: str = "json",
 ) -> str:
     parts = [
@@ -8517,9 +8539,9 @@ def _read_more_command(
     ]
     if codex_home is not None:
         parts.extend(["--codex-home", str(codex_home)])
-    parts.extend(
-        ["--format", output_format, "--mode", "window", "--before", str(before), "--after", str(after)]
-    )
+    parts.extend(["--format", output_format, "--mode", mode])
+    if mode == "window":
+        parts.extend(["--before", str(before), "--after", str(after)])
     return " ".join(shlex.quote(part) for part in parts)
 
 

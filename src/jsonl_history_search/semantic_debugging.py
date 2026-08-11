@@ -829,6 +829,10 @@ def build_semantic_debug_payload(
             next_reads,
             query=agent_find["query"]["original"],
         )
+    next_reads = demote_discussion_memory_runtime_echo_reads(
+        next_reads,
+        route_family=str(family.get("primary") or "semantic_debug"),
+    )
     core_convo_first_read_plan = build_core_convo_first_read_plan(
         target_reads=dedupe_dicts(
             list(action_proof_plan.get("primary_proof_refs") or [])
@@ -12429,6 +12433,55 @@ def build_core_convo_first_read_plan(
     }
 
 
+DISCUSSION_MEMORY_RUNTIME_ECHO_DEMOTION_FAMILIES = {
+    "remembered_instruction",
+    "remembered_topic",
+    "why_did_this_happen",
+    "long_range_history",
+}
+
+
+def demote_discussion_memory_runtime_echo_reads(
+    reads: list[dict[str, Any]],
+    *,
+    route_family: str | None,
+) -> list[dict[str, Any]]:
+    if route_family not in DISCUSSION_MEMORY_RUNTIME_ECHO_DEMOTION_FAMILIES:
+        return reads
+    demoted_reads: list[dict[str, Any]] = []
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+        metadata = read.get("record_metadata") if isinstance(read.get("record_metadata"), dict) else {}
+        conversation_label = str(metadata.get("conversation_label") or "").casefold()
+        top_role = str(metadata.get("top_role") or metadata.get("message_role") or "").casefold()
+        is_runtime_echo = (
+            metadata.get("is_user_authored") is False
+            and (
+                conversation_label in {"tool_or_runtime_record", "tool_event"}
+                or any(token in top_role for token in ("tool", "call", "output", "command"))
+            )
+        )
+        if not is_runtime_echo:
+            demoted_reads.append(read)
+            continue
+        row = dict(read)
+        row["target_source_role"] = "diagnostic_or_post_hoc"
+        row["diagnostic_only"] = True
+        row["read_more_actionable"] = False
+        row["followthrough_actionable"] = False
+        row["final_support_allowed"] = False
+        row["diagnostic_open_policy"] = (
+            "discussion-memory route: tool/runtime echoes are diagnostics only; "
+            "open only for a named action-proof gap"
+        )
+        row["demotion_reason"] = "discussion_memory_runtime_echo_not_primary_source"
+        row.pop("expansion_actions", None)
+        row.pop("context_actions", None)
+        demoted_reads.append(row)
+    return demoted_reads
+
+
 EXPECTATION_MISMATCH_READ_ORDER = [
     "expected_behavior_evidence",
     "observed_behavior_or_action_proof",
@@ -14304,6 +14357,7 @@ def build_next_reads(
                 "candidate_id": str(candidate.get("candidate_id") or ""),
                 "source_ref": dict(ref),
                 "reason": "confirm candidate snippet in source context",
+                "record_metadata": candidate_record_metadata(candidate),
                 "expansion_actions": read_more_actions_for_source_ref(
                     ref,
                     candidate_id=str(candidate.get("candidate_id") or ""),
@@ -14327,6 +14381,12 @@ def build_next_reads(
                     "target": target,
                     "source_ref": dict(ref),
                     "reason": "confirm structured action proof",
+                    "record_metadata": {
+                        "conversation_label": "tool_event",
+                        "conversation_confidence": "high",
+                        "is_user_authored": False,
+                        "top_role": event.get("role"),
+                    },
                     "expansion_actions": read_more_actions_for_source_ref(
                         ref,
                         expansion_action_context=expansion_action_context,
@@ -14494,6 +14554,30 @@ def correction_window_source_next_reads(
         if read["target"]:
             reads.append(read)
     return reads
+
+
+def candidate_record_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
+    role = str(candidate.get("role") or "").casefold()
+    is_user = role in {"user", "human", HUMAN_AUTHORED_USER_MESSAGE}
+    if not role:
+        label = "unknown"
+    elif is_user:
+        label = "user_message"
+    elif any(token in role for token in ("tool", "call", "output", "patch", "command")):
+        label = "tool_or_runtime_record"
+    elif any(token in role for token in ("assistant", "agent")):
+        label = "assistant_message"
+    elif "session_meta" in role or "reasoning" in role:
+        label = "session_or_reasoning_metadata"
+    else:
+        label = role
+    return {
+        "conversation_label": label,
+        "conversation_confidence": "high" if role else "unknown",
+        "is_user_authored": is_user,
+        "top_role": candidate.get("role"),
+        "message_role": candidate.get("role"),
+    }
 
 
 def correction_window_source_selection_wanted(query: str) -> bool:

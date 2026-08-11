@@ -21,4 +21,4 @@ For broad/pre-compaction history, run its target-preserving continuation first;
 if absent, return a searched-scope/missing-facet fail-closed packet without a user question.
 
 Method packets: `required_surfaces`/`read_order`; raw refs before artifacts.
-Continue only for named gaps/caps/omissions/contradictions.
+Continue only for named gaps/caps/omissions.

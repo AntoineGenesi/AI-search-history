@@ -5481,6 +5481,121 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
     }
 
 
+def _remembered_instruction_user_authored_reads(contract: dict) -> list[dict]:
+    reads: list[dict] = []
+    for item in contract.get("read") or []:
+        if not isinstance(item, dict):
+            continue
+        if not _remembered_user_wording_recovery_ref_allowed(item):
+            continue
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        role_values = {
+            str(metadata.get("top_role") or "").casefold(),
+            str(metadata.get("message_role") or "").casefold(),
+            str(item.get("role") or "").casefold(),
+        }
+        if metadata.get("is_user_authored") is True or role_values.intersection(
+            {"user", "human", "human_authored_user_message"}
+        ):
+            reads.append(_conversation_message_record_read(item))
+    return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
+
+
+def _remembered_instruction_diagnostic_reads(contract: dict) -> list[dict]:
+    diagnostics = list(contract.get("diagnostics_after") or [])
+    for item in contract.get("read") or []:
+        if not isinstance(item, dict):
+            continue
+        if _remembered_instruction_user_authored_reads({"read": [item]}):
+            continue
+        diagnostic = dict(item)
+        diagnostic["diagnostic_only"] = True
+        diagnostic["read_more_actionable"] = False
+        diagnostic["followthrough_actionable"] = False
+        diagnostic["final_support_allowed"] = False
+        diagnostic["diagnostic_open_policy"] = (
+            "not user-authored remembered-instruction proof; do not open by default"
+        )
+        diagnostics.append(diagnostic)
+    return _dedupe_action_contract_rows(diagnostics)[:_ASK_ANSWER_MAX_REFS]
+
+
+def _conversation_message_record_read(item: dict) -> dict:
+    read = dict(item)
+    record_action = next(
+        (
+            action
+            for action in read.get("expansion_actions") or []
+            if isinstance(action, dict) and action.get("mode") == "record" and action.get("command")
+        ),
+        None,
+    )
+    target = str(read.get("target") or "")
+    command = record_action.get("command") if record_action else None
+    if not command and target:
+        command = (
+            f"jsonl-history-search read-more {shlex.quote(target)} "
+            '--mode record --cwd "$PWD" --format text'
+        )
+    if command:
+        read["command"] = command
+        read["primary_record_only"] = True
+    return read
+
+
+def _long_range_history_message_reads(contract: dict) -> list[dict]:
+    allowed_roles = {
+        "user",
+        "human",
+        "human_authored_user_message",
+        "assistant",
+        "agent",
+        "assistant_or_agent_message",
+        "agent_message",
+    }
+    reads: list[dict] = []
+    for item in contract.get("read") or []:
+        if not isinstance(item, dict) or not _remembered_user_wording_recovery_ref_allowed(item):
+            continue
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        roles = {
+            str(metadata.get("top_role") or "").casefold(),
+            str(metadata.get("message_role") or "").casefold(),
+            str(item.get("role") or "").casefold(),
+        }
+        label = str(metadata.get("conversation_label") or "").casefold()
+        if label in {"user_message", "assistant_message"} or roles.intersection(allowed_roles):
+            reads.append(_conversation_message_record_read(item))
+    return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
+
+
+def _long_range_history_diagnostic_reads(contract: dict, clean_reads: list[dict]) -> list[dict]:
+    clean_targets = {
+        str(item.get("target") or item.get("command") or "") for item in clean_reads
+    }
+    diagnostics = list(contract.get("diagnostics_after") or [])
+    for item in contract.get("read") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("target") or item.get("command") or "") in clean_targets:
+            continue
+        diagnostic = dict(item)
+        diagnostic.update(
+            {
+                "diagnostic_only": True,
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "final_support_allowed": False,
+                "diagnostic_open_policy": (
+                    "tool/runtime/session metadata is not default old-context decision proof"
+                ),
+            }
+        )
+        diagnostic.pop("command", None)
+        diagnostics.append(diagnostic)
+    return _dedupe_action_contract_rows(diagnostics)[:_ASK_ANSWER_MAX_REFS]
+
+
 def _continuation_first_history_contract(*, compact: dict, selected_route: dict) -> dict:
     route_family = str(selected_route.get("route_family") or "")
     handoff = compact.get("answer_ready_handoff") or {}
@@ -6398,7 +6513,37 @@ def _answer_action_contract_from_executed_output(
             contract["diagnostics_after"] = []
             contract["stop"] = provenance_handoff.get("stop_instruction") or contract["stop"]
             contract.pop("only_continue_if", None)
+        if route_family == "long_range_history":
+            message_reads = _long_range_history_message_reads(contract)
+            contract["diagnostics_after"] = _long_range_history_diagnostic_reads(
+                contract, message_reads
+            )
+            contract["read"] = message_reads
+            contract["source_inspection_boundary"] = {
+                "decision": (
+                    "answer_after_conversation_message_inspection"
+                    if message_reads
+                    else "fail_closed_missing_conversation_message"
+                ),
+                "inspect_required_primary_proof_before_answer": True,
+                "required_primary_proof_source": "user_or_assistant_history_record",
+                "tool_runtime_session_echoes_default_final_support": False,
+                "diagnostics_default_final_support": False,
+            }
+            if not message_reads:
+                contract["answer_status"] = "fail-closed/missing-primary-history"
+                contract["promotion_status"] = "long_range_history_message_source_missing"
+                contract["promotion_reason"] = (
+                    "The old-context route surfaced only tool/runtime/session rows. They remain "
+                    "diagnostic and are not default reads for a remembered decision."
+                )
+                contract["stop"] = (
+                    "Return the searched-scope/missing-primary-history boundary without opening "
+                    "tool/runtime/session diagnostics or substituting task/report artifacts."
+                )
+                contract.pop("only_continue_if", None)
         if route_family == "remembered_instruction":
+            remembered_user_reads = _remembered_instruction_user_authored_reads(contract)
             contract["receiving_agent_workflow"] = {
                 "mode": "history_answer_only",
                 "answer_or_continue": (
@@ -6414,6 +6559,43 @@ def _answer_action_contract_from_executed_output(
                 ],
             }
             contract["stop"] = selected_route.get("stop_guidance")
+            if remembered_user_reads:
+                contract["read"] = remembered_user_reads
+                contract["diagnostics_after"] = _remembered_instruction_diagnostic_reads(contract)
+                contract["source_inspection_boundary"] = {
+                    "decision": "answer_after_user_authored_source_inspection",
+                    "inspect_required_primary_proof_before_answer": True,
+                    "required_primary_proof_source": "user_authored_history_row",
+                    "assistant_tool_current_or_prior_answer_echoes_default_final_support": False,
+                    "diagnostics_default_final_support": False,
+                }
+            else:
+                diagnostic_reads = _remembered_instruction_diagnostic_reads(contract)
+                contract["answer_status"] = "not-ready/missing-user-authored-remembered-instruction"
+                contract["promotion_status"] = "remembered_instruction_user_authored_source_missing"
+                contract["promotion_reason"] = (
+                    "The remembered-instruction route did not surface a clean user-authored history row. "
+                    "Assistant/tool/current-loop/prior-answer echoes are diagnostics only and must not be "
+                    "opened as the default answer contract."
+                )
+                contract["read"] = []
+                contract["diagnostics_after"] = diagnostic_reads
+                contract["missing_evidence_stop_contract"] = {
+                    "answer_allowed": False,
+                    "ask_user_now": False,
+                    "missing_primary_evidence": "user-authored conversation-history row for the remembered constraint",
+                    "secondary_substitution_allowed": False,
+                    "diagnostic_surfaces": [
+                        "assistant/tool/runtime echoes",
+                        "benchmark prompts or prior lane outputs",
+                        "task/report/review artifacts",
+                        "current workspace state",
+                    ],
+                    "next_allowed_action": (
+                        "Use only an emitted bounded JSONL continuation or a user-role constrained history search; "
+                        "do not implement from the recovered imperative text."
+                    ),
+                }
         return contract
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
@@ -10863,17 +11045,141 @@ def _ask_answer_from_execute(
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
     if not usable:
+        if route_family in {"remembered_user_wording", "remembered_topic"}:
+            remembered_recovery_contract_key = (
+                "remembered_topic_causal_user_instruction_recovery"
+                if route_family == "remembered_topic"
+                else "remembered_user_wording_recovery"
+            )
+            if route_family == "remembered_topic":
+                latest_recovery = _recover_remembered_topic_causal_instruction_from_latest_user_messages(
+                    query=str(report.get("query") or ""),
+                    config=remembered_user_latest_recovery,
+                    cwd=cwd,
+                )
+                latest_opened = [
+                    item
+                    for item in latest_recovery.get("opened") or []
+                    if _remembered_topic_causal_opened_supports_answer(
+                        query=str(report.get("query") or ""),
+                        item=item,
+                    )
+                ]
+            else:
+                latest_recovery = _recover_remembered_user_wording_from_latest_user_messages(
+                    query=str(report.get("query") or ""),
+                    config=remembered_user_latest_recovery,
+                    cwd=cwd,
+                )
+                latest_opened = list(latest_recovery.get("opened") or [])
+            if latest_opened:
+                answer["source_contract"][remembered_recovery_contract_key] = {
+                    "schema_version": 1,
+                    "status": "clean_user_proof_recovered_from_bounded_user_message_scan",
+                    "searched_scope": latest_recovery.get("searched_scope"),
+                    "searched_files": latest_recovery.get("searched_files"),
+                    "candidate_user_message_count": latest_recovery.get("candidate_user_message_count"),
+                    "matched_user_message_count": latest_recovery.get("matched_user_message_count"),
+                    "rejected_prompt_echo_ref_count": latest_recovery.get("rejected_prompt_echo_ref_count"),
+                    "prior_packet_recovery_status": "no_usable_primary_refs_exposed",
+                }
+                usable = latest_opened
+            else:
+                diagnostic_opened = _remembered_user_wording_rejected_diagnostic_opened(
+                    report=report,
+                    action=action,
+                    cwd=cwd,
+                )
+                return _ask_answer_fail_closed(
+                    answer,
+                    "opened remembered-user-wording proof refs did not include user-authored JSONL message rows",
+                    {
+                        "required_next_proof": "raw user-authored message ref",
+                        "suggested_action": (
+                            "rerun or inspect remembered-user-wording proof with a role/user-message constraint; "
+                            "already surfaced target reads did not yield clean user-authored non-echo proof"
+                        ),
+                        "bounded_recovery": {
+                            "status": "no_usable_primary_refs_exposed",
+                            "searched_ref_count": 0,
+                            "opened_ref_count": 0,
+                            "rejected_prompt_echo_ref_count": 0,
+                            "rejected_non_user_ref_count": 0,
+                        },
+                        "user_message_recovery": _remembered_user_latest_recovery_public(latest_recovery),
+                        "opened_ref_metadata": [
+                            _ref_public_summary(item)
+                            for item in (opened or diagnostic_opened)
+                            if item.get("status") == "opened"
+                        ],
+                    },
+                )
+        if route_family == "expectation_mismatch":
+            expectation_gate = _expectation_mismatch_answer_proof_gate(
+                action=action,
+                opened=opened,
+                query=str(report.get("query") or ""),
+            )
+            if not expectation_gate.get("rejected_ref_count"):
+                plan = (
+                    action.get("expectation_mismatch_plan")
+                    if isinstance(action.get("expectation_mismatch_plan"), dict)
+                    else {}
+                )
+                rejected = [
+                    item
+                    for item in (
+                        list(plan.get("diagnostic_or_post_hoc") or [])
+                        + list(action.get("read") or [])
+                    )
+                    if isinstance(item, dict)
+                ]
+                if rejected:
+                    expectation_gate["rejected_refs"] = [
+                        {
+                            **_ref_public_summary(item),
+                            "rejected_source_role": (
+                                "tool_output"
+                                if any(
+                                    marker
+                                    in " ".join(
+                                        [
+                                            str(item.get("kind") or ""),
+                                            str(item.get("record_metadata") or ""),
+                                            str(item.get("target") or ""),
+                                        ]
+                                    ).casefold()
+                                    for marker in ("tool", "function_call_output", "custom_tool_call_output")
+                                )
+                                else "diagnostic_or_non_actionable"
+                            ),
+                        }
+                        for item in rejected[:_ASK_ANSWER_MAX_REFS]
+                    ]
+                    expectation_gate["rejected_ref_count"] = len(rejected)
+                    expectation_gate["rejected_source_roles"] = _unique_preserving_order(
+                        item["rejected_source_role"] for item in expectation_gate["rejected_refs"]
+                    )
+            answer["source_contract"]["expectation_mismatch_answer_gate"] = (
+                _expectation_mismatch_gate_public_contract(expectation_gate)
+            )
+            return _ask_answer_fail_closed(
+                answer,
+                "expectation-mismatch proof facets missing or only diagnostic/tool-output/task-doc evidence was opened",
+                expectation_gate,
+            )
         if work_episode and work_episode.get("status") != "not_applicable":
             return _ask_answer_fail_closed(
                 answer,
                 "work episode resolver did not find readable primary behavior proof for the query episode",
                 _work_episode_next_proof_step(work_episode, action),
             )
-        return _ask_answer_fail_closed(
-            answer,
-            "answer contract did not expose readable local proof refs",
-            _next_proof_step_from_action(action),
-        )
+        if not usable:
+            return _ask_answer_fail_closed(
+                answer,
+                "answer contract did not expose readable local proof refs",
+                _next_proof_step_from_action(action),
+            )
 
     answer_opened = usable
     if route_family in {"remembered_user_wording", "remembered_topic"}:
@@ -15509,6 +15815,42 @@ def _recover_remembered_user_wording_clean_opened(
         "rejected_prompt_echo_refs": rejected_echo[:_ASK_ANSWER_MAX_REFS],
         "rejected_non_user_refs": rejected_non_user[:_ASK_ANSWER_MAX_REFS],
     }
+
+
+def _remembered_user_wording_rejected_diagnostic_opened(
+    *,
+    report: dict,
+    action: dict,
+    cwd: Path,
+) -> list[dict]:
+    refs: list[dict] = []
+
+    def add_group(group: object) -> None:
+        for item in group if isinstance(group, list) else []:
+            if isinstance(item, dict):
+                refs.append(item)
+
+    compact = report.get("executed_output") if isinstance(report.get("executed_output"), dict) else {}
+    core_plan = compact.get("core_convo_first_read_plan") if isinstance(compact.get("core_convo_first_read_plan"), dict) else {}
+    locator = compact.get("source_locator_handoff") if isinstance(compact.get("source_locator_handoff"), dict) else {}
+    add_group(action.get("read"))
+    add_group(action.get("diagnostics_after"))
+    add_group(locator.get("next_reads"))
+    add_group(core_plan.get("read"))
+    add_group(core_plan.get("diagnostics_after"))
+    add_group(compact.get("next_reads"))
+    diagnostic_refs = [
+        ref
+        for ref in _dedupe_ask_answer_proof_refs(refs)
+        if ref.get("diagnostic_only") is True
+        or ref.get("target_source_role") == "diagnostic_or_post_hoc"
+        or ref.get("final_support_allowed") is False
+    ]
+    return [
+        item
+        for item in _open_ask_answer_proof_refs(diagnostic_refs, cwd=cwd)
+        if item.get("status") == "opened" and item.get("summary")
+    ]
 
 
 def _recover_remembered_user_wording_from_latest_user_messages(

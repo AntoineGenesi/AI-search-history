@@ -1,5 +1,7 @@
 # Action Proof
 
+Tool calls/outputs, diffs, commits, tests can prove actions when tied to the same episode.
+
 ## Chronology Gate
 
 Open an independently identified original raw/session/tool source first.

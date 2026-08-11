@@ -5495,6 +5495,7 @@ def render_status_anchor_answer(payload: dict) -> str:
     lines = [
         "ANSWER READY",
         "answer_ready=true",
+        "terminal_answer_and_stop=true",
         (
             "Selected parent history row: "
             f"{selected.get('timestamp_utc')} {selected.get('source_ref')} "

@@ -12,7 +12,7 @@ Use this alias only for explicit local conversation-history retrieval.
 ## First Move
 
 For a parent/main latest-message ask paired with an explicit alias, remove only
-the alias, preserve parent scope with `--parent-thread`, and run the matching
+the alias, preserve parent/main-thread variants with `--parent-thread`, and run the matching
 `what-happened-since` command before repo search,
 `which/command -v`, `convo --help`, connector discovery, plugin install, Git,
 or visible-context synthesis:
