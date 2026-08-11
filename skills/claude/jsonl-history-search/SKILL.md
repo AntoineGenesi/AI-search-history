@@ -29,9 +29,8 @@ intent -> `--evidence-source local`; conversation/source-session intent ->
 "Do you want current local Git/task evidence or prior conversation history?"
 and use zero tools.
 
-Resolve before asking: after named-task scope, search once before asking the
-user to repeat prior conversation; ask only if
-absent/capped/ambiguous/unavailable result.
+Resolve before asking: search once after named-task scope; ask only on
+absent/capped/ambiguous/unavailable.
 
 Start exactly one installed route before repo search, Git, or visible-context synthesis.
 Latest-message aliases, including parent/main wording, use `what-happened-since`;
@@ -52,6 +51,9 @@ jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 
 Blank/unset query fails closed; use original wording.
 
+Action/provenance: inline `--query-origin original`; summary
+`--query-origin summary --original-query-file <prompt-file>` (hash).
+
 Wait for that command to exit. While it is running, do not start another `ask`,
 direct `semantic-debug`, or source-checkout
 fallback. Interrupt/no packet: report liveness failure; last stderr
@@ -69,8 +71,7 @@ If neither command is available, report the installation failure.
 
 ## Follow The Route
 
-After `ask --execute`, follow `method_selection_packet`
-(`required_surfaces`, `read_order`,
+After `ask --execute`, obey `method_selection_packet` (`required_surfaces`, `read_order`,
 `secondary_policy`, `stop_rule`, `continue_only_if`,
 `cap_language_required`, `single_flight_policy`). Do not rerun `ask` or
 direct `semantic-debug`. Read one matching file under `references/`:
@@ -88,8 +89,7 @@ direct `semantic-debug`. Read one matching file under `references/`:
 ## Source And Stop Rules
 
 1. Treat CLI summaries as navigation, not as primary proof. Use its selected refs/
-   `source_locator_handoff`/`next_reads`; `terminal_answer_and_stop`: answer
-   searched scope; run no command.
+   `source_locator_handoff`/`next_reads`; obey `terminal_answer_and_stop`.
 2. Use the emitted command or open:
 
    ```bash
@@ -98,10 +98,10 @@ direct `semantic-debug`. Read one matching file under `references/`:
 
 3. Prefer original user turns; tool evidence proves actions.
 4. Exact screenshot/OCR/source phrases: use `bulk-line-match` with
-   `--phrase`/`--phrases-file`; validate with the emitted continuation.
+   `--phrase`/`--phrases-file`; validate its continuation.
 5. `not_found_in_searched_scope` is searched-scope only.
 6. Stop when inspected primary sources answer the question. Widen for a
    named gap. On absent/capped/ambiguous/failure, follow an emitted continuation
    or fail closed; never `sed`/`rg`/`jq` transcript homes.
-7. Keep audit caveats; ordinary prompts and status/local questions stay quick.
+7. ordinary prompts and status/local questions stay quick.
 8. Never modify, delete, publish, or upload conversation data.

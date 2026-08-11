@@ -522,6 +522,31 @@ def render_retained_source_read_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _original_prompt_identity_lines(identity: dict, *, markdown: bool) -> list[str]:
+    if not identity:
+        return []
+    source = identity.get("original_prompt_source") or {}
+    status = identity.get("status")
+    satisfied = str(bool(identity.get("original_wording_contract_satisfied"))).lower()
+    source_ref = source.get("source_reference") or source.get("kind")
+    byte_count = source.get("byte_count")
+    sha256 = source.get("sha256")
+    reread_required = str(bool(identity.get("identity_audit_read_required"))).lower()
+    if markdown:
+        return [
+            f"- Original prompt identity: `{status}`",
+            f"- Original wording contract satisfied: `{satisfied}`",
+            f"- Original prompt source: `{source_ref}` bytes=`{byte_count}` sha256=`{sha256}`",
+            f"- Original prompt reread required: `{reread_required}`",
+        ]
+    return [
+        f"Original prompt identity: {status}",
+        f"Original wording contract satisfied: {satisfied}",
+        f"Original prompt source: {source_ref} bytes={byte_count} sha256={sha256}",
+        f"Original prompt reread required: {reread_required}",
+    ]
+
+
 def render_ask_router_text(payload: dict) -> str:
     report = payload["ask_router"]
     resolution = report.get("command_resolution") or {}
@@ -538,6 +563,7 @@ def render_ask_router_text(payload: dict) -> str:
         f"Why: {report.get('why_it_applies')}",
         f"Read: {report.get('read_specialization')}",
     ]
+    lines.extend(_original_prompt_identity_lines(report.get("original_prompt_identity") or {}, markdown=False))
     if resolution.get("mode") != "not_applicable":
         lines.extend(
             [
@@ -719,6 +745,7 @@ def render_ask_execute_text(payload: dict) -> str:
         f"Execution status: {execution.get('status')}",
         f"Command family: {execution.get('command_family') or '(unsupported)'}",
     ]
+    lines.extend(_original_prompt_identity_lines(report.get("original_prompt_identity") or {}, markdown=False))
     if single_flight:
         lines.append(
             "Route already executed: selected semantic-debug route completed by ask --execute; "
@@ -878,6 +905,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
         f"- Execution status: `{execution.get('status')}`",
         f"- Command family: `{execution.get('command_family') or '(unsupported)'}`",
     ]
+    lines.extend(_original_prompt_identity_lines(report.get("original_prompt_identity") or {}, markdown=True))
     if single_flight:
         lines.append(
             "- Route already executed: selected `semantic-debug` route completed by `ask --execute`; "
@@ -1770,6 +1798,7 @@ def render_ask_router_markdown(payload: dict) -> str:
         f"- Why: {report.get('why_it_applies')}",
         f"- Read: `{report.get('read_specialization')}`",
     ]
+    lines.extend(_original_prompt_identity_lines(report.get("original_prompt_identity") or {}, markdown=True))
     if resolution.get("mode") != "not_applicable":
         lines.extend(
             [

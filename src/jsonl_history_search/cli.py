@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -300,7 +301,7 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             "action/currentness/wrap-up prompts. It does not produce final answers."
         ),
     )
-    ask.add_argument("query", help="User wording to classify into a JSONL first route.")
+    ask.add_argument("query", help="Original user wording, or a summary paired with --original-query-file.")
     add_common_args(ask)
     ask.add_argument(
         "--evidence-source",
@@ -338,6 +339,23 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         help=(
             "Execute the selected route only when it is an allow-listed JSONL "
             "semantic-debug or no-evidence route; unsupported routes return a fail-closed contract."
+        ),
+    )
+    ask.add_argument(
+        "--query-origin",
+        choices=("original", "summary"),
+        default=None,
+        help=(
+            "Declare whether the positional query is exact original wording or a retrieval summary. "
+            "summary requires --original-query-file or the free-running prompt-file environment contract."
+        ),
+    )
+    ask.add_argument(
+        "--original-query-file",
+        default=None,
+        help=(
+            "UTF-8 file containing the exact original prompt. Its canonical path, byte count, and "
+            "SHA-256 are recorded without copying its contents into the route report."
         ),
     )
     ask.add_argument(
@@ -2288,6 +2306,7 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         "ask_execute": {
             "schema_version": "ask_execute_route_fusion.v1",
             "query": args.query,
+            "original_prompt_identity": args.original_prompt_identity,
             "cwd": cwd,
             "selected_route": selected_route,
             "execution_status": "unsupported_route",
@@ -18415,6 +18434,76 @@ def discovery_payload_from_args(args: argparse.Namespace) -> dict:
     return build_jsonl_candidate_discovery(plan, explicit_roots_provided=True)
 
 
+def _resolve_ask_original_prompt_identity(args: argparse.Namespace) -> dict:
+    query = str(args.query or "")
+    query_bytes = query.encode("utf-8")
+    explicit_source_path = getattr(args, "original_query_file", None)
+    environment_source_path = os.environ.get("JSONL_HISTORY_SEARCH_ORIGINAL_PROMPT_FILE")
+    source_path_value = explicit_source_path or environment_source_path
+    declared_query_origin = getattr(args, "query_origin", None)
+
+    if declared_query_origin == "summary" and not source_path_value:
+        raise ValueError(
+            "--query-origin summary requires --original-query-file PATH; "
+            "a summarized query cannot stand in for the original prompt"
+        )
+
+    if source_path_value:
+        source_path = Path(source_path_value).expanduser().resolve()
+        original_bytes = source_path.read_bytes()
+        original_text = original_bytes.decode("utf-8")
+        if not original_text.strip():
+            raise ValueError("--original-query-file must contain nonblank UTF-8 prompt text")
+        matches_query = original_bytes == query_bytes
+        if declared_query_origin == "original" and not matches_query:
+            raise ValueError(
+                "query declared original does not exactly match --original-query-file; "
+                "use --query-origin summary for a retrieval summary"
+            )
+        query_origin = declared_query_origin or ("original" if matches_query else "summary")
+        digest = hashlib.sha256(original_bytes).hexdigest()
+        source = {
+            "kind": "original_query_file",
+            "path": str(source_path),
+            "byte_count": len(original_bytes),
+            "sha256": digest,
+            "source_reference": f"sha256:{digest}",
+            "attachment_method": (
+                "explicit_cli" if explicit_source_path else "free_running_prompt_environment"
+            ),
+            "content_included_in_route": False,
+        }
+        status = "original_file_exact_match" if matches_query else "summary_with_original_file"
+    else:
+        query_origin = declared_query_origin or "undeclared"
+        matches_query = True if declared_query_origin == "original" else None
+        digest = hashlib.sha256(query_bytes).hexdigest()
+        source = {
+            "kind": "inline_query",
+            "path": None,
+            "byte_count": len(query_bytes),
+            "sha256": digest,
+            "source_reference": f"sha256:{digest}",
+            "attachment_method": "inline_query",
+            "content_included_in_route": True,
+        }
+        status = "original_inline" if declared_query_origin == "original" else "inline_origin_undeclared"
+
+    return {
+        "schema_version": "ask_original_prompt_identity.v1",
+        "status": status,
+        "original_wording_contract_satisfied": status != "inline_origin_undeclared",
+        "query_origin": query_origin,
+        "query_origin_declaration": "explicit" if declared_query_origin else "inferred",
+        "query_matches_original_prompt": matches_query,
+        "original_prompt_source": source,
+        "identity_audit_read_required": False,
+        "identity_audit_read_policy": (
+            "Do not reopen the original prompt file after routing unless its recorded identity is disputed."
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv == ["--help-internal"]:
@@ -18428,6 +18517,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
+        try:
+            args.original_prompt_identity = _resolve_ask_original_prompt_identity(args)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"ask original prompt identity error: {exc}", file=sys.stderr)
+            return 2
         if not args.query.strip():
             print(
                 "ask requires the original user wording; retry: "
@@ -18444,6 +18538,7 @@ def main(argv: list[str] | None = None) -> int:
             activation_mode=args.activation_mode,
             audit_depth=args.audit_depth,
         )
+        payload["ask_router"]["original_prompt_identity"] = args.original_prompt_identity
         auto_execute_bounded = (
             args.auto_execute_bounded_no_evidence
             and payload["ask_router"].get("route_family") == "bounded_no_evidence"
