@@ -291,7 +291,7 @@ def apply_deep_audit_find_target_contract(
         and query.get("role") == "user"
         and set(query_terms) == set(requested_terms)
     )
-    eligible_candidate_ids = []
+    eligible_candidate_ids: list[str] = []
     for candidate in agent_find.get("find_candidates") or []:
         haystack = " ".join(
             [
@@ -306,7 +306,9 @@ def apply_deep_audit_find_target_contract(
             "eligible_as_final_audit_evidence": False,
         }
         if candidate["deep_audit_target_match"]["eligible_as_prompt_history_lead"]:
-            eligible_candidate_ids.append(candidate.get("candidate_id"))
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if candidate_id:
+                eligible_candidate_ids.append(candidate_id)
     agent_find["deep_audit_target_continuation"] = {
         "schema_version": 1,
         "status": "target_contract_enforced" if query_enforced else "target_contract_mismatch",
@@ -327,6 +329,14 @@ def apply_deep_audit_find_target_contract(
         "Continue only with the preserved target contract and its requested failure-class terms."
     ]
     if query_enforced:
+        handoff = agent_find.get("source_locator_handoff")
+        if isinstance(handoff, dict):
+            eligible_candidate_id_set = set(eligible_candidate_ids)
+            handoff["next_reads"] = [
+                read
+                for read in handoff.get("next_reads") or []
+                if str(read.get("candidate_id") or "") in eligible_candidate_id_set
+            ]
         return
     agent_find["status"] = "failed_closed_target_contract_mismatch"
     agent_find["find_candidates"] = []
