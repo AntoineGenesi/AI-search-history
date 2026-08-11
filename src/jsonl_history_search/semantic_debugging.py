@@ -13534,15 +13534,25 @@ def action_proof_read_has_original_source_provenance(read: dict[str, Any]) -> bo
         return False
     if reviewed_source_packet_pointer_read(read):
         return True
+    action_selection = (
+        read.get("action_proof_source_selection")
+        if isinstance(read.get("action_proof_source_selection"), dict)
+        else {}
+    )
     selection = (
         read.get("historical_provenance_selection")
         if isinstance(read.get("historical_provenance_selection"), dict)
         else {}
     )
     return bool(
-        str(selection.get("source_chronology_role") or "").startswith(
-            "target_historical_raw"
-        )
+        action_selection
+        and selection.get("source_chronology_role")
+        in {
+            "target_historical_raw_action_source",
+            "target_historical_raw_known_action_source",
+            "target_historical_raw_direct_event_source_ref",
+            "target_historical_raw_worker_completion_source_ref",
+        }
         and selection.get("final_support_allowed") is True
         and selection.get("diagnostic_only") is False
     )
