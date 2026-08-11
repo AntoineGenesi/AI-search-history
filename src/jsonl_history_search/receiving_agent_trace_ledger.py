@@ -95,9 +95,13 @@ UNCLEAR_SOURCE_PATH_RE = re.compile(
 )
 CURRENT_LOOP_ID_RE = re.compile(r"(?i)\bjsh[-_]?([0-9]+)")
 RAW_WINDOW_RECORD_LABEL_RE = re.compile(
-    r"(?im)^-\s+[^\n]+\.jsonl:\d+:\s+([a-z_][a-z0-9_]*)\s*$"
+    r"(?im)^-\s+(?P<path>[^\n]+\.jsonl):(?P<line>\d+):\s+"
+    r"(?P<role>[a-z_][a-z0-9_]*)\s*$"
 )
 RAW_WINDOW_RECORD_COUNT_RE = re.compile(r"(?im)^Records:\s+(\d+)\s+included\b")
+RAW_WINDOW_LINE_RANGE_RE = re.compile(
+    r"(?im)^Lines:\s+(\d+)\.\.(\d+)\s+\(anchor\s+\d+\)\s*$"
+)
 RAW_SETUP_ONLY_RECORD_LABELS = {
     "developer",
     "session_meta",
@@ -379,16 +383,39 @@ def _raw_window_contains_current_loop_answer_access(
 
     count_match = RAW_WINDOW_RECORD_COUNT_RE.search(output)
     trusted_matches = record_matches[:1]
-    if count_match and int(count_match.group(1)) == len(record_matches):
-        trusted_matches = record_matches
-    elif count_match:
+    if count_match:
         included_count = int(count_match.group(1))
-        if 1 < included_count < len(record_matches):
-            # Quoted headers belong to earlier raw text; later rendered records remain the trailing headers.
+        range_match = RAW_WINDOW_LINE_RANGE_RE.search(output)
+        if range_match and included_count == int(range_match.group(2)) - int(range_match.group(1)) + 1:
+            source_path = record_matches[0].group("path")
+            expected_lines = range(int(range_match.group(1)), int(range_match.group(2)) + 1)
+            rendered_matches = []
+            search_start = 0
+            for expected_line in expected_lines:
+                rendered_match = next(
+                    (
+                        match
+                        for match in record_matches[search_start:]
+                        if match.group("path") == source_path
+                        and int(match.group("line")) == expected_line
+                    ),
+                    None,
+                )
+                if rendered_match is None:
+                    rendered_matches = []
+                    break
+                rendered_matches.append(rendered_match)
+                search_start = record_matches.index(rendered_match) + 1
+            if len(rendered_matches) == included_count:
+                trusted_matches = rendered_matches
+        elif included_count == len(record_matches):
+            trusted_matches = record_matches
+        elif 1 < included_count < len(record_matches):
+            # Legacy captures without line metadata preserve the first and trailing rendered headers.
             trusted_matches = [record_matches[0], *record_matches[-(included_count - 1) :]]
 
     for index, match in enumerate(trusted_matches):
-        if match.group(1).lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
+        if match.group("role").lower() not in {"custom_tool_call", "custom_tool_call_output", "tool"}:
             continue
         block_end = trusted_matches[index + 1].start() if index + 1 < len(trusted_matches) else len(output)
         block = output[match.start() : block_end]
@@ -428,7 +455,7 @@ def _event_command_succeeded(event: dict[str, Any]) -> bool:
 
 
 def _raw_window_is_setup_only(output: str) -> bool:
-    labels = RAW_WINDOW_RECORD_LABEL_RE.findall(output)
+    labels = [match.group("role") for match in RAW_WINDOW_RECORD_LABEL_RE.finditer(output)]
     return bool(labels) and all(label.lower() in RAW_SETUP_ONLY_RECORD_LABELS for label in labels)
 
 
