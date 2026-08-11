@@ -433,6 +433,32 @@ def _raw_window_contains_current_loop_answer_access(
     return False
 
 
+def _raw_window_has_ambiguous_record_boundaries(output: str) -> bool:
+    record_matches = list(RAW_WINDOW_RECORD_LABEL_RE.finditer(output))
+    count_match = RAW_WINDOW_RECORD_COUNT_RE.search(output)
+    range_match = RAW_WINDOW_LINE_RANGE_RE.search(output)
+    if not record_matches or not count_match or not range_match:
+        return False
+
+    included_count = int(count_match.group(1))
+    range_start = int(range_match.group(1))
+    range_end = int(range_match.group(2))
+    if included_count != range_end - range_start + 1:
+        return False
+
+    source_path = record_matches[0].group("path")
+    expected_lines = set(range(range_start, range_end + 1))
+    seen: set[tuple[str, int]] = set()
+    for match in record_matches:
+        key = (match.group("path"), int(match.group("line")))
+        if key[0] != source_path or key[1] not in expected_lines:
+            continue
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
 def _has_primary_raw_history_path(text: str) -> bool:
     for match in RAW_HISTORY_PATH_RE.finditer(text):
         matched_path = match.group(0)
@@ -607,7 +633,10 @@ def _evidence_access_classes(
         )
     ) or (
         command_kind == "jsonl_read_more"
-        and _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
+        and (
+            _raw_window_contains_current_loop_answer_access(output, current_loop_markers)
+            or _raw_window_has_ambiguous_record_boundaries(output)
+        )
     )
     current_loop_from_raw_output = (
         command_has_primary
