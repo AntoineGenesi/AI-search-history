@@ -999,6 +999,16 @@ def build_semantic_debug_payload(
                 "missing_or_omitted_child_ref_count", 0
             ),
             "cap_status": subagent_provenance_workflow.get("cap_status"),
+            "required_provenance_facets": subagent_provenance_workflow.get(
+                "required_provenance_facets"
+            ),
+            "completed_provenance_facets": subagent_provenance_workflow.get(
+                "completed_provenance_facets"
+            ),
+            "missing_provenance_facets": subagent_provenance_workflow.get(
+                "missing_provenance_facets"
+            ),
+            "stop_condition": subagent_provenance_workflow.get("stop_condition"),
         }
         if not subagent_provenance_workflow.get("answer_ready"):
             commands = list(subagent_provenance_workflow.get("continuation_commands") or [])
@@ -2780,7 +2790,7 @@ def build_historical_orchestration_provenance_final_support_plan(
     if not historical_orchestration_provenance_plan_wanted(query, family=family):
         return {}
     required_primary_roles = historical_orchestration_requested_roles(query)
-    required_secondary_roles = list(HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES)
+    required_secondary_roles = historical_orchestration_requested_secondary_roles(query)
     required_roles = required_primary_roles + [
         role for role in required_secondary_roles if role not in required_primary_roles
     ]
@@ -2861,6 +2871,15 @@ def build_historical_orchestration_provenance_final_support_plan(
         "missing_roles": missing_roles,
         "missing_primary_roles": missing_primary_roles,
         "missing_secondary_roles": missing_secondary_roles,
+        "required_provenance_facets": [
+            historical_orchestration_role_facet(role) for role in required_roles
+        ],
+        "completed_provenance_facets": [
+            historical_orchestration_role_facet(role) for role in covered_roles
+        ],
+        "missing_provenance_facets": [
+            historical_orchestration_role_facet(role) for role in missing_roles
+        ],
         "role_coverage": historical_orchestration_role_coverage_rows(
             required_primary_roles=required_primary_roles,
             required_secondary_roles=required_secondary_roles,
@@ -2909,7 +2928,10 @@ def build_historical_orchestration_provenance_final_support_plan(
             "current_run_current_task_same_loop_refs_count_as_final_support": False,
             "secondary_or_non_final_reads_count_as_final_support": False,
             "answer_ready_requires_all_requested_roles": True,
-            "answer_ready_requires_secondary_task_review_commit_support": True,
+            "answer_ready_requires_secondary_task_review_commit_support": bool(
+                required_secondary_roles
+            ),
+            "secondary_support_is_query_conditional": True,
             "release_or_token_savings_claim_supported": False,
         },
     }
@@ -3053,36 +3075,78 @@ def build_cap_aware_subagent_provenance_workflow(
     if not plan and not resolution.get("applies"):
         return {}
 
-    required_roles = list(plan.get("required_roles") or [])
-    covered_roles = list(plan.get("covered_roles") or [])
-    missing_roles = list(plan.get("missing_roles") or [])
+    current_scope_child_roles = [
+        role
+        for role in historical_orchestration_roles_from_text(query)
+        if role in {"worker", "reviewer"}
+    ]
+    explicit_current_child_scope = bool(
+        historical_provenance_current_scope_requested(query)
+        and resolution.get("applies")
+        and current_scope_child_roles
+    )
+    required_roles = (
+        current_scope_child_roles
+        if explicit_current_child_scope
+        else list(plan.get("required_roles") or [])
+    )
+    covered_roles = (
+        [] if explicit_current_child_scope else list(plan.get("covered_roles") or [])
+    )
+    missing_roles = (
+        [] if explicit_current_child_scope else list(plan.get("missing_roles") or [])
+    )
     child_dependent_roles = [
         role for role in required_roles if role in {"worker", "reviewer"}
     ]
     child_refs_required = bool(child_dependent_roles or resolution.get("applies"))
     child_refs = list(resolution.get("child_transcript_refs") or [])
-    child_ref_identities = {
-        identity
-        for item in child_refs
-        if isinstance(item, dict)
-        for identity in source_identity_variants(
-            str(
-                item.get("target")
-                or source_ref_target(
-                    item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
-                )
+    child_refs_by_identity: dict[str, list[dict[str, Any]]] = {}
+    for item in child_refs:
+        if not isinstance(item, dict):
+            continue
+        target = str(
+            item.get("target")
+            or source_ref_target(
+                item.get("source_ref") if isinstance(item.get("source_ref"), dict) else {}
             )
         )
-    }
+        for identity in source_identity_variants(target):
+            child_refs_by_identity.setdefault(identity, []).append(item)
+    child_ref_identities = set(child_refs_by_identity)
     role_child_refs = {
         role: []
         for role in child_dependent_roles
     }
-    for read in list(plan.get("primary_historical_final_support_reads") or []):
+    role_evidence_reads = list(plan.get("primary_historical_final_support_reads") or [])
+    known_role_evidence_targets = {
+        historical_orchestration_read_identity(read) for read in role_evidence_reads
+    }
+    role_evidence_reads.extend(
+        item
+        for item in child_refs
+        if isinstance(item, dict)
+        and historical_orchestration_read_identity(item) not in known_role_evidence_targets
+    )
+    for read in role_evidence_reads:
         read_identities = source_identity_variants(historical_orchestration_read_identity(read))
         if not child_ref_identities.intersection(read_identities):
             continue
-        for role in read.get("orchestration_roles") or []:
+        matching_child_refs = dedupe_dicts(
+            [
+                child_ref
+                for identity in read_identities
+                for child_ref in child_refs_by_identity.get(identity, [])
+            ]
+        )
+        explicit_owner_roles = dedupe(
+            [
+                role
+                for item in [read, *matching_child_refs]
+                for role in historical_orchestration_explicit_source_owner_roles(item)
+            ]
+        )
+        for role in explicit_owner_roles:
             if role in role_child_refs:
                 role_child_refs[role].append(read)
     missing_child_role_refs = [
@@ -3094,6 +3158,29 @@ def build_cap_aware_subagent_provenance_workflow(
             for role in child_dependent_roles
             if (refs := role_child_refs.get(role))
         ]
+    )
+    primary_reads = list(plan.get("primary_historical_final_support_reads") or [])
+    secondary_reads = list(plan.get("secondary_task_review_commit_support_reads") or [])
+    historical_parent_applicable = not explicit_current_child_scope
+    parent_target = next(
+        (
+            historical_orchestration_read_identity(read)
+            for read in primary_reads
+            if historical_parent_applicable
+            and "parent_or_coordinator" in set(read.get("orchestration_roles") or [])
+            and not child_ref_identities.intersection(
+                source_identity_variants(historical_orchestration_read_identity(read))
+            )
+        ),
+        "",
+    )
+    traversal_target_candidates = [parent_target, *required_role_child_targets]
+    if "secondary_task_review_commit_support" in required_roles and secondary_reads:
+        traversal_target_candidates.append(
+            historical_orchestration_read_identity(secondary_reads[0])
+        )
+    selected_traversal_targets = dedupe(
+        [target for target in traversal_target_candidates if target]
     )
     diagnostics = resolution.get("diagnostics") or {}
     caps = resolution.get("caps") or {}
@@ -3130,16 +3217,79 @@ def build_cap_aware_subagent_provenance_workflow(
                 "count": len(omitted_children) or safe_count(diagnostics.get("child_scope_omitted")) or 1,
             }
         )
-    plan_answer_ready = plan.get("status") == "answer_ready" if plan else bool(child_refs)
-    answer_ready = bool(plan_answer_ready and not blockers and (child_refs or not child_refs_required))
+    if explicit_current_child_scope:
+        covered_roles = [role for role in required_roles if role_child_refs.get(role)]
+    facet_status: dict[str, bool] = {
+        "parent_coordinator_prompt": (
+            "parent_or_coordinator" in covered_roles and bool(parent_target)
+        ),
+        "spawned_worker_ids": not child_refs_required or bool(child_refs),
+        "worker_events_or_final": (
+            "worker" not in required_roles or bool(role_child_refs.get("worker"))
+        ),
+        "reviewer_events_or_final": (
+            "reviewer" not in required_roles or bool(role_child_refs.get("reviewer"))
+        ),
+        "review_fix_merge_proof": (
+            "secondary_task_review_commit_support" not in required_roles
+            or "secondary_task_review_commit_support" in covered_roles
+        ),
+    }
+    required_facets = [
+        *(["parent_coordinator_prompt"] if historical_parent_applicable else []),
+        *(["spawned_worker_ids"] if child_refs_required else []),
+        *(["worker_events_or_final"] if "worker" in required_roles else []),
+        *(["reviewer_events_or_final"] if "reviewer" in required_roles else []),
+        *(
+            ["review_fix_merge_proof"]
+            if "secondary_task_review_commit_support" in required_roles
+            else []
+        ),
+    ]
+    completed_facets = [facet for facet in required_facets if facet_status[facet]]
+    missing_facets = [facet for facet in required_facets if not facet_status[facet]]
+    plan_answer_ready = (
+        bool(child_refs)
+        if explicit_current_child_scope
+        else plan.get("status") == "answer_ready"
+        if plan
+        else bool(child_refs)
+    )
+    answer_ready = bool(
+        plan_answer_ready
+        and not blockers
+        and not missing_facets
+        and (child_refs or not child_refs_required)
+    )
 
+    selected_child_targets = set(required_role_child_targets)
+    unresolved_child_frontier = next(
+        (
+            item
+            for item in child_refs
+            if isinstance(item, dict)
+            and item.get("target")
+            and str(item.get("target")) not in selected_child_targets
+        ),
+        None,
+    )
+    continuation_source_refs = [
+        item
+        for item in child_refs
+        if isinstance(item, dict) and str(item.get("target") or "") in selected_child_targets
+    ]
+    if missing_child_role_refs and unresolved_child_frontier:
+        continuation_source_refs.append(unresolved_child_frontier)
+        selected_traversal_targets = dedupe(
+            selected_traversal_targets + [str(unresolved_child_frontier.get("target") or "")]
+        )
     continuation_reads = [
         {
             "kind": "spawned_child_transcript_source_ref",
             "target": item.get("target"),
             "source_ref": item.get("source_ref"),
         }
-        for item in child_refs
+        for item in continuation_source_refs
         if isinstance(item, dict) and item.get("target")
     ][:HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP]
     recovery_refs = list(plan.get("missing_role_recovery_refs") or [])
@@ -3177,6 +3327,34 @@ def build_cap_aware_subagent_provenance_workflow(
         "required_roles": required_roles,
         "covered_roles": covered_roles,
         "missing_roles": missing_roles,
+        "required_provenance_facets": required_facets,
+        "completed_provenance_facets": completed_facets,
+        "missing_provenance_facets": missing_facets,
+        "not_applicable_provenance_facets": (
+            ["parent_coordinator_prompt"] if not historical_parent_applicable else []
+        ),
+        "historical_parent_provenance": {
+            "applicable": historical_parent_applicable,
+            "reason": (
+                "required_for_historical_orchestration_scope"
+                if historical_parent_applicable
+                else "explicit_current_run_worker_or_subagent_scope"
+            ),
+        },
+        "traversal_order": [
+            {
+                "stage": facet,
+                "status": "complete" if facet_status[facet] else "missing",
+            }
+            for facet in required_facets
+        ],
+        "stop_condition": (
+            "required_provenance_facets_complete"
+            if answer_ready
+            else "continue_only_for_missing_provenance_facets"
+        ),
+        "selected_traversal_targets": selected_traversal_targets,
+        "deferred_child_ref_count": max(0, len(child_refs) - len(continuation_source_refs)),
         "child_refs_required": child_refs_required,
         "child_dependent_roles": child_dependent_roles,
         "role_child_ref_counts": {
@@ -3200,6 +3378,10 @@ def build_cap_aware_subagent_provenance_workflow(
             "parent_coordinator_summary_replaces_child_refs": False,
             "capped_or_missing_child_scope_can_be_answer_ready": False,
             "avoid_subagents_policy": False,
+            "inspect_every_subagent_by_default": False,
+            "stop_when_required_provenance_facets_complete": True,
+            "source_role_mentions_can_satisfy_other_role_facets": False,
+            "explicit_current_run_child_scope_requires_historical_parent": False,
         },
     }
 
@@ -3225,18 +3407,6 @@ def apply_subagent_provenance_read_budget(
     workflow = subagent_provenance_workflow or {}
     if not workflow.get("applies"):
         return next_reads, {}
-    if not workflow.get("answer_ready"):
-        return next_reads, {
-            "applies": True,
-            "status": "deferred_incomplete_provenance",
-            "selected_read_count": 0,
-            "demoted_read_count": 0,
-            "claim_boundaries": {
-                "incomplete_or_capped_reads_remain_available": True,
-                "demotion_does_not_make_incomplete_provenance_answer_ready": True,
-            },
-        }
-
     selected_reads = list(historical_orchestration_role_evidence_bundle.get("required_role_reads") or [])
     selected_identities = {
         historical_orchestration_read_identity(read)
@@ -3247,6 +3417,11 @@ def apply_subagent_provenance_read_budget(
     selected_identities.update(
         str(target)
         for target in workflow.get("_required_role_child_targets") or []
+        if target
+    )
+    selected_identities.update(
+        str(target)
+        for target in workflow.get("selected_traversal_targets") or []
         if target
     )
     if not selected_identities:
@@ -3264,10 +3439,17 @@ def apply_subagent_provenance_read_budget(
             "primary_historical_final_support_reads",
             "secondary_task_review_commit_support_reads",
             "bounded_non_final_required_reads",
+            "current_run_self_echo_candidates",
         )
         for read in plan.get(key) or []
         if isinstance(read, dict) and historical_orchestration_read_identity(read)
     }
+    selected_order = {
+        str(target): index
+        for index, target in enumerate(workflow.get("selected_traversal_targets") or [])
+        if target
+    }
+    selected_rows: list[tuple[int, dict[str, Any]]] = []
     rows: list[dict[str, Any]] = []
     demoted = 0
     retained = 0
@@ -3279,7 +3461,7 @@ def apply_subagent_provenance_read_budget(
         if read_identity in selected_identities:
             if read_is_required_surface_actionable(read):
                 retained += 1
-            rows.append(read)
+            selected_rows.append((selected_order.get(read_identity, len(selected_order)), read))
             continue
         if (
             read_identity in budget_candidate_identities
@@ -3302,16 +3484,19 @@ def apply_subagent_provenance_read_budget(
         else:
             rows.append(read)
 
+    ordered_selected = [read for _index, read in sorted(selected_rows, key=lambda item: item[0])]
+    rows = ordered_selected + rows
     return rows, {
         "applies": True,
         "status": "applied",
-        "mode": "answer_ready_role_reads",
+        "mode": "need_to_know_traversal_frontier",
         "selected_read_count": len(selected_identities),
         "retained_actionable_read_count": retained,
         "demoted_read_count": demoted,
         "claim_boundaries": {
             "demoted_reads_are_diagnostic_leads": True,
             "demotion_does_not_make_incomplete_provenance_answer_ready": True,
+            "non_frontier_subagents_are_not_default_actionable": True,
         },
     }
 
@@ -3555,9 +3740,90 @@ def historical_orchestration_requested_roles(query: str) -> list[str]:
     ]
     if not roles:
         roles = list(HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES)
+    if "reviewer" in roles and "worker" not in roles:
+        roles.insert(0, "worker")
     if "worker" in roles and "parent_or_coordinator" not in roles:
         roles.insert(0, "parent_or_coordinator")
     return roles
+
+
+def historical_orchestration_requested_secondary_roles(query: str) -> list[str]:
+    lowered = re.sub(r"\s+", " ", str(query or "").lower().replace("_", " ")).strip()
+    artifact_or_outcome_requested = bool(
+        re.search(
+            r"\b(?:task (?:file|status|artifact)|report (?:artifact|file|output)|"
+            r"review (?:artifact|file|verdict|report)|commit|merge|merged|merge proof|"
+            r"git show|git log)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:review(?:er)?|rereview|validation|fix(?:ed)?|merge(?:d)?) "
+            r"(?:proof|evidence|artifact|report|verdict)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:proof|evidence) (?:of |for )?(?:the )?"
+            r"(?:review|rereview|validation|fix|merge)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:proof|evidence) (?:proves?|shows?|demonstrates?|confirms?) "
+            r"(?:the )?(?:review|rereview|validation|fix|merge)\b",
+            lowered,
+        )
+    )
+    return (
+        list(HISTORICAL_ORCHESTRATION_SECONDARY_REQUIRED_ROLES)
+        if artifact_or_outcome_requested
+        else []
+    )
+
+
+def historical_orchestration_role_facet(role: str) -> str:
+    return {
+        "parent_or_coordinator": "parent_coordinator_prompt",
+        "worker": "worker_events_or_final",
+        "reviewer": "reviewer_events_or_final",
+        "secondary_task_review_commit_support": "review_fix_merge_proof",
+    }.get(role, role)
+
+
+def historical_orchestration_explicit_source_owner_roles(read: dict[str, Any]) -> list[str]:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    provenance = (
+        read.get("spawned_session_resolution")
+        if isinstance(read.get("spawned_session_resolution"), dict)
+        else {}
+    )
+    values: list[Any] = []
+    for row in (read, source_ref, provenance):
+        values.extend(
+            [
+                row.get("source_owner_role"),
+                row.get("source_owner_roles"),
+                row.get("agent_role"),
+                row.get("orchestration_owner_role"),
+            ]
+        )
+    roles: list[str] = []
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            role = historical_orchestration_normalized_owner_role(item)
+            if role:
+                roles.append(role)
+    return dedupe(roles)
+
+
+def historical_orchestration_normalized_owner_role(value: Any) -> str | None:
+    normalized = re.sub(r"[^a-z]+", "_", str(value or "").casefold()).strip("_")
+    if normalized in {"worker", "implementer", "implementation"}:
+        return "worker"
+    if normalized in {"reviewer", "rereviewer", "re_reviewer"}:
+        return "reviewer"
+    if normalized in {"parent", "coordinator", "orchestrator"}:
+        return "parent_or_coordinator"
+    return None
 
 
 def historical_orchestration_roles_from_text(text: str) -> list[str]:
@@ -3764,6 +4030,12 @@ def historical_orchestration_read_plan_row(
     if historical_orchestration_secondary_support_from_ref(read, candidate, text=text):
         roles.append("secondary_task_review_commit_support")
         roles = dedupe(roles)
+    explicit_owner_roles = dedupe(
+        historical_orchestration_explicit_source_owner_roles(read)
+        + historical_orchestration_explicit_source_owner_roles(candidate)
+    )
+    roles = dedupe(roles + explicit_owner_roles)
+    source_owner_roles = explicit_owner_roles
     role = str(selection.get("source_chronology_role") or "candidate_or_original_source_ref")
     current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(
         text,
@@ -3790,6 +4062,7 @@ def historical_orchestration_read_plan_row(
         "source_ref": guided_source_ref(source_ref) if source_ref else None,
         "source_chronology_role": role,
         "orchestration_roles": roles,
+        "source_owner_roles": source_owner_roles,
         "final_support_allowed": final_support_allowed,
         "required_final_support_read": final_support_allowed,
         "read_more_actionable": bool(read.get("read_more_actionable", True))
@@ -3893,6 +4166,9 @@ def historical_orchestration_plan_summary(plan: dict[str, Any]) -> dict[str, Any
         "missing_roles": list(plan.get("missing_roles") or []),
         "missing_primary_roles": list(plan.get("missing_primary_roles") or []),
         "missing_secondary_roles": list(plan.get("missing_secondary_roles") or []),
+        "required_provenance_facets": list(plan.get("required_provenance_facets") or []),
+        "completed_provenance_facets": list(plan.get("completed_provenance_facets") or []),
+        "missing_provenance_facets": list(plan.get("missing_provenance_facets") or []),
         "role_coverage": list(plan.get("role_coverage") or []),
         "primary_historical_final_support_read_count": plan.get(
             "primary_historical_final_support_read_count", 0

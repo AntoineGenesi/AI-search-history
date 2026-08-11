@@ -44,6 +44,7 @@ class _ResolvedChild:
     depth: int
     edge_source: str
     parent_path: Path | None = None
+    source_owner_roles: tuple[str, ...] = ()
 
 
 def resolve_spawned_session_transcripts(
@@ -137,7 +138,11 @@ class _SpawnedSessionResolver:
             ],
             "next_reads": child_reads,
             "child_transcript_refs": [
-                {"target": read.get("target"), "source_ref": read.get("source_ref")}
+                {
+                    "target": read.get("target"),
+                    "source_ref": read.get("source_ref"),
+                    "source_owner_roles": list(read.get("source_owner_roles") or []),
+                }
                 for read in child_reads
             ],
             "missing_children": self.missing[: self.limits.max_children],
@@ -341,7 +346,15 @@ class _SpawnedSessionResolver:
                 if line is None:
                     self.missing.append({"diagnostic": "child_transcript_missing", "source": "thread_spawn_edges"})
                     continue
-                children.append(_ResolvedChild(path=child_path, line=line, depth=depth + 1, edge_source="thread_spawn_edges"))
+                children.append(
+                    _ResolvedChild(
+                        path=child_path,
+                        line=line,
+                        depth=depth + 1,
+                        edge_source="thread_spawn_edges",
+                        source_owner_roles=_transcript_source_owner_roles(child_path),
+                    )
+                )
                 if should_expand_child:
                     frontier.append((child_id, depth + 1))
                 if len(children) >= self.limits.max_children:
@@ -414,6 +427,8 @@ class _SpawnedSessionResolver:
                     if child_path is None or not child_path.exists():
                         self.missing.append({"diagnostic": "child_transcript_missing", "source": "parent_transcript_event"})
                         continue
+                    if raw_line and not self._charge_file(child_path):
+                        continue
                     line = raw_line or self._first_record_line(child_path)
                     if line is None:
                         self.missing.append({"diagnostic": "child_transcript_missing", "source": "parent_transcript_event"})
@@ -425,6 +440,7 @@ class _SpawnedSessionResolver:
                             depth=depth,
                             edge_source="parent_transcript_event",
                             parent_path=parent_path,
+                            source_owner_roles=_transcript_source_owner_roles(child_path),
                         )
                     )
                     if len(rows) + len(self.children) >= self.limits.max_children:
@@ -499,6 +515,7 @@ class _SpawnedSessionResolver:
                 "reason": "inspect spawned child transcript as primary source evidence before relying on parent summaries",
                 "target_source_role": "target_historical_raw",
                 "final_support_allowed": True,
+                "source_owner_roles": list(child.source_owner_roles),
                 "spawned_session_resolution": {
                     "diagnostic": "child_transcript_inspected",
                     "edge_source": child.edge_source,
@@ -542,6 +559,37 @@ def _first_string(row: dict[str, Any], names: tuple[str, ...]) -> str | None:
         value = lowered.get(name.casefold())
         if value not in (None, ""):
             return str(value)
+    return None
+
+
+def _transcript_source_owner_roles(path: Path) -> tuple[str, ...]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    raw = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(raw, dict) or str(raw.get("type") or "") != "session_meta":
+                    continue
+                payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+                role = _normalized_source_owner_role(
+                    payload.get("agent_role") or payload.get("agent_nickname")
+                )
+                return (role,) if role else ()
+    except OSError:
+        return ()
+    return ()
+
+
+def _normalized_source_owner_role(value: Any) -> str | None:
+    normalized = re.sub(r"[^a-z]+", "_", str(value or "").casefold()).strip("_")
+    if normalized in {"worker", "implementer", "implementation"}:
+        return "worker"
+    if normalized in {"reviewer", "rereviewer", "re_reviewer"}:
+        return "reviewer"
+    if normalized in {"parent", "coordinator", "orchestrator"}:
+        return "parent_or_coordinator"
     return None
 
 
