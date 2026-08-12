@@ -5329,6 +5329,9 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "query": packet["query"],
             "audit_depth": packet.get("audit_depth"),
             "question_family": packet["question_family"],
+            "directional_history_reconstruction": packet.get(
+                "directional_history_reconstruction"
+            ),
             "report_written": str(Path(report_output).expanduser()),
             "candidate_count": len(packet["strongest_candidates"]),
             "event_count": packet["tool_action_proof"]["event_count"],
@@ -6261,6 +6264,39 @@ def _answer_action_contract_from_executed_output(
             "linked_reports": compact.get("linked_reports"),
         }
     if output_key == "semantic_debug":
+        directional = compact.get("directional_history_reconstruction") or {}
+        if directional.get("applies") and selected_route.get("route_family") in {
+            "causal_history",
+            "topic_history",
+        }:
+            directional_reads = directional.get("stages") or []
+            continue_only_if = [
+                "a named required causal role or before/during/after phase remains missing"
+            ]
+            return {
+                "answer_status": directional.get("status"),
+                "promotion_status": "directional_history_reads_required",
+                "promotion_reason": (
+                    "The selected history route requires its ordered directional source reads before synthesis."
+                ),
+                "directional_history_reconstruction": directional,
+                "read": directional_reads,
+                "answer_gate": directional.get("answer_gate"),
+                "stop": directional.get("stop_rule"),
+                "only_continue_if": continue_only_if,
+                "single_flight_contract": {
+                    "schema_version": 1,
+                    "status": "route_executed_ordered_directional_reads_next",
+                    "route_already_executed": True,
+                    "default_action": "run_ordered_directional_reads_without_rerunning_route",
+                    "selected_primary_read_count": len(directional_reads),
+                    "selected_primary_reads": directional_reads,
+                    "do_not_rerun": ["ask --execute", "direct semantic-debug"],
+                    "continue_only_if": continue_only_if,
+                    "stop_rule": directional.get("stop_rule"),
+                },
+                "saved_report": compact.get("report_written"),
+            }
         handoff = compact.get("answer_ready_handoff") or {}
         readiness_summary = compact.get("answer_readiness_summary") or {}
         longitudinal_phase_source_plan = compact.get("longitudinal_phase_source_plan") or {}
@@ -10549,6 +10585,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "status": compact.get("status"),
             "report_written": compact.get("report_written"),
             "question_family": compact.get("question_family"),
+            "directional_history_reconstruction": compact.get("directional_history_reconstruction"),
             "candidate_count": _semantic_debug_compact_candidate_count(compact),
             "event_count": compact.get("event_count")
             if compact.get("event_count") is not None

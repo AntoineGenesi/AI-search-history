@@ -30,6 +30,8 @@ EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES = frozenset(
         "remembered_instruction",
         "remembered_user_wording",
         "remembered_topic",
+        "causal_history",
+        "topic_history",
         "long_range_history",
         "semantic_debug",
     }
@@ -64,6 +66,44 @@ METHOD_SELECTION_PACKET_SCHEMA_VERSION = "route-family-method-packet/v1"
 
 
 METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
+    "latest_status": {
+        "method_id": "latest_status_forward_interval",
+        "traversal": "forward_to_current_tail",
+        "read_order": [
+            "Select and inspect the named boundary Y.",
+            "Traverse raw parent/session/tool/worker/review evidence forward from Y to the current tail or emitted machine continuation.",
+            "Answer only after complete interval coverage; otherwise follow the canonical continuation without visible-context synthesis.",
+        ],
+        "stop_rule": (
+            "Stop at answer_ready=true after the selected boundary and complete forward interval are proven, "
+            "or at a terminal machine blocker."
+        ),
+    },
+    "causal_history": {
+        "method_id": "causal_history_backward_first",
+        "traversal": "backward_first",
+        "read_order": [
+            "Select the event or failure X from primary conversation history.",
+            "Read backward first through prior instructions, decisions, setup, tool outputs, errors, and reviews.",
+            "Check forward consequences only after causal evidence is grounded.",
+        ],
+        "stop_rule": (
+            "Answer why only after inspected prior evidence grounds the causal chain; keep later consequences "
+            "as confirmation rather than the cause."
+        ),
+    },
+    "topic_history": {
+        "method_id": "topic_history_before_during_after",
+        "traversal": "before_during_after",
+        "read_order": [
+            "Select the topic or event X from primary conversation history.",
+            "Open bounded before, during, and after windows around X.",
+            "Stop after those phases reconstruct the requested episode or report the specific missing phase.",
+        ],
+        "stop_rule": (
+            "Answer only from the bounded before/during/after reconstruction; do not substitute current local state."
+        ),
+    },
     "remembered_instruction": {
         "method_id": "remembered_instruction",
         "forbidden_first_moves": [
@@ -981,6 +1021,54 @@ LATEST_USER_MESSAGES_ROUTE = AskRoute(
 )
 
 
+CAUSAL_HISTORY_ROUTE = AskRoute(
+    route_family="causal_history",
+    chosen_route="causal-history / semantic-debug",
+    why_it_applies=(
+        "The caller explicitly requested conversation history for a concrete causal event. "
+        "Select the event, inspect prior causal/provenance evidence backward first, then check consequences."
+    ),
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.directional_history_reconstruction event selection",
+        "backward-first prior instructions, decisions, setup, tool outputs, errors, and reviews",
+        "forward consequence check only after causal evidence is grounded",
+    ),
+    stop_guidance=(
+        "Execute the emitted backward-first reconstruction stages in order. Do not treat a later outcome "
+        "as the cause until prior source evidence grounds it."
+    ),
+    manual_search_guidance=(
+        "Use only the emitted bounded continuation for a named missing causal facet; current local state is not a substitute."
+    ),
+)
+
+
+TOPIC_HISTORY_ROUTE = AskRoute(
+    route_family="topic_history",
+    chosen_route="topic-history / semantic-debug",
+    why_it_applies=(
+        "The caller explicitly requested conversation history for a concrete topic or event. "
+        "Reconstruct a bounded before/during/after episode around the selected source event."
+    ),
+    first_command_template='{cli} semantic-debug {query} --cwd "$PWD" --format text',
+    read_specialization="references/semantic-debugging.md",
+    inspect_after=(
+        "semantic_debug.directional_history_reconstruction selected topic/event",
+        "bounded before context",
+        "bounded during event evidence",
+        "bounded after consequences",
+    ),
+    stop_guidance=(
+        "Execute the emitted before/during/after stages in order and stop when the bounded episode is reconstructed."
+    ),
+    manual_search_guidance=(
+        "Continue only for a named missing before, during, or after phase; do not switch to current local task evidence."
+    ),
+)
+
+
 ROUTES: tuple[AskRoute, ...] = (
     AskRoute(
         route_family="skill_check",
@@ -1569,6 +1657,12 @@ def classify_ask_route(
             return NAMED_TASK_CONVERSATION_HISTORY_ROUTE
         return NAMED_TASK_EVIDENCE_SOURCE_REQUIRED_ROUTE
 
+    if explicit_query is not None and _looks_like_concrete_causal_history_query(normalized):
+        return CAUSAL_HISTORY_ROUTE
+
+    if explicit_query is not None and _looks_like_concrete_topic_history_query(normalized):
+        return TOPIC_HISTORY_ROUTE
+
     if _looks_like_skill_compliance_query(normalized) and not _looks_like_action_proof_query(normalized):
         return ROUTES[0]
 
@@ -1822,6 +1916,8 @@ def _looks_like_history_tool_alias_context(normalized: str) -> bool:
         return False
     return (
         _looks_like_latest_status_anchor_query(normalized)
+        or _looks_like_concrete_causal_history_query(normalized)
+        or _looks_like_concrete_topic_history_query(normalized)
         or _looks_like_long_range_history_query(normalized)
         or _looks_like_deep_history_audit_query(normalized)
         or _looks_like_devlog_failure_analysis_query(normalized)
@@ -1853,6 +1949,52 @@ def _looks_like_history_tool_alias_context(normalized: str) -> bool:
                 "what has happened since",
             ),
         )
+    )
+
+
+def _concrete_history_event_target(normalized: str, pattern: str) -> str | None:
+    match = re.fullmatch(pattern, normalized.strip(" .?!"))
+    if not match:
+        return None
+    target = " ".join(match.group("target").strip(" .?!").split())
+    if target in {"it", "this", "that", "this event", "that event", "here"}:
+        return None
+    local_markers = (
+        "this task file",
+        "the task file",
+        "this current task",
+        "the current task",
+        "this branch",
+        "the current branch",
+        "this repo",
+        "the current repo",
+        "this repository",
+        "the current repository",
+        "this checkout",
+        "the current checkout",
+        "this workspace",
+        "the current workspace",
+        "local file",
+        "local task",
+        "local branch",
+        "local repo",
+    )
+    if any(marker in target for marker in local_markers):
+        return None
+    return target or None
+
+
+def _looks_like_concrete_causal_history_query(normalized: str) -> bool:
+    return _concrete_history_event_target(normalized, r"why did (?P<target>.+?) happen") is not None
+
+
+def _looks_like_concrete_topic_history_query(normalized: str) -> bool:
+    return (
+        _concrete_history_event_target(
+            normalized,
+            r"what (?:has )?happened with (?P<target>.+)",
+        )
+        is not None
     )
 
 

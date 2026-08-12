@@ -93,6 +93,7 @@ DECISION_CONTEXT_ROUTES = {
 SUPPORTED_QUESTION_FAMILIES = {
     "expectation_mismatch": "Why observed AI/agent behavior diverged from an expected stop, instruction, plan, or task state.",
     "why_did_this_happen": "Vague bug, incident, regression, symptom, or assumption questions.",
+    "topic_event_reconstruction": "Bounded before/during/after reconstruction for a named conversation topic or event.",
     "provenance": "Task, path, branch, commit, review, or artifact provenance questions.",
     "claimed_action": "Whether an agent actually ran, edited, tested, reviewed, or claimed a concrete action.",
     "process_actual_use": "Whether a process, artifact, checklist, learning, or front-door was actually used before/during work and changed behavior.",
@@ -1563,6 +1564,15 @@ def build_semantic_debug_payload(
             source_handle_routing=source_handle_routing,
             source_window_action_proof=source_window_action_proof,
         )
+    directional_history_reconstruction = build_directional_history_reconstruction(
+        query=agent_find["query"]["original"],
+        family=family,
+        next_reads=next_reads,
+    )
+    if directional_history_reconstruction.get("applies"):
+        source_locator_handoff["directional_history_reconstruction"] = directional_history_reconstruction
+        answer_ready_handoff["directional_history_reconstruction"] = directional_history_reconstruction
+        agent_instruction["directional_history_reconstruction"] = directional_history_reconstruction
     command_status = semantic_debug_command_status(agent_find.get("status"))
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -1573,6 +1583,7 @@ def build_semantic_debug_payload(
         "in_depth_audit_followthrough": in_depth_audit_followthrough,
         "audit_continuation_workflow": in_depth_audit_followthrough.get("audit_continuation_workflow"),
         "question_family": family,
+        "directional_history_reconstruction": directional_history_reconstruction,
         "investigation_state": investigation_state,
         "scope": source_scope,
         "routes": routes,
@@ -1709,7 +1720,12 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
         detected.append("process_actual_use")
     if looks_like_expectation_mismatch_query(text):
         detected.append("expectation_mismatch")
-    if any(word in text for word in ("why", "cause", "caused", "happen", "regression", "bug", "symptom", "assumption")):
+    topic_reconstruction = looks_like_topic_event_reconstruction_query(text)
+    if topic_reconstruction:
+        detected.append("topic_event_reconstruction")
+    if not topic_reconstruction and any(
+        word in text for word in ("why", "cause", "caused", "happen", "regression", "bug", "symptom", "assumption")
+    ):
         detected.append("why_did_this_happen")
     if any(hints.values()) or any(word in text for word in ("commit", "branch", "task", "review", "provenance", "path")):
         detected.append("provenance")
@@ -1748,6 +1764,195 @@ def classify_question_family(query: str, *, hints: dict[str, str | None], status
             {"label": label, "meaning": meaning} for label, meaning in sorted(UNSUPPORTED_QUESTION_FAMILIES.items())
         ],
     }
+
+
+def looks_like_topic_event_reconstruction_query(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().replace("?", " ").replace("!", " ").split())
+    match = re.fullmatch(r"what (?:has )?happened with (?P<target>.+)", normalized.strip(" ."))
+    if not match:
+        return False
+    target = match.group("target").strip(" .")
+    return target not in {"it", "this", "that", "here", "this event", "that event"}
+
+
+def build_directional_history_reconstruction(
+    *,
+    query: str,
+    family: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    primary = str(family.get("primary") or "")
+    if primary == "why_did_this_happen":
+        route_family = "causal_history"
+        traversal = "backward_first"
+    elif primary == "topic_event_reconstruction":
+        route_family = "topic_history"
+        traversal = "before_during_after"
+    else:
+        return {"applies": False}
+
+    selected = next(
+        (
+            read
+            for read in next_reads
+            if read.get("read_more_actionable") is not False
+            and not read.get("diagnostic_only")
+            and read.get("target")
+        ),
+        None,
+    )
+    if selected is None:
+        return {
+            "schema_version": "directional_history_reconstruction.v1",
+            "applies": True,
+            "route_family": route_family,
+            "traversal": traversal,
+            "status": "blocked_no_primary_event_ref",
+            "stages": [],
+            "machine_blocker": "No actionable primary event/source ref was found in the searched scope.",
+            "answer_gate": {"answer_ready": False, "missing": ["selected_primary_event_ref"]},
+        }
+
+    actions = list(selected.get("expansion_actions") or [])
+    record_action = next((action for action in actions if action.get("mode") == "record"), None)
+    window_action = next((action for action in actions if action.get("mode") == "window"), None)
+    next_action = next((action for action in actions if action.get("mode") == "next"), None)
+    if not record_action or not window_action:
+        return {
+            "schema_version": "directional_history_reconstruction.v1",
+            "applies": True,
+            "route_family": route_family,
+            "traversal": traversal,
+            "status": "blocked_no_executable_source_window",
+            "selected_event_ref": selected.get("target"),
+            "stages": [],
+            "machine_blocker": "The selected primary ref has no executable record/window expansion argv.",
+            "answer_gate": {"answer_ready": False, "missing": ["executable_source_window"]},
+        }
+
+    source_line = int((selected.get("source_ref") or {}).get("line") or 1)
+    backward_argv = _directional_window_argv(
+        list(window_action.get("argv") or []),
+        before=max(0, source_line - 1),
+        after=0,
+        mode="before",
+    )
+    during_argv = list(window_action.get("argv") or [])
+    after_argv = list((next_action or window_action).get("argv") or [])
+    if next_action is None:
+        after_argv = _directional_window_argv(after_argv, before=0, after=1)
+
+    if route_family == "causal_history":
+        stages = [
+            _directional_stage(
+                phase="event",
+                action="select_event_or_failure",
+                argv=list(record_action.get("argv") or []),
+                requires=[],
+            ),
+            _directional_stage(
+                phase="before",
+                action="inspect_prior_causal_context",
+                argv=backward_argv,
+                requires=["event_or_failure_selected"],
+            ),
+            _directional_stage(
+                phase="after",
+                action="check_forward_consequences",
+                argv=after_argv,
+                requires=["causal_evidence_grounded"],
+            ),
+        ]
+        answer_gate = {
+            "answer_ready": False,
+            "required_evidence_roles": [
+                "prior_instructions",
+                "decisions_and_setup",
+                "tool_outputs_and_errors",
+                "reviews_or_validation",
+            ],
+            "forward_check_before_causal_grounding_allowed": False,
+            "promotion": "answer_ready_after_backward_causal_evidence_is_grounded",
+        }
+    else:
+        stages = [
+            _directional_stage(
+                phase="before",
+                action="inspect_before_context",
+                argv=backward_argv,
+                requires=["topic_or_event_selected"],
+            ),
+            _directional_stage(
+                phase="during",
+                action="inspect_during_event",
+                argv=during_argv,
+                requires=["before_context_inspected"],
+            ),
+            _directional_stage(
+                phase="after",
+                action="inspect_after_consequences",
+                argv=after_argv,
+                requires=["during_event_inspected"],
+            ),
+        ]
+        answer_gate = {
+            "answer_ready": False,
+            "required_phases": ["before", "during", "after"],
+            "promotion": "answer_ready_after_bounded_episode_reconstruction",
+        }
+    return {
+        "schema_version": "directional_history_reconstruction.v1",
+        "applies": True,
+        "route_family": route_family,
+        "traversal": traversal,
+        "status": "ordered_reads_required",
+        "selected_event_ref": selected.get("target"),
+        "selected_candidate_id": selected.get("candidate_id"),
+        "stages": stages,
+        "answer_gate": answer_gate,
+        "stop_rule": (
+            "Stop after the ordered stages support the route-specific answer; otherwise return the named missing "
+            "evidence role or phase without current-context substitution."
+        ),
+        "raw_text_included": False,
+    }
+
+
+def _directional_stage(*, phase: str, action: str, argv: list[str], requires: list[str]) -> dict[str, Any]:
+    command_argv = list(argv)
+    if command_argv and command_argv[0] != "jsonl-history-search":
+        command_argv.insert(0, "jsonl-history-search")
+    return {
+        "phase": phase,
+        "action": action,
+        "argv": argv,
+        "command": " ".join(shlex.quote(str(part)) for part in command_argv),
+        "requires": requires,
+        "produces": f"{phase}_evidence_inspected",
+    }
+
+
+def _directional_window_argv(
+    argv: list[str],
+    *,
+    before: int,
+    after: int,
+    mode: str | None = None,
+) -> list[str]:
+    result = list(argv)
+    if mode is not None:
+        if "--mode" in result:
+            result[result.index("--mode") + 1] = mode
+        else:
+            insert_at = result.index("--format") if "--format" in result else len(result)
+            result[insert_at:insert_at] = ["--mode", mode]
+    for option, value in (("--before", before), ("--after", after)):
+        if option in result:
+            result[result.index(option) + 1] = str(value)
+        else:
+            insert_at = result.index("--format") if "--format" in result else len(result)
+            result[insert_at:insert_at] = [option, str(value)]
+    return result
 
 
 def process_actual_use_detected(family: dict[str, Any]) -> bool:

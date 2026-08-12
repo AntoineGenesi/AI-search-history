@@ -750,13 +750,14 @@ def _render_method_selection_packet_text(packet: dict) -> list[str]:
         f"- schema_version: {packet.get('schema_version')}",
         f"- route_family: {packet.get('route_family')}",
         f"- method_id: {packet.get('method_id')}",
-        f"- first_command: {packet.get('first_command')}",
         f"- cap_language_required: {packet.get('cap_language_required')}",
         f"- single_flight_policy: {packet.get('single_flight_policy')}",
         f"- secondary_policy: {packet.get('secondary_policy')}",
         f"- stop_rule: {packet.get('stop_rule')}",
         f"- continue_only_if: {packet.get('continue_only_if')}",
     ]
+    if packet.get("first_command"):
+        lines.insert(4, f"- first_command: {packet.get('first_command')}")
     for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
         values = packet.get(field) or []
         lines.append(f"- {field}:")
@@ -882,6 +883,8 @@ def render_ask_execute_text(payload: dict) -> str:
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
     packet = route.get("method_selection_packet") or {}
     if packet:
+        if single_flight:
+            packet = {key: value for key, value in packet.items() if key != "first_command"}
         lines.extend(_render_method_selection_packet_text(packet))
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
@@ -1064,6 +1067,8 @@ def render_ask_execute_markdown(payload: dict) -> str:
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
     packet = route.get("method_selection_packet") or {}
     if packet:
+        if single_flight:
+            packet = {key: value for key, value in packet.items() if key != "first_command"}
         lines.extend(_render_method_selection_packet_markdown(packet))
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
@@ -1186,7 +1191,10 @@ def _ask_execute_single_flight_contract(action: dict) -> dict:
         return {}
     if contract.get("route_already_executed") is not True:
         return {}
-    if action.get("answer_status") != "answer-ready-after-source-inspection":
+    if (
+        action.get("answer_status") != "answer-ready-after-source-inspection"
+        and action.get("promotion_status") != "directional_history_reads_required"
+    ):
         return {}
     if not action.get("read"):
         return {}
@@ -2070,13 +2078,14 @@ def _render_method_selection_packet_markdown(packet: dict) -> list[str]:
         f"- `schema_version`: `{packet.get('schema_version')}`",
         f"- `route_family`: `{packet.get('route_family')}`",
         f"- `method_id`: `{packet.get('method_id')}`",
-        f"- `first_command`: `{packet.get('first_command')}`",
         f"- `cap_language_required`: `{packet.get('cap_language_required')}`",
         f"- `single_flight_policy`: {packet.get('single_flight_policy')}",
         f"- `secondary_policy`: {packet.get('secondary_policy')}",
         f"- `stop_rule`: {packet.get('stop_rule')}",
         f"- `continue_only_if`: {packet.get('continue_only_if')}",
     ]
+    if packet.get("first_command"):
+        lines.insert(6, f"- `first_command`: `{packet.get('first_command')}`")
     for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
         values = packet.get(field) or []
         lines.append(f"- `{field}`:")
@@ -9282,6 +9291,17 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
             actionability = "diagnostic-only" if item.get("diagnostic_only") or item.get("read_more_actionable") is False else "actionable"
             reason = f" reason={item.get('reason')}" if item.get("reason") else ""
             lines.append(f"- next read ({actionability}): {item.get('kind')} {item.get('target')}{reason}")
+    directional = handoff.get("directional_history_reconstruction") or {}
+    if directional.get("applies"):
+        lines.append(
+            "- directional reconstruction: "
+            f"route={directional.get('route_family')} traversal={directional.get('traversal')} "
+            f"status={directional.get('status')}"
+        )
+        for stage in directional.get("stages") or []:
+            lines.append(
+                f"- directional stage {stage.get('phase')}: {stage.get('action')} command={stage.get('command')}"
+            )
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_text(
             lines,
@@ -9674,6 +9694,17 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(str(item.get('target', '')))} | "
                 f"{_escape_markdown_table(actionability)} | "
                 f"{_escape_markdown_table(str(item.get('reason', '')))} |"
+            )
+    directional = handoff.get("directional_history_reconstruction") or {}
+    if directional.get("applies"):
+        lines.append(
+            "- Directional reconstruction: "
+            f"`route={directional.get('route_family')}`; `traversal={directional.get('traversal')}`; "
+            f"`status={directional.get('status')}`."
+        )
+        for stage in directional.get("stages") or []:
+            lines.append(
+                f"- Directional stage `{stage.get('phase')}` (`{stage.get('action')}`): `{stage.get('command')}`"
             )
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_markdown(
