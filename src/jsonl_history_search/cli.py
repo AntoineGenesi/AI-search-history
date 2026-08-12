@@ -12417,6 +12417,34 @@ def _ask_answer_finalization_veto(
         merge_gate_allows_artifact_finalization = True
 
     action_contract_blocks = _answer_action_contract_blocks_final_answer(action)
+    latest_status_gate = (
+        answer.get("source_contract", {}).get("latest_status_post_anchor_interval_answer_gate")
+        if isinstance(
+            answer.get("source_contract", {}).get("latest_status_post_anchor_interval_answer_gate"),
+            dict,
+        )
+        else {}
+    )
+    if (
+        action_contract_blocks
+        and route_family == "latest_status"
+        and latest_status_gate.get("status") == "answer_allowed"
+        and _ask_answer_can_follow_raw_proof_despite_status(
+            action=action,
+            route_family=route_family,
+        )
+    ):
+        answer["source_contract"]["latest_status_finalization_override"] = {
+            "schema_version": 1,
+            "status": "opened_required_primary_refs_satisfied_needs_more_proof_contract",
+            "overridden_answer_action_status": action.get("answer_status"),
+            "overridden_promotion_status": action.get("promotion_status"),
+            "boundary": (
+                "only the concrete latest-status required-primary follow-through contract was satisfied; "
+                "canonical continuation packets and incomplete interval coverage remain blocking"
+            ),
+        }
+        action_contract_blocks = False
     if (
         action_contract_blocks
         and merge_gate_allows_artifact_finalization
@@ -13190,6 +13218,50 @@ def _ask_answer_missing_source_session_next_step(action: dict) -> dict:
 
 
 def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_family: str) -> bool:
+    if route_family == "latest_status" and action.get("answer_status") == "not-ready/needs-more-proof":
+        continuation_packet = action.get("canonical_continuation_packet")
+        if isinstance(continuation_packet, dict) and continuation_packet:
+            return False
+        contract = (
+            action.get("latest_status_followthrough_contract")
+            if isinstance(action.get("latest_status_followthrough_contract"), dict)
+            else {}
+        )
+        required_reads = [
+            item for item in contract.get("required_primary_reads") or [] if isinstance(item, dict)
+        ]
+        action_reads = [item for item in action.get("read") or [] if isinstance(item, dict)]
+        if (
+            contract.get("schema_version") != "latest_status_followthrough_contract.v1"
+            or not required_reads
+            or not action_reads
+        ):
+            return False
+        required_identities = {
+            identity
+            for item in required_reads
+            if (identity := _latest_status_required_read_identity(item))
+            and (
+                item.get("openable_target")
+                or item.get("target")
+                or item.get("path")
+                or isinstance(item.get("source_ref"), dict)
+            )
+        }
+        action_identities = {
+            identity
+            for item in action_reads
+            if (identity := _latest_status_required_read_identity(item))
+        }
+        has_selected_anchor = bool(action.get("selected_anchor")) or any(
+            str(item.get("answer_support_role") or "") == "selected_parent_thread_raw_user_row"
+            for item in required_reads
+        )
+        return (
+            has_selected_anchor
+            and len(required_identities) == len(required_reads)
+            and required_identities <= action_identities
+        )
     if route_family not in {"action_proof", "remembered_topic"} or action.get("answer_status") != "inspect_recovery_first":
         return False
     for item in action.get("read") or []:
@@ -17657,7 +17729,18 @@ def _compose_latest_status_answer(*, query: str, action: dict, opened: list[dict
     selected_anchor = action.get("selected_anchor") if isinstance(action.get("selected_anchor"), dict) else {}
     readiness = action.get("answer_readiness") if isinstance(action.get("answer_readiness"), dict) else {}
     scanner_ready = readiness.get("scanner_coverage_answer_allowed", readiness.get("answer_allowed"))
-    if not selected_anchor or scanner_ready is not True:
+    opened_followthrough_ready = (
+        _ask_answer_can_follow_raw_proof_despite_status(
+            action=action,
+            route_family="latest_status",
+        )
+        and _latest_status_post_anchor_interval_final_proof_gate(
+            action=action,
+            opened=opened,
+        ).get("status")
+        == "answer_allowed"
+    )
+    if not selected_anchor or (scanner_ready is not True and not opened_followthrough_ready):
         return None
     anchor_text = str(selected_anchor.get("snippet") or selected_anchor.get("text") or "").strip()
     anchor_time = str(selected_anchor.get("timestamp_utc") or selected_anchor.get("local_timestamp") or "").strip()
