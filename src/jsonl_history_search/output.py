@@ -750,13 +750,14 @@ def _render_method_selection_packet_text(packet: dict) -> list[str]:
         f"- schema_version: {packet.get('schema_version')}",
         f"- route_family: {packet.get('route_family')}",
         f"- method_id: {packet.get('method_id')}",
-        f"- first_command: {packet.get('first_command')}",
         f"- cap_language_required: {packet.get('cap_language_required')}",
         f"- single_flight_policy: {packet.get('single_flight_policy')}",
         f"- secondary_policy: {packet.get('secondary_policy')}",
         f"- stop_rule: {packet.get('stop_rule')}",
         f"- continue_only_if: {packet.get('continue_only_if')}",
     ]
+    if packet.get("first_command"):
+        lines.insert(4, f"- first_command: {packet.get('first_command')}")
     for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
         values = packet.get(field) or []
         lines.append(f"- {field}:")
@@ -882,6 +883,8 @@ def render_ask_execute_text(payload: dict) -> str:
     lines.append(f"Command resolution: {resolution.get('mode') or 'unresolved'}")
     packet = route.get("method_selection_packet") or {}
     if packet:
+        if single_flight:
+            packet = {key: value for key, value in packet.items() if key != "first_command"}
         lines.extend(_render_method_selection_packet_text(packet))
     if execution.get("report_written"):
         lines.append(f"Report written: {execution.get('report_written')}")
@@ -1064,6 +1067,8 @@ def render_ask_execute_markdown(payload: dict) -> str:
     lines.append(f"- Command resolution: `{resolution.get('mode') or 'unresolved'}`")
     packet = route.get("method_selection_packet") or {}
     if packet:
+        if single_flight:
+            packet = {key: value for key, value in packet.items() if key != "first_command"}
         lines.extend(_render_method_selection_packet_markdown(packet))
     if execution.get("report_written"):
         lines.append(f"- Report written: `{execution.get('report_written')}`")
@@ -1186,7 +1191,10 @@ def _ask_execute_single_flight_contract(action: dict) -> dict:
         return {}
     if contract.get("route_already_executed") is not True:
         return {}
-    if action.get("answer_status") != "answer-ready-after-source-inspection":
+    if (
+        action.get("answer_status") != "answer-ready-after-source-inspection"
+        and action.get("promotion_status") != "directional_history_reads_required"
+    ):
         return {}
     if not action.get("read"):
         return {}
@@ -2070,13 +2078,14 @@ def _render_method_selection_packet_markdown(packet: dict) -> list[str]:
         f"- `schema_version`: `{packet.get('schema_version')}`",
         f"- `route_family`: `{packet.get('route_family')}`",
         f"- `method_id`: `{packet.get('method_id')}`",
-        f"- `first_command`: `{packet.get('first_command')}`",
         f"- `cap_language_required`: `{packet.get('cap_language_required')}`",
         f"- `single_flight_policy`: {packet.get('single_flight_policy')}",
         f"- `secondary_policy`: {packet.get('secondary_policy')}",
         f"- `stop_rule`: {packet.get('stop_rule')}",
         f"- `continue_only_if`: {packet.get('continue_only_if')}",
     ]
+    if packet.get("first_command"):
+        lines.insert(6, f"- `first_command`: `{packet.get('first_command')}`")
     for field in ("forbidden_first_moves", "required_surfaces", "read_order"):
         values = packet.get(field) or []
         lines.append(f"- `{field}`:")

@@ -1835,6 +1835,7 @@ def build_directional_history_reconstruction(
         list(window_action.get("argv") or []),
         before=max(0, source_line - 1),
         after=0,
+        mode="before",
     )
     during_argv = list(window_action.get("argv") or [])
     after_argv = list((next_action or window_action).get("argv") or [])
@@ -1918,18 +1919,33 @@ def build_directional_history_reconstruction(
 
 
 def _directional_stage(*, phase: str, action: str, argv: list[str], requires: list[str]) -> dict[str, Any]:
+    command_argv = list(argv)
+    if command_argv and command_argv[0] != "jsonl-history-search":
+        command_argv.insert(0, "jsonl-history-search")
     return {
         "phase": phase,
         "action": action,
         "argv": argv,
-        "command": " ".join(shlex.quote(str(part)) for part in argv),
+        "command": " ".join(shlex.quote(str(part)) for part in command_argv),
         "requires": requires,
         "produces": f"{phase}_evidence_inspected",
     }
 
 
-def _directional_window_argv(argv: list[str], *, before: int, after: int) -> list[str]:
+def _directional_window_argv(
+    argv: list[str],
+    *,
+    before: int,
+    after: int,
+    mode: str | None = None,
+) -> list[str]:
     result = list(argv)
+    if mode is not None:
+        if "--mode" in result:
+            result[result.index("--mode") + 1] = mode
+        else:
+            insert_at = result.index("--format") if "--format" in result else len(result)
+            result[insert_at:insert_at] = ["--mode", mode]
     for option, value in (("--before", before), ("--after", after)):
         if option in result:
             result[result.index(option) + 1] = str(value)

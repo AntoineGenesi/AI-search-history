@@ -6269,6 +6269,10 @@ def _answer_action_contract_from_executed_output(
             "causal_history",
             "topic_history",
         }:
+            directional_reads = directional.get("stages") or []
+            continue_only_if = [
+                "a named required causal role or before/during/after phase remains missing"
+            ]
             return {
                 "answer_status": directional.get("status"),
                 "promotion_status": "directional_history_reads_required",
@@ -6276,10 +6280,21 @@ def _answer_action_contract_from_executed_output(
                     "The selected history route requires its ordered directional source reads before synthesis."
                 ),
                 "directional_history_reconstruction": directional,
-                "read": directional.get("stages") or [],
+                "read": directional_reads,
                 "answer_gate": directional.get("answer_gate"),
                 "stop": directional.get("stop_rule"),
-                "only_continue_if": "A named required causal role or before/during/after phase remains missing.",
+                "only_continue_if": continue_only_if,
+                "single_flight_contract": {
+                    "schema_version": 1,
+                    "status": "route_executed_ordered_directional_reads_next",
+                    "route_already_executed": True,
+                    "default_action": "run_ordered_directional_reads_without_rerunning_route",
+                    "selected_primary_read_count": len(directional_reads),
+                    "selected_primary_reads": directional_reads,
+                    "do_not_rerun": ["ask --execute", "direct semantic-debug"],
+                    "continue_only_if": continue_only_if,
+                    "stop_rule": directional.get("stop_rule"),
+                },
                 "saved_report": compact.get("report_written"),
             }
         handoff = compact.get("answer_ready_handoff") or {}
