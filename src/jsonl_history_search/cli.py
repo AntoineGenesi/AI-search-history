@@ -2482,12 +2482,22 @@ def _remembered_instruction_context_from_report(report_output: str) -> dict:
     if not isinstance(packet, dict):
         return {}
     scope = packet.get("scope") if isinstance(packet.get("scope"), dict) else {}
+    candidates = [
+        {
+            "candidate_id": str(item.get("candidate_id") or ""),
+            "timestamp_utc": item.get("timestamp_utc"),
+            "role": item.get("role"),
+            "snippet": str(item.get("snippet") or ""),
+            "source_ref": item.get("source_ref") or {},
+        }
+        for item in packet.get("strongest_candidates") or []
+        if isinstance(item, dict) and item.get("candidate_id")
+    ]
     return {
         "candidate_snippets": {
-            str(item.get("candidate_id") or ""): str(item.get("snippet") or "")
-            for item in packet.get("strongest_candidates") or []
-            if isinstance(item, dict) and item.get("candidate_id")
+            item["candidate_id"]: item["snippet"] for item in candidates
         },
+        "candidates": candidates,
         "searched_scope": (
             scope.get("searched_scope")
             if isinstance(scope.get("searched_scope"), dict)
@@ -5526,8 +5536,14 @@ def _remembered_instruction_user_authored_reads(
     *,
     query: str = "",
     candidate_snippets: dict[str, str] | None = None,
+    chronology_boundary: dict | None = None,
 ) -> list[dict]:
     reads: list[dict] = []
+    selected_candidate_id = str(
+        (chronology_boundary or {}).get("selected_prior_candidate_id") or ""
+    )
+    if not selected_candidate_id:
+        return reads
     topic_terms = _remembered_user_wording_topic_terms(query) - {
         "change",
         "continue",
@@ -5536,6 +5552,8 @@ def _remembered_instruction_user_authored_reads(
     }
     for item in contract.get("read") or []:
         if not isinstance(item, dict):
+            continue
+        if str(item.get("candidate_id") or "") != selected_candidate_id:
             continue
         if not _remembered_user_wording_recovery_ref_allowed(item):
             continue
@@ -5572,11 +5590,114 @@ def _remembered_instruction_user_authored_reads(
     return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
 
 
+def _remembered_instruction_chronology_boundary(
+    *,
+    query: str,
+    candidates: list[dict],
+) -> dict:
+    query_text = _simple_normalize(query)
+    if not query_text:
+        return {"status": "missing_current_query_boundary"}
+
+    normalized: list[dict] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("candidate_id") or "")
+        timestamp = parse_datetime(candidate.get("timestamp_utc"), timezone.utc)
+        role = str(candidate.get("role") or "").casefold()
+        snippet = str(candidate.get("snippet") or "")
+        if not candidate_id or timestamp is None or role not in {"user", "human"}:
+            continue
+        normalized.append(
+            {
+                "candidate_id": candidate_id,
+                "timestamp": timestamp.astimezone(timezone.utc),
+                "snippet": snippet,
+                "source_identity": str(
+                    (candidate.get("source_ref") or {}).get("session")
+                    or (candidate.get("source_ref") or {}).get("path")
+                    or ""
+                ),
+            }
+        )
+
+    current_query_boundaries = [
+        candidate
+        for candidate in normalized
+        if query_text in _simple_normalize(candidate["snippet"])
+    ]
+    if len(current_query_boundaries) != 1:
+        return {
+            "status": (
+                "missing_current_query_boundary"
+                if not current_query_boundaries
+                else "ambiguous_current_query_boundary"
+            ),
+            "current_query_boundary_count": len(current_query_boundaries),
+        }
+
+    boundary = current_query_boundaries[0]
+    topic_terms = _remembered_user_wording_topic_terms(query) - {
+        "change",
+        "continue",
+        "context",
+        "using",
+    }
+    prior_candidates = []
+    for candidate in normalized:
+        if candidate["candidate_id"] == boundary["candidate_id"]:
+            continue
+        if candidate["timestamp"] >= boundary["timestamp"]:
+            continue
+        if not candidate["source_identity"] or not boundary["source_identity"]:
+            continue
+        if candidate["source_identity"] == boundary["source_identity"]:
+            continue
+        candidate_terms = {
+            _remembered_user_wording_stem(term)
+            for term in re.findall(
+                r"[a-z0-9][a-z0-9_-]{2,}",
+                candidate["snippet"].casefold(),
+            )
+        }
+        if topic_terms and not topic_terms.intersection(candidate_terms):
+            continue
+        if _remembered_user_wording_prompt_echo_reasons(
+            {"summary": candidate["snippet"]},
+            query=query,
+        ):
+            continue
+        prior_candidates.append(candidate)
+
+    if len(prior_candidates) != 1:
+        return {
+            "status": (
+                "missing_unique_prior_candidate"
+                if not prior_candidates
+                else "ambiguous_prior_candidates"
+            ),
+            "current_query_boundary_candidate_id": boundary["candidate_id"],
+            "eligible_prior_candidate_count": len(prior_candidates),
+        }
+    return {
+        "status": "established",
+        "basis": (
+            "unique_user_topic_candidate_strictly_before_exact_current_query_echo_"
+            "and_outside_its_source_session"
+        ),
+        "current_query_boundary_candidate_id": boundary["candidate_id"],
+        "selected_prior_candidate_id": prior_candidates[0]["candidate_id"],
+        "eligible_prior_candidate_count": 1,
+    }
+
+
 def _remembered_instruction_diagnostic_reads(
     contract: dict,
     *,
     query: str = "",
     candidate_snippets: dict[str, str] | None = None,
+    chronology_boundary: dict | None = None,
 ) -> list[dict]:
     diagnostics = list(contract.get("diagnostics_after") or [])
     for item in contract.get("read") or []:
@@ -5586,6 +5707,7 @@ def _remembered_instruction_diagnostic_reads(
             {"read": [item]},
             query=query,
             candidate_snippets=candidate_snippets,
+            chronology_boundary=chronology_boundary,
         ):
             continue
         diagnostic = dict(item)
@@ -6635,10 +6757,26 @@ def _answer_action_contract_from_executed_output(
                 for item in compact.get("strongest_candidates") or []
                 if isinstance(item, dict) and item.get("candidate_id")
             }
+            remembered_candidates = list(remembered_context.get("candidates") or []) or [
+                {
+                    "candidate_id": str(item.get("candidate_id") or ""),
+                    "timestamp_utc": item.get("timestamp_utc"),
+                    "role": item.get("role"),
+                    "snippet": str(item.get("snippet") or ""),
+                    "source_ref": item.get("source_ref") or {},
+                }
+                for item in compact.get("strongest_candidates") or []
+                if isinstance(item, dict) and item.get("candidate_id")
+            ]
+            chronology_boundary = _remembered_instruction_chronology_boundary(
+                query=query,
+                candidates=remembered_candidates,
+            )
             remembered_user_reads = _remembered_instruction_user_authored_reads(
                 contract,
                 query=query,
                 candidate_snippets=candidate_snippets,
+                chronology_boundary=chronology_boundary,
             )
             contract["receiving_agent_workflow"] = {
                 "mode": "history_answer_only",
@@ -6661,6 +6799,7 @@ def _answer_action_contract_from_executed_output(
                     contract,
                     query=query,
                     candidate_snippets=candidate_snippets,
+                    chronology_boundary=chronology_boundary,
                 )
                 contract["promotion_status"] = "remembered_instruction_user_authored_source_selected"
                 contract["source_inspection_boundary"] = {
@@ -6669,12 +6808,14 @@ def _answer_action_contract_from_executed_output(
                     "required_primary_proof_source": "user_authored_history_row",
                     "assistant_tool_current_or_prior_answer_echoes_default_final_support": False,
                     "diagnostics_default_final_support": False,
+                    "remembered_instruction_chronology_boundary": chronology_boundary,
                 }
             else:
                 diagnostic_reads = _remembered_instruction_diagnostic_reads(
                     contract,
                     query=query,
                     candidate_snippets=candidate_snippets,
+                    chronology_boundary=chronology_boundary,
                 )
                 contract["answer_status"] = "not-ready/missing-user-authored-remembered-instruction"
                 contract["promotion_status"] = "remembered_instruction_user_authored_source_missing"
@@ -6690,6 +6831,7 @@ def _answer_action_contract_from_executed_output(
                     "ask_user_now": False,
                     "missing_primary_evidence": "user-authored conversation-history row for the remembered constraint",
                     "secondary_substitution_allowed": False,
+                    "remembered_instruction_chronology_boundary": chronology_boundary,
                     "diagnostic_surfaces": [
                         "assistant/tool/runtime echoes",
                         "benchmark prompts or prior lane outputs",
@@ -10507,7 +10649,7 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:(?:the|an?|a)\b.{0,160}\b)?"
-    r"(evaluator|implementer|re-?reviewer|reviewer|worker|coordinator|read-only\b.{0,80}\b(?:agent|slice))\b",
+    r"(implementer|re-?reviewer|reviewer|worker|coordinator|read-only\b.{0,80}\b(?:agent|slice))\b",
     re.IGNORECASE | re.DOTALL,
 )
 _QUOTED_STATUS_BOUNDARY_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")
@@ -16528,20 +16670,20 @@ def _remembered_user_wording_prompt_echo_reasons(item: dict, *, query: str) -> l
     raw_text = str(item.get("summary") or "")
     text = raw_text.casefold()
     shared_echo = setup_echo_classification(raw_text, query=query)
-    reasons: list[str] = []
-    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(raw_text):
-        reasons.append("assignment_or_review_scaffolding")
-    for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
-        if marker in text:
-            reasons.append(f"prompt_echo_marker:{marker}")
-    if shared_echo.get("explicit_prompt_scaffold_query") and not reasons:
+    if shared_echo.get("explicit_prompt_scaffold_query"):
         return []
+    reasons: list[str] = []
     query_text = str(query or "").strip().casefold()
     if query_text and query_text in text:
         reasons.append("contains_current_ask_query_text")
+    if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(raw_text):
+        reasons.append("assignment_or_review_scaffolding")
     if shared_echo.get("is_setup_echo"):
         reason = str(shared_echo.get("reason") or "setup_echo")
         reasons.append(f"setup_echo:{reason}")
+    for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
+        if marker in text:
+            reasons.append(f"prompt_echo_marker:{marker}")
     return _unique_preserving_order(reasons)
 
 
