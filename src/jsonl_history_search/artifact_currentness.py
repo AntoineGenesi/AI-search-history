@@ -132,14 +132,21 @@ STOP_WORDS = {
 
 
 def build_artifact_currentness_payload(args: Any) -> dict:
-    cwd = Path(args.cwd).expanduser().resolve()
+    requested_cwd = Path(args.cwd).expanduser().resolve()
     query = str(getattr(args, "artifact_or_query", "") or "").strip()
+    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
+    cwd, workspace_resolution = _resolve_cleanup_workspace(
+        query=query,
+        requested_cwd=requested_cwd,
+        codex_home=codex_home,
+        max_files=min(getattr(args, "max_files", 200) or 200, 50),
+    )
     started = time.monotonic()
     latest_limit = min(getattr(args, "max_matches", 40) or 40, 8)
     latest = {}
     try:
         latest = latest_user_messages(
-            codex_home=Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex",
+            codex_home=codex_home,
             default_tz=_timezone_from_args(args),
             limit=latest_limit,
             max_files=min(getattr(args, "max_files", 200) or 200, 50),
@@ -149,14 +156,131 @@ def build_artifact_currentness_payload(args: Any) -> dict:
         )
     except Exception as exc:  # pragma: no cover - defensive around optional local history shapes.
         latest = {"messages": [], "warnings": [f"latest-user-messages unavailable: {exc}"]}
-    return {
-        "artifact_currentness": artifact_currentness_report(
-            query=query,
-            cwd=cwd,
-            latest=latest,
-            started=started,
-        )
+    report = artifact_currentness_report(
+        query=query,
+        cwd=cwd,
+        latest=latest,
+        started=started,
+    )
+    report["workspace_resolution"] = workspace_resolution
+    return {"artifact_currentness": report}
+
+
+def _resolve_cleanup_workspace(
+    *,
+    query: str,
+    requested_cwd: Path,
+    codex_home: Path,
+    max_files: int,
+) -> tuple[Path, dict]:
+    base = {
+        "status": "requested_workspace_used",
+        "requested_cwd": str(requested_cwd),
+        "resolved_cwd": str(requested_cwd),
+        "source_role": "workspace_navigation",
+        "causal_proof_allowed": False,
     }
+    if not is_worktree_cleanup_currentness_query(query) or _has_local_cleanup_surface(requested_cwd):
+        return requested_cwd, base
+
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.is_dir():
+        return requested_cwd, {**base, "status": "historical_workspace_not_found"}
+    session_paths = sorted(
+        sessions_root.rglob("*.jsonl"),
+        key=lambda path: _mtime(path),
+        reverse=True,
+    )[:max_files]
+    for session_path in session_paths:
+        for line_number, candidate in _session_workspace_candidates(session_path):
+            for root in _git_checkout_roots(candidate):
+                if not _query_names_checkout(query, root):
+                    continue
+                return root, {
+                    **base,
+                    "status": "historical_session_workspace_recovered",
+                    "resolved_cwd": str(root),
+                    "navigation_source": f"codex_session_metadata:{session_path.name}:{line_number}",
+                    "boundary": (
+                        "Session cwd metadata resolved the checkout only; it is navigation, not cleanup-causality proof."
+                    ),
+                }
+    return requested_cwd, {**base, "status": "historical_workspace_not_found"}
+
+
+def _has_local_cleanup_surface(cwd: Path) -> bool:
+    if any((cwd / path).exists() for path in ("reports", "tasks", "docs", "codex/state", "TODO.md", "TASKS.md")):
+        return True
+    result = _run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])
+    return result.returncode == 0
+
+
+def _session_workspace_candidates(path: Path) -> list[tuple[int, Path]]:
+    candidates: list[tuple[int, Path]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if line_number > 12:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                for value in (row.get("cwd"), payload.get("cwd")):
+                    if isinstance(value, str) and value.strip():
+                        candidates.append((line_number, Path(value).expanduser()))
+    except OSError:
+        return []
+    return candidates
+
+
+def _git_checkout_roots(candidate: Path) -> list[Path]:
+    roots: list[Path] = []
+    top = _run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"])
+    if top.returncode != 0:
+        return roots
+    top_path = Path(top.stdout.strip()).resolve()
+    roots.append(top_path)
+    common = _run(["git", "-C", str(candidate), "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if common.returncode == 0:
+        common_path = Path(common.stdout.strip()).resolve()
+        parent_checkout = common_path.parent if common_path.name == ".git" else None
+        if parent_checkout and parent_checkout not in roots:
+            roots.append(parent_checkout)
+    return roots
+
+
+def _query_names_checkout(query: str, root: Path) -> bool:
+    query_tokens = set(re.findall(r"[a-z0-9]+", query.casefold()))
+    root_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", root.name.casefold())
+        if len(token) >= 3
+    }
+    return len(root_tokens) >= 2 and root_tokens <= query_tokens
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr=str(exc))
 
 
 def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = None, started: float | None = None) -> dict:

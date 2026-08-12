@@ -186,6 +186,7 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
             target,
             evidence_files,
             cleanup_causality.get("operational_records") or [],
+            default_branch=branch_state.get("default_branch"),
         )
         for target in selected
     ]
@@ -338,10 +339,20 @@ def _discover_branch_state(cwd: Path) -> dict:
             "source": "git_for_each_ref",
             "branch_count": 0,
         }
+    default_branch = next(
+        (
+            candidate
+            for candidate in ("master", "main")
+            if _run(["git", "-C", str(cwd), "rev-parse", "--verify", "--quiet", candidate], timeout=5).returncode
+            == 0
+        ),
+        None,
+    )
     return {
         "status": "ok",
         "source": "git_for_each_ref",
         "branch_count": len([line for line in result.stdout.splitlines() if line.strip()]),
+        "default_branch": default_branch,
     }
 
 
@@ -406,6 +417,8 @@ def _classify_target(
     target: dict,
     evidence_files: list[Path],
     operational_records: list[dict] | None = None,
+    *,
+    default_branch: str | None = None,
 ) -> dict:
     identifier = _target_identifier(target)
     slug = _target_slug(identifier, target)
@@ -418,7 +431,7 @@ def _classify_target(
     evidence = [] if named_missing_cleanup_target else _scan_evidence(cwd, evidence_files, tokens)
     if _is_cleanup_causality_query(query):
         evidence = _dedupe_evidence(evidence + list(operational_records or []))
-    status = _worktree_status(target)
+    status = _worktree_status(target, cwd=cwd, default_branch=default_branch)
     private = _private_artifact_summary(target)
     classification, why, secondary = _classification_from_evidence(target, evidence, status, private)
     archive_root = f".private/worktree-cleanup-archive/{slug}"
@@ -721,6 +734,11 @@ def _finish_cleanup_causality_report(
                 "classified_targets": [item.get("path") or item.get("identifier") for item in items],
             },
             "causality_currentness_boundary": _cleanup_causality_currentness_boundary(),
+            "current_state_summary": _cleanup_current_state_summary(
+                items,
+                worktrees,
+                branch_state,
+            ),
         }
     )
     report["facet_coverage"] = _cleanup_facet_coverage(report)
@@ -1059,17 +1077,102 @@ def _source_roles_present(cleanup_causality: dict, items: list[dict]) -> list[st
     return [role for role in ("operational_record", "git_state", "private_retention_evidence", "raw_agent_behavior") if role in roles]
 
 
-def _worktree_status(target: dict) -> dict:
+def _cleanup_current_state_summary(
+    items: list[dict],
+    worktrees: list[dict],
+    branch_state: dict,
+) -> dict:
+    dirty = [item for item in items if (item.get("status") or {}).get("dirty")]
+    retained_private = [
+        item
+        for item in items
+        if (item.get("private_artifacts") or {}).get("has_private_artifacts")
+    ]
+    not_reachable = [
+        item
+        for item in items
+        if (item.get("status") or {}).get("default_branch_reachability") == "not_reachable"
+    ]
+    clean_reachable = [
+        item
+        for item in items
+        if not (item.get("status") or {}).get("dirty")
+        and (item.get("status") or {}).get("default_branch_reachability") == "reachable"
+    ]
+
+    def identifiers(rows: list[dict]) -> list[str]:
+        return [
+            str(item.get("branch") or item.get("path") or item.get("identifier") or "")
+            for item in rows
+            if item.get("branch") or item.get("path") or item.get("identifier")
+        ]
+
+    return {
+        "phase": "current_state_after_historical_causality",
+        "source_role": "git_state",
+        "causal_proof_allowed": False,
+        "registered_worktree_count": len(worktrees),
+        "linked_task_worktree_count": len(items),
+        "dirty_worktree_count": len(dirty),
+        "dirty_worktrees": identifiers(dirty),
+        "private_retention_worktree_count": len(retained_private),
+        "private_retention_worktrees": identifiers(retained_private),
+        "not_reachable_from_default_count": len(not_reachable),
+        "not_reachable_from_default": identifiers(not_reachable),
+        "clean_reachable_manual_closeout_debt_count": len(clean_reachable),
+        "clean_reachable_manual_closeout_debt": identifiers(clean_reachable),
+        "default_branch": branch_state.get("default_branch"),
+        "interpretation": (
+            "Dirty, private-retention, and not-reachable worktrees are current blockers; clean reachable "
+            "worktrees that remain registered are manual closeout debt, not evidence of automatic cleanup."
+        ),
+    }
+
+
+def _worktree_status(
+    target: dict,
+    *,
+    cwd: Path,
+    default_branch: str | None,
+) -> dict:
     path = target.get("path")
     if not path:
-        return {"available": False, "dirty": False, "short": [], "branch_line": ""}
+        return {
+            "available": False,
+            "dirty": False,
+            "short": [],
+            "branch_line": "",
+            "default_branch_reachability": "unknown",
+        }
     result = _run(["git", "-C", path, "status", "--short", "--branch"], timeout=5)
     if result.returncode != 0:
-        return {"available": False, "dirty": False, "short": [], "branch_line": "", "error": _compact(result.stderr)}
+        return {
+            "available": False,
+            "dirty": False,
+            "short": [],
+            "branch_line": "",
+            "default_branch_reachability": "unknown",
+            "error": _compact(result.stderr),
+        }
     lines = result.stdout.splitlines()
     branch_line = lines[0] if lines and lines[0].startswith("##") else ""
     short = [line for line in lines if not line.startswith("##")]
-    return {"available": True, "dirty": bool(short), "short": short[:12], "branch_line": branch_line}
+    reachability = "unknown"
+    head = str(target.get("head") or "")
+    if default_branch and head:
+        reachability_result = _run(
+            ["git", "-C", str(cwd), "merge-base", "--is-ancestor", head, default_branch],
+            timeout=5,
+        )
+        reachability = "reachable" if reachability_result.returncode == 0 else "not_reachable"
+    return {
+        "available": True,
+        "dirty": bool(short),
+        "short": short[:12],
+        "branch_line": branch_line,
+        "default_branch_reachability": reachability,
+        "default_branch": default_branch,
+    }
 
 
 def _private_artifact_summary(target: dict) -> dict:

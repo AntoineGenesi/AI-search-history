@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from .agent_contract import source_ref_target
 from .metric_contract import TOKEN_FORMULA
@@ -1216,11 +1216,14 @@ def _append_answer_handoff_text(lines: list[str], handoff: object) -> None:
     )
     if handoff.get("answer"):
         lines.append(f"- answer: {handoff.get('answer')}")
+    source_root = _answer_handoff_source_root(handoff)
+    if source_root:
+        lines.append(f"- validated source root: {source_root}")
     refs = handoff.get("refs_used") or []
     if refs:
         lines.append("- validated refs:")
         for item in refs[:4]:
-            lines.append(f"  - {item.get('target')}")
+            lines.append(f"  - {_answer_handoff_openable_target(item, source_root)}")
 
 
 def _append_answer_handoff_markdown(lines: list[str], handoff: object) -> None:
@@ -1236,11 +1239,35 @@ def _append_answer_handoff_markdown(lines: list[str], handoff: object) -> None:
     )
     if handoff.get("answer"):
         lines.extend(["", str(handoff.get("answer"))])
+    source_root = _answer_handoff_source_root(handoff)
+    if source_root:
+        lines.extend(["", f"Validated source root: `{source_root}`"])
     refs = handoff.get("refs_used") or []
     if refs:
         lines.extend(["", "Validated refs:"])
         for item in refs[:4]:
-            lines.append(f"- `{item.get('target')}`")
+            target = _answer_handoff_openable_target(item, source_root)
+            lines.append(f"- [`{item.get('target')}`](<{target}>)")
+
+
+def _answer_handoff_source_root(handoff: dict) -> str:
+    value = str(handoff.get("cwd") or "").strip()
+    return str(Path(value).expanduser()) if value else ""
+
+
+def _answer_handoff_openable_target(item: object, source_root: str) -> str:
+    if not isinstance(item, dict):
+        return ""
+    target = str(item.get("openable_target") or item.get("target") or "").strip()
+    if not target or not source_root:
+        return target
+    match = re.match(r"^(.+):(\d+)$", target)
+    path_text = match.group(1) if match else target
+    suffix = f":{match.group(2)}" if match else ""
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = Path(source_root) / path
+    return f"{path.resolve()}{suffix}"
 
 
 def _append_artifact_currentness_execute_text(lines: list[str], executed: dict) -> None:
