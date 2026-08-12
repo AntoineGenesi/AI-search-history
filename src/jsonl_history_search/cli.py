@@ -2348,6 +2348,8 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         query=route.get("structured_execution_query") or args.query,
         audit_depth_override=_selected_route_audit_depth_label(selected_route),
     )
+    if route.get("route_family") == "remembered_instruction":
+        execution_args.role = "user"
     if execution_kind == "what-happened-since" and _looks_like_parent_main_complete_interval_status_query(
         _normalize_ask_route_text(str(route.get("structured_execution_query") or args.query))
     ):
@@ -2445,9 +2447,15 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     )
     contract["ask_execute"]["execution_status"] = "executed"
     contract["ask_execute"]["executed_output"] = _compact_executed_output_for_ask(output_key=output_key, compact=compact)
+    action_compact = compact
+    if route.get("route_family") == "remembered_instruction":
+        action_compact = dict(compact)
+        action_compact["_remembered_instruction_report_context"] = (
+            _remembered_instruction_context_from_report(report_output)
+        )
     contract["ask_execute"]["answer_action_contract"] = _answer_action_contract_from_executed_output(
         output_key=output_key,
-        compact=compact,
+        compact=action_compact,
         selected_route=selected_route,
         query=args.query,
         cwd=cwd,
@@ -2463,6 +2471,36 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
     ):
         _attach_worktree_cleanup_answer_handoff(contract, cwd=Path(cwd))
     return contract
+
+
+def _remembered_instruction_context_from_report(report_output: str) -> dict:
+    try:
+        payload = json.loads(Path(report_output).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    packet = payload.get("semantic_debug") if isinstance(payload, dict) else None
+    if not isinstance(packet, dict):
+        return {}
+    scope = packet.get("scope") if isinstance(packet.get("scope"), dict) else {}
+    return {
+        "candidate_snippets": {
+            str(item.get("candidate_id") or ""): str(item.get("snippet") or "")
+            for item in packet.get("strongest_candidates") or []
+            if isinstance(item, dict) and item.get("candidate_id")
+        },
+        "searched_scope": (
+            scope.get("searched_scope")
+            if isinstance(scope.get("searched_scope"), dict)
+            else {}
+        ),
+        "selected_roots": list(scope.get("selected_roots") or []),
+        "excluded_root_count": int(
+            (scope.get("excluded_scope") or {}).get("rejected_root_count") or 0
+        ),
+        "missing_roots": list(
+            (scope.get("not_searched_scope") or {}).get("missing_roots") or []
+        ),
+    }
 
 
 def _is_answer_ready_worktree_cleanup_execute(args: argparse.Namespace, execution_kind: str) -> bool:
@@ -3048,6 +3086,8 @@ def _extract_bounded_auto_execute_hard_cap(query: str, kind: str) -> int | None:
 def _structured_execution_argv(args: argparse.Namespace) -> list[str]:
     argv = ["jsonl-history-search", args.command, args.query, "--cwd", args.cwd, "--format", "json"]
     _append_structured_source_contract(argv, args)
+    if getattr(args, "role", None):
+        argv.extend(["--role", str(args.role)])
     if getattr(args, "audit_depth", None):
         argv.extend(["--audit-depth", str(args.audit_depth)])
     if args.command == "what-happened-since":
@@ -5481,8 +5521,19 @@ def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_f
     }
 
 
-def _remembered_instruction_user_authored_reads(contract: dict) -> list[dict]:
+def _remembered_instruction_user_authored_reads(
+    contract: dict,
+    *,
+    query: str = "",
+    candidate_snippets: dict[str, str] | None = None,
+) -> list[dict]:
     reads: list[dict] = []
+    topic_terms = _remembered_user_wording_topic_terms(query) - {
+        "change",
+        "continue",
+        "context",
+        "using",
+    }
     for item in contract.get("read") or []:
         if not isinstance(item, dict):
             continue
@@ -5497,16 +5548,45 @@ def _remembered_instruction_user_authored_reads(contract: dict) -> list[dict]:
         if metadata.get("is_user_authored") is True or role_values.intersection(
             {"user", "human", "human_authored_user_message"}
         ):
+            candidate_text = str(
+                (candidate_snippets or {}).get(str(item.get("candidate_id") or ""))
+                or item.get("snippet")
+                or ""
+            )
+            if candidate_text and _remembered_user_wording_prompt_echo_reasons(
+                {"summary": candidate_text},
+                query=query,
+            ):
+                continue
+            if candidate_text and topic_terms:
+                candidate_terms = {
+                    _remembered_user_wording_stem(term)
+                    for term in re.findall(
+                        r"[a-z0-9][a-z0-9_-]{2,}",
+                        candidate_text.casefold(),
+                    )
+                }
+                if not topic_terms.intersection(candidate_terms):
+                    continue
             reads.append(_conversation_message_record_read(item))
     return _dedupe_action_contract_rows(reads)[:_ASK_ANSWER_MAX_REFS]
 
 
-def _remembered_instruction_diagnostic_reads(contract: dict) -> list[dict]:
+def _remembered_instruction_diagnostic_reads(
+    contract: dict,
+    *,
+    query: str = "",
+    candidate_snippets: dict[str, str] | None = None,
+) -> list[dict]:
     diagnostics = list(contract.get("diagnostics_after") or [])
     for item in contract.get("read") or []:
         if not isinstance(item, dict):
             continue
-        if _remembered_instruction_user_authored_reads({"read": [item]}):
+        if _remembered_instruction_user_authored_reads(
+            {"read": [item]},
+            query=query,
+            candidate_snippets=candidate_snippets,
+        ):
             continue
         diagnostic = dict(item)
         diagnostic["diagnostic_only"] = True
@@ -6543,7 +6623,23 @@ def _answer_action_contract_from_executed_output(
                 )
                 contract.pop("only_continue_if", None)
         if route_family == "remembered_instruction":
-            remembered_user_reads = _remembered_instruction_user_authored_reads(contract)
+            remembered_context = (
+                compact.get("_remembered_instruction_report_context")
+                if isinstance(compact.get("_remembered_instruction_report_context"), dict)
+                else {}
+            )
+            candidate_snippets = dict(
+                remembered_context.get("candidate_snippets") or {}
+            ) or {
+                str(item.get("candidate_id") or ""): str(item.get("snippet") or "")
+                for item in compact.get("strongest_candidates") or []
+                if isinstance(item, dict) and item.get("candidate_id")
+            }
+            remembered_user_reads = _remembered_instruction_user_authored_reads(
+                contract,
+                query=query,
+                candidate_snippets=candidate_snippets,
+            )
             contract["receiving_agent_workflow"] = {
                 "mode": "history_answer_only",
                 "answer_or_continue": (
@@ -6561,7 +6657,12 @@ def _answer_action_contract_from_executed_output(
             contract["stop"] = selected_route.get("stop_guidance")
             if remembered_user_reads:
                 contract["read"] = remembered_user_reads
-                contract["diagnostics_after"] = _remembered_instruction_diagnostic_reads(contract)
+                contract["diagnostics_after"] = _remembered_instruction_diagnostic_reads(
+                    contract,
+                    query=query,
+                    candidate_snippets=candidate_snippets,
+                )
+                contract["promotion_status"] = "remembered_instruction_user_authored_source_selected"
                 contract["source_inspection_boundary"] = {
                     "decision": "answer_after_user_authored_source_inspection",
                     "inspect_required_primary_proof_before_answer": True,
@@ -6570,7 +6671,11 @@ def _answer_action_contract_from_executed_output(
                     "diagnostics_default_final_support": False,
                 }
             else:
-                diagnostic_reads = _remembered_instruction_diagnostic_reads(contract)
+                diagnostic_reads = _remembered_instruction_diagnostic_reads(
+                    contract,
+                    query=query,
+                    candidate_snippets=candidate_snippets,
+                )
                 contract["answer_status"] = "not-ready/missing-user-authored-remembered-instruction"
                 contract["promotion_status"] = "remembered_instruction_user_authored_source_missing"
                 contract["promotion_reason"] = (
@@ -6591,11 +6696,50 @@ def _answer_action_contract_from_executed_output(
                         "task/report/review artifacts",
                         "current workspace state",
                     ],
+                    "bounded_evidence_checked": {
+                        "searched_files": int(
+                            (remembered_context.get("searched_scope") or {}).get(
+                                "searched_files"
+                            )
+                            or 0
+                        ),
+                        "searched_bytes": int(
+                            (remembered_context.get("searched_scope") or {}).get(
+                                "searched_bytes"
+                            )
+                            or 0
+                        ),
+                        "roots": list(remembered_context.get("selected_roots") or []),
+                        "searched_roots": list(
+                            (remembered_context.get("searched_scope") or {}).get("roots")
+                            or []
+                        ),
+                        "missing_roots": list(remembered_context.get("missing_roots") or []),
+                        "selected_root_count": len(
+                            remembered_context.get("selected_roots") or []
+                        ),
+                        "searched_root_count": len(
+                            (remembered_context.get("searched_scope") or {}).get("roots")
+                            or []
+                        ),
+                        "excluded_root_count": int(
+                            remembered_context.get("excluded_root_count") or 0
+                        ),
+                        "missing_root_count": len(
+                            remembered_context.get("missing_roots") or []
+                        ),
+                    },
+                    "broad_repo_search_allowed": False,
+                    "secondary_substitution_allowed": False,
                     "next_allowed_action": (
-                        "Use only an emitted bounded JSONL continuation or a user-role constrained history search; "
-                        "do not implement from the recovered imperative text."
+                        "Fail closed: no clean user-authored row matched the remembered instruction topic in the "
+                        "bounded selected history. Continue only after a primary history root or source anchor is "
+                        "available; do not inspect or act on secondary paraphrases."
                     ),
                 }
+                contract["only_continue_if"] = contract["missing_evidence_stop_contract"][
+                    "next_allowed_action"
+                ]
         return contract
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
@@ -10363,7 +10507,7 @@ _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS = (
 )
 _REMEMBERED_USER_WORDING_ASSIGNMENT_RE = re.compile(
     r"\byou are (?:(?:the|an?|a)\b.{0,160}\b)?"
-    r"(implementer|re-?reviewer|reviewer|worker|coordinator|read-only\b.{0,80}\b(?:agent|slice))\b",
+    r"(evaluator|implementer|re-?reviewer|reviewer|worker|coordinator|read-only\b.{0,80}\b(?:agent|slice))\b",
     re.IGNORECASE | re.DOTALL,
 )
 _QUOTED_STATUS_BOUNDARY_RE = re.compile(r"[\"'`]([^\"'`]{8,220})[\"'`]")
@@ -16384,20 +16528,20 @@ def _remembered_user_wording_prompt_echo_reasons(item: dict, *, query: str) -> l
     raw_text = str(item.get("summary") or "")
     text = raw_text.casefold()
     shared_echo = setup_echo_classification(raw_text, query=query)
-    if shared_echo.get("explicit_prompt_scaffold_query"):
-        return []
     reasons: list[str] = []
-    query_text = str(query or "").strip().casefold()
-    if query_text and query_text in text:
-        reasons.append("contains_current_ask_query_text")
     if _REMEMBERED_USER_WORDING_ASSIGNMENT_RE.search(raw_text):
         reasons.append("assignment_or_review_scaffolding")
-    if shared_echo.get("is_setup_echo"):
-        reason = str(shared_echo.get("reason") or "setup_echo")
-        reasons.append(f"setup_echo:{reason}")
     for marker in _REMEMBERED_USER_WORDING_PROMPT_ECHO_MARKERS:
         if marker in text:
             reasons.append(f"prompt_echo_marker:{marker}")
+    if shared_echo.get("explicit_prompt_scaffold_query") and not reasons:
+        return []
+    query_text = str(query or "").strip().casefold()
+    if query_text and query_text in text:
+        reasons.append("contains_current_ask_query_text")
+    if shared_echo.get("is_setup_echo"):
+        reason = str(shared_echo.get("reason") or "setup_echo")
+        reasons.append(f"setup_echo:{reason}")
     return _unique_preserving_order(reasons)
 
 
