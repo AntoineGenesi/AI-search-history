@@ -18,6 +18,7 @@ from .real_history_post_jsh763_date_timeline_diagnostic import (
     render_post_jsh763_date_timeline_diagnostic_text,
 )
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
+from .status_anchor import parent_thread_interval_continuation_packet
 
 
 SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE = re.compile(
@@ -5424,6 +5425,8 @@ def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
 
 
 def _status_anchor_needs_clarification(report: dict) -> bool:
+    if parent_thread_interval_continuation_packet(report):
+        return False
     source_tiers = report.get("source_tiers") or {}
     structured_continuation_available = any(
         read.get("read_more_command")
@@ -5642,6 +5645,16 @@ def render_status_anchor_text(payload: dict) -> str:
 
 def render_status_anchor_answer(payload: dict) -> str:
     report = payload["status_anchor"]
+    continuation_packet = parent_thread_interval_continuation_packet(report)
+    if continuation_packet:
+        return "\n".join(
+            [
+                "NOT ANSWERABLE YET",
+                "CANONICAL CONTINUATION PACKET",
+                json.dumps(continuation_packet, ensure_ascii=True, sort_keys=True),
+                "answer_ready=false",
+            ]
+        )
     if _status_anchor_needs_clarification(report):
         return _render_status_anchor_clarification_text(report)
     if not _status_anchor_answer_format_ready(report):

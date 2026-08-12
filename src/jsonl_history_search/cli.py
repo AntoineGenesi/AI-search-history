@@ -3011,6 +3011,7 @@ def _execution_args_from_ask(
             "query": query if query is not None else args.query,
             "format": "json",
             "report_output": report_output,
+            "receiver_answer_mode": bool(getattr(args, "answer", False)),
         }
     )
     if audit_depth_override is not None:
@@ -6116,6 +6117,7 @@ def _answer_action_contract_from_executed_output(
         source_tiers = compact.get("source_tiers") or {}
         answer_readiness = compact.get("answer_readiness") or {}
         latest_followthrough = _latest_status_followthrough_contract(compact)
+        continuation_packet = compact.get("parent_thread_interval_continuation") or {}
         answer_allowed = bool(
             answer_readiness.get("scanner_coverage_answer_allowed", answer_readiness.get("answer_allowed"))
         )
@@ -6126,12 +6128,16 @@ def _answer_action_contract_from_executed_output(
             read_contract = (compact.get("follow_through_plan") or {}).get("open_first") or compact.get("next_reads", [])[:4]
         return {
             "answer_status": (
-                "follow-required-primary-refs-before-answer"
+                "canonical-continuation-packet-required"
+                if continuation_packet
+                else "follow-required-primary-refs-before-answer"
                 if answer_allowed
                 else "not-ready/needs-more-proof"
             ),
             "promotion_status": (
-                "latest_status_navigation_only_until_required_primary_reads"
+                "canonical_continuation_packet"
+                if continuation_packet
+                else "latest_status_navigation_only_until_required_primary_reads"
                 if answer_allowed
                 else compact.get("status")
             ),
@@ -6139,7 +6145,9 @@ def _answer_action_contract_from_executed_output(
                 "The latest-status route is executable, but a factual answer requires opened selected-anchor "
                 "and post-anchor interval raw JSONL refs before any secondary task/report/git joins."
             ),
-            "read": read_contract,
+            "read": [] if continuation_packet else read_contract,
+            "canonical_continuation_packet": continuation_packet or None,
+            "partial_evidence_rendering_allowed": False if continuation_packet else None,
             "navigation_only": latest_followthrough.get("navigation_only"),
             "answer_from_report_allowed": False,
             "required_primary_windows_opened": False,
@@ -6160,7 +6168,7 @@ def _answer_action_contract_from_executed_output(
                 "required_primary": (source_tiers.get("required_primary") or [])[:6],
                 "required_secondary": (source_tiers.get("required_secondary") or [])[:6],
             },
-            "clarification_request": compact.get("clarification_request"),
+            "clarification_request": None if continuation_packet else compact.get("clarification_request"),
             "parent_main_anchor_shortlist": compact.get("parent_main_anchor_shortlist"),
             "parent_thread_side_boundary": compact.get("parent_thread_side_boundary"),
             "follow_through_plan": compact.get("follow_through_plan"),
@@ -10634,6 +10642,7 @@ _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
         "not-ready/missing-current-named-task-proof",
         "not-ready/missing-completed-task-merge-artifact-proof",
         "not-ready/missing-raw-worker-chronology",
+        "canonical-continuation-packet-required",
         "inspect_recovery_first",
         "needs_investigation",
     }
@@ -12420,6 +12429,8 @@ def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
         return False
     if answer_status.startswith("not-ready"):
         return True
+    if answer_status == "canonical-continuation-packet-required":
+        return True
     if answer_status in {"cannot-answer-directly-yet", "needs_investigation"}:
         return True
     if "target-source-role-mismatch" in answer_status or "target-source-role-mismatch" in promotion_status:
@@ -13045,6 +13056,9 @@ def _scoped_no_evidence_current_repo_boundary(*, scoped: dict, cwd: Path) -> str
 
 
 def _next_proof_step_from_action(action: dict) -> object:
+    continuation_packet = action.get("canonical_continuation_packet")
+    if isinstance(continuation_packet, dict) and continuation_packet:
+        return continuation_packet
     raw_worker_chronology = action.get("raw_worker_chronology_handoff")
     if isinstance(raw_worker_chronology, dict) and raw_worker_chronology:
         required_roles = list(raw_worker_chronology.get("required_roles") or [])
