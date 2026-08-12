@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -317,13 +317,39 @@ def build_status_anchor_payload(args: Any) -> dict:
     codex_home = history_home_from_args(args, provider="codex")
     cwd = Path(args.cwd).expanduser().resolve()
     query = getattr(args, "query", None) or DEFAULT_STATUS_QUERY
+    started = time.monotonic()
     parent_thread_mode = bool(getattr(args, "parent_thread", False))
     complete_interval = bool(getattr(args, "complete_interval", False))
     receiver_answer_mode = bool(getattr(args, "receiver_answer_mode", False))
     anchor_ref = getattr(args, "anchor_ref", None)
     output_format = str(getattr(args, "format", "json") or "json")
+    answer_mode_parent_complete_interval = bool(
+        parent_thread_mode
+        and complete_interval
+        and (output_format == "answer" or receiver_answer_mode)
+    )
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
     snippet_chars = max(0, getattr(args, "snippet_chars", 280))
+    command_options = {
+        "query": query,
+        "cwd": str(cwd),
+        "codex_home": str(codex_home) if codex_home else None,
+        "max_matches": limit,
+        "parent_thread": parent_thread_mode,
+        "complete_interval": complete_interval,
+        "receiver_answer_mode": receiver_answer_mode,
+        "anchor_ref": anchor_ref,
+        "format": output_format,
+    }
+    preflight_blocker = _parent_thread_answer_mode_preflight_blocker(
+        query=query,
+        cwd=cwd,
+        codex_home=codex_home,
+        started=started,
+        command_options=command_options,
+    )
+    if preflight_blocker is not None:
+        return {"status_anchor": preflight_blocker}
     latest = latest_user_messages(
         codex_home=codex_home,
         default_tz=default_tz,
@@ -332,6 +358,7 @@ def build_status_anchor_payload(args: Any) -> dict:
         max_bytes=args.max_bytes,
         max_elapsed=args.max_elapsed,
         snippet_chars=snippet_chars,
+        collapse_canonical_duplicates=answer_mode_parent_complete_interval,
     )
     return {
         "status_anchor": status_anchor_report(
@@ -339,23 +366,601 @@ def build_status_anchor_payload(args: Any) -> dict:
             latest=latest,
             cwd=cwd,
             codex_home=codex_home,
-            started=time.monotonic(),
+            started=started,
             parent_thread_mode=parent_thread_mode,
             complete_interval=complete_interval,
             anchor_ref=anchor_ref,
-            command_options={
-                "query": query,
-                "cwd": str(cwd),
-                "codex_home": str(codex_home) if codex_home else None,
-                "max_matches": limit,
-                "parent_thread": parent_thread_mode,
-                "complete_interval": complete_interval,
-                "receiver_answer_mode": receiver_answer_mode,
-                "anchor_ref": anchor_ref,
-                "format": output_format,
-            },
+            command_options=command_options,
         )
     }
+
+
+def _parent_thread_answer_mode_preflight_blocker(
+    *,
+    query: str,
+    cwd: Path,
+    codex_home: Path | None,
+    started: float | None,
+    command_options: dict,
+) -> dict | None:
+    if not (
+        command_options.get("parent_thread")
+        and command_options.get("complete_interval")
+        and (
+            command_options.get("format") == "answer"
+            or command_options.get("receiver_answer_mode") is True
+        )
+        and not command_options.get("anchor_ref")
+        and codex_home
+    ):
+        return None
+    effective_query = _query_with_parent_thread_mode(query, True)
+    if not is_status_question(effective_query):
+        return None
+    history_path = codex_home / "history.jsonl"
+    if not history_path.is_file():
+        return None
+    rows = _canonical_history_human_rows(history_path, query=effective_query)
+    if not rows:
+        return None
+    rows = _collapse_adjacent_canonical_history_rows(rows)
+    require_exact = _requires_raw_parent_thread_boundary(effective_query)
+    boundary = _canonical_parent_main_boundary_row(
+        rows,
+        query=effective_query,
+        status_as_of_boundary=None,
+        require_exact_query=require_exact,
+    )
+    if boundary is None:
+        lineage = _fast_recover_out_of_band_parent_main_anchor(
+            rows=rows,
+            cwd=cwd,
+            codex_home=codex_home,
+        )
+        if lineage.get("status") == "selected":
+            return None
+        rejected = lineage.get("rejected_anchor_alternatives") or [
+            _lineage_rejected_anchor(
+                row,
+                {"status": "not_inspected"},
+                "canonical_status_boundary_not_found_before_broad_retrieval",
+            )
+            for row in _preflight_parent_anchor_candidate_rows(rows)[:8]
+        ]
+    else:
+        lineage = (
+            _fast_parent_thread_side_boundary_resolution(
+                rows=rows,
+                boundary=boundary,
+                query=effective_query,
+                cwd=cwd,
+                codex_home=codex_home,
+            )
+            if require_exact
+            else _fast_parent_thread_lineage_anchor_resolution(
+                rows=rows,
+                boundary=boundary,
+                cwd=cwd,
+                codex_home=codex_home,
+            )
+        )
+        if lineage.get("status") == "selected":
+            return None
+        rejected = (lineage.get("rejected_anchor_alternatives") or []) + [_occurrence_candidate(boundary)]
+    status_boundary = _canonical_parent_main_boundary(boundary) if boundary else None
+    boundary_candidate = _occurrence_candidate(boundary) if boundary else None
+    canonical_parent_main_interval = {
+        "status": "ambiguous",
+        "kind": "canonical_parent_main_status_interval",
+        "context_boundary": (
+            "explicit_parent_thread_status_boundary_missing"
+            if boundary is None
+            else "explicit_parent_thread_side_boundary_missing"
+            if require_exact
+            else "explicit_parent_main_canonical_history_anchor_missing"
+        ),
+        "anchor_reason": (
+            "canonical_parent_thread_status_boundary_not_found"
+            if boundary is None
+            else "raw_parent_thread_side_boundary_not_proven"
+            if require_exact
+            else "canonical_parent_main_preceding_anchor_not_proven"
+        ),
+        "reason": lineage.get("reason") or "machine_parent_thread_lineage_not_proven",
+        "status_as_of_boundary": status_boundary,
+        "boundary": boundary_candidate,
+        "parent_thread_side_boundary": lineage,
+        "anchor_candidates": rejected[:8],
+        "rejected_anchor_alternatives": rejected[:8],
+        "preflight_before_latest_user_messages": True,
+    }
+    anchor_decision = {
+        "context_boundary": canonical_parent_main_interval["context_boundary"],
+        "anchor_scope": "parent_thread",
+        "anchor_reason": canonical_parent_main_interval["anchor_reason"],
+        "anchor_ref": None,
+        "selected_anchor": None,
+        "rejected_anchor_alternatives": rejected[:8],
+    }
+    _, anchor_decision, parent_main_anchor_shortlist = _apply_parent_main_anchor_shortlist_contract(
+        query=effective_query,
+        selected_anchor=None,
+        anchor_decision=anchor_decision,
+        anchor_candidates=rejected[:8],
+        canonical_parent_main_interval=canonical_parent_main_interval,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
+    latest = {
+        "messages": [],
+        "source_scope": {
+            "codex_home": str(codex_home),
+            "history_path": str(history_path),
+            "preflight_only": True,
+            "latest_user_messages_scanned": False,
+        },
+        "summary": {"preflight_only": True, "latest_user_messages_scanned": False},
+        "sources": {"warnings": []},
+    }
+    parent_thread_side_boundary = canonical_parent_main_interval.get("parent_thread_side_boundary") or {
+        "status": "ambiguous",
+        "reason": canonical_parent_main_interval.get("reason"),
+    }
+    return _parent_thread_fast_machine_blocker_report(
+        original_query=query,
+        effective_query=effective_query,
+        latest=latest,
+        cwd=cwd,
+        codex_home=codex_home,
+        started=started,
+        command_options=command_options,
+        target_window=_target_window_from_query(effective_query),
+        status_as_of_boundary=status_boundary,
+        canonical_parent_main_interval=canonical_parent_main_interval,
+        canonical_parent_main_fallback=_canonical_parent_main_fallback_from_interval(canonical_parent_main_interval),
+        parent_thread_side_boundary=parent_thread_side_boundary,
+        anchor_candidates=rejected[:8],
+        anchor_decision=anchor_decision,
+        parent_main_anchor_shortlist=parent_main_anchor_shortlist,
+    )
+
+
+def _fast_parent_thread_side_boundary_resolution(
+    *,
+    rows: list[dict],
+    boundary: dict,
+    query: str,
+    cwd: Path,
+    codex_home: Path,
+) -> dict:
+    boundary_lineage = _fast_lineage_for_anchor(boundary, codex_home=codex_home, cwd=cwd)
+    if boundary_lineage.get("status") != "ok":
+        return _fast_recover_parent_thread_side_boundary_without_direct_edge(
+            rows=rows,
+            boundary=boundary,
+            query=query,
+            cwd=cwd,
+            codex_home=codex_home,
+            side_lineage=boundary_lineage,
+        )
+    parent_thread_id_hash = boundary_lineage.get("parent_thread_id_hash")
+    boundary_thread_hashes = {
+        boundary_lineage.get("session_id_hash"),
+        boundary_lineage.get("raw_thread_id_hash"),
+    } - {None}
+    if not parent_thread_id_hash or parent_thread_id_hash in boundary_thread_hashes:
+        return _fast_recover_parent_thread_side_boundary_without_direct_edge(
+            rows=rows,
+            boundary=boundary,
+            query=query,
+            cwd=cwd,
+            codex_home=codex_home,
+            side_lineage=boundary_lineage,
+        )
+    boundary_line = int(boundary.get("line") or 0)
+    parent_identifier = f"history-session-{parent_thread_id_hash}"
+    parent_rows = [
+        row
+        for row in rows
+        if int(row.get("line") or 0) < boundary_line
+        and row.get("source_identifier") == parent_identifier
+        and not _is_never_anchor(row)
+        and _is_eligible_anchor(row)
+    ]
+    parent_rows.sort(key=lambda row: int(row.get("line") or 0), reverse=True)
+    rejected = []
+    for row in parent_rows:
+        parent_lineage = _fast_lineage_for_anchor(row, codex_home=codex_home, cwd=cwd)
+        rejection = _parent_thread_lineage_rejection_reason(parent_lineage)
+        parent_hashes = {
+            parent_lineage.get("session_id_hash"),
+            parent_lineage.get("raw_thread_id_hash"),
+        } - {None}
+        if parent_lineage.get("status") != "ok" or parent_thread_id_hash not in parent_hashes or rejection:
+            rejected.append(
+                _lineage_rejected_anchor(
+                    row,
+                    parent_lineage,
+                    rejection or "side_parent_thread_id_did_not_match_candidate_session",
+                )
+            )
+            continue
+        selected = dict(row)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["side_parent_boundary_anchor"] = True
+        selected["lineage_resolution"] = parent_lineage
+        return {
+            "status": "selected",
+            "contract": "parent_thread_side_boundary",
+            "reason": "raw_side_session_parent_thread_id_matched_parent_history_session",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "selected_anchor": selected,
+            "selected_anchor_ref": selected.get("source_ref"),
+            "selected_lineage": parent_lineage,
+            "side_lineage": boundary_lineage,
+            "parent_thread_id_hash": parent_thread_id_hash,
+            "selected_session_identifier": parent_identifier,
+            "rejected_anchor_alternatives": rejected[:8],
+            "preflight_before_latest_user_messages": True,
+        }
+    return {
+        "status": "ambiguous",
+        "contract": "parent_thread_side_boundary",
+        "reason": "side_parent_thread_id_did_not_match_any_bounded_candidate_session",
+        "boundary_source_ref": boundary.get("source_ref"),
+        "side_lineage": boundary_lineage,
+        "rejected_anchor_alternatives": rejected[:8],
+        "preflight_before_latest_user_messages": True,
+    }
+
+
+def _fast_recover_out_of_band_parent_main_anchor(
+    *,
+    rows: list[dict],
+    cwd: Path,
+    codex_home: Path,
+) -> dict:
+    eligible = []
+    rejected = []
+    latest_timestamp = None
+    for row in _preflight_parent_anchor_candidate_rows(rows):
+        row_timestamp_text = str(row.get("timestamp_utc") or "")
+        if (
+            latest_timestamp is not None
+            and row_timestamp_text < latest_timestamp
+            and _eligible_parent_anchor_window_has_substantive(eligible)
+        ):
+            break
+        lineage = _fast_lineage_for_anchor(row, codex_home=codex_home, cwd=cwd)
+        if lineage.get("status") != "ok":
+            rejected.append(_lineage_rejected_anchor(row, lineage, "candidate_session_metadata_not_found"))
+            continue
+        rejection = _no_edge_parent_candidate_rejection_reason(lineage)
+        if rejection:
+            rejected.append(_lineage_rejected_anchor(row, lineage, rejection))
+            continue
+        selected = dict(row)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["side_parent_boundary_anchor"] = True
+        selected["deterministic_parent_session_recovery_anchor"] = True
+        selected["lineage_resolution"] = lineage
+        eligible.append(selected)
+        latest_timestamp = row_timestamp_text
+    if not eligible:
+        return {
+            "status": "ambiguous",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": "canonical_parent_thread_status_boundary_not_found_before_broad_retrieval",
+            "rejected_anchor_alternatives": rejected[:8],
+            "preflight_before_latest_user_messages": True,
+        }
+    selection = _select_out_of_band_parent_main_anchor(eligible)
+    if selection.get("status") == "selected":
+        selected = selection["selected_anchor"]
+        return {
+            "status": "selected",
+            "contract": "out_of_band_parent_main_anchor",
+            "reason": selection.get("reason") or "unique_latest_workspace_compatible_parent_session_recovered_without_status_boundary",
+            "selection_mode": "canonical_history_session_chronology_recovery",
+            "selected_anchor": selected,
+            "selected_anchor_ref": selected.get("source_ref"),
+            "selected_lineage": selected.get("lineage_resolution"),
+            "selected_session_identifier": str(selected.get("source_identifier") or ""),
+            "direct_parent_thread_id_available": False,
+            "eligible_parent_session_count": len(eligible),
+            "anchor_candidates": (
+                [selected]
+                + [item for item in eligible if item.get("source_ref") != selected.get("source_ref")]
+                + rejected
+            )[:8],
+            "rejected_anchor_alternatives": rejected[:8],
+            "preflight_before_latest_user_messages": True,
+        }
+    return {
+        "status": "ambiguous",
+        "contract": "out_of_band_parent_main_anchor",
+        "reason": selection.get("reason") or "out_of_band_parent_main_anchor_not_unique",
+        "eligible_parent_session_count": len(eligible),
+        "anchor_candidates": eligible[:8],
+        "rejected_anchor_alternatives": [
+            {
+                **_lineage_rejected_anchor(
+                    candidate,
+                    candidate.get("lineage_resolution") or {},
+                    "equally_latest_parent_session_candidate",
+                ),
+                "decision": "ambiguous",
+            }
+            for candidate in eligible[:8]
+        ]
+        + rejected[: max(0, 8 - len(eligible))],
+        "preflight_before_latest_user_messages": True,
+    }
+
+
+def _fast_recover_parent_thread_side_boundary_without_direct_edge(
+    *,
+    rows: list[dict],
+    boundary: dict,
+    query: str,
+    cwd: Path,
+    codex_home: Path,
+    side_lineage: dict,
+) -> dict:
+    boundary_line = int(boundary.get("line") or 0)
+    boundary_identifier = str(boundary.get("source_identifier") or "")
+    if (
+        not boundary_line
+        or boundary.get("source_kind") != "codex_history"
+        or not _requires_raw_parent_thread_boundary(query)
+        or not _canonical_row_matches_exact_status_query_boundary(boundary, query=query)
+    ):
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "canonical_side_thread_ask_not_proven_for_no_edge_recovery",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+            "preflight_before_latest_user_messages": True,
+        }
+    prior_rows = [
+        row
+        for row in _preflight_parent_anchor_candidate_rows(rows)
+        if int(row.get("line") or 0) < boundary_line
+    ]
+    side_session_identifiers = {
+        str(row.get("source_identifier") or "")
+        for row in rows
+        if int(row.get("line") or 0) < boundary_line
+        and is_status_question(str(row.get("snippet") or ""))
+        and _requires_raw_parent_thread_boundary(str(row.get("snippet") or ""))
+    } - {""}
+    eligible_sessions = []
+    rejected = []
+    inspected_sessions: set[str] = set()
+    latest_eligible_timestamp: str | None = None
+    for candidate in prior_rows:
+        candidate_timestamp = str(candidate.get("timestamp_utc") or "")
+        if latest_eligible_timestamp is not None and candidate_timestamp < latest_eligible_timestamp:
+            break
+        identifier = str(candidate.get("source_identifier") or "")
+        if not identifier or identifier == boundary_identifier or identifier in inspected_sessions:
+            continue
+        inspected_sessions.add(identifier)
+        if identifier in side_session_identifiers:
+            rejected.append(
+                _lineage_rejected_anchor(
+                    candidate,
+                    {"status": "canonical_side_thread_status_session"},
+                    "prior_side_thread_status_session_not_parent_main",
+                )
+            )
+            continue
+        lineage = _fast_lineage_for_anchor(candidate, codex_home=codex_home, cwd=cwd)
+        if lineage.get("status") != "ok":
+            rejected.append(_lineage_rejected_anchor(candidate, lineage, "candidate_session_metadata_not_found"))
+            continue
+        rejection = _no_edge_parent_candidate_rejection_reason(
+            lineage,
+            allow_unrelated_user_root=side_lineage.get("status") != "ok",
+            candidate_classification=str(candidate.get("classification") or ""),
+            candidate_has_ambiguous_session_mirror=_has_ambiguous_session_mirror(candidate),
+        )
+        if rejection:
+            rejected.append(_lineage_rejected_anchor(candidate, lineage, rejection))
+            continue
+        selected = dict(candidate)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["side_parent_boundary_anchor"] = True
+        selected["deterministic_parent_session_recovery_anchor"] = True
+        selected["lineage_resolution"] = lineage
+        eligible_sessions.append(selected)
+        latest_eligible_timestamp = candidate_timestamp
+    if not eligible_sessions:
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "no_workspace_compatible_parent_session_candidate_without_direct_edge",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+            "rejected_anchor_alternatives": rejected[:8],
+            "preflight_before_latest_user_messages": True,
+        }
+    eligible_sessions.sort(
+        key=lambda candidate: (
+            str(candidate.get("timestamp_utc") or ""),
+            int(candidate.get("line") or 0),
+        ),
+        reverse=True,
+    )
+    latest_timestamp = str(eligible_sessions[0].get("timestamp_utc") or "")
+    latest_sessions = [
+        candidate
+        for candidate in eligible_sessions
+        if str(candidate.get("timestamp_utc") or "") == latest_timestamp
+    ]
+    if len(latest_sessions) != 1:
+        return {
+            "status": "ambiguous",
+            "contract": "parent_thread_side_boundary",
+            "reason": "multiple_equally_latest_workspace_compatible_parent_sessions_without_direct_edge",
+            "boundary_source_ref": boundary.get("source_ref"),
+            "side_lineage": side_lineage,
+            "eligible_parent_session_count": len(latest_sessions),
+            "rejected_anchor_alternatives": [
+                {
+                    **_lineage_rejected_anchor(
+                        candidate,
+                        candidate.get("lineage_resolution") or {},
+                        "equally_latest_parent_session_candidate",
+                    ),
+                    "decision": "ambiguous",
+                }
+                for candidate in latest_sessions[:8]
+            ]
+            + rejected[: max(0, 8 - len(latest_sessions))],
+            "preflight_before_latest_user_messages": True,
+        }
+    selected = latest_sessions[0]
+    return {
+        "status": "selected",
+        "contract": "parent_thread_side_boundary",
+        "reason": "unique_latest_workspace_compatible_parent_session_recovered_without_direct_edge",
+        "selection_mode": "canonical_history_session_chronology_recovery",
+        "boundary_source_ref": boundary.get("source_ref"),
+        "selected_anchor": selected,
+        "selected_anchor_ref": selected.get("source_ref"),
+        "selected_lineage": selected.get("lineage_resolution"),
+        "selected_session_identifier": str(selected.get("source_identifier") or ""),
+        "side_lineage": side_lineage,
+        "direct_parent_thread_id_available": False,
+        "eligible_parent_session_count": 1,
+        "rejected_anchor_alternatives": rejected[:8],
+        "preflight_before_latest_user_messages": True,
+    }
+
+
+def _fast_parent_thread_lineage_anchor_resolution(
+    *,
+    rows: list[dict],
+    boundary: dict,
+    cwd: Path,
+    codex_home: Path,
+) -> dict:
+    boundary_line = int(boundary.get("line") or 0)
+    inspected = []
+    rejected = []
+    eligible = []
+    for row in [
+        candidate
+        for candidate in _preflight_parent_anchor_candidate_rows(rows)
+        if int(candidate.get("line") or 0) < boundary_line
+    ]:
+        lineage = _fast_lineage_for_anchor(row, codex_home=codex_home, cwd=cwd)
+        reason = _parent_thread_lineage_rejection_reason(lineage)
+        if lineage.get("status") != "ok" or reason:
+            rejected.append(_lineage_rejected_anchor(row, lineage, reason or "candidate_session_metadata_not_found"))
+            continue
+        selected = dict(row)
+        selected["parent_thread_lineage_anchor"] = True
+        selected["lineage_resolution"] = lineage
+        eligible.append(selected)
+        inspected.append(selected)
+        break
+    if len(eligible) == 1:
+        return {
+            "status": "selected",
+            "contract": "parent_thread_lineage_anchor",
+            "reason": "bounded_parent_thread_lineage_anchor_selected",
+            "selected_anchor": eligible[0],
+            "selected_anchor_ref": eligible[0].get("source_ref"),
+            "selected_lineage": eligible[0].get("lineage_resolution"),
+            "rejected_anchor_alternatives": rejected[:8],
+            "preflight_before_latest_user_messages": True,
+        }
+    return {
+        "status": "ambiguous",
+        "contract": "parent_thread_lineage_anchor",
+        "reason": "bounded_parent_thread_lineage_anchor_not_selected",
+        "inspected_candidate_count": len(inspected),
+        "rejected_anchor_alternatives": rejected[:8],
+        "preflight_before_latest_user_messages": True,
+    }
+
+
+def _fast_lineage_for_anchor(anchor: dict, *, codex_home: Path, cwd: Path) -> dict:
+    files = _fast_session_files_for_history_anchor(anchor, codex_home=codex_home)
+    if not files:
+        return {"status": "no_raw_session_metadata", "reason": "no_bounded_session_file_for_candidate"}
+    metas = [_session_lineage_metadata(path, cwd=cwd) for path in files]
+    metas = [meta for meta in metas if meta.get("status") == "ok"]
+    if not metas:
+        return {"status": "no_raw_session_metadata", "reason": "bounded_session_files_have_no_session_meta"}
+    primary = metas[0]
+    return {
+        "status": "ok",
+        "session_id_hash": primary.get("session_id_hash"),
+        "raw_thread_id_hash": primary.get("raw_thread_id_hash"),
+        "parent_thread_id_hash": primary.get("parent_thread_id_hash"),
+        "root_thread_id_hash": primary.get("root_thread_id_hash"),
+        "thread_source": primary.get("thread_source"),
+        "agent_role": primary.get("agent_role"),
+        "source_kind": primary.get("source_kind"),
+        "cwd": primary.get("cwd"),
+        "cwd_relation": primary.get("cwd_relation"),
+        "workspace_roots": primary.get("workspace_roots"),
+        "workspace_relation": primary.get("workspace_relation"),
+        "session_file_count": len(metas),
+        "session_source_refs": [meta.get("session_source_ref") for meta in metas if meta.get("session_source_ref")],
+        "bounded_session_file_lookup": True,
+    }
+
+
+def _fast_session_files_for_history_anchor(anchor: dict, *, codex_home: Path) -> list[Path]:
+    source_ref = str(anchor.get("source_ref") or "")
+    line_number = _line_from_source_ref(source_ref)
+    if line_number is None:
+        return []
+    record = _read_jsonl_line(codex_home / "history.jsonl", line_number)
+    if not isinstance(record, Mapping):
+        return []
+    session_id = record.get("session_id")
+    if not session_id:
+        return []
+    timestamp = parse_datetime(record.get("ts") or record.get("timestamp") or record.get("created_at"), timezone.utc)
+    if timestamp is None:
+        return []
+    needle = str(session_id)
+    message_day = timestamp.astimezone(timezone.utc).date()
+    roots = []
+    for day in (message_day, message_day - timedelta(days=1)):
+        root = codex_home / "sessions" / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+        if root.is_dir():
+            roots.append(root)
+    matches = []
+    seen = set()
+    for root in roots:
+        for path in sorted(root.glob("*.jsonl")):
+            if needle not in path.name or path in seen:
+                continue
+            seen.add(path)
+            matches.append(path)
+    return matches
+
+
+def _preflight_parent_anchor_candidate_rows(rows: list[dict]) -> list[dict]:
+    candidates = []
+    for row in sorted(
+        rows,
+        key=lambda item: (str(item.get("timestamp_utc") or ""), int(item.get("line") or 0)),
+        reverse=True,
+    ):
+        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            continue
+        candidates.append(row)
+        if len(candidates) >= 8:
+            break
+    return candidates
 
 
 def status_anchor_report(
@@ -372,6 +977,14 @@ def status_anchor_report(
 ) -> dict:
     original_query = query
     effective_query = _query_with_parent_thread_mode(query, parent_thread_mode)
+    answer_mode_parent_complete_interval = bool(
+        parent_thread_mode
+        and complete_interval
+        and (
+            (command_options or {}).get("format") == "answer"
+            or (command_options or {}).get("receiver_answer_mode") is True
+        )
+    )
     latest_messages = latest.get("messages", [])
     target_window = _target_window_from_query(effective_query)
     status_as_of_boundary = _status_as_of_boundary_from_messages(effective_query, latest_messages)
@@ -382,6 +995,7 @@ def status_anchor_report(
         cwd=cwd,
         status_as_of_boundary=status_as_of_boundary,
         latest_messages=latest_messages,
+        collapse_adjacent_canonical_duplicates=answer_mode_parent_complete_interval,
     )
     prior_request_occurrence = _prior_request_occurrence_recovery(
         query=effective_query,
@@ -450,6 +1064,24 @@ def status_anchor_report(
         cwd=cwd,
         codex_home=codex_home,
     )
+    if answer_mode_parent_complete_interval and not selected_anchor:
+        return _parent_thread_fast_machine_blocker_report(
+            original_query=original_query,
+            effective_query=effective_query,
+            latest=latest,
+            cwd=cwd,
+            codex_home=codex_home,
+            started=started,
+            command_options=command_options or {},
+            target_window=target_window,
+            status_as_of_boundary=status_as_of_boundary,
+            canonical_parent_main_interval=canonical_parent_main_interval,
+            canonical_parent_main_fallback=canonical_parent_main_fallback,
+            parent_thread_side_boundary=parent_thread_side_boundary,
+            anchor_candidates=anchor_candidates,
+            anchor_decision=anchor_decision,
+            parent_main_anchor_shortlist=parent_main_anchor_shortlist,
+        )
     anchor_decision = {
         **anchor_decision,
         "selected_anchor": None,
@@ -733,6 +1365,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
     ]
     steps = []
     operation = "complete_post_anchor_interval"
+    continuation_anchor_ref = str(selected.get("source_ref") or "")
     if not selected:
         exact_candidates = [
             candidate
@@ -742,6 +1375,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         exact_candidate = exact_candidates[0] if len(exact_candidates) == 1 else None
         if exact_candidate:
             operation = "rerun_with_recovered_canonical_anchor"
+            continuation_anchor_ref = str(exact_candidate["source_ref"])
             steps.append(
                 {
                     "step_id": "rerun_complete_interval_with_recovered_anchor",
@@ -757,23 +1391,13 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
                 }
             )
         else:
-            operation = "canonical_history_anchor_discovery"
-            steps.append(
-                {
-                    "step_id": "discover_canonical_parent_anchor",
-                    "action": "discover_canonical_parent_anchor",
-                    "command": _latest_user_messages_recovery_command(command_options),
-                    "result_contract": (
-                        "Select one canonical codex_history:history.jsonl:<line> human parent/main row from machine output; "
-                        "do not use candidate text as answer material."
-                    ),
-                }
-            )
+            operation = "canonical_parent_anchor_machine_blocker"
     else:
         freshness = (readiness.get("parent_main_anchor_freshness") or {})
         freshness_command = freshness.get("canonical_continuation_command")
         if freshness.get("current") is False and freshness_command:
             operation = "refresh_stale_parent_anchor"
+            continuation_anchor_ref = str((freshness.get("newest_candidate") or {}).get("source_ref") or "")
             steps.append(
                 {
                     "step_id": "rerun_complete_interval_with_newest_anchor",
@@ -826,27 +1450,37 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
     roots = []
     if codex_home:
         roots = [str(Path(codex_home) / "history.jsonl"), str(Path(codex_home) / "sessions")]
-    completion_argv = [
-        "jsonl-history-search",
-        "what-happened-since",
-        str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
-        "--cwd",
-        str(command_options.get("cwd") or "."),
-    ]
-    if codex_home:
-        completion_argv.extend(["--codex-home", codex_home])
-    completion_argv.extend(
-        [
-            "--parent-thread",
-            "--complete-interval",
-            "--anchor-ref",
-            "<canonical-codex-history-source-ref>",
-            "--format",
-            "answer",
+    completion_transition = {
+        "required_result": "machine_lineage_required_before_retry",
+        "terminal": True,
+    }
+    if operation != "canonical_parent_anchor_machine_blocker":
+        completion_argv = [
+            "jsonl-history-search",
+            "what-happened-since",
+            str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
+            "--cwd",
+            str(command_options.get("cwd") or "."),
         ]
-    )
-    if command_options.get("max_matches"):
-        completion_argv.extend(["--max-matches", str(command_options["max_matches"])])
+        if codex_home:
+            completion_argv.extend(["--codex-home", codex_home])
+        completion_argv.extend(
+            [
+                "--parent-thread",
+                "--complete-interval",
+                "--anchor-ref",
+                continuation_anchor_ref,
+                "--format",
+                "answer",
+            ]
+        )
+        if command_options.get("max_matches"):
+            completion_argv.extend(["--max-matches", str(command_options["max_matches"])])
+        completion_transition = {
+            "required_result": "answer_ready=true",
+            "terminal": False,
+            "anchor_discovery_rerun_argv_template": completion_argv,
+        }
     packet_seed = "|".join(
         [
             str(report.get("query") or ""),
@@ -855,7 +1489,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         ]
     )
     boundary = interval.get("boundary") or {}
-    return {
+    packet = {
         "schema_version": "parent_thread_interval_continuation.v1",
         "packet_id": f"parent-thread-interval-{hashlib.sha256(packet_seed.encode('utf-8')).hexdigest()[:12]}",
         "status": "canonical_continuation_packet",
@@ -891,14 +1525,195 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
             },
         },
         "steps": steps,
-        "completion_transition": {
-            "required_result": "answer_ready=true",
-            "anchor_discovery_rerun_argv_template": completion_argv,
-        },
+        "completion_transition": completion_transition,
         "partial_evidence_rendering_allowed": False,
         "visible_context_synthesis_allowed": False,
         "user_anchor_clarification_allowed": False,
     }
+    if operation == "canonical_parent_anchor_machine_blocker":
+        shortlist = report.get("parent_main_anchor_shortlist") or {}
+        packet["machine_blocker"] = {
+            "status": "no_unique_canonical_parent_anchor",
+            "reason": "machine_selection_found_no_unique_proven_parent_main_lineage",
+            "selection_status": shortlist.get("status") or "anchor_ambiguous",
+            "selection_rule": shortlist.get("selection_rule"),
+            "candidate_count": shortlist.get("candidate_count", 0),
+            "canonical_high_confidence_count": shortlist.get("canonical_high_confidence_count", 0),
+            "candidate_diagnostics": [
+                _continuation_anchor_candidate_diagnostic(candidate)
+                for candidate in (shortlist.get("candidates") or [])[:10]
+            ],
+        }
+    return packet
+
+
+def _parent_thread_fast_machine_blocker_report(
+    *,
+    original_query: str,
+    effective_query: str,
+    latest: dict,
+    cwd: Path,
+    codex_home: Path | None,
+    started: float | None,
+    command_options: dict,
+    target_window: dict | None,
+    status_as_of_boundary: dict | None,
+    canonical_parent_main_interval: dict,
+    canonical_parent_main_fallback: dict,
+    parent_thread_side_boundary: dict,
+    anchor_candidates: list[dict],
+    anchor_decision: dict,
+    parent_main_anchor_shortlist: dict,
+) -> dict:
+    elapsed = None if started is None else round(time.monotonic() - started, 6)
+    answer_readiness = {
+        "status": "fail_closed_no_unique_parent_main_anchor",
+        "answer_ready": False,
+        "answer_allowed": False,
+        "selected_anchor_answer_ready": False,
+        "parent_main_status_answer": True,
+        "missing_required_answer_facets": ["selected_anchor_and_boundary"],
+        "required_answer_facets": _required_answer_facets(target_window=target_window),
+        "parent_main_anchor_freshness": {
+            "status": "missing_selected_anchor",
+            "current": False,
+            "newer_candidate_count": 0,
+        },
+    }
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "anchor_ambiguous",
+        "query": original_query,
+        "effective_query": effective_query,
+        "command_options": command_options,
+        "routing": {
+            "route": "what_happened_since_status_anchor",
+            "natural_status_triggered": is_status_question(effective_query),
+            "jsonl_first": True,
+            "built_on": "latest_user_messages",
+            "no_spawned_agents": True,
+            "raw_jsonl_session_trace": "not_started_no_unique_parent_anchor",
+            "commits_and_repo_state_are_secondary": True,
+            "commit_only_answers_allowed": False,
+            "context_boundary": anchor_decision.get("context_boundary"),
+            "anchor_scope": anchor_decision.get("anchor_scope"),
+            "anchor_reason": anchor_decision.get("anchor_reason"),
+            "anchor_ref": None,
+            "target_window": target_window,
+            "status_as_of_boundary": status_as_of_boundary,
+            "audit_run_requested": _audit_run_requested(effective_query, target_window),
+        },
+        "source_scope": latest.get("source_scope"),
+        "summary": {
+            "anchor_candidate_count": len(anchor_candidates),
+            "selected_anchor_available": False,
+            "answer_allowed": False,
+            "answer_readiness_status": answer_readiness["status"],
+            "missing_required_answer_facet_count": 1,
+            "post_anchor_interval_status": "not_started_no_unique_parent_anchor",
+            "post_anchor_interval_coverage_status": "not_started",
+            "post_anchor_interval_entry_count": 0,
+            "post_anchor_interval_omitted_entry_count": 0,
+            "raw_session_file_count": 0,
+            "raw_session_record_count": 0,
+            "spawned_session_call_count": 0,
+            "elapsed_seconds": elapsed,
+            "context_boundary": anchor_decision.get("context_boundary"),
+            "anchor_scope": anchor_decision.get("anchor_scope"),
+            "anchor_reason": anchor_decision.get("anchor_reason"),
+            "status_as_of_boundary_available": status_as_of_boundary is not None,
+            "canonical_parent_main_interval_status": canonical_parent_main_interval.get("status"),
+            "canonical_parent_main_fallback_status": canonical_parent_main_fallback.get("status"),
+            "parent_main_anchor_shortlist_status": parent_main_anchor_shortlist.get("status"),
+            "parent_main_anchor_shortlist_candidate_count": parent_main_anchor_shortlist.get("candidate_count", 0),
+            "parent_main_anchor_shortlist_high_confidence_count": parent_main_anchor_shortlist.get(
+                "canonical_high_confidence_count", 0
+            ),
+            "parent_thread_side_boundary_status": parent_thread_side_boundary.get("status"),
+            "parent_thread_mode_requested": True,
+            "complete_interval_requested": True,
+            "fast_blocker_before_interval_retrieval": True,
+        },
+        "anchor_candidates": anchor_candidates,
+        "parent_main_anchor_shortlist": parent_main_anchor_shortlist,
+        "selected_anchor": None,
+        "anchor_decision": {
+            **anchor_decision,
+            "selected_anchor": None,
+            "anchor_ref": None,
+        },
+        "session_activity": {
+            "status": "not_started_no_unique_parent_anchor",
+            "anchor_timestamp_utc": None,
+            "session_followups": [],
+            "chronological_activity_after_anchor": [],
+            "activity_after_anchor": _empty_activity_counts(),
+            "missing_logs": [],
+            "summary": {
+                "session_file_count": 0,
+                "records_after_anchor": 0,
+                "spawned_session_call_count": 0,
+                "interval_ledger_entry_count": 0,
+                "omitted_interval_ledger_entry_count": 0,
+            },
+        },
+        "post_anchor_interval_reconstruction": {
+            "status": "not_started_no_unique_parent_anchor",
+            "coverage": {"complete": False, "status": "not_started"},
+        },
+        "evidence_contract": _evidence_contract(),
+        "next_reads": [],
+        "source_tiers": {"required_primary": [], "required_secondary": [], "diagnostic_optional": []},
+        "follow_through_plan": {
+            "status": "blocked_before_interval_retrieval",
+            "open_first": [],
+            "then_confirm": [],
+            "do_not_open_by_default": [],
+            "stop_condition": (
+                "Fail closed before the expensive interval retrieval: machine lineage did not select one "
+                "canonical parent/main history anchor."
+            ),
+        },
+        "answer_ready": False,
+        "answer_readiness": answer_readiness,
+        "required_answer_facets": answer_readiness["required_answer_facets"],
+        "target_window": target_window,
+        "status_as_of_boundary": status_as_of_boundary,
+        "prior_request_occurrence_recovery": {"status": "not_started_fast_blocker"},
+        "canonical_parent_main_status_interval": canonical_parent_main_interval,
+        "canonical_parent_main_fallback": canonical_parent_main_fallback,
+        "parent_thread_side_boundary": parent_thread_side_boundary,
+        "suppressed_support": {"count": 0, "items": []},
+        "clarification_request": None,
+        "fail_closed_guidance": {
+            "status": "fail_closed_no_unique_parent_main_anchor",
+            "reason": "machine_selection_found_no_unique_proven_parent_main_lineage",
+        },
+        "agent_instruction": (
+            "Do not ask the user and do not answer from visible context. Retry only after machine lineage "
+            "can identify one canonical parent/main anchor."
+        ),
+        "work_products": {"tasks": [], "reports": [], "reviews": [], "commits": []},
+        "behavior_deltas": [],
+        "non_deltas": [],
+        "diagnostic_optional_work_products": [],
+        "unresolved_blockers": [],
+        "answer_brief": None,
+        "blind_spots": ["No unique machine-selected parent/main anchor was available."],
+        "privacy": {
+            "raw_transcript_dump_included": False,
+            "raw_text_included": False,
+            "raw_session_activity_snippets_included": False,
+            "snippets_are_compact": True,
+            "source_refs_included": True,
+        },
+        "latest_user_messages_summary": latest.get("summary", {}),
+        "warnings": latest.get("sources", {}).get("warnings", []),
+    }
+    continuation_packet = parent_thread_interval_continuation_packet(report)
+    if continuation_packet:
+        report["parent_thread_interval_continuation"] = continuation_packet
+    return report
 
 
 def _continuation_recovery_candidate(read: dict) -> dict:
@@ -917,12 +1732,22 @@ def _continuation_recovery_candidate(read: dict) -> dict:
     }
 
 
-def _latest_user_messages_recovery_command(command_options: dict) -> str:
-    parts = ["jsonl-history-search", "latest-user-messages", "--cwd", str(command_options.get("cwd") or ".")]
-    if command_options.get("codex_home"):
-        parts.extend(["--codex-home", str(command_options["codex_home"])])
-    parts.extend(["--limit", str(command_options.get("max_matches") or 40), "--snippet-chars", "1", "--format", "json"])
-    return " ".join(shlex.quote(part) for part in parts)
+def _continuation_anchor_candidate_diagnostic(candidate: dict) -> dict:
+    return {
+        key: candidate.get(key)
+        for key in (
+            "source_ref",
+            "source_kind",
+            "source_scope",
+            "timestamp_utc",
+            "classification",
+            "decision",
+            "confidence_label",
+            "ambiguity_label",
+            "lineage_rejection_reason",
+        )
+        if candidate.get(key) is not None
+    }
 
 
 def _latest_status_navigation_only_report(report: dict) -> dict:
@@ -2337,6 +3162,7 @@ def _canonical_parent_main_status_interval(
     cwd: Path,
     status_as_of_boundary: dict | None,
     latest_messages: list[dict],
+    collapse_adjacent_canonical_duplicates: bool = False,
 ) -> dict:
     if not codex_home or not is_status_question(query) or not (
         _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
@@ -2349,6 +3175,8 @@ def _canonical_parent_main_status_interval(
     if not rows:
         return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
     rows = _attach_latest_correlation_to_canonical_rows(rows, latest_messages)
+    if collapse_adjacent_canonical_duplicates:
+        rows = _collapse_adjacent_canonical_history_rows(rows)
     require_side_parent_boundary = _requires_raw_parent_thread_boundary(query)
     boundary = _canonical_parent_main_boundary_row(
         rows,
@@ -2532,6 +3360,77 @@ def _canonical_parent_main_status_interval(
             ),
         },
     }
+
+
+def _collapse_adjacent_canonical_history_rows(rows: list[dict]) -> list[dict]:
+    ordered = sorted((dict(row) for row in rows), key=lambda item: int(item.get("line") or 0))
+    collapsed: list[dict] = []
+    for row in ordered:
+        previous = collapsed[-1] if collapsed else None
+        if not previous or not _is_adjacent_canonical_history_duplicate(previous, row):
+            collapsed.append(row)
+            continue
+        previous_mirrors = list(previous.get("mirror_sources") or [_canonical_row_mirror_source(previous)])
+        row_mirrors = list(row.get("mirror_sources") or [_canonical_row_mirror_source(row)])
+        duplicate_refs = [
+            ref
+            for ref in [
+                *(previous.get("canonical_duplicate_source_refs") or [previous.get("source_ref")]),
+                row.get("source_ref"),
+            ]
+            if ref
+        ]
+        row["mirror_sources"] = _dedupe_mirror_sources([*previous_mirrors, *row_mirrors])
+        row["canonical_duplicate_source_refs"] = list(dict.fromkeys(str(ref) for ref in duplicate_refs))
+        row["canonical_duplicate_count"] = int(previous.get("canonical_duplicate_count") or 0) + 1
+        row["correlation_status"] = row.get("correlation_status") or previous.get("correlation_status")
+        if previous.get("session_activity_location") and not row.get("session_activity_location"):
+            row["session_activity_location"] = previous.get("session_activity_location")
+        if previous.get("logical_message_id") and not row.get("logical_message_id"):
+            row["logical_message_id"] = previous.get("logical_message_id")
+        collapsed[-1] = row
+    return collapsed
+
+
+def _is_adjacent_canonical_history_duplicate(previous: dict, row: dict) -> bool:
+    if int(row.get("line") or 0) != int(previous.get("line") or 0) + 1:
+        return False
+    if str(row.get("source_identifier") or "") != str(previous.get("source_identifier") or ""):
+        return False
+    if _normalize(str(row.get("snippet") or "")) != _normalize(str(previous.get("snippet") or "")):
+        return False
+    row_time = parse_datetime(str(row.get("timestamp_utc") or ""), timezone.utc)
+    previous_time = parse_datetime(str(previous.get("timestamp_utc") or ""), timezone.utc)
+    if row_time is None or previous_time is None:
+        return False
+    return abs((row_time.astimezone(timezone.utc) - previous_time.astimezone(timezone.utc)).total_seconds()) <= (
+        MIRROR_CORRELATION_WINDOW_SECONDS
+    )
+
+
+def _canonical_row_mirror_source(row: dict) -> dict:
+    return {
+        "source_kind": row.get("source_kind"),
+        "source_ref": row.get("source_ref"),
+        "source_identifier": row.get("source_identifier"),
+        "thread_key": row.get("thread_key"),
+        "openable_source_ref": row.get("openable_source_ref"),
+        "openable_target": row.get("openable_target"),
+    }
+
+
+def _dedupe_mirror_sources(mirrors: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for mirror in mirrors:
+        if not isinstance(mirror, Mapping):
+            continue
+        key = (str(mirror.get("source_kind") or ""), str(mirror.get("source_ref") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(dict(mirror))
+    return deduped
 
 
 def _canonical_parent_main_anchor_candidates(
