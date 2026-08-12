@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -930,11 +930,22 @@ def _fast_session_files_for_history_anchor(anchor: dict, *, codex_home: Path) ->
     timestamp = parse_datetime(record.get("ts") or record.get("timestamp") or record.get("created_at"), timezone.utc)
     if timestamp is None:
         return []
-    day_root = codex_home / "sessions" / f"{timestamp.year:04d}" / f"{timestamp.month:02d}" / f"{timestamp.day:02d}"
-    if not day_root.is_dir():
-        return []
     needle = str(session_id)
-    return sorted(path for path in day_root.glob("*.jsonl") if needle in path.name)
+    message_day = timestamp.astimezone(timezone.utc).date()
+    roots = []
+    for day in (message_day, message_day - timedelta(days=1)):
+        root = codex_home / "sessions" / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+        if root.is_dir():
+            roots.append(root)
+    matches = []
+    seen = set()
+    for root in roots:
+        for path in sorted(root.glob("*.jsonl")):
+            if needle not in path.name or path in seen:
+                continue
+            seen.add(path)
+            matches.append(path)
+    return matches
 
 
 def _preflight_parent_anchor_candidate_rows(rows: list[dict]) -> list[dict]:
