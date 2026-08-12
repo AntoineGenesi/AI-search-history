@@ -9282,6 +9282,17 @@ def render_source_locator_handoff_text(handoff: dict) -> list[str]:
             actionability = "diagnostic-only" if item.get("diagnostic_only") or item.get("read_more_actionable") is False else "actionable"
             reason = f" reason={item.get('reason')}" if item.get("reason") else ""
             lines.append(f"- next read ({actionability}): {item.get('kind')} {item.get('target')}{reason}")
+    directional = handoff.get("directional_history_reconstruction") or {}
+    if directional.get("applies"):
+        lines.append(
+            "- directional reconstruction: "
+            f"route={directional.get('route_family')} traversal={directional.get('traversal')} "
+            f"status={directional.get('status')}"
+        )
+        for stage in directional.get("stages") or []:
+            lines.append(
+                f"- directional stage {stage.get('phase')}: {stage.get('action')} command={stage.get('command')}"
+            )
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_text(
             lines,
@@ -9674,6 +9685,17 @@ def render_source_locator_handoff_markdown(handoff: dict) -> list[str]:
                 f"{_escape_markdown_table(str(item.get('target', '')))} | "
                 f"{_escape_markdown_table(actionability)} | "
                 f"{_escape_markdown_table(str(item.get('reason', '')))} |"
+            )
+    directional = handoff.get("directional_history_reconstruction") or {}
+    if directional.get("applies"):
+        lines.append(
+            "- Directional reconstruction: "
+            f"`route={directional.get('route_family')}`; `traversal={directional.get('traversal')}`; "
+            f"`status={directional.get('status')}`."
+        )
+        for stage in directional.get("stages") or []:
+            lines.append(
+                f"- Directional stage `{stage.get('phase')}` (`{stage.get('action')}`): `{stage.get('command')}`"
             )
     if handoff.get("process_actual_use_bucket_evidence_bundle"):
         _append_process_actual_use_bucket_bundle_markdown(
