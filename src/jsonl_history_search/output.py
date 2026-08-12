@@ -30,24 +30,123 @@ def render_json(payload: dict) -> str:
     return json.dumps(safe_payload or payload, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+def project_semantic_debug_continuation_step(payload: dict) -> dict:
+    report = payload.get("semantic_debug")
+    if not isinstance(report, dict):
+        return payload
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    workflow = report.get("audit_continuation_workflow") or followthrough.get(
+        "audit_continuation_workflow"
+    ) or {}
+    if workflow.get("answer_ready") is True:
+        report["continuation_step_contract"] = {
+            "status": "answer_ready",
+            "answer_ready": True,
+            "evidence_projection": "normal_answer_ready_output",
+        }
+        return payload
+
+    projected = _semantic_debug_cap_hit_json_projection(payload)
+    if projected is None:
+        scoped_fail_closed = {
+            "schema_version": 1,
+            "status": "scoped_fail_closed",
+            "answer_ready": False,
+            "canonical_continuation": None,
+            "canonical_continuation_packet": None,
+            "scoped_fail_closed": {
+                "reason": (
+                    "Continuation step remains unresolved without a canonical nested continuation; "
+                    "partial evidence is withheld."
+                ),
+                "searched_scope": (followthrough.get("coverage_state") or {}).get("searched_scope") or {},
+                "not_searched_scope": (followthrough.get("coverage_state") or {}).get("not_searched_scope") or {},
+                "source_boundary": "serialized selected history roots and reported searched windows only",
+            },
+            "partial_evidence_rendering_allowed": False,
+            "manual_history_fallback_allowed": False,
+        }
+        synthetic_followthrough = {**followthrough, "cap_hit_disposition": scoped_fail_closed}
+        synthetic_workflow = {
+            **workflow,
+            "applies": True,
+            "answer_ready": False,
+            "hard_stop": True,
+            "cap_hit_disposition": scoped_fail_closed,
+        }
+        synthetic_followthrough["audit_continuation_workflow"] = synthetic_workflow
+        projected = _semantic_debug_cap_hit_json_projection(
+            {
+                "semantic_debug": {
+                    **report,
+                    "in_depth_audit_followthrough": synthetic_followthrough,
+                    "audit_continuation_workflow": synthetic_workflow,
+                }
+            }
+        )
+    if projected is None:
+        return {
+            "semantic_debug": {
+                "schema_version": report.get("schema_version"),
+                "status": "scoped_fail_closed",
+                "answer_gate": {
+                    "status": "not_answerable_yet",
+                    "answer_ready": False,
+                    "hard_stop": True,
+                    "partial_evidence_rendering_allowed": False,
+                },
+            }
+        }
+    safe_report = projected["semantic_debug"]
+    safe_report["continuation_step_contract"] = {
+        "status": "unresolved_evidence_withheld",
+        "answer_ready": False,
+        "evidence_projection": "metadata_only",
+        "forbidden_evidence_fields": [
+            "strongest_candidates",
+            "timeline",
+            "next_reads",
+            "snippet",
+            "text",
+            "read",
+        ],
+    }
+    safe_report["message"] = (
+        "Continuation-step evidence is withheld until this step is answer-ready; follow only a nested "
+        "canonical continuation or return the reported scoped blocker."
+    )
+    return projected
+
+
 def _semantic_debug_cap_hit_json_projection(payload: dict) -> dict | None:
     report = payload.get("semantic_debug")
     if not isinstance(report, dict):
         return None
     followthrough = report.get("in_depth_audit_followthrough") or {}
     disposition = followthrough.get("cap_hit_disposition") or {}
-    if disposition.get("status") not in {"canonical_continuation", "scoped_fail_closed"}:
+    if disposition.get("status") not in {
+        "canonical_continuation",
+        "canonical_continuation_packet",
+        "scoped_fail_closed",
+    }:
         return None
     if disposition.get("answer_ready") is not False:
         return None
 
     canonical = disposition.get("canonical_continuation")
     safe_canonical = _semantic_debug_safe_continuation(canonical) if isinstance(canonical, dict) else None
+    continuation_packet = disposition.get("canonical_continuation_packet")
+    safe_packet = (
+        _semantic_debug_safe_continuation_packet(continuation_packet)
+        if isinstance(continuation_packet, dict)
+        else None
+    )
     safe_disposition = {
         "schema_version": disposition.get("schema_version"),
         "status": disposition.get("status"),
         "answer_ready": False,
         "canonical_continuation": safe_canonical,
+        "canonical_continuation_packet": safe_packet,
         "scoped_fail_closed": disposition.get("scoped_fail_closed"),
         "partial_evidence_rendering_allowed": False,
         "manual_history_fallback_allowed": False,
@@ -74,6 +173,7 @@ def _semantic_debug_cap_hit_json_projection(payload: dict) -> dict | None:
         "hard_stop_semantics": workflow.get("hard_stop_semantics"),
         "pending_slices": list(workflow.get("pending_slices") or []),
         "continuation_commands": [safe_canonical] if safe_canonical else [],
+        "continuation_packet": safe_packet,
         "cap_hit_disposition": safe_disposition,
         "do_not_abandon_jsonl_guidance": workflow.get("do_not_abandon_jsonl_guidance"),
     }
@@ -119,10 +219,35 @@ def _semantic_debug_safe_continuation(action: dict) -> dict:
         "retry_guidance",
         "target_fingerprint_12",
         "target_persistence_required",
+        "evidence_output_contract",
         "argv",
         "command",
     )
     return {key: action.get(key) for key in safe_keys if key in action}
+
+
+def _semantic_debug_safe_continuation_packet(packet: dict) -> dict:
+    return {
+        "schema_version": packet.get("schema_version"),
+        "packet_id": packet.get("packet_id"),
+        "status": packet.get("status"),
+        "answer_ready": False,
+        "execution_mode": packet.get("execution_mode"),
+        "source_scope": packet.get("source_scope") or {},
+        "omitted_ranges": list(packet.get("omitted_ranges") or []),
+        "caps": packet.get("caps") or {},
+        "target_contract": packet.get("target_contract") or {},
+        "pending_slices": list(packet.get("pending_slices") or []),
+        "steps": [
+            _semantic_debug_safe_continuation(step)
+            for step in packet.get("steps") or []
+            if isinstance(step, dict)
+        ],
+        "blockers": list(packet.get("blockers") or []),
+        "completion_contract": packet.get("completion_contract") or {},
+        "partial_evidence_rendering_allowed": False,
+        "manual_history_fallback_allowed": False,
+    }
 
 
 def render_text(payload: dict) -> str:
@@ -797,6 +922,17 @@ def render_ask_execute_text(payload: dict) -> str:
         lines.append(f"Continuation-first status: {continuation_first.get('status')}")
         lines.append(f"Ask user now: {str(bool(continuation_first.get('ask_user_now'))).lower()}")
         lines.append(f"Missing facet: {continuation_first.get('missing_facet')}")
+    continuation_packet = action.get("canonical_continuation_packet") or {}
+    if continuation_packet:
+        lines.append(f"Canonical continuation packet: {continuation_packet.get('packet_id')}")
+        lines.append("Run every packet step in order; partial step results are not answer material.")
+        for index, step in enumerate(continuation_packet.get("steps") or [], 1):
+            command = step.get("command") if isinstance(step, dict) else None
+            if command:
+                lines.append(f"Packet step {index}: {command}")
+        blockers = list(continuation_packet.get("blockers") or [])
+        if blockers:
+            lines.append(f"Packet blockers: {json.dumps(blockers, sort_keys=True)}")
     _append_latest_status_followthrough_contract(
         lines,
         latest_status_contract,
@@ -958,6 +1094,21 @@ def render_ask_execute_markdown(payload: dict) -> str:
             f"- Ask user now: `{str(bool(continuation_first.get('ask_user_now'))).lower()}`"
         )
         lines.append(f"- Missing facet: {continuation_first.get('missing_facet')}")
+    continuation_packet = action.get("canonical_continuation_packet") or {}
+    if continuation_packet:
+        lines.extend(
+            [
+                f"- Canonical continuation packet: `{continuation_packet.get('packet_id')}`",
+                "- Run every packet step in order; partial step results are not answer material.",
+            ]
+        )
+        for index, step in enumerate(continuation_packet.get("steps") or [], 1):
+            command = step.get("command") if isinstance(step, dict) else None
+            if command:
+                lines.append(f"- Packet step {index}: `{command}`")
+        blockers = list(continuation_packet.get("blockers") or [])
+        if blockers:
+            lines.append(f"- Packet blockers: `{json.dumps(blockers, sort_keys=True)}`")
     _append_latest_status_followthrough_contract(
         lines,
         latest_status_contract,
@@ -6814,7 +6965,11 @@ def _render_semantic_debug_cap_hit_disposition(
     followthrough = report.get("in_depth_audit_followthrough") or {}
     disposition = followthrough.get("cap_hit_disposition") or {}
     status = disposition.get("status")
-    if status not in {"canonical_continuation", "scoped_fail_closed"}:
+    if status not in {
+        "canonical_continuation",
+        "canonical_continuation_packet",
+        "scoped_fail_closed",
+    }:
         return None
 
     coverage = followthrough.get("coverage_state") or {}
@@ -6825,6 +6980,9 @@ def _render_semantic_debug_cap_hit_disposition(
     boundary = "selected history roots and reported searched windows only; hidden evidence may remain"
     canonical = disposition.get("canonical_continuation") or {}
     command = canonical.get("command") if isinstance(canonical, dict) else None
+    continuation_packet = disposition.get("canonical_continuation_packet") or {}
+    packet_steps = continuation_packet.get("steps") if isinstance(continuation_packet, dict) else []
+    packet_steps = [step for step in packet_steps or [] if isinstance(step, dict) and step.get("command")]
 
     if markdown:
         lines = [
@@ -6843,6 +7001,22 @@ def _render_semantic_debug_cap_hit_disposition(
         ]
         if status == "canonical_continuation" and command:
             lines.extend(["", "## Canonical Continuation", "", "```bash", str(command), "```"])
+        elif status == "canonical_continuation_packet" and packet_steps:
+            lines.extend(
+                [
+                    "",
+                    "## Canonical Continuation Packet",
+                    "",
+                    f"- Packet ID: `{continuation_packet.get('packet_id')}`",
+                    f"- Execution mode: `{continuation_packet.get('execution_mode')}`",
+                    "- Run every step in order. Partial step results are not answer material.",
+                ]
+            )
+            for index, step in enumerate(packet_steps, 1):
+                lines.extend(["", f"### Step {index}", "", "```bash", str(step["command"]), "```"])
+            blockers = list(continuation_packet.get("blockers") or [])
+            if blockers:
+                lines.append(f"- Remaining blockers after bounded steps: `{json.dumps(blockers, sort_keys=True)}`")
         else:
             reason = (disposition.get("scoped_fail_closed") or {}).get("reason")
             lines.extend(["", f"- **FAIL CLOSED:** {reason or 'No safe canonical continuation is available.'}"])
@@ -6863,6 +7037,20 @@ def _render_semantic_debug_cap_hit_disposition(
     ]
     if status == "canonical_continuation" and command:
         lines.extend(["Canonical continuation:", str(command)])
+    elif status == "canonical_continuation_packet" and packet_steps:
+        lines.extend(
+            [
+                "CANONICAL CONTINUATION PACKET",
+                f"Packet ID: {continuation_packet.get('packet_id')}",
+                f"Execution mode: {continuation_packet.get('execution_mode')}",
+                "Run every step in order. Partial step results are not answer material.",
+            ]
+        )
+        for index, step in enumerate(packet_steps, 1):
+            lines.extend([f"Step {index}:", str(step["command"])])
+        blockers = list(continuation_packet.get("blockers") or [])
+        if blockers:
+            lines.append(f"Remaining blockers after bounded steps: {json.dumps(blockers, sort_keys=True)}")
     else:
         reason = (disposition.get("scoped_fail_closed") or {}).get("reason")
         lines.append(f"FAIL CLOSED: {reason or 'No safe canonical continuation is available.'}")
