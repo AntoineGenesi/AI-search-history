@@ -10947,6 +10947,10 @@ def _ask_answer_worktree_cleanup_currentness(
             "total_count": facet_coverage.get("total_count"),
         },
         "current_state_summary": current_state,
+        "unsupported_inferences": [
+            "worktree creation is automated",
+            "successful completion does not trigger cleanup",
+        ],
         "boundary": "read-only cleanup causality; no cleanup, branch deletion, worktree removal, or storage action",
     }
     return {"ask_answer": answer}
