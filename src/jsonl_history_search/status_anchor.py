@@ -322,6 +322,11 @@ def build_status_anchor_payload(args: Any) -> dict:
     receiver_answer_mode = bool(getattr(args, "receiver_answer_mode", False))
     anchor_ref = getattr(args, "anchor_ref", None)
     output_format = str(getattr(args, "format", "json") or "json")
+    answer_mode_parent_complete_interval = bool(
+        parent_thread_mode
+        and complete_interval
+        and (output_format == "answer" or receiver_answer_mode)
+    )
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
     snippet_chars = max(0, getattr(args, "snippet_chars", 280))
     latest = latest_user_messages(
@@ -332,7 +337,7 @@ def build_status_anchor_payload(args: Any) -> dict:
         max_bytes=args.max_bytes,
         max_elapsed=args.max_elapsed,
         snippet_chars=snippet_chars,
-        collapse_canonical_duplicates=False,
+        collapse_canonical_duplicates=answer_mode_parent_complete_interval,
     )
     return {
         "status_anchor": status_anchor_report(
@@ -373,6 +378,14 @@ def status_anchor_report(
 ) -> dict:
     original_query = query
     effective_query = _query_with_parent_thread_mode(query, parent_thread_mode)
+    answer_mode_parent_complete_interval = bool(
+        parent_thread_mode
+        and complete_interval
+        and (
+            (command_options or {}).get("format") == "answer"
+            or (command_options or {}).get("receiver_answer_mode") is True
+        )
+    )
     latest_messages = latest.get("messages", [])
     target_window = _target_window_from_query(effective_query)
     status_as_of_boundary = _status_as_of_boundary_from_messages(effective_query, latest_messages)
@@ -383,6 +396,7 @@ def status_anchor_report(
         cwd=cwd,
         status_as_of_boundary=status_as_of_boundary,
         latest_messages=latest_messages,
+        collapse_adjacent_canonical_duplicates=answer_mode_parent_complete_interval,
     )
     prior_request_occurrence = _prior_request_occurrence_recovery(
         query=effective_query,
@@ -451,6 +465,24 @@ def status_anchor_report(
         cwd=cwd,
         codex_home=codex_home,
     )
+    if answer_mode_parent_complete_interval and not selected_anchor:
+        return _parent_thread_fast_machine_blocker_report(
+            original_query=original_query,
+            effective_query=effective_query,
+            latest=latest,
+            cwd=cwd,
+            codex_home=codex_home,
+            started=started,
+            command_options=command_options or {},
+            target_window=target_window,
+            status_as_of_boundary=status_as_of_boundary,
+            canonical_parent_main_interval=canonical_parent_main_interval,
+            canonical_parent_main_fallback=canonical_parent_main_fallback,
+            parent_thread_side_boundary=parent_thread_side_boundary,
+            anchor_candidates=anchor_candidates,
+            anchor_decision=anchor_decision,
+            parent_main_anchor_shortlist=parent_main_anchor_shortlist,
+        )
     anchor_decision = {
         **anchor_decision,
         "selected_anchor": None,
@@ -914,6 +946,169 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
             ],
         }
     return packet
+
+
+def _parent_thread_fast_machine_blocker_report(
+    *,
+    original_query: str,
+    effective_query: str,
+    latest: dict,
+    cwd: Path,
+    codex_home: Path | None,
+    started: float | None,
+    command_options: dict,
+    target_window: dict | None,
+    status_as_of_boundary: dict | None,
+    canonical_parent_main_interval: dict,
+    canonical_parent_main_fallback: dict,
+    parent_thread_side_boundary: dict,
+    anchor_candidates: list[dict],
+    anchor_decision: dict,
+    parent_main_anchor_shortlist: dict,
+) -> dict:
+    elapsed = None if started is None else round(time.monotonic() - started, 6)
+    answer_readiness = {
+        "status": "fail_closed_no_unique_parent_main_anchor",
+        "answer_ready": False,
+        "answer_allowed": False,
+        "selected_anchor_answer_ready": False,
+        "parent_main_status_answer": True,
+        "missing_required_answer_facets": ["selected_anchor_and_boundary"],
+        "required_answer_facets": _required_answer_facets(target_window=target_window),
+        "parent_main_anchor_freshness": {
+            "status": "missing_selected_anchor",
+            "current": False,
+            "newer_candidate_count": 0,
+        },
+    }
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "anchor_ambiguous",
+        "query": original_query,
+        "effective_query": effective_query,
+        "command_options": command_options,
+        "routing": {
+            "route": "what_happened_since_status_anchor",
+            "natural_status_triggered": is_status_question(effective_query),
+            "jsonl_first": True,
+            "built_on": "latest_user_messages",
+            "no_spawned_agents": True,
+            "raw_jsonl_session_trace": "not_started_no_unique_parent_anchor",
+            "commits_and_repo_state_are_secondary": True,
+            "commit_only_answers_allowed": False,
+            "context_boundary": anchor_decision.get("context_boundary"),
+            "anchor_scope": anchor_decision.get("anchor_scope"),
+            "anchor_reason": anchor_decision.get("anchor_reason"),
+            "anchor_ref": None,
+            "target_window": target_window,
+            "status_as_of_boundary": status_as_of_boundary,
+            "audit_run_requested": _audit_run_requested(effective_query, target_window),
+        },
+        "source_scope": latest.get("source_scope"),
+        "summary": {
+            "anchor_candidate_count": len(anchor_candidates),
+            "selected_anchor_available": False,
+            "answer_allowed": False,
+            "answer_readiness_status": answer_readiness["status"],
+            "missing_required_answer_facet_count": 1,
+            "post_anchor_interval_status": "not_started_no_unique_parent_anchor",
+            "post_anchor_interval_coverage_status": "not_started",
+            "post_anchor_interval_entry_count": 0,
+            "post_anchor_interval_omitted_entry_count": 0,
+            "raw_session_file_count": 0,
+            "raw_session_record_count": 0,
+            "spawned_session_call_count": 0,
+            "elapsed_seconds": elapsed,
+            "context_boundary": anchor_decision.get("context_boundary"),
+            "anchor_scope": anchor_decision.get("anchor_scope"),
+            "anchor_reason": anchor_decision.get("anchor_reason"),
+            "status_as_of_boundary_available": status_as_of_boundary is not None,
+            "canonical_parent_main_interval_status": canonical_parent_main_interval.get("status"),
+            "canonical_parent_main_fallback_status": canonical_parent_main_fallback.get("status"),
+            "parent_main_anchor_shortlist_status": parent_main_anchor_shortlist.get("status"),
+            "parent_main_anchor_shortlist_candidate_count": parent_main_anchor_shortlist.get("candidate_count", 0),
+            "parent_main_anchor_shortlist_high_confidence_count": parent_main_anchor_shortlist.get(
+                "canonical_high_confidence_count", 0
+            ),
+            "parent_thread_side_boundary_status": parent_thread_side_boundary.get("status"),
+            "parent_thread_mode_requested": True,
+            "complete_interval_requested": True,
+            "fast_blocker_before_interval_retrieval": True,
+        },
+        "anchor_candidates": anchor_candidates,
+        "parent_main_anchor_shortlist": parent_main_anchor_shortlist,
+        "selected_anchor": None,
+        "anchor_decision": {
+            **anchor_decision,
+            "selected_anchor": None,
+            "anchor_ref": None,
+        },
+        "session_activity": _session_activity_trace(
+            None,
+            anchor_decision,
+            cwd=cwd,
+            codex_home=codex_home,
+            target_window=target_window,
+            status_as_of_boundary=status_as_of_boundary,
+            complete_interval_requested=True,
+        ),
+        "post_anchor_interval_reconstruction": {
+            "status": "not_started_no_unique_parent_anchor",
+            "coverage": {"complete": False, "status": "not_started"},
+        },
+        "evidence_contract": _evidence_contract(),
+        "next_reads": [],
+        "source_tiers": {"required_primary": [], "required_secondary": [], "diagnostic_optional": []},
+        "follow_through_plan": {
+            "status": "blocked_before_interval_retrieval",
+            "open_first": [],
+            "then_confirm": [],
+            "do_not_open_by_default": [],
+            "stop_condition": (
+                "Fail closed before the expensive interval retrieval: machine lineage did not select one "
+                "canonical parent/main history anchor."
+            ),
+        },
+        "answer_ready": False,
+        "answer_readiness": answer_readiness,
+        "required_answer_facets": answer_readiness["required_answer_facets"],
+        "target_window": target_window,
+        "status_as_of_boundary": status_as_of_boundary,
+        "prior_request_occurrence_recovery": {"status": "not_started_fast_blocker"},
+        "canonical_parent_main_status_interval": canonical_parent_main_interval,
+        "canonical_parent_main_fallback": canonical_parent_main_fallback,
+        "parent_thread_side_boundary": parent_thread_side_boundary,
+        "suppressed_support": {"count": 0, "items": []},
+        "clarification_request": None,
+        "fail_closed_guidance": {
+            "status": "fail_closed_no_unique_parent_main_anchor",
+            "reason": "machine_selection_found_no_unique_proven_parent_main_lineage",
+        },
+        "agent_instruction": (
+            "Do not ask the user and do not answer from visible context. Retry only after machine lineage "
+            "can identify one canonical parent/main anchor."
+        ),
+        "work_products": {"tasks": [], "reports": [], "reviews": [], "commits": []},
+        "behavior_deltas": [],
+        "non_deltas": [],
+        "diagnostic_optional_work_products": [],
+        "unresolved_blockers": [],
+        "answer_brief": None,
+        "blind_spots": ["No unique machine-selected parent/main anchor was available."],
+        "privacy": {
+            "raw_transcript_dump_included": False,
+            "raw_text_included": False,
+            "raw_session_activity_snippets_included": False,
+            "snippets_are_compact": True,
+            "source_refs_included": True,
+        },
+        "latest_user_messages_summary": latest.get("summary", {}),
+        "warnings": latest.get("sources", {}).get("warnings", []),
+    }
+    continuation_packet = parent_thread_interval_continuation_packet(report)
+    if continuation_packet:
+        report["parent_thread_interval_continuation"] = continuation_packet
+    return report
 
 
 def _continuation_recovery_candidate(read: dict) -> dict:
@@ -2362,6 +2557,7 @@ def _canonical_parent_main_status_interval(
     cwd: Path,
     status_as_of_boundary: dict | None,
     latest_messages: list[dict],
+    collapse_adjacent_canonical_duplicates: bool = False,
 ) -> dict:
     if not codex_home or not is_status_question(query) or not (
         _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
@@ -2374,6 +2570,8 @@ def _canonical_parent_main_status_interval(
     if not rows:
         return {"status": "not_applicable", "reason": "canonical_history_has_no_human_rows"}
     rows = _attach_latest_correlation_to_canonical_rows(rows, latest_messages)
+    if collapse_adjacent_canonical_duplicates:
+        rows = _collapse_adjacent_canonical_history_rows(rows)
     require_side_parent_boundary = _requires_raw_parent_thread_boundary(query)
     boundary = _canonical_parent_main_boundary_row(
         rows,
@@ -2557,6 +2755,77 @@ def _canonical_parent_main_status_interval(
             ),
         },
     }
+
+
+def _collapse_adjacent_canonical_history_rows(rows: list[dict]) -> list[dict]:
+    ordered = sorted((dict(row) for row in rows), key=lambda item: int(item.get("line") or 0))
+    collapsed: list[dict] = []
+    for row in ordered:
+        previous = collapsed[-1] if collapsed else None
+        if not previous or not _is_adjacent_canonical_history_duplicate(previous, row):
+            collapsed.append(row)
+            continue
+        previous_mirrors = list(previous.get("mirror_sources") or [_canonical_row_mirror_source(previous)])
+        row_mirrors = list(row.get("mirror_sources") or [_canonical_row_mirror_source(row)])
+        duplicate_refs = [
+            ref
+            for ref in [
+                *(previous.get("canonical_duplicate_source_refs") or [previous.get("source_ref")]),
+                row.get("source_ref"),
+            ]
+            if ref
+        ]
+        row["mirror_sources"] = _dedupe_mirror_sources([*previous_mirrors, *row_mirrors])
+        row["canonical_duplicate_source_refs"] = list(dict.fromkeys(str(ref) for ref in duplicate_refs))
+        row["canonical_duplicate_count"] = int(previous.get("canonical_duplicate_count") or 0) + 1
+        row["correlation_status"] = row.get("correlation_status") or previous.get("correlation_status")
+        if previous.get("session_activity_location") and not row.get("session_activity_location"):
+            row["session_activity_location"] = previous.get("session_activity_location")
+        if previous.get("logical_message_id") and not row.get("logical_message_id"):
+            row["logical_message_id"] = previous.get("logical_message_id")
+        collapsed[-1] = row
+    return collapsed
+
+
+def _is_adjacent_canonical_history_duplicate(previous: dict, row: dict) -> bool:
+    if int(row.get("line") or 0) != int(previous.get("line") or 0) + 1:
+        return False
+    if str(row.get("source_identifier") or "") != str(previous.get("source_identifier") or ""):
+        return False
+    if _normalize(str(row.get("snippet") or "")) != _normalize(str(previous.get("snippet") or "")):
+        return False
+    row_time = parse_datetime(str(row.get("timestamp_utc") or ""), timezone.utc)
+    previous_time = parse_datetime(str(previous.get("timestamp_utc") or ""), timezone.utc)
+    if row_time is None or previous_time is None:
+        return False
+    return abs((row_time.astimezone(timezone.utc) - previous_time.astimezone(timezone.utc)).total_seconds()) <= (
+        MIRROR_CORRELATION_WINDOW_SECONDS
+    )
+
+
+def _canonical_row_mirror_source(row: dict) -> dict:
+    return {
+        "source_kind": row.get("source_kind"),
+        "source_ref": row.get("source_ref"),
+        "source_identifier": row.get("source_identifier"),
+        "thread_key": row.get("thread_key"),
+        "openable_source_ref": row.get("openable_source_ref"),
+        "openable_target": row.get("openable_target"),
+    }
+
+
+def _dedupe_mirror_sources(mirrors: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for mirror in mirrors:
+        if not isinstance(mirror, Mapping):
+            continue
+        key = (str(mirror.get("source_kind") or ""), str(mirror.get("source_ref") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(dict(mirror))
+    return deduped
 
 
 def _canonical_parent_main_anchor_candidates(
