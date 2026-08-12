@@ -2461,7 +2461,10 @@ def _run_ask_execute(args: argparse.Namespace, *, cwd: str, route_payload: dict)
         .get("is_cleanup_causality_query")
         and _is_answer_ready_worktree_cleanup_execute(args, execution_kind)
     ):
-        _attach_worktree_cleanup_answer_handoff(contract, cwd=Path(cwd))
+        _attach_worktree_cleanup_answer_handoff(
+            contract,
+            cwd=_artifact_currentness_answer_cwd(compact, Path(cwd)),
+        )
     return contract
 
 
@@ -2531,8 +2534,19 @@ def _run_worktree_cleanup_execute_without_report(
     if _is_answer_ready_worktree_cleanup_query(
         str(getattr(execution_args, "query", "") or "")
     ):
-        _attach_worktree_cleanup_answer_handoff(contract, cwd=cwd)
+        _attach_worktree_cleanup_answer_handoff(
+            contract,
+            cwd=_artifact_currentness_answer_cwd(compact, cwd),
+        )
     return contract
+
+
+def _artifact_currentness_answer_cwd(compact: dict, requested_cwd: Path) -> Path:
+    resolution = compact.get("workspace_resolution") or {}
+    if resolution.get("status") != "historical_session_workspace_recovered":
+        return requested_cwd
+    resolved = Path(str(resolution.get("resolved_cwd") or "")).expanduser()
+    return resolved.resolve() if resolved.is_dir() else requested_cwd
 
 
 def _attach_worktree_cleanup_answer_handoff(contract: dict, *, cwd: Path) -> None:
@@ -5406,6 +5420,62 @@ def _compact_cleanup_chronology_gate(gate: object) -> dict:
     }
 
 
+def _compact_cleanup_current_state(summary: object) -> dict:
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        key: summary.get(key)
+        for key in (
+            "phase",
+            "source_role",
+            "causal_proof_allowed",
+            "registered_worktree_count",
+            "linked_task_worktree_count",
+            "dirty_worktree_count",
+            "private_retention_worktree_count",
+            "not_reachable_from_default_count",
+            "clean_reachable_manual_closeout_debt_count",
+            "default_branch",
+        )
+    }
+
+
+def _compact_worktree_classifications(rows: object) -> list[dict]:
+    if not isinstance(rows, list):
+        return []
+    compact: list[dict] = []
+    for item in rows[:8]:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        private = (
+            item.get("private_artifacts")
+            if isinstance(item.get("private_artifacts"), dict)
+            else {}
+        )
+        compact.append(
+            {
+                "identifier": item.get("identifier"),
+                "path": item.get("path"),
+                "branch": item.get("branch"),
+                "classification": item.get("classification"),
+                "source_refs": (item.get("source_refs") or [])[:4],
+                "status": {
+                    "dirty": bool(status.get("dirty")),
+                    "default_branch_reachability": status.get(
+                        "default_branch_reachability"
+                    ),
+                },
+                "private_artifacts": {
+                    "has_private_artifacts": bool(
+                        private.get("has_private_artifacts")
+                    )
+                },
+            }
+        )
+    return compact
+
+
 def _remembered_user_wording_missing_evidence_contract(*, compact: dict, route_family: str) -> dict:
     if route_family != "remembered_user_wording":
         return {}
@@ -5733,7 +5803,9 @@ def _answer_action_contract_from_executed_output(
                 "read": next_reads,
                 "then_use": {
                     "target_binding": target_binding,
-                    "worktree_classifications": (worktree.get("classifications") or [])[:8],
+                    "worktree_classifications": _compact_worktree_classifications(
+                        worktree.get("classifications")
+                    ),
                 },
                 "diagnostics_after": [],
                 "excluded_evidence": (
@@ -5778,7 +5850,9 @@ def _answer_action_contract_from_executed_output(
                     "causal_summary": cleanup.get("causal_summary"),
                 },
                 "source_roles_present": worktree.get("source_roles_present"),
-                "worktree_classifications": (worktree.get("classifications") or [])[:8],
+                "worktree_classifications": _compact_worktree_classifications(
+                    worktree.get("classifications")
+                ),
             },
             "diagnostics_after": (
                 [
@@ -9945,6 +10019,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "currentness_verdict": compact.get("currentness_verdict"),
             "why": compact.get("why"),
             "selected_artifact_or_topic": compact.get("selected_artifact_or_topic"),
+            "workspace_resolution": compact.get("workspace_resolution"),
             "cleanup_causality": {
                 "debt_status": cleanup.get("debt_status"),
                 "causal_summary": cleanup.get("causal_summary"),
@@ -9961,6 +10036,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "facet_coverage": _compact_cleanup_facet_coverage(
                     cleanup.get("facet_coverage")
                 ),
+                "current_state_summary": _compact_cleanup_current_state(
+                    cleanup.get("current_state_summary")
+                ),
                 "causality_currentness_boundary": {
                     "status": "historical_causality_first_current_state_second",
                     "current_state_is_not_causal_proof": True,
@@ -9969,7 +10047,9 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
             "cleanup_causal_role_order": worktree.get("cleanup_causal_role_order"),
             "source_role_order": worktree.get("source_role_order"),
             "source_roles_present": worktree.get("source_roles_present"),
-            "worktree_classifications": (worktree.get("classifications") or [])[:8],
+            "worktree_classifications": _compact_worktree_classifications(
+                worktree.get("classifications")
+            ),
             "next_reads": (compact.get("next_reads") or [])[:8],
             "blind_spots": (compact.get("blind_spots") or [])[:5],
             "boundary": worktree.get("boundary"),
@@ -10816,14 +10896,35 @@ def _ask_answer_worktree_cleanup_currentness(
             "worktree cleanup causal summary is missing from the inspected proof contract",
             {"required_next_proof": "cleanup causality summary backed by opened operational records"},
         )
+    current_state = cleanup.get("current_state_summary") or {}
+    current_state_clause = ""
+    if current_state:
+        default_branch = str(current_state.get("default_branch") or "the default branch")
+        linked_count = int(current_state.get("linked_task_worktree_count") or 0)
+        debt_count = int(
+            current_state.get("clean_reachable_manual_closeout_debt_count") or 0
+        )
+        linked_noun = "worktree" if linked_count == 1 else "worktrees"
+        linked_verb = "remains" if linked_count == 1 else "remain"
+        debt_noun = "worktree" if debt_count == 1 else "worktrees"
+        debt_verb = "remains" if debt_count == 1 else "remain"
+        current_state_clause = (
+            " Current state was inspected only after that historical chain: "
+            f"{linked_count} linked task {linked_noun} {linked_verb}, "
+            f"including {int(current_state.get('dirty_worktree_count') or 0)} dirty, "
+            f"{int(current_state.get('private_retention_worktree_count') or 0)} with retained .private evidence, "
+            f"and {int(current_state.get('not_reachable_from_default_count') or 0)} not reachable from {default_branch}; "
+            f"{debt_count} clean reachable {debt_noun} {debt_verb} as manual closeout debt."
+        )
     answer["answer_status"] = "answered-from-proof"
     answer["answer"] = (
-        "The worktrees did not clean themselves up because the audit stopped at a report-only "
+        "The worktrees did not clean themselves up automatically because physical removal is a manual "
+        "closeout operation, and the audit stopped at a report-only "
         "preserve-then-remove classification: private evidence still had to be retained, and later "
         "handoffs left the pre-existing worktrees unaudited instead of completing that lifecycle step. "
         "The cleanup policy required preserved evidence to be followed by physical worktree removal "
         "while retaining branch refs, so those refs were not the blocker. "
-        f"{causal_summary} "
+        f"{causal_summary}{current_state_clause} "
         "This is a read-only causality answer and does not authorize or perform cleanup actions."
     )
     answer["refs_used"] = [_ref_public_summary(item) for item in usable]
@@ -10845,6 +10946,7 @@ def _ask_answer_worktree_cleanup_currentness(
             "proven_count": facet_coverage.get("proven_count"),
             "total_count": facet_coverage.get("total_count"),
         },
+        "current_state_summary": current_state,
         "boundary": "read-only cleanup causality; no cleanup, branch deletion, worktree removal, or storage action",
     }
     return {"ask_answer": answer}
