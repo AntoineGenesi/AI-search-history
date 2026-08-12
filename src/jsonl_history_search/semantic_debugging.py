@@ -1424,6 +1424,8 @@ def build_semantic_debug_payload(
             args=args,
             coverage=in_depth_audit_coverage,
             scope_boundary_summary=scope_boundary_summary,
+            source_scope=source_scope,
+            source_plan=source_plan,
             next_reads=next_reads,
             now_utc=parse_source_plan_now(source_plan),
             default_tz=default_tz,
@@ -16486,6 +16488,8 @@ def build_in_depth_audit_followthrough_plan(
     coverage: dict[str, Any],
     scope_boundary_summary: dict[str, Any],
     next_reads: list[dict[str, Any]],
+    source_scope: dict[str, Any] | None = None,
+    source_plan: dict[str, Any] | None = None,
     now_utc: datetime | None = None,
     default_tz: Any = timezone.utc,
 ) -> dict[str, Any]:
@@ -16504,6 +16508,12 @@ def build_in_depth_audit_followthrough_plan(
     ]
     target_contract = build_deep_audit_target_persistence_contract(query=query, next_reads=classified_reads)
     target_persistence_ready = deep_audit_target_persistence_ready(target_contract)
+    selected_roots = deep_audit_serialized_selected_roots(
+        args=args,
+        source_scope=source_scope,
+        source_plan=source_plan,
+    )
+    provider_homes = deep_audit_serialized_provider_homes(args=args, source_plan=source_plan)
     selected_reads = (
         select_in_depth_audit_primary_reads_for_query(classified_reads, query=query)
         if target_persistence_ready
@@ -16524,6 +16534,8 @@ def build_in_depth_audit_followthrough_plan(
         args=args,
         coverage=coverage,
         target_contract=target_contract,
+        selected_roots=selected_roots,
+        provider_homes=provider_homes,
     )
     tail_followup_actions = list(source_continuation.get("tail_followup_actions") or [])
     if target_persistence_ready:
@@ -16533,6 +16545,9 @@ def build_in_depth_audit_followthrough_plan(
             query=query,
             args=args,
             target_contract=target_contract,
+            selected_roots=selected_roots,
+            audit_depth=(coverage.get("audit_depth") or {}).get("depth"),
+            provider_homes=provider_homes,
         )
         continuation_candidates = [refocus] if refocus else []
     coverage_complete = bool(coverage.get("answer_promotion_allowed")) and target_persistence_ready
@@ -16561,6 +16576,9 @@ def build_in_depth_audit_followthrough_plan(
             query=query,
             args=args,
             target_contract=target_contract,
+            selected_roots=selected_roots,
+            audit_depth=(coverage.get("audit_depth") or {}).get("depth"),
+            provider_homes=provider_homes,
         )
         if continuation:
             continuation_candidates.append(continuation)
@@ -16605,15 +16623,20 @@ def build_in_depth_audit_followthrough_plan(
                 args=args,
                 coverage=coverage,
                 scope_boundary_summary=scope_boundary_summary,
+                source_plan=source_plan or {},
                 target_contract=target_contract,
                 commands=continuation_candidates + cap_continuation_commands,
                 pending_slices=pending_cap_slices,
+                selected_roots=selected_roots,
+                provider_homes=provider_homes,
             )
             if not canonical_continuation and canonical_scope_coverage_complete
             else None
         )
         fail_closed_reason = (
-            "Search caps blocked complete coverage and no deterministic JSONL continuation was available."
+            "Selected root identity could not be serialized; no continuation command is safe."
+            if not selected_roots
+            else "Search caps blocked complete coverage and no deterministic JSONL continuation was available."
             if not continuation_candidates and not cap_continuation_commands
             else (
                 "Available follow-up does not cover every unresolved capped slice; no command is canonical."
@@ -16642,6 +16665,16 @@ def build_in_depth_audit_followthrough_plan(
                     "not_searched_scope": not_searched_scope,
                     "caps": caps or coverage.get("search_cap_hit") or {},
                     "source_boundary": "selected history roots and reported searched windows only",
+                    "blockers": (
+                        [
+                            {
+                                "kind": "unserializable_selected_root_scope",
+                                "resolution": "rerun_from_the_original_result_with_serialized_selected_roots",
+                            }
+                        ]
+                        if not selected_roots
+                        else []
+                    ),
                 }
             ),
             "partial_evidence_rendering_allowed": False,
@@ -17351,12 +17384,47 @@ def in_depth_audit_omitted_or_capped_windows(coverage: dict[str, Any]) -> list[d
     return rows[:8]
 
 
+def deep_audit_serialized_selected_roots(
+    *,
+    args: Any,
+    source_scope: dict[str, Any] | None = None,
+    source_plan: dict[str, Any] | None = None,
+) -> list[str]:
+    planned_roots = []
+    for row in ((source_plan or {}).get("sources") or {}).get("roots") or []:
+        path = row.get("path") if isinstance(row, dict) else None
+        if path:
+            planned_roots.append(str(path))
+    if isinstance(source_scope, dict):
+        for row in source_scope.get("selected_roots") or []:
+            path = row.get("path") if isinstance(row, dict) else None
+            if path:
+                planned_roots.append(str(path))
+    roots = planned_roots or [str(root) for root in getattr(args, "root", None) or [] if root]
+    return dedupe(roots)
+
+
+def deep_audit_serialized_provider_homes(
+    *,
+    args: Any,
+    source_plan: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    homes = {}
+    for name in ("codex_home", "claude_home"):
+        value = (source_plan or {}).get(name) or getattr(args, name, None)
+        if value:
+            homes[name] = str(value)
+    return homes
+
+
 def in_depth_audit_continuation_commands(
     *,
     query: str,
     args: Any,
     coverage: dict[str, Any],
     target_contract: dict[str, Any] | None = None,
+    selected_roots: list[str] | None = None,
+    provider_homes: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     if coverage.get("answer_promotion_allowed"):
         return []
@@ -17369,6 +17437,8 @@ def in_depth_audit_continuation_commands(
             index=len(commands) + 1,
             target_contract=target_contract or {},
             audit_depth=(coverage.get("audit_depth") or {}).get("depth"),
+            selected_roots=selected_roots,
+            provider_homes=provider_homes,
         )
         if command:
             commands.append(command)
@@ -17385,12 +17455,21 @@ def in_depth_audit_continuation_command_for_slice(
     index: int,
     target_contract: dict[str, Any] | None = None,
     audit_depth: str | None = None,
+    selected_roots: list[str] | None = None,
+    provider_homes: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     window = slice_row.get("window") if isinstance(slice_row.get("window"), dict) else {}
     depth = str(audit_depth or "in-depth").replace("_", "-")
+    roots = selected_roots if selected_roots is not None else deep_audit_serialized_selected_roots(args=args)
+    if not roots:
+        return None
     argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", depth]
-    for root in getattr(args, "root", None) or []:
+    for root in roots:
         argv.extend(["--root", str(root)])
+    for name, flag in (("codex_home", "--codex-home"), ("claude_home", "--claude-home")):
+        value = (provider_homes or {}).get(name)
+        if value:
+            argv.extend([flag, value])
     cwd = getattr(args, "cwd", None)
     if cwd:
         argv.extend(["--cwd", str(cwd)])
@@ -17425,7 +17504,7 @@ def in_depth_audit_continuation_command_for_slice(
                 json.dumps(executable_target_contract, sort_keys=True, separators=(",", ":")),
             ]
         )
-    argv.extend(["--format", "json"])
+    argv.extend(["--deep-audit-continuation-step", "--format", "json"])
     return {
         "command_id": f"continue_scoped_audit_slice_{index:02d}",
         "slice": slice_row.get("slice"),
@@ -17439,6 +17518,7 @@ def in_depth_audit_continuation_command_for_slice(
         "target_persistence_required": True,
         "target_reminder": target_contract.get("canonical_target_reminder"),
         "audit_depth": depth,
+        "evidence_output_contract": "metadata_only_until_answer_ready",
         **deep_audit_target_contract_continuation_fields(target_contract),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
@@ -17450,9 +17530,12 @@ def build_deep_audit_cap_continuation_packet(
     args: Any,
     coverage: dict[str, Any],
     scope_boundary_summary: dict[str, Any],
+    source_plan: dict[str, Any],
     target_contract: dict[str, Any],
     commands: list[dict[str, Any]],
     pending_slices: list[dict[str, Any]],
+    selected_roots: list[str],
+    provider_homes: dict[str, str],
 ) -> dict[str, Any] | None:
     steps = []
     seen = set()
@@ -17464,7 +17547,11 @@ def build_deep_audit_cap_continuation_packet(
             continue
         seen.add(identity)
         steps.append(command)
-    if not steps:
+    if (
+        not steps
+        or not selected_roots
+        or any(step.get("evidence_output_contract") != "metadata_only_until_answer_ready" for step in steps)
+    ):
         return None
 
     searched_scope = scope_boundary_summary.get("searched_scope") or {}
@@ -17483,6 +17570,12 @@ def build_deep_audit_cap_continuation_packet(
         if getattr(args, name, None) is not None
     }
     blockers = []
+    selected_root_set = set(selected_roots)
+    selected_missing_roots = [
+        row
+        for row in (((source_plan.get("sources") or {}).get("missing_roots") or []))
+        if isinstance(row, dict) and str(row.get("path") or "") in selected_root_set
+    ]
     missing_roots = int(not_searched_scope.get("missing_root_count", 0) or 0)
     deferred_files = int(not_searched_scope.get("source_plan_deferred_files", 0) or 0)
     if missing_roots:
@@ -17490,6 +17583,7 @@ def build_deep_audit_cap_continuation_packet(
             {
                 "kind": "unavailable_selected_roots",
                 "count": missing_roots,
+                "roots": selected_missing_roots,
                 "resolution": "fail_closed_until_the_selected_roots_are_available",
             }
         )
@@ -17503,7 +17597,8 @@ def build_deep_audit_cap_continuation_packet(
         )
 
     packet_basis = {
-        "roots": [str(root) for root in getattr(args, "root", None) or []],
+        "roots": selected_roots,
+        "provider_homes": provider_homes,
         "cwd": str(getattr(args, "cwd", None) or ""),
         "audit_depth": str((coverage.get("audit_depth") or {}).get("depth") or "in_depth"),
         "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
@@ -17511,6 +17606,11 @@ def build_deep_audit_cap_continuation_packet(
         "step_ids": [str(row.get("command_id")) for row in steps],
         "inherited_caps": inherited_caps,
     }
+    root_scope_source = (
+        "resolved_source_plan"
+        if ((source_plan.get("sources") or {}).get("roots") or [])
+        else "explicit_cli_roots"
+    )
     packet_id = "deep-audit-continuation-" + hashlib.sha256(
         json.dumps(packet_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
@@ -17522,6 +17622,10 @@ def build_deep_audit_cap_continuation_packet(
         "execution_mode": "run_all_steps_in_order_then_reassess_coverage",
         "source_scope": {
             "roots": packet_basis["roots"],
+            "roots_serialized": True,
+            "root_scope_source": root_scope_source,
+            "provider_homes": provider_homes,
+            "missing_roots": selected_missing_roots,
             "cwd": packet_basis["cwd"],
             "allow_arbitrary_root": bool(getattr(args, "allow_arbitrary_root", False)),
             "searched_scope": searched_scope,
@@ -17554,14 +17658,33 @@ def in_depth_audit_target_refocus_command(
     query: str,
     args: Any,
     target_contract: dict[str, Any],
+    selected_roots: list[str] | None = None,
+    audit_depth: str | None = None,
+    provider_homes: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     source_terms = list(target_contract.get("prompt_history_source_terms") or [])
     if not source_terms:
         return None
+    roots = selected_roots if selected_roots is not None else deep_audit_serialized_selected_roots(args=args)
+    if not roots:
+        return None
     source_query = " ".join(str(term) for term in source_terms)
-    argv = ["jsonl-history-search", "find", source_query, "--role", "user"]
-    for root in getattr(args, "root", None) or []:
+    depth = str(audit_depth or "in-depth").replace("_", "-")
+    argv = [
+        "jsonl-history-search",
+        "semantic-debug",
+        source_query,
+        "--role",
+        "user",
+        "--audit-depth",
+        depth,
+    ]
+    for root in roots:
         argv.extend(["--root", str(root)])
+    for name, flag in (("codex_home", "--codex-home"), ("claude_home", "--claude-home")):
+        value = (provider_homes or {}).get(name)
+        if value:
+            argv.extend([flag, value])
     cwd = getattr(args, "cwd", None)
     if cwd:
         argv.extend(["--cwd", str(cwd)])
@@ -17583,6 +17706,7 @@ def in_depth_audit_target_refocus_command(
         [
             "--deep-audit-target-contract",
             json.dumps(executable_target_contract, sort_keys=True, separators=(",", ":")),
+            "--deep-audit-continuation-step",
             "--format",
             "json",
         ]
@@ -17604,6 +17728,8 @@ def in_depth_audit_target_refocus_command(
         "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
         "target_persistence_required": True,
         "target_reminder": target_contract.get("canonical_target_reminder"),
+        "audit_depth": depth,
+        "evidence_output_contract": "metadata_only_until_answer_ready",
         **deep_audit_target_contract_continuation_fields(target_contract),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),

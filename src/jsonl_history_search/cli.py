@@ -104,7 +104,7 @@ from .mechanism_eval import build_mechanism_eval_payload
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
 from .prompt_echo import setup_echo_classification
-from .output import render
+from .output import project_semantic_debug_continuation_step, render
 from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .profiling import AskExecutePhaseEmitter, finish_phase_profile, start_phase_profile
@@ -835,6 +835,11 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "--deep-audit-target-contract",
         type=_json_object_argument,
         default=None,
+        help=argparse.SUPPRESS,
+    )
+    semantic_debug.add_argument(
+        "--deep-audit-continuation-step",
+        action="store_true",
         help=argparse.SUPPRESS,
     )
     semantic_debug.add_argument(
@@ -19440,6 +19445,8 @@ def main(argv: list[str] | None = None) -> int:
             mask_context=_mask_context_from_args(args),
             configuration_warnings=_configuration_warnings(source_plan),
         )
+        if args.deep_audit_continuation_step:
+            payload = project_semantic_debug_continuation_step(payload)
         output_profile_token = start_phase_profile("semantic_debug_output_report")
         rendered = render(payload, args.format)
         report_bytes = 0

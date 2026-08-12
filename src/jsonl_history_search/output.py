@@ -30,6 +30,94 @@ def render_json(payload: dict) -> str:
     return json.dumps(safe_payload or payload, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+def project_semantic_debug_continuation_step(payload: dict) -> dict:
+    report = payload.get("semantic_debug")
+    if not isinstance(report, dict):
+        return payload
+    followthrough = report.get("in_depth_audit_followthrough") or {}
+    workflow = report.get("audit_continuation_workflow") or followthrough.get(
+        "audit_continuation_workflow"
+    ) or {}
+    if workflow.get("answer_ready") is True:
+        report["continuation_step_contract"] = {
+            "status": "answer_ready",
+            "answer_ready": True,
+            "evidence_projection": "normal_answer_ready_output",
+        }
+        return payload
+
+    projected = _semantic_debug_cap_hit_json_projection(payload)
+    if projected is None:
+        scoped_fail_closed = {
+            "schema_version": 1,
+            "status": "scoped_fail_closed",
+            "answer_ready": False,
+            "canonical_continuation": None,
+            "canonical_continuation_packet": None,
+            "scoped_fail_closed": {
+                "reason": (
+                    "Continuation step remains unresolved without a canonical nested continuation; "
+                    "partial evidence is withheld."
+                ),
+                "searched_scope": (followthrough.get("coverage_state") or {}).get("searched_scope") or {},
+                "not_searched_scope": (followthrough.get("coverage_state") or {}).get("not_searched_scope") or {},
+                "source_boundary": "serialized selected history roots and reported searched windows only",
+            },
+            "partial_evidence_rendering_allowed": False,
+            "manual_history_fallback_allowed": False,
+        }
+        synthetic_followthrough = {**followthrough, "cap_hit_disposition": scoped_fail_closed}
+        synthetic_workflow = {
+            **workflow,
+            "applies": True,
+            "answer_ready": False,
+            "hard_stop": True,
+            "cap_hit_disposition": scoped_fail_closed,
+        }
+        synthetic_followthrough["audit_continuation_workflow"] = synthetic_workflow
+        projected = _semantic_debug_cap_hit_json_projection(
+            {
+                "semantic_debug": {
+                    **report,
+                    "in_depth_audit_followthrough": synthetic_followthrough,
+                    "audit_continuation_workflow": synthetic_workflow,
+                }
+            }
+        )
+    if projected is None:
+        return {
+            "semantic_debug": {
+                "schema_version": report.get("schema_version"),
+                "status": "scoped_fail_closed",
+                "answer_gate": {
+                    "status": "not_answerable_yet",
+                    "answer_ready": False,
+                    "hard_stop": True,
+                    "partial_evidence_rendering_allowed": False,
+                },
+            }
+        }
+    safe_report = projected["semantic_debug"]
+    safe_report["continuation_step_contract"] = {
+        "status": "unresolved_evidence_withheld",
+        "answer_ready": False,
+        "evidence_projection": "metadata_only",
+        "forbidden_evidence_fields": [
+            "strongest_candidates",
+            "timeline",
+            "next_reads",
+            "snippet",
+            "text",
+            "read",
+        ],
+    }
+    safe_report["message"] = (
+        "Continuation-step evidence is withheld until this step is answer-ready; follow only a nested "
+        "canonical continuation or return the reported scoped blocker."
+    )
+    return projected
+
+
 def _semantic_debug_cap_hit_json_projection(payload: dict) -> dict | None:
     report = payload.get("semantic_debug")
     if not isinstance(report, dict):
@@ -131,6 +219,7 @@ def _semantic_debug_safe_continuation(action: dict) -> dict:
         "retry_guidance",
         "target_fingerprint_12",
         "target_persistence_required",
+        "evidence_output_contract",
         "argv",
         "command",
     )
