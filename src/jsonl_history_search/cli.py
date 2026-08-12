@@ -12073,6 +12073,13 @@ def _ask_answer_from_execute(
         query=str(report.get("query") or ""),
         route_family=route_family,
         opened=answer_opened,
+        preserve_all_allowed=(
+            route_family == "latest_status"
+            and (answer["source_contract"].get("latest_status_post_anchor_interval_answer_gate") or {}).get(
+                "status"
+            )
+            == "answer_allowed"
+        ),
     )
     if current_run_gate.get("applies"):
         answer["source_contract"]["current_run_final_support_gate"] = (
@@ -15777,7 +15784,13 @@ CURRENT_RUN_FINAL_SUPPORT_ROUTE_FAMILIES = frozenset(
 )
 
 
-def _current_run_final_support_gate(*, query: str, route_family: str, opened: list[dict]) -> dict:
+def _current_run_final_support_gate(
+    *,
+    query: str,
+    route_family: str,
+    opened: list[dict],
+    preserve_all_allowed: bool = False,
+) -> dict:
     if route_family not in CURRENT_RUN_FINAL_SUPPORT_ROUTE_FAMILIES:
         return {"schema_version": 1, "applies": False, "status": "not_applicable"}
     allowed: list[dict] = []
@@ -15803,7 +15816,7 @@ def _current_run_final_support_gate(*, query: str, route_family: str, opened: li
         "applies": True,
         "route_family": route_family,
         "status": status,
-        "opened": allowed[:_ASK_ANSWER_MAX_REFS],
+        "opened": allowed if preserve_all_allowed else allowed[:_ASK_ANSWER_MAX_REFS],
         "rejected": rejected[:_ASK_ANSWER_MAX_REFS],
         "allowed_ref_count": len(allowed),
         "rejected_ref_count": len(rejected),
