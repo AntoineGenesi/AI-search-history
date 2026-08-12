@@ -319,6 +319,7 @@ def build_status_anchor_payload(args: Any) -> dict:
     query = getattr(args, "query", None) or DEFAULT_STATUS_QUERY
     parent_thread_mode = bool(getattr(args, "parent_thread", False))
     complete_interval = bool(getattr(args, "complete_interval", False))
+    receiver_answer_mode = bool(getattr(args, "receiver_answer_mode", False))
     anchor_ref = getattr(args, "anchor_ref", None)
     output_format = str(getattr(args, "format", "json") or "json")
     limit = getattr(args, "limit", None) or getattr(args, "max_matches", 40)
@@ -349,6 +350,7 @@ def build_status_anchor_payload(args: Any) -> dict:
                 "max_matches": limit,
                 "parent_thread": parent_thread_mode,
                 "complete_interval": complete_interval,
+                "receiver_answer_mode": receiver_answer_mode,
                 "anchor_ref": anchor_ref,
                 "format": output_format,
             },
@@ -711,6 +713,10 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
     if not (
         command_options.get("parent_thread")
         and command_options.get("complete_interval")
+        and (
+            command_options.get("format") == "answer"
+            or command_options.get("receiver_answer_mode") is True
+        )
         and readiness.get("answer_allowed") is not True
     ):
         return None

@@ -3011,6 +3011,7 @@ def _execution_args_from_ask(
             "query": query if query is not None else args.query,
             "format": "json",
             "report_output": report_output,
+            "receiver_answer_mode": bool(getattr(args, "answer", False)),
         }
     )
     if audit_depth_override is not None:
