@@ -78,6 +78,7 @@ def latest_user_messages(
     max_bytes: int,
     max_elapsed: float,
     snippet_chars: int = 500,
+    collapse_canonical_duplicates: bool = True,
 ) -> dict:
     started = time.monotonic()
     warnings: list[str] = []
@@ -134,7 +135,10 @@ def latest_user_messages(
             }
         )
 
-    messages, deduped_mirror_count = _dedupe_and_sort(candidates)
+    messages, deduped_mirror_count = _dedupe_and_sort(
+        candidates,
+        collapse_canonical_duplicates=collapse_canonical_duplicates,
+    )
     rendered = [_message_to_dict(item, default_tz, snippet_chars) for item in messages[:limit]]
     raw_paths_included = any(message.get("openable_target") for message in rendered)
     return {
@@ -289,15 +293,23 @@ def _simple_top_level_user_text(data: Mapping[str, Any]) -> str | None:
     return text or None
 
 
-def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUserMessage], int]:
+def _dedupe_and_sort(
+    messages: list[LatestUserMessage],
+    *,
+    collapse_canonical_duplicates: bool,
+) -> tuple[list[LatestUserMessage], int]:
+    canonical_messages = [message for message in messages if message.source_kind == "codex_history"]
+    canonical_duplicates = 0
+    if collapse_canonical_duplicates:
+        canonical_messages, canonical_duplicates = _collapse_canonical_history_duplicates(canonical_messages)
     canonical_groups: list[list[LatestUserMessage]] = [
-        [message] for message in messages if message.source_kind == "codex_history"
+        [message] for message in canonical_messages
     ]
     session_messages, transport_duplicates = _collapse_session_transport_duplicates(
         [item for item in messages if item.source_kind != "codex_history"]
     )
     standalone: list[LatestUserMessage] = []
-    deduped = transport_duplicates
+    deduped = canonical_duplicates + transport_duplicates
     for message in session_messages:
         matches = [group for group in canonical_groups if _is_correlated_mirror(group[0], message)]
         if len(matches) == 1:
@@ -321,7 +333,7 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
     for group in canonical_groups:
         canonical = group[0]
         session_copies = group[1:]
-        canonical.mirror_sources = [_mirror_source(canonical)]
+        canonical.mirror_sources = canonical.mirror_sources or [_mirror_source(canonical)]
         for session_copy in session_copies:
             canonical.mirror_sources.extend(session_copy.mirror_sources or [_mirror_source(session_copy)])
         canonical.canonical_authority = _mirror_source(canonical)
@@ -363,6 +375,35 @@ def _dedupe_and_sort(messages: list[LatestUserMessage]) -> tuple[list[LatestUser
         reverse=True,
     )
     return deduped_messages, deduped
+
+
+def _collapse_canonical_history_duplicates(
+    messages: list[LatestUserMessage],
+) -> tuple[list[LatestUserMessage], int]:
+    ordered = sorted(messages, key=lambda item: item.line)
+    collapsed: list[LatestUserMessage] = []
+    duplicate_count = 0
+    for message in ordered:
+        previous = collapsed[-1] if collapsed else None
+        is_adjacent_duplicate = bool(
+            previous
+            and message.line == previous.line + 1
+            and message.source_identifier == previous.source_identifier
+            and message.correlated_session_identity == previous.correlated_session_identity
+            and _normalized_text(message.text) == _normalized_text(previous.text)
+            and abs((message.timestamp_utc - previous.timestamp_utc).total_seconds())
+            <= MIRROR_CORRELATION_WINDOW_SECONDS
+        )
+        if not is_adjacent_duplicate:
+            collapsed.append(message)
+            continue
+        message.mirror_sources = [
+            *(previous.mirror_sources or [_mirror_source(previous)]),
+            _mirror_source(message),
+        ]
+        collapsed[-1] = message
+        duplicate_count += 1
+    return collapsed, duplicate_count
 
 
 def _collapse_session_transport_duplicates(

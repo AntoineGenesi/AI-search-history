@@ -332,6 +332,7 @@ def build_status_anchor_payload(args: Any) -> dict:
         max_bytes=args.max_bytes,
         max_elapsed=args.max_elapsed,
         snippet_chars=snippet_chars,
+        collapse_canonical_duplicates=False,
     )
     return {
         "status_anchor": status_anchor_report(
@@ -733,6 +734,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
     ]
     steps = []
     operation = "complete_post_anchor_interval"
+    continuation_anchor_ref = str(selected.get("source_ref") or "")
     if not selected:
         exact_candidates = [
             candidate
@@ -742,6 +744,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         exact_candidate = exact_candidates[0] if len(exact_candidates) == 1 else None
         if exact_candidate:
             operation = "rerun_with_recovered_canonical_anchor"
+            continuation_anchor_ref = str(exact_candidate["source_ref"])
             steps.append(
                 {
                     "step_id": "rerun_complete_interval_with_recovered_anchor",
@@ -757,23 +760,13 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
                 }
             )
         else:
-            operation = "canonical_history_anchor_discovery"
-            steps.append(
-                {
-                    "step_id": "discover_canonical_parent_anchor",
-                    "action": "discover_canonical_parent_anchor",
-                    "command": _latest_user_messages_recovery_command(command_options),
-                    "result_contract": (
-                        "Select one canonical codex_history:history.jsonl:<line> human parent/main row from machine output; "
-                        "do not use candidate text as answer material."
-                    ),
-                }
-            )
+            operation = "canonical_parent_anchor_machine_blocker"
     else:
         freshness = (readiness.get("parent_main_anchor_freshness") or {})
         freshness_command = freshness.get("canonical_continuation_command")
         if freshness.get("current") is False and freshness_command:
             operation = "refresh_stale_parent_anchor"
+            continuation_anchor_ref = str((freshness.get("newest_candidate") or {}).get("source_ref") or "")
             steps.append(
                 {
                     "step_id": "rerun_complete_interval_with_newest_anchor",
@@ -826,27 +819,37 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
     roots = []
     if codex_home:
         roots = [str(Path(codex_home) / "history.jsonl"), str(Path(codex_home) / "sessions")]
-    completion_argv = [
-        "jsonl-history-search",
-        "what-happened-since",
-        str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
-        "--cwd",
-        str(command_options.get("cwd") or "."),
-    ]
-    if codex_home:
-        completion_argv.extend(["--codex-home", codex_home])
-    completion_argv.extend(
-        [
-            "--parent-thread",
-            "--complete-interval",
-            "--anchor-ref",
-            "<canonical-codex-history-source-ref>",
-            "--format",
-            "answer",
+    completion_transition = {
+        "required_result": "machine_lineage_required_before_retry",
+        "terminal": True,
+    }
+    if operation != "canonical_parent_anchor_machine_blocker":
+        completion_argv = [
+            "jsonl-history-search",
+            "what-happened-since",
+            str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
+            "--cwd",
+            str(command_options.get("cwd") or "."),
         ]
-    )
-    if command_options.get("max_matches"):
-        completion_argv.extend(["--max-matches", str(command_options["max_matches"])])
+        if codex_home:
+            completion_argv.extend(["--codex-home", codex_home])
+        completion_argv.extend(
+            [
+                "--parent-thread",
+                "--complete-interval",
+                "--anchor-ref",
+                continuation_anchor_ref,
+                "--format",
+                "answer",
+            ]
+        )
+        if command_options.get("max_matches"):
+            completion_argv.extend(["--max-matches", str(command_options["max_matches"])])
+        completion_transition = {
+            "required_result": "answer_ready=true",
+            "terminal": False,
+            "anchor_discovery_rerun_argv_template": completion_argv,
+        }
     packet_seed = "|".join(
         [
             str(report.get("query") or ""),
@@ -855,7 +858,7 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         ]
     )
     boundary = interval.get("boundary") or {}
-    return {
+    packet = {
         "schema_version": "parent_thread_interval_continuation.v1",
         "packet_id": f"parent-thread-interval-{hashlib.sha256(packet_seed.encode('utf-8')).hexdigest()[:12]}",
         "status": "canonical_continuation_packet",
@@ -891,14 +894,26 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
             },
         },
         "steps": steps,
-        "completion_transition": {
-            "required_result": "answer_ready=true",
-            "anchor_discovery_rerun_argv_template": completion_argv,
-        },
+        "completion_transition": completion_transition,
         "partial_evidence_rendering_allowed": False,
         "visible_context_synthesis_allowed": False,
         "user_anchor_clarification_allowed": False,
     }
+    if operation == "canonical_parent_anchor_machine_blocker":
+        shortlist = report.get("parent_main_anchor_shortlist") or {}
+        packet["machine_blocker"] = {
+            "status": "no_unique_canonical_parent_anchor",
+            "reason": "machine_selection_found_no_unique_proven_parent_main_lineage",
+            "selection_status": shortlist.get("status") or "anchor_ambiguous",
+            "selection_rule": shortlist.get("selection_rule"),
+            "candidate_count": shortlist.get("candidate_count", 0),
+            "canonical_high_confidence_count": shortlist.get("canonical_high_confidence_count", 0),
+            "candidate_diagnostics": [
+                _continuation_anchor_candidate_diagnostic(candidate)
+                for candidate in (shortlist.get("candidates") or [])[:10]
+            ],
+        }
+    return packet
 
 
 def _continuation_recovery_candidate(read: dict) -> dict:
@@ -917,12 +932,22 @@ def _continuation_recovery_candidate(read: dict) -> dict:
     }
 
 
-def _latest_user_messages_recovery_command(command_options: dict) -> str:
-    parts = ["jsonl-history-search", "latest-user-messages", "--cwd", str(command_options.get("cwd") or ".")]
-    if command_options.get("codex_home"):
-        parts.extend(["--codex-home", str(command_options["codex_home"])])
-    parts.extend(["--limit", str(command_options.get("max_matches") or 40), "--snippet-chars", "1", "--format", "json"])
-    return " ".join(shlex.quote(part) for part in parts)
+def _continuation_anchor_candidate_diagnostic(candidate: dict) -> dict:
+    return {
+        key: candidate.get(key)
+        for key in (
+            "source_ref",
+            "source_kind",
+            "source_scope",
+            "timestamp_utc",
+            "classification",
+            "decision",
+            "confidence_label",
+            "ambiguity_label",
+            "lineage_rejection_reason",
+        )
+        if candidate.get(key) is not None
+    }
 
 
 def _latest_status_navigation_only_report(report: dict) -> dict:
