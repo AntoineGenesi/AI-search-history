@@ -16568,18 +16568,30 @@ def build_in_depth_audit_followthrough_plan(
     search_cap_hit = bool((coverage.get("search_cap_hit") or {}).get("hit") or caps.get("hit"))
     cap_hit_disposition: dict[str, Any] = {}
     if search_cap_hit:
+        pending_cap_slices = in_depth_audit_pending_slice_labels(coverage)
         unresolved_cap_slices = {
             str(row.get("slice"))
-            for row in in_depth_audit_pending_slice_labels(coverage)
+            for row in pending_cap_slices
             if row.get("slice")
+        }
+        non_aggregate_unresolved_cap_slices = unresolved_cap_slices - {"selected_scope"}
+        precise_unresolved_cap_slices = {
+            str(row.get("slice"))
+            for row in pending_cap_slices
+            if row.get("slice")
+            and row.get("slice") != "selected_scope"
+            and isinstance(row.get("window"), dict)
+            and row["window"].get("type") in {"date", "path"}
         }
         covered_cap_slices = {
             str(command.get("slice"))
             for command in cap_continuation_commands
             if command.get("slice")
         }
-        canonical_scope_coverage_complete = bool(unresolved_cap_slices) and (
-            covered_cap_slices == unresolved_cap_slices
+        canonical_scope_coverage_complete = bool(precise_unresolved_cap_slices) and (
+            covered_cap_slices
+            == precise_unresolved_cap_slices
+            == non_aggregate_unresolved_cap_slices
         )
         canonical_continuation = (
             cap_continuation_commands[0]
@@ -16588,9 +16600,21 @@ def build_in_depth_audit_followthrough_plan(
             and canonical_scope_coverage_complete
             else None
         )
+        canonical_continuation_packet = (
+            build_deep_audit_cap_continuation_packet(
+                args=args,
+                coverage=coverage,
+                scope_boundary_summary=scope_boundary_summary,
+                target_contract=target_contract,
+                commands=continuation_candidates + cap_continuation_commands,
+                pending_slices=pending_cap_slices,
+            )
+            if not canonical_continuation and canonical_scope_coverage_complete
+            else None
+        )
         fail_closed_reason = (
             "Search caps blocked complete coverage and no deterministic JSONL continuation was available."
-            if not continuation_candidates
+            if not continuation_candidates and not cap_continuation_commands
             else (
                 "Available follow-up does not cover every unresolved capped slice; no command is canonical."
                 if not canonical_scope_coverage_complete
@@ -16599,12 +16623,19 @@ def build_in_depth_audit_followthrough_plan(
         )
         cap_hit_disposition = {
             "schema_version": 1,
-            "status": "canonical_continuation" if canonical_continuation else "scoped_fail_closed",
+            "status": (
+                "canonical_continuation"
+                if canonical_continuation
+                else "canonical_continuation_packet"
+                if canonical_continuation_packet
+                else "scoped_fail_closed"
+            ),
             "answer_ready": False,
             "canonical_continuation": canonical_continuation,
+            "canonical_continuation_packet": canonical_continuation_packet,
             "scoped_fail_closed": (
                 None
-                if canonical_continuation
+                if canonical_continuation or canonical_continuation_packet
                 else {
                     "reason": fail_closed_reason,
                     "searched_scope": searched_scope,
@@ -16615,7 +16646,9 @@ def build_in_depth_audit_followthrough_plan(
             ),
             "partial_evidence_rendering_allowed": False,
             "manual_history_fallback_allowed": False,
-            "pending_continuation_candidate_count": len(continuation_candidates),
+            "pending_continuation_candidate_count": len(
+                (canonical_continuation_packet or {}).get("steps") or continuation_candidates
+            ),
             "cap_continuation_count": len(cap_continuation_commands),
             "tail_followup_count": len(tail_followup_actions),
             "unresolved_cap_slice_count": len(unresolved_cap_slices),
@@ -16645,6 +16678,7 @@ def build_in_depth_audit_followthrough_plan(
         "ordered_primary_refs_to_open_first": selected_reads,
         "pending_slices": in_depth_audit_pending_slice_labels(coverage),
         "continuation_commands": continuation_commands,
+        "continuation_packet": cap_hit_disposition.get("canonical_continuation_packet"),
         "cap_hit_disposition": cap_hit_disposition,
         "do_not_abandon_jsonl_guidance": (
             "Do not abandon JSONL/convo for broad git/rg/task artifact inspection after a cap. Continue with "
@@ -16729,6 +16763,7 @@ def build_in_depth_audit_followthrough_plan(
         },
         "pending_slice_count": len(workflow["pending_slices"]),
         "continuation_commands": continuation_commands,
+        "continuation_packet": cap_hit_disposition.get("canonical_continuation_packet"),
         "cap_hit_disposition": cap_hit_disposition,
         "audit_continuation_workflow": workflow,
     }
@@ -17333,6 +17368,7 @@ def in_depth_audit_continuation_commands(
             slice_row=slice_row,
             index=len(commands) + 1,
             target_contract=target_contract or {},
+            audit_depth=(coverage.get("audit_depth") or {}).get("depth"),
         )
         if command:
             commands.append(command)
@@ -17348,9 +17384,11 @@ def in_depth_audit_continuation_command_for_slice(
     slice_row: dict[str, Any],
     index: int,
     target_contract: dict[str, Any] | None = None,
+    audit_depth: str | None = None,
 ) -> dict[str, Any] | None:
     window = slice_row.get("window") if isinstance(slice_row.get("window"), dict) else {}
-    argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", "in-depth"]
+    depth = str(audit_depth or "in-depth").replace("_", "-")
+    argv = ["jsonl-history-search", "semantic-debug", query, "--audit-depth", depth]
     for root in getattr(args, "root", None) or []:
         argv.extend(["--root", str(root)])
     cwd = getattr(args, "cwd", None)
@@ -17368,6 +17406,26 @@ def in_depth_audit_continuation_command_for_slice(
     else:
         return None
     target_contract = target_contract or {}
+    for name, flag in (
+        ("max_files", "--max-files"),
+        ("max_bytes", "--max-bytes"),
+        ("max_matches", "--max-matches"),
+        ("max_elapsed", "--max-elapsed"),
+        ("hard_cap_files", "--hard-cap-files"),
+        ("hard_cap_bytes", "--hard-cap-bytes"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            argv.extend([flag, str(value)])
+    executable_target_contract = deep_audit_executable_target_contract(target_contract)
+    if executable_target_contract.get("target_fingerprint_12"):
+        argv.extend(
+            [
+                "--deep-audit-target-contract",
+                json.dumps(executable_target_contract, sort_keys=True, separators=(",", ":")),
+            ]
+        )
+    argv.extend(["--format", "json"])
     return {
         "command_id": f"continue_scoped_audit_slice_{index:02d}",
         "slice": slice_row.get("slice"),
@@ -17380,9 +17438,114 @@ def in_depth_audit_continuation_command_for_slice(
         "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
         "target_persistence_required": True,
         "target_reminder": target_contract.get("canonical_target_reminder"),
+        "audit_depth": depth,
         **deep_audit_target_contract_continuation_fields(target_contract),
         "argv": argv,
         "command": " ".join(shlex.quote(str(part)) for part in argv),
+    }
+
+
+def build_deep_audit_cap_continuation_packet(
+    *,
+    args: Any,
+    coverage: dict[str, Any],
+    scope_boundary_summary: dict[str, Any],
+    target_contract: dict[str, Any],
+    commands: list[dict[str, Any]],
+    pending_slices: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    steps = []
+    seen = set()
+    for command in commands:
+        if not isinstance(command, dict) or not command.get("command"):
+            continue
+        identity = str(command.get("command_id") or command.get("command"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        steps.append(command)
+    if not steps:
+        return None
+
+    searched_scope = scope_boundary_summary.get("searched_scope") or {}
+    not_searched_scope = scope_boundary_summary.get("not_searched_scope") or {}
+    caps = scope_boundary_summary.get("caps") or coverage.get("search_cap_hit") or {}
+    inherited_caps = {
+        name: getattr(args, name, None)
+        for name in (
+            "max_files",
+            "max_bytes",
+            "max_matches",
+            "max_elapsed",
+            "hard_cap_files",
+            "hard_cap_bytes",
+        )
+        if getattr(args, name, None) is not None
+    }
+    blockers = []
+    missing_roots = int(not_searched_scope.get("missing_root_count", 0) or 0)
+    deferred_files = int(not_searched_scope.get("source_plan_deferred_files", 0) or 0)
+    if missing_roots:
+        blockers.append(
+            {
+                "kind": "unavailable_selected_roots",
+                "count": missing_roots,
+                "resolution": "fail_closed_until_the_selected_roots_are_available",
+            }
+        )
+    if deferred_files:
+        blockers.append(
+            {
+                "kind": "deferred_source_plan_files",
+                "count": deferred_files,
+                "resolution": "resolve_through_the_bounded_packet_steps_or_keep_the_gap_explicit",
+            }
+        )
+
+    packet_basis = {
+        "roots": [str(root) for root in getattr(args, "root", None) or []],
+        "cwd": str(getattr(args, "cwd", None) or ""),
+        "audit_depth": str((coverage.get("audit_depth") or {}).get("depth") or "in_depth"),
+        "target_fingerprint_12": target_contract.get("target_fingerprint_12"),
+        "pending_slice_ids": [str(row.get("slice")) for row in pending_slices if row.get("slice")],
+        "step_ids": [str(row.get("command_id")) for row in steps],
+        "inherited_caps": inherited_caps,
+    }
+    packet_id = "deep-audit-continuation-" + hashlib.sha256(
+        json.dumps(packet_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    return {
+        "schema_version": 1,
+        "packet_id": packet_id,
+        "status": "canonical_continuation_packet",
+        "answer_ready": False,
+        "execution_mode": "run_all_steps_in_order_then_reassess_coverage",
+        "source_scope": {
+            "roots": packet_basis["roots"],
+            "cwd": packet_basis["cwd"],
+            "allow_arbitrary_root": bool(getattr(args, "allow_arbitrary_root", False)),
+            "searched_scope": searched_scope,
+            "not_searched_scope": not_searched_scope,
+        },
+        "omitted_ranges": in_depth_audit_omitted_or_capped_windows(coverage),
+        "caps": {
+            "caps_hit": list(caps.get("caps_hit") or []),
+            "inherited_cli_caps": inherited_caps,
+        },
+        "target_contract": deep_audit_executable_target_contract(target_contract),
+        "pending_slices": pending_slices,
+        "steps": steps,
+        "blockers": blockers,
+        "completion_contract": {
+            "required_step_ids": [row.get("command_id") for row in steps],
+            "all_steps_required_before_synthesis": True,
+            "partial_step_results_are_answer_material": False,
+            "on_nested_cap_hit": "follow_only_the_nested_canonical_packet_or_fail_closed",
+            "on_remaining_blocker": "return_scoped_fail_closed_with_the_blocker_and_unresolved_coverage",
+            "on_complete_coverage": "synthesize_only_from_inspected_primary_evidence_across_completed_steps",
+        },
+        "partial_evidence_rendering_allowed": False,
+        "manual_history_fallback_allowed": False,
     }
 
 

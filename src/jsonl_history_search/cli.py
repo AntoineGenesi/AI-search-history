@@ -832,6 +832,12 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         ),
     )
     semantic_debug.add_argument(
+        "--deep-audit-target-contract",
+        type=_json_object_argument,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    semantic_debug.add_argument(
         "--gold-manifest",
         default=str(DEFAULT_GOLD_MANIFEST),
         help="Committed sanitized real-history gold manifest for coverage-only caveats; no private bridge is required.",
@@ -5740,8 +5746,39 @@ def _continuation_first_history_contract(*, compact: dict, selected_route: dict)
     followthrough = compact.get("in_depth_audit_followthrough") or {}
     if not followthrough.get("applies") or followthrough.get("answer_ready"):
         return {}
+    disposition = followthrough.get("cap_hit_disposition") or {}
+    continuation_packet = disposition.get("canonical_continuation_packet") or followthrough.get(
+        "continuation_packet"
+    )
     primary_reads = list(followthrough.get("ordered_primary_refs_to_open_first") or [])
     continuations = list(followthrough.get("continuation_commands") or [])[:1]
+    if continuation_packet:
+        return {
+            "answer_status": "canonical-continuation-packet-required",
+            "promotion_status": "deep_history_audit_continuation_packet",
+            "promotion_reason": (
+                "The capped broad-history audit is not answer-ready. Run every bounded step in the single "
+                "canonical packet, then reassess its blockers before synthesizing anything."
+            ),
+            "read": [],
+            "conditional_required": [],
+            "canonical_continuation_packet": continuation_packet,
+            "partial_evidence_rendering_allowed": False,
+            "continuation_first_contract": {
+                "status": "canonical_continuation_packet",
+                "ask_user_now": False,
+                "searched_scope": (followthrough.get("coverage_state") or {}).get("searched_scope") or {},
+                "missing_facet": "complete target-matching deep-history coverage",
+                "packet_id": continuation_packet.get("packet_id"),
+                "step_count": len(continuation_packet.get("steps") or []),
+            },
+            "stop": (
+                "Do not answer from individual step output. Run all packet steps in order; answer only if the "
+                "combined coverage is complete, otherwise return the packet's remaining blocker fail closed."
+            ),
+            "only_continue_if": "The canonical packet still has an uncompleted step or named blocker.",
+            "saved_report": compact.get("report_written"),
+        }
     return {
         "answer_status": (
             "inspect-primary-then-bounded-continuation"
