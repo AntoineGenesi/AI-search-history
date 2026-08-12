@@ -8,7 +8,7 @@ jsonl-history-search find "<terms>" --role user --cwd "$PWD" --format text
 
 Use the router first. Main/parent wording requires raw lineage/history evidence. Visible context and local repository state are not substitutes.
 
-`anchor_ambiguous`: ask its clarification and stop; text exposes no refs, commands, or snippets.
+Plain `anchor_ambiguous`: ask its clarification and stop; text exposes no refs, commands, or snippets. Parent-thread answer packets with `user_anchor_clarification_allowed=false` are different: do not ask the user, report the terminal blocker or exact continuation contract.
 
 Mine user turns/corrections/reactions as leads, not proof; message timestamp is not capture/report/mtime.
 Complete `ANSWER READY` output is terminal: answer from its timeline; compact
