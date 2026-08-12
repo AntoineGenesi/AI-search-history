@@ -5614,11 +5614,6 @@ def _remembered_instruction_chronology_boundary(
                 "candidate_id": candidate_id,
                 "timestamp": timestamp.astimezone(timezone.utc),
                 "snippet": snippet,
-                "source_identity": str(
-                    (candidate.get("source_ref") or {}).get("session")
-                    or (candidate.get("source_ref") or {}).get("path")
-                    or ""
-                ),
             }
         )
 
@@ -5650,10 +5645,6 @@ def _remembered_instruction_chronology_boundary(
             continue
         if candidate["timestamp"] >= boundary["timestamp"]:
             continue
-        if not candidate["source_identity"] or not boundary["source_identity"]:
-            continue
-        if candidate["source_identity"] == boundary["source_identity"]:
-            continue
         candidate_terms = {
             _remembered_user_wording_stem(term)
             for term in re.findall(
@@ -5681,13 +5672,15 @@ def _remembered_instruction_chronology_boundary(
             "eligible_prior_candidate_count": len(prior_candidates),
         }
     return {
-        "status": "established",
-        "basis": (
-            "unique_user_topic_candidate_strictly_before_exact_current_query_echo_"
-            "and_outside_its_source_session"
+        "status": "unproven_original_authorship",
+        "reason": (
+            "Candidate-packet role, topic overlap, timestamp order, and source/session identity "
+            "do not prove that the row is the original user instruction rather than evaluator "
+            "or current-loop paraphrase material."
         ),
+        "candidate_scope": "bounded_strongest_candidates_packet_only",
         "current_query_boundary_candidate_id": boundary["candidate_id"],
-        "selected_prior_candidate_id": prior_candidates[0]["candidate_id"],
+        "unproven_prior_candidate_id": prior_candidates[0]["candidate_id"],
         "eligible_prior_candidate_count": 1,
     }
 
@@ -6820,9 +6813,9 @@ def _answer_action_contract_from_executed_output(
                 contract["answer_status"] = "not-ready/missing-user-authored-remembered-instruction"
                 contract["promotion_status"] = "remembered_instruction_user_authored_source_missing"
                 contract["promotion_reason"] = (
-                    "The remembered-instruction route did not surface a clean user-authored history row. "
-                    "Assistant/tool/current-loop/prior-answer echoes are diagnostics only and must not be "
-                    "opened as the default answer contract."
+                    "The bounded candidate packet did not prove original user authorship. Role, topic, "
+                    "timestamp, and source/session separation cannot distinguish a historical instruction "
+                    "from evaluator or current-loop paraphrase material."
                 )
                 contract["read"] = []
                 contract["diagnostics_after"] = diagnostic_reads
@@ -6874,9 +6867,9 @@ def _answer_action_contract_from_executed_output(
                     "broad_repo_search_allowed": False,
                     "secondary_substitution_allowed": False,
                     "next_allowed_action": (
-                        "Fail closed: no clean user-authored row matched the remembered instruction topic in the "
-                        "bounded selected history. Continue only after a primary history root or source anchor is "
-                        "available; do not inspect or act on secondary paraphrases."
+                        "Fail closed: the bounded candidate packet did not prove original user authorship. "
+                        "Continue only after a primary user-message source anchor with independent provenance is "
+                        "available; do not inspect or act on candidate paraphrases."
                     ),
                 }
                 contract["only_continue_if"] = contract["missing_evidence_stop_contract"][
