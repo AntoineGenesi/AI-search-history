@@ -7044,10 +7044,18 @@ def _answer_action_contract_from_executed_output(
                     contract["only_continue_if"] = (
                         target_proof_handoff.get("only_continue_if") or []
                     )
-            contract["diagnostics_after"] = (
-                target_proof_handoff.get("secondary_context_after_source_inspection")
-                or []
-            ) + (target_proof_handoff.get("diagnostics_after") or [])[:4]
+            if target_proof_handoff.get("status") == "target_primary_proof_refs_missing":
+                # A bounded missing-primary action-proof decision is terminal for
+                # this receiver pass. Do not leak generic semantic-debug/current
+                # loop diagnostics back into the packet as read-more alternatives.
+                contract["read"] = []
+                contract["diagnostics_after"] = []
+                contract.pop("conditional_required", None)
+            else:
+                contract["diagnostics_after"] = (
+                    target_proof_handoff.get("secondary_context_after_source_inspection")
+                    or []
+                ) + (target_proof_handoff.get("diagnostics_after") or [])[:4]
             if (
                 target_proof_handoff.get("status") == "target_primary_proof_refs_available"
                 and answer_status == "answer-ready-after-source-inspection"
@@ -10942,6 +10950,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
         "remembered_user_wording",
         "semantic_wrapup",
         "semantic_debug",
+        "source_window_semantic_debug",
         "latest_status",
         "active_status_front_door",
     }
@@ -17605,6 +17614,8 @@ def _ref_public_summary(item: dict) -> dict:
         "expectation_mismatch_inferred_role": ref.get("expectation_mismatch_inferred_role"),
     }
     for key in (
+        "source_ref_id",
+        "reviewed_source_case_handle",
         "commit",
         "commit_time",
         "author",
@@ -17676,7 +17687,33 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
         return _compose_process_actual_use_answer(action=action, opened=opened)
     if _branch_work_episode_answer_wanted(query=query, route_family=route_family):
         return _compose_branch_work_episode_answer(query=query, opened=opened)
-    if route_family in {"action_proof", "orchestration_provenance", "provenance", "semantic_debug"}:
+    if route_family == "source_window_semantic_debug":
+        reviewed_source_ids = _unique_preserving_order(
+            [
+                str(
+                    (item.get("ref") if isinstance(item.get("ref"), dict) else {}).get("source_ref_id")
+                    or (
+                        (item.get("ref") if isinstance(item.get("ref"), dict) else {})
+                        .get("reviewed_source_packet_pointer", {})
+                        .get("source_ref_id")
+                    )
+                    or ""
+                )
+                for item in opened
+            ]
+        )
+        citation = (
+            f" Reviewed source handle(s): {', '.join(reviewed_source_ids[:4])}."
+            if reviewed_source_ids
+            else ""
+        )
+        return f"The opened reviewed-source proof refs show: {_short_join(summaries[:4])}{citation}"
+    if route_family in {
+        "action_proof",
+        "orchestration_provenance",
+        "provenance",
+        "semantic_debug",
+    }:
         return f"The opened proof refs show: {_short_join(summaries[:4])}"
     return None
 
