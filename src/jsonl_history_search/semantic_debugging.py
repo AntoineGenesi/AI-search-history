@@ -1573,6 +1573,50 @@ def build_semantic_debug_payload(
         source_locator_handoff["directional_history_reconstruction"] = directional_history_reconstruction
         answer_ready_handoff["directional_history_reconstruction"] = directional_history_reconstruction
         agent_instruction["directional_history_reconstruction"] = directional_history_reconstruction
+    continuation_workflow = (
+        in_depth_audit_followthrough.get("audit_continuation_workflow")
+        if isinstance(in_depth_audit_followthrough.get("audit_continuation_workflow"), dict)
+        else {}
+    )
+    cap_hit_disposition = (
+        continuation_workflow.get("cap_hit_disposition")
+        if isinstance(continuation_workflow.get("cap_hit_disposition"), dict)
+        else {}
+    )
+    canonical_continuation_packet = (
+        cap_hit_disposition.get("canonical_continuation_packet")
+        if isinstance(cap_hit_disposition.get("canonical_continuation_packet"), dict)
+        else continuation_workflow.get("continuation_packet")
+        if isinstance(continuation_workflow.get("continuation_packet"), dict)
+        else None
+    )
+    investigation_finalization_state = build_investigation_finalization_state(
+        answer_readiness=answer_readiness,
+        answer_ready_handoff=answer_ready_handoff,
+        source_followthrough_plan=source_followthrough_plan,
+        next_reads=next_reads,
+        route_family=str(family.get("primary") or "semantic_debug"),
+        canonical_continuation_packet=canonical_continuation_packet,
+    )
+    answer_ready_handoff["investigation_finalization_state"] = investigation_finalization_state
+    answer_ready_handoff["links"]["investigation_finalization_state"] = (
+        "semantic_debug.investigation_finalization_state"
+    )
+    answer_ready_handoff["source_use_summary"]["investigation_finalization_state"] = {
+        "link": "semantic_debug.investigation_finalization_state",
+        "state": investigation_finalization_state.get("state"),
+        "terminal": investigation_finalization_state.get("terminal"),
+        "answer_promotion_allowed": investigation_finalization_state.get("answer_promotion_allowed"),
+        "required_receiver_action": investigation_finalization_state.get("required_receiver_action"),
+    }
+    final_answer_contract["investigation_finalization_state"] = investigation_finalization_state
+    agent_instruction["investigation_finalization_state"] = {
+        "state": investigation_finalization_state.get("state"),
+        "terminal": investigation_finalization_state.get("terminal"),
+        "answer_promotion_allowed": investigation_finalization_state.get("answer_promotion_allowed"),
+        "required_receiver_action": investigation_finalization_state.get("required_receiver_action"),
+        "canonical_next_action": investigation_finalization_state.get("canonical_next_action"),
+    }
     command_status = semantic_debug_command_status(agent_find.get("status"))
     packet = {
         "schema_version": SCHEMA_VERSION,
@@ -1584,6 +1628,7 @@ def build_semantic_debug_payload(
         "audit_continuation_workflow": in_depth_audit_followthrough.get("audit_continuation_workflow"),
         "question_family": family,
         "directional_history_reconstruction": directional_history_reconstruction,
+        "investigation_finalization_state": investigation_finalization_state,
         "investigation_state": investigation_state,
         "scope": source_scope,
         "routes": routes,
@@ -8056,6 +8101,328 @@ def answer_support_classification(
             "adjacent_artifact_success_requires_caveat": current == "answer_with_caveat",
             "read_more_required_before_clean_answer": current == "read_more_required",
             "scoped_no_evidence_answer_allowed": current == "scoped_no_evidence_answer",
+        },
+    }
+
+
+def _finalization_read_target(read: dict[str, Any]) -> str:
+    source_ref = read.get("source_ref")
+    if isinstance(source_ref, dict):
+        path = source_ref.get("path") or ""
+        line = source_ref.get("line") or ""
+        if path and line:
+            return f"{path}:{line}"
+    return str(read.get("target") or read.get("openable_target") or read.get("command") or "")
+
+
+def _finalization_required_primary_reads(
+    *,
+    source_followthrough_plan: dict[str, Any],
+    answer_ready_handoff: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for key in (
+        "default_required_primary_proof",
+        "required_primary_proof",
+        "required_primary_reads",
+    ):
+        candidates.extend(
+            item
+            for item in source_followthrough_plan.get(key) or []
+            if isinstance(item, dict)
+        )
+    if not candidates:
+        candidates.extend(
+            item
+            for item in answer_ready_handoff.get("bounded_next_reads") or []
+            if isinstance(item, dict) and read_is_required_surface_actionable(item)
+        )
+    if not candidates:
+        candidates.extend(
+            item
+            for item in next_reads
+            if isinstance(item, dict)
+            and read_is_required_surface_actionable(item)
+            and not item.get("diagnostic_only")
+        )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        target = _finalization_read_target(item)
+        key = target or json.dumps(item, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _finalization_read_progress(required_reads: list[dict[str, Any]]) -> dict[str, Any]:
+    uninspected = 0
+    exhausted = 0
+    inspected_unsupported = 0
+    inspected_supported = 0
+    missing_facets: list[str] = []
+    exhausted_targets: list[str] = []
+    inspected_targets: list[str] = []
+    for read in required_reads:
+        status = str(
+            read.get("inspection_status")
+            or read.get("status")
+            or read.get("read_status")
+            or read.get("result_status")
+            or ""
+        ).casefold()
+        target = _finalization_read_target(read)
+        read_result = read.get("read_result") if isinstance(read.get("read_result"), dict) else {}
+        facets = read.get("missing_facets") or read_result.get("missing_facets") or []
+        if facets:
+            missing_facets.extend(str(item) for item in facets if item)
+        is_exhausted = (
+            read.get("exhausted") is True
+            or read_result.get("exhausted") is True
+            or status in {"exhausted", "searched_no_support", "no_support_found", "no_match", "not_found"}
+        )
+        is_inspected = (
+            read.get("inspected") is True
+            or read.get("opened") is True
+            or bool(read_result)
+            or status
+            in {
+                "opened",
+                "inspected",
+                "supports_answer",
+                "unsupported",
+                "partial_support",
+                "exhausted",
+                "searched_no_support",
+                "no_support_found",
+                "no_match",
+                "not_found",
+            }
+        )
+        supports = (
+            read.get("supports_answer") is True
+            or read_result.get("supports_answer") is True
+            or status == "supports_answer"
+        )
+        if is_exhausted:
+            exhausted += 1
+            if target:
+                exhausted_targets.append(target)
+        elif not is_inspected:
+            uninspected += 1
+        elif supports:
+            inspected_supported += 1
+            if target:
+                inspected_targets.append(target)
+        else:
+            inspected_unsupported += 1
+            if target:
+                inspected_targets.append(target)
+    total = len(required_reads)
+    return {
+        "required_primary_total": total,
+        "required_primary_uninspected_count": uninspected,
+        "required_primary_inspected_unsupported_count": inspected_unsupported,
+        "required_primary_inspected_supported_count": inspected_supported,
+        "required_primary_exhausted_count": exhausted,
+        "required_primary_remaining_count": max(total - inspected_supported - exhausted, 0),
+        "missing_facets": dedupe(missing_facets)[:8],
+        "inspected_targets": dedupe(inspected_targets)[:8],
+        "exhausted_targets": dedupe(exhausted_targets)[:8],
+        "progress_meaning": (
+            "uninspected required-primary refs remain"
+            if uninspected
+            else "required-primary refs were inspected or exhausted but answer support is still incomplete"
+            if inspected_unsupported or exhausted
+            else "no required-primary progress data recorded"
+            if total
+            else "no required-primary reads required by this state"
+        ),
+    }
+
+
+def _finalization_command_from_packet(packet: dict[str, Any] | None) -> str | None:
+    if not packet:
+        return None
+    command = packet.get("command")
+    if isinstance(command, str) and command:
+        return command
+    for step in packet.get("steps") or []:
+        if isinstance(step, dict) and isinstance(step.get("command"), str) and step.get("command"):
+            return str(step["command"])
+        if isinstance(step, str) and step:
+            return step
+    return None
+
+
+def build_investigation_finalization_state(
+    *,
+    answer_readiness: dict[str, Any],
+    answer_ready_handoff: dict[str, Any],
+    source_followthrough_plan: dict[str, Any],
+    next_reads: list[dict[str, Any]],
+    route_family: str,
+    canonical_continuation_packet: dict[str, Any] | None = None,
+    tool_runtime_failure: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    required_reads = _finalization_required_primary_reads(
+        source_followthrough_plan=source_followthrough_plan or {},
+        answer_ready_handoff=answer_ready_handoff or {},
+        next_reads=next_reads or [],
+    )
+    progress = _finalization_read_progress(required_reads)
+    handoff_decision = str((answer_ready_handoff or {}).get("decision") or "")
+    readiness_decision = str((answer_readiness or {}).get("decision") or "")
+    readiness_status = str((answer_readiness or {}).get("status") or "")
+    copy_paste_commands = [
+        str(command)
+        for command in (answer_ready_handoff or {}).get("copy_paste_commands") or []
+        if command
+    ]
+    packet_command = _finalization_command_from_packet(canonical_continuation_packet)
+    first_follow_next_command = next(
+        (
+            command
+            for command in copy_paste_commands
+            if "follow-next-reads" in command
+        ),
+        None,
+    )
+    first_jsonl_command = next(
+        (
+            command
+            for command in copy_paste_commands
+            if command.startswith("jsonl-history-search ")
+        ),
+        None,
+    )
+    optional_diagnostics = [
+        item
+        for item in (source_followthrough_plan or {}).get("optional_diagnostic") or []
+        if isinstance(item, dict)
+    ]
+
+    if tool_runtime_failure:
+        state = "tool_runtime_failure"
+        terminal = True
+        answer_promotion_allowed = False
+        required_receiver_action = "report_tool_runtime_failure"
+        canonical_next_action = {
+            "kind": "none",
+            "command": None,
+            "source": "tool_runtime_failure",
+        }
+        blockers = [tool_runtime_failure]
+    elif readiness_decision == "answer_now" or readiness_status == "answer_ready":
+        state = "answer_ready"
+        terminal = True
+        answer_promotion_allowed = True
+        required_receiver_action = "answer_from_opened_primary_proof"
+        canonical_next_action = {
+            "kind": "ask_answer",
+            "command": None,
+            "source": "semantic_debug.answer_readiness",
+        }
+        blockers = []
+    elif handoff_decision == "scoped_no_evidence" or readiness_decision == "state_scoped_no_evidence":
+        state = "terminal_scoped_no_evidence"
+        terminal = True
+        answer_promotion_allowed = True
+        required_receiver_action = "answer_scoped_no_evidence_only"
+        canonical_next_action = {
+            "kind": "none",
+            "command": None,
+            "source": "semantic_debug.scope_boundary_summary",
+        }
+        blockers = []
+    elif required_reads:
+        state = "actionable_primary_reads"
+        terminal = False
+        answer_promotion_allowed = False
+        required_receiver_action = "open_required_primary_reads"
+        canonical_next_action = {
+            "kind": "follow_next_reads" if first_follow_next_command else "read_more",
+            "command": first_follow_next_command or first_jsonl_command,
+            "source": "semantic_debug.source_followthrough_plan.required_primary_proof[0]",
+        }
+        blockers = []
+    elif canonical_continuation_packet or first_jsonl_command:
+        state = "actionable_canonical_continuation"
+        terminal = False
+        answer_promotion_allowed = False
+        required_receiver_action = "run_canonical_continuation"
+        canonical_next_action = {
+            "kind": "semantic_debug_continuation",
+            "command": packet_command or first_jsonl_command,
+            "source": (
+                "semantic_debug.in_depth_audit_followthrough.audit_continuation_workflow"
+                if canonical_continuation_packet
+                else "semantic_debug.answer_ready_handoff.copy_paste_commands[0]"
+            ),
+        }
+        blockers = []
+    else:
+        state = "terminal_machine_blocker"
+        terminal = True
+        answer_promotion_allowed = False
+        required_receiver_action = "return_exact_blocker_or_scope"
+        canonical_next_action = {
+            "kind": "none",
+            "command": None,
+            "source": "semantic_debug.answer_ready_handoff",
+        }
+        blockers = [
+            {
+                "kind": "no_safe_package_continuation",
+                "answer_readiness_status": readiness_status,
+                "answer_ready_handoff_decision": handoff_decision,
+            }
+        ]
+
+    return {
+        "schema_version": "investigation_finalization_state.v1",
+        "state": state,
+        "answer_ready": state == "answer_ready",
+        "answer_promotion_allowed": answer_promotion_allowed,
+        "terminal": terminal,
+        "required_receiver_action": required_receiver_action,
+        "canonical_next_action": canonical_next_action,
+        "boundedness": {
+            "broad_search_rerun_allowed": False,
+            "optional_diagnostics_default_actionable": False,
+            "max_primary_reads_or_steps": ANSWER_READY_HANDOFF_READ_CAP,
+            "selection_order_source": "source_followthrough_plan/next_reads deterministic order",
+        },
+        "terminal_scope": (
+            (answer_ready_handoff or {}).get("scope_boundary_summary")
+            or (answer_ready_handoff or {}).get("source_action_guidance", {}).get("scope_boundary_summary")
+            if state == "terminal_scoped_no_evidence"
+            else None
+        ),
+        "blockers": blockers,
+        "source_links": {
+            "answer_readiness": "semantic_debug.answer_readiness",
+            "answer_ready_handoff": "semantic_debug.answer_ready_handoff",
+            "next_reads": "semantic_debug.next_reads",
+            "source_followthrough_plan": "semantic_debug.source_followthrough_plan",
+        },
+        "evidence_progress": progress,
+        "required_primary_reads": required_reads[:ANSWER_READY_HANDOFF_READ_CAP],
+        "canonical_continuation_packet": canonical_continuation_packet,
+        "optional_diagnostics": {
+            "default_actionable": False,
+            "count": len(optional_diagnostics),
+            "targets": [_finalization_read_target(item) for item in optional_diagnostics[:5]],
+        },
+        "receipt_protocol": {
+            "uninspected_vs_exhausted_distinguished": True,
+            "receiver_must_report_after_opening": (
+                "record opened/exhausted/support status for each required primary read before promotion"
+            ),
         },
     }
 
