@@ -1332,7 +1332,12 @@ def status_anchor_report(
         and (answer_readiness.get("parent_main_anchor_freshness") or {}).get("current") is not False
         and (command_options or {}).get("format") != "answer"
     ):
-        return _latest_status_navigation_only_report(report)
+        navigation_report = _latest_status_navigation_only_report(report)
+        if (command_options or {}).get("format") in {"text", "markdown"}:
+            continuation_packet = parent_thread_interval_continuation_packet(navigation_report)
+            if continuation_packet:
+                navigation_report["parent_thread_interval_continuation"] = continuation_packet
+        return navigation_report
     return report
 
 
@@ -1342,18 +1347,20 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         return existing
     command_options = report.get("command_options") or {}
     readiness = report.get("answer_readiness") or {}
+    selected = report.get("selected_anchor") or {}
+    active_text_continuation = bool(selected) and command_options.get("format") in {"text", "markdown"}
     if not (
         command_options.get("parent_thread")
         and command_options.get("complete_interval")
         and (
             command_options.get("format") == "answer"
             or command_options.get("receiver_answer_mode") is True
+            or active_text_continuation
         )
         and readiness.get("answer_allowed") is not True
     ):
         return None
 
-    selected = report.get("selected_anchor") or {}
     interval = report.get("post_anchor_interval_reconstruction") or {}
     coverage = interval.get("coverage") or {}
     source_tiers = report.get("source_tiers") or {}
@@ -1407,39 +1414,61 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
                 }
             )
         else:
-            guidance = interval.get("next_read_guidance") or {}
-            commands = [str(command) for command in guidance.get("commands") or [] if command]
-            for omitted in interval.get("omitted_ranges") or []:
-                command = omitted.get("read_next_command")
-                if command:
-                    commands.append(str(command))
-            seen = set()
-            for command in commands:
-                if command in seen:
-                    continue
-                seen.add(command)
+            if active_text_continuation:
+                for index, read in enumerate(source_tiers.get("required_primary") or [], 1):
+                    step = _required_primary_continuation_step(read, index=index)
+                    if step:
+                        steps.append(step)
+            if not steps:
+                guidance = interval.get("next_read_guidance") or {}
+                commands = [str(command) for command in guidance.get("commands") or [] if command]
+                for omitted in interval.get("omitted_ranges") or []:
+                    command = omitted.get("read_next_command")
+                    if command:
+                        commands.append(str(command))
+                seen = set()
+                for command in commands:
+                    if command in seen:
+                        continue
+                    seen.add(command)
+                    steps.append(
+                        {
+                            "step_id": f"continue_interval_{len(steps) + 1:02d}",
+                            "action": "continue_post_anchor_interval",
+                            "command": command,
+                            "result_contract": "Partial window output is continuation state, not answer material.",
+                        }
+                    )
+            if not steps:
                 steps.append(
                     {
-                        "step_id": f"continue_interval_{len(steps) + 1:02d}",
-                        "action": "continue_post_anchor_interval",
-                        "command": command,
-                        "result_contract": "Partial window output is continuation state, not answer material.",
+                        "step_id": "rerun_complete_interval",
+                        "action": "rerun_complete_interval_with_exact_anchor",
+                        "command": _explicit_parent_anchor_rerun_command(
+                            query=str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
+                            anchor_ref=str(selected.get("source_ref") or ""),
+                            cwd=str(command_options.get("cwd") or "."),
+                            codex_home=str(command_options.get("codex_home") or ""),
+                            max_matches=command_options.get("max_matches"),
+                        ),
+                        "result_contract": "Only answer_ready=true from this exact-anchor rerun permits synthesis.",
                     }
                 )
-            steps.append(
-                {
-                    "step_id": "rerun_complete_interval",
-                    "action": "rerun_complete_interval_with_exact_anchor",
-                    "command": _explicit_parent_anchor_rerun_command(
-                        query=str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
-                        anchor_ref=str(selected.get("source_ref") or ""),
-                        cwd=str(command_options.get("cwd") or "."),
-                        codex_home=str(command_options.get("codex_home") or ""),
-                        max_matches=command_options.get("max_matches"),
-                    ),
-                    "result_contract": "Only answer_ready=true from this exact-anchor rerun permits synthesis.",
-                }
-            )
+            elif not active_text_continuation:
+                steps.append(
+                    {
+                        "step_id": "rerun_complete_interval",
+                        "action": "rerun_complete_interval_with_exact_anchor",
+                        "command": _explicit_parent_anchor_rerun_command(
+                            query=str(command_options.get("query") or report.get("query") or DEFAULT_STATUS_QUERY),
+                            anchor_ref=str(selected.get("source_ref") or ""),
+                            cwd=str(command_options.get("cwd") or "."),
+                            codex_home=str(command_options.get("codex_home") or ""),
+                            max_matches=command_options.get("max_matches"),
+                        ),
+                        "result_contract": "Only answer_ready=true from this exact-anchor rerun permits synthesis.",
+                    }
+                )
 
     touched_files = []
     for followup in (report.get("session_activity") or {}).get("session_followups") or []:
@@ -1504,6 +1533,11 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
         "anchor_state": {
             "status": report.get("status"),
             "selected_anchor_ref": selected.get("source_ref"),
+            "shortlist_selected_anchor_ref": (report.get("parent_main_anchor_shortlist") or {}).get("selected_anchor"),
+            "readiness_selected_anchor_ref": (
+                readiness.get("parent_main_anchor_freshness") or {}
+            ).get("selected_anchor"),
+            "authoritative_selected_anchor_ref": selected.get("source_ref"),
             "parent_session_identity": selected.get("source_identifier"),
             "parent_session_hash": selected.get("session_id_hash"),
             "anchor_reason": (report.get("routing") or {}).get("anchor_reason"),
@@ -1545,6 +1579,36 @@ def parent_thread_interval_continuation_packet(report: dict) -> dict | None:
             ],
         }
     return packet
+
+
+def _required_primary_continuation_step(read: dict, *, index: int) -> dict | None:
+    if not isinstance(read, Mapping) or read.get("diagnostic_only") is True:
+        return None
+    target = read.get("openable_target") or read.get("target") or read.get("path")
+    if not target and isinstance(read.get("source_ref"), str):
+        target = read.get("source_ref")
+    if not target:
+        return None
+    role = str(read.get("answer_support_role") or read.get("read_role") or "")
+    if not role:
+        role = "post_anchor_interval_activity"
+    if read.get("canonical_authority_read") or read.get("selected_anchor_raw_session_row"):
+        role = "selected_parent_thread_raw_user_row"
+    elif index == 1 and role == "post_anchor_interval_activity":
+        role = "selected_parent_thread_raw_user_row"
+    return {
+        "step_id": f"forward_interval_required_primary_{index:02d}",
+        "action": "open_required_primary_forward_interval_ref",
+        "target": str(target),
+        "source_ref": read.get("source_ref"),
+        "read_role": role,
+        "mode": read.get("mode") or ("record" if role == "selected_parent_thread_raw_user_row" else "window"),
+        "before": read.get("before"),
+        "after": read.get("after"),
+        "answer_use_required": True,
+        "forward_interval_anchor_ref": read.get("forward_interval_anchor_ref"),
+        "result_contract": "Opened raw JSONL window is continuation proof; synthesize only after all packet steps are executed.",
+    }
 
 
 def _parent_thread_fast_machine_blocker_report(
@@ -9096,6 +9160,21 @@ def _parent_main_anchor_freshness(
             "newer_candidate_count": 0,
         }
     selected_time = selected_time.astimezone(timezone.utc)
+    shortlist_status = parent_main_anchor_shortlist.get("status")
+    shortlist_selected = str(parent_main_anchor_shortlist.get("selected_anchor") or "")
+    if (
+        shortlist_status == "selected"
+        and parent_main_anchor_shortlist.get("answer_allowed") is True
+        and shortlist_selected
+        and shortlist_selected == selected_ref
+    ):
+        return {
+            "status": "current",
+            "current": True,
+            "selected_anchor": selected_ref or None,
+            "newer_candidate_count": 0,
+            "authority": "parent_main_anchor_shortlist.selected",
+        }
     newer_candidates = []
     for candidate in parent_main_anchor_shortlist.get("candidates") or []:
         if not isinstance(candidate, Mapping):
@@ -9117,6 +9196,9 @@ def _parent_main_anchor_freshness(
             continue
         if candidate.get("lineage_rejection_reason") and not same_canonical_parent_session:
             continue
+        if parent_main_anchor_shortlist.get("status") == "stale_selected_anchor":
+            if candidate.get("decision") not in {"newer_candidate", "ambiguous"}:
+                continue
         if candidate.get("classification") in {
             "worker_or_reviewer_prompt",
             "non_human_boundary_or_tool_context",
@@ -9541,7 +9623,7 @@ def _fail_closed_guidance(
     answer_readiness: dict,
 ) -> dict:
     if not answer_readiness.get("answer_allowed"):
-        parent_main_recovery = anchor_decision.get("anchor_scope") == "parent_thread"
+        parent_main_recovery = anchor_decision.get("anchor_scope") == "parent_thread" and not selected_anchor
         guidance = (
             "Fail closed: required answer facets are missing. Do not answer from visible context, "
             "inherited summaries, current worker prompts, commits, or repo status. Inspect candidate anchors "
@@ -9562,6 +9644,13 @@ def _fail_closed_guidance(
             )
             candidate_fields.append("source_tiers.required_primary[parent_main_anchor_recovery_candidate]")
             candidate_fields.append("source_tiers.required_primary[prior_request_occurrence_candidate]")
+        elif selected_anchor:
+            guidance = (
+                "Continue from the selected parent/main anchor and opened-forward interval contract. "
+                "Do not answer from visible context, inherited summaries, current worker/reviewer prompts, "
+                "task/report artifacts, commits, or repo status until the saved packet-bound continuation "
+                "or every required primary raw ref has been executed."
+            )
         return {
             "mode": "candidate_anchors_required_before_answer",
             "answer_allowed": False,
