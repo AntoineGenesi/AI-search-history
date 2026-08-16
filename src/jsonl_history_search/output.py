@@ -7283,6 +7283,7 @@ def render_semantic_debug_text(payload: dict) -> str:
         or source_followthrough_plan.get("required_primary_proof")
         or []
     )
+    active_finalization_command = _active_finalization_continuation_command(report)
     orchestration_role_bundle = (
         report.get("historical_orchestration_role_evidence_bundle")
         or handoff.get("historical_orchestration_role_evidence_bundle")
@@ -7315,7 +7316,12 @@ def render_semantic_debug_text(payload: dict) -> str:
             f"slice_status_counts={in_depth_coverage.get('slice_status_counts')}"
         )
     lines.extend(render_in_depth_audit_followthrough_text(in_depth_followthrough, command_by_target=command_by_target))
-    if not deep_audit_followthrough_active:
+    if active_finalization_command:
+        lines.append(
+            "First source-followthrough plan: encoded in canonical continuation packet; "
+            "default action is investigation_finalization_state.canonical_next_action."
+        )
+    elif not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     lines.extend(render_investigation_finalization_state_text(report.get("investigation_finalization_state") or {}))
@@ -7341,7 +7347,9 @@ def render_semantic_debug_text(payload: dict) -> str:
     if longitudinal_plan and longitudinal_plan.get("applies"):
         lines.extend(render_longitudinal_phase_source_plan_text(longitudinal_plan))
     lines.append("Open these source refs first:")
-    if deep_audit_followthrough_active:
+    if active_finalization_command:
+        lines.append("- run the canonical execute-continuation command above; individual read-more refs are packet steps, not a separate default plan")
+    elif deep_audit_followthrough_active:
         lines.append("- see AUDIT CONTINUATION WORKFLOW.ordered_primary_refs_to_open_first above")
     elif scoped_no_evidence:
         lines.append("- no required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries")
@@ -7380,7 +7388,9 @@ def render_semantic_debug_text(payload: dict) -> str:
     for item in only_continue[:4]:
         lines.append(f"Only continue if: {item}")
     lines.append("Required proof reads:")
-    if required_reads:
+    if active_finalization_command:
+        lines.append("- encoded in investigation_finalization_state.canonical_continuation_packet; default action is the canonical command above")
+    elif required_reads:
         for read in required_reads[:8]:
             _append_text_read(lines, read, command_by_target=command_by_target)
     else:
@@ -7644,6 +7654,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
         or source_followthrough_plan.get("required_primary_proof")
         or []
     )
+    active_finalization_command = _active_finalization_continuation_command(report)
     orchestration_role_bundle = (
         report.get("historical_orchestration_role_evidence_bundle")
         or handoff.get("historical_orchestration_role_evidence_bundle")
@@ -7668,7 +7679,16 @@ def render_semantic_debug_markdown(payload: dict) -> str:
             f"`slice_status_counts={in_depth_coverage.get('slice_status_counts')}`"
         )
     lines.extend(render_in_depth_audit_followthrough_markdown(in_depth_followthrough, command_by_target=command_by_target))
-    if not deep_audit_followthrough_active:
+    if active_finalization_command:
+        lines.extend(
+            [
+                "",
+                "## First Source-Followthrough Plan",
+                "",
+                "- Encoded in canonical continuation packet; default action is `investigation_finalization_state.canonical_next_action`.",
+            ]
+        )
+    elif not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
     lines.extend(render_investigation_finalization_state_markdown(report.get("investigation_finalization_state") or {}))
@@ -7700,7 +7720,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if longitudinal_plan and longitudinal_plan.get("applies"):
         lines.extend(render_longitudinal_phase_source_plan_markdown(longitudinal_plan))
     lines.extend(["", "## Open These Source Refs First", ""])
-    if deep_audit_followthrough_active:
+    if active_finalization_command:
+        lines.append("- Run the canonical `execute-continuation` command above; individual `read-more` refs are packet steps, not a separate default plan.")
+    elif deep_audit_followthrough_active:
         lines.append("- See `Audit Continuation Workflow.ordered_primary_refs_to_open_first` above.")
     elif scoped_no_evidence:
         lines.append("- No required primary source read; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries.")
@@ -7740,7 +7762,9 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if scoped_no_evidence and source_action_guidance.get("retrieval_escalation_condition"):
         lines.append(f"- Retrieval escalation condition: {source_action_guidance.get('retrieval_escalation_condition')}")
     lines.extend(["", "## Required Proof Reads", ""])
-    if required_reads:
+    if active_finalization_command:
+        lines.append("- Encoded in `investigation_finalization_state.canonical_continuation_packet`; default action is the canonical command above.")
+    elif required_reads:
         for read in required_reads[:8]:
             _append_markdown_read(lines, read, command_by_target=command_by_target)
     else:
@@ -8012,6 +8036,23 @@ def render_investigation_state_text(investigation_state: dict) -> list[str]:
         f"rrf_default_allowed={recommendation.get('rrf_default_allowed')}"
     )
     return lines
+
+
+def _active_finalization_continuation_command(report: dict) -> str | None:
+    finalization = report.get("investigation_finalization_state")
+    if not isinstance(finalization, dict):
+        return None
+    if finalization.get("terminal") or finalization.get("answer_ready"):
+        return None
+    if finalization.get("required_receiver_action") != "run_canonical_continuation":
+        return None
+    canonical_next = finalization.get("canonical_next_action")
+    if not isinstance(canonical_next, dict):
+        return None
+    command = canonical_next.get("command")
+    if isinstance(command, str) and " execute-continuation " in f" {command} ":
+        return command
+    return None
 
 
 def render_investigation_finalization_state_text(finalization_state: dict) -> list[str]:
