@@ -6291,6 +6291,49 @@ def _answer_action_contract_from_executed_output(
                 ),
                 "saved_report": compact.get("report_written"),
             }
+        if terminal_scoped_no_proof:
+            terminal = {
+                "schema_version": 1,
+                "status": "terminal_answer_and_stop",
+                "answer_now": True,
+                "terminal_reason": "scoped_no_project_worktree_cleanup_proof",
+                "rejected_evidence": (
+                    (cleanup.get("source_isolation") or {}).get("rejected_source_classes")
+                    or [
+                        "current_run_directory",
+                        "lane_command_and_environment",
+                        "run_state_metadata",
+                        "generated_evaluator_reports",
+                        "sandbox_git_mount",
+                    ]
+                ),
+                "stop": (
+                    "Do not inspect active run/lane metadata, generated evaluator reports, sandbox Git, "
+                    "or local git/rg/find output as project worktree-cleanup causality."
+                ),
+            }
+            return {
+                "answer_status": "answer-scoped-no-evidence-now",
+                "promotion_status": "terminal_scoped_no_project_worktree_cleanup_proof",
+                "promotion_reason": (
+                    "No independently resolved project checkout or original cleanup chronology is available; "
+                    "evaluator/harness artifacts are diagnostic-only."
+                ),
+                "read": [],
+                "then_use": {
+                    "cleanup_causality": {
+                        "debt_status": cleanup.get("debt_status"),
+                        "causal_summary": cleanup.get("causal_summary"),
+                    }
+                },
+                "diagnostics_after": [],
+                "source_role_order": worktree.get("source_role_order"),
+                "source_roles_present": worktree.get("source_roles_present"),
+                "terminal_answer_and_stop_contract": terminal,
+                "stop": terminal["stop"],
+                "only_continue_if": [],
+                "saved_report": compact.get("report_written"),
+            }
         return {
             "answer_status": (
                 "answer-ready-after-source-inspection"
@@ -11439,6 +11482,50 @@ def _ask_answer_worktree_cleanup_currentness(
         else {}
     )
     debt_status = str(cleanup.get("debt_status") or "")
+    if debt_status.startswith("scoped_no_proof_"):
+        isolation = cleanup.get("source_isolation") if isinstance(cleanup.get("source_isolation"), dict) else {}
+        rejected_evidence = list(isolation.get("rejected_source_classes") or [])
+        if not rejected_evidence:
+            rejected_evidence = [
+                "current_run_directory",
+                "lane_command_and_environment",
+                "run_state_metadata",
+                "generated_evaluator_reports",
+                "sandbox_git_mount",
+            ]
+        gate = {
+            "status": "terminal_scoped_no_project_worktree_cleanup_proof",
+            "terminal": True,
+            "debt_status": debt_status,
+            "rejected_evidence": rejected_evidence,
+            "project_source_recovery": None,
+            "boundary": (
+                "No active run/lane/harness metadata, generated evaluator report, sandbox Git state, "
+                "or local git/rg/find output may support project worktree cleanup causality."
+            ),
+        }
+        answer["answer_status"] = "answered-from-scoped-no-proof-contract"
+        answer["answer"] = (
+            "I cannot establish why the JSON-search-history project worktrees were not cleaned up from "
+            "the available project evidence. No independently resolved project checkout or original cleanup "
+            "chronology was recovered. The active run/lane/harness state is diagnostic-only and cannot support "
+            "project cleanup causality. This is a terminal scoped no-proof result; do not infer a cause from "
+            "local Git/search output or the active evaluation run."
+        )
+        answer["refs_used"] = []
+        answer["proof_summary"] = [
+            f"debt_status={debt_status}",
+            "active run/lane/harness artifacts rejected as project cleanup causality support",
+        ]
+        answer["source_contract"]["worktree_cleanup_answer_gate"] = gate
+        answer["source_contract"]["terminal_answer_and_stop_contract"] = {
+            "schema_version": 1,
+            "status": "terminal_answer_and_stop",
+            "answer_now": True,
+            "terminal_reason": "scoped_no_project_worktree_cleanup_proof",
+            "rejected_evidence": rejected_evidence,
+        }
+        return {"ask_answer": answer}
     facet_coverage = cleanup.get("facet_coverage") if isinstance(cleanup.get("facet_coverage"), dict) else {}
     action_reads = action.get("read") if isinstance(action.get("read"), list) else []
     normalized: list[dict] = []
