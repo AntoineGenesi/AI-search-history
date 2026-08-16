@@ -270,30 +270,26 @@ def _project_checkout_source_isolation(cwd: Path) -> dict:
 
 
 def _classify_evaluator_workspace(cwd: Path) -> dict:
-    """Reject evaluator lane topology, rather than a particular run-root path.
+    """Reject evaluator run topology, rather than a particular run-root path.
 
-    A lane can be mounted anywhere.  Its distinguishing evidence is the lane
-    contract (command/environment/prompt), its ``lanes`` parent, and a run
-    state above that parent; ordinary project reports alone are insufficient.
+    A lane can be mounted anywhere, and a receiver may start at its workspace,
+    the run root, or an adjacent generated report root. Its distinguishing
+    evidence is a run-state plus a ``lanes`` tree containing lane contracts;
+    ordinary project reports alone are insufficient.
     """
-    lane_root = None
-    run_root = None
-    current = cwd
-    for _ in range(10):
-        if all((current / name).is_file() for name in ("command.json", "environment.json", "prompt.txt")):
-            parent = current.parent
-            candidate_run = parent.parent if parent.name == "lanes" else None
-            if candidate_run and (candidate_run / "run-state.json").is_file():
-                lane_root = current
-                run_root = candidate_run
-                break
-        if current.parent == current:
-            break
-        current = current.parent
-    rejected = lane_root is not None
+    run_root = _evaluator_run_root_from_ancestry(cwd)
+    lane_root = _evaluator_lane_root_from_ancestry(cwd, run_root)
+    rejected = run_root is not None
+    classification = (
+        "same_loop_evaluator_lane"
+        if lane_root is not None
+        else "same_loop_evaluator_run"
+        if rejected
+        else "ordinary_workspace"
+    )
     return {
-        "status": "rejected_evaluator_lane_harness" if rejected else "not_evaluator_lane_harness",
-        "classification": "same_loop_evaluator_lane" if rejected else "ordinary_workspace",
+        "status": "rejected_evaluator_run_harness" if rejected else "not_evaluator_run_harness",
+        "classification": classification,
         "requested_cwd": str(cwd),
         "lane_root": str(lane_root) if lane_root else None,
         "run_root": str(run_root) if run_root else None,
@@ -312,6 +308,46 @@ def _classify_evaluator_workspace(cwd: Path) -> dict:
             else []
         ),
     }
+
+
+def _evaluator_run_root_from_ancestry(cwd: Path) -> Path | None:
+    current = cwd
+    for _ in range(10):
+        if _is_evaluator_run_root(current):
+            return current
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def _is_evaluator_run_root(path: Path) -> bool:
+    lanes = path / "lanes"
+    if not (path / "run-state.json").is_file() or not lanes.is_dir():
+        return False
+    try:
+        return any(
+            child.is_dir()
+            and all((child / name).is_file() for name in ("command.json", "environment.json", "prompt.txt"))
+            for child in lanes.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _evaluator_lane_root_from_ancestry(cwd: Path, run_root: Path | None) -> Path | None:
+    if run_root is None:
+        return None
+    current = cwd
+    for _ in range(10):
+        if current.parent == run_root / "lanes" and all(
+            (current / name).is_file() for name in ("command.json", "environment.json", "prompt.txt")
+        ):
+            return current
+        if current == run_root or current.parent == current:
+            break
+        current = current.parent
+    return None
 
 
 def _session_workspace_candidates(path: Path) -> list[tuple[int, Path]]:
