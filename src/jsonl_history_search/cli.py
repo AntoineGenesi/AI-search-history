@@ -5340,6 +5340,7 @@ def _short_semantic_debug_report_written_payload(packet: dict, report_output: st
             "audit_continuation_workflow": packet.get("audit_continuation_workflow"),
             "in_depth_audit_followthrough": packet.get("in_depth_audit_followthrough"),
             "source_followthrough_plan": packet.get("source_followthrough_plan"),
+            "investigation_finalization_state": packet.get("investigation_finalization_state"),
             "provenance_direct_evidence_facet_ledger": packet.get(
                 "provenance_direct_evidence_facet_ledger"
             ),
@@ -6015,6 +6016,68 @@ def _continuation_first_history_contract(*, compact: dict, selected_route: dict)
     }
 
 
+_FINALIZATION_ACTIVE_STATES = {
+    "actionable_primary_reads",
+    "actionable_canonical_continuation",
+}
+_FINALIZATION_PROMOTABLE_STATES = {
+    "answer_ready",
+    "terminal_scoped_no_evidence",
+}
+
+
+def _action_contract_with_investigation_finalization_state(
+    contract: dict,
+    finalization_state: dict | None,
+) -> dict:
+    if not isinstance(finalization_state, dict) or not finalization_state.get("state"):
+        return contract
+    contract = dict(contract)
+    contract["investigation_finalization_state"] = finalization_state
+    state = str(finalization_state.get("state") or "")
+    if state in _FINALIZATION_PROMOTABLE_STATES:
+        contract["answer_promotion_allowed_by_investigation_finalization_state"] = True
+        return contract
+
+    contract["answer_promotion_allowed_by_investigation_finalization_state"] = False
+    contract["promotion_status"] = f"investigation_finalization_state_{state}"
+    contract["promotion_reason"] = (
+        "The package-controlled investigation finalization state is not promotable; "
+        "follow the emitted bounded next action or terminal blocker instead of answering."
+    )
+    if state in _FINALIZATION_ACTIVE_STATES:
+        contract["answer_status"] = "cannot-answer-directly-yet"
+        required_reads = list(finalization_state.get("required_primary_reads") or [])
+        if required_reads:
+            contract["read"] = required_reads
+        canonical_next = finalization_state.get("canonical_next_action") or {}
+        if canonical_next:
+            contract["canonical_next_action"] = canonical_next
+        if state == "actionable_canonical_continuation" and canonical_next.get("command"):
+            contract.setdefault("read", [])
+        contract["diagnostics_after"] = [
+            item
+            for item in contract.get("diagnostics_after") or []
+            if isinstance(item, dict) and item.get("diagnostic_only") is not True
+        ]
+        contract["only_continue_if"] = [
+            "Continue only with investigation_finalization_state.canonical_next_action "
+            "or required_primary_reads until the state becomes answer_ready, "
+            "terminal_scoped_no_evidence, or a terminal blocker."
+        ]
+        return contract
+
+    contract["answer_status"] = (
+        "tool-runtime-failure"
+        if state == "tool_runtime_failure"
+        else "cannot-answer-directly-yet"
+    )
+    contract["read"] = []
+    contract["diagnostics_after"] = []
+    contract["only_continue_if"] = []
+    return contract
+
+
 def _answer_action_contract_from_executed_output(
     *,
     output_key: str,
@@ -6023,6 +6086,11 @@ def _answer_action_contract_from_executed_output(
     query: str = "",
     cwd: str = ".",
 ) -> dict:
+    investigation_finalization_state = (
+        compact.get("investigation_finalization_state")
+        if isinstance(compact.get("investigation_finalization_state"), dict)
+        else {}
+    )
     if output_key == "artifact_currentness":
         worktree = compact.get("worktree_currentness") or {}
         cleanup = worktree.get("cleanup_causality") or {}
@@ -6273,7 +6341,7 @@ def _answer_action_contract_from_executed_output(
             continue_only_if = [
                 "a named required causal role or before/during/after phase remains missing"
             ]
-            return {
+            directional_contract = {
                 "answer_status": directional.get("status"),
                 "promotion_status": "directional_history_reads_required",
                 "promotion_reason": (
@@ -6297,6 +6365,10 @@ def _answer_action_contract_from_executed_output(
                 },
                 "saved_report": compact.get("report_written"),
             }
+            return _action_contract_with_investigation_finalization_state(
+                directional_contract,
+                investigation_finalization_state,
+            )
         handoff = compact.get("answer_ready_handoff") or {}
         readiness_summary = compact.get("answer_readiness_summary") or {}
         longitudinal_phase_source_plan = compact.get("longitudinal_phase_source_plan") or {}
@@ -6378,13 +6450,19 @@ def _answer_action_contract_from_executed_output(
             route_family=route_family,
         )
         if remembered_missing:
-            return remembered_missing
+            return _action_contract_with_investigation_finalization_state(
+                remembered_missing,
+                investigation_finalization_state,
+            )
         continuation_first = _continuation_first_history_contract(
             compact=compact,
             selected_route=selected_route,
         )
         if continuation_first:
-            return continuation_first
+            return _action_contract_with_investigation_finalization_state(
+                continuation_first,
+                investigation_finalization_state,
+            )
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
         target_proof_handoff = _semantic_debug_target_proof_handoff(
             compact=compact,
@@ -7035,7 +7113,10 @@ def _answer_action_contract_from_executed_output(
                 contract["only_continue_if"] = contract["missing_evidence_stop_contract"][
                     "next_allowed_action"
                 ]
-        return contract
+        return _action_contract_with_investigation_finalization_state(
+            contract,
+            investigation_finalization_state,
+        )
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
         answer_use = compact.get("answer_use_contract") or {}
@@ -11434,6 +11515,15 @@ def _ask_answer_from_execute(
     if action.get("answer_status") == "answer-scoped-no-evidence-now" and isinstance(scoped, dict):
         return _ask_answer_scoped_no_evidence(answer, scoped, cwd=cwd)
 
+    finalization_veto = _investigation_finalization_state_veto(action)
+    if finalization_veto.get("blocked"):
+        answer["proof_summary"] = list(finalization_veto.get("summary_lines") or [])
+        return _ask_answer_fail_closed(
+            answer,
+            str(finalization_veto.get("reason") or "investigation finalization state is not promotable"),
+            finalization_veto.get("next_step"),
+        )
+
     can_follow_raw_proof = _ask_answer_can_follow_raw_proof_despite_status(
         action=action,
         route_family=route_family,
@@ -12381,6 +12471,9 @@ def _ask_answer_finalization_veto(
     action: dict,
     opened: list[dict],
 ) -> dict:
+    finalization_veto = _investigation_finalization_state_veto(action)
+    if finalization_veto.get("blocked"):
+        return finalization_veto
     merge_gate_allows_artifact_finalization = False
     if _action_chronology_final_role_gate_wanted(query=query, route_family=route_family):
         chronology_gate = (
@@ -12494,7 +12587,56 @@ def _ask_answer_finalization_veto(
     return {"blocked": False}
 
 
+def _investigation_finalization_state_veto(action: dict) -> dict:
+    finalization_state = (
+        action.get("investigation_finalization_state")
+        if isinstance(action.get("investigation_finalization_state"), dict)
+        else {}
+    )
+    if finalization_state:
+        state = str(finalization_state.get("state") or "")
+        promotion_allowed = finalization_state.get("answer_promotion_allowed") is True
+        if state not in _FINALIZATION_PROMOTABLE_STATES or not promotion_allowed:
+            return {
+                "blocked": True,
+                "reason": (
+                    "investigation_finalization_state is "
+                    f"{state or 'unknown'}; answer promotion is not allowed"
+                ),
+                "next_step": {
+                    "schema_version": 1,
+                    "status": "investigation_finalization_state_blocks_answer",
+                    "state": state,
+                    "required_receiver_action": finalization_state.get("required_receiver_action"),
+                    "canonical_next_action": finalization_state.get("canonical_next_action"),
+                    "evidence_progress": finalization_state.get("evidence_progress"),
+                    "required_primary_reads": finalization_state.get("required_primary_reads") or [],
+                    "terminal": finalization_state.get("terminal"),
+                    "blockers": finalization_state.get("blockers") or [],
+                    "boundedness": finalization_state.get("boundedness") or {},
+                },
+                "summary_lines": [
+                    (
+                        "investigation_finalization_state requires "
+                        f"{finalization_state.get('required_receiver_action')}; "
+                        "do not synthesize unknown/history-not-found/partial prose from this packet."
+                    )
+                ],
+            }
+    return {"blocked": False}
+
+
 def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
+    finalization_state = (
+        action.get("investigation_finalization_state")
+        if isinstance(action.get("investigation_finalization_state"), dict)
+        else {}
+    )
+    if finalization_state and (
+        finalization_state.get("answer_promotion_allowed") is not True
+        or str(finalization_state.get("state") or "") not in _FINALIZATION_PROMOTABLE_STATES
+    ):
+        return True
     answer_status = str(action.get("answer_status") or "").casefold()
     promotion_status = str(action.get("promotion_status") or "").casefold()
     if not answer_status and not promotion_status:
@@ -20782,6 +20924,7 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
         "scope_aware_no_evidence_workflow": _compact_scope_aware_no_evidence_workflow(
             workflow
         ),
+        "investigation_finalization_state": packet.get("investigation_finalization_state"),
         "answer_readiness_summary": summarize_answer_readiness(packet.get("answer_readiness") or {}),
         "core_convo_first_read_plan": packet.get("core_convo_first_read_plan"),
         "searched_scope": _no_evidence_searched_scope_summary(no_evidence),
@@ -20824,6 +20967,7 @@ def _short_semantic_debug_no_evidence_report_written_payload(packet: dict, repor
                 "source_locator_handoff": packet.get("source_locator_handoff"),
                 "source_handle_routing": routing,
                 "source_followthrough_plan": packet.get("source_followthrough_plan"),
+                "investigation_finalization_state": packet.get("investigation_finalization_state"),
                 "answer_ready_handoff": packet.get("answer_ready_handoff"),
                 "final_answer_source_use_contract": packet.get("final_answer_source_use_contract"),
                 "action_proof_plan": packet.get("action_proof_plan"),
