@@ -5480,6 +5480,33 @@ def _status_anchor_navigation_only(report: dict) -> bool:
     )
 
 
+def _status_anchor_active_continuation_command(report: dict) -> str | None:
+    packet = parent_thread_interval_continuation_packet(report)
+    if not isinstance(packet, dict) or not packet.get("steps"):
+        return None
+    if packet.get("answer_ready") is True:
+        return None
+    selected = report.get("selected_anchor") or {}
+    if not selected:
+        return None
+    report_written = report.get("report_written")
+    packet_id = packet.get("packet_id")
+    if not report_written or not packet_id:
+        return None
+    return " ".join(
+        [
+            "jsonl-history-search",
+            "execute-continuation",
+            "--from-report",
+            shlex.quote(str(report_written)),
+            "--packet-id",
+            shlex.quote(str(packet_id)),
+            "--format",
+            "text",
+        ]
+    )
+
+
 def _render_status_anchor_navigation_only_text(report: dict) -> str:
     contract = report.get("generated_report_contract") or {}
     selected = report.get("selected_anchor") or {}
@@ -5488,35 +5515,58 @@ def _render_status_anchor_navigation_only_text(report: dict) -> str:
     interval = report.get("post_anchor_interval_reconstruction") or {}
     coverage = interval.get("coverage") or {}
     summary = report.get("summary") or {}
-    return "\n".join(
-        [
-            "Status Anchor",
-            f"Status: {report.get('status')}",
-            "Answer status: not-ready/required-primary-followthrough",
-            "Navigation only: true",
-            "Answer from report allowed: false",
-            "Required primary windows opened: "
-            f"false (0/{contract.get('required_primary_window_count', 0)})",
-            (
-                "Selected parent history row: "
-                f"{selected.get('timestamp_utc')} {selected.get('source_ref')}"
-            ),
-            (
-                "Parent/main anchor freshness: "
-                f"status={freshness.get('status')} current={freshness.get('current')}"
-            ),
-            (
-                "Scanner coverage: "
-                f"status={coverage.get('status')} complete={coverage.get('complete')} "
-                f"records_after_anchor={coverage.get('records_after_anchor')} "
-                f"retained_entries={summary.get('post_anchor_interval_entry_count', 0)} "
-                f"omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}"
-            ),
-            "Canonical follow-through path: "
-            f"{contract.get('canonical_follow_through_path')}",
-            f"STOP: {contract.get('stop')}",
-        ]
-    )
+    command = _status_anchor_active_continuation_command(report)
+    lines = [
+        "Status Anchor",
+        f"Status: {report.get('status')}",
+        "Answer status: not-ready/required-primary-followthrough",
+        "Navigation only: true",
+        "Answer from report allowed: false",
+        "Required primary windows opened: "
+        f"false (0/{contract.get('required_primary_window_count', 0)})",
+        (
+            "Selected parent history row: "
+            f"{selected.get('timestamp_utc')} {selected.get('source_ref')}"
+        ),
+        (
+            "Parent/main anchor freshness: "
+            f"status={freshness.get('status')} current={freshness.get('current')}"
+        ),
+        (
+            "Scanner coverage: "
+            f"status={coverage.get('status')} complete={coverage.get('complete')} "
+            f"records_after_anchor={coverage.get('records_after_anchor')} "
+            f"retained_entries={summary.get('post_anchor_interval_entry_count', 0)} "
+            f"omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}"
+        ),
+    ]
+    if command:
+        packet = parent_thread_interval_continuation_packet(report) or {}
+        anchor_state = packet.get("anchor_state") or {}
+        lines.extend(
+            [
+                "Investigation finalization: state=actionable_canonical_continuation answer_ready=False terminal=False receiver_action=run_canonical_continuation",
+                f"- Canonical next command: {command}",
+                "- Continue boundary: run this saved packet-bound action; do not run direct read-more, broad search, or fresh ask as the default plan.",
+                (
+                    "Selected anchor authority: "
+                    f"shortlist={anchor_state.get('shortlist_selected_anchor_ref')} "
+                    f"selected_anchor={anchor_state.get('selected_anchor_ref')} "
+                    f"readiness={anchor_state.get('readiness_selected_anchor_ref')} "
+                    f"continuation={anchor_state.get('authoritative_selected_anchor_ref')}"
+                ),
+                f"Report written: {report.get('report_written')}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Canonical follow-through path: "
+                f"{contract.get('canonical_follow_through_path')}",
+                f"STOP: {contract.get('stop')}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
@@ -5527,30 +5577,60 @@ def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
     interval = report.get("post_anchor_interval_reconstruction") or {}
     coverage = interval.get("coverage") or {}
     summary = report.get("summary") or {}
-    return "\n".join(
-        [
-            "# Status Anchor",
-            "",
-            f"- Status: `{report.get('status')}`",
-            "- Answer status: `not-ready/required-primary-followthrough`",
-            "- Navigation only: `true`",
-            "- Answer from report allowed: `false`",
-            "- Required primary windows opened: "
-            f"`false` (`0/{contract.get('required_primary_window_count', 0)}`)",
-            "- Selected parent history row: "
-            f"`{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`",
-            "- Parent/main anchor freshness: "
-            f"`status={freshness.get('status')}` `current={freshness.get('current')}`",
-            "- Scanner coverage: "
-            f"`status={coverage.get('status')}` `complete={coverage.get('complete')}` "
-            f"`records_after_anchor={coverage.get('records_after_anchor')}` "
-            f"`retained_entries={summary.get('post_anchor_interval_entry_count', 0)}` "
-            f"`omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}`",
-            "- Canonical follow-through path: "
-            f"`{contract.get('canonical_follow_through_path')}`",
-            f"- **STOP:** {contract.get('stop')}",
-        ]
-    )
+    command = _status_anchor_active_continuation_command(report)
+    lines = [
+        "# Status Anchor",
+        "",
+        f"- Status: `{report.get('status')}`",
+        "- Answer status: `not-ready/required-primary-followthrough`",
+        "- Navigation only: `true`",
+        "- Answer from report allowed: `false`",
+        "- Required primary windows opened: "
+        f"`false` (`0/{contract.get('required_primary_window_count', 0)}`)",
+        "- Selected parent history row: "
+        f"`{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`",
+        "- Parent/main anchor freshness: "
+        f"`status={freshness.get('status')}` `current={freshness.get('current')}`",
+        "- Scanner coverage: "
+        f"`status={coverage.get('status')}` `complete={coverage.get('complete')}` "
+        f"`records_after_anchor={coverage.get('records_after_anchor')}` "
+        f"`retained_entries={summary.get('post_anchor_interval_entry_count', 0)}` "
+        f"`omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}`",
+    ]
+    if command:
+        packet = parent_thread_interval_continuation_packet(report) or {}
+        anchor_state = packet.get("anchor_state") or {}
+        lines.extend(
+            [
+                "",
+                "## Investigation Finalization",
+                "",
+                "- `state`: `actionable_canonical_continuation`",
+                "- `answer_ready`: `False`",
+                "- `terminal`: `False`",
+                "- `required_receiver_action`: `run_canonical_continuation`",
+                "",
+                "```bash",
+                command,
+                "```",
+                "- Continue boundary: run this saved packet-bound action; do not run direct `read-more`, broad search, or fresh `ask` as the default plan.",
+                "- Selected anchor authority: "
+                f"`shortlist={anchor_state.get('shortlist_selected_anchor_ref')}` "
+                f"`selected_anchor={anchor_state.get('selected_anchor_ref')}` "
+                f"`readiness={anchor_state.get('readiness_selected_anchor_ref')}` "
+                f"`continuation={anchor_state.get('authoritative_selected_anchor_ref')}`",
+                f"- Report written: `{report.get('report_written')}`",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- Canonical follow-through path: "
+                f"`{contract.get('canonical_follow_through_path')}`",
+                f"- **STOP:** {contract.get('stop')}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _status_anchor_needs_clarification(report: dict) -> bool:

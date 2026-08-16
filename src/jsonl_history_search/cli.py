@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -3250,6 +3251,33 @@ def _build_status_anchor_report_output_payload(args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
     return {"status_anchor": compact}
+
+
+def _persist_status_anchor_active_continuation_report(payload: dict) -> None:
+    report = payload.get("status_anchor") if isinstance(payload, dict) else None
+    if not isinstance(report, dict) or report.get("report_written"):
+        return
+    packet = report.get("parent_thread_interval_continuation")
+    selected = report.get("selected_anchor")
+    if not (
+        isinstance(packet, dict)
+        and packet.get("packet_id")
+        and packet.get("steps")
+        and isinstance(selected, dict)
+        and selected.get("source_ref")
+        and (report.get("answer_readiness") or {}).get("answer_allowed") is not True
+    ):
+        return
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="jsonl-history-search-status-anchor-",
+        suffix=".json",
+        delete=False,
+    )
+    with handle:
+        report["report_written"] = handle.name
+        handle.write(render(payload, "json"))
 
 
 def _build_artifact_currentness_report_output_payload(args: argparse.Namespace) -> dict:
@@ -20668,6 +20696,7 @@ def main(argv: list[str] | None = None) -> int:
             phase_emitter.complete(source_phase)
         retrieval_phase = phase_emitter.start("retrieval") if phase_emitter else None
         payload = build_status_anchor_payload(args)
+        _persist_status_anchor_active_continuation_report(payload)
         if phase_emitter and retrieval_phase:
             phase_emitter.complete(retrieval_phase)
         rendering_phase = phase_emitter.start("rendering") if phase_emitter else None
