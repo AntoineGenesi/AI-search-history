@@ -90,6 +90,14 @@ RECEIVER_ESCAPE_ACTION_ALIASES = {
     "required_primary_proof_read": {"jsonl_read_more"},
     "bounded_referent_check_or_clarification": set(),
 }
+RECEIVER_ESCAPE_CURRENT_LOOP_MARKERS = ("jsh1537a", "jsh1537")
+RECEIVER_ESCAPE_NON_PRIMARY_SOURCE_PREFIXES = (
+    "benchmarks/",
+    "codex/state/reviews/",
+    "reports/",
+    "tasks/",
+)
+RECEIVER_ESCAPE_NON_PRIMARY_JSONL_NAMES = {"events.jsonl", "session_index.jsonl"}
 
 
 def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
@@ -622,6 +630,22 @@ def _receiver_escape_action_types(command_order: list[dict[str, Any]]) -> set[st
     return action_types
 
 
+def _receiver_escape_primary_source_refs(source_refs: list[str]) -> list[str]:
+    primary_refs: list[str] = []
+    for source_ref in source_refs:
+        lowered = source_ref.lower()
+        path_part = lowered.rpartition(":")[0] or lowered
+        if any(path_part.startswith(prefix) for prefix in RECEIVER_ESCAPE_NON_PRIMARY_SOURCE_PREFIXES):
+            continue
+        if ".jsonl" not in path_part:
+            continue
+        basename = path_part.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if basename in RECEIVER_ESCAPE_NON_PRIMARY_JSONL_NAMES:
+            continue
+        primary_refs.append(source_ref)
+    return primary_refs
+
+
 def receiver_escape_observations_from_trace_ledger(
     ledger_payload: dict[str, Any], adjudications: Iterable[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -653,13 +677,15 @@ def receiver_escape_observations_from_trace_ledger(
         contamination = lane.get("contamination_chronology") or {}
         primary_count = int(contamination.get("primary_raw_evidence_access_count") or 0)
         source_refs = adjudication["source_refs"]
+        primary_source_refs = _receiver_escape_primary_source_refs(source_refs)
         observations.append(
             {
                 **adjudication,
                 "case_id": case_id,
                 "jsonl_product_command_count": int(activation.get("jsonl_product_surface_count") or 0),
-                "primary_source_ref_count": max(len(source_refs), primary_count),
+                "primary_source_ref_count": max(len(primary_source_refs), primary_count),
                 "ledger_primary_raw_evidence_access_count": primary_count,
+                "adjudicated_primary_source_refs": primary_source_refs,
                 "detected_route_families": routes,
                 "partial_packet_detected": partial_packet_detected,
                 "continuation_detected": any(
@@ -912,6 +938,18 @@ def evaluate_receiver_escape_replay_fixture(
         metadata = lane.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValueError(f"Receiver-escape replay lane {case_id!r} metadata must be an object")
+        metadata = dict(metadata)
+        configured_markers = metadata.get("current_loop_markers", [])
+        if not isinstance(configured_markers, list):
+            raise ValueError(
+                f"Receiver-escape replay lane {case_id!r} metadata.current_loop_markers must be a list when present"
+            )
+        metadata["current_loop_markers"] = sorted(
+            {
+                *RECEIVER_ESCAPE_CURRENT_LOOP_MARKERS,
+                *[marker for marker in configured_markers if isinstance(marker, str)],
+            }
+        )
         adjudication = lane.get("adjudication")
         if not isinstance(adjudication, dict):
             raise ValueError(f"Receiver-escape replay lane {case_id!r} adjudication must be an object")
