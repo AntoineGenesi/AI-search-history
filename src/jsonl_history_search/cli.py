@@ -6122,15 +6122,22 @@ def _investigation_finalization_state_should_gate_contract(
     promotion_status = str(contract.get("promotion_status") or "")
     if answer_status in {
         "answer-ready-after-source-inspection",
+        "semantic-wrapup-ready-after-required-primary-proof",
         "answer-scoped-no-evidence-now",
         "canonical-continuation-packet-required",
     }:
         return False
     if answer_status.startswith("not-ready/") and answer_status != "not-ready/needs-more-proof":
         return False
-    if promotion_status and promotion_status != "unpromoted_semantic_debug_execution":
+    if promotion_status and promotion_status not in {
+        "unpromoted_semantic_debug_execution",
+        "unpromoted_semantic_wrapup_execution",
+    }:
         return False
-    return promotion_status == "unpromoted_semantic_debug_execution" or answer_status in {
+    return promotion_status in {
+        "unpromoted_semantic_debug_execution",
+        "unpromoted_semantic_wrapup_execution",
+    } or answer_status in {
         "",
         "cannot-answer-directly-yet",
         "needs_investigation",
@@ -6180,7 +6187,7 @@ def _action_contract_with_investigation_finalization_state(
         if canonical_next:
             contract["canonical_next_action"] = canonical_next
         if state == "actionable_canonical_continuation" and canonical_next.get("command"):
-            contract.setdefault("read", [])
+            contract["read"] = []
         contract["diagnostics_after"] = [
             item
             for item in contract.get("diagnostics_after") or []
@@ -7282,7 +7289,7 @@ def _answer_action_contract_from_executed_output(
                 "missing facets, or chronology gaps."
             )
         )
-        return {
+        contract = {
             "answer_status": answer_status,
             "promotion_status": "unpromoted_semantic_wrapup_execution",
             "promotion_reason": promotion_reason,
@@ -7316,6 +7323,13 @@ def _answer_action_contract_from_executed_output(
             "saved_report": compact.get("report_written")
             or (compact.get("context_budget") or {}).get("report_written"),
         }
+        contract["semantic_wrapup_answer_ready_contract"] = answer_ready
+        contract["semantic_wrapup_source_followthrough_plan"] = compact.get("source_followthrough_plan") or {}
+        return _action_contract_with_investigation_finalization_state(
+            contract,
+            investigation_finalization_state,
+            route_family="semantic_wrapup",
+        )
     if _promotable_bounded_no_evidence_contract(compact=compact, selected_route=selected_route):
         diagnostic_reads = list(compact.get("source_locator_handoff", {}).get("next_reads") or [])
         return {
@@ -12726,6 +12740,11 @@ def _investigation_finalization_state_veto(action: dict) -> dict:
         else {}
     )
     if finalization_state:
+        if _ask_answer_can_follow_raw_proof_despite_status(
+            action=action,
+            route_family="semantic_wrapup",
+        ):
+            return {"blocked": False}
         state = str(finalization_state.get("state") or "")
         promotion_allowed = finalization_state.get("answer_promotion_allowed") is True
         if state not in _FINALIZATION_PROMOTABLE_STATES or not promotion_allowed:
@@ -12764,11 +12783,24 @@ def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
         if isinstance(action.get("investigation_finalization_state"), dict)
         else {}
     )
-    if action.get("investigation_finalization_gate_applies") is True and finalization_state and (
+    if (
+        action.get("investigation_finalization_gate_applies") is True
+        and finalization_state
+        and not _ask_answer_can_follow_raw_proof_despite_status(
+            action=action,
+            route_family="semantic_wrapup",
+        )
+        and (
         finalization_state.get("answer_promotion_allowed") is not True
         or str(finalization_state.get("state") or "") not in _FINALIZATION_PROMOTABLE_STATES
+        )
     ):
         return True
+    if _ask_answer_can_follow_raw_proof_despite_status(
+        action=action,
+        route_family="semantic_wrapup",
+    ):
+        return False
     answer_status = str(action.get("answer_status") or "").casefold()
     promotion_status = str(action.get("promotion_status") or "").casefold()
     if not answer_status and not promotion_status:
@@ -13499,6 +13531,44 @@ def _ask_answer_missing_source_session_next_step(action: dict) -> dict:
 
 
 def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_family: str) -> bool:
+    if route_family == "semantic_wrapup" and action.get("answer_status") in {
+        "not-ready/needs-more-proof",
+        "cannot-answer-directly-yet",
+    }:
+        finalization = (
+            action.get("investigation_finalization_state")
+            if isinstance(action.get("investigation_finalization_state"), dict)
+            else {}
+        )
+        answer_ready = (
+            action.get("semantic_wrapup_answer_ready_contract")
+            if isinstance(action.get("semantic_wrapup_answer_ready_contract"), dict)
+            else {}
+        )
+        required_reads = [
+            item
+            for item in finalization.get("required_primary_reads") or []
+            if isinstance(item, dict)
+        ]
+        action_reads = [item for item in action.get("read") or [] if isinstance(item, dict)]
+        required_ids = {
+            _semantic_wrapup_required_read_identity(item)
+            for item in required_reads
+            if _semantic_wrapup_required_read_identity(item)
+        }
+        action_ids = {
+            _semantic_wrapup_required_read_identity(item)
+            for item in action_reads
+            if _semantic_wrapup_required_read_identity(item)
+        }
+        return (
+            answer_ready.get("answer_ready") is True
+            and finalization.get("state") == "actionable_primary_reads"
+            and finalization.get("terminal") is False
+            and finalization.get("required_receiver_action") == "open_required_primary_reads"
+            and bool(required_ids)
+            and required_ids <= action_ids
+        )
     if route_family == "latest_status" and action.get("answer_status") == "not-ready/needs-more-proof":
         continuation_packet = action.get("canonical_continuation_packet")
         if isinstance(continuation_packet, dict) and continuation_packet:
@@ -13557,6 +13627,13 @@ def _ask_answer_can_follow_raw_proof_despite_status(*, action: dict, route_famil
         if item.get("source_ref") or item.get("target"):
             return True
     return False
+
+
+def _semantic_wrapup_required_read_identity(read: dict) -> str:
+    source_ref = read.get("source_ref")
+    if isinstance(source_ref, dict):
+        source_ref = f"{source_ref.get('path') or ''}:{source_ref.get('line') or ''}"
+    return str(source_ref or read.get("target") or read.get("path") or "")
 
 
 def _ask_answer_work_episode_handoff(*, report: dict, action: dict, route_family: str, cwd: Path) -> dict:
