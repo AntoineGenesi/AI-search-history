@@ -11030,6 +11030,11 @@ _ASK_ANSWER_REMEMBERED_USER_RECOVERY_MAX_REFS = 16
 _ASK_ANSWER_REMEMBERED_USER_LATEST_RECOVERY_LIMIT = 200
 _ASK_ANSWER_MAX_LINE_CHARS = 900
 _ASK_ANSWER_MAX_FILE_CHARS = 1200
+# A reviewed packet authorizes one exact raw source. Inspecting that source
+# past its anchor is not broad recovery, but it remains explicitly bounded.
+_ASK_ANSWER_REVIEWED_SOURCE_MAX_RECORDS = 2500
+_ASK_ANSWER_REVIEWED_SOURCE_ACTION_RECORDS = 2
+_ASK_ANSWER_REVIEWED_SOURCE_CAVEAT_RECORDS = 2
 _ASK_ANSWER_WORK_EPISODE_ROUTE_FAMILIES = frozenset(
     {"action_proof", "provenance", "semantic_debug"}
 )
@@ -11906,6 +11911,13 @@ def _ask_answer_from_execute(
         proof_refs = _active_status_front_door_proof_refs(action, proof_refs)
     opened = _open_ask_answer_proof_refs(proof_refs, cwd=cwd)
     usable = [item for item in opened if item.get("status") == "opened" and item.get("summary")]
+    reviewed_expansion_continuation = _reviewed_source_expansion_continuation(opened)
+    if reviewed_expansion_continuation:
+        return _ask_answer_fail_closed(
+            answer,
+            "the packet-authorized reviewed primary source reached its bounded expansion limit",
+            reviewed_expansion_continuation,
+        )
     if not usable:
         if route_family in {"remembered_user_wording", "remembered_topic"}:
             remembered_recovery_contract_key = (
@@ -14957,6 +14969,9 @@ def _open_ask_answer_proof_refs(refs: list[dict], *, cwd: Path) -> list[dict]:
         if not path.is_file():
             opened.append({"status": "skipped", "reason": "target_not_a_file", "target": target, "ref": ref})
             continue
+        if _reviewed_source_primary_expansion_requested(ref, path=path, line=line):
+            opened.append(_read_reviewed_source_primary_expansion(path=path, line=line, ref=ref, cwd=cwd))
+            continue
         opened.append(_read_ask_answer_ref(path=path, line=line, ref=ref, cwd=cwd))
     return opened
 
@@ -14975,6 +14990,188 @@ def _target_from_canonical_status_source_ref(source_ref: str) -> str:
     path = match.group(1)
     line = match.group(2)
     return f"{path}:{line}" if line else path
+
+
+def _reviewed_source_primary_expansion_requested(ref: dict, *, path: Path, line: int | None) -> bool:
+    pointer = ref.get("reviewed_source_packet_pointer")
+    return bool(
+        line
+        and path.suffix.lower() == ".jsonl"
+        and isinstance(pointer, dict)
+        and pointer.get("source_ref_id")
+        and pointer.get("source_window_verification_required") is True
+    )
+
+
+def _reviewed_source_completion_caveat_score(summary: str) -> int:
+    text = summary.casefold()
+    score = 0
+    for marker in (
+        "not run",
+        "did not run",
+        "not complete",
+        "not committed",
+        "uncommitted",
+        "remaining work",
+        "remaining",
+        "still pending",
+        "review/fix",
+        "profiled diagnostic",
+        "todo",
+        "not yet",
+    ):
+        if marker in text:
+            score += 3
+    if "not " in text:
+        score += 1
+    return score
+
+
+def _reviewed_source_record_text(raw: str) -> str:
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip()
+    return _extract_text_from_json_row(row) if isinstance(row, dict) else raw.strip()
+
+
+def _reviewed_source_evidence_excerpt(text: str, *, caveat: bool) -> str:
+    normalized = " ".join(str(text or "").split())
+    markers = (
+        ("not run", "did not run", "not complete", "not committed", "uncommitted", "remaining", "pending", "todo")
+        if caveat
+        else ("git apply", "apply patch", "modified", "implement", "embedding", "test")
+    )
+    lowered = normalized.casefold()
+    positions = [lowered.find(marker) for marker in markers if lowered.find(marker) >= 0]
+    if positions:
+        start = max(0, min(positions) - 180)
+        return normalized[start : start + _ASK_ANSWER_MAX_LINE_CHARS]
+    return normalized[:_ASK_ANSWER_MAX_LINE_CHARS]
+
+
+def _reviewed_source_expansion_record_public(record: dict) -> dict:
+    return {
+        "target": record["target"],
+        "line": record["line"],
+        "summary": record["summary"],
+        "record_metadata": record["record_metadata"],
+    }
+
+
+def _reviewed_source_expansion_continuation(opened: list[dict]) -> dict | None:
+    for item in opened:
+        expansion = item.get("reviewed_primary_expansion")
+        if not isinstance(expansion, dict) or expansion.get("source_tail_reached") is True:
+            continue
+        path = str(item.get("path") or "")
+        line_range = expansion.get("scanned_line_range") if isinstance(expansion.get("scanned_line_range"), dict) else {}
+        end_line = _positive_int(line_range.get("end"))
+        if not path or not end_line:
+            continue
+        target = f"{path}:{end_line}"
+        return {
+            "required_next_proof": "continue the same packet-authorized primary source window before answering",
+            "canonical_next_action": {
+                "kind": "read_more_authorized_reviewed_primary_source",
+                "target": target,
+                "command": (
+                    f"jsonl-history-search read-more {shlex.quote(target)} --mode next "
+                    f"--next-count {_ASK_ANSWER_REVIEWED_SOURCE_MAX_RECORDS} "
+                    f"--max-records {_ASK_ANSWER_REVIEWED_SOURCE_MAX_RECORDS} --cwd \"$PWD\" --format text"
+                ),
+            },
+            "source_boundaries": {
+                "allowed": "continue only the exact packet-authorized reviewed primary source",
+                "forbidden": "no broad search, ranking rerun, or secondary-summary substitution",
+            },
+        }
+    return None
+
+
+def _read_reviewed_source_primary_expansion(
+    *,
+    path: Path,
+    line: int,
+    ref: dict,
+    cwd: Path,
+) -> dict:
+    """Inspect a bounded, packet-authorized primary source after its anchor."""
+    rel = _safe_relative_path(cwd, path)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return {"status": "error", "reason": str(exc), "target": rel, "ref": ref}
+    if not lines:
+        return {"status": "opened", "target": rel, "line": line, "summary": "", "ref": ref}
+
+    start = max(0, min(line - 1, len(lines) - 1))
+    end = min(len(lines), start + _ASK_ANSWER_REVIEWED_SOURCE_MAX_RECORDS)
+    records: list[dict] = []
+    for index, raw in enumerate(lines[start:end], start=start + 1):
+        summary = _summarize_jsonl_or_text_line(raw, fallback=f"{rel}:{index}")
+        if not summary:
+            continue
+        records.append(
+            {
+                "target": f"{rel}:{index}",
+                "line": index,
+                "summary": summary,
+                "evidence_text": _reviewed_source_record_text(raw),
+                "record_metadata": _ask_answer_jsonl_record_metadata(raw) or {},
+            }
+        )
+
+    anchor = records[0] if records else None
+    action_records = [
+        record
+        for record in records
+        if record["record_metadata"].get("conversation_label") == "tool_action_output"
+        or record["record_metadata"].get("payload_type") in {"function_call", "function_call_output"}
+        or record["record_metadata"].get("top_role") == "tool"
+    ][-_ASK_ANSWER_REVIEWED_SOURCE_ACTION_RECORDS :]
+    caveat_records = sorted(
+        (
+            record
+            for record in records
+            if record["record_metadata"].get("is_user_authored") is not True
+            and _reviewed_source_completion_caveat_score(record["evidence_text"]) > 0
+        ),
+        key=lambda record: (_reviewed_source_completion_caveat_score(record["evidence_text"]), record["line"]),
+        reverse=True,
+    )[:_ASK_ANSWER_REVIEWED_SOURCE_CAVEAT_RECORDS]
+    selected: list[dict] = []
+    for record in [anchor, *action_records, *caveat_records]:
+        if record and all(record["line"] != existing["line"] for existing in selected):
+            selected.append(record)
+    selected.sort(key=lambda record: record["line"])
+    for record in action_records:
+        record["summary"] = _reviewed_source_evidence_excerpt(record["evidence_text"], caveat=False)
+    for record in caveat_records:
+        record["summary"] = _reviewed_source_evidence_excerpt(record["evidence_text"], caveat=True)
+    selected_public = [_reviewed_source_expansion_record_public(record) for record in selected]
+    action_public = [_reviewed_source_expansion_record_public(record) for record in action_records]
+    caveat_public = [_reviewed_source_expansion_record_public(record) for record in caveat_records]
+    return {
+        "status": "opened",
+        "target": f"{rel}:{start + 1}",
+        "path": rel,
+        "line": start + 1,
+        "summary": _short_join([record["summary"] for record in selected], limit=_ASK_ANSWER_MAX_FILE_CHARS),
+        "record_summaries": selected_public,
+        "record_metadata": anchor["record_metadata"] if anchor else {},
+        "reviewed_primary_expansion": {
+            "status": "bounded_primary_source_expanded",
+            "anchor_target": f"{rel}:{start + 1}",
+            "scanned_line_range": {"start": start + 1, "end": end},
+            "scanned_record_count": end - start,
+            "source_tail_reached": end == len(lines),
+            "action_evidence": action_public,
+            "completion_caveat_evidence": caveat_public,
+            "selected_records": selected_public,
+        },
+        "ref": ref,
+    }
 
 
 def _read_ask_answer_ref(*, path: Path, line: int | None, ref: dict, cwd: Path) -> dict:
@@ -17848,6 +18045,17 @@ def _ref_public_summary(item: dict) -> dict:
     ):
         if key in ref:
             summary[key] = ref.get(key)
+    expansion = item.get("reviewed_primary_expansion")
+    if isinstance(expansion, dict):
+        summary["reviewed_primary_expansion"] = {
+            "status": expansion.get("status"),
+            "anchor_target": expansion.get("anchor_target"),
+            "scanned_line_range": expansion.get("scanned_line_range"),
+            "scanned_record_count": expansion.get("scanned_record_count"),
+            "source_tail_reached": expansion.get("source_tail_reached"),
+            "action_evidence": expansion.get("action_evidence") or [],
+            "completion_caveat_evidence": expansion.get("completion_caveat_evidence") or [],
+        }
     metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
     if metadata:
         summary["record_metadata"] = {
@@ -17926,6 +18134,32 @@ def _compose_ask_answer(*, query: str, route_family: str, action: dict, opened: 
             if reviewed_source_ids
             else ""
         )
+        expansions = [
+            item.get("reviewed_primary_expansion")
+            for item in opened
+            if isinstance(item.get("reviewed_primary_expansion"), dict)
+        ]
+        action_evidence = [
+            record
+            for expansion in expansions
+            for record in expansion.get("action_evidence") or []
+            if isinstance(record, dict) and record.get("summary")
+        ]
+        completion_caveats = [
+            record
+            for expansion in expansions
+            for record in expansion.get("completion_caveat_evidence") or []
+            if isinstance(record, dict) and record.get("summary")
+        ]
+        if action_evidence and completion_caveats:
+            return (
+                "The packet-authorized reviewed-source primary expansion proves partial implementation work, "
+                "but not completion of the broader programme. Action evidence: "
+                f"{_short_join([str(record['summary']) for record in action_evidence[:2]], limit=520)}. "
+                "Completion/validation remains unproven: "
+                f"{_short_join([str(record['summary']) for record in completion_caveats[:2]], limit=520)}."
+                f"{citation}"
+            )
         return f"The opened reviewed-source proof refs show: {_short_join(summaries[:4])}{citation}"
     if route_family in {
         "action_proof",
