@@ -627,9 +627,14 @@ def _transcript_source_owner_roles(path: Path) -> tuple[str, ...]:
 
 def _normalized_source_owner_role(value: Any) -> str | None:
     normalized = re.sub(r"[^a-z]+", "_", str(value or "").casefold()).strip("_")
-    if normalized in {"worker", "implementer", "implementation"}:
+    role_tokens = set(normalized.split("_"))
+    if normalized in {"worker", "implementer", "implementation"} or role_tokens.intersection(
+        {"worker", "implementer"}
+    ):
         return "worker"
-    if normalized in {"reviewer", "rereviewer", "re_reviewer"}:
+    if normalized in {"reviewer", "rereviewer", "re_reviewer"} or role_tokens.intersection(
+        {"reviewer", "rereviewer"}
+    ):
         return "reviewer"
     if normalized in {"parent", "coordinator", "orchestrator"}:
         return "parent_or_coordinator"
