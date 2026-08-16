@@ -184,7 +184,12 @@ from .semantic_debugging import (
     summarize_guided_audit_flow,
 )
 from .skill_audit import build_skill_audit_payload
-from .source_expansion import ExpansionRequest, build_follow_next_reads_payload, build_source_expansion_payload
+from .source_expansion import (
+    ExpansionRequest,
+    build_execute_continuation_payload,
+    build_follow_next_reads_payload,
+    build_source_expansion_payload,
+)
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan, normalize_local_path
 from .status_anchor import DEFAULT_STATUS_QUERY, build_status_anchor_payload
 from .structural_hybrid import search_structural_hybrid_budgeted
@@ -208,6 +213,7 @@ Launch-facing commands:
   bulk-line-match        Local bulk literal phrase candidate generation for selected JSONL roots.
   read-more              Open bounded context for an exact source ref.
   follow-next-reads      Expand saved next_reads from a JSON report without rerunning search.
+  execute-continuation   Execute a saved canonical continuation packet and emit a successor receipt.
   find                   Focused candidate recovery when the full semantic-debug packet is unnecessary.
 
 Developer/internal commands:
@@ -650,6 +656,48 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "--report-output",
         default=None,
         help="Optional path where the follow-next-reads recovery packet should be written as JSON.",
+    )
+    execute_continuation = subparsers.add_parser(
+        "execute-continuation",
+        description=(
+            "Execute a saved canonical continuation packet in package-owned order. "
+            "Only serialized bounded jsonl-history-search argv steps are allowed; "
+            "fresh ask/find/bulk search, shell commands, guessed anchors, and optional diagnostics are rejected."
+        ),
+    )
+    add_common_args(execute_continuation)
+    execute_continuation.set_defaults(format="json")
+    execute_continuation.add_argument(
+        "--from-report",
+        required=True,
+        help="Saved JSON report containing a canonical_continuation_packet or next_proof_step packet.",
+    )
+    execute_continuation.add_argument(
+        "--packet-id",
+        default=None,
+        help="Optional packet_id to select when a report contains multiple continuation packets.",
+    )
+    execute_continuation.add_argument(
+        "--prior-receipt",
+        default=None,
+        help="Optional previous execute-continuation JSON receipt used to detect repeated bounded exhaustion.",
+    )
+    execute_continuation.add_argument(
+        "--max-steps",
+        type=int,
+        default=12,
+        help="Maximum serialized packet steps to execute in this run.",
+    )
+    execute_continuation.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=4000,
+        help="Maximum raw output characters allowed in future step receipts; recorded as a receipt boundary.",
+    )
+    execute_continuation.add_argument(
+        "--report-output",
+        default=None,
+        help="Optional path where the continuation successor receipt should be written as JSON.",
     )
     failure_analysis = subparsers.add_parser(
         "failure-analysis",
@@ -20712,6 +20760,27 @@ def main(argv: list[str] | None = None) -> int:
         if packet["status"] not in {"expanded", "partial_expanded", "no_next_reads"}:
             return 1
         return 0
+    if args.command == "execute-continuation":
+        args.query = str(args.from_report)
+        _source_plan, _intent, plan = payload_from_args(args)
+        payload = build_execute_continuation_payload(
+            report_path=Path(args.from_report).expanduser(),
+            packet_id=args.packet_id,
+            prior_receipt_path=Path(args.prior_receipt).expanduser() if args.prior_receipt else None,
+            max_steps=args.max_steps,
+            max_output_chars=args.max_output_chars,
+            plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            cwd=Path(args.cwd).expanduser().resolve(),
+            receipt_output_path=Path(args.report_output).expanduser() if args.report_output else None,
+        )
+        print(render(payload, args.format))
+        packet = payload["execute_continuation"]
+        if args.report_output:
+            output_path = Path(args.report_output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(render(payload, args.format), encoding="utf-8")
+        return 0 if packet["status"] == "executed" else 1
     source_plan, intent, plan = payload_from_args(args)
     if args.command == "manifest":
         payload = build_manifest_report(

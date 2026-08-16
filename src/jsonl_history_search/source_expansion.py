@@ -34,6 +34,19 @@ RECOVERY_USABILITY_STATUSES = {
     "review_gap",
 }
 REVIEWED_FOLLOWED_RECOVERY_TARGET = "answer_only_for_reviewed_usable_facets_and_state_remaining_gaps"
+GEOMETRY_CAUSALITY_ORIGINAL_ROLES = {
+    "original_decision_rationale",
+    "original_decision",
+    "original_rationale",
+    "decision_rationale",
+    "causal_decision",
+}
+GEOMETRY_CAUSALITY_LATER_ROLES = {
+    "later_radius_adjustment",
+    "radius_adjustment",
+    "later_consequence",
+    "consequence",
+}
 
 
 @dataclass(frozen=True)
@@ -235,6 +248,227 @@ def build_follow_next_reads_payload(
             ),
         }
     }
+
+
+def build_execute_continuation_payload(
+    *,
+    report_path: Path,
+    packet_id: str | None,
+    prior_receipt_path: Path | None,
+    max_steps: int,
+    max_output_chars: int,
+    plan: SourcePlan,
+    default_tz,
+    cwd: Path,
+    receipt_output_path: Path | None = None,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "from_report": str(report_path),
+        "packet_id": packet_id,
+        "limits": {
+            "max_steps": max(0, int(max_steps)),
+            "max_output_chars": max(0, int(max_output_chars)),
+        },
+        "claim_boundaries": {
+            "broad_search_rerun": False,
+            "fresh_ask_allowed": False,
+            "fresh_semantic_debug_allowed": False,
+            "bulk_line_match_allowed": False,
+            "shell_archaeology_allowed": False,
+            "guessed_anchor_allowed": False,
+            "answer_generation_included": False,
+            "all_history_completeness_claim_supported": False,
+        },
+        "privacy_flags": {
+            "raw_text_included": True,
+            "raw_paths_included": True,
+            "committed_safe_without_sanitization": False,
+        },
+    }
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "execute_continuation": {
+                **base,
+                "status": "report_not_found",
+                "successor_state": "terminal_report_not_found",
+                "remaining_named_gap": "saved_report_missing",
+                "failure_reason": "from-report path does not exist",
+            }
+        }
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "execute_continuation": {
+                **base,
+                "status": "report_read_error",
+                "successor_state": "terminal_report_read_error",
+                "remaining_named_gap": "saved_report_unreadable",
+                "failure_reason": str(exc),
+            }
+        }
+    except json.JSONDecodeError as exc:
+        return {
+            "execute_continuation": {
+                **base,
+                "status": "invalid_report_json",
+                "successor_state": "terminal_invalid_report_json",
+                "remaining_named_gap": "saved_report_invalid_json",
+                "failure_reason": str(exc),
+            }
+        }
+
+    packet_info = select_continuation_packet(report, packet_id=packet_id)
+    if packet_info["status"] != "selected":
+        return {
+            "execute_continuation": {
+                **base,
+                "status": packet_info["status"],
+                "successor_state": "terminal_no_supported_continuation_packet",
+                "remaining_named_gap": "canonical_continuation_packet_missing",
+                "failure_reason": packet_info.get("failure_reason"),
+                "available_packet_ids": packet_info.get("available_packet_ids", []),
+            }
+        }
+
+    packet = packet_info["packet"]
+    reads = prioritize_follow_next_reads(continuation_packet_follow_reads(packet))
+    packet_binding = continuation_packet_binding(packet_info, packet=packet, reads=reads)
+    prior_summary = validate_prior_continuation_receipt_binding(
+        load_prior_continuation_receipt_summary(prior_receipt_path),
+        expected_binding=packet_binding,
+    )
+    prior_step_identities = set(prior_summary.get("executed_step_identities") or [])
+    prior_step_states = [
+        item for item in prior_summary.get("executed_step_states") or [] if isinstance(item, dict)
+    ]
+    pending_reads = [
+        read
+        for read in reads
+        if continuation_step_identity(read) not in prior_step_identities
+    ]
+    selected_reads = pending_reads[: max(0, int(max_steps))]
+    expanded_reads = [
+        expand_follow_next_read(
+            read=read,
+            rank=index + 1,
+            plan=plan,
+            default_tz=default_tz,
+            cwd=cwd,
+            usability_decisions=None,
+        )
+        for index, read in enumerate(selected_reads)
+    ]
+    counts = follow_next_read_counts(selected_reads, expanded_reads)
+    selected_step_identities = [continuation_step_identity(read) for read in selected_reads]
+    new_executed_step_states = continuation_executed_step_states(expanded_reads)
+    executed_step_states = prior_step_states + new_executed_step_states
+    executed_step_identities = list(
+        dict.fromkeys(list(prior_summary.get("executed_step_identities") or []) + selected_step_identities)
+    )
+    remaining_after_count = max(0, len(reads) - len(executed_step_identities))
+    geometry_gate = build_geometry_causality_gate(
+        expanded_reads,
+        prior_evidence_states=prior_geometry_causality_states(reads, prior_summary),
+    )
+    remaining_named_gap = continuation_remaining_named_gap(
+        packet=packet,
+        selected_reads=selected_reads,
+        expanded_reads=expanded_reads,
+        geometry_gate=geometry_gate,
+    )
+    repeated_exhaustion = bool(
+        prior_summary.get("status") == "loaded"
+        and prior_summary.get("remaining_named_gap") == remaining_named_gap
+        and not selected_reads
+        and len(reads) > 0
+        and len(prior_step_identities) >= len(reads)
+    )
+    successor_state = continuation_successor_state(
+        available_count=len(reads),
+        selected_count=len(selected_reads),
+        counts=counts,
+        geometry_gate=geometry_gate,
+        repeated_exhaustion=repeated_exhaustion,
+        remaining_after_count=remaining_after_count,
+    )
+    receipt = {
+        **base,
+        "status": "executed",
+        "successor_state": successor_state,
+        "remaining_named_gap": remaining_named_gap,
+        "packet": {
+            "packet_id": packet_info.get("packet_id"),
+            "canonical_packet_fingerprint": packet_binding.get("canonical_packet_fingerprint"),
+            "surface": packet_info.get("surface"),
+            "status": packet.get("status"),
+            "declared_named_gap": packet.get("named_gap") or packet.get("remaining_named_gap") or packet.get("gap_name"),
+        },
+        "packet_binding": packet_binding,
+        "selection": {
+            "available_structured_step_count": len(reads),
+            "prior_executed_step_count": len(prior_step_identities),
+            "pending_structured_step_count": len(pending_reads),
+            "selected_count": len(selected_reads),
+            "expanded_count": counts["expanded_count"],
+            "failed_count": counts["failed_count"],
+            "limit_applied": max(0, int(max_steps)),
+            "unselected_step_count": max(0, len(pending_reads) - len(selected_reads)),
+            "remaining_after_run_count": remaining_after_count,
+            "priority_order": [
+                "geometry_original_decision_rationale",
+                "required_primary_proof",
+                "conditional_required",
+                "promoted_continuation_recovery_clr",
+                "omitted_window_recovery",
+                "ordinary_next_read",
+            ],
+        },
+        "packet_progress": {
+            "schema_version": 1,
+            "packet_binding": packet_binding,
+            "status": "advanced" if selected_reads else "exhausted",
+            "total_step_count": len(reads),
+            "prior_executed_step_count": len(prior_step_identities),
+            "newly_selected_step_identities": selected_step_identities,
+            "executed_step_identities": executed_step_identities,
+            "executed_step_states": executed_step_states,
+            "remaining_step_count": remaining_after_count,
+            "prior_receipt_consumed": prior_summary.get("status") == "loaded",
+        },
+        "geometry_causality_gate": geometry_gate,
+        "reviewed_follow_through_answer_gate": build_reviewed_follow_through_answer_gate(counts, {**base, **counts}),
+        "searched_scope": continuation_searched_scope(reads, selected_reads, expanded_reads, plan),
+        "residual_unknowns": continuation_residual_unknowns(
+            available_count=len(reads),
+            selected_count=len(selected_reads),
+            counts=counts,
+            remaining_named_gap=remaining_named_gap,
+            geometry_gate=geometry_gate,
+            failed_reads=failed_follow_next_read_summaries(expanded_reads),
+        ),
+        "failed_reads": failed_follow_next_read_summaries(expanded_reads),
+        "executed_steps": expanded_reads,
+        "prior_receipt": prior_summary,
+        "agent_instruction": {
+            "required_next_action": "answer_only_if_geometry_gate_and_reviewed_gate_allow_named_gap_closure",
+            "do_not_do": [
+                "do_not_rerun_ask",
+                "do_not_rerun_semantic_debug",
+                "do_not_run_bulk_line_match",
+                "do_not_search_shell_history",
+                "do_not_guess_new_anchors",
+            ],
+            "terminal_rule": (
+                "If selected structured steps are exhausted, name searched_scope and residual_unknowns; "
+                "do not widen beyond the saved packet without a new explicit packet."
+            ),
+        },
+    }
+    if receipt_output_path is not None:
+        receipt["report_output"] = str(receipt_output_path)
+    return {"execute_continuation": receipt}
 
 
 def build_follow_next_reads_agent_instruction(
@@ -1149,8 +1383,12 @@ def prioritize_follow_next_reads(reads: list[dict[str, Any]]) -> list[dict[str, 
 def follow_next_read_priority_key(read: dict[str, Any]) -> tuple[int, int, str]:
     read_role = str(read.get("read_role") or read.get("_source_followthrough_group") or "")
     default_actionable = read.get("default_actionable") is True
-    if read_role == "required_primary_proof" and default_actionable:
+    if read_role in GEOMETRY_CAUSALITY_ORIGINAL_ROLES:
         role_tier = 0
+    elif read_role == "required_primary_proof" and default_actionable:
+        role_tier = 0
+    elif read_role in GEOMETRY_CAUSALITY_LATER_ROLES:
+        role_tier = 3
     elif read_role == "required_primary_proof":
         role_tier = 1
     elif read_role == "conditional_required":
@@ -1169,6 +1407,591 @@ def follow_next_read_priority_key(read: dict[str, Any]) -> tuple[int, int, str]:
     else:
         tier = role_tier
     return (tier, 0 if read.get("target") else 1, str(read.get("target") or ""))
+
+
+def select_continuation_packet(report: Any, *, packet_id: str | None = None) -> dict[str, Any]:
+    packets = find_continuation_packets(report)
+    if not packets:
+        return {
+            "status": "no_continuation_packet",
+            "failure_reason": "expected canonical_continuation_packet, next_proof_step, or continuation_packet with structured reads",
+        }
+    available_ids = [str(item.get("packet_id")) for item in packets if item.get("packet_id")]
+    if packet_id:
+        for item in packets:
+            if str(item.get("packet_id") or "") == packet_id:
+                return {"status": "selected", **item}
+        return {
+            "status": "packet_id_not_found",
+            "failure_reason": f"packet_id not found: {packet_id}",
+            "available_packet_ids": available_ids,
+        }
+    return {"status": "selected", **packets[0], "available_packet_ids": available_ids}
+
+
+def continuation_packet_binding(packet_info: dict[str, Any], *, packet: dict[str, Any], reads: list[dict[str, Any]]) -> dict[str, Any]:
+    packet_id_value = packet_info.get("packet_id")
+    packet_id = str(packet_id_value).strip() if packet_id_value is not None else ""
+    canonical = canonical_continuation_packet_for_fingerprint(packet, reads)
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "canonicalization": "jsonl-history-search.continuation-packet.v1",
+        "packet_id": packet_id or None,
+        "canonical_packet_fingerprint": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+    }
+
+
+def canonical_continuation_packet_for_fingerprint(
+    packet: dict[str, Any],
+    reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "packet": {
+            "packet_id": packet.get("packet_id"),
+            "packet_kind": packet.get("packet_kind"),
+            "status": packet.get("status"),
+            "named_gap": packet.get("named_gap"),
+            "remaining_named_gap": packet.get("remaining_named_gap"),
+            "gap_name": packet.get("gap_name"),
+        },
+        "structured_steps": [
+            {
+                "canonical_order": index,
+                "candidate_id": read.get("candidate_id"),
+                "step_id": read.get("step_id"),
+                "step_identity": read.get("step_identity"),
+                "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
+                "target": read.get("target"),
+                "source_ref": read.get("source_ref"),
+                "mode": read.get("mode"),
+                "scope": read.get("scope"),
+                "before": read.get("before"),
+                "after": read.get("after"),
+                "next_count": read.get("next_count"),
+                "max_records": read.get("max_records"),
+                "projection": read.get("projection"),
+                "named_gap": read.get("named_gap"),
+                "remaining_named_gap": read.get("remaining_named_gap"),
+                "command": read.get("command"),
+                "argv": read.get("argv"),
+                "source_followthrough_group": read.get("_source_followthrough_group"),
+                "follow_surface": read.get("_follow_surface") or read.get("surface"),
+            }
+            for index, read in enumerate(reads, 1)
+        ],
+    }
+
+
+def validate_prior_continuation_receipt_binding(
+    prior_summary: dict[str, Any],
+    *,
+    expected_binding: dict[str, Any],
+) -> dict[str, Any]:
+    if prior_summary.get("status") != "loaded":
+        return {
+            **prior_summary,
+            "packet_binding_validation": {
+                "status": "not_applicable",
+                "reason": f"prior_receipt_{prior_summary.get('status')}",
+            },
+        }
+
+    expected_packet_id = str(expected_binding.get("packet_id") or "").strip()
+    expected_fingerprint = str(expected_binding.get("canonical_packet_fingerprint") or "").strip()
+    if not expected_packet_id or not expected_fingerprint:
+        return rejected_prior_continuation_receipt_summary(
+            prior_summary,
+            status="binding_malformed",
+            reason="selected continuation packet has no valid packet_id or canonical fingerprint",
+            expected_binding=expected_binding,
+        )
+
+    actual_binding = prior_summary.get("packet_binding")
+    if not isinstance(actual_binding, dict):
+        return rejected_prior_continuation_receipt_summary(
+            prior_summary,
+            status="binding_missing",
+            reason="prior receipt does not include packet_binding",
+            expected_binding=expected_binding,
+            actual_binding=actual_binding,
+        )
+    actual_packet_id = str(actual_binding.get("packet_id") or "").strip()
+    actual_fingerprint = str(actual_binding.get("canonical_packet_fingerprint") or "").strip()
+    if not actual_packet_id or not actual_fingerprint:
+        return rejected_prior_continuation_receipt_summary(
+            prior_summary,
+            status="binding_malformed",
+            reason="prior receipt packet_binding is missing packet_id or canonical_packet_fingerprint",
+            expected_binding=expected_binding,
+            actual_binding=actual_binding,
+        )
+    if actual_packet_id != expected_packet_id:
+        return rejected_prior_continuation_receipt_summary(
+            prior_summary,
+            status="binding_packet_id_mismatch",
+            reason="prior receipt packet_id does not match selected continuation packet",
+            expected_binding=expected_binding,
+            actual_binding=actual_binding,
+        )
+    if actual_fingerprint != expected_fingerprint:
+        return rejected_prior_continuation_receipt_summary(
+            prior_summary,
+            status="binding_fingerprint_mismatch",
+            reason="prior receipt canonical packet fingerprint does not match selected continuation packet",
+            expected_binding=expected_binding,
+            actual_binding=actual_binding,
+        )
+    return {
+        **prior_summary,
+        "packet_binding_validation": {
+            "status": "valid",
+            "packet_id": expected_packet_id,
+            "canonical_packet_fingerprint": expected_fingerprint,
+        },
+    }
+
+
+def rejected_prior_continuation_receipt_summary(
+    prior_summary: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    expected_binding: dict[str, Any],
+    actual_binding: Any | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "failure_reason": reason,
+        "successor_state": prior_summary.get("successor_state"),
+        "remaining_named_gap": prior_summary.get("remaining_named_gap"),
+        "executed_step_identities": [],
+        "executed_step_states": [],
+        "packet_binding_validation": {
+            "status": status,
+            "reason": reason,
+            "expected_packet_id": expected_binding.get("packet_id"),
+            "expected_canonical_packet_fingerprint": expected_binding.get("canonical_packet_fingerprint"),
+            "actual_packet_id": actual_binding.get("packet_id") if isinstance(actual_binding, dict) else None,
+            "actual_canonical_packet_fingerprint": (
+                actual_binding.get("canonical_packet_fingerprint") if isinstance(actual_binding, dict) else None
+            ),
+            "prior_proof_consumed": False,
+        },
+    }
+
+
+def find_continuation_packets(node: Any, *, surface: str = "$") -> list[dict[str, Any]]:
+    packets: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        for key in ("canonical_continuation_packet", "next_proof_step", "continuation_packet"):
+            value = node.get(key)
+            if isinstance(value, dict) and continuation_packet_follow_reads(value):
+                packets.append(
+                    {
+                        "packet": value,
+                        "packet_id": value.get("packet_id"),
+                        "surface": f"{surface}.{key}",
+                    }
+                )
+        if continuation_packet_follow_reads(node) and (
+            str(node.get("packet_kind") or "").startswith("canonical_continuation")
+            or node.get("steps")
+            or node.get("continuation_steps")
+        ):
+            packets.append(
+                {
+                    "packet": node,
+                    "packet_id": node.get("packet_id"),
+                    "surface": surface,
+                }
+            )
+        for key, value in node.items():
+            if isinstance(value, (dict, list)):
+                packets.extend(find_continuation_packets(value, surface=f"{surface}.{key}"))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, (dict, list)):
+                packets.extend(find_continuation_packets(value, surface=f"{surface}[{index}]"))
+    deduped: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in packets:
+        identity = id(item["packet"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(item)
+    return deduped
+
+
+def continuation_packet_follow_reads(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(packet, dict):
+        return []
+    reads: list[dict[str, Any]] = []
+
+    def add_group(group: Any, group_name: str) -> None:
+        for index, item in enumerate(list_or_empty(group), 1):
+            read = continuation_step_to_follow_read(item, group_name=group_name, index=index, packet=packet)
+            if read:
+                reads.append(read)
+
+    add_group(packet.get("required_primary_proof"), "required_primary_proof")
+    add_group(packet.get("conditional_required"), "conditional_required")
+    add_group(packet.get("next_reads"), "next_reads")
+    add_group(packet.get("required_next_reads"), "required_next_reads")
+    add_group(packet.get("read"), "read")
+    add_group(packet.get("steps"), "steps")
+    add_group(packet.get("continuation_steps"), "continuation_steps")
+    by_key: dict[str, dict[str, Any]] = {}
+    for read in reads:
+        key = follow_next_read_key(read)
+        if not key:
+            continue
+        if key in by_key:
+            by_key[key] = merge_duplicate_follow_next_read(by_key[key], read)
+        else:
+            by_key[key] = read
+    ordered_reads = list(by_key.values())
+    for read in ordered_reads:
+        read["step_identity"] = continuation_step_identity(read)
+    return ordered_reads
+
+
+def continuation_step_to_follow_read(
+    item: Any,
+    *,
+    group_name: str,
+    index: int,
+    packet: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    if item.get("diagnostic_only") is True or item.get("optional") is True:
+        return None
+    target = item.get("target") or item.get("openable_target")
+    source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else None
+    argv = item.get("argv") if isinstance(item.get("argv"), list) else []
+    command = str(item.get("command") or "")
+    if not target and not source_ref and argv:
+        target = continuation_target_from_argv(argv)
+    if not target and not source_ref and command:
+        target = continuation_target_from_command(command)
+    if not target and not source_ref:
+        return None
+    read_role = str(item.get("read_role") or item.get("role") or item.get("target_source_role") or group_name)
+    return {
+        **item,
+        "target": target,
+        "source_ref": source_ref,
+        "read_role": read_role,
+        "_source_followthrough_group": group_name,
+        "_follow_surface": f"canonical_continuation_packet.{group_name}",
+        "candidate_id": item.get("candidate_id") or item.get("step_id") or f"{group_name}-{index}",
+        "named_gap": item.get("named_gap")
+        or item.get("remaining_named_gap")
+        or packet.get("named_gap")
+        or packet.get("remaining_named_gap")
+        or packet.get("gap_name"),
+    }
+
+
+def continuation_target_from_argv(argv: list[Any]) -> str | None:
+    parts = [str(part) for part in argv]
+    if len(parts) >= 3 and parts[0] == "jsonl-history-search" and parts[1] == "read-more":
+        return parts[2]
+    if len(parts) >= 2 and parts[0] == "read-more":
+        return parts[1]
+    return None
+
+
+def continuation_target_from_command(command: str) -> str | None:
+    try:
+        return continuation_target_from_argv(shlex.split(command))
+    except ValueError:
+        return None
+
+
+def continuation_step_identity(read: dict[str, Any]) -> str:
+    explicit = read.get("step_identity")
+    if explicit:
+        return str(explicit)
+    identity_packet = {
+        "candidate_id": read.get("candidate_id"),
+        "step_id": read.get("step_id"),
+        "target": read.get("target"),
+        "source_ref": read.get("source_ref"),
+        "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
+        "surface": read.get("_follow_surface") or read.get("surface"),
+    }
+    return hashed_handle("continuation-step", json.dumps(identity_packet, sort_keys=True, default=str))
+
+
+def continuation_executed_step_states(expanded_reads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for item in expanded_reads:
+        states.append(
+            {
+                "step_identity": item.get("step_identity"),
+                "candidate_id": item.get("candidate_id"),
+                "read_role": item.get("read_role"),
+                "status": item.get("status"),
+                "remaining_named_gap": item.get("named_gap"),
+                "target_handle": hashed_handle("target", item.get("target")),
+                "source_handle": hashed_handle(
+                    "source",
+                    json.dumps(item.get("source_ref"), sort_keys=True, default=str)
+                    if isinstance(item.get("source_ref"), dict)
+                    else None,
+                ),
+            }
+        )
+    return states
+
+
+def prior_geometry_causality_states(
+    packet_reads: list[dict[str, Any]],
+    prior_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if prior_summary.get("status") != "loaded":
+        return []
+    expected_by_identity = {
+        continuation_step_identity(read): {
+            "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
+            "target_handle": hashed_handle("target", read.get("target")),
+            "source_handle": hashed_handle(
+                "source",
+                json.dumps(read.get("source_ref"), sort_keys=True, default=str)
+                if isinstance(read.get("source_ref"), dict)
+                else None,
+            ),
+        }
+        for read in packet_reads
+    }
+    valid_states: list[dict[str, Any]] = []
+    for state in prior_summary.get("executed_step_states") or []:
+        if not isinstance(state, dict) or state.get("status") != "expanded":
+            continue
+        step_identity = str(state.get("step_identity") or "")
+        expected = expected_by_identity.get(step_identity)
+        if not expected:
+            continue
+        if str(state.get("read_role") or "") != str(expected.get("read_role") or ""):
+            continue
+        if state.get("target_handle") != expected.get("target_handle"):
+            continue
+        expected_source_handle = expected.get("source_handle")
+        if expected_source_handle is not None and state.get("source_handle") != expected_source_handle:
+            continue
+        valid_states.append(
+            {
+                "rank": None,
+                "candidate_id": state.get("candidate_id"),
+                "status": state.get("status"),
+                "role": state.get("read_role"),
+                "target_handle": state.get("target_handle"),
+                "source_handle": state.get("source_handle"),
+                "step_identity": step_identity,
+                "evidence_source": "prior_receipt",
+            }
+        )
+    return valid_states
+
+
+def build_geometry_causality_gate(
+    expanded_reads: list[dict[str, Any]],
+    *,
+    prior_evidence_states: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    original = []
+    later = []
+    for item in prior_evidence_states or []:
+        role = str(item.get("role") or item.get("read_role") or "")
+        row = {
+            "rank": item.get("rank"),
+            "candidate_id": item.get("candidate_id"),
+            "status": item.get("status"),
+            "role": role,
+            "target_handle": item.get("target_handle"),
+            "source_handle": item.get("source_handle"),
+            "step_identity": item.get("step_identity"),
+            "evidence_source": "prior_receipt",
+        }
+        if role in GEOMETRY_CAUSALITY_ORIGINAL_ROLES:
+            original.append(row)
+        elif role in GEOMETRY_CAUSALITY_LATER_ROLES:
+            later.append(row)
+    for item in expanded_reads:
+        role = str(item.get("read_role") or item.get("target_source_role") or "")
+        row = {
+            "rank": item.get("rank"),
+            "candidate_id": item.get("candidate_id"),
+            "status": item.get("status"),
+            "role": role,
+            "target_handle": hashed_handle("target", item.get("target")),
+            "source_handle": hashed_handle(
+                "source",
+                json.dumps(item.get("source_ref"), sort_keys=True, default=str)
+                if isinstance(item.get("source_ref"), dict)
+                else None,
+            ),
+            "step_identity": item.get("step_identity"),
+            "evidence_source": "current_invocation",
+        }
+        if role in GEOMETRY_CAUSALITY_ORIGINAL_ROLES:
+            original.append(row)
+        elif role in GEOMETRY_CAUSALITY_LATER_ROLES:
+            later.append(row)
+    original_expanded = any(item.get("status") == "expanded" for item in original)
+    later_expanded = any(item.get("status") == "expanded" for item in later)
+    if original_expanded:
+        status = "original_decision_rationale_observed"
+    elif later_expanded:
+        status = "blocked_waiting_original_decision_rationale"
+    else:
+        status = "not_applicable_or_not_observed"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "required_before_closure": ["original_decision_rationale"],
+        "original_decision_rationale_reads": original,
+        "later_radius_adjustment_or_consequence_reads": later,
+        "later_radius_evidence_cannot_close_answer": bool(later_expanded and not original_expanded),
+        "answer_closure_allowed_for_geometry_causality": bool(original_expanded),
+    }
+
+
+def continuation_remaining_named_gap(
+    *,
+    packet: dict[str, Any],
+    selected_reads: list[dict[str, Any]],
+    expanded_reads: list[dict[str, Any]],
+    geometry_gate: dict[str, Any],
+) -> str:
+    if geometry_gate.get("later_radius_evidence_cannot_close_answer"):
+        return "geometry_original_decision_rationale"
+    for read in selected_reads + expanded_reads:
+        gap = read.get("named_gap") or read.get("remaining_named_gap")
+        if gap:
+            return str(gap)
+    return str(packet.get("remaining_named_gap") or packet.get("named_gap") or packet.get("gap_name") or "continuation_gap")
+
+
+def continuation_successor_state(
+    *,
+    available_count: int,
+    selected_count: int,
+    counts: dict[str, int],
+    geometry_gate: dict[str, Any],
+    repeated_exhaustion: bool,
+    remaining_after_count: int,
+) -> str:
+    if repeated_exhaustion:
+        return "terminal_repeated_bounded_exhaustion"
+    if available_count <= 0 or selected_count <= 0:
+        return "terminal_no_structured_steps"
+    if geometry_gate.get("later_radius_evidence_cannot_close_answer"):
+        return "advanced_geometry_causality_blocked"
+    if counts["expanded_count"] and counts["failed_count"]:
+        return "advanced_with_read_failures_remaining"
+    if counts["expanded_count"] and remaining_after_count > 0:
+        return "advanced_with_unselected_bounded_steps"
+    if counts["expanded_count"]:
+        return "bounded_scope_exhausted_with_named_gap"
+    return "bounded_steps_failed"
+
+
+def continuation_searched_scope(
+    reads: list[dict[str, Any]],
+    selected_reads: list[dict[str, Any]],
+    expanded_reads: list[dict[str, Any]],
+    plan: SourcePlan,
+) -> dict[str, Any]:
+    return {
+        "available_structured_step_count": len(reads),
+        "selected_count": len(selected_reads),
+        "expanded_count": sum(1 for item in expanded_reads if item.get("status") == "expanded"),
+        "failed_count": sum(1 for item in expanded_reads if item.get("status") != "expanded"),
+        "selected_target_handles": [hashed_handle("target", item.get("target")) for item in selected_reads[:20]],
+        "root_count": len(plan.roots),
+        "root_kinds": sorted({str(getattr(root, "kind", "unknown")) for root in plan.roots}),
+        "scope_boundary": (
+            "Only exact source refs serialized in the saved continuation packet were expanded; "
+            "no broad retrieval, ask routing, shell search, or guessed anchors were run."
+        ),
+    }
+
+
+def continuation_residual_unknowns(
+    *,
+    available_count: int,
+    selected_count: int,
+    counts: dict[str, int],
+    remaining_named_gap: str,
+    geometry_gate: dict[str, Any],
+    failed_reads: list[dict[str, Any]],
+) -> list[str]:
+    unknowns = [f"remaining_named_gap:{remaining_named_gap}"]
+    if selected_count < available_count:
+        unknowns.append(f"unselected_structured_steps:{available_count - selected_count}")
+    if counts["failed_count"]:
+        unknowns.append(f"failed_structured_reads:{counts['failed_count']}")
+    if counts["reviewed_usable_recovery_evidence_count"] == 0:
+        unknowns.append("no_reviewed_usable_recovery_evidence")
+    if geometry_gate.get("later_radius_evidence_cannot_close_answer"):
+        unknowns.append("geometry_original_decision_rationale_not_observed")
+    for failure in failed_reads[:3]:
+        reason = failure.get("failure_reason")
+        if reason:
+            unknowns.append(f"failed_read_reason:{reason}")
+    return list(dict.fromkeys(unknowns))
+
+
+def load_prior_continuation_receipt_summary(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"status": "not_supplied"}
+    try:
+        loaded = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "not_found"}
+    except (OSError, UnicodeDecodeError):
+        return {"status": "read_error"}
+    except json.JSONDecodeError:
+        return {"status": "invalid_json"}
+    packet = loaded.get("execute_continuation") if isinstance(loaded, dict) else None
+    if not isinstance(packet, dict):
+        return {"status": "unsupported_shape"}
+    progress = packet.get("packet_progress") if isinstance(packet.get("packet_progress"), dict) else {}
+    packet_binding = packet.get("packet_binding") if isinstance(packet.get("packet_binding"), dict) else None
+    if packet_binding is None and isinstance(progress.get("packet_binding"), dict):
+        packet_binding = progress.get("packet_binding")
+    raw_step_states = progress.get("executed_step_states") if isinstance(progress.get("executed_step_states"), list) else []
+    executed_step_states = [item for item in raw_step_states if isinstance(item, dict)]
+    executed_step_identities = [
+        str(item)
+        for item in progress.get("executed_step_identities") or []
+        if str(item).strip()
+    ]
+    if not executed_step_identities:
+        executed_step_identities = [
+            str(item.get("step_identity"))
+            for item in packet.get("executed_steps") or []
+            if isinstance(item, dict) and item.get("step_identity")
+        ]
+    return {
+        "status": "loaded",
+        "successor_state": packet.get("successor_state"),
+        "remaining_named_gap": packet.get("remaining_named_gap"),
+        "searched_scope": packet.get("searched_scope"),
+        "packet_binding": packet_binding,
+        "executed_step_identities": list(dict.fromkeys(executed_step_identities)),
+        "executed_step_states": executed_step_states,
+    }
 
 
 def expand_follow_next_read(
@@ -1194,6 +2017,9 @@ def expand_follow_next_read(
         "target": read.get("target") or request.target,
         "source_ref": read.get("source_ref"),
         "surface": read.get("_follow_surface"),
+        "step_identity": read.get("step_identity") or continuation_step_identity(read),
+        "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
+        "named_gap": read.get("named_gap") or read.get("remaining_named_gap"),
         "duplicate_surfaces": list_or_empty(read.get("_follow_duplicate_surfaces")),
         "duplicate_candidate_ids": list_or_empty(read.get("_follow_duplicate_candidate_ids")),
         "discarded_duplicate_reads": list_or_empty(read.get("_follow_discarded_duplicates")),
