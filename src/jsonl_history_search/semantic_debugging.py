@@ -1595,9 +1595,20 @@ def build_semantic_debug_payload(
         answer_ready_handoff=answer_ready_handoff,
         source_followthrough_plan=source_followthrough_plan,
         next_reads=next_reads,
-        route_family=str(family.get("primary") or "semantic_debug"),
+        route_family=str(
+            directional_history_reconstruction.get("route_family")
+            if directional_history_reconstruction.get("applies")
+            else family.get("primary")
+            or "semantic_debug"
+        ),
         canonical_continuation_packet=canonical_continuation_packet,
+        directional_history_reconstruction=directional_history_reconstruction,
         report_output=getattr(args, "report_output", None),
+    )
+    canonical_continuation_packet = (
+        investigation_finalization_state.get("canonical_continuation_packet")
+        if isinstance(investigation_finalization_state.get("canonical_continuation_packet"), dict)
+        else canonical_continuation_packet
     )
     answer_ready_handoff["investigation_finalization_state"] = investigation_finalization_state
     answer_ready_handoff["links"]["investigation_finalization_state"] = (
@@ -1630,6 +1641,7 @@ def build_semantic_debug_payload(
         "question_family": family,
         "directional_history_reconstruction": directional_history_reconstruction,
         "investigation_finalization_state": investigation_finalization_state,
+        "canonical_continuation_packet": canonical_continuation_packet,
         "investigation_state": investigation_state,
         "scope": source_scope,
         "routes": routes,
@@ -8116,6 +8128,196 @@ def _finalization_read_target(read: dict[str, Any]) -> str:
     return str(read.get("target") or read.get("openable_target") or read.get("command") or "")
 
 
+def _read_source_line(read: dict[str, Any]) -> int | None:
+    source_ref = read.get("source_ref") if isinstance(read.get("source_ref"), dict) else {}
+    raw_line = source_ref.get("line")
+    if raw_line is None:
+        target = str(read.get("target") or "")
+        match = re.search(r":(\d+)(?:$|\D)", target)
+        raw_line = match.group(1) if match else None
+    try:
+        return int(raw_line) if raw_line is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _directional_selected_event_line(directional_history_reconstruction: dict[str, Any] | None) -> int | None:
+    if not isinstance(directional_history_reconstruction, dict):
+        return None
+    return _read_source_line({"target": directional_history_reconstruction.get("selected_event_ref")})
+
+
+def _canonical_required_read_role(
+    read: dict[str, Any],
+    *,
+    route_family: str,
+    directional_history_reconstruction: dict[str, Any] | None,
+) -> str:
+    explicit = str(read.get("read_role") or read.get("role") or read.get("target_source_role") or "")
+    if route_family != "causal_history":
+        return explicit if explicit and explicit != "required_primary_proof" else "required_primary_proof"
+
+    target = _finalization_read_target(read)
+    line = _read_source_line(read)
+    selected_event_line = _directional_selected_event_line(directional_history_reconstruction)
+    searchable = " ".join(
+        str(read.get(key) or "")
+        for key in (
+            "reason",
+            "target",
+            "candidate_id",
+            "source_chronology_role",
+            "target_source_role",
+            "proof_role",
+            "secondary_context_role",
+        )
+    ).casefold()
+    if re.search(r"\b(?:original|rationale|decision|prior|before|cause|causal|setup|instruction)\b", searchable):
+        return "original_decision_rationale"
+    if re.search(r"\b(?:later|radius|threshold|consequence|after|follow-up|followup)\b", searchable):
+        return "later_radius_adjustment"
+    if selected_event_line is not None and line is not None:
+        if line < selected_event_line:
+            return "original_decision_rationale"
+        if line >= selected_event_line:
+            return "later_radius_adjustment"
+    if target:
+        return "original_decision_rationale"
+    return "required_primary_proof"
+
+
+def _canonical_required_read_sort_key(
+    read: dict[str, Any],
+    *,
+    route_family: str,
+    directional_history_reconstruction: dict[str, Any] | None,
+) -> tuple[int, int, str]:
+    role = _canonical_required_read_role(
+        read,
+        route_family=route_family,
+        directional_history_reconstruction=directional_history_reconstruction,
+    )
+    if role in {"original_decision_rationale", "original_decision", "original_rationale", "decision_rationale"}:
+        role_tier = 0
+    elif role == "required_primary_proof" and read.get("default_actionable") is True:
+        role_tier = 1
+    elif role == "required_primary_proof":
+        role_tier = 2
+    elif role in {"later_radius_adjustment", "radius_adjustment", "later_consequence", "consequence"}:
+        role_tier = 3
+    else:
+        role_tier = 4
+    return (
+        role_tier,
+        _read_source_line(read) or 10**12,
+        _finalization_read_target(read),
+    )
+
+
+def _canonical_continuation_packet_id(
+    *,
+    route_family: str,
+    reads: list[dict[str, Any]],
+    named_gap: str,
+) -> str:
+    basis = {
+        "route_family": route_family,
+        "named_gap": named_gap,
+        "targets": [_finalization_read_target(read) for read in reads],
+        "roles": [read.get("read_role") for read in reads],
+    }
+    digest = hashlib.sha256(json.dumps(basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    return f"semantic-debug-{route_family or 'generic'}-{digest}"
+
+
+def build_required_primary_canonical_continuation_packet(
+    *,
+    required_reads: list[dict[str, Any]],
+    route_family: str,
+    directional_history_reconstruction: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not required_reads:
+        return None
+    ordered_reads = sorted(
+        required_reads,
+        key=lambda read: _canonical_required_read_sort_key(
+            read,
+            route_family=route_family,
+            directional_history_reconstruction=directional_history_reconstruction,
+        ),
+    )
+    named_gap = (
+        "geometry_original_decision_rationale"
+        if route_family == "causal_history"
+        else "required_primary_source_proof"
+    )
+    steps: list[dict[str, Any]] = []
+    for index, read in enumerate(ordered_reads, 1):
+        target = _finalization_read_target(read)
+        if not target:
+            continue
+        role = _canonical_required_read_role(
+            read,
+            route_family=route_family,
+            directional_history_reconstruction=directional_history_reconstruction,
+        )
+        step = {
+            "step_id": read.get("candidate_id") or f"required-primary-{index}",
+            "target": target,
+            "source_ref": read.get("source_ref") if isinstance(read.get("source_ref"), dict) else None,
+            "read_role": role,
+            "named_gap": named_gap,
+            "reason": read.get("reason") or "required primary source proof before answer promotion",
+            "default_actionable": read.get("default_actionable") is True,
+            "selection_source": read.get("selection_source"),
+        }
+        steps.append({key: value for key, value in step.items() if value not in (None, [], {})})
+    if not steps:
+        return None
+    packet_id = _canonical_continuation_packet_id(
+        route_family=route_family,
+        reads=steps,
+        named_gap=named_gap,
+    )
+    packet = {
+        "packet_id": packet_id,
+        "packet_kind": "canonical_continuation.v1",
+        "status": "actionable_canonical_continuation",
+        "route_family": route_family,
+        "named_gap": named_gap,
+        "execution_mode": "execute-continuation",
+        "steps": steps,
+        "claim_boundaries": {
+            "broad_search_rerun_allowed": False,
+            "fresh_semantic_debug_allowed": False,
+            "answer_generation_included": False,
+        },
+        "causal_ordering": (
+            {
+                "applies": True,
+                "required_order": [
+                    "original_decision_rationale_or_prior_causal_context",
+                    "later_radius_adjustment_or_consequence",
+                ],
+                "labels_only_sufficient": False,
+                "original_or_prior_steps": [
+                    step.get("step_id")
+                    for step in steps
+                    if step.get("read_role") == "original_decision_rationale"
+                ],
+                "later_or_consequence_steps": [
+                    step.get("step_id")
+                    for step in steps
+                    if step.get("read_role") == "later_radius_adjustment"
+                ],
+            }
+            if route_family == "causal_history"
+            else {"applies": False}
+        ),
+    }
+    return packet
+
+
 def _finalization_required_primary_reads(
     *,
     source_followthrough_plan: dict[str, Any],
@@ -8298,6 +8500,7 @@ def build_investigation_finalization_state(
     next_reads: list[dict[str, Any]],
     route_family: str,
     canonical_continuation_packet: dict[str, Any] | None = None,
+    directional_history_reconstruction: dict[str, Any] | None = None,
     tool_runtime_failure: dict[str, Any] | None = None,
     report_output: str | None = None,
 ) -> dict[str, Any]:
@@ -8306,6 +8509,12 @@ def build_investigation_finalization_state(
         answer_ready_handoff=answer_ready_handoff or {},
         next_reads=next_reads or [],
     )
+    if required_reads and not canonical_continuation_packet and report_output:
+        canonical_continuation_packet = build_required_primary_canonical_continuation_packet(
+            required_reads=required_reads,
+            route_family=route_family,
+            directional_history_reconstruction=directional_history_reconstruction,
+        )
     progress = _finalization_read_progress(required_reads)
     handoff_decision = str((answer_ready_handoff or {}).get("decision") or "")
     readiness_decision = str((answer_readiness or {}).get("decision") or "")
@@ -8374,7 +8583,7 @@ def build_investigation_finalization_state(
             "source": "semantic_debug.scope_boundary_summary",
         }
         blockers = []
-    elif required_reads:
+    elif required_reads and not canonical_continuation_packet:
         state = "actionable_primary_reads"
         terminal = False
         answer_promotion_allowed = False
