@@ -12207,11 +12207,11 @@ def _ask_answer_from_execute(
         )
         answer["source_contract"]["action_proof_final_support_gate"] = action_proof_gate
         if action_proof_gate.get("status") != "answer_allowed":
-            answer["proof_summary"] = list(action_proof_gate.get("summary_lines") or [])
+            answer["proof_summary"] = _action_proof_rejection_summary_lines(action_proof_gate)
             return _ask_answer_fail_closed(
                 answer,
                 "original command/tool call and output proof is missing; secondary summaries cannot prove the action",
-                action_proof_gate,
+                _action_proof_fail_closed_next_step(action=action, gate=action_proof_gate),
             )
         answer_opened = list(action_proof_gate.get("opened") or answer_opened)
 
@@ -16158,8 +16158,7 @@ def _action_proof_final_support_gate(*, action: dict, opened: list[dict], query:
         if not is_call and not is_output:
             reasons.append("missing_original_command_or_output_role")
         if reasons:
-            row = dict(item)
-            row["action_proof_reject_reasons"] = _unique_preserving_order(reasons)
+            row = _demote_action_proof_rejected_opened_ref(item, reasons=reasons)
             rejected.append(row)
             continue
         row = dict(item)
@@ -16192,6 +16191,109 @@ def _action_proof_final_support_gate(*, action: dict, opened: list[dict], query:
             f"{item.get('target')}: rejected_action_proof={','.join(item.get('action_proof_reject_reasons') or [])}"
             for item in rejected[:_ASK_ANSWER_MAX_REFS]
         ],
+    }
+
+
+_ACTION_PROOF_INERT_REJECTION_REASONS = frozenset(
+    {
+        "missing_original_command_or_output_role",
+        "not_in_action_proof_required_primary_reads",
+    }
+)
+
+
+def _demote_action_proof_rejected_opened_ref(item: dict, *, reasons: list[str]) -> dict:
+    """Keep rejected action-proof candidates diagnostic-only in every public surface."""
+    row = dict(item)
+    normalized_reasons = _unique_preserving_order(reasons)
+    row["action_proof_reject_reasons"] = normalized_reasons
+    if not _ACTION_PROOF_INERT_REJECTION_REASONS.intersection(normalized_reasons):
+        return row
+    row["diagnostic_only"] = True
+    row["read_more_actionable"] = False
+    row["followthrough_actionable"] = False
+    row["final_support_allowed"] = False
+    row["diagnostic_open_policy"] = "rejected_action_proof_candidate_not_followthrough"
+    ref = row.get("ref") if isinstance(row.get("ref"), dict) else {}
+    if ref:
+        ref = dict(ref)
+        selection = (
+            dict(ref.get("historical_provenance_selection"))
+            if isinstance(ref.get("historical_provenance_selection"), dict)
+            else {}
+        )
+        selection.update(
+            {
+                "diagnostic_only": True,
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "final_support_allowed": False,
+            }
+        )
+        ref.update(
+            {
+                "diagnostic_only": True,
+                "read_more_actionable": False,
+                "followthrough_actionable": False,
+                "final_support_allowed": False,
+                "diagnostic_open_policy": "rejected_action_proof_candidate_not_followthrough",
+                "historical_provenance_selection": selection,
+            }
+        )
+        row["ref"] = ref
+    return row
+
+
+def _action_proof_rejection_summary_lines(gate: dict) -> list[str]:
+    rejected_count = int(gate.get("rejected_ref_count") or 0)
+    if not rejected_count:
+        return ["No original command/tool call and output pair was opened."]
+    return [
+        (
+            f"{rejected_count} opened candidate ref(s) were rejected as non-actionable diagnostics; "
+            "no original command/tool call and output pair was opened."
+        )
+    ]
+
+
+def _action_proof_fail_closed_next_step(*, action: dict, gate: dict) -> dict:
+    """Expose the missing-proof boundary without turning rejected refs into commands."""
+    target_handoff = (
+        action.get("target_proof_handoff")
+        if isinstance(action.get("target_proof_handoff"), dict)
+        else {}
+    )
+    bounded = (
+        target_handoff.get("bounded_no_proof_state")
+        if isinstance(target_handoff.get("bounded_no_proof_state"), dict)
+        else {}
+    )
+    is_bounded_missing_primary = (
+        action.get("answer_status") == "not-proven/bounded-missing-primary-action-proof"
+        or bounded.get("terminal") is True
+    )
+    return {
+        "schema_version": 1,
+        "status": "bounded_missing_primary_action_proof"
+        if is_bounded_missing_primary
+        else "missing_original_action_proof",
+        "required_roles": list(gate.get("required_roles") or []),
+        "missing_roles": list(gate.get("missing_roles") or []),
+        "rejected_diagnostic_count": int(gate.get("rejected_ref_count") or 0),
+        "rejected_refs_actionable": False,
+        "secondary_action_support_allowed": False,
+        "broad_search_rerun_allowed": False if is_bounded_missing_primary else None,
+        "required_target_anchor": bounded.get("required_target_anchor"),
+        "only_continue_if": (
+            list(target_handoff.get("only_continue_if") or [])
+            if is_bounded_missing_primary
+            else []
+        ),
+        "required_next_proof": (
+            "Supply an explicit target anchor, then open only that target's original command/tool call and output."
+            if is_bounded_missing_primary
+            else gate.get("required_next_proof")
+        ),
     }
 
 
