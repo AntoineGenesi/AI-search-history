@@ -9,7 +9,7 @@ Trigger for prior conversation history: old decisions before/outside visible con
 
 Non-triggers: bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, repo/Git history prompts, local repo/task/artifact status prompts, generic questions not anchored to prior conversation history, or self-contained writing/editing/summarizing prompts.
 
-Before asking for clarification, resolve immediate visible-context referents when they preserve the history target. Ask at most one short clarifying question only when material ambiguity changes the target; Ask one short clarifying question and use zero tools.
+Resolve visible-context referents if they preserve the history target. Ask at most one short clarifying question only when ambiguity changes the target; Ask one short clarifying question and use zero tools.
 
 `JSONL activation mode: explicit-only` requires `convo`/`use the convo tool`, except that bounded question.
 
@@ -17,9 +17,9 @@ Before asking for clarification, resolve immediate visible-context referents whe
 
 For named `tasks`/`...md`, decide scope before any tool: checkout/HEAD/current-Git intent -> `--evidence-source local`; conversation/source-session intent -> `--evidence-source conversation-history`; unresolved scope -> ask "Do you want current local Git/task evidence or prior conversation history?" and use zero tools.
 
-Start exactly one installed route. Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. Current-chat semantic audits run `jsonl-history-search ask --answer '<original user wording>' --cwd "$PWD" --format text`; if unavailable, return that source boundary. Natural bounded history-evidence questions: copy the emitted `First command` exactly (`shlex.quote`); never double-quote/requote original wording—backticks/`$(...)` stay literal—then wait for its scope contract; do not use `rg`, `nl`, or `wc` first. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+Start exactly one installed route. Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. Current-chat semantic audits run `jsonl-history-search ask --answer '<original user wording>' --cwd "$PWD" --format text`; if unavailable, return that source boundary. Natural bounded history-evidence questions run exactly one `jsonl-history-search ask --answer '<original user wording>' --cwd "$PWD" --format text`, never `ask --execute` first. Copy the emitted `First command` exactly (`shlex.quote`); never double-quote/requote original wording—backticks/`$(...)` stay literal—and do not use `rg`, `nl`, `wc`, or `read-more` first. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
 
-Route old-context decisions (`before compaction`, `outside visible context`, `earlier in the thread`), remembered constraints, and explicit all-chats/agent-history audit wording through `ask --execute`; its `semantic-debug` contract chooses depth; use `--audit-depth exhaustive` only for scoped full coverage. Otherwise run:
+For non-bounded old-context decisions (`before compaction`, `outside visible context`, `earlier in the thread`), remembered constraints, and explicit all-chats/agent-history audit wording, use `ask --execute`; its `semantic-debug` contract chooses depth; use `--audit-depth exhaustive` only for scoped full coverage. Otherwise run:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
@@ -39,7 +39,7 @@ Source use is failure recovery, never a parallel or equivalent route.
 
 ## Follow The Route
 
-After `ask --execute`, obey `method_selection_packet` (`required_surfaces`, `read_order`, `secondary_policy`, `continue_only_if`, `cap_language_required`, `single_flight_policy`); do not rerun `ask` or direct `semantic-debug`. Active `investigation_finalization_state` means do not synthesize: use only emitted `jsonl-history-search execute-continuation ...` or required primary reads. `answer_ready=true` means answer from opened primary proof; terminal means return its scoped boundary.
+After `ask --execute`, obey `method_selection_packet` (`required_surfaces`, `read_order`, `secondary_policy`, `continue_only_if`, `cap_language_required`, `single_flight_policy`); do not rerun `ask` or direct `semantic-debug`. Active `investigation_finalization_state`: use only emitted `jsonl-history-search execute-continuation ...` or required primary reads. `answer_ready=true`: answer from primary proof; terminal: scoped boundary.
 
 Read one matching file under `references/`; difficult retrieval: `references/retrieval-escalation.md`; repeated corrections or session lessons: `references/semantic-wrapup.md`; named skill-use audit: `references/skill-audit.md`.
 
