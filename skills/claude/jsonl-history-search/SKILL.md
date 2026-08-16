@@ -17,15 +17,13 @@ Before asking for clarification, resolve immediate visible-context referents whe
 
 For named `tasks`/`...md`, decide scope before any tool: checkout/HEAD/current-Git intent -> `--evidence-source local`; conversation/source-session intent -> `--evidence-source conversation-history`; unresolved scope -> ask "Do you want current local Git/task evidence or prior conversation history?" and use zero tools.
 
-Start exactly one installed route. Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. Current-chat semantic audits run `jsonl-history-search ask --answer "<original user wording>" --cwd "$PWD" --format text`; if unavailable, return that source boundary. Natural bounded history-evidence questions use this command; wait for its scope contract and do not use `rg`, `nl`, or `wc` first. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+Start exactly one installed route. Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. Current-chat semantic audits run `jsonl-history-search ask --answer '<original user wording>' --cwd "$PWD" --format text`; if unavailable, return that source boundary. Natural bounded history-evidence questions: copy the emitted `First command` exactly (`shlex.quote`); never double-quote/requote original wording—backticks/`$(...)` stay literal—then wait for its scope contract; do not use `rg`, `nl`, or `wc` first. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
 
 Route old-context decisions (`before compaction`, `outside visible context`, `earlier in the thread`), remembered constraints, and explicit all-chats/agent-history audit wording through `ask --execute`; its `semantic-debug` contract chooses depth; use `--audit-depth exhaustive` only for scoped full coverage. Otherwise run:
 
 ```bash
 jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
-
-Blank/unset query fails closed; use original wording.
 
 Wait for that command to exit. While running, do not start another `ask` or source-checkout
 fallback. A `jsonl_history_search.phase` start means live; do not interrupt or
@@ -37,7 +35,7 @@ install/import failure, and cwd has `src/jsonl_history_search/cli.py`, recover o
 PYTHONPATH=src python3 -m jsonl_history_search.cli ask --execute "<user wording>" --cwd "$PWD" --format text
 ```
 
-Source use is failure recovery, never a parallel or equivalent route. If neither command is available, report the installation failure.
+Source use is failure recovery, never a parallel or equivalent route.
 
 ## Follow The Route
 

@@ -1500,6 +1500,14 @@ def build_ask_router_payload(
             "structured_execution_query": structured_execution_query,
             "command_resolution": command_resolution_payload,
             "first_command": first_command,
+            "first_command_contract": {
+                "copy_exactly": True,
+                "query_quoting": "POSIX shell quoting via shlex.quote",
+                "instruction": (
+                    "Copy First command exactly. Never re-wrap the original prompt in double quotes; "
+                    "backticks and $(...) must remain literal query text."
+                ),
+            },
             "method_selection_packet": method_selection_packet,
             "next_commands": next_commands,
             "answer_ready_handoff": answer_ready_handoff,

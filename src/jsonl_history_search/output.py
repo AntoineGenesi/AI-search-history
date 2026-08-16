@@ -680,12 +680,14 @@ def _original_prompt_identity_lines(identity: dict, *, markdown: bool) -> list[s
 def render_ask_router_text(payload: dict) -> str:
     report = payload["ask_router"]
     resolution = report.get("command_resolution") or {}
+    first_command_contract = report.get("first_command_contract") or {}
     lines = [
         "Ask Route",
         "Answer status: not-ready/needs-more-proof",
         "Open these source refs first: none yet; run the first command to produce source refs.",
         f"Run this first: {report.get('first_command')}",
         f"First command: {report.get('first_command')}",
+        f"Command safety: {first_command_contract.get('instruction') or 'Copy First command exactly.'}",
         f"Stop condition: {report.get('stop_guidance')}",
         f"Only continue if: {report.get('manual_search_guidance')}",
         f"Chosen route: {report.get('chosen_route')}",
@@ -2000,6 +2002,7 @@ def _with_cli_prefix(command: str, cli_prefix: str) -> str:
 def render_ask_router_markdown(payload: dict) -> str:
     report = payload["ask_router"]
     resolution = report.get("command_resolution") or {}
+    first_command_contract = report.get("first_command_contract") or {}
     lines = [
         "# JSONL Ask Route",
         "",
@@ -2007,6 +2010,7 @@ def render_ask_router_markdown(payload: dict) -> str:
         "- Open these source refs first: none yet; run the first command to produce source refs.",
         f"- Run this first: `{report.get('first_command')}`",
         f"- First command: `{report.get('first_command')}`",
+        f"- Command safety: {first_command_contract.get('instruction') or 'Copy First command exactly.'}",
         f"- Stop condition: {report.get('stop_guidance')}",
         f"- Only continue if: {report.get('manual_search_guidance')}",
         "",
