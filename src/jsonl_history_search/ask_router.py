@@ -2406,7 +2406,7 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
     )
     if not has_explicit_handle:
         return False
-    if _has_any(
+    current_run_scope = _has_any(
         normalized,
         (
             "current run",
@@ -2418,7 +2418,19 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "current route",
             "this route",
         ),
-    ):
+    ) or bool(
+        re.search(
+            r"\b(?:current|this)\s+(?:[a-z0-9_-]+\s+)?(?:evaluation\s+)?run\b",
+            normalized,
+        )
+    )
+    current_run_scope_is_negated = bool(
+        re.search(
+            r"\b(?:not|rather than)\s+(?:about\s+)?(?:the\s+)?current\s+(?:[a-z0-9_-]+\s+)?(?:evaluation\s+)?run\b",
+            normalized,
+        )
+    )
+    if current_run_scope and not current_run_scope_is_negated:
         return False
     return _has_any(
         normalized,
