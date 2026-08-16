@@ -5,11 +5,11 @@ description: Trigger even without JSONL or `convo` for prior conversation histor
 
 ## Activation Gate
 
-Trigger for prior conversation history: what the user said; old decisions before/outside visible context; cleanup or multi-step process was deferred, repeated, or failed; `what happened since my last message?`; and the exact automatic trigger `what has happened since my last message in the parent thread?`. Latest-message aliases, including parent/main wording, trigger.
+Trigger for prior conversation history: what the user said; old decisions before/outside visible context; cleanup or multi-step process was deferred, repeated, or failed; `what happened since my last message?`; and the exact automatic trigger `what has happened since my last message in the parent thread?`. Latest-message aliases, including parent/main wording, trigger. A request to use the convo tool to audit `this chat`/`this conversation` for what went wrong or things to fix is a current-conversation semantic audit: retain the original wording and open primary refs before fixes.
 
-Non-triggers: bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, repo/Git history prompts, local repo/task/artifact status prompts, generic questions not anchored to prior conversation history, or self-contained writing/editing/summarizing prompts. History-dependent writing/editing remains a trigger.
+Non-triggers: bare `what happened?`, `what changed in this task file?`, ordinary branch/cleanliness/local-status prompts, repo/Git history prompts, local repo/task/artifact status prompts, generic questions not anchored to prior conversation history, or self-contained writing/editing/summarizing prompts.
 
-Resolve before asking: Before asking for clarification, resolve immediate visible-context referents (`this`, `that`, `it`, `the above`, message just shown) when they preserve likely history target. Ask at most one short clarifying question only when material ambiguity changes local Git/task evidence vs prior conversation history, target identity, or time boundary; Ask one short clarifying question and use zero tools.
+Resolve immediate visible-context referents when they preserve the history target. For material ambiguity, Ask one short clarifying question and use zero tools.
 
 `JSONL activation mode: explicit-only` requires `convo`/`use the convo tool`.
 
@@ -17,7 +17,7 @@ Resolve before asking: Before asking for clarification, resolve immediate visibl
 
 For named `tasks`/`...md`, decide scope before any tool: checkout/HEAD/current-Git intent -> `--evidence-source local`; conversation/source-session intent -> `--evidence-source conversation-history`; unresolved scope -> ask "Do you want current local Git/task evidence or prior conversation history?" and use zero tools.
 
-Start one installed route before repo search, Git, or visible-context synthesis. Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. For unscoped latest-message wording, omit `--parent-thread` and `--complete-interval`. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
+Parent/main latest-message wording uses `jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer`; unscoped wording omits `--parent-thread` and `--complete-interval`. Current-chat semantic audits run `jsonl-history-search ask --answer "<original user wording>" --cwd "$PWD" --format text`; if context is unavailable, return that source boundary. `convo tool`, `convo CLI`, `jsonl-search-history`, `JSONL tool`, `the skill`, and `use the convo tool` map to the canonical CLI; no connector discovery/plugin install/`convo --help`.
 
 Route old-context decisions (`before compaction`, `outside visible context`, `earlier in the thread`), remembered constraints, and explicit all-chats/agent-history audit wording through `ask --execute`; its `semantic-debug` contract chooses depth; use `--audit-depth exhaustive` only for scoped full coverage. Otherwise run:
 

@@ -2027,7 +2027,18 @@ def _currentness_boundary(plan: SourcePlan, query: str) -> dict:
     normalized = _normalize(query)
     mentions_current = any(
         term in normalized
-        for term in ("this session", "current session", "current-session", "this run", "current run", "latest session")
+        for term in (
+            "this session",
+            "current session",
+            "current-session",
+            "this run",
+            "current run",
+            "latest session",
+            "this chat",
+            "current chat",
+            "this conversation",
+            "current conversation",
+        )
     )
     short_correction_prompt = bool(
         re.search(r"\bwhat did i (keep )?(correct|correcting|complain|complaining)\b", normalized)
@@ -2114,7 +2125,18 @@ def _empty_current_session_source_selection(reason: str) -> dict:
 
 def _is_current_session_complaint_fix_query(query: str) -> bool:
     normalized = _normalize(query)
-    has_current_session = any(term in normalized for term in ("this session", "current session", "current-session"))
+    has_current_session = any(
+        term in normalized
+        for term in (
+            "this session",
+            "current session",
+            "current-session",
+            "this chat",
+            "current chat",
+            "this conversation",
+            "current conversation",
+        )
+    )
     has_complaint_or_fix = any(
         term in normalized
         for term in (
@@ -2131,6 +2153,13 @@ def _is_current_session_complaint_fix_query(query: str) -> bool:
             "fix from",
             "semantic wrap-up",
             "semantic-wrapup",
+            "audit",
+            "what went wrong",
+            "things to fix",
+            "suggestion for improvement",
+            "suggestions for improvement",
+            "improve",
+            "fix",
         )
     )
     return has_current_session and has_complaint_or_fix

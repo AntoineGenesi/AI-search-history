@@ -1772,6 +1772,9 @@ def classify_ask_route(
     if _looks_like_ticket_currentness(normalized):
         return ROUTES[8]
 
+    if _looks_like_current_conversation_audit_query(normalized):
+        return ROUTES[9]
+
     if _looks_like_repeated_complaint_or_failure_query(normalized):
         return ROUTES[9]
 
@@ -1915,6 +1918,8 @@ def _looks_like_history_tool_alias_context(normalized: str) -> bool:
     if not normalized:
         return False
     return (
+        _looks_like_current_conversation_audit_query(normalized)
+        or
         _looks_like_latest_status_anchor_query(normalized)
         or _looks_like_concrete_causal_history_query(normalized)
         or _looks_like_concrete_topic_history_query(normalized)
@@ -2012,6 +2017,10 @@ _CURRENT_SESSION_SCOPE_TERMS = (
     "latest session",
     "current thread",
     "this thread",
+    "this chat",
+    "current chat",
+    "this conversation",
+    "current conversation",
 )
 
 
@@ -2062,6 +2071,38 @@ def _looks_like_bare_correction_or_complaint_prompt(normalized: str) -> bool:
             "what have i kept yelling",
         ),
     )
+
+
+def _looks_like_current_conversation_audit_query(normalized: str) -> bool:
+    """Recognize a narrow, deictic audit of the active conversation.
+
+    A bare ``this`` remains ambiguous.  The current-chat/conversation anchor and
+    an audit/failure/fix intent must both be present so explicit alias handling
+    does not turn writing or local-status prompts into history searches.
+    """
+    current_conversation = _has_any(
+        normalized,
+        ("this chat", "current chat", "this conversation", "current conversation"),
+    )
+    audit_intent = _has_any(
+        normalized,
+        (
+            "audit",
+            "what went wrong",
+            "what went badly",
+            "failure",
+            "failed",
+            "things to fix",
+            "thing to fix",
+            "suggestion for improvement",
+            "suggestions for improvement",
+            "suggestion to improve",
+            "suggestions to improve",
+            "improve",
+            "fix",
+        ),
+    )
+    return current_conversation and audit_intent
 
 
 def _looks_like_action_proof_query(normalized: str) -> bool:
