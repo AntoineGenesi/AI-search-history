@@ -1597,6 +1597,7 @@ def build_semantic_debug_payload(
         next_reads=next_reads,
         route_family=str(family.get("primary") or "semantic_debug"),
         canonical_continuation_packet=canonical_continuation_packet,
+        report_output=getattr(args, "report_output", None),
     )
     answer_ready_handoff["investigation_finalization_state"] = investigation_finalization_state
     answer_ready_handoff["links"]["investigation_finalization_state"] = (
@@ -8245,7 +8246,37 @@ def _finalization_read_progress(required_reads: list[dict[str, Any]]) -> dict[st
     }
 
 
-def _finalization_command_from_packet(packet: dict[str, Any] | None) -> str | None:
+def _execute_continuation_command_from_packet(
+    packet: dict[str, Any] | None,
+    *,
+    report_output: str | None,
+) -> str | None:
+    if not packet or not report_output:
+        return None
+    argv: list[Any] = [
+        "jsonl-history-search",
+        "execute-continuation",
+        "--from-report",
+        str(Path(report_output).expanduser()),
+    ]
+    packet_id = packet.get("packet_id")
+    if packet_id:
+        argv.extend(["--packet-id", str(packet_id)])
+    argv.extend(["--format", "text"])
+    return shell_command(argv)
+
+
+def _finalization_command_from_packet(
+    packet: dict[str, Any] | None,
+    *,
+    report_output: str | None = None,
+) -> str | None:
+    execute_command = _execute_continuation_command_from_packet(
+        packet,
+        report_output=report_output,
+    )
+    if execute_command:
+        return execute_command
     if not packet:
         return None
     command = packet.get("command")
@@ -8268,6 +8299,7 @@ def build_investigation_finalization_state(
     route_family: str,
     canonical_continuation_packet: dict[str, Any] | None = None,
     tool_runtime_failure: dict[str, Any] | None = None,
+    report_output: str | None = None,
 ) -> dict[str, Any]:
     required_reads = _finalization_required_primary_reads(
         source_followthrough_plan=source_followthrough_plan or {},
@@ -8283,7 +8315,10 @@ def build_investigation_finalization_state(
         for command in (answer_ready_handoff or {}).get("copy_paste_commands") or []
         if command
     ]
-    packet_command = _finalization_command_from_packet(canonical_continuation_packet)
+    packet_command = _finalization_command_from_packet(
+        canonical_continuation_packet,
+        report_output=report_output,
+    )
     first_follow_next_command = next(
         (
             command

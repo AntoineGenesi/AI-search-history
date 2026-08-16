@@ -278,6 +278,8 @@ def render_text(payload: dict) -> str:
         return render_source_expansion_text(payload)
     if "follow_next_reads" in payload:
         return render_follow_next_reads_text(payload)
+    if "execute_continuation" in payload:
+        return render_execute_continuation_text(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_text(payload)
     if "capability_diagnostic" in payload:
@@ -431,6 +433,8 @@ def render_markdown(payload: dict) -> str:
         return render_source_expansion_markdown(payload)
     if "follow_next_reads" in payload:
         return render_follow_next_reads_markdown(payload)
+    if "execute_continuation" in payload:
+        return render_execute_continuation_markdown(payload)
     if "jsonl_candidate_discovery" in payload:
         return render_jsonl_candidate_discovery_markdown(payload)
     if "capability_diagnostic" in payload:
@@ -915,6 +919,7 @@ def render_ask_execute_text(payload: dict) -> str:
             f"Promotion status: {action.get('promotion_status')}",
         ]
     )
+    lines.extend(render_investigation_finalization_state_text(action.get("investigation_finalization_state") or {}))
     workflow = action.get("receiving_agent_workflow") or {}
     if workflow:
         lines.append(f"Receiving-agent workflow: {workflow.get('mode')}")
@@ -1087,6 +1092,7 @@ def render_ask_execute_markdown(payload: dict) -> str:
             f"- Promotion status: `{action.get('promotion_status')}`",
         ]
     )
+    lines.extend(render_investigation_finalization_state_markdown(action.get("investigation_finalization_state") or {}))
     workflow = action.get("receiving_agent_workflow") or {}
     if workflow:
         lines.append(f"- Receiving-agent workflow: `{workflow.get('mode')}`")
@@ -4342,6 +4348,120 @@ def render_follow_next_reads_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_execute_continuation_text(payload: dict) -> str:
+    receipt = payload["execute_continuation"]
+    selection = receipt.get("selection") or {}
+    binding = receipt.get("packet_binding") or {}
+    geometry_gate = receipt.get("geometry_causality_gate") or {}
+    claim_boundaries = receipt.get("claim_boundaries") or {}
+    lines = [
+        "Execute Continuation",
+        f"Status: {receipt.get('status')}",
+        f"Successor state: {receipt.get('successor_state')}",
+        f"Remaining named gap: {receipt.get('remaining_named_gap')}",
+        f"Packet id: {binding.get('packet_id')}",
+        f"Selected/expanded steps: {selection.get('selected_count')} / {selection.get('expanded_count')}",
+    ]
+    if binding.get("canonical_packet_fingerprint"):
+        lines.append(f"Canonical packet fingerprint: {binding.get('canonical_packet_fingerprint')}")
+    if geometry_gate:
+        lines.append(
+            "Geometry causality gate: "
+            f"original_expanded={geometry_gate.get('original_decision_rationale_expanded')} "
+            f"later_radius_cannot_close={geometry_gate.get('later_radius_evidence_cannot_close_answer')} "
+            f"answer_closure_allowed={geometry_gate.get('answer_closure_allowed_for_geometry_causality')}"
+        )
+    if receipt.get("residual_unknowns"):
+        lines.append("Residual unknowns:")
+        for item in list(receipt.get("residual_unknowns") or [])[:8]:
+            lines.append(f"- {item}")
+    if claim_boundaries:
+        lines.append(
+            "Claim boundaries: "
+            f"fresh_ask_allowed={claim_boundaries.get('fresh_ask_allowed')} "
+            f"broad_search_rerun={claim_boundaries.get('broad_search_rerun')} "
+            f"bulk_line_match_allowed={claim_boundaries.get('bulk_line_match_allowed')}"
+        )
+    searched_scope = receipt.get("searched_scope") or {}
+    if searched_scope:
+        lines.append(
+            "Searched scope: "
+            f"expanded_count={searched_scope.get('expanded_count')} "
+            f"scope_boundary={searched_scope.get('scope_boundary')}"
+        )
+    lines.append(
+        "Receiver rule: answer only if the successor state and required gate allow closure; "
+        "otherwise report the remaining named gap and do not run fresh broad search."
+    )
+    return "\n".join(lines)
+
+
+def render_execute_continuation_markdown(payload: dict) -> str:
+    receipt = payload["execute_continuation"]
+    selection = receipt.get("selection") or {}
+    binding = receipt.get("packet_binding") or {}
+    geometry_gate = receipt.get("geometry_causality_gate") or {}
+    claim_boundaries = receipt.get("claim_boundaries") or {}
+    lines = [
+        "# Execute Continuation",
+        "",
+        f"- `status`: `{receipt.get('status')}`",
+        f"- `successor_state`: `{receipt.get('successor_state')}`",
+        f"- `remaining_named_gap`: `{receipt.get('remaining_named_gap')}`",
+        f"- `packet_id`: `{binding.get('packet_id')}`",
+        f"- `selected_steps`: `{selection.get('selected_count')}`",
+        f"- `expanded_steps`: `{selection.get('expanded_count')}`",
+    ]
+    if binding.get("canonical_packet_fingerprint"):
+        lines.append(f"- `canonical_packet_fingerprint`: `{binding.get('canonical_packet_fingerprint')}`")
+    if geometry_gate:
+        lines.extend(
+            [
+                "",
+                "## Geometry Causality Gate",
+                "",
+                f"- `original_decision_rationale_expanded`: `{geometry_gate.get('original_decision_rationale_expanded')}`",
+                f"- `later_radius_evidence_cannot_close_answer`: `{geometry_gate.get('later_radius_evidence_cannot_close_answer')}`",
+                f"- `answer_closure_allowed_for_geometry_causality`: `{geometry_gate.get('answer_closure_allowed_for_geometry_causality')}`",
+            ]
+        )
+    if receipt.get("residual_unknowns"):
+        lines.extend(["", "## Residual Unknowns", ""])
+        for item in list(receipt.get("residual_unknowns") or [])[:8]:
+            lines.append(f"- `{item}`")
+    if claim_boundaries:
+        lines.extend(
+            [
+                "",
+                "## Claim Boundaries",
+                "",
+                f"- `fresh_ask_allowed`: `{claim_boundaries.get('fresh_ask_allowed')}`",
+                f"- `broad_search_rerun`: `{claim_boundaries.get('broad_search_rerun')}`",
+                f"- `bulk_line_match_allowed`: `{claim_boundaries.get('bulk_line_match_allowed')}`",
+            ]
+        )
+    searched_scope = receipt.get("searched_scope") or {}
+    if searched_scope:
+        lines.extend(
+            [
+                "",
+                "## Searched Scope",
+                "",
+                f"- `expanded_count`: `{searched_scope.get('expanded_count')}`",
+                f"- `scope_boundary`: {searched_scope.get('scope_boundary')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Receiver Rule",
+            "",
+            "- Answer only if the successor state and required gate allow closure; otherwise report the remaining named gap and do not run fresh broad search.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 _RECOVERY_REVIEW_COUNT_KEYS = (
     "recovery_opened",
     "reviewed_usable",
@@ -7198,6 +7318,7 @@ def render_semantic_debug_text(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_text(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_text(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    lines.extend(render_investigation_finalization_state_text(report.get("investigation_finalization_state") or {}))
     if report.get("cap_next_action"):
         action = report["cap_next_action"]
         reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
@@ -7550,6 +7671,7 @@ def render_semantic_debug_markdown(payload: dict) -> str:
     if not deep_audit_followthrough_active:
         lines.extend(render_source_followthrough_plan_markdown(source_followthrough_plan, command_by_target=command_by_target))
     lines.extend(render_scope_boundary_summary_markdown(report.get("scope_boundary_summary") or handoff.get("scope_boundary_summary") or {}))
+    lines.extend(render_investigation_finalization_state_markdown(report.get("investigation_finalization_state") or {}))
     if report.get("cap_next_action"):
         action = report["cap_next_action"]
         reasons = ", ".join(str(item) for item in action.get("trigger_reasons", []))
@@ -7889,6 +8011,118 @@ def render_investigation_state_text(investigation_state: dict) -> list[str]:
         f"rrf_default_promoted={claim_boundaries.get('rrf_default_promoted')} "
         f"rrf_default_allowed={recommendation.get('rrf_default_allowed')}"
     )
+    return lines
+
+
+def render_investigation_finalization_state_text(finalization_state: dict) -> list[str]:
+    if not isinstance(finalization_state, dict) or not finalization_state.get("state"):
+        return []
+    state = str(finalization_state.get("state") or "")
+    canonical_next = finalization_state.get("canonical_next_action") or {}
+    command = canonical_next.get("command")
+    progress = finalization_state.get("evidence_progress") or {}
+    boundedness = finalization_state.get("boundedness") or {}
+    lines = [
+        "Investigation finalization: "
+        f"state={state} "
+        f"answer_ready={finalization_state.get('answer_ready')} "
+        f"terminal={finalization_state.get('terminal')} "
+        f"receiver_action={finalization_state.get('required_receiver_action')}",
+    ]
+    if state == "answer_ready" and finalization_state.get("answer_promotion_allowed") is True:
+        lines.append("- Receiver action: answer-ready; stop broad searching and answer only from opened primary proof.")
+        return lines
+    if state == "terminal_scoped_no_evidence" and finalization_state.get("answer_promotion_allowed") is True:
+        lines.append(
+            "- Receiver action: terminal scoped stop; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries."
+        )
+        return lines
+    if finalization_state.get("terminal"):
+        lines.append("- Receiver action: terminal blocker; report the scoped blocker instead of running fresh broad search.")
+        for blocker in list(finalization_state.get("blockers") or [])[:3]:
+            if isinstance(blocker, dict):
+                lines.append(f"- blocker: {blocker.get('kind') or blocker}")
+        return lines
+
+    lines.append("- Receiver action: not answer-ready; do not synthesize; continue with the canonical bounded action.")
+    if command:
+        lines.append(f"- Canonical next command: {command}")
+    else:
+        lines.append(f"- Canonical next action: {canonical_next.get('kind') or '(none emitted)'}")
+    lines.append(
+        "- Continue boundary: do not rerun broad ask/search or use optional diagnostics as answer material; "
+        "continue only until this state becomes answer_ready or terminal."
+    )
+    if progress:
+        lines.append(
+            "Evidence progress: "
+            f"required={progress.get('required_primary_total')} "
+            f"uninspected={progress.get('required_primary_uninspected_count')} "
+            f"exhausted={progress.get('required_primary_exhausted_count')}"
+        )
+    if boundedness:
+        lines.append(
+            "Finalization controls: "
+            f"broad_search_rerun_allowed={boundedness.get('broad_search_rerun_allowed')} "
+            f"optional_diagnostics_default_actionable={boundedness.get('optional_diagnostics_default_actionable')}"
+        )
+    return lines
+
+
+def render_investigation_finalization_state_markdown(finalization_state: dict) -> list[str]:
+    if not isinstance(finalization_state, dict) or not finalization_state.get("state"):
+        return []
+    state = str(finalization_state.get("state") or "")
+    canonical_next = finalization_state.get("canonical_next_action") or {}
+    command = canonical_next.get("command")
+    progress = finalization_state.get("evidence_progress") or {}
+    boundedness = finalization_state.get("boundedness") or {}
+    lines = [
+        "",
+        "## Investigation Finalization",
+        "",
+        f"- `state`: `{state}`",
+        f"- `answer_ready`: `{finalization_state.get('answer_ready')}`",
+        f"- `terminal`: `{finalization_state.get('terminal')}`",
+        f"- `required_receiver_action`: `{finalization_state.get('required_receiver_action')}`",
+    ]
+    if state == "answer_ready" and finalization_state.get("answer_promotion_allowed") is True:
+        lines.append("- Receiver action: answer-ready; stop broad searching and answer only from opened primary proof.")
+        return lines
+    if state == "terminal_scoped_no_evidence" and finalization_state.get("answer_promotion_allowed") is True:
+        lines.append(
+            "- Receiver action: terminal scoped stop; answer `not_found_in_searched_scope` with searched/not-searched/cap boundaries."
+        )
+        return lines
+    if finalization_state.get("terminal"):
+        lines.append("- Receiver action: terminal blocker; report the scoped blocker instead of running fresh broad search.")
+        for blocker in list(finalization_state.get("blockers") or [])[:3]:
+            if isinstance(blocker, dict):
+                lines.append(f"- `blocker`: `{blocker.get('kind') or blocker}`")
+        return lines
+
+    lines.append("- Receiver action: not answer-ready; do not synthesize; continue with the canonical bounded action.")
+    if command:
+        lines.extend(["", "```bash", str(command), "```"])
+    else:
+        lines.append(f"- `canonical_next_action`: `{canonical_next.get('kind') or '(none emitted)'}`")
+    lines.append(
+        "- Continue boundary: do not rerun broad `ask`/search or use optional diagnostics as answer material; "
+        "continue only until this state becomes `answer_ready` or terminal."
+    )
+    if progress:
+        lines.append(
+            "- `evidence_progress`: "
+            f"required=`{progress.get('required_primary_total')}` "
+            f"uninspected=`{progress.get('required_primary_uninspected_count')}` "
+            f"exhausted=`{progress.get('required_primary_exhausted_count')}`"
+        )
+    if boundedness:
+        lines.append(
+            "- `finalization_controls`: "
+            f"broad_search_rerun_allowed=`{boundedness.get('broad_search_rerun_allowed')}`; "
+            f"optional_diagnostics_default_actionable=`{boundedness.get('optional_diagnostics_default_actionable')}`"
+        )
     return lines
 
 
