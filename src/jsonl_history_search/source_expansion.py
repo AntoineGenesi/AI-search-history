@@ -26,7 +26,7 @@ TERMINAL_CLAIM_CUE_RE = re.compile(
     r"final rerun|focused checks?|missing final|no closeout|session ended|terminal state|commit(?:ted)?)\b",
     re.IGNORECASE,
 )
-SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery"}
+SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery", "required_primary_proof"}
 RECOVERY_USABILITY_STATUSES = {
     "private_reviewed_usable",
     "reviewed_not_useful",
@@ -148,7 +148,7 @@ def build_follow_next_reads_payload(
             }
         }
 
-    packet_info = detect_follow_packet(report)
+    packet_info = detect_follow_packet(report, kind=kind)
     if packet_info["status"] != "supported":
         return {
             "follow_next_reads": {
@@ -160,7 +160,9 @@ def build_follow_next_reads_payload(
             }
         }
 
-    reads = prioritize_follow_next_reads(collect_follow_next_reads(packet_info["packet"], packet_info["packet_type"]))
+    reads = prioritize_follow_next_reads(
+        collect_follow_next_reads(packet_info["packet"], packet_info["packet_type"], kind=kind)
+    )
     selected_reads = reads[: max(0, int(limit))]
     expanded_reads = [
         expand_follow_next_read(
@@ -1219,7 +1221,7 @@ def _source_expansion_age_is_near_query(age_seconds: float | None) -> bool:
     return age_seconds is not None and -60 <= age_seconds <= LIVE_TAIL_MAX_AGE_SECONDS
 
 
-def detect_follow_packet(report: Any) -> dict[str, Any]:
+def detect_follow_packet(report: Any, *, kind: str = "recovery") -> dict[str, Any]:
     if not isinstance(report, dict):
         return {"status": "unsupported_report_shape", "failure_reason": "report JSON must be an object"}
     candidates: list[tuple[str, Any]] = []
@@ -1227,10 +1229,12 @@ def detect_follow_packet(report: Any) -> dict[str, Any]:
         candidates.append(("semantic_debug", report.get("semantic_debug")))
     if "agent_find" in report:
         candidates.append(("agent_find", report.get("agent_find")))
+    if kind == "required_primary_proof" and "semantic_wrapup" in report:
+        candidates.append(("semantic_wrapup", report.get("semantic_wrapup")))
     for packet_type, packet in candidates:
         if not isinstance(packet, dict):
             continue
-        surfaces = follow_next_read_surfaces(packet, packet_type)
+        surfaces = follow_next_read_surfaces(packet, packet_type, kind=kind)
         if surfaces:
             return {
                 "status": "supported",
@@ -1251,13 +1255,19 @@ def detect_follow_packet(report: Any) -> dict[str, Any]:
             "status": "stale_or_missing_next_reads",
             "failure_reason": "recognized packet type does not include current next_reads surfaces",
         }
+    expected = "semantic_wrapup" if kind == "required_primary_proof" else "semantic_debug or agent_find"
     return {
         "status": "unsupported_report_shape",
-        "failure_reason": "expected top-level semantic_debug or agent_find packet",
+        "failure_reason": f"expected top-level {expected} packet",
     }
 
 
-def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[tuple[str, list[Any]]]:
+def follow_next_read_surfaces(
+    packet: dict[str, Any],
+    packet_type: str,
+    *,
+    kind: str = "recovery",
+) -> list[tuple[str, list[Any]]]:
     surfaces: list[tuple[str, list[Any]]] = []
     if packet_type == "semantic_debug":
         source_followthrough_plan = packet.get("source_followthrough_plan")
@@ -1287,6 +1297,17 @@ def follow_next_read_surfaces(packet: dict[str, Any], packet_type: str) -> list[
             "agent_find.compact_provenance_handoff.next_reads",
             packet.get("compact_provenance_handoff") or {},
         )
+    elif packet_type == "semantic_wrapup" and kind == "required_primary_proof":
+        plan = packet.get("source_followthrough_plan") or {}
+        reads = [
+            {**item, "_source_followthrough_group": "required_primary_proof"}
+            for item in list_or_empty(plan.get("required_primary_proof"))
+            if isinstance(item, dict)
+            and item.get("read_role") == "required_primary_proof"
+            and item.get("read_more_actionable") is not False
+            and item.get("diagnostic_only") is not True
+        ]
+        surfaces.append(("semantic_wrapup.source_followthrough_plan.required_primary_proof", reads))
     return surfaces
 
 
@@ -1317,10 +1338,15 @@ def append_next_read_surface(surfaces: list[tuple[str, list[Any]]], label: str, 
         surfaces.append((label, list_or_empty(container.get("next_reads"))))
 
 
-def collect_follow_next_reads(packet: dict[str, Any], packet_type: str) -> list[dict[str, Any]]:
+def collect_follow_next_reads(
+    packet: dict[str, Any],
+    packet_type: str,
+    *,
+    kind: str = "recovery",
+) -> list[dict[str, Any]]:
     reads: list[dict[str, Any]] = []
     by_key: dict[str, int] = {}
-    for surface, surface_reads in follow_next_read_surfaces(packet, packet_type):
+    for surface, surface_reads in follow_next_read_surfaces(packet, packet_type, kind=kind):
         for item in surface_reads:
             if not isinstance(item, dict):
                 continue

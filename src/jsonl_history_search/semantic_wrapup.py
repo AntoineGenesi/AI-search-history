@@ -710,6 +710,12 @@ def build_semantic_wrapup_payload(
         rolling_window_coverage=rolling_window_coverage,
         root_handoff_contract=root_handoff_contract,
     )
+    investigation_finalization_state = _semantic_wrapup_investigation_finalization_state(
+        answer_ready_contract=answer_ready_contract,
+        source_followthrough_plan=source_followthrough_plan,
+        next_reads=next_reads,
+        report_output=report_output,
+    )
     late_signal_handling = _late_signal_handling(records, signals, failure_modes, query, mirror_collapse=mirror_collapse)
     answer_use_contract = _answer_use_contract(
         status,
@@ -809,6 +815,7 @@ def build_semantic_wrapup_payload(
             ),
             "answer_ready_contract": answer_ready_contract,
             "answer_use_contract": answer_use_contract,
+            "investigation_finalization_state": investigation_finalization_state,
             "read_role_summary": read_role_summary,
             "source_followthrough_plan": source_followthrough_plan,
             "next_reads": next_reads,
@@ -833,6 +840,94 @@ def build_semantic_wrapup_payload(
     if "masking" in scan:
         payload["masking"] = scan["masking"]
     return payload
+
+
+def _semantic_wrapup_investigation_finalization_state(
+    *,
+    answer_ready_contract: dict,
+    source_followthrough_plan: dict,
+    next_reads: list[dict],
+    report_output: str | None,
+) -> dict:
+    """State whether a semantic-wrapup packet is an active proof loop or a stop.
+
+    `answer_ready` here deliberately means *ready after primary proof is opened*,
+    not that the generated packet itself may be used as final evidence.
+    """
+    required_reads = [
+        read
+        for read in source_followthrough_plan.get("required_primary_proof") or next_reads
+        if isinstance(read, dict)
+        and read.get("read_role") == READ_ROLE_REQUIRED_PRIMARY_PROOF
+        and read.get("read_more_actionable") is not False
+        and read.get("diagnostic_only") is not True
+    ]
+    answer_ready_after_primary_proof = answer_ready_contract.get("answer_ready") is True
+    if required_reads and not answer_ready_after_primary_proof and report_output:
+        state = "actionable_canonical_continuation"
+        terminal = False
+        receiver_action = "run_canonical_continuation"
+        blockers = []
+    elif required_reads:
+        state = "actionable_primary_reads"
+        terminal = False
+        receiver_action = "open_required_primary_reads"
+        blockers: list[dict] = []
+    elif answer_ready_after_primary_proof:
+        state = "answer_ready"
+        terminal = True
+        receiver_action = "answer_from_opened_primary_proof"
+        blockers = []
+    else:
+        state = "terminal_machine_blocker"
+        terminal = True
+        receiver_action = "return_exact_blocker_or_scope"
+        blockers = [
+            {
+                "kind": "semantic_wrapup_required_primary_proof_unavailable",
+                "reason": answer_ready_contract.get("reason"),
+            }
+        ]
+    return {
+        "schema_version": "investigation_finalization_state.v1",
+        "state": state,
+        "answer_ready": state == "answer_ready",
+        "answer_promotion_allowed": state == "answer_ready",
+        "terminal": terminal,
+        "required_receiver_action": receiver_action,
+        "canonical_next_action": {
+            "kind": (
+                "follow_next_reads"
+                if state == "actionable_canonical_continuation"
+                else "read_more" if required_reads else "ask_answer" if state == "answer_ready" else "none"
+            ),
+            "command": (
+                f"jsonl-history-search follow-next-reads --from-report {shlex.quote(report_output)} "
+                '--kind required_primary_proof --limit 6 --cwd "$PWD" --format json'
+                if state == "actionable_canonical_continuation"
+                else None
+            ),
+            "source": "semantic_wrapup.source_followthrough_plan.required_primary_proof",
+        },
+        "evidence_progress": {
+            "required_primary_total": len(required_reads),
+            "required_primary_uninspected_count": len(required_reads),
+            "required_primary_exhausted_count": 0,
+        },
+        "required_primary_reads": required_reads[:6],
+        "boundedness": {
+            "broad_search_rerun_allowed": False,
+            "optional_diagnostics_default_actionable": False,
+            "selection_order_source": "semantic_wrapup.source_followthrough_plan deterministic order",
+        },
+        "blockers": blockers,
+        "receipt_protocol": {
+            "uninspected_vs_exhausted_distinguished": True,
+            "receiver_must_report_after_opening": (
+                "record opened/exhausted/support status for each required primary read before promotion"
+            ),
+        },
+    }
 
 
 def _semantic_wrapup_status(plan: SourcePlan, failure_modes: list[dict]) -> str:
