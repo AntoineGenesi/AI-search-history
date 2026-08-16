@@ -18,7 +18,13 @@ ordinary branch/cleanliness/local-status prompts, repo/Git history prompts,
 local repo/task/artifact status prompts, generic questions not anchored to prior conversation history,
 or self-contained writing/editing/summarizing prompts. History-dependent writing/editing remains a trigger.
 Remembered coding: answer/continue; do not edit/test.
-Ask one short clarifying question and use zero tools only for non-history ambiguity.
+Before asking for clarification, resolve immediate visible-context referents
+(`this`, `that`, `it`, `the above`, or the message just shown) against the
+current user-visible turn when doing so materially preserves the user's likely
+history target. Ask at most one short clarifying question only when the
+ambiguity would change local Git/task evidence versus prior conversation
+history, target identity, or temporal boundary. Use zero tools for that genuine
+material ambiguity.
 
 `JSONL activation mode: explicit-only` requires `convo`/`use the convo tool`.
 
@@ -65,7 +71,15 @@ If neither command is available, report the installation failure.
 
 After `ask --execute`, obey `method_selection_packet` (`required_surfaces`, `read_order`,
 `secondary_policy`, `stop_rule`, `continue_only_if`, `cap_language_required`, `single_flight_policy`). Do not rerun `ask` or
-direct `semantic-debug`. Read one matching file under `references/`:
+direct `semantic-debug`. Also obey `investigation_finalization_state` when it
+appears in compact text/Markdown/JSON: active states
+(`actionable_primary_reads`, `actionable_canonical_continuation`) mean
+not answer-ready, do not synthesize, and continue only with the emitted
+canonical bounded action such as `jsonl-history-search execute-continuation ...`
+or required primary reads. `answer_ready=true` means stop broad searching and
+answer from opened primary proof. Terminal states mean return the scoped
+terminal blocker/no-evidence boundary; do not start fresh broad history search
+unless the user asks a new broader question. Read one matching file under `references/`:
 
 - remembered wording or preference: `references/remembered-instruction.md`;
 - remembered topic: `references/remembered-topic.md`;
