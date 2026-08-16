@@ -12209,7 +12209,27 @@ def _ask_answer_from_execute(
             )
         answer_opened = list(process_gate.get("opened") or answer_opened)
 
-    if route_family == "action_proof":
+    named_task_action_proof = (
+        action.get("named_task_action_proof_handoff")
+        if isinstance(action.get("named_task_action_proof_handoff"), dict)
+        else {}
+    )
+    named_task_current_proof_ready = (
+        named_task_action_proof.get("status")
+        in {
+            "current_named_task_proof_refs_available",
+            "current_named_task_stopped_episode_proof_refs_available",
+        }
+    )
+    # Named-task review/current-proof, stop-chronology, and post-merge-smoke
+    # flows have their own final gates below. The generic raw command/output
+    # gate is intentionally stricter and must not preempt those contracts.
+    if (
+        route_family == "action_proof"
+        and not named_task_current_proof_ready
+        and not action_chronology_wanted
+        and not post_merge_smoke_wanted
+    ):
         action_proof_gate = _action_proof_final_support_gate(
             action=action,
             opened=answer_opened,
