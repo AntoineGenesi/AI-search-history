@@ -16674,6 +16674,10 @@ def _action_proof_rejected_episode_next_step(*, action: dict, episode_selection:
         if isinstance(action.get("target_proof_handoff"), dict)
         else {}
     )
+    episode_required_proof = str(
+        episode_selection.get("next_required_proof")
+        or _work_episode_rejected_next_required_proof({})
+    )
     return {
         "schema_version": 1,
         "status": "bounded_missing_primary_action_proof",
@@ -16683,6 +16687,7 @@ def _action_proof_rejected_episode_next_step(*, action: dict, episode_selection:
         "required_episode_hints": dict(episode_selection.get("required_episode_hints") or {}),
         "required_target_anchor": bounded.get("required_target_anchor"),
         "required_next_proof": (
+            f"{episode_required_proof} "
             "Supply an explicit target anchor for the requested episode, then open only that target's original "
             "command/tool call and its output. Current-run, evaluator, reviewer, task, and report material "
             "remains diagnostic only."
