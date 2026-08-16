@@ -619,11 +619,16 @@ def build_semantic_debug_payload(
             subagent_provenance_workflow=subagent_provenance_workflow,
             historical_orchestration_plan=historical_orchestration_plan,
             historical_orchestration_role_evidence_bundle=historical_orchestration_role_evidence_bundle,
+            query=agent_find["query"]["original"],
         )
-        if subagent_provenance_workflow.get("answer_ready"):
-            subagent_required_role_child_targets = list(
-                subagent_provenance_workflow.get("_required_role_child_targets") or []
-            )
+        subagent_required_role_child_targets = dedupe(
+            list(subagent_provenance_workflow.get("_required_role_child_targets") or [])
+            + [
+                str(read.get("target") or "")
+                for read in subagent_provenance_workflow.get("continuation_read_plan") or []
+                if isinstance(read, dict) and read.get("target")
+            ]
+        )
         subagent_provenance_workflow.pop("_required_role_child_targets", None)
         if subagent_read_budget.get("demoted_read_count"):
             subagent_provenance_workflow["read_budget"] = subagent_read_budget
@@ -3717,6 +3722,7 @@ def apply_subagent_provenance_read_budget(
     subagent_provenance_workflow: dict[str, Any],
     historical_orchestration_plan: dict[str, Any],
     historical_orchestration_role_evidence_bundle: dict[str, Any],
+    query: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     workflow = subagent_provenance_workflow or {}
     if not workflow.get("applies"):
@@ -3777,6 +3783,22 @@ def apply_subagent_provenance_read_budget(
                 retained += 1
             selected_rows.append((selected_order.get(read_identity, len(selected_order)), read))
             continue
+        if subagent_provenance_current_loop_echo(read, query=query):
+            demoted += 1
+            demoted_read = dict(read)
+            demoted_read["read_more_actionable"] = False
+            demoted_read["followthrough_actionable"] = False
+            demoted_read["diagnostic_only"] = True
+            demoted_read["final_support_allowed"] = False
+            demoted_read["provenance_read_budget"] = {
+                "selection": "demoted_current_loop_echo_before_role_source_reads",
+                "reason": (
+                    "A non-target current/evaluation pressure or complete-answer echo is diagnostic only; "
+                    "open task-correlated raw worker/reviewer refs before any artifact or echo support."
+                ),
+            }
+            rows.append(demoted_read)
+            continue
         if (
             read_identity in budget_candidate_identities
             and read_is_required_surface_actionable(read)
@@ -3813,6 +3835,54 @@ def apply_subagent_provenance_read_budget(
             "non_frontier_subagents_are_not_default_actionable": True,
         },
     }
+
+
+def subagent_provenance_current_loop_echo(read: dict[str, Any], *, query: str) -> bool:
+    if historical_orchestration_current_task_same_loop_candidate(read, candidate={}, text=""):
+        return True
+    target_handles = historical_provenance_handles(query)
+    target_handle = next(
+        (handle.casefold() for handle in target_handles if TASKISH_HANDLE_RE.fullmatch(handle)),
+        "",
+    )
+    if not target_handle:
+        return False
+    marker_text = " ".join(
+        str(part or "")
+        for part in (
+            read.get("target"),
+            (read.get("source_ref") or {}).get("path")
+            if isinstance(read.get("source_ref"), dict)
+            else "",
+            read.get("reason"),
+            read.get("snippet"),
+            read.get("summary"),
+        )
+    ).casefold()
+    marker_text = re.sub(r"\.jsonl(?=[:\s]|$)", "", marker_text)
+    handles = {
+        match.group(0).casefold()
+        for match in TASKISH_HANDLE_RE.finditer(marker_text)
+    }
+    return bool(
+        handles - {target_handle}
+        and any(
+            marker in marker_text
+            for marker in (
+                "pressure",
+                "evaluation",
+                "current",
+                "same-loop",
+                "same loop",
+                "post-merge",
+                "postmerge",
+                "adjudication",
+                "answer key",
+                "complete answer",
+                "final answer",
+            )
+        )
+    )
 
 
 def subagent_budget_independently_required_proof(read: dict[str, Any]) -> bool:
