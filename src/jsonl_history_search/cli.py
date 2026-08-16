@@ -642,8 +642,8 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     )
     add_common_args(follow_next_reads)
     follow_next_reads.set_defaults(format="json")
-    follow_next_reads.add_argument("--from-report", required=True, help="Saved agent_find or semantic_debug JSON report.")
-    follow_next_reads.add_argument("--kind", choices=("recovery",), default="recovery")
+    follow_next_reads.add_argument("--from-report", required=True, help="Saved agent_find, semantic_debug, or semantic_wrapup JSON report.")
+    follow_next_reads.add_argument("--kind", choices=("recovery", "required_primary_proof"), default="recovery")
     follow_next_reads.add_argument("--limit", type=int, default=3)
     follow_next_reads.add_argument(
         "--reviewed-usability-decisions",

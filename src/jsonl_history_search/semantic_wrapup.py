@@ -903,7 +903,7 @@ def _semantic_wrapup_investigation_finalization_state(
             ),
             "command": (
                 f"jsonl-history-search follow-next-reads --from-report {shlex.quote(report_output)} "
-                '--kind required_primary_proof --limit 6 --cwd "$PWD" --format text'
+                '--kind required_primary_proof --limit 6 --cwd "$PWD" --format json'
                 if state == "actionable_canonical_continuation"
                 else None
             ),
