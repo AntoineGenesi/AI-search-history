@@ -14354,18 +14354,35 @@ def build_action_proof_plan(
     )
     if not primary_refs:
         stop_condition = (
-            "If required proof reads still do not expose action proof, state the missing proof buckets before "
-            "rerunning broader retrieval; do not fill the gap with adjacent artifacts or assistant prose."
+            "State bounded not-proven action proof. Do not broaden retrieval or fill the gap with adjacent "
+            "artifacts, assistant prose, coordinator/reviewer summaries, tasks, or reports."
         )
     return {
         "schema_version": 1,
         "applies": True,
         "status": "primary_proof_refs_available" if primary_refs else "primary_proof_refs_missing",
         "primary_question_family": primary_family,
-        "do_first": "open_primary_proof_refs_before_broad_search" if primary_refs else "open_required_proof_reads_then_check_gaps",
+        "do_first": "open_primary_proof_refs_before_broad_search" if primary_refs else "resolve_target_or_return_bounded_not_proven_action_proof",
         "primary_proof_refs": primary_refs[:4],
         "required_proof_reads": required_reads[:4],
         "optional_diagnostics": optional_diagnostics[:4],
+        "primary_proof_continuation": (
+            {
+                "state": "open_original_command_and_output_before_answer",
+                "terminal": False,
+                "canonical_primary_read_count": len(required_reads[:4]),
+                "secondary_action_support_allowed": False,
+            }
+            if primary_refs
+            else {
+                "state": "target_or_original_action_output_unresolved",
+                "terminal": False,
+                "canonical_primary_read_count": 0,
+                "secondary_action_support_allowed": False,
+                "required_target_anchor": "explicit reviewed source handle, task ID, branch/commit, session, or timestamp",
+                "broad_search_rerun_allowed": False,
+            }
+        ),
         "stop_condition": stop_condition,
         "retrieval_mode_guidance": retrieval,
         "answer_boundary": {

@@ -6853,19 +6853,21 @@ def _answer_action_contract_from_executed_output(
                 "diagnostics_default_final_support": False,
             }
         elif target_proof_handoff.get("status") == "target_primary_proof_refs_missing":
-            answer_status = "not-ready/action-proof-target-identity-missing"
-            promotion_status = "semantic_debug_action_proof_target_identity_fail_closed"
+            answer_status = "not-proven/bounded-missing-primary-action-proof"
+            promotion_status = "semantic_debug_action_proof_bounded_no_primary_proof"
             promotion_reason = (
-                "The action-proof plan has no primary proof refs because the target episode is not established. "
-                "Do not promote generic current, evaluator, reviewer, benchmark, or diagnostic refs."
+                "The action-proof plan has no independently identified original command/output proof. "
+                "This is bounded not-proven, not an invitation to broaden into current, evaluator, coordinator, "
+                "reviewer, task, report, benchmark, or diagnostic material."
             )
             source_inspection_boundary = {
-                "decision": "recover_action_proof_target_identity",
+                "decision": "bounded_not_proven_missing_primary_action_proof",
                 "answer_allowed": False,
                 "inspect_required_primary_proof_before_answer": False,
                 "required_primary_proof_source": "explicit_target_historical_raw_action_source",
                 "secondary_context_default_final_support": False,
                 "diagnostics_default_final_support": False,
+                "broad_search_rerun_allowed": False,
             }
         elif target_proof_handoff.get("status") == "target_primary_proof_refs_available":
             answer_status = "answer-ready-after-source-inspection"
@@ -7064,6 +7066,24 @@ def _answer_action_contract_from_executed_output(
                     diagnostics=target_proof_handoff.get("diagnostics_after") or [],
                     stop=contract.get("stop"),
                     suppress_broad_fallback_labels=bool(provenance_handoff.get("active")),
+                )
+                contract["only_continue_if"] = contract["single_flight_contract"]["continue_only_if"]
+        if route_family == "action_proof":
+            action_plan = compact.get("action_proof_plan") or {}
+            original_pair_reads = [
+                item
+                for item in action_plan.get("required_proof_reads") or []
+                if isinstance(item, dict) and (item.get("target") or item.get("source_ref"))
+            ]
+            if action_plan.get("status") == "primary_proof_refs_available" and original_pair_reads:
+                contract["read"] = original_pair_reads
+                contract["diagnostics_after"] = []
+                contract["single_flight_contract"] = _semantic_debug_target_single_flight_contract(
+                    selected_primary=original_pair_reads,
+                    secondary_context=[],
+                    diagnostics=[],
+                    stop=contract.get("stop"),
+                    suppress_broad_fallback_labels=True,
                 )
                 contract["only_continue_if"] = contract["single_flight_contract"]["continue_only_if"]
         if merge_artifact_handoff:
@@ -7887,6 +7907,20 @@ def _reviewed_source_unresolved_target_handoff(
     }
 
 
+def _action_proof_query_has_target_anchor(query: str) -> bool:
+    normalized = _simple_normalize(query)
+    if _ask_execute_named_task_ids(query):
+        return True
+    if re.search(r"\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", normalized):
+        return True
+    if re.search(
+        r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b",
+        normalized,
+    ):
+        return True
+    return bool(re.search(r"\b(?:commit|branch|session)\s+[`'\"]?[a-z0-9][\w./-]*", normalized))
+
+
 def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, query: str = "") -> dict:
     if route_family not in _ASK_EXECUTE_TARGET_PROOF_ROUTE_FAMILIES:
         return {}
@@ -7900,15 +7934,16 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
     if (
         route_family == "action_proof"
         and action_proof_plan.get("applies") is True
-        and action_proof_plan.get("status") == "primary_proof_refs_missing"
+        and action_proof_plan.get("status") in {"primary_proof_refs_missing", "bounded_no_primary_proof"}
         and unsafe_target_identity_demoted
+        and not _action_proof_query_has_target_anchor(query)
     ):
         return {
             "schema_version": 1,
             "status": "target_primary_proof_refs_missing",
-            "mismatch_reason": "action_proof_target_identity_missing",
+            "mismatch_reason": "action_proof_target_identity_or_original_output_missing",
             "route_family": route_family,
-            "answer_readiness_decision": "recover_action_proof_target_identity",
+            "answer_readiness_decision": "bounded_not_proven_missing_primary_action_proof",
             "required_primary_proof": [],
             "source_boundaries": {
                 "required_primary_proof": (
@@ -7918,20 +7953,19 @@ def _semantic_debug_target_proof_handoff(*, compact: dict, route_family: str, qu
                     "unmapped current, evaluator, reviewer, benchmark, and diagnostic refs are not primary proof"
                 ),
             },
-            "read": [
-                {
-                    "kind": "targeted_fail_closed_boundary",
-                    "reason": (
-                        "Action-proof target identity is missing; provide or recover an explicit reviewed "
-                        "source handle, task ID, branch or commit, session, or timestamp before selecting proof."
-                    ),
-                    "required_source_roles": ["target_historical_raw_action_source"],
-                }
-            ],
+            "read": [],
+            "bounded_no_proof_state": {
+                "status": "not_proven_in_selected_scope",
+                "terminal": True,
+                "original_command_or_output_opened": False,
+                "secondary_action_support_allowed": False,
+                "broad_search_rerun_allowed": False,
+                "required_target_anchor": "explicit reviewed source handle, task ID, branch/commit, session, or timestamp",
+            },
             "only_continue_if": [
                 (
-                    "establish the target episode from an explicit reviewed source handle, task ID, branch or "
-                    "commit, session, or timestamp, then open its raw action/tool evidence"
+                    "a new explicit target anchor is supplied (reviewed source handle, task ID, branch/commit, "
+                    "session, or timestamp); then open only that target's original command/tool output evidence"
                 )
             ],
         }
@@ -10914,6 +10948,7 @@ _ASK_ANSWER_SUPPORTED_ROUTE_FAMILIES = frozenset(
 )
 _ASK_ANSWER_EXPLICIT_FAIL_STATUSES = frozenset(
     {
+        "not-proven/bounded-missing-primary-action-proof",
         "not-ready/needs-more-proof",
         "not-ready/missing-current-named-task-proof",
         "not-ready/missing-completed-task-merge-artifact-proof",
@@ -12154,6 +12189,22 @@ def _ask_answer_from_execute(
                 process_gate,
             )
         answer_opened = list(process_gate.get("opened") or answer_opened)
+
+    if route_family == "action_proof":
+        action_proof_gate = _action_proof_final_support_gate(
+            action=action,
+            opened=answer_opened,
+            query=str(report.get("query") or ""),
+        )
+        answer["source_contract"]["action_proof_final_support_gate"] = action_proof_gate
+        if action_proof_gate.get("status") != "answer_allowed":
+            answer["proof_summary"] = list(action_proof_gate.get("summary_lines") or [])
+            return _ask_answer_fail_closed(
+                answer,
+                "original command/tool call and output proof is missing; secondary summaries cannot prove the action",
+                action_proof_gate,
+            )
+        answer_opened = list(action_proof_gate.get("opened") or answer_opened)
 
     if _named_task_repair_causality_answer_wanted(
         query=str(report.get("query") or ""),
@@ -16049,6 +16100,89 @@ def _process_actual_use_answer_proof_gate(*, action: dict, opened: list[dict], q
             "primary raw timing or reviewer-enforcement evidence for consulted-before-planning "
             "and behavior/scope/claim-boundary buckets"
         ),
+    }
+
+
+def _action_proof_final_support_gate(*, action: dict, opened: list[dict], query: str = "") -> dict:
+    """Require opened original command and output evidence for action claims."""
+    plan = action.get("action_proof_plan") if isinstance(action.get("action_proof_plan"), dict) else {}
+    continuation = plan.get("primary_proof_continuation") if isinstance(plan.get("primary_proof_continuation"), dict) else {}
+    required_targets = {
+        str(item.get("target") or "")
+        for item in plan.get("required_proof_reads") or []
+        if isinstance(item, dict) and str(item.get("target") or "").strip()
+    }
+    allowed: list[dict] = []
+    rejected: list[dict] = []
+    covered_roles: set[str] = set()
+    for item in opened:
+        if item.get("status") != "opened" or not item.get("summary"):
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        target = str(ref.get("target") or item.get("target") or "")
+        source_ref = ref.get("source_ref") if isinstance(ref.get("source_ref"), dict) else {}
+        source_path = str(source_ref.get("path") or "")
+        selection = ref.get("historical_provenance_selection") if isinstance(ref.get("historical_provenance_selection"), dict) else {}
+        proof_role = str(ref.get("proof_role") or "")
+        metadata = item.get("record_metadata") if isinstance(item.get("record_metadata"), dict) else {}
+        payload_type = str(metadata.get("payload_type") or "").casefold()
+        source_lower = f"{target} {source_path}".casefold()
+        reasons = _target_episode_ref_reject_reasons(item, required_ids=_explicit_query_episode_ids(query))
+        if required_targets and target not in required_targets:
+            reasons.append("not_in_action_proof_required_primary_reads")
+        if ref.get("diagnostic_only") is True or selection.get("diagnostic_only") is True:
+            reasons.append("diagnostic_only_source")
+        if ref.get("final_support_allowed") is False or selection.get("final_support_allowed") is False:
+            reasons.append("final_support_not_allowed")
+        if any(marker in source_lower for marker in ("/tasks/", "/reviews/", "/reports/")):
+            reasons.append("secondary_task_review_or_report_source")
+        if not source_path.endswith((".jsonl", ".json")):
+            reasons.append("not_raw_conversation_or_tool_source")
+        is_call = proof_role == "command_or_tool_call" or payload_type in {"function_call", "tool_call"}
+        is_output = proof_role == "command_or_tool_output" or payload_type in {
+            "function_call_output", "tool_output", "custom_tool_call_output"
+        }
+        local_pair = ref.get("action_proof_local_pair") if isinstance(ref.get("action_proof_local_pair"), dict) else {}
+        if local_pair:
+            is_call = True
+            is_output = True
+        if not is_call and not is_output:
+            reasons.append("missing_original_command_or_output_role")
+        if reasons:
+            row = dict(item)
+            row["action_proof_reject_reasons"] = _unique_preserving_order(reasons)
+            rejected.append(row)
+            continue
+        row = dict(item)
+        row["action_proof_opened_roles"] = [
+            role for role, present in (("command_or_tool_call", is_call), ("command_or_tool_output", is_output)) if present
+        ]
+        allowed.append(row)
+        if is_call:
+            covered_roles.add("command_or_tool_call")
+        if is_output:
+            covered_roles.add("command_or_tool_output")
+    required_roles = ["command_or_tool_call", "command_or_tool_output"]
+    missing_roles = [role for role in required_roles if role not in covered_roles]
+    return {
+        "schema_version": 1,
+        "status": "answer_allowed" if not missing_roles else "missing_original_action_proof",
+        "continuation_state": continuation.get("state"),
+        "required_roles": required_roles,
+        "covered_roles": required_roles if not missing_roles else sorted(covered_roles),
+        "missing_roles": missing_roles,
+        "opened": allowed[:_ASK_ANSWER_MAX_REFS],
+        "rejected": rejected[:_ASK_ANSWER_MAX_REFS],
+        "rejected_ref_count": len(rejected),
+        "secondary_action_support_allowed": False,
+        "required_next_proof": (
+            "Open the selected target's original command/tool call and its output. Coordinator, reviewer, "
+            "task, report, and assistant-summary evidence remains diagnostic only."
+        ),
+        "summary_lines": [
+            f"{item.get('target')}: rejected_action_proof={','.join(item.get('action_proof_reject_reasons') or [])}"
+            for item in rejected[:_ASK_ANSWER_MAX_REFS]
+        ],
     }
 
 
