@@ -12263,6 +12263,40 @@ def _ask_answer_from_execute(
         work_episode=work_episode,
     )
     if episode_selection.get("status") == "rejected_unrelated_episode":
+        if route_family == "action_proof":
+            # This returns before the generic final-support gate below.  Keep
+            # rejected current-loop candidates equally inert here so an
+            # unmatched episode cannot become a read-more/final-support hint.
+            rejected_opened = [
+                _demote_action_proof_rejected_opened_ref(
+                    item,
+                    reasons=["not_in_action_proof_required_primary_reads"],
+                )
+                for item in answer_opened
+            ]
+            firewall = _action_proof_rejected_episode_firewall(
+                action=action,
+                episode_selection=episode_selection,
+                rejected_opened=rejected_opened,
+            )
+            # The general work-episode contract may contain source roots or
+            # secondary claim refs.  They are diagnostic-only on this early
+            # action-proof exit, so keep only the path-free firewall contract.
+            for contract_key in ("work_episode_resolver", "saved_report", "parent_thread_side_boundary"):
+                answer["source_contract"].pop(contract_key, None)
+            answer["source_contract"]["action_proof_episode_rejection_firewall"] = firewall
+            answer["selected_route"] = {
+                "route_family": "action_proof",
+                "status": "bounded_missing_primary_action_proof",
+            }
+            answer["proof_summary"] = [
+                "Opened action-proof candidates did not match the requested episode; no original command/tool call and output pair was opened."
+            ]
+            return _ask_answer_fail_closed(
+                answer,
+                "opened action-proof refs did not match the work episode implied by the query",
+                _action_proof_rejected_episode_next_step(action=action, episode_selection=episode_selection),
+            )
         answer["proof_summary"] = list(episode_selection.get("rejected_summaries") or [])
         return _ask_answer_fail_closed(
             answer,
@@ -16607,6 +16641,51 @@ def _action_proof_fail_closed_next_step(*, action: dict, gate: dict) -> dict:
             "Supply an explicit target anchor, then open only that target's original command/tool call and output."
             if is_bounded_missing_primary
             else gate.get("required_next_proof")
+        ),
+    }
+
+
+def _action_proof_rejected_episode_firewall(*, action: dict, episode_selection: dict, rejected_opened: list[dict]) -> dict:
+    """Describe an unmatched action-proof episode without publishing rejected refs."""
+    bounded = (
+        action.get("target_proof_handoff", {}).get("bounded_no_proof_state", {})
+        if isinstance(action.get("target_proof_handoff"), dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "status": "rejected_unrelated_episode_missing_primary_action_proof",
+        "rejected_ref_count": len(rejected_opened),
+        "rejected_refs_actionable": False,
+        "diagnostic_only": True,
+        "read_more_actionable": False,
+        "followthrough_actionable": False,
+        "final_support_allowed": False,
+        "secondary_action_support_allowed": False,
+        "required_episode_hints": dict(episode_selection.get("required_episode_hints") or {}),
+        "required_target_anchor": bounded.get("required_target_anchor"),
+    }
+
+
+def _action_proof_rejected_episode_next_step(*, action: dict, episode_selection: dict) -> dict:
+    """Give only abstract, target-anchored continuation guidance after episode rejection."""
+    bounded = (
+        action.get("target_proof_handoff", {}).get("bounded_no_proof_state", {})
+        if isinstance(action.get("target_proof_handoff"), dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "status": "bounded_missing_primary_action_proof",
+        "rejected_refs_actionable": False,
+        "secondary_action_support_allowed": False,
+        "broad_search_rerun_allowed": False,
+        "required_episode_hints": dict(episode_selection.get("required_episode_hints") or {}),
+        "required_target_anchor": bounded.get("required_target_anchor"),
+        "required_next_proof": (
+            "Supply an explicit target anchor for the requested episode, then open only that target's original "
+            "command/tool call and its output. Current-run, evaluator, reviewer, task, and report material "
+            "remains diagnostic only."
         ),
     }
 
