@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import re
 import shlex
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,29 @@ TERMINAL_CLAIM_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 SUPPORTED_FOLLOW_NEXT_READ_KINDS = {"recovery", "required_primary_proof"}
+DEEP_AUDIT_CONTINUATION_ALLOWED_VALUE_FLAGS = {
+    "--role",
+    "--audit-depth",
+    "--root",
+    "--codex-home",
+    "--claude-home",
+    "--cwd",
+    "--since",
+    "--until",
+    "--path",
+    "--max-files",
+    "--max-bytes",
+    "--max-matches",
+    "--max-elapsed",
+    "--hard-cap-files",
+    "--hard-cap-bytes",
+    "--deep-audit-target-contract",
+    "--format",
+}
+DEEP_AUDIT_CONTINUATION_ALLOWED_SWITCHES = {
+    "--allow-arbitrary-root",
+    "--deep-audit-continuation-step",
+}
 RECOVERY_USABILITY_STATUSES = {
     "private_reviewed_usable",
     "reviewed_not_useful",
@@ -352,13 +377,13 @@ def build_execute_continuation_payload(
     ]
     selected_reads = pending_reads[: max(0, int(max_steps))]
     expanded_reads = [
-        expand_follow_next_read(
+        execute_continuation_step(
             read=read,
             rank=index + 1,
             plan=plan,
             default_tz=default_tz,
             cwd=cwd,
-            usability_decisions=None,
+            max_output_chars=max(0, int(max_output_chars)),
         )
         for index, read in enumerate(selected_reads)
     ]
@@ -1704,6 +1729,25 @@ def continuation_step_to_follow_read(
     source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else None
     argv = item.get("argv") if isinstance(item.get("argv"), list) else []
     command = str(item.get("command") or "")
+    semantic_debug_validation = deep_audit_continuation_argv_validation(argv)
+    if semantic_debug_validation["status"] != "not_deep_audit_semantic_debug":
+        read_role = str(item.get("read_role") or item.get("role") or item.get("target_source_role") or group_name)
+        return {
+            **item,
+            "target": None,
+            "source_ref": None,
+            "read_role": read_role,
+            "_continuation_step_kind": "deep_audit_semantic_debug",
+            "_deep_audit_argv_validation": semantic_debug_validation,
+            "_source_followthrough_group": group_name,
+            "_follow_surface": f"canonical_continuation_packet.{group_name}",
+            "candidate_id": item.get("candidate_id") or item.get("step_id") or item.get("command_id") or f"{group_name}-{index}",
+            "named_gap": item.get("named_gap")
+            or item.get("remaining_named_gap")
+            or packet.get("named_gap")
+            or packet.get("remaining_named_gap")
+            or packet.get("gap_name"),
+        }
     if not target and not source_ref and argv:
         target = continuation_target_from_argv(argv)
     if not target and not source_ref and command:
@@ -1724,6 +1768,73 @@ def continuation_step_to_follow_read(
         or packet.get("named_gap")
         or packet.get("remaining_named_gap")
         or packet.get("gap_name"),
+    }
+
+
+def deep_audit_continuation_argv_validation(argv: list[Any]) -> dict[str, Any]:
+    """Accept only the serialized deep-audit semantic-debug step contract.
+
+    A canonical continuation packet is untrusted input at the CLI boundary.  The
+    packet binding protects resumptions, while this parser limits first use to
+    the one semantic-debug shape produced by the deep-audit packet builder.
+    """
+    parts = [str(part) for part in argv]
+    if len(parts) < 5 or parts[:2] != ["jsonl-history-search", "semantic-debug"]:
+        return {"status": "not_deep_audit_semantic_debug"}
+    query = parts[2]
+    if not query or query.startswith("-"):
+        return {"status": "rejected", "reason": "semantic-debug continuation requires one non-option query"}
+
+    index = 3
+    seen_deep_step = 0
+    seen_audit_depth = 0
+    seen_target_contract = 0
+    seen_roots = 0
+    seen_format = 0
+    format_value = None
+    while index < len(parts):
+        token = parts[index]
+        if token in DEEP_AUDIT_CONTINUATION_ALLOWED_SWITCHES:
+            if token == "--deep-audit-continuation-step":
+                seen_deep_step += 1
+            index += 1
+            continue
+        if token not in DEEP_AUDIT_CONTINUATION_ALLOWED_VALUE_FLAGS:
+            return {"status": "rejected", "reason": f"unsupported deep-audit continuation option: {token}"}
+        if index + 1 >= len(parts) or parts[index + 1].startswith("--"):
+            return {"status": "rejected", "reason": f"missing value for deep-audit continuation option: {token}"}
+        value = parts[index + 1]
+        if token == "--format":
+            seen_format += 1
+            format_value = value
+        if token == "--audit-depth":
+            seen_audit_depth += 1
+            if value not in {"in-depth", "exhaustive"}:
+                return {"status": "rejected", "reason": "deep-audit continuation audit depth must be in-depth or exhaustive"}
+        if token == "--root":
+            seen_roots += 1
+        if token == "--deep-audit-target-contract":
+            seen_target_contract += 1
+            try:
+                if not isinstance(json.loads(value), dict):
+                    raise ValueError("target contract is not an object")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {"status": "rejected", "reason": "deep-audit target contract must be a JSON object"}
+        index += 2
+    if seen_deep_step != 1:
+        return {"status": "rejected", "reason": "deep-audit continuation marker must appear exactly once"}
+    if seen_audit_depth != 1:
+        return {"status": "rejected", "reason": "deep-audit continuation requires exactly one audit-depth"}
+    if seen_target_contract != 1:
+        return {"status": "rejected", "reason": "deep-audit continuation requires exactly one preserved target contract"}
+    if seen_roots < 1:
+        return {"status": "rejected", "reason": "deep-audit continuation requires at least one serialized root"}
+    if seen_format != 1 or format_value != "json":
+        return {"status": "rejected", "reason": "deep-audit continuation output must be JSON"}
+    return {
+        "status": "allowed",
+        "command_family": "semantic-debug",
+        "execution_contract": "packet_owned_deep_audit_continuation_step",
     }
 
 
@@ -1752,6 +1863,8 @@ def continuation_step_identity(read: dict[str, Any]) -> str:
         "step_id": read.get("step_id"),
         "target": read.get("target"),
         "source_ref": read.get("source_ref"),
+        "argv": read.get("argv") if read.get("_continuation_step_kind") else None,
+        "continuation_step_kind": read.get("_continuation_step_kind"),
         "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
         "surface": read.get("_follow_surface") or read.get("surface"),
     }
@@ -2017,6 +2130,136 @@ def load_prior_continuation_receipt_summary(path: Path | None) -> dict[str, Any]
         "packet_binding": packet_binding,
         "executed_step_identities": list(dict.fromkeys(executed_step_identities)),
         "executed_step_states": executed_step_states,
+    }
+
+
+def execute_continuation_step(
+    *,
+    read: dict[str, Any],
+    rank: int,
+    plan: SourcePlan,
+    default_tz,
+    cwd: Path,
+    max_output_chars: int,
+) -> dict[str, Any]:
+    if read.get("_continuation_step_kind") == "deep_audit_semantic_debug":
+        return execute_deep_audit_semantic_debug_step(
+            read=read,
+            rank=rank,
+            max_output_chars=max_output_chars,
+        )
+    return expand_follow_next_read(
+        read=read,
+        rank=rank,
+        plan=plan,
+        default_tz=default_tz,
+        cwd=cwd,
+        usability_decisions=None,
+    )
+
+
+def execute_deep_audit_semantic_debug_step(
+    *,
+    read: dict[str, Any],
+    rank: int,
+    max_output_chars: int,
+) -> dict[str, Any]:
+    argv = [str(part) for part in list_or_empty(read.get("argv"))]
+    validation = deep_audit_continuation_argv_validation(argv)
+    base = {
+        "rank": rank,
+        "target": None,
+        "source_ref": None,
+        "surface": read.get("_follow_surface"),
+        "step_identity": read.get("step_identity") or continuation_step_identity(read),
+        "read_role": read.get("read_role") or read.get("role") or read.get("target_source_role"),
+        "named_gap": read.get("named_gap") or read.get("remaining_named_gap"),
+        "duplicate_surfaces": list_or_empty(read.get("_follow_duplicate_surfaces")),
+        "duplicate_candidate_ids": list_or_empty(read.get("_follow_duplicate_candidate_ids")),
+        "discarded_duplicate_reads": list_or_empty(read.get("_follow_discarded_duplicates")),
+        "candidate_id": read.get("candidate_id"),
+        "continuation_step_kind": "deep_audit_semantic_debug",
+        "serialized_argv_validation": validation,
+        "metadata_only": True,
+    }
+    if validation.get("status") != "allowed":
+        return {
+            **base,
+            "status": "rejected_continuation_argv",
+            "failure_reason": validation.get("reason") or "serialized command is not an allowed deep-audit continuation",
+        }
+
+    # Importing CLI at module import time would create a cycle.  The local
+    # import executes the exact saved argv in-process only after the package is
+    # fully initialized; no shell, ask, find, bulk matcher, or fresh command is
+    # involved.
+    from .cli import main
+
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            exit_code = main(argv[1:])
+    except Exception as exc:  # pragma: no cover - defensive boundary for saved packets
+        return {
+            **base,
+            "status": "semantic_debug_execution_error",
+            "failure_reason": f"{type(exc).__name__}: {exc}",
+        }
+    raw_output = stdout.getvalue()
+    try:
+        nested_payload = json.loads(raw_output)
+    except json.JSONDecodeError:
+        return {
+            **base,
+            "status": "semantic_debug_invalid_json_output",
+            "failure_reason": "serialized semantic-debug continuation did not return one JSON payload",
+            "nested_exit_code": exit_code,
+            "nested_output_char_count": len(raw_output),
+        }
+    nested = nested_payload.get("semantic_debug") if isinstance(nested_payload, dict) else None
+    if not isinstance(nested, dict):
+        return {
+            **base,
+            "status": "semantic_debug_invalid_payload",
+            "failure_reason": "serialized semantic-debug continuation did not return semantic_debug metadata",
+            "nested_exit_code": exit_code,
+            "nested_output_char_count": len(raw_output),
+        }
+
+    step_contract = nested.get("continuation_step_contract") if isinstance(nested.get("continuation_step_contract"), dict) else {}
+    workflow = nested.get("audit_continuation_workflow") if isinstance(nested.get("audit_continuation_workflow"), dict) else {}
+    followthrough = nested.get("in_depth_audit_followthrough") if isinstance(nested.get("in_depth_audit_followthrough"), dict) else {}
+    disposition = workflow.get("cap_hit_disposition") if isinstance(workflow.get("cap_hit_disposition"), dict) else followthrough.get("cap_hit_disposition") if isinstance(followthrough.get("cap_hit_disposition"), dict) else {}
+    nested_packet = disposition.get("canonical_continuation_packet") if isinstance(disposition.get("canonical_continuation_packet"), dict) else None
+    if exit_code != 0:
+        return {
+            **base,
+            "status": "semantic_debug_nonzero_exit",
+            "failure_reason": "serialized semantic-debug continuation returned nonzero",
+            "nested_exit_code": exit_code,
+            "nested_output_char_count": len(raw_output),
+        }
+    return {
+        **base,
+        "status": "expanded",
+        "nested_exit_code": exit_code,
+        "nested_output_char_count": len(raw_output),
+        "nested_output_within_receipt_limit": not max_output_chars or len(raw_output) <= max_output_chars,
+        "receipt_output_char_limit": max_output_chars,
+        "nested_status": nested.get("status"),
+        "nested_continuation_step_status": step_contract.get("status"),
+        "nested_answer_ready": step_contract.get("answer_ready"),
+        "nested_cap_hit_status": disposition.get("status"),
+        "nested_canonical_packet_id": nested_packet.get("packet_id") if nested_packet else None,
+        "claim_boundaries": {
+            "nested_evidence_projection": step_contract.get("evidence_projection"),
+            "nested_answer_ready": step_contract.get("answer_ready"),
+            "answer_generation_included": False,
+            "raw_nested_output_included": False,
+            "nested_output_exceeded_receipt_limit_but_was_not_retained": bool(
+                max_output_chars and len(raw_output) > max_output_chars
+            ),
+        },
     }
 
 
@@ -2438,6 +2681,10 @@ def follow_next_read_key(read: dict[str, Any]) -> str | None:
     source_ref = read.get("source_ref")
     if isinstance(source_ref, dict):
         return f"source_ref:{json.dumps(source_ref, sort_keys=True)}"
+    if read.get("_continuation_step_kind") == "deep_audit_semantic_debug":
+        argv = read.get("argv")
+        if isinstance(argv, list):
+            return f"deep_audit_semantic_debug:{json.dumps(argv, ensure_ascii=False)}"
     return None
 
 
