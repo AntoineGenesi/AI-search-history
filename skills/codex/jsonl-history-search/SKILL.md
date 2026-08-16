@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Trigger even without JSONL or `convo` for prior conversation history. Do not load this skill for ambiguous task ID/status alone, e.g. `Is TASK-123 done?`. Trigger for `what has happened since my last message in the parent thread?` or deferred/failed work. Resolve before asking the user to repeat information. `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`. Non-triggers: self-contained writing/editing or coding, bare `what happened?`, local repo/task/Git status.
+description: Trigger for bounded JSONL evidence scopes (“in the bounded scope … is there evidence”) without JSONL/`convo`: run `jsonl-history-search` before `rg`/`nl`/`wc`; also prior history, `what has happened since my last message in the parent thread?`, or deferred/failed work. `use the convo tool` maps to `jsonl-history-search`, not connector discovery or `convo --help`. Do not load this skill for ambiguous task ID/status alone, e.g. `Is TASK-123 done?`; bare `what happened?` or local repo/task/Git status.
 ---
 
 ## Activation Gate
