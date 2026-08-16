@@ -3084,10 +3084,12 @@ def _args_with_bounded_auto_execute_prompt_scope(args: argparse.Namespace) -> ar
     values = vars(args).copy()
     roots = list(values.get("root") or [])
     extracted_roots = _extract_bounded_auto_execute_roots_from_query(str(values.get("query") or ""))
+    extracted_safe_root = False
     changed = False
     if not roots and extracted_roots:
         values["root"] = extracted_roots
         roots = extracted_roots
+        extracted_safe_root = True
         changed = True
     if values.get("hard_cap_files") is None:
         hard_cap_files = _extract_bounded_auto_execute_hard_cap(str(values.get("query") or ""), "files")
@@ -3099,8 +3101,20 @@ def _args_with_bounded_auto_execute_prompt_scope(args: argparse.Namespace) -> ar
         if hard_cap_bytes is not None:
             values["hard_cap_bytes"] = hard_cap_bytes
             changed = True
+    # A natural bounded-evidence prompt commonly names the public fixture root
+    # but does not spell out scanner caps.  The extractor accepts only that
+    # narrow fixture prefix, so give this one receiver-facing path explicit,
+    # conservative bounds rather than rejecting the named root and forcing a
+    # manual rg/nl fallback.  Explicit roots still require explicit caps.
+    if extracted_safe_root and values.get("hard_cap_files") is None:
+        values["hard_cap_files"] = 50
+        changed = True
+    if extracted_safe_root and values.get("hard_cap_bytes") is None:
+        values["hard_cap_bytes"] = 2_000_000
+        changed = True
     if (
-        roots
+        extracted_safe_root
+        and roots
         and not values.get("allow_arbitrary_root")
         and values.get("hard_cap_files") is not None
         and values.get("hard_cap_bytes") is not None

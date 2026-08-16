@@ -588,8 +588,8 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "instead of becoming a generic semantic-debug question."
     ),
     first_command_template=(
-        '{cli} ask --execute {query} --cwd "$PWD" '
-        "--report-output .private/jsonl/ask-execute-no-evidence-report.json --format text"
+        '{cli} ask --answer {query} --cwd "$PWD" '
+        "--report-output .private/jsonl/ask-answer-no-evidence-report.json --format text"
     ),
     read_specialization="references/no-evidence.md",
     inspect_after=(
@@ -599,7 +599,7 @@ BOUNDED_NO_EVIDENCE_ROUTE = AskRoute(
         "sufficient_to_stop_for_searched_scope_only and read_more_guidance.required_before_scoped_no_evidence_answer",
     ),
     stop_guidance=(
-        "Read references/no-evidence.md, then run ask --execute and inspect the "
+        "Read references/no-evidence.md, then run ask --answer and inspect the "
         "scoped no-evidence contract: searched scope, answer_scope, cap status, "
         "missing/excluded scope, not_all_history_absence, saved report, and "
         "read_more_required_before_scoped_no_evidence_answer. Do not run "
