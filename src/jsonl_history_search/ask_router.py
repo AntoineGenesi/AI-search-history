@@ -2418,6 +2418,11 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "current route",
             "this route",
         ),
+    ) or bool(
+        re.search(
+            r"\b(?:current|this)\s+(?:[a-z0-9_-]+\s+)?(?:evaluation\s+)?run\b",
+            normalized,
+        )
     )
     current_run_scope_is_negated = bool(
         re.search(
