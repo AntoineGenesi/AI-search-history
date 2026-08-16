@@ -6246,6 +6246,9 @@ def _answer_action_contract_from_executed_output(
             cleanup.get("operational_records") or []
         )
         next_reads = list(compact.get("next_reads") or [])[:8]
+        terminal_scoped_no_proof = str(cleanup.get("debt_status") or "").startswith(
+            "scoped_no_proof_"
+        )
         target_binding = cleanup.get("target_binding") or {}
         if target_binding:
             missing_target = target_binding.get("status") == "blocked_named_target_missing"
@@ -6299,7 +6302,7 @@ def _answer_action_contract_from_executed_output(
                 "Original cleanup chronology is answer-leading evidence. Current Git/worktree state is a "
                 "separate later phase and cannot substitute for missing defer, preservation, or cleanup proof."
             ),
-            "read": operational_records or next_reads,
+            "read": [] if terminal_scoped_no_proof else operational_records or next_reads,
             "then_use": {
                 "cleanup_causality": {
                     "debt_status": cleanup.get("debt_status"),
@@ -6322,11 +6325,17 @@ def _answer_action_contract_from_executed_output(
             "source_role_order": worktree.get("source_role_order"),
             "source_roles_present": worktree.get("source_roles_present"),
             "stop": (
-                "Stop after the operational records are inspected when debt_status and their "
+                "Terminal scoped no-proof: do not inspect current lane metadata, sandbox Git state, "
+                "generated evaluator reports, or local lane commands as project cleanup causality."
+                if terminal_scoped_no_proof
+                else "Stop after the operational records are inspected when debt_status and their "
                 "source refs sufficiently explain why cleanup remained open or how it closed."
             ),
             "only_continue_if": (
-                "Continue only if the operational records conflict, debt_status is missing, "
+                "No continuation is supplied from this workspace; recover an independently identified "
+                "project checkout before retrying this project-causality question."
+                if terminal_scoped_no_proof
+                else "Continue only if the operational records conflict, debt_status is missing, "
                 "or a selected worktree still needs classification evidence."
             ),
             "saved_report": compact.get("report_written"),
@@ -10676,6 +10685,7 @@ def _compact_executed_output_for_ask(*, output_key: str, compact: dict) -> dict:
                 "physical_worktree_count": cleanup.get("physical_worktree_count"),
                 "target_selection_note": cleanup.get("target_selection_note"),
                 "target_binding": cleanup.get("target_binding"),
+                "source_isolation": cleanup.get("source_isolation"),
                 "chronology_gate": _compact_cleanup_chronology_gate(
                     cleanup.get("chronology_gate")
                 ),
