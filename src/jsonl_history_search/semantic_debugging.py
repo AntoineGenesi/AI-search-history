@@ -3560,26 +3560,36 @@ def build_cap_aware_subagent_provenance_workflow(
     )
 
     selected_child_targets = set(required_role_child_targets)
-    unresolved_child_frontier = next(
-        (
-            item
-            for item in child_refs
-            if isinstance(item, dict)
-            and item.get("target")
-            and str(item.get("target")) not in selected_child_targets
-        ),
-        None,
-    )
     continuation_source_refs = [
         item
         for item in child_refs
         if isinstance(item, dict) and str(item.get("target") or "") in selected_child_targets
     ]
-    if missing_child_role_refs and unresolved_child_frontier:
-        continuation_source_refs.append(unresolved_child_frontier)
-        selected_traversal_targets = dedupe(
-            selected_traversal_targets + [str(unresolved_child_frontier.get("target") or "")]
+    if missing_child_role_refs:
+        task_handles = historical_provenance_handles(query)
+        unresolved_child_frontier = next(
+            (
+                item
+                for item in child_refs
+                if isinstance(item, dict)
+                and item.get("target")
+                and str(item.get("target")) not in selected_child_targets
+                and (
+                    not task_handles
+                    or bool(
+                        (item.get("spawned_session_resolution") or {}).get(
+                            "task_correlated"
+                        )
+                    )
+                )
+            ),
+            None,
         )
+        if unresolved_child_frontier:
+            continuation_source_refs.append(unresolved_child_frontier)
+            selected_traversal_targets = dedupe(
+                selected_traversal_targets + [str(unresolved_child_frontier.get("target") or "")]
+            )
     continuation_reads = [
         {
             "kind": "spawned_child_transcript_source_ref",
@@ -3589,7 +3599,14 @@ def build_cap_aware_subagent_provenance_workflow(
         for item in continuation_source_refs
         if isinstance(item, dict) and item.get("target")
     ][:HISTORICAL_ORCHESTRATION_ROLE_EVIDENCE_BUNDLE_READ_CAP]
+    missing_recovery_roles = dedupe(missing_child_role_refs + missing_roles)
     recovery_refs = list(plan.get("missing_role_recovery_refs") or [])
+    if missing_recovery_roles:
+        recovery_refs = [
+            item
+            for item in recovery_refs
+            if isinstance(item, dict) and item.get("role") in missing_recovery_roles
+        ][:1]
     continuation_commands = [
         {
             "command_id": f"recover_missing_role_{index}",
@@ -3600,7 +3617,7 @@ def build_cap_aware_subagent_provenance_workflow(
         for index, item in enumerate(recovery_refs, 1)
         if isinstance(item, dict) and item.get("command")
     ]
-    if not answer_ready and (caps.get("hit") or missing_children or not child_refs):
+    if not continuation_commands and not answer_ready and (caps.get("hit") or missing_children or not child_refs):
         max_children = safe_count((resolution.get("limits") or {}).get("max_children")) or 8
         argv = semantic_debug_scope_continuation_argv(
             query=query,
