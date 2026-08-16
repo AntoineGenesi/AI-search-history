@@ -26,6 +26,7 @@ JSONL_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
+TASK_HANDLE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+\b")
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class _ResolvedChild:
     edge_source: str
     parent_path: Path | None = None
     source_owner_roles: tuple[str, ...] = ()
+    task_correlation_matches: tuple[str, ...] = ()
 
 
 def resolve_spawned_session_transcripts(
@@ -101,6 +103,9 @@ class _SpawnedSessionResolver:
         self.detected_events: list[dict[str, Any]] = []
         self.children: list[_ResolvedChild] = []
         self._known_files: list[Path] | None = None
+        self._task_handles = tuple(
+            dict.fromkeys(match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(query or ""))
+        )
 
     def resolve(self) -> dict[str, Any]:
         query_wants_spawn = bool(SPAWN_EVENT_RE.search(self.query or ""))
@@ -158,6 +163,9 @@ class _SpawnedSessionResolver:
                 "files_examined": self.files_examined,
                 "bytes_examined": self.bytes_examined,
                 "child_ref_count": len(child_reads),
+                "task_correlated_child_ref_count": sum(
+                    bool(child.task_correlation_matches) for child in self.children
+                ),
                 "edge_source_counts": _count_by(child.edge_source for child in self.children),
             },
             "caps": {
@@ -269,12 +277,16 @@ class _SpawnedSessionResolver:
 
     def _structured_edge_children(self, parent_paths: list[Path]) -> list[_ResolvedChild]:
         rows: list[_ResolvedChild] = []
+        candidate_cap = self._child_candidate_cap()
         for db_path in self._state_db_paths():
             rows.extend(self._structured_edge_children_from_db(db_path, parent_paths))
-            if len(rows) >= self.limits.max_children:
+            if len(rows) >= candidate_cap:
                 self.cap_hits.add("max_children")
-                return rows[: self.limits.max_children]
-        return rows
+                break
+        prioritized = self._prioritize_children(rows)
+        if len(prioritized) > self.limits.max_children:
+            self.cap_hits.add("max_children")
+        return prioritized[: self.limits.max_children]
 
     def _structured_edge_children_from_db(self, db_path: Path, parent_paths: list[Path]) -> list[_ResolvedChild]:
         try:
@@ -315,7 +327,8 @@ class _SpawnedSessionResolver:
         children: list[_ResolvedChild] = []
         frontier = [(parent_id, 0) for parent_id in sorted(parent_ids)]
         visited_threads: set[str] = set()
-        while frontier and len(children) < self.limits.max_children and self._within_caps():
+        candidate_cap = self._child_candidate_cap()
+        while frontier and len(children) < candidate_cap and self._within_caps():
             parent_id, depth = frontier.pop(0)
             if parent_id in visited_threads:
                 continue
@@ -353,11 +366,12 @@ class _SpawnedSessionResolver:
                         depth=depth + 1,
                         edge_source="thread_spawn_edges",
                         source_owner_roles=_transcript_source_owner_roles(child_path),
+                        task_correlation_matches=self._task_correlation_matches(child_path),
                     )
                 )
                 if should_expand_child:
                     frontier.append((child_id, depth + 1))
-                if len(children) >= self.limits.max_children:
+                if len(children) >= candidate_cap:
                     self.cap_hits.add("max_children")
                     break
         return children
@@ -441,6 +455,7 @@ class _SpawnedSessionResolver:
                             edge_source="parent_transcript_event",
                             parent_path=parent_path,
                             source_owner_roles=_transcript_source_owner_roles(child_path),
+                            task_correlation_matches=self._task_correlation_matches(child_path),
                         )
                     )
                     if len(rows) + len(self.children) >= self.limits.max_children:
@@ -460,6 +475,32 @@ class _SpawnedSessionResolver:
         if any((str(existing.path), int(existing.line or 1)) == key for existing in self.children):
             return
         self.children.append(child)
+
+    def _child_candidate_cap(self) -> int:
+        return max(self.limits.max_children, self.limits.max_children * 4)
+
+    def _prioritize_children(self, children: list[_ResolvedChild]) -> list[_ResolvedChild]:
+        return sorted(
+            children,
+            key=lambda child: len(child.task_correlation_matches),
+            reverse=True,
+        )
+
+    def _task_correlation_matches(self, path: Path) -> tuple[str, ...]:
+        if not self._task_handles:
+            return ()
+        matches = {handle for handle in self._task_handles if handle in path.name.casefold()}
+        bytes_read = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    bytes_read += len(line.encode("utf-8", errors="replace"))
+                    matches.update(task for task in self._task_handles if task in line.casefold())
+                    if bytes_read >= 262144:
+                        break
+        except OSError:
+            return tuple(sorted(matches))
+        return tuple(sorted(matches))
 
     def _first_record_line(self, path: Path) -> int | None:
         if not self._charge_file(path):
@@ -520,6 +561,8 @@ class _SpawnedSessionResolver:
                     "diagnostic": "child_transcript_inspected",
                     "edge_source": child.edge_source,
                     "depth": child.depth,
+                    "task_correlated": bool(child.task_correlation_matches),
+                    "task_correlation_match_count": len(child.task_correlation_matches),
                     "raw_private_text_included": False,
                     "raw_session_ids_included": False,
                 },
