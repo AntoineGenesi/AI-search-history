@@ -161,6 +161,7 @@ def build_artifact_currentness_payload(args: Any) -> dict:
         cwd=cwd,
         latest=latest,
         started=started,
+        workspace_resolution=workspace_resolution,
     )
     report["workspace_resolution"] = workspace_resolution
     return {"artifact_currentness": report}
@@ -179,13 +180,26 @@ def _resolve_cleanup_workspace(
         "resolved_cwd": str(requested_cwd),
         "source_role": "workspace_navigation",
         "causal_proof_allowed": False,
+        "independently_resolved_project_checkout": False,
     }
-    if not is_worktree_cleanup_currentness_query(query) or _has_local_cleanup_surface(requested_cwd):
+    if not is_worktree_cleanup_currentness_query(query):
         return requested_cwd, base
+
+    requested_isolation = _classify_evaluator_workspace(requested_cwd)
+    if not requested_isolation["rejected_for_project_causality"] and _has_local_cleanup_surface(requested_cwd):
+        return requested_cwd, {
+            **base,
+            "independently_resolved_project_checkout": _is_git_checkout(requested_cwd),
+            "source_isolation": requested_isolation,
+        }
 
     sessions_root = codex_home / "sessions"
     if not sessions_root.is_dir():
-        return requested_cwd, {**base, "status": "historical_workspace_not_found"}
+        return _unresolved_cleanup_workspace(
+            requested_cwd,
+            base,
+            requested_isolation,
+        )
     session_paths = sorted(
         sessions_root.rglob("*.jsonl"),
         key=lambda path: _mtime(path),
@@ -200,12 +214,36 @@ def _resolve_cleanup_workspace(
                     **base,
                     "status": "historical_session_workspace_recovered",
                     "resolved_cwd": str(root),
+                    "independently_resolved_project_checkout": True,
+                    "source_isolation": _project_checkout_source_isolation(root),
                     "navigation_source": f"codex_session_metadata:{session_path.name}:{line_number}",
                     "boundary": (
                         "Session cwd metadata resolved the checkout only; it is navigation, not cleanup-causality proof."
                     ),
                 }
-    return requested_cwd, {**base, "status": "historical_workspace_not_found"}
+    return _unresolved_cleanup_workspace(requested_cwd, base, requested_isolation)
+
+
+def _unresolved_cleanup_workspace(
+    requested_cwd: Path,
+    base: dict,
+    requested_isolation: dict,
+) -> tuple[Path, dict]:
+    status = (
+        "evaluator_workspace_rejected_project_checkout_not_recovered"
+        if requested_isolation["rejected_for_project_causality"]
+        else "historical_workspace_not_found"
+    )
+    return requested_cwd, {
+        **base,
+        "status": status,
+        "source_isolation": requested_isolation,
+        "boundary": (
+            "Evaluator/lane artifacts are diagnostic-only and cannot support project worktree cleanup causality."
+            if requested_isolation["rejected_for_project_causality"]
+            else "No independently resolved project checkout was recovered from session navigation metadata."
+        ),
+    }
 
 
 def _has_local_cleanup_surface(cwd: Path) -> bool:
@@ -213,6 +251,67 @@ def _has_local_cleanup_surface(cwd: Path) -> bool:
         return True
     result = _run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])
     return result.returncode == 0
+
+
+def _is_git_checkout(cwd: Path) -> bool:
+    return _run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]).returncode == 0
+
+
+def _project_checkout_source_isolation(cwd: Path) -> dict:
+    return {
+        "status": "project_checkout",
+        "classification": "independently_resolved_project_checkout",
+        "requested_cwd": str(cwd),
+        "rejected_for_project_causality": False,
+        "diagnostic_only": False,
+        "independently_resolved_project_checkout": True,
+        "rejected_source_classes": [],
+    }
+
+
+def _classify_evaluator_workspace(cwd: Path) -> dict:
+    """Reject evaluator lane topology, rather than a particular run-root path.
+
+    A lane can be mounted anywhere.  Its distinguishing evidence is the lane
+    contract (command/environment/prompt), its ``lanes`` parent, and a run
+    state above that parent; ordinary project reports alone are insufficient.
+    """
+    lane_root = None
+    run_root = None
+    current = cwd
+    for _ in range(10):
+        if all((current / name).is_file() for name in ("command.json", "environment.json", "prompt.txt")):
+            parent = current.parent
+            candidate_run = parent.parent if parent.name == "lanes" else None
+            if candidate_run and (candidate_run / "run-state.json").is_file():
+                lane_root = current
+                run_root = candidate_run
+                break
+        if current.parent == current:
+            break
+        current = current.parent
+    rejected = lane_root is not None
+    return {
+        "status": "rejected_evaluator_lane_harness" if rejected else "not_evaluator_lane_harness",
+        "classification": "same_loop_evaluator_lane" if rejected else "ordinary_workspace",
+        "requested_cwd": str(cwd),
+        "lane_root": str(lane_root) if lane_root else None,
+        "run_root": str(run_root) if run_root else None,
+        "rejected_for_project_causality": rejected,
+        "diagnostic_only": rejected,
+        "independently_resolved_project_checkout": False,
+        "rejected_source_classes": (
+            [
+                "current_run_directory",
+                "lane_command_and_environment",
+                "run_state_metadata",
+                "generated_evaluator_reports",
+                "sandbox_git_mount",
+            ]
+            if rejected
+            else []
+        ),
+    }
 
 
 def _session_workspace_candidates(path: Path) -> list[tuple[int, Path]]:
@@ -283,11 +382,31 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr=str(exc))
 
 
-def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = None, started: float | None = None) -> dict:
+def artifact_currentness_report(
+    *,
+    query: str,
+    cwd: Path,
+    latest: dict | None = None,
+    started: float | None = None,
+    workspace_resolution: dict | None = None,
+) -> dict:
     latest = latest or {}
     detected_intent = detect_artifact_currentness_intent(query, cwd)
     if detected_intent == "worktree_cleanup_currentness":
-        worktree_report = build_worktree_currentness_report(query, cwd)
+        workspace_resolution = workspace_resolution or {
+            "status": "direct_workspace",
+            "resolved_cwd": str(cwd),
+            "independently_resolved_project_checkout": _is_git_checkout(cwd),
+            "source_isolation": _classify_evaluator_workspace(cwd),
+        }
+        worktree_report = build_worktree_currentness_report(
+            query,
+            cwd,
+            source_isolation=workspace_resolution.get("source_isolation"),
+            independently_resolved_project_checkout=bool(
+                workspace_resolution.get("independently_resolved_project_checkout")
+            ),
+        )
         elapsed = None if started is None else round(time.monotonic() - started, 6)
         chain = _worktree_evidence_chain(worktree_report)
         cleanup = worktree_report.get("cleanup_causality") or {}
@@ -313,7 +432,11 @@ def artifact_currentness_report(*, query: str, cwd: Path, latest: dict | None = 
                 "claim_present": False,
                 "assessment": "worktree_mode_uses_git_artifact_and_private_evidence_not_status_field_only",
             },
-            "current_front_door": _current_front_door(cwd),
+            "current_front_door": (
+                _current_front_door(cwd)
+                if not (workspace_resolution.get("source_isolation") or {}).get("rejected_for_project_causality")
+                else {"status": "rejected_evaluator_lane_harness", "source_refs": [], "active_current": []}
+            ),
             "next_reads": _worktree_next_reads(worktree_report, chain),
             "blind_spots": _worktree_blind_spots(worktree_report, latest),
             "worktree_currentness": worktree_report,
@@ -1170,6 +1293,11 @@ def _worktree_evidence_chain(worktree_report: dict) -> list[dict]:
 def _worktree_next_reads(worktree_report: dict, chain: list[dict]) -> list[dict]:
     reads = []
     cleanup = worktree_report.get("cleanup_causality") or {}
+    if str(cleanup.get("debt_status") or "").startswith("scoped_no_proof_"):
+        # A current evaluator workspace is diagnostic-only.  Returning local
+        # git/rg/find commands here would invite a receiver to turn the lane
+        # itself into the causal answer after this route has rejected it.
+        return []
     target_binding = cleanup.get("target_binding") or {}
     if target_binding.get("status") == "blocked_named_target_missing":
         for command in worktree_report.get("next_commands") or []:
@@ -1233,6 +1361,12 @@ def _worktree_blind_spots(worktree_report: dict, latest: dict) -> list[str]:
         "This route does not execute cleanup and keeps branch refs retained unless explicitly scoped otherwise.",
         "External issue trackers were not queried; only local/exported artifacts and git worktree state were inspected.",
     ]
+    cleanup = worktree_report.get("cleanup_causality") or {}
+    if str(cleanup.get("debt_status") or "").startswith("scoped_no_proof_"):
+        return [
+            "Current evaluator/lane artifacts were rejected as diagnostic-only for project cleanup causality.",
+            "No independently resolved project checkout or original cleanup chronology was available in this route.",
+        ]
     if not (worktree_report.get("discovered_worktrees") or []):
         blind.append("No physical git worktrees were discovered from git worktree list or ./worktrees/.")
     if not (latest.get("messages") or []):

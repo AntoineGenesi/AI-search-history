@@ -162,19 +162,54 @@ def is_answer_ready_worktree_cleanup_causality_query(query: str) -> bool:
     return normalized in {_normalize(item) for item in ANSWER_READY_CLEANUP_QUERIES}
 
 
-def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
+def build_worktree_currentness_report(
+    query: str,
+    cwd: Path,
+    *,
+    source_isolation: dict | None = None,
+    independently_resolved_project_checkout: bool | None = None,
+) -> dict:
     named = extract_named_worktree_targets(query)
-    evidence_files = _discover_evidence_files(cwd)
+    source_isolation = source_isolation or _default_source_isolation(cwd)
+    reject_evaluator_sources = bool(source_isolation.get("rejected_for_project_causality"))
+    evidence_files = [] if reject_evaluator_sources else _discover_evidence_files(cwd)
     cleanup_causality = _cleanup_causality_report(
         query,
         cwd,
         evidence_files,
         named_targets=named,
     )
-    # Historical causality is resolved or declared missing before live Git and
-    # worktree state can be inspected as a separate currentness layer.
-    worktrees = _discover_worktrees(cwd)
-    branch_state = _discover_branch_state(cwd)
+    original_chronology_found = (
+        (cleanup_causality.get("chronology_gate") or {}).get("status")
+        == "original_chronology_found"
+    )
+    if independently_resolved_project_checkout is None:
+        independently_resolved_project_checkout = _is_git_checkout(cwd)
+    terminal_scoped_no_proof = bool(
+        cleanup_causality.get("is_cleanup_causality_query")
+        and (
+            reject_evaluator_sources
+            or (
+                not named
+                and
+                not independently_resolved_project_checkout
+                and not original_chronology_found
+            )
+        )
+    )
+    # Current Git/worktree state is meaningful only after original chronology
+    # is available or the project checkout itself was independently resolved.
+    # Never inspect the evaluator lane as a substitute project checkout.
+    if terminal_scoped_no_proof:
+        worktrees = []
+        branch_state = {
+            "status": "not_inspected_scoped_no_proof",
+            "source": "current_workspace_scan_suppressed",
+            "branch_count": 0,
+        }
+    else:
+        worktrees = _discover_worktrees(cwd)
+        branch_state = _discover_branch_state(cwd)
     if cleanup_causality.get("is_cleanup_causality_query") and not named:
         selected = _select_cleanup_causality_targets(worktrees, cwd)
     else:
@@ -196,6 +231,9 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         worktrees,
         branch_state,
         cwd,
+        source_isolation=source_isolation,
+        independently_resolved_project_checkout=bool(independently_resolved_project_checkout),
+        terminal_scoped_no_proof=terminal_scoped_no_proof,
     )
     return {
         "status": "ok",
@@ -213,12 +251,16 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
         "source_roles_present": _source_roles_present(cleanup_causality, items),
         "named_targets": named,
         "discovered_worktrees": [_public_worktree(item, cwd) for item in worktrees],
-        "next_commands": _general_next_commands(
-            named,
-            exact_git_only=(
-                (cleanup_causality.get("target_binding") or {}).get("status")
-                == "blocked_named_target_missing"
-            ),
+        "next_commands": (
+            []
+            if terminal_scoped_no_proof
+            else _general_next_commands(
+                named,
+                exact_git_only=(
+                    (cleanup_causality.get("target_binding") or {}).get("status")
+                    == "blocked_named_target_missing"
+                ),
+            )
         ),
         "preservation_policy": (
             "If a worktree-local .private directory contains evidence, copy or archive it under "
@@ -230,6 +272,22 @@ def build_worktree_currentness_report(query: str, cwd: Path) -> dict:
             "It does not execute cleanup or recommend branch ref pruning."
         ),
     }
+
+
+def _default_source_isolation(cwd: Path) -> dict:
+    return {
+        "status": "direct_workspace",
+        "classification": "ordinary_workspace",
+        "requested_cwd": str(cwd),
+        "rejected_for_project_causality": False,
+        "diagnostic_only": False,
+        "independently_resolved_project_checkout": _is_git_checkout(cwd),
+        "rejected_source_classes": [],
+    }
+
+
+def _is_git_checkout(cwd: Path) -> bool:
+    return _run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"], timeout=3).returncode == 0
 
 
 def extract_named_worktree_targets(query: str) -> list[dict]:
@@ -627,13 +685,68 @@ def _finish_cleanup_causality_report(
     worktrees: list[dict],
     branch_state: dict,
     cwd: Path,
+    *,
+    source_isolation: dict,
+    independently_resolved_project_checkout: bool,
+    terminal_scoped_no_proof: bool,
 ) -> dict:
     if not report.get("is_cleanup_causality_query"):
         return report
     report["physical_worktree_count"] = len(worktrees)
     chronology_gate = report.get("chronology_gate") or {}
-    chronology_gate["current_workspace_scan"] = "completed_after_chronology_gate"
+    chronology_gate["current_workspace_scan"] = (
+        "suppressed_same_loop_evaluator_harness"
+        if source_isolation.get("rejected_for_project_causality")
+        else (
+            "suppressed_no_project_checkout_or_original_chronology"
+            if terminal_scoped_no_proof
+            else "completed_after_chronology_gate"
+        )
+    )
     report["chronology_gate"] = chronology_gate
+    report["source_isolation"] = source_isolation
+    if terminal_scoped_no_proof:
+        rejected_evaluator = bool(source_isolation.get("rejected_for_project_causality"))
+        report.update(
+            {
+                "debt_status": (
+                    "scoped_no_proof_evaluator_artifacts_rejected"
+                    if rejected_evaluator
+                    else "scoped_no_proof_project_checkout_unresolved"
+                ),
+                "causal_summary": (
+                    "No project worktree-cleanup causality proof is available: current evaluator/lane artifacts "
+                    "were classified as diagnostic-only and rejected, and no independently resolved project checkout "
+                    "or original cleanup chronology was recovered."
+                    if rejected_evaluator
+                    else "No project worktree-cleanup causality proof is available: no independently resolved project "
+                    "checkout and no original cleanup chronology were found."
+                ),
+                "target_selection_note": (
+                    "Terminal scoped no-proof: do not use current lane metadata, sandbox Git state, generated reports, "
+                    "or local lane commands as project cleanup causality."
+                    if rejected_evaluator
+                    else "Terminal scoped no-proof: current workspace state is not project cleanup causality without a "
+                    "resolved checkout or original chronology."
+                ),
+                "git_state": {
+                    "source_role": "git_state",
+                    "evidence_scope": "not_inspected",
+                    "discovered_worktrees": [],
+                    "branch_state": branch_state,
+                    "classified_targets": [],
+                },
+                "causality_currentness_boundary": _cleanup_causality_currentness_boundary(),
+                "current_state_summary": {
+                    "phase": "not_inspected_scoped_no_proof",
+                    "source_role": "git_state",
+                    "causal_proof_allowed": False,
+                    "reason": "same_loop_evaluator_harness" if rejected_evaluator else "project_checkout_or_original_chronology_missing",
+                },
+            }
+        )
+        report["facet_coverage"] = _cleanup_facet_coverage(report)
+        return report
     named_targets = report.get("named_targets") or []
     if named_targets:
         target_values = list(
@@ -1064,7 +1177,7 @@ def _source_roles_present(cleanup_causality: dict, items: list[dict]) -> list[st
     for record in cleanup_causality.get("operational_records") or []:
         if record.get("source_role"):
             roles.add(record["source_role"])
-    if cleanup_causality.get("git_state"):
+    if (cleanup_causality.get("git_state") or {}).get("evidence_scope") != "not_inspected":
         roles.add("git_state")
     for item in items:
         for ref in item.get("source_refs") or []:
