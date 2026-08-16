@@ -24,6 +24,12 @@ jsonl-history-search what-happened-since "what has happened since my last messag
 For unscoped latest-message wording, omit `--parent-thread` and
 `--complete-interval`, and use `--format text`.
 
+For a current-chat/conversation audit that asks what went wrong or what to fix,
+retain the original wording and run `jsonl-history-search ask --answer` so the
+current-session source is selected and primary refs are opened before fixes. If
+there is no recoverable current-session source, return that boundary rather
+than asking the user to restate the chat anchor or broadening history.
+
 For explicit history-tool aliases that are not latest-message asks, immediately
 run:
 
