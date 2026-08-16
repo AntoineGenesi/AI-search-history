@@ -6024,11 +6024,49 @@ _FINALIZATION_PROMOTABLE_STATES = {
     "answer_ready",
     "terminal_scoped_no_evidence",
 }
+_FINALIZATION_ROUTE_SPECIFIC_CONTRACT_FAMILIES = {
+    "remembered_topic",
+    "expectation_mismatch",
+    "orchestration_provenance",
+}
+
+
+def _investigation_finalization_state_should_gate_contract(
+    contract: dict,
+    state: str,
+    *,
+    route_family: str = "",
+) -> bool:
+    if state not in _FINALIZATION_ACTIVE_STATES:
+        return False
+    route_family = route_family or str(contract.get("route_family") or "")
+    if route_family in _FINALIZATION_ROUTE_SPECIFIC_CONTRACT_FAMILIES:
+        return False
+    answer_status = str(contract.get("answer_status") or "")
+    promotion_status = str(contract.get("promotion_status") or "")
+    if answer_status in {
+        "answer-ready-after-source-inspection",
+        "answer-scoped-no-evidence-now",
+        "canonical-continuation-packet-required",
+    }:
+        return False
+    if answer_status.startswith("not-ready/") and answer_status != "not-ready/needs-more-proof":
+        return False
+    if promotion_status and promotion_status != "unpromoted_semantic_debug_execution":
+        return False
+    return promotion_status == "unpromoted_semantic_debug_execution" or answer_status in {
+        "",
+        "cannot-answer-directly-yet",
+        "needs_investigation",
+        "not-ready/needs-more-proof",
+    }
 
 
 def _action_contract_with_investigation_finalization_state(
     contract: dict,
     finalization_state: dict | None,
+    *,
+    route_family: str = "",
 ) -> dict:
     if not isinstance(finalization_state, dict) or not finalization_state.get("state"):
         return contract
@@ -6040,6 +6078,18 @@ def _action_contract_with_investigation_finalization_state(
         return contract
 
     contract["answer_promotion_allowed_by_investigation_finalization_state"] = False
+    if not _investigation_finalization_state_should_gate_contract(
+        contract,
+        state,
+        route_family=route_family,
+    ):
+        contract["investigation_finalization_gate_applies"] = False
+        contract["investigation_finalization_gate_boundary"] = (
+            "route-specific answer-ready, terminal, continuation, mismatch, or blocker contract preserved"
+        )
+        return contract
+
+    contract["investigation_finalization_gate_applies"] = True
     contract["promotion_status"] = f"investigation_finalization_state_{state}"
     contract["promotion_reason"] = (
         "The package-controlled investigation finalization state is not promotable; "
@@ -6332,6 +6382,7 @@ def _answer_action_contract_from_executed_output(
             "linked_reports": compact.get("linked_reports"),
         }
     if output_key == "semantic_debug":
+        route_family = str(selected_route.get("route_family") or "")
         directional = compact.get("directional_history_reconstruction") or {}
         if directional.get("applies") and selected_route.get("route_family") in {
             "causal_history",
@@ -6368,6 +6419,7 @@ def _answer_action_contract_from_executed_output(
             return _action_contract_with_investigation_finalization_state(
                 directional_contract,
                 investigation_finalization_state,
+                route_family=route_family,
             )
         handoff = compact.get("answer_ready_handoff") or {}
         readiness_summary = compact.get("answer_readiness_summary") or {}
@@ -6444,7 +6496,6 @@ def _answer_action_contract_from_executed_output(
             or compact.get("answer_readiness_summary", {}).get("status")
             or compact.get("status")
         )
-        route_family = str(selected_route.get("route_family") or "")
         remembered_missing = _remembered_user_wording_missing_evidence_contract(
             compact=compact,
             route_family=route_family,
@@ -6453,6 +6504,7 @@ def _answer_action_contract_from_executed_output(
             return _action_contract_with_investigation_finalization_state(
                 remembered_missing,
                 investigation_finalization_state,
+                route_family=route_family,
             )
         continuation_first = _continuation_first_history_contract(
             compact=compact,
@@ -6462,6 +6514,7 @@ def _answer_action_contract_from_executed_output(
             return _action_contract_with_investigation_finalization_state(
                 continuation_first,
                 investigation_finalization_state,
+                route_family=route_family,
             )
         expectation_mismatch_plan = compact.get("expectation_mismatch_plan") or {}
         target_proof_handoff = _semantic_debug_target_proof_handoff(
@@ -7116,6 +7169,7 @@ def _answer_action_contract_from_executed_output(
         return _action_contract_with_investigation_finalization_state(
             contract,
             investigation_finalization_state,
+            route_family=route_family,
         )
     if output_key == "semantic_wrapup":
         answer_ready = compact.get("answer_ready_contract") or {}
@@ -12588,6 +12642,8 @@ def _ask_answer_finalization_veto(
 
 
 def _investigation_finalization_state_veto(action: dict) -> dict:
+    if action.get("investigation_finalization_gate_applies") is not True:
+        return {"blocked": False}
     finalization_state = (
         action.get("investigation_finalization_state")
         if isinstance(action.get("investigation_finalization_state"), dict)
@@ -12632,7 +12688,7 @@ def _answer_action_contract_blocks_final_answer(action: dict) -> bool:
         if isinstance(action.get("investigation_finalization_state"), dict)
         else {}
     )
-    if finalization_state and (
+    if action.get("investigation_finalization_gate_applies") is True and finalization_state and (
         finalization_state.get("answer_promotion_allowed") is not True
         or str(finalization_state.get("state") or "") not in _FINALIZATION_PROMOTABLE_STATES
     ):
