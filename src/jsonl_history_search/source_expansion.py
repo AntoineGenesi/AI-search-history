@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import io
+import os
 import re
 import shlex
 from contextlib import redirect_stdout
@@ -72,6 +73,10 @@ GEOMETRY_CAUSALITY_LATER_ROLES = {
     "later_consequence",
     "consequence",
 }
+APPROVED_HISTORY_ORCHESTRATION_ROLES = {"parent_or_coordinator", "worker", "reviewer"}
+APPROVED_HISTORY_ORCHESTRATION_MAX_FILES = 120
+APPROVED_HISTORY_ORCHESTRATION_MAX_BYTES = 5 * 1024 * 1024
+APPROVED_HISTORY_ORCHESTRATION_HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+$")
 
 
 @dataclass(frozen=True)
@@ -376,17 +381,20 @@ def build_execute_continuation_payload(
         if continuation_step_identity(read) not in prior_step_identities
     ]
     selected_reads = pending_reads[: max(0, int(max_steps))]
-    expanded_reads = [
-        execute_continuation_step(
+    approved_history_budget = approved_history_budget_from_step_states(prior_step_states)
+    expanded_reads = []
+    for index, read in enumerate(selected_reads):
+        expanded = execute_continuation_step(
             read=read,
             rank=index + 1,
             plan=plan,
             default_tz=default_tz,
             cwd=cwd,
             max_output_chars=max(0, int(max_output_chars)),
+            approved_history_budget=approved_history_budget,
         )
-        for index, read in enumerate(selected_reads)
-    ]
+        expanded_reads.append(expanded)
+        approved_history_budget = approved_history_budget_after_step(approved_history_budget, expanded)
     counts = follow_next_read_counts(selected_reads, expanded_reads)
     selected_step_identities = [continuation_step_identity(read) for read in selected_reads]
     new_executed_step_states = continuation_executed_step_states(expanded_reads)
@@ -463,6 +471,7 @@ def build_execute_continuation_payload(
             "executed_step_states": executed_step_states,
             "remaining_step_count": remaining_after_count,
             "prior_receipt_consumed": prior_summary.get("status") == "loaded",
+            "approved_history_cumulative_budget": approved_history_budget,
         },
         "geometry_causality_gate": geometry_gate,
         "reviewed_follow_through_answer_gate": build_reviewed_follow_through_answer_gate(counts, {**base, **counts}),
@@ -1511,6 +1520,11 @@ def canonical_continuation_packet_for_fingerprint(
             "named_gap": packet.get("named_gap"),
             "remaining_named_gap": packet.get("remaining_named_gap"),
             "gap_name": packet.get("gap_name"),
+            "continuation_kind": packet.get("continuation_kind"),
+            "task_handle": packet.get("task_handle"),
+            "approved_roots": packet.get("approved_roots"),
+            "approved_source_plan_fingerprint": packet.get("approved_source_plan_fingerprint"),
+            "inherited_caps": packet.get("inherited_caps"),
         },
         "structured_steps": [
             {
@@ -1532,6 +1546,12 @@ def canonical_continuation_packet_for_fingerprint(
                 "remaining_named_gap": read.get("remaining_named_gap"),
                 "command": read.get("command"),
                 "argv": read.get("argv"),
+                "step_kind": read.get("step_kind"),
+                "task_handle": read.get("task_handle"),
+                "required_roles": read.get("required_roles"),
+                "approved_root": read.get("approved_root"),
+                "approved_source_plan_fingerprint": read.get("approved_source_plan_fingerprint"),
+                "inherited_caps": read.get("inherited_caps"),
                 "source_followthrough_group": read.get("_source_followthrough_group"),
                 "follow_surface": read.get("_follow_surface") or read.get("surface"),
             }
@@ -1729,6 +1749,21 @@ def continuation_step_to_follow_read(
     source_ref = item.get("source_ref") if isinstance(item.get("source_ref"), dict) else None
     argv = item.get("argv") if isinstance(item.get("argv"), list) else []
     command = str(item.get("command") or "")
+    approved_history_validation = approved_history_orchestration_step_validation(item, packet=packet)
+    if approved_history_validation["status"] != "not_approved_history_orchestration":
+        return {
+            **item,
+            "target": None,
+            "source_ref": None,
+            "read_role": "approved_history_orchestration_roles",
+            "_continuation_step_kind": "approved_history_orchestration_roles",
+            "_approved_history_validation": approved_history_validation,
+            "_packet": packet,
+            "_source_followthrough_group": group_name,
+            "_follow_surface": f"canonical_continuation_packet.{group_name}",
+            "candidate_id": item.get("step_id") or f"{group_name}-{index}",
+            "named_gap": item.get("named_gap") or packet.get("named_gap"),
+        }
     semantic_debug_validation = deep_audit_continuation_argv_validation(argv)
     if semantic_debug_validation["status"] != "not_deep_audit_semantic_debug":
         read_role = str(item.get("read_role") or item.get("role") or item.get("target_source_role") or group_name)
@@ -1769,6 +1804,43 @@ def continuation_step_to_follow_read(
         or packet.get("remaining_named_gap")
         or packet.get("gap_name"),
     }
+
+
+def approved_history_orchestration_step_validation(item: dict[str, Any], *, packet: dict[str, Any]) -> dict[str, Any]:
+    """Allow only the generated, root-bound historical-role packet shape."""
+    if str(item.get("step_kind") or "") != "approved_history_orchestration_roles":
+        return {"status": "not_approved_history_orchestration"}
+    if packet.get("packet_kind") != "approved_history_orchestration_roles.v1" or packet.get("continuation_kind") != "approved_history_orchestration_roles":
+        return {"status": "rejected", "reason": "approved-history continuation kind is unsupported"}
+    if item.get("argv") or item.get("command"):
+        return {"status": "rejected", "reason": "approved-history continuation cannot carry argv or shell command text"}
+    task_handle = str(item.get("task_handle") or "")
+    if not APPROVED_HISTORY_ORCHESTRATION_HANDLE_RE.fullmatch(task_handle) or task_handle != str(packet.get("task_handle") or ""):
+        return {"status": "rejected", "reason": "approved-history continuation task handle is invalid or unbound"}
+    roles = item.get("required_roles")
+    if not isinstance(roles, list) or not roles or any(role not in APPROVED_HISTORY_ORCHESTRATION_ROLES for role in roles) or roles != packet.get("required_roles"):
+        return {"status": "rejected", "reason": "approved-history continuation roles are invalid or unbound"}
+    roots = packet.get("approved_roots")
+    root = item.get("approved_root")
+    if not isinstance(roots, list) or not roots or not isinstance(root, str):
+        return {"status": "rejected", "reason": "approved-history continuation requires packet-bound roots"}
+    normalized_roots = [str(Path(str(value)).expanduser().resolve(strict=False)) for value in roots if isinstance(value, str)]
+    normalized_root = str(Path(root).expanduser().resolve(strict=False))
+    if len(normalized_roots) != len(roots) or len(set(normalized_roots)) != len(normalized_roots) or normalized_root != root or normalized_root not in normalized_roots:
+        return {"status": "rejected", "reason": "approved-history continuation root is malformed or widened"}
+    fingerprint = hashlib.sha256(json.dumps(normalized_roots, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if item.get("approved_source_plan_fingerprint") != fingerprint or packet.get("approved_source_plan_fingerprint") != fingerprint:
+        return {"status": "rejected", "reason": "approved-history continuation source-plan fingerprint does not match roots"}
+    caps = item.get("inherited_caps")
+    if not isinstance(caps, dict) or caps != packet.get("inherited_caps"):
+        return {"status": "rejected", "reason": "approved-history continuation caps are invalid or unbound"}
+    try:
+        max_files, max_bytes = int(caps["max_files"]), int(caps["max_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return {"status": "rejected", "reason": "approved-history continuation caps are malformed"}
+    if not (0 < max_files <= APPROVED_HISTORY_ORCHESTRATION_MAX_FILES and 0 < max_bytes <= APPROVED_HISTORY_ORCHESTRATION_MAX_BYTES):
+        return {"status": "rejected", "reason": "approved-history continuation attempts to widen inherited caps"}
+    return {"status": "allowed", "execution_contract": "packet_owned_approved_history_orchestration_roles"}
 
 
 def deep_audit_continuation_argv_validation(argv: list[Any]) -> dict[str, Any]:
@@ -1879,6 +1951,7 @@ def continuation_executed_step_states(expanded_reads: list[dict[str, Any]]) -> l
                 "step_identity": item.get("step_identity"),
                 "candidate_id": item.get("candidate_id"),
                 "read_role": item.get("read_role"),
+                "continuation_step_kind": item.get("continuation_step_kind"),
                 "status": item.get("status"),
                 "remaining_named_gap": item.get("named_gap"),
                 "target_handle": hashed_handle("target", item.get("target")),
@@ -1887,6 +1960,14 @@ def continuation_executed_step_states(expanded_reads: list[dict[str, Any]]) -> l
                     json.dumps(item.get("source_ref"), sort_keys=True, default=str)
                     if isinstance(item.get("source_ref"), dict)
                     else None,
+                ),
+                "approved_history_packet_budget": (
+                    {
+                        "files_examined": (item.get("searched_scope") or {}).get("files_examined", 0),
+                        "bytes_examined": (item.get("searched_scope") or {}).get("bytes_examined", 0),
+                    }
+                    if item.get("continuation_step_kind") == "approved_history_orchestration_roles"
+                    else None
                 ),
             }
         )
@@ -2141,12 +2222,19 @@ def execute_continuation_step(
     default_tz,
     cwd: Path,
     max_output_chars: int,
+    approved_history_budget: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if read.get("_continuation_step_kind") == "deep_audit_semantic_debug":
         return execute_deep_audit_semantic_debug_step(
             read=read,
             rank=rank,
             max_output_chars=max_output_chars,
+        )
+    if read.get("_continuation_step_kind") == "approved_history_orchestration_roles":
+        return execute_approved_history_orchestration_roles_step(
+            read=read,
+            rank=rank,
+            prior_budget=approved_history_budget,
         )
     return expand_follow_next_read(
         read=read,
@@ -2156,6 +2244,147 @@ def execute_continuation_step(
         cwd=cwd,
         usability_decisions=None,
     )
+
+
+def execute_approved_history_orchestration_roles_step(
+    *,
+    read: dict[str, Any],
+    rank: int,
+    prior_budget: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    validation = approved_history_orchestration_step_validation(read, packet=read.get("_packet") or {})
+    base = {
+        "rank": rank,
+        "target": None,
+        "source_ref": None,
+        "surface": read.get("_follow_surface"),
+        "step_identity": read.get("step_identity") or continuation_step_identity(read),
+        "read_role": "approved_history_orchestration_roles",
+        "named_gap": read.get("named_gap"),
+        "candidate_id": read.get("candidate_id"),
+        "continuation_step_kind": "approved_history_orchestration_roles",
+        "serialized_packet_validation": validation,
+        "metadata_only": True,
+    }
+    if validation.get("status") != "allowed":
+        return {**base, "status": "rejected_continuation_packet", "failure_reason": validation.get("reason")}
+    root = Path(str(read["approved_root"])).expanduser()
+    if not root.exists() or root.is_symlink():
+        return {
+            **base,
+            "status": "expanded",
+            "continuation_result_status": "approved_history_root_unavailable",
+            "failure_reason": "packet-approved transcript root is missing, unreadable, or a symlink",
+            "role_scoped_raw_refs": [],
+            "searched_scope": {"approved_root": str(root), "files_examined": 0, "bytes_examined": 0, "caps_hit": [], "current_workspace_searched": False},
+        }
+    caps = read["inherited_caps"]
+    prior_budget = prior_budget or {}
+    prior_files = max(0, int(prior_budget.get("files_examined") or 0))
+    prior_bytes = max(0, int(prior_budget.get("bytes_examined") or 0))
+    files, bytes_examined, cap_hits, refs = 0, 0, [], []
+    paths = [root] if root.is_file() and root.suffix == ".jsonl" else []
+    if root.is_dir():
+        for directory, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(name for name in dirnames if not (Path(directory) / name).is_symlink())
+            paths.extend(Path(directory) / name for name in sorted(filenames) if name.endswith(".jsonl"))
+    for path in paths:
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            continue
+        if not path_is_inside(resolved, root):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if prior_files + files >= int(caps["max_files"]):
+            cap_hits.append("max_files")
+            break
+        if prior_bytes + bytes_examined + size > int(caps["max_bytes"]):
+            cap_hits.append("max_bytes")
+            break
+        files += 1
+        bytes_examined += size
+        refs.extend(approved_history_role_refs_in_file(path, task_handle=str(read["task_handle"]), roles=read["required_roles"]))
+    deduped_refs, seen_roles = [], set()
+    for ref in refs:
+        if ref["role"] not in seen_roles:
+            seen_roles.add(ref["role"])
+            deduped_refs.append(ref)
+    missing_roles = [role for role in read["required_roles"] if role not in seen_roles]
+    return {
+        **base,
+        "status": "expanded",
+        "continuation_result_status": "approved_history_roles_found" if not missing_roles else "approved_history_capped" if cap_hits else "not_found_within_approved_corpus_and_budget",
+        "role_scoped_raw_refs": deduped_refs,
+        "missing_roles": missing_roles,
+        "searched_scope": {
+            "approved_root": str(root),
+            "files_examined": files,
+            "bytes_examined": bytes_examined,
+            "caps_hit": cap_hits,
+            "current_workspace_searched": False,
+            "packet_budget": {
+                "max_files": int(caps["max_files"]),
+                "max_bytes": int(caps["max_bytes"]),
+                "prior_files_examined": prior_files,
+                "prior_bytes_examined": prior_bytes,
+                "cumulative_files_examined": prior_files + files,
+                "cumulative_bytes_examined": prior_bytes + bytes_examined,
+            },
+        },
+        "claim_boundaries": {"generic_shell_recovery_allowed": False, "root_widening_allowed": False, "answer_generation_included": False},
+    }
+
+
+def approved_history_budget_from_step_states(step_states: list[dict[str, Any]]) -> dict[str, int]:
+    files, bytes_examined = 0, 0
+    for state in step_states:
+        if state.get("continuation_step_kind") != "approved_history_orchestration_roles":
+            continue
+        budget = state.get("approved_history_packet_budget")
+        if not isinstance(budget, dict):
+            continue
+        files += max(0, int(budget.get("files_examined") or 0))
+        bytes_examined += max(0, int(budget.get("bytes_examined") or 0))
+    return {"files_examined": files, "bytes_examined": bytes_examined}
+
+
+def approved_history_budget_after_step(prior_budget: dict[str, int], step: dict[str, Any]) -> dict[str, int]:
+    files = max(0, int(prior_budget.get("files_examined") or 0))
+    bytes_examined = max(0, int(prior_budget.get("bytes_examined") or 0))
+    scope = step.get("searched_scope") if isinstance(step.get("searched_scope"), dict) else {}
+    if step.get("continuation_step_kind") == "approved_history_orchestration_roles":
+        files += max(0, int(scope.get("files_examined") or 0))
+        bytes_examined += max(0, int(scope.get("bytes_examined") or 0))
+    return {"files_examined": files, "bytes_examined": bytes_examined}
+
+
+def approved_history_role_refs_in_file(path: Path, *, task_handle: str, roles: list[str]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return refs
+    for line_number, line in enumerate(lines, 1):
+        lowered = line.casefold()
+        if task_handle.casefold() not in lowered:
+            continue
+        for role, terms in {
+            "parent_or_coordinator": ("coordinator", "parent", "spawned", "launched"),
+            "worker": ("worker", "implementer", "subagent"),
+            "reviewer": ("reviewer", "rereviewer", "verified"),
+        }.items():
+            # A coordinator line that merely names a worker/reviewer is parent
+            # evidence, not the child's own raw-role session ref.
+            child_role_on_parent_line = role in {"worker", "reviewer"} and any(
+                marker in lowered for marker in ("coordinator", "parent", "spawned", "launched")
+            )
+            if role in roles and not child_role_on_parent_line and any(term in lowered for term in terms):
+                refs.append({"role": role, "source_ref": {"path": str(path), "line": line_number}, "target": f"{path}:{line_number}", "raw_text_included": False})
+    return refs
 
 
 def execute_deep_audit_semantic_debug_step(
@@ -2685,6 +2914,8 @@ def follow_next_read_key(read: dict[str, Any]) -> str | None:
         argv = read.get("argv")
         if isinstance(argv, list):
             return f"deep_audit_semantic_debug:{json.dumps(argv, ensure_ascii=False)}"
+    if read.get("_continuation_step_kind") == "approved_history_orchestration_roles":
+        return "approved_history_orchestration_roles:" + str(read.get("step_id") or read.get("candidate_id") or "")
     return None
 
 

@@ -4393,6 +4393,17 @@ def render_execute_continuation_text(payload: dict) -> str:
             f"expanded_count={searched_scope.get('expanded_count')} "
             f"scope_boundary={searched_scope.get('scope_boundary')}"
         )
+    role_refs = [
+        ref
+        for step in receipt.get("executed_steps") or []
+        if isinstance(step, dict)
+        for ref in step.get("role_scoped_raw_refs") or []
+        if isinstance(ref, dict) and ref.get("target")
+    ]
+    if role_refs:
+        lines.append("Approved-history role refs:")
+        for ref in role_refs[:8]:
+            lines.append(f"- {ref.get('role')}: {ref.get('target')}")
     lines.append(
         "Receiver rule: answer only if the successor state and required gate allow closure; "
         "otherwise report the remaining named gap and do not run fresh broad search."
@@ -4433,6 +4444,17 @@ def render_execute_continuation_markdown(payload: dict) -> str:
         lines.extend(["", "## Residual Unknowns", ""])
         for item in list(receipt.get("residual_unknowns") or [])[:8]:
             lines.append(f"- `{item}`")
+    role_refs = [
+        ref
+        for step in receipt.get("executed_steps") or []
+        if isinstance(step, dict)
+        for ref in step.get("role_scoped_raw_refs") or []
+        if isinstance(ref, dict) and ref.get("target")
+    ]
+    if role_refs:
+        lines.extend(["", "## Approved-History Role Refs", ""])
+        for ref in role_refs[:8]:
+            lines.append(f"- `{ref.get('role')}`: `{ref.get('target')}`")
     if claim_boundaries:
         lines.extend(
             [
