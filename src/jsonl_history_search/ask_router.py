@@ -63,6 +63,10 @@ ActivationMode = Literal["implicit", "explicit-only"]
 
 
 METHOD_SELECTION_PACKET_SCHEMA_VERSION = "route-family-method-packet/v1"
+_TASK_HANDLE_PATTERN = r"(?=[a-z0-9_-]*\d)(?:[a-z]+[-_][a-z0-9]+[-_][a-z0-9_-]*|[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*)"
+_CURRENT_TASK_RUN_HANDLE_RE = re.compile(
+    rf"\b(?:current|this)\s+(?P<handle>{_TASK_HANDLE_PATTERN})\s+(?:evaluation\s+)?run\b"
+)
 
 
 METHOD_SELECTION_PACKET_TEMPLATES: dict[str, dict] = {
@@ -1715,6 +1719,9 @@ def classify_ask_route(
     if _looks_like_coordinator_context_query(normalized):
         return COORDINATOR_CONTEXT_ROUTE
 
+    if _looks_like_historical_orchestration_episode_query(normalized):
+        return ROUTES[4]
+
     if _looks_like_latest_status_anchor_query(normalized):
         if activation_mode == "explicit-only" and explicit_query is None:
             return EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE
@@ -2400,11 +2407,7 @@ def _normalize_skill_name(value: str) -> str:
 
 
 def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
-    has_explicit_handle = bool(
-        re.search(r"\b[a-z]+[-_][a-z0-9]+[-_][a-z0-9_-]*\b", normalized)
-        or re.search(r"\b[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*\b", normalized)
-    )
-    if not has_explicit_handle:
+    if len(_historical_task_handles(normalized)) != 1:
         return False
     current_run_scope = _has_any(
         normalized,
@@ -2459,6 +2462,44 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "provenance",
         ),
     )
+
+
+def _looks_like_historical_orchestration_episode_query(normalized: str) -> bool:
+    """Reserve task-specific orchestration provenance for raw-source discovery.
+
+    This deliberately sits ahead of the generic status-anchor detector.  A
+    range/status handoff remains a status request, and an explicit current-run
+    request remains outside historical discovery.
+    """
+    if _looks_like_task_window_status_handoff_query(normalized):
+        return False
+    if not _looks_like_orchestration_provenance_query(normalized):
+        return False
+    if len(_historical_task_handles(normalized)) != 1:
+        return False
+    return _has_any(
+        normalized,
+        (
+            "historical",
+            "pre-existing",
+            "provenance",
+            "actually did",
+            "what changed",
+            "what was verified",
+            "what remains",
+        ),
+    )
+
+
+def _historical_task_handles(normalized: str) -> set[str]:
+    handles = {
+        match.group(0)
+        for match in re.finditer(rf"\b{_TASK_HANDLE_PATTERN}\b", normalized)
+    }
+    current_run_handles = {
+        match.group("handle") for match in _CURRENT_TASK_RUN_HANDLE_RE.finditer(normalized)
+    }
+    return handles - current_run_handles
 
 
 def _looks_like_task_review_commit_provenance_query(normalized: str) -> bool:

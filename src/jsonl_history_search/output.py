@@ -9835,6 +9835,12 @@ def render_historical_orchestration_role_evidence_bundle_text(bundle: dict) -> l
             f"- missing_role_recovery_ref_count: {bundle.get('missing_role_recovery_ref_count', 0)}"
         )
         for item in list(bundle.get("missing_role_recovery_refs") or [])[:5]:
+            if item.get("kind") == "unavailable_primary_orchestration_source":
+                lines.append(
+                    "- unavailable primary source: "
+                    f"{item.get('status')} missing_roles={','.join(item.get('missing_roles') or [])}"
+                )
+                continue
             role = labels.get(item.get("role"), item.get("role"))
             lines.append(f"- recovery for {role}: {item.get('target') or '(no target)'}")
             if item.get("command"):
@@ -9873,6 +9879,12 @@ def render_historical_orchestration_role_evidence_bundle_markdown(bundle: dict) 
             f"- `missing_role_recovery_ref_count`: `{bundle.get('missing_role_recovery_ref_count', 0)}`"
         )
         for item in list(bundle.get("missing_role_recovery_refs") or [])[:5]:
+            if item.get("kind") == "unavailable_primary_orchestration_source":
+                lines.append(
+                    "- unavailable primary source: "
+                    f"`{item.get('status')}` missing_roles=`{','.join(item.get('missing_roles') or [])}`"
+                )
+                continue
             role = labels.get(item.get("role"), item.get("role"))
             lines.append(f"- recovery for `{role}`: `{item.get('target') or '(no target)'}`")
             if item.get("command"):
@@ -9933,6 +9945,12 @@ def render_historical_orchestration_role_coverage_source_plan_text(plan: dict) -
                 f"{plan.get('missing_role_recovery_ref_count', len(recovery_refs))}"
             )
             for item in recovery_refs[:3]:
+                if item.get("kind") == "unavailable_primary_orchestration_source":
+                    lines.append(
+                        "- unavailable primary source: "
+                        f"{item.get('status')} missing_roles={','.join(item.get('missing_roles') or [])}"
+                    )
+                    continue
                 role = labels.get(item.get("role"), item.get("role"))
                 command = item.get("command")
                 target = item.get("target") or "(no target)"
