@@ -624,6 +624,37 @@ def build_semantic_debug_payload(
             "Do not make affirmative worker/reviewer role claims. The one emitted primary-source blocker "
             "states that approved transcript-root discovery did not yield both raw child-session refs."
         )
+    approved_history_continuation_packet = build_approved_history_orchestration_continuation_packet(
+        query=agent_find["query"]["original"],
+        historical_orchestration_plan=historical_orchestration_plan,
+        episode_locator=episode_locator,
+        source_plan=source_plan,
+        resolver_limits=spawned_session_resolution.get("limits"),
+    )
+    if historical_orchestration_plan and approved_history_continuation_packet:
+        # Capped approved-root discovery is not permission to hand the receiver
+        # a workspace shell search.  The saved packet carries the only allowed
+        # continuation scope and is executed by the package allowlist.
+        continuation_ref = {
+            "kind": "approved_history_orchestration_continuation",
+            "status": "actionable_canonical_continuation",
+            "continuation_packet_id": approved_history_continuation_packet["packet_id"],
+            "missing_roles": list(approved_history_continuation_packet["required_roles"]),
+            "final_support_allowed": False,
+            "raw_text_included": False,
+            "current_run_echo_recovery_allowed": False,
+            "recovery_instruction": (
+                "Run the saved package-owned approved-history continuation before answering; "
+                "it searches only the packet-bound approved transcript roots."
+            ),
+        }
+        historical_orchestration_plan["approved_history_continuation_packet"] = approved_history_continuation_packet
+        historical_orchestration_plan["missing_role_recovery_refs"] = [continuation_ref]
+        historical_orchestration_plan["missing_role_recovery_ref_count"] = 1
+        historical_orchestration_plan["guidance"]["incomplete_coverage_policy"] = (
+            "Run the one saved package-owned approved-history continuation for the named missing primary "
+            "roles. Do not run generic shell or current-workspace recovery."
+        )
     historical_orchestration_role_evidence_bundle = (
         build_historical_orchestration_role_evidence_bundle(historical_orchestration_plan)
         if historical_orchestration_plan
@@ -1623,11 +1654,14 @@ def build_semantic_debug_payload(
         else {}
     )
     canonical_continuation_packet = (
-        cap_hit_disposition.get("canonical_continuation_packet")
-        if isinstance(cap_hit_disposition.get("canonical_continuation_packet"), dict)
-        else continuation_workflow.get("continuation_packet")
-        if isinstance(continuation_workflow.get("continuation_packet"), dict)
-        else None
+        approved_history_continuation_packet
+        or (
+            cap_hit_disposition.get("canonical_continuation_packet")
+            if isinstance(cap_hit_disposition.get("canonical_continuation_packet"), dict)
+            else continuation_workflow.get("continuation_packet")
+            if isinstance(continuation_workflow.get("continuation_packet"), dict)
+            else None
+        )
     )
     investigation_finalization_state = build_investigation_finalization_state(
         answer_readiness=answer_readiness,
@@ -4128,6 +4162,106 @@ def historical_orchestration_missing_role_recovery_refs(
             }
         )
     return rows
+
+
+def build_approved_history_orchestration_continuation_packet(
+    *,
+    query: str,
+    historical_orchestration_plan: dict[str, Any],
+    episode_locator: dict[str, Any],
+    source_plan: dict[str, Any],
+    resolver_limits: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build the sole recovery surface for incomplete approved-root role discovery.
+
+    This deliberately does not reuse the generic role-recovery command builder:
+    its output is a receiver shell command and may default to the current
+    workspace.  The continuation instead carries the original transcript-root
+    scope into the saved report and is only interpreted by execute-continuation.
+    """
+    if not historical_orchestration_plan or not episode_locator.get("applies"):
+        return None
+    if not re.search(r"\bhistorical\b", query, re.IGNORECASE):
+        return None
+    if episode_locator.get("root_search_complete") is not False:
+        return None
+    missing_roles = [
+        role
+        for role in historical_orchestration_plan.get("missing_roles") or []
+        if role in HISTORICAL_ORCHESTRATION_PRIMARY_REQUIRED_ROLES
+    ]
+    if not missing_roles:
+        return None
+    handles = historical_provenance_handles(query)
+    task_handles = [handle for handle in handles if re.search(r"\d", handle)]
+    if len(task_handles) != 1:
+        return None
+    roots = dedupe(
+        [
+            str(row.get("path"))
+            for row in ((source_plan.get("sources") or {}).get("roots") or [])
+            if isinstance(row, dict) and row.get("path")
+        ]
+    )
+    if not roots:
+        return None
+    normalized_roots = [str(Path(root).expanduser().resolve(strict=False)) for root in roots]
+    source_plan_fingerprint = hashlib.sha256(
+        json.dumps(normalized_roots, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    limits = resolver_limits if isinstance(resolver_limits, dict) else {}
+    inherited_caps = {
+        "max_files": max(1, int(limits.get("max_files") or 120)),
+        "max_bytes": max(1, int(limits.get("max_bytes") or 5 * 1024 * 1024)),
+    }
+    packet_basis = {
+        "task_handle": task_handles[0],
+        "required_roles": missing_roles,
+        "roots": normalized_roots,
+        "source_plan_fingerprint": source_plan_fingerprint,
+        "inherited_caps": inherited_caps,
+    }
+    packet_id = "approved-history-orchestration-" + hashlib.sha256(
+        json.dumps(packet_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    steps = [
+        {
+            "step_id": f"approved-history-root-{index:02d}",
+            "step_kind": "approved_history_orchestration_roles",
+            "task_handle": task_handles[0],
+            "required_roles": missing_roles,
+            "approved_root": root,
+            "approved_root_index": index,
+            "approved_root_count": len(normalized_roots),
+            "approved_source_plan_fingerprint": source_plan_fingerprint,
+            "inherited_caps": inherited_caps,
+            "named_gap": "historical_orchestration_primary_raw_roles",
+        }
+        for index, root in enumerate(normalized_roots, 1)
+    ]
+    return {
+        "packet_id": packet_id,
+        "packet_kind": "approved_history_orchestration_roles.v1",
+        "continuation_kind": "approved_history_orchestration_roles",
+        "status": "actionable_canonical_continuation",
+        "route_family": "orchestration_provenance",
+        "named_gap": "historical_orchestration_primary_raw_roles",
+        "execution_mode": "execute-continuation",
+        "task_handle": task_handles[0],
+        "required_roles": missing_roles,
+        "approved_roots": normalized_roots,
+        "approved_source_plan_fingerprint": source_plan_fingerprint,
+        "inherited_caps": inherited_caps,
+        "steps": steps,
+        "claim_boundaries": {
+            "approved_transcript_roots_only": True,
+            "current_workspace_search_allowed": False,
+            "generic_shell_recovery_allowed": False,
+            "root_widening_allowed": False,
+            "cap_reset_allowed": False,
+            "answer_generation_included": False,
+        },
+    }
 
 
 def historical_orchestration_provenance_plan_wanted(query: str, *, family: dict[str, Any]) -> bool:
