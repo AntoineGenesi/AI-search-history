@@ -416,6 +416,7 @@ def _parent_thread_answer_mode_preflight_blocker(
             rows=rows,
             cwd=cwd,
             codex_home=codex_home,
+            query=effective_query,
         )
         if lineage.get("status") == "selected":
             return None
@@ -425,7 +426,10 @@ def _parent_thread_answer_mode_preflight_blocker(
                 {"status": "not_inspected"},
                 "canonical_status_boundary_not_found_before_broad_retrieval",
             )
-            for row in _preflight_parent_anchor_candidate_rows(rows)[:8]
+            for row in _preflight_parent_anchor_candidate_rows(
+                rows,
+                include_literal_latest_followups=_literal_latest_parent_message_mode(effective_query),
+            )[:8]
         ]
     else:
         lineage = (
@@ -564,7 +568,7 @@ def _fast_parent_thread_side_boundary_resolution(
         for row in rows
         if int(row.get("line") or 0) < boundary_line
         and row.get("source_identifier") == parent_identifier
-        and not _is_never_anchor(row)
+        and (not _is_never_anchor(row) or _literal_latest_parent_anchor_candidate(row, query=query))
         and _is_eligible_anchor(row)
     ]
     parent_rows.sort(key=lambda row: int(row.get("line") or 0), reverse=True)
@@ -585,7 +589,7 @@ def _fast_parent_thread_side_boundary_resolution(
                 )
             )
             continue
-        selected = dict(row)
+        selected = _literal_latest_parent_anchor_candidate(row, query=query) or dict(row)
         selected["parent_thread_lineage_anchor"] = True
         selected["side_parent_boundary_anchor"] = True
         selected["lineage_resolution"] = parent_lineage
@@ -619,11 +623,16 @@ def _fast_recover_out_of_band_parent_main_anchor(
     rows: list[dict],
     cwd: Path,
     codex_home: Path,
+    query: str,
 ) -> dict:
     eligible = []
     rejected = []
     latest_timestamp = None
-    for row in _preflight_parent_anchor_candidate_rows(rows):
+    literal_latest_mode = _literal_latest_parent_message_mode(query) and _has_status_question_boundary_row(rows)
+    for row in _preflight_parent_anchor_candidate_rows(
+        rows,
+        include_literal_latest_followups=literal_latest_mode,
+    ):
         row_timestamp_text = str(row.get("timestamp_utc") or "")
         if (
             latest_timestamp is not None
@@ -639,7 +648,7 @@ def _fast_recover_out_of_band_parent_main_anchor(
         if rejection:
             rejected.append(_lineage_rejected_anchor(row, lineage, rejection))
             continue
-        selected = dict(row)
+        selected = _literal_latest_parent_anchor_candidate(row, query=query) or dict(row)
         selected["parent_thread_lineage_anchor"] = True
         selected["side_parent_boundary_anchor"] = True
         selected["deterministic_parent_session_recovery_anchor"] = True
@@ -654,7 +663,10 @@ def _fast_recover_out_of_band_parent_main_anchor(
             "rejected_anchor_alternatives": rejected[:8],
             "preflight_before_latest_user_messages": True,
         }
-    selection = _select_out_of_band_parent_main_anchor(eligible)
+    selection = _select_out_of_band_parent_main_anchor(
+        eligible,
+        prefer_literal_latest=literal_latest_mode,
+    )
     if selection.get("status") == "selected":
         selected = selection["selected_anchor"]
         return {
@@ -723,9 +735,13 @@ def _fast_recover_parent_thread_side_boundary_without_direct_edge(
             "side_lineage": side_lineage,
             "preflight_before_latest_user_messages": True,
         }
+    literal_latest_mode = _literal_latest_parent_message_mode(query)
     prior_rows = [
         row
-        for row in _preflight_parent_anchor_candidate_rows(rows)
+        for row in _preflight_parent_anchor_candidate_rows(
+            rows,
+            include_literal_latest_followups=literal_latest_mode,
+        )
         if int(row.get("line") or 0) < boundary_line
     ]
     side_session_identifiers = {
@@ -948,16 +964,29 @@ def _fast_session_files_for_history_anchor(anchor: dict, *, codex_home: Path) ->
     return matches
 
 
-def _preflight_parent_anchor_candidate_rows(rows: list[dict]) -> list[dict]:
+def _preflight_parent_anchor_candidate_rows(
+    rows: list[dict],
+    *,
+    include_literal_latest_followups: bool = False,
+) -> list[dict]:
     candidates = []
     for row in sorted(
         rows,
         key=lambda item: (str(item.get("timestamp_utc") or ""), int(item.get("line") or 0)),
         reverse=True,
     ):
+        literal_followup = (
+            _literal_latest_parent_anchor_candidate(row, query="since my last message in the parent thread")
+            if include_literal_latest_followups
+            else None
+        )
         if _is_never_anchor(row) or not _is_eligible_anchor(row):
+            if literal_followup:
+                candidates.append(literal_followup)
+                if len(candidates) >= 8:
+                    break
             continue
-        candidates.append(row)
+        candidates.append(literal_followup or row)
         if len(candidates) >= 8:
             break
     return candidates
@@ -3255,6 +3284,7 @@ def _canonical_parent_main_status_interval(
             cwd=cwd,
             codex_home=codex_home,
             status_as_of_boundary=status_as_of_boundary,
+            prefer_literal_latest=collapse_adjacent_canonical_duplicates,
         )
         if out_of_band.get("status") == "selected":
             selected = out_of_band.get("selected_anchor") or {}
@@ -3826,6 +3856,7 @@ def _recover_out_of_band_parent_main_anchor(
     cwd: Path,
     codex_home: Path,
     status_as_of_boundary: dict | None,
+    prefer_literal_latest: bool = False,
 ) -> dict:
     if not is_status_question(query) or not (
         _prefers_parent_main_anchor(query) or _relative_status_requires_history_first_anchor(query)
@@ -3841,6 +3872,7 @@ def _recover_out_of_band_parent_main_anchor(
     eligible = []
     rejected = []
     latest_timestamp = None
+    literal_latest_mode = prefer_literal_latest and _literal_latest_parent_message_mode(query)
     for row in sorted(
         rows,
         key=lambda item: (str(item.get("timestamp_utc") or ""), int(item.get("line") or 0)),
@@ -3863,7 +3895,12 @@ def _recover_out_of_band_parent_main_anchor(
             and _eligible_parent_anchor_window_has_substantive(eligible)
         ):
             break
-        if _is_never_anchor(row) or not _is_eligible_anchor(row):
+        literal_latest_candidate = (
+            _literal_latest_parent_anchor_candidate(row, query=query)
+            if literal_latest_mode
+            else None
+        )
+        if (_is_never_anchor(row) or not _is_eligible_anchor(row)) and not literal_latest_candidate:
             if len(rejected) < 8:
                 rejected.append(
                     _lineage_rejected_anchor(
@@ -3883,7 +3920,7 @@ def _recover_out_of_band_parent_main_anchor(
             if len(rejected) < 8:
                 rejected.append(_lineage_rejected_anchor(row, lineage, rejection))
             continue
-        selected = dict(row)
+        selected = literal_latest_candidate or dict(row)
         selected["parent_thread_lineage_anchor"] = True
         selected["side_parent_boundary_anchor"] = True
         selected["deterministic_parent_session_recovery_anchor"] = True
@@ -3905,7 +3942,10 @@ def _recover_out_of_band_parent_main_anchor(
             "status_as_of_boundary": status_as_of_boundary,
             "rejected_anchor_alternatives": rejected[:8],
         }
-    selection = _select_out_of_band_parent_main_anchor(eligible)
+    selection = _select_out_of_band_parent_main_anchor(
+        eligible,
+        prefer_literal_latest=literal_latest_mode,
+    )
     if selection.get("status") == "selected":
         selected = selection["selected_anchor"]
         selected_identifier = str(selected.get("source_identifier") or "")
@@ -4002,10 +4042,33 @@ def _eligible_parent_anchor_window_has_substantive(eligible: list[dict]) -> bool
     return any(item.get("classification") == "substantive_work_anchor" for item in eligible)
 
 
-def _select_out_of_band_parent_main_anchor(eligible: list[dict]) -> dict:
+def _select_out_of_band_parent_main_anchor(eligible: list[dict], *, prefer_literal_latest: bool = False) -> dict:
     if not eligible:
         return {"status": "not_found"}
     latest = eligible[0]
+    if prefer_literal_latest:
+        latest_timestamp = str(latest.get("timestamp_utc") or "")
+        equally_latest = [
+            item
+            for item in eligible
+            if str(item.get("timestamp_utc") or "") == latest_timestamp
+        ]
+        if len(equally_latest) > 1:
+            return {
+                "status": "ambiguous",
+                "reason": "multiple_equally_latest_workspace_compatible_parent_sessions_without_direct_edge",
+            }
+        selected = dict(latest)
+        selected["literal_latest_parent_message_anchor"] = True
+        selected["rationale"] = (
+            str(selected.get("rationale") or "").rstrip()
+            + "; selected as the literal latest parent/main user row for a last-message parent-thread query"
+        )
+        return {
+            "status": "selected",
+            "reason": "literal_latest_parent_message_anchor_for_last_message_query",
+            "selected_anchor": selected,
+        }
     substantive = [item for item in eligible if item.get("classification") == "substantive_work_anchor"]
     if substantive:
         selected = substantive[0]
@@ -5850,6 +5913,36 @@ def _relative_status_requires_history_first_anchor(query: str) -> bool:
             "before the side thread",
         )
     )
+
+
+def _literal_latest_parent_message_mode(query: str) -> bool:
+    return _relative_status_requires_history_first_anchor(query) and _requires_raw_parent_thread_boundary(query)
+
+
+def _literal_latest_parent_anchor_candidate(row: dict, *, query: str) -> dict | None:
+    if not _literal_latest_parent_message_mode(query):
+        return None
+    if row.get("classification") not in {"followup_or_meta_control_turn", "worker_or_reviewer_prompt"}:
+        return None
+    if row.get("source_kind") != "codex_history":
+        return None
+    snippet = str(row.get("snippet") or "")
+    if is_status_question(snippet) or _is_status_boundary_prompt_noise({"snippet": snippet}):
+        return None
+    candidate = dict(row)
+    candidate["decision"] = "fallback_candidate"
+    candidate["score"] = max(1, int(candidate.get("score") or 0))
+    candidate["literal_latest_parent_message_anchor"] = True
+    candidate["rationale"] = "literal latest parent/main user continuation accepted for a last-message parent-thread query"
+    return candidate
+
+
+def _has_status_question_boundary_row(rows: list[dict]) -> bool:
+    for row in rows:
+        snippet = str(row.get("snippet") or "")
+        if is_status_question(snippet) and not _is_status_boundary_prompt_noise({"snippet": snippet}):
+            return True
+    return False
 
 
 def _has_canonical_history_source(messages: list[dict]) -> bool:
