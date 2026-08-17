@@ -1699,9 +1699,6 @@ def classify_ask_route(
     if _looks_like_process_actual_use_query(normalized):
         return ROUTES[3]
 
-    if _looks_like_task_window_status_handoff_query(normalized):
-        return ROUTES[5]
-
     if _looks_like_parent_main_status_anchor_failure_query(normalized):
         return ROUTES[5]
 
@@ -1721,6 +1718,9 @@ def classify_ask_route(
 
     if _looks_like_historical_orchestration_episode_query(normalized):
         return ROUTES[4]
+
+    if _looks_like_task_window_status_handoff_query(normalized):
+        return ROUTES[5]
 
     if _looks_like_latest_status_anchor_query(normalized):
         if activation_mode == "explicit-only" and explicit_query is None:
@@ -2467,12 +2467,12 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
 def _looks_like_historical_orchestration_episode_query(normalized: str) -> bool:
     """Reserve task-specific orchestration provenance for raw-source discovery.
 
-    This deliberately sits ahead of the generic status-anchor detector.  A
-    range/status handoff remains a status request, and an explicit current-run
-    request remains outside historical discovery.
+    This deliberately sits ahead of generic status handoff detection.  A
+    multi-task range/status handoff remains a status request, and an explicit
+    current-run request remains outside historical discovery.  A separately
+    named, explicitly negated current evaluation run does not turn the one
+    historical episode into a two-task status handoff.
     """
-    if _looks_like_task_window_status_handoff_query(normalized):
-        return False
     if not _looks_like_orchestration_provenance_query(normalized):
         return False
     if len(_historical_task_handles(normalized)) != 1:
