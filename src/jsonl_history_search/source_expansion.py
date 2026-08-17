@@ -381,17 +381,20 @@ def build_execute_continuation_payload(
         if continuation_step_identity(read) not in prior_step_identities
     ]
     selected_reads = pending_reads[: max(0, int(max_steps))]
-    expanded_reads = [
-        execute_continuation_step(
+    approved_history_budget = approved_history_budget_from_step_states(prior_step_states)
+    expanded_reads = []
+    for index, read in enumerate(selected_reads):
+        expanded = execute_continuation_step(
             read=read,
             rank=index + 1,
             plan=plan,
             default_tz=default_tz,
             cwd=cwd,
             max_output_chars=max(0, int(max_output_chars)),
+            approved_history_budget=approved_history_budget,
         )
-        for index, read in enumerate(selected_reads)
-    ]
+        expanded_reads.append(expanded)
+        approved_history_budget = approved_history_budget_after_step(approved_history_budget, expanded)
     counts = follow_next_read_counts(selected_reads, expanded_reads)
     selected_step_identities = [continuation_step_identity(read) for read in selected_reads]
     new_executed_step_states = continuation_executed_step_states(expanded_reads)
@@ -468,6 +471,7 @@ def build_execute_continuation_payload(
             "executed_step_states": executed_step_states,
             "remaining_step_count": remaining_after_count,
             "prior_receipt_consumed": prior_summary.get("status") == "loaded",
+            "approved_history_cumulative_budget": approved_history_budget,
         },
         "geometry_causality_gate": geometry_gate,
         "reviewed_follow_through_answer_gate": build_reviewed_follow_through_answer_gate(counts, {**base, **counts}),
@@ -1947,6 +1951,7 @@ def continuation_executed_step_states(expanded_reads: list[dict[str, Any]]) -> l
                 "step_identity": item.get("step_identity"),
                 "candidate_id": item.get("candidate_id"),
                 "read_role": item.get("read_role"),
+                "continuation_step_kind": item.get("continuation_step_kind"),
                 "status": item.get("status"),
                 "remaining_named_gap": item.get("named_gap"),
                 "target_handle": hashed_handle("target", item.get("target")),
@@ -1955,6 +1960,14 @@ def continuation_executed_step_states(expanded_reads: list[dict[str, Any]]) -> l
                     json.dumps(item.get("source_ref"), sort_keys=True, default=str)
                     if isinstance(item.get("source_ref"), dict)
                     else None,
+                ),
+                "approved_history_packet_budget": (
+                    {
+                        "files_examined": (item.get("searched_scope") or {}).get("files_examined", 0),
+                        "bytes_examined": (item.get("searched_scope") or {}).get("bytes_examined", 0),
+                    }
+                    if item.get("continuation_step_kind") == "approved_history_orchestration_roles"
+                    else None
                 ),
             }
         )
@@ -2209,6 +2222,7 @@ def execute_continuation_step(
     default_tz,
     cwd: Path,
     max_output_chars: int,
+    approved_history_budget: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if read.get("_continuation_step_kind") == "deep_audit_semantic_debug":
         return execute_deep_audit_semantic_debug_step(
@@ -2217,7 +2231,11 @@ def execute_continuation_step(
             max_output_chars=max_output_chars,
         )
     if read.get("_continuation_step_kind") == "approved_history_orchestration_roles":
-        return execute_approved_history_orchestration_roles_step(read=read, rank=rank)
+        return execute_approved_history_orchestration_roles_step(
+            read=read,
+            rank=rank,
+            prior_budget=approved_history_budget,
+        )
     return expand_follow_next_read(
         read=read,
         rank=rank,
@@ -2228,7 +2246,12 @@ def execute_continuation_step(
     )
 
 
-def execute_approved_history_orchestration_roles_step(*, read: dict[str, Any], rank: int) -> dict[str, Any]:
+def execute_approved_history_orchestration_roles_step(
+    *,
+    read: dict[str, Any],
+    rank: int,
+    prior_budget: dict[str, int] | None = None,
+) -> dict[str, Any]:
     validation = approved_history_orchestration_step_validation(read, packet=read.get("_packet") or {})
     base = {
         "rank": rank,
@@ -2256,6 +2279,9 @@ def execute_approved_history_orchestration_roles_step(*, read: dict[str, Any], r
             "searched_scope": {"approved_root": str(root), "files_examined": 0, "bytes_examined": 0, "caps_hit": [], "current_workspace_searched": False},
         }
     caps = read["inherited_caps"]
+    prior_budget = prior_budget or {}
+    prior_files = max(0, int(prior_budget.get("files_examined") or 0))
+    prior_bytes = max(0, int(prior_budget.get("bytes_examined") or 0))
     files, bytes_examined, cap_hits, refs = 0, 0, [], []
     paths = [root] if root.is_file() and root.suffix == ".jsonl" else []
     if root.is_dir():
@@ -2273,10 +2299,10 @@ def execute_approved_history_orchestration_roles_step(*, read: dict[str, Any], r
             size = path.stat().st_size
         except OSError:
             continue
-        if files >= int(caps["max_files"]):
+        if prior_files + files >= int(caps["max_files"]):
             cap_hits.append("max_files")
             break
-        if bytes_examined + size > int(caps["max_bytes"]):
+        if prior_bytes + bytes_examined + size > int(caps["max_bytes"]):
             cap_hits.append("max_bytes")
             break
         files += 1
@@ -2294,9 +2320,46 @@ def execute_approved_history_orchestration_roles_step(*, read: dict[str, Any], r
         "continuation_result_status": "approved_history_roles_found" if not missing_roles else "approved_history_capped" if cap_hits else "not_found_within_approved_corpus_and_budget",
         "role_scoped_raw_refs": deduped_refs,
         "missing_roles": missing_roles,
-        "searched_scope": {"approved_root": str(root), "files_examined": files, "bytes_examined": bytes_examined, "caps_hit": cap_hits, "current_workspace_searched": False},
+        "searched_scope": {
+            "approved_root": str(root),
+            "files_examined": files,
+            "bytes_examined": bytes_examined,
+            "caps_hit": cap_hits,
+            "current_workspace_searched": False,
+            "packet_budget": {
+                "max_files": int(caps["max_files"]),
+                "max_bytes": int(caps["max_bytes"]),
+                "prior_files_examined": prior_files,
+                "prior_bytes_examined": prior_bytes,
+                "cumulative_files_examined": prior_files + files,
+                "cumulative_bytes_examined": prior_bytes + bytes_examined,
+            },
+        },
         "claim_boundaries": {"generic_shell_recovery_allowed": False, "root_widening_allowed": False, "answer_generation_included": False},
     }
+
+
+def approved_history_budget_from_step_states(step_states: list[dict[str, Any]]) -> dict[str, int]:
+    files, bytes_examined = 0, 0
+    for state in step_states:
+        if state.get("continuation_step_kind") != "approved_history_orchestration_roles":
+            continue
+        budget = state.get("approved_history_packet_budget")
+        if not isinstance(budget, dict):
+            continue
+        files += max(0, int(budget.get("files_examined") or 0))
+        bytes_examined += max(0, int(budget.get("bytes_examined") or 0))
+    return {"files_examined": files, "bytes_examined": bytes_examined}
+
+
+def approved_history_budget_after_step(prior_budget: dict[str, int], step: dict[str, Any]) -> dict[str, int]:
+    files = max(0, int(prior_budget.get("files_examined") or 0))
+    bytes_examined = max(0, int(prior_budget.get("bytes_examined") or 0))
+    scope = step.get("searched_scope") if isinstance(step.get("searched_scope"), dict) else {}
+    if step.get("continuation_step_kind") == "approved_history_orchestration_roles":
+        files += max(0, int(scope.get("files_examined") or 0))
+        bytes_examined += max(0, int(scope.get("bytes_examined") or 0))
+    return {"files_examined": files, "bytes_examined": bytes_examined}
 
 
 def approved_history_role_refs_in_file(path: Path, *, task_handle: str, roles: list[str]) -> list[dict[str, Any]]:
