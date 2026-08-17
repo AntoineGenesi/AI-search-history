@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -32,6 +33,7 @@ CURRENT_TASK_RUN_HANDLE_RE = re.compile(
     r"(?:evaluation\s+)?run\b",
     re.IGNORECASE,
 )
+EPISODE_PARENT_SCAN_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,7 @@ class _SpawnedSessionResolver:
             and handle not in self._current_run_task_handles
         )
         self._episode_parent_paths: list[Path] = []
+        self._episode_locator_sampled_paths: set[Path] = set()
         self._episode_locator_applies = bool(
             len(self._episode_task_handles) == 1
             and re.search(
@@ -169,6 +172,7 @@ class _SpawnedSessionResolver:
             if self._episode_locator_applies
             else []
         )
+        root_search_complete = not self.cap_hits and not self.omitted_reasons
         primary_source_blocker = (
             {
                 "kind": "unavailable_primary_orchestration_source",
@@ -181,7 +185,7 @@ class _SpawnedSessionResolver:
                 "final_support_allowed": False,
                 "raw_text_included": False,
             }
-            if missing_primary_child_roles
+            if missing_primary_child_roles and root_search_complete
             else None
         )
         diagnostics = {
@@ -226,6 +230,7 @@ class _SpawnedSessionResolver:
                 "primary_child_roles_found": sorted(child_owner_roles),
                 "required_primary_child_roles": required_primary_child_roles,
                 "missing_primary_child_roles": missing_primary_child_roles,
+                "root_search_complete": root_search_complete,
                 "primary_source_blocker": primary_source_blocker,
                 "raw_text_included": False,
             },
@@ -286,20 +291,135 @@ class _SpawnedSessionResolver:
     def _locate_historical_episode_parents(self) -> list[Path]:
         """Find task-handle parent transcripts only inside the approved plan roots."""
         parents: list[Path] = []
-        for path, _size, _warnings in enumerate_jsonl_files(
-            self.plan,
-            preferred_terms=list(self._episode_task_handles),
-        ):
-            if not self._within_caps() or len(parents) >= self.limits.max_children:
+        for path in self._historical_episode_candidate_files():
+            if not self._within_caps():
+                break
+            if len(parents) >= self.limits.max_children:
+                self.cap_hits.add("max_children")
                 break
             if self._is_current_task_or_same_loop_path(path):
                 continue
-            if not self._charge_file(path):
+            if not self._charge_episode_locator_sample(path):
                 break
             if not self._looks_like_episode_parent(path):
                 continue
             parents.append(path)
         return parents
+
+    def _historical_episode_candidate_files(self) -> Iterable[Path]:
+        """Yield approved-root files one per dated bucket before taking another.
+
+        Generic enumeration is newest-first and accounts for complete files.
+        A large current transcript can therefore consume the whole locator
+        budget before an older historical episode is considered.  The episode
+        locator needs only a bounded header to identify a parent, so it
+        interleaves dated buckets while retaining the resolver's caps.
+        """
+        groups: list[list[Path]] = []
+        for planned_root in self.plan.roots:
+            if not self._within_caps():
+                break
+            root = planned_root.path.expanduser()
+            if root.is_file() and root.suffix == ".jsonl":
+                groups.append([root])
+            elif root.is_dir():
+                root_groups = self._historical_episode_date_groups(root)
+                groups.extend(root_groups or self._historical_episode_unstructured_groups(root))
+
+        width = max((len(paths) for paths in groups), default=0)
+        for index in range(width):
+            for paths in groups:
+                if index < len(paths):
+                    yield paths[index]
+
+    def _historical_episode_date_groups(self, root: Path) -> list[list[Path]]:
+        """Return direct-file and YYYY/MM/DD groups in newest-first order."""
+        groups: list[list[Path]] = []
+        try:
+            years = sorted(
+                [entry for entry in os.scandir(root) if entry.is_dir(follow_symlinks=False) and entry.name.isdigit()],
+                key=lambda entry: entry.name,
+                reverse=True,
+            )
+            if not years:
+                return []
+            for year in years:
+                if not self._within_caps():
+                    return groups
+                months = sorted(
+                    [entry for entry in os.scandir(year.path) if entry.is_dir(follow_symlinks=False) and entry.name.isdigit()],
+                    key=lambda entry: entry.name,
+                    reverse=True,
+                )
+                for month in months:
+                    if not self._within_caps():
+                        return groups
+                    direct_files = self._episode_group_files(Path(month.path))
+                    if direct_files:
+                        groups.append(direct_files)
+                    days = sorted(
+                        [entry for entry in os.scandir(month.path) if entry.is_dir(follow_symlinks=False) and entry.name.isdigit()],
+                        key=lambda entry: entry.name,
+                        reverse=True,
+                    )
+                    for day in days:
+                        if not self._within_caps():
+                            return groups
+                        paths = self._episode_group_files(Path(day.path))
+                        if paths:
+                            groups.append(paths)
+        except OSError:
+            self.omitted_reasons.append("episode_parent_root_unreadable")
+        return groups
+
+    def _historical_episode_unstructured_groups(self, root: Path) -> list[list[Path]]:
+        """Retain bounded parent discovery for approved roots without date folders."""
+        groups: list[list[Path]] = []
+        try:
+            for directory, dirnames, _filenames in os.walk(root, followlinks=False):
+                if not self._within_caps():
+                    return groups
+                dirnames.sort(reverse=True)
+                paths = self._episode_group_files(Path(directory))
+                if paths:
+                    groups.append(paths)
+        except OSError:
+            self.omitted_reasons.append("episode_parent_root_unreadable")
+        return groups
+
+    def _episode_group_files(self, directory: Path) -> list[Path]:
+        try:
+            paths = [
+                Path(entry.path)
+                for entry in os.scandir(directory)
+                if entry.is_file(follow_symlinks=False) and entry.name.endswith(".jsonl")
+            ]
+        except OSError:
+            self.omitted_reasons.append("episode_parent_root_unreadable")
+            return []
+        return sorted(
+            paths,
+            key=lambda path: (
+                not any(handle in path.name.casefold() for handle in self._episode_task_handles),
+                path.name,
+            ),
+            reverse=False,
+        )
+
+    def _charge_episode_locator_sample(self, path: Path) -> bool:
+        if path in self._episode_locator_sampled_paths:
+            return True
+        if self.files_examined >= self.limits.max_files:
+            self.cap_hits.add("max_files")
+            return False
+        sample_bytes = min(stat_size(path), EPISODE_PARENT_SCAN_BYTES)
+        if self.bytes_examined + sample_bytes > self.limits.max_bytes:
+            self.cap_hits.add("max_bytes")
+            return False
+        self.files_examined += 1
+        self.bytes_examined += sample_bytes
+        self._episode_locator_sampled_paths.add(path)
+        return True
 
     @staticmethod
     def _is_current_task_or_same_loop_path(path: Path) -> bool:
@@ -333,7 +453,7 @@ class _SpawnedSessionResolver:
                 bytes_read = 0
                 for line in handle:
                     line_bytes = len(line.encode("utf-8", errors="replace"))
-                    if bytes_read + line_bytes > 262144:
+                    if bytes_read + line_bytes > EPISODE_PARENT_SCAN_BYTES:
                         break
                     bytes_read += line_bytes
                     lowered = line.casefold()
@@ -351,7 +471,7 @@ class _SpawnedSessionResolver:
                             lowered,
                         )
                     )
-                    if bytes_read >= 262144:
+                    if bytes_read >= EPISODE_PARENT_SCAN_BYTES:
                         break
         except OSError:
             self.omitted_reasons.append("episode_parent_unreadable")
