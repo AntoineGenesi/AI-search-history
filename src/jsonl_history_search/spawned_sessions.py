@@ -103,8 +103,18 @@ class _SpawnedSessionResolver:
         self.detected_events: list[dict[str, Any]] = []
         self.children: list[_ResolvedChild] = []
         self._known_files: list[Path] | None = None
+        self._charged_paths: set[Path] = set()
         self._task_handles = tuple(
             dict.fromkeys(match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(query or ""))
+        )
+        self._episode_parent_paths: list[Path] = []
+        self._episode_locator_applies = bool(
+            self._task_handles
+            and re.search(
+                r"\b(?:coordinator|worker|reviewer|rereviewer|subagent|spawned|launched|orchestration)\b",
+                query or "",
+                re.IGNORECASE,
+            )
         )
 
     def resolve(self) -> dict[str, Any]:
@@ -112,6 +122,11 @@ class _SpawnedSessionResolver:
         if not query_wants_spawn:
             return self._result(applies=False, status="not_applicable")
         parent_paths = self._parent_paths()
+        if self._episode_locator_applies:
+            self._episode_parent_paths = self._locate_historical_episode_parents()
+            parent_paths = self._episode_parent_paths + [
+                path for path in parent_paths if path not in self._episode_parent_paths
+            ]
 
         for child in self._structured_edge_children(parent_paths):
             self._add_child(child)
@@ -125,6 +140,34 @@ class _SpawnedSessionResolver:
 
     def _result(self, *, applies: bool, status: str) -> dict[str, Any]:
         child_reads = self._child_next_reads()
+        episode_parent_reads = self._episode_parent_next_reads()
+        child_owner_roles = {
+            role
+            for read in child_reads
+            for role in read.get("source_owner_roles") or []
+            if role in {"worker", "reviewer"}
+        }
+        required_primary_child_roles = self._requested_primary_child_roles()
+        missing_primary_child_roles = (
+            [role for role in required_primary_child_roles if role not in child_owner_roles]
+            if self._episode_locator_applies and self._episode_parent_paths
+            else []
+        )
+        primary_source_blocker = (
+            {
+                "kind": "unavailable_primary_orchestration_source",
+                "status": "unavailable_primary_worker_reviewer_raw_source",
+                "missing_roles": missing_primary_child_roles,
+                "reason": (
+                    "The approved transcript roots were searched within the episode locator caps, but "
+                    "pre-existing raw worker/reviewer child-session refs were not both available."
+                ),
+                "final_support_allowed": False,
+                "raw_text_included": False,
+            }
+            if missing_primary_child_roles
+            else None
+        )
         diagnostics = {
             "spawn_detected": len(self.detected_events),
             "child_transcript_inspected": len(child_reads),
@@ -142,6 +185,7 @@ class _SpawnedSessionResolver:
                 if count
             ],
             "next_reads": child_reads,
+            "episode_parent_next_reads": episode_parent_reads,
             "child_transcript_refs": [
                 {
                     "target": read.get("target"),
@@ -151,6 +195,24 @@ class _SpawnedSessionResolver:
                 for read in child_reads
             ],
             "missing_children": self.missing[: self.limits.max_children],
+            "historical_orchestration_episode_locator": {
+                "applies": self._episode_locator_applies,
+                "status": (
+                    "parent_refs_found"
+                    if self._episode_parent_paths
+                    else "no_parent_ref_found_in_approved_roots"
+                    if self._episode_locator_applies
+                    else "not_applicable"
+                ),
+                "parent_ref_count": len(episode_parent_reads),
+                "parent_refs": episode_parent_reads,
+                "approved_root_count": len(self.plan.roots),
+                "primary_child_roles_found": sorted(child_owner_roles),
+                "required_primary_child_roles": required_primary_child_roles,
+                "missing_primary_child_roles": missing_primary_child_roles,
+                "primary_source_blocker": primary_source_blocker,
+                "raw_text_included": False,
+            },
             "limits": {
                 "max_depth": self.limits.max_depth,
                 "max_children": self.limits.max_children,
@@ -204,6 +266,113 @@ class _SpawnedSessionResolver:
         if paths:
             return paths
         return self._known_jsonl_files()[: min(5, self.limits.max_files)]
+
+    def _locate_historical_episode_parents(self) -> list[Path]:
+        """Find task-handle parent transcripts only inside the approved plan roots."""
+        parents: list[Path] = []
+        for path, _size, _warnings in enumerate_jsonl_files(
+            self.plan,
+            preferred_terms=list(self._task_handles),
+        ):
+            if not self._within_caps() or len(parents) >= self.limits.max_children:
+                break
+            if self._is_current_task_or_same_loop_path(path):
+                continue
+            if not self._charge_file(path):
+                break
+            if not self._looks_like_episode_parent(path):
+                continue
+            parents.append(path)
+        return parents
+
+    @staticmethod
+    def _is_current_task_or_same_loop_path(path: Path) -> bool:
+        parts = {part.casefold().replace("-", "_") for part in path.parts}
+        return bool(
+            parts.intersection(
+                {
+                    "current_task",
+                    "currenttask",
+                    "same_loop",
+                    "sameloop",
+                    "same_run",
+                    "samerun",
+                    "current_run",
+                    "currentrun",
+                    "live_task",
+                    "livetask",
+                    "this_task",
+                    "thistask",
+                }
+            )
+        )
+
+    def _looks_like_episode_parent(self, path: Path) -> bool:
+        handles = set(self._task_handles)
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                bytes_read = 0
+                for line in handle:
+                    bytes_read += len(line.encode("utf-8", errors="replace"))
+                    lowered = line.casefold()
+                    if not handles.intersection({match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(line)}):
+                        if bytes_read >= 262144:
+                            break
+                        continue
+                    if re.search(
+                        r"\b(?:spawn(?:ed|ing)?|launch(?:ed|ing)?|started|created|child\s+(?:session|transcript)|"
+                        r"worker\s+transcript|subagent\s+transcript|reviewer\s+transcript)\b",
+                        lowered,
+                    ):
+                        return True
+                    if bytes_read >= 262144:
+                        break
+        except OSError:
+            self.omitted_reasons.append("episode_parent_unreadable")
+        return False
+
+    def _episode_parent_next_reads(self) -> list[dict[str, Any]]:
+        reads: list[dict[str, Any]] = []
+        for index, path in enumerate(self._episode_parent_paths[: self.limits.max_children], 1):
+            line = self._first_record_line(path)
+            if line is None:
+                continue
+            source_ref = {"path": str(path), "line": line}
+            target = source_ref_target(source_ref)
+            if not target:
+                continue
+            reads.append(
+                {
+                    "kind": "historical_orchestration_parent_source_ref",
+                    "target": target,
+                    "candidate_id": f"historical-orchestration-parent-{index:03d}",
+                    "source_ref": source_ref,
+                    "reason": "inspect pre-existing parent/coordinator transcript before child role claims",
+                    "target_source_role": "target_historical_raw",
+                    "orchestration_roles": ["parent_or_coordinator"],
+                    "source_owner_roles": ["parent_or_coordinator"],
+                    "final_support_allowed": True,
+                    "historical_orchestration_episode_locator": {
+                        "source": "approved_transcript_root_task_handle_locator",
+                        "raw_text_included": False,
+                    },
+                    "expansion_actions": read_more_actions_for_source_ref(
+                        source_ref,
+                        candidate_id=f"historical-orchestration-parent-{index:03d}",
+                        expansion_action_context=self.expansion_action_context,
+                    ),
+                }
+            )
+        return reads
+
+    def _requested_primary_child_roles(self) -> list[str]:
+        lowered = (self.query or "").casefold()
+        roles: list[str] = []
+        if re.search(r"\b(?:worker|implementer|implementation|subagent)\b", lowered):
+            roles.append("worker")
+        if re.search(r"\b(?:reviewer|rereviewer|reviewed|verification|verified)\b", lowered):
+            roles.append("reviewer")
+        return roles or ["worker", "reviewer"]
 
     def _resolve_relative_path(self, path: Path) -> Path | None:
         for root in self._root_paths():
@@ -515,6 +684,8 @@ class _SpawnedSessionResolver:
         return None
 
     def _charge_file(self, path: Path) -> bool:
+        if path in self._charged_paths:
+            return True
         if self.files_examined >= self.limits.max_files:
             self.cap_hits.add("max_files")
             return False
@@ -524,6 +695,7 @@ class _SpawnedSessionResolver:
             return False
         self.files_examined += 1
         self.bytes_examined += size
+        self._charged_paths.add(path)
         return True
 
     def _within_caps(self) -> bool:

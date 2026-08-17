@@ -552,7 +552,9 @@ def build_semantic_debug_payload(
         ),
     )
     if spawned_session_resolution.get("applies"):
-        spawned_reads = list(spawned_session_resolution.get("next_reads") or [])
+        spawned_reads = list(spawned_session_resolution.get("episode_parent_next_reads") or []) + list(
+            spawned_session_resolution.get("next_reads") or []
+        )
         if spawned_reads:
             next_reads = dedupe_dicts(spawned_reads + list(source_locator_handoff.get("next_reads") or next_reads))[:12]
             source_locator_handoff["next_reads"] = next_reads
@@ -589,7 +591,21 @@ def build_semantic_debug_payload(
         candidates=source_selection_candidates,
         query=agent_find["query"]["original"],
         family=family,
+        require_distinct_child_raw_roles=bool(
+            (spawned_session_resolution.get("historical_orchestration_episode_locator") or {}).get("applies")
+        ),
     )
+    episode_locator = spawned_session_resolution.get("historical_orchestration_episode_locator") or {}
+    primary_source_blocker = episode_locator.get("primary_source_blocker")
+    if historical_orchestration_plan and isinstance(primary_source_blocker, dict):
+        historical_orchestration_plan["status"] = "unavailable_primary_source"
+        historical_orchestration_plan["primary_source_blocker"] = primary_source_blocker
+        historical_orchestration_plan["missing_role_recovery_refs"] = [primary_source_blocker]
+        historical_orchestration_plan["missing_role_recovery_ref_count"] = 1
+        historical_orchestration_plan["guidance"]["incomplete_coverage_policy"] = (
+            "Do not make affirmative worker/reviewer role claims. The one emitted primary-source blocker "
+            "states that approved transcript-root discovery did not yield both raw child-session refs."
+        )
     historical_orchestration_role_evidence_bundle = (
         build_historical_orchestration_role_evidence_bundle(historical_orchestration_plan)
         if historical_orchestration_plan
@@ -3088,6 +3104,7 @@ def build_historical_orchestration_provenance_final_support_plan(
     candidates: list[dict[str, Any]],
     query: str,
     family: dict[str, Any],
+    require_distinct_child_raw_roles: bool = False,
 ) -> dict[str, Any]:
     if not historical_orchestration_provenance_plan_wanted(query, family=family):
         return {}
@@ -3115,7 +3132,12 @@ def build_historical_orchestration_provenance_final_support_plan(
             or target_to_candidate.get(str(read.get("target") or ""))
             or {}
         )
-        row = historical_orchestration_read_plan_row(read, candidate=candidate, query=query)
+        row = historical_orchestration_read_plan_row(
+            read,
+            candidate=candidate,
+            query=query,
+            require_distinct_child_raw_roles=require_distinct_child_raw_roles,
+        )
         if row["final_support_allowed"]:
             final_support.append(row)
         elif row["source_chronology_role"] in {
@@ -4397,6 +4419,7 @@ def historical_orchestration_read_plan_row(
     *,
     candidate: dict[str, Any],
     query: str,
+    require_distinct_child_raw_roles: bool = False,
 ) -> dict[str, Any]:
     selection = (
         read.get("historical_provenance_selection")
@@ -4419,6 +4442,12 @@ def historical_orchestration_read_plan_row(
         + historical_orchestration_explicit_source_owner_roles(candidate)
     )
     roles = dedupe(roles + explicit_owner_roles)
+    if require_distinct_child_raw_roles:
+        roles = [
+            role
+            for role in roles
+            if role not in {"worker", "reviewer"} or role in explicit_owner_roles
+        ]
     source_owner_roles = explicit_owner_roles
     role = str(selection.get("source_chronology_role") or "candidate_or_original_source_ref")
     current_run_echo = role == "current_run_self_echo_diagnostic" or historical_provenance_current_run_or_self_echo_candidate(

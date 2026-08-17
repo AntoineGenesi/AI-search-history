@@ -1715,6 +1715,9 @@ def classify_ask_route(
     if _looks_like_coordinator_context_query(normalized):
         return COORDINATOR_CONTEXT_ROUTE
 
+    if _looks_like_historical_orchestration_episode_query(normalized):
+        return ROUTES[4]
+
     if _looks_like_latest_status_anchor_query(normalized):
         if activation_mode == "explicit-only" and explicit_query is None:
             return EXPLICIT_HISTORY_TRIGGER_REQUIRED_ROUTE
@@ -2457,6 +2460,33 @@ def _looks_like_orchestration_provenance_query(normalized: str) -> bool:
             "unresolved",
             "caveat",
             "provenance",
+        ),
+    )
+
+
+def _looks_like_historical_orchestration_episode_query(normalized: str) -> bool:
+    """Reserve task-specific orchestration provenance for raw-source discovery.
+
+    This deliberately sits ahead of the generic status-anchor detector.  A
+    range/status handoff remains a status request, and an explicit current-run
+    request remains outside historical discovery.
+    """
+    if _looks_like_task_window_status_handoff_query(normalized):
+        return False
+    if not _looks_like_orchestration_provenance_query(normalized):
+        return False
+    if not re.search(r"\b[a-z]{2,}[-_]\d{2,}[a-z0-9_-]*\b", normalized):
+        return False
+    return _has_any(
+        normalized,
+        (
+            "historical",
+            "pre-existing",
+            "provenance",
+            "actually did",
+            "what changed",
+            "what was verified",
+            "what remains",
         ),
     )
 
