@@ -27,6 +27,11 @@ JSONL_PATH_RE = re.compile(
 )
 SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
 TASK_HANDLE_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+\b")
+CURRENT_TASK_RUN_HANDLE_RE = re.compile(
+    r"\b(?:current|this)\s+(?P<handle>[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+)\s+"
+    r"(?:evaluation\s+)?run\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -107,9 +112,19 @@ class _SpawnedSessionResolver:
         self._task_handles = tuple(
             dict.fromkeys(match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(query or ""))
         )
+        self._current_run_task_handles = {
+            match.group("handle").casefold()
+            for match in CURRENT_TASK_RUN_HANDLE_RE.finditer(query or "")
+        }
+        self._episode_task_handles = tuple(
+            handle
+            for handle in self._task_handles
+            if any(char.isdigit() for char in handle)
+            and handle not in self._current_run_task_handles
+        )
         self._episode_parent_paths: list[Path] = []
         self._episode_locator_applies = bool(
-            self._task_handles
+            len(self._episode_task_handles) == 1
             and re.search(
                 r"\b(?:coordinator|worker|reviewer|rereviewer|subagent|spawned|launched|orchestration)\b",
                 query or "",
@@ -124,9 +139,10 @@ class _SpawnedSessionResolver:
         parent_paths = self._parent_paths()
         if self._episode_locator_applies:
             self._episode_parent_paths = self._locate_historical_episode_parents()
-            parent_paths = self._episode_parent_paths + [
-                path for path in parent_paths if path not in self._episode_parent_paths
-            ]
+            # A strict historical episode must not inherit retrieval-selected
+            # current or unrelated parents.  They are diagnostic leads only;
+            # child discovery begins from the approved-root task parent.
+            parent_paths = list(self._episode_parent_paths)
 
         for child in self._structured_edge_children(parent_paths):
             self._add_child(child)
@@ -150,7 +166,7 @@ class _SpawnedSessionResolver:
         required_primary_child_roles = self._requested_primary_child_roles()
         missing_primary_child_roles = (
             [role for role in required_primary_child_roles if role not in child_owner_roles]
-            if self._episode_locator_applies and self._episode_parent_paths
+            if self._episode_locator_applies
             else []
         )
         primary_source_blocker = (
@@ -272,7 +288,7 @@ class _SpawnedSessionResolver:
         parents: list[Path] = []
         for path, _size, _warnings in enumerate_jsonl_files(
             self.plan,
-            preferred_terms=list(self._task_handles),
+            preferred_terms=list(self._episode_task_handles),
         ):
             if not self._within_caps() or len(parents) >= self.limits.max_children:
                 break
@@ -308,28 +324,38 @@ class _SpawnedSessionResolver:
         )
 
     def _looks_like_episode_parent(self, path: Path) -> bool:
-        handles = set(self._task_handles)
+        handles = set(self._episode_task_handles)
+        has_target_handle = False
+        has_spawn_evidence = False
+        has_current_run_handle = False
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 bytes_read = 0
                 for line in handle:
-                    bytes_read += len(line.encode("utf-8", errors="replace"))
+                    line_bytes = len(line.encode("utf-8", errors="replace"))
+                    if bytes_read + line_bytes > 262144:
+                        break
+                    bytes_read += line_bytes
                     lowered = line.casefold()
-                    if not handles.intersection({match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(line)}):
-                        if bytes_read >= 262144:
-                            break
-                        continue
-                    if re.search(
-                        r"\b(?:spawn(?:ed|ing)?|launch(?:ed|ing)?|started|created|child\s+(?:session|transcript)|"
-                        r"worker\s+transcript|subagent\s+transcript|reviewer\s+transcript)\b",
-                        lowered,
-                    ):
-                        return True
+                    line_handles = {
+                        match.group(0).casefold() for match in TASK_HANDLE_RE.finditer(line)
+                    }
+                    has_target_handle = has_target_handle or bool(handles.intersection(line_handles))
+                    has_current_run_handle = has_current_run_handle or bool(
+                        self._current_run_task_handles.intersection(line_handles)
+                    )
+                    has_spawn_evidence = has_spawn_evidence or bool(
+                        re.search(
+                            r"\b(?:spawn(?:ed|ing)?|launch(?:ed|ing)?|started|created|child\s+(?:session|transcript)|"
+                            r"worker\s+transcript|subagent\s+transcript|reviewer\s+transcript)\b",
+                            lowered,
+                        )
+                    )
                     if bytes_read >= 262144:
                         break
         except OSError:
             self.omitted_reasons.append("episode_parent_unreadable")
-        return False
+        return has_target_handle and has_spawn_evidence and not has_current_run_handle
 
     def _episode_parent_next_reads(self) -> list[dict[str, Any]]:
         reads: list[dict[str, Any]] = []
