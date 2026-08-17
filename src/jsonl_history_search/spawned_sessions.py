@@ -292,7 +292,10 @@ class _SpawnedSessionResolver:
         """Find task-handle parent transcripts only inside the approved plan roots."""
         parents: list[Path] = []
         for path in self._historical_episode_candidate_files():
-            if not self._within_caps() or len(parents) >= self.limits.max_children:
+            if not self._within_caps():
+                break
+            if len(parents) >= self.limits.max_children:
+                self.cap_hits.add("max_children")
                 break
             if self._is_current_task_or_same_loop_path(path):
                 continue
@@ -301,10 +304,6 @@ class _SpawnedSessionResolver:
             if not self._looks_like_episode_parent(path):
                 continue
             parents.append(path)
-            # An exact historical task handle defines one episode.  Once its
-            # parent is found, preserve the remaining bounded budget for its
-            # role-owned child transcripts rather than sampling later files.
-            break
         return parents
 
     def _historical_episode_candidate_files(self) -> Iterable[Path]:
