@@ -556,7 +556,14 @@ def build_semantic_debug_payload(
             spawned_session_resolution.get("next_reads") or []
         )
         episode_locator = spawned_session_resolution.get("historical_orchestration_episode_locator") or {}
-        if episode_locator.get("applies"):
+        historical_episode_primary_boundary = bool(
+            episode_locator.get("applies")
+            and historical_orchestration_provenance_plan_wanted(
+                agent_find["query"]["original"],
+                family=family,
+            )
+        )
+        if historical_episode_primary_boundary:
             # The one-handle historical episode locator is the primary-source
             # boundary. Do not let retrieval-selected current-loop or unrelated
             # child reads become actionable before its parent/role refs (or its
@@ -568,7 +575,7 @@ def build_semantic_debug_payload(
                 spawned_reads + list(source_locator_handoff.get("next_reads") or next_reads)
             )[:12]
             source_locator_handoff["next_reads"] = next_reads
-        if spawned_reads or episode_locator.get("applies"):
+        if spawned_reads or historical_episode_primary_boundary:
             source_handle_routing = build_source_handle_routing(
                 agent_find["query"]["original"],
                 candidates=source_selection_candidates,
