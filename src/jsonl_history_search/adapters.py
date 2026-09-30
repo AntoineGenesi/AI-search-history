@@ -482,6 +482,7 @@ class CursorSqliteAdapter:
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
                      raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        _note_immutable_wal_omission(raw_line_stats, "cursor", path)
         try:
             connection = _open_immutable_query_only(path)
         except (OSError, sqlite3.Error) as exc:
@@ -568,6 +569,7 @@ class OpenCodeSqliteAdapter:
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
                      raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        _note_immutable_wal_omission(raw_line_stats, "opencode", path)
         try:
             connection = _open_immutable_query_only(path)
         except (OSError, sqlite3.Error) as exc:
@@ -741,6 +743,36 @@ def _open_immutable_query_only(path: Path) -> sqlite3.Connection:
         raise
     connection.close()
     raise sqlite3.OperationalError("query_only could not be enabled")
+
+
+def _note_immutable_wal_omission(
+    stats: RawLineScanStats | None, provider: str, path: Path
+) -> None:
+    if stats is None:
+        return
+    wal_path = Path(f"{path}-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        stats.note_partial(
+            provider=provider,
+            path=path,
+            line=None,
+            reason=f"could not inspect SQLite WAL sidecar before immutable read: {exc}",
+        )
+        return
+    if wal_size > 0:
+        stats.note_partial(
+            provider=provider,
+            path=path,
+            line=None,
+            reason=(
+                f"non-empty SQLite WAL sidecar ({wal_size} bytes) was omitted by immutable read; "
+                "committed uncheckpointed rows may be absent"
+            ),
+        )
 
 
 def _sqlite_tables(connection: sqlite3.Connection) -> set[str]:
