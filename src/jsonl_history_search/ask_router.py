@@ -5,6 +5,7 @@ import re
 import shlex
 from typing import Literal
 
+from .decisions import DecisionEngine, DecisionQuestion, DecisionRequest
 from .agent_command_cookbook import (
     STORAGE_ROOT_INVENTORY_COMMAND,
     agent_question_cookbook,
@@ -1359,6 +1360,7 @@ def build_ask_router_payload(
     evidence_source: EvidenceSource | None = None,
     activation_mode: ActivationMode = "implicit",
     audit_depth: str | None = None,
+    decision_engine: DecisionEngine | None = None,
 ) -> dict:
     explicit_history_tool_alias = _explicit_history_tool_alias(query)
     route_query = _explicit_history_tool_alias_query(query) or query
@@ -1367,6 +1369,13 @@ def build_ask_router_payload(
         evidence_source=evidence_source,
         activation_mode=activation_mode,
     )
+    decision_support = None
+    if decision_engine is not None:
+        route, decision_support = _apply_optional_route_decision(
+            route=route,
+            query=route_query,
+            engine=decision_engine,
+        )
     explicit_convo_trigger = explicit_history_tool_alias is not None
     named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(route_query)
@@ -1486,7 +1495,7 @@ def build_ask_router_payload(
             cli_prefix=cli_prefix,
             query=query,
         )
-    return {
+    payload = {
         "ask_router": {
             "status": "matched",
             "query": query,
@@ -1531,6 +1540,9 @@ def build_ask_router_payload(
             ),
         }
     }
+    if decision_support is not None:
+        payload["ask_router"]["decision_support"] = decision_support
+    return payload
 
 
 def execution_kind_for_route_family(route_family: str) -> str | None:
@@ -1836,6 +1848,132 @@ def classify_ask_route(
             "no-evidence or a named missing-primary-source blocker."
         ),
     )
+
+
+_OPTIONAL_ROUTE_CHOICES = {
+    "causal_history": CAUSAL_HISTORY_ROUTE,
+    "topic_history": TOPIC_HISTORY_ROUTE,
+    "remembered_user_wording": REMEMBERED_USER_WORDING_ROUTE,
+}
+
+
+def _apply_optional_route_decision(
+    *,
+    route: AskRoute,
+    query: str,
+    engine: DecisionEngine,
+) -> tuple[AskRoute, dict]:
+    engine_name = str(getattr(engine, "name", "unknown"))
+    if not _is_generic_semantic_debug_fallback(route):
+        return route, {
+            "enabled": True,
+            "engine": engine_name,
+            "eligible": False,
+            "applied": False,
+            "reason": "deterministic_route_not_eligible",
+            "source_content_sent": False,
+            "raw_query_sent": False,
+        }
+
+    request = DecisionRequest(
+        state=_sanitized_route_features(query),
+        questions={
+            "route": DecisionQuestion(
+                type="choice",
+                fallback="semantic_debug",
+                instructions=(
+                    "Choose the best bounded history-search route from the fixed criteria. "
+                    "Use semantic_debug when the derived signals do not clearly support a narrower route."
+                ),
+                criteria={
+                    "semantic_debug": "General history or provenance investigation.",
+                    "causal_history": "The question is primarily asking why an event happened.",
+                    "topic_history": "The question is primarily asking about a topic across time.",
+                    "remembered_user_wording": "The question is primarily asking for prior user wording.",
+                },
+            )
+        },
+        contains_source_content=False,
+    )
+    try:
+        response = engine.decide(request)
+        answer = response.answers.get("route")
+    except Exception as exc:
+        return route, {
+            "enabled": True,
+            "engine": engine_name,
+            "eligible": True,
+            "applied": False,
+            "reason": f"decision_engine_error:{type(exc).__name__}",
+            "fallback_route_family": route.route_family,
+            "source_content_sent": False,
+            "raw_query_sent": False,
+        }
+
+    choice = str(answer.value) if answer is not None else "semantic_debug"
+    decision_accepted = (
+        answer is not None
+        and not answer.used_fallback
+        and choice in {"semantic_debug", *_OPTIONAL_ROUTE_CHOICES}
+    )
+    selected = _OPTIONAL_ROUTE_CHOICES.get(choice, route)
+    if not decision_accepted:
+        selected = route
+    return selected, {
+        "enabled": True,
+        "engine": engine_name,
+        "eligible": True,
+        "decision_accepted": decision_accepted,
+        "applied": decision_accepted and selected is not route,
+        "reason": answer.reason if answer is not None else "missing_route_answer",
+        "fallback_route_family": route.route_family,
+        "selected_choice": choice,
+        "selected_route_family": selected.route_family,
+        "source_content_sent": False,
+        "raw_query_sent": False,
+        "request_state": request.state,
+        "response": response.as_dict(),
+    }
+
+
+def _is_generic_semantic_debug_fallback(route: AskRoute) -> bool:
+    return (
+        route.route_family == "semantic_debug"
+        and route.chosen_route == "semantic-debug"
+        and route.why_it_applies.startswith("The wording looks like a natural conversation-history")
+    )
+
+
+def _sanitized_route_features(query: str) -> dict:
+    normalized = _normalize_for_route(_explicit_history_tool_alias_query(query) or query)
+    word_count = len(re.findall(r"[a-z0-9]+", normalized))
+    if word_count <= 8:
+        word_count_bucket = "short"
+    elif word_count <= 24:
+        word_count_bucket = "medium"
+    else:
+        word_count_bucket = "long"
+    return {
+        "schema_version": "ask_route_features.v1",
+        "content_policy": "derived_features_only",
+        "word_count_bucket": word_count_bucket,
+        "explicit_history_alias": _explicit_history_tool_alias(query) is not None,
+        "asks_why": normalized.startswith("why ") or " why " in f" {normalized} ",
+        "mentions_cause": _has_any(normalized, ("cause", "caused", "reason", "led to")),
+        "mentions_topic_over_time": _has_any(
+            normalized,
+            ("over time", "history of", "how did", "evolve", "timeline"),
+        ),
+        "asks_prior_wording": _has_any(
+            normalized,
+            ("what did i say", "my exact words", "exact wording", "when did i say"),
+        ),
+        "mentions_prior_context": _has_any(
+            normalized,
+            ("before", "earlier", "previous", "prior", "remember"),
+        ),
+        "first_person_reference": bool(re.search(r"\b(i|me|my|we|our)\b", normalized)),
+    }
 
 
 def _explicit_convo_trigger_query(query: str) -> str | None:
