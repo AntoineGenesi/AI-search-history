@@ -2021,6 +2021,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gemini-home", default=None)
     parser.add_argument("--grok-home", default=None)
     parser.add_argument("--aider-root", default=None)
+    parser.add_argument("--cursor-home", default=None)
+    parser.add_argument("--opencode-root", default=None)
     parser.add_argument("--root", action="append", default=[])
     parser.add_argument("--role", default=None)
     parser.add_argument("--max-files", type=int, default=200)
@@ -2149,7 +2151,7 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
     claude_home = normalize_local_path(_history_home_from_args(args, provider="claude"))
     provider_roots = {
         provider: normalize_local_path(_history_home_from_args(args, provider=provider))
-        for provider in ("gemini", "grok", "aider")
+        for provider in ("gemini", "grok", "aider", "cursor", "opencode")
     }
     limits = Limits(
         max_files=args.max_files,

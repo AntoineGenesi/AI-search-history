@@ -24,6 +24,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ProviderSpec("gemini", ("gemini-cli",), ("json", "jsonl"), ("JSONL_HISTORY_GEMINI_HOME", "GEMINI_HOME"), "gemini_home", lambda _cwd: Path.home() / ".gemini" / "tmp"),
     ProviderSpec("grok", ("grok-build", "grok-cli"), ("jsonl", "json-sidecar"), ("JSONL_HISTORY_GROK_HOME", "GROK_HOME"), "grok_home", lambda _cwd: Path.home() / ".grok"),
     ProviderSpec("aider", ("aider-chat",), ("markdown",), ("JSONL_HISTORY_AIDER_ROOT", "CASS_AIDER_DATA_ROOT"), "aider_root", lambda cwd: cwd / ".aider.chat.history.md"),
+    ProviderSpec("cursor", ("cursor-agent", "cursor-composer"), ("jsonl", "sqlite"), ("JSONL_HISTORY_CURSOR_HOME", "CURSOR_HOME"), "cursor_home", lambda _cwd: Path.home() / ".cursor"),
+    ProviderSpec("opencode", ("opencode-cli",), ("sqlite", "legacy-json"), ("JSONL_HISTORY_OPENCODE_ROOT", "OPENCODE_SQLITE_DB", "OPENCODE_STORAGE_ROOT"), "opencode_root", lambda _cwd: Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "opencode"),
 )
 
 _BY_ALIAS = {alias: spec for spec in PROVIDERS for alias in (spec.name, *spec.aliases)}

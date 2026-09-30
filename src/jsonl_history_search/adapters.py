@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -412,7 +413,258 @@ class AiderMarkdownAdapter:
             )
 
 
+class CursorAgentJsonlAdapter:
+    name = "cursor_agent_jsonl"
+    line_oriented = True
+    supports_append_only = True
+
+    def can_handle(self, path: Path, source_kind: str) -> bool:
+        return source_kind.startswith("cursor_") and path.suffix.lower() == ".jsonl"
+
+    def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            _note_malformed(raw_line_stats, "cursor", path, None, f"unreadable Cursor Agent JSONL: {exc}")
+            return
+        with handle:
+            for line_number, raw_line in enumerate(handle, 1):
+                if raw_line_stats is not None:
+                    raw_line_stats.raw_lines_examined += 1
+                if on_raw_line_examined is not None:
+                    on_raw_line_examined(path, line_number)
+                if not raw_line.strip():
+                    continue
+                try:
+                    data = json.loads(raw_line.lstrip("\ufeff"))
+                except json.JSONDecodeError:
+                    _note_malformed(raw_line_stats, "cursor", path, line_number, "malformed Cursor Agent JSONL row")
+                    continue
+                if not isinstance(data, dict):
+                    _note_skipped(raw_line_stats, "cursor", path, line_number, "non-object Cursor Agent row")
+                    continue
+                if raw_line_stats is not None:
+                    raw_line_stats.full_json_records_parsed += 1
+                message = data.get("message") if isinstance(data.get("message"), dict) else data
+                text = _mixed_text(message.get("content") or message.get("text") or message.get("message"))
+                if not text:
+                    _note_ignored(raw_line_stats)
+                    continue
+                role = _normalized_role(message.get("role") or data.get("role") or data.get("type"))
+                raw_timestamp = message.get("timestamp") or data.get("timestamp") or data.get("created_at")
+                native_id = _string_or_none(
+                    message.get("id") or message.get("messageId") or message.get("bubbleId") or data.get("id")
+                ) or f"line-{line_number}"
+                session_id = _string_or_none(
+                    data.get("sessionId") or data.get("session_id") or data.get("conversationId")
+                ) or path.stem
+                locator = f"{path}:{line_number}"
+                yield Record(
+                    path=str(path), line=line_number, role=role, text=text,
+                    timestamp=_provider_datetime(raw_timestamp, default_tz),
+                    cwd=_string_or_none(data.get("cwd") or data.get("workspace") or data.get("projectPath")),
+                    raw_timestamp=str(raw_timestamp) if raw_timestamp is not None else None,
+                    raw=data, source_format=source_kind, record_id=native_id,
+                    conversation_id=session_id, provider="cursor", source_ref=locator,
+                    source_refs=[locator], native_id=native_id,
+                    coverage_notes=["Cursor Agent JSONL support is based on the documented local shape; retain the raw row when attributing actions."],
+                )
+
+
+class CursorSqliteAdapter:
+    name = "cursor_composer_sqlite"
+    line_oriented = False
+    supports_append_only = False
+
+    def can_handle(self, path: Path, source_kind: str) -> bool:
+        return source_kind.startswith("cursor_") and path.suffix.lower() in {".vscdb", ".db", ".sqlite", ".sqlite3"}
+
+    def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        _note_immutable_wal_omission(raw_line_stats, "cursor", path)
+        try:
+            connection = _open_immutable_query_only(path)
+        except (OSError, sqlite3.Error) as exc:
+            _note_malformed(raw_line_stats, "cursor", path, None, f"unreadable or locked Cursor SQLite store: {exc}")
+            return
+        try:
+            tables = _sqlite_tables(connection)
+            supported = [table for table in ("cursorDiskKV", "ItemTable") if table in tables]
+            if not supported:
+                _note_skipped(raw_line_stats, "cursor", path, None, "unsupported Cursor SQLite schema: no cursorDiskKV or ItemTable")
+                return
+            emitted = False
+            for table in supported:
+                columns = _sqlite_columns(connection, table)
+                if not {"key", "value"}.issubset(columns):
+                    _note_skipped(raw_line_stats, "cursor", path, None, f"unsupported Cursor {table} columns")
+                    continue
+                rows = connection.execute(
+                    f'SELECT key, value FROM "{table}" '
+                    "WHERE key LIKE 'composerData:%' OR key LIKE 'bubbleId:%' ORDER BY key LIMIT ?",
+                    (_SQLITE_ROW_LIMIT + 1,),
+                ).fetchall()
+                if len(rows) > _SQLITE_ROW_LIMIT:
+                    raw_line_stats.note_partial(provider="cursor", path=path, line=None, reason=f"Cursor {table} row cap reached") if raw_line_stats else None
+                    rows = rows[:_SQLITE_ROW_LIMIT]
+                decoded: dict[str, dict[str, Any]] = {}
+                for row in rows:
+                    key = str(row["key"])
+                    try:
+                        value = json.loads(row["value"])
+                    except (TypeError, json.JSONDecodeError):
+                        _note_malformed(raw_line_stats, "cursor", path, None, f"malformed JSON in {table}:{key}")
+                        continue
+                    if isinstance(value, dict):
+                        decoded[key] = value
+                    else:
+                        _note_skipped(raw_line_stats, "cursor", path, None, f"non-object JSON in {table}:{key}")
+                for key, composer in decoded.items():
+                    if not key.startswith("composerData:"):
+                        continue
+                    composer_id = key.split(":", 1)[1]
+                    for ordinal, (message, pointer, supporting_key) in enumerate(
+                        _cursor_messages(composer, composer_id=composer_id, decoded=decoded), 1
+                    ):
+                        text = _mixed_text(
+                            message.get("text") or message.get("rawText") or message.get("content") or message.get("message")
+                        )
+                        if not text:
+                            continue
+                        raw_timestamp = message.get("timestamp") or composer.get("createdAt")
+                        message_id = _string_or_none(message.get("bubbleId") or message.get("id")) or f"message-{ordinal}"
+                        base_ref = f"{path}#{table}:{key}"
+                        source_refs = [f"{base_ref}#{pointer}"]
+                        if supporting_key:
+                            source_refs.append(f"{path}#{table}:{supporting_key}")
+                        if raw_line_stats is not None:
+                            raw_line_stats.full_json_records_parsed += 1
+                        emitted = True
+                        yield Record(
+                            path=str(path), line=ordinal, role=_normalized_role(message.get("role") or message.get("type")),
+                            text=text, timestamp=_provider_datetime(raw_timestamp, default_tz),
+                            cwd=_cursor_workspace(message) or _cursor_workspace(composer),
+                            raw_timestamp=str(raw_timestamp) if raw_timestamp is not None else None,
+                            raw={"composer": composer, "message": message}, source_format=source_kind,
+                            record_id=message_id, conversation_id=composer_id, provider="cursor",
+                            source_ref=source_refs[-1] if supporting_key else source_refs[0],
+                            source_refs=source_refs, native_id=message_id,
+                        )
+            if not emitted:
+                _note_skipped(raw_line_stats, "cursor", path, None, "Cursor SQLite store contained no readable Composer messages")
+        except sqlite3.Error as exc:
+            _note_malformed(raw_line_stats, "cursor", path, None, f"Cursor SQLite query failed: {exc}")
+        finally:
+            connection.close()
+
+
+class OpenCodeSqliteAdapter:
+    name = "opencode_sqlite"
+    line_oriented = False
+    supports_append_only = False
+
+    def can_handle(self, path: Path, source_kind: str) -> bool:
+        return source_kind.startswith("opencode_") and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+
+    def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        _note_immutable_wal_omission(raw_line_stats, "opencode", path)
+        try:
+            connection = _open_immutable_query_only(path)
+        except (OSError, sqlite3.Error) as exc:
+            _note_malformed(raw_line_stats, "opencode", path, None, f"unreadable or locked OpenCode SQLite store: {exc}")
+            return
+        try:
+            tables = _sqlite_tables(connection)
+            emitted = False
+            v2_sessions: set[str] = set()
+            if "session_message" in tables:
+                v2_records, v2_sessions = _opencode_v2_records(
+                    connection, path=path, source_kind=source_kind, default_tz=default_tz,
+                    tables=tables, stats=raw_line_stats,
+                )
+                for record in v2_records:
+                    emitted = True
+                    yield record
+            if {"session", "message", "part"}.issubset(tables):
+                for record in _opencode_v1_records(
+                    connection, path=path, source_kind=source_kind, default_tz=default_tz,
+                    stats=raw_line_stats, excluded_sessions=v2_sessions,
+                ):
+                    emitted = True
+                    yield record
+            if "session_message" not in tables and not {"session", "message", "part"}.issubset(tables):
+                _note_skipped(raw_line_stats, "opencode", path, None, "unsupported OpenCode SQLite schema")
+            elif not emitted:
+                _note_skipped(raw_line_stats, "opencode", path, None, "OpenCode SQLite store contained no readable messages")
+        except sqlite3.Error as exc:
+            _note_malformed(raw_line_stats, "opencode", path, None, f"OpenCode SQLite query failed: {exc}")
+        finally:
+            connection.close()
+
+
+class OpenCodeLegacyJsonAdapter:
+    name = "opencode_legacy_json"
+    line_oriented = False
+    supports_append_only = False
+
+    def can_handle(self, path: Path, source_kind: str) -> bool:
+        return source_kind.startswith("opencode_") and path.suffix.lower() == ".json"
+
+    def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+        storage_root = _legacy_storage_root(path)
+        if storage_root is None or path.parent.parent.name != "message":
+            return
+        try:
+            message = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _note_malformed(raw_line_stats, "opencode", path, None, f"malformed or unreadable legacy message JSON: {exc}")
+            return
+        if not isinstance(message, dict):
+            _note_skipped(raw_line_stats, "opencode", path, None, "legacy message JSON is not an object")
+            return
+        message_id = _string_or_none(message.get("id")) or path.stem
+        session_id = _string_or_none(message.get("sessionID") or message.get("session_id")) or path.parent.name
+        part_dir = storage_root / "part" / message_id
+        part_payloads: list[tuple[Path, dict[str, Any]]] = []
+        if part_dir.is_dir():
+            for part_path in sorted(part_dir.glob("*.json")):
+                try:
+                    part = json.loads(part_path.read_text(encoding="utf-8", errors="replace"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    _note_malformed(raw_line_stats, "opencode", part_path, None, f"malformed or unreadable legacy part JSON: {exc}")
+                    continue
+                if isinstance(part, dict):
+                    part_payloads.append((part_path, part))
+        else:
+            _note_skipped(raw_line_stats, "opencode", path, None, f"legacy message {message_id} has no part directory")
+        text = _opencode_parts_text([payload for _part_path, payload in part_payloads]) or _mixed_text(message.get("content"))
+        if not text:
+            return
+        raw_timestamp = _nested_time(message, "created")
+        message_ref = f"{path}#message:{message_id}"
+        part_refs = [f"{part_path}#part:{_string_or_none(payload.get('id')) or part_path.stem}" for part_path, payload in part_payloads]
+        session_ref = f"{storage_root}#session:{session_id}"
+        if raw_line_stats is not None:
+            raw_line_stats.full_json_records_parsed += 1
+        yield Record(
+            path=str(path), line=1, role=_normalized_role(message.get("role")), text=text,
+            timestamp=_provider_datetime(raw_timestamp, default_tz),
+            raw_timestamp=str(raw_timestamp) if raw_timestamp is not None else None,
+            raw={"message": message, "parts": [payload for _path, payload in part_payloads]},
+            source_format=source_kind, record_id=message_id, conversation_id=session_id,
+            provider="opencode", source_ref=message_ref,
+            source_refs=[message_ref, session_ref, *part_refs], native_id=message_id,
+        )
+
+
 ADAPTERS: tuple[RecordAdapter, ...] = (
+    CursorAgentJsonlAdapter(),
+    CursorSqliteAdapter(),
+    OpenCodeSqliteAdapter(),
+    OpenCodeLegacyJsonAdapter(),
     GeminiJsonAdapter(),
     GeminiJsonlAdapter(),
     GrokSessionAdapter(),
@@ -467,10 +719,301 @@ def _string_or_none(value: Any) -> str | None:
 
 
 def _provider_from_source_kind(source_kind: str) -> str:
-    for provider in ("codex", "claude", "gemini", "grok", "aider"):
+    for provider in ("codex", "claude", "gemini", "grok", "aider", "cursor", "opencode"):
         if provider in source_kind:
             return provider
     return "unknown"
+
+
+_SQLITE_ROW_LIMIT = 5000
+
+
+def _open_immutable_query_only(path: Path) -> sqlite3.Connection:
+    if not path.is_file():
+        raise OSError("database file is missing")
+    uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True, timeout=0)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        if connection.execute("PRAGMA query_only").fetchone()[0] == 1:
+            return connection
+    except sqlite3.Error:
+        connection.close()
+        raise
+    connection.close()
+    raise sqlite3.OperationalError("query_only could not be enabled")
+
+
+def _note_immutable_wal_omission(
+    stats: RawLineScanStats | None, provider: str, path: Path
+) -> None:
+    if stats is None:
+        return
+    wal_path = Path(f"{path}-wal")
+    try:
+        wal_size = wal_path.stat().st_size
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        stats.note_partial(
+            provider=provider,
+            path=path,
+            line=None,
+            reason=f"could not inspect SQLite WAL sidecar before immutable read: {exc}",
+        )
+        return
+    if wal_size > 0:
+        stats.note_partial(
+            provider=provider,
+            path=path,
+            line=None,
+            reason=(
+                f"non-empty SQLite WAL sidecar ({wal_size} bytes) was omitted by immutable read; "
+                "committed uncheckpointed rows may be absent"
+            ),
+        )
+
+
+def _sqlite_tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+
+def _sqlite_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    if table not in {"cursorDiskKV", "ItemTable", "session", "session_v2", "session_message", "message", "part"}:
+        return set()
+    return {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
+
+
+def _cursor_messages(
+    composer: dict[str, Any], *, composer_id: str, decoded: dict[str, dict[str, Any]]
+) -> list[tuple[dict[str, Any], str, str | None]]:
+    messages: list[tuple[dict[str, Any], str, str | None]] = []
+    headers = composer.get("fullConversationHeadersOnly")
+    if isinstance(headers, list):
+        for index, header in enumerate(headers):
+            if not isinstance(header, dict):
+                continue
+            bubble_id = _string_or_none(header.get("bubbleId") or header.get("id"))
+            supporting_key = f"bubbleId:{composer_id}:{bubble_id}" if bubble_id else None
+            bubble = decoded.get(supporting_key or "")
+            if bubble is not None:
+                messages.append((bubble, f"/fullConversationHeadersOnly/{index}", supporting_key))
+    tabs = composer.get("tabs")
+    if isinstance(tabs, list):
+        for tab_index, tab in enumerate(tabs):
+            bubbles = tab.get("bubbles") if isinstance(tab, dict) else None
+            if not isinstance(bubbles, list):
+                continue
+            for bubble_index, bubble in enumerate(bubbles):
+                if isinstance(bubble, dict):
+                    messages.append((bubble, f"/tabs/{tab_index}/bubbles/{bubble_index}", None))
+    if not messages and _mixed_text(
+        composer.get("text") or composer.get("rawText") or composer.get("content") or composer.get("message")
+    ):
+        messages.append((composer, "/", None))
+    return messages
+
+
+def _normalized_role(value: Any) -> str:
+    if value in {1, "1", "human", "user", "prompt"}:
+        return "user"
+    if value in {2, "2", "ai", "assistant", "model", "tool", "tool_result"}:
+        return "assistant"
+    return str(value or "assistant")
+
+
+def _provider_datetime(value: Any, default_tz):
+    if isinstance(value, (int, float)) and value > 10_000_000_000:
+        value = value / 1000
+    return parse_datetime(value, default_tz)
+
+
+def _mixed_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(item for item in (_mixed_text(entry) for entry in value) if item)
+    if isinstance(value, dict):
+        pieces: list[str] = []
+        for key in ("text", "rawText", "content", "message", "prompt", "output", "result", "arguments", "input", "state", "reasoning"):
+            if key in value:
+                piece = _mixed_text(value[key])
+                if piece and piece not in pieces:
+                    pieces.append(piece)
+        return "\n".join(pieces)
+    return str(value)
+
+
+def _cursor_workspace(value: dict[str, Any]) -> str | None:
+    direct = value.get("workspaceProjectDir") or value.get("cwd") or value.get("workspace")
+    if direct:
+        return str(direct)
+    uris = value.get("workspaceUris")
+    if isinstance(uris, list) and uris:
+        return str(uris[0])
+    return None
+
+
+def _opencode_v2_records(
+    connection: sqlite3.Connection, *, path: Path, source_kind: str, default_tz,
+    tables: set[str], stats: RawLineScanStats | None,
+) -> tuple[list[Record], set[str]]:
+    required = {"id", "session_id", "type", "seq", "data"}
+    if not required.issubset(_sqlite_columns(connection, "session_message")):
+        _note_skipped(stats, "opencode", path, None, "unsupported OpenCode v2 session_message columns")
+        return [], set()
+    session_table = "session_v2" if "session_v2" in tables else "session" if "session" in tables else None
+    if session_table is None:
+        _note_skipped(stats, "opencode", path, None, "OpenCode v2 session_message has no session_v2 or session table")
+    session_meta = _opencode_session_metadata(connection, session_table) if session_table else {}
+    rows = connection.execute(
+        "SELECT * FROM session_message ORDER BY session_id, seq LIMIT ?", (_SQLITE_ROW_LIMIT + 1,)
+    ).fetchall()
+    if len(rows) > _SQLITE_ROW_LIMIT:
+        stats.note_partial(provider="opencode", path=path, line=None, reason="OpenCode v2 row cap reached") if stats else None
+        rows = rows[:_SQLITE_ROW_LIMIT]
+    records: list[Record] = []
+    session_ids: set[str] = set()
+    for row in rows:
+        row_id = str(row["id"])
+        session_id = str(row["session_id"])
+        session_ids.add(session_id)
+        try:
+            data = json.loads(row["data"])
+        except (TypeError, json.JSONDecodeError):
+            _note_malformed(stats, "opencode", path, None, f"malformed JSON in session_message:{row_id}")
+            continue
+        if not isinstance(data, dict):
+            _note_skipped(stats, "opencode", path, None, f"non-object JSON in session_message:{row_id}")
+            continue
+        text = _mixed_text(data)
+        role = _normalized_role(data.get("role") or row["type"])
+        if not text or role not in {"user", "assistant"}:
+            _note_ignored(stats)
+            continue
+        timestamp_value = row["time_created"] if "time_created" in row.keys() else data.get("timestamp")
+        locator = f"{path}#session_message:{row_id}#/data"
+        sequence_ref = f"{path}#session:{session_id}:seq:{row['seq']}"
+        meta = session_meta.get(session_id, {})
+        if stats is not None:
+            stats.full_json_records_parsed += 1
+        records.append(Record(
+            path=str(path), line=int(row["seq"] or 0) + 1, role=role, text=text,
+            timestamp=_provider_datetime(timestamp_value, default_tz), cwd=_string_or_none(meta.get("directory")),
+            raw_timestamp=str(timestamp_value) if timestamp_value is not None else None,
+            raw=data, source_format=source_kind, record_id=row_id, conversation_id=session_id,
+            provider="opencode", source_ref=locator, source_refs=[locator, sequence_ref], native_id=row_id,
+        ))
+    return records, session_ids
+
+
+def _opencode_v1_records(
+    connection: sqlite3.Connection, *, path: Path, source_kind: str, default_tz,
+    stats: RawLineScanStats | None, excluded_sessions: set[str],
+) -> list[Record]:
+    if not {"id", "session_id", "data"}.issubset(_sqlite_columns(connection, "message")):
+        _note_skipped(stats, "opencode", path, None, "unsupported OpenCode v1 message columns")
+        return []
+    if not {"id", "message_id", "data"}.issubset(_sqlite_columns(connection, "part")):
+        _note_skipped(stats, "opencode", path, None, "unsupported OpenCode v1 part columns")
+        return []
+    session_meta = _opencode_session_metadata(connection, "session")
+    part_rows = connection.execute("SELECT * FROM part ORDER BY message_id, time_created, id LIMIT ?", (_SQLITE_ROW_LIMIT + 1,)).fetchall()
+    if len(part_rows) > _SQLITE_ROW_LIMIT:
+        stats.note_partial(provider="opencode", path=path, line=None, reason="OpenCode v1 part row cap reached") if stats else None
+        part_rows = part_rows[:_SQLITE_ROW_LIMIT]
+    parts_by_message: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for row in part_rows:
+        part_id = str(row["id"])
+        try:
+            data = json.loads(row["data"])
+        except (TypeError, json.JSONDecodeError):
+            _note_malformed(stats, "opencode", path, None, f"malformed JSON in part:{part_id}")
+            continue
+        if isinstance(data, dict):
+            parts_by_message.setdefault(str(row["message_id"]), []).append((part_id, data))
+    rows = connection.execute("SELECT * FROM message ORDER BY session_id, time_created, id LIMIT ?", (_SQLITE_ROW_LIMIT + 1,)).fetchall()
+    if len(rows) > _SQLITE_ROW_LIMIT:
+        stats.note_partial(provider="opencode", path=path, line=None, reason="OpenCode v1 message row cap reached") if stats else None
+        rows = rows[:_SQLITE_ROW_LIMIT]
+    records: list[Record] = []
+    for ordinal, row in enumerate(rows, 1):
+        message_id = str(row["id"])
+        session_id = str(row["session_id"])
+        if session_id in excluded_sessions:
+            continue
+        try:
+            data = json.loads(row["data"])
+        except (TypeError, json.JSONDecodeError):
+            _note_malformed(stats, "opencode", path, None, f"malformed JSON in message:{message_id}")
+            continue
+        if not isinstance(data, dict):
+            _note_skipped(stats, "opencode", path, None, f"non-object JSON in message:{message_id}")
+            continue
+        parts = parts_by_message.get(message_id, [])
+        text = _opencode_parts_text([payload for _part_id, payload in parts]) or _mixed_text(data)
+        if not text:
+            _note_skipped(stats, "opencode", path, None, f"OpenCode v1 message {message_id} has no readable parts")
+            continue
+        timestamp_value = row["time_created"] if "time_created" in row.keys() else data.get("timestamp")
+        message_ref = f"{path}#message:{message_id}"
+        part_refs = [f"{path}#part:{part_id}" for part_id, _payload in parts]
+        session_ref = f"{path}#session:{session_id}"
+        meta = session_meta.get(session_id, {})
+        if stats is not None:
+            stats.full_json_records_parsed += 1
+        records.append(Record(
+            path=str(path), line=ordinal, role=_normalized_role(data.get("role")), text=text,
+            timestamp=_provider_datetime(timestamp_value, default_tz), cwd=_string_or_none(meta.get("directory")),
+            raw_timestamp=str(timestamp_value) if timestamp_value is not None else None,
+            raw={"message": data, "parts": [payload for _id, payload in parts]},
+            source_format=source_kind, record_id=message_id, conversation_id=session_id,
+            provider="opencode", source_ref=message_ref,
+            source_refs=[message_ref, session_ref, *part_refs], native_id=message_id,
+        ))
+    return records
+
+
+def _opencode_session_metadata(connection: sqlite3.Connection, table: str | None) -> dict[str, dict[str, Any]]:
+    if table is None or "id" not in _sqlite_columns(connection, table):
+        return {}
+    rows = connection.execute(f'SELECT * FROM "{table}" LIMIT ?', (_SQLITE_ROW_LIMIT,)).fetchall()
+    return {str(row["id"]): dict(row) for row in rows}
+
+
+def _opencode_parts_text(parts: list[dict[str, Any]]) -> str:
+    pieces: list[str] = []
+    for part in parts:
+        text = _mixed_text(part.get("text") or part.get("content"))
+        kind = str(part.get("type") or "").lower()
+        if kind == "reasoning" and text:
+            pieces.append(f"[Reasoning]\n{text}")
+        elif kind in {"tool", "tool_result", "tool-invocation"}:
+            tool_text = text or _mixed_text(part.get("state") or part.get("output") or part.get("input"))
+            if tool_text:
+                pieces.append(f"[Tool]\n{tool_text}")
+        elif text:
+            pieces.append(text)
+    return "\n".join(pieces)
+
+
+def _legacy_storage_root(path: Path) -> Path | None:
+    parts = path.parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] in {"session", "message", "part"}:
+            return Path(*parts[:index])
+    return None
+
+
+def _nested_time(data: dict[str, Any], key: str) -> Any:
+    value = data.get("time")
+    return value.get(key) if isinstance(value, dict) else data.get(f"time_{key}")
 
 
 def _lossy_conversions(message: dict[str, Any]) -> list[str]:

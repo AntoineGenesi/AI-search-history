@@ -312,6 +312,17 @@ def search(
     matches = matches[: plan.limits.max_matches]
     groups = group_matches(matches)
     _mark_expected_final_candidates(expected_diag, matches)
+    partial_failures = list(raw_line_stats.partial_failures or [])
+    for missing in plan.missing_roots:
+        if missing.root_format == "sqlite" or missing.path.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".vscdb"}:
+            partial_failures.append(
+                {
+                    "provider": missing.provider,
+                    "path": str(missing.path),
+                    "line": None,
+                    "reason": "selected provider database is missing",
+                }
+            )
     payload = {
         "searched_files": searched_files,
         "searched_bytes": searched_bytes,
@@ -329,8 +340,8 @@ def search(
             "ignored_rows": raw_line_stats.ignored_rows,
             "weak_timestamp_records": raw_line_stats.weak_timestamp_records,
             "fallback_records": raw_line_stats.fallback_records,
-            "partial_failures": list(raw_line_stats.partial_failures or []),
-            "coverage": "partial" if raw_line_stats.partial_failures or stopped else "complete_within_caps",
+            "partial_failures": partial_failures,
+            "coverage": "partial" if partial_failures or stopped else "complete_within_caps",
         },
         "providers_searched": sorted({root.provider for root in plan.roots if root.provider}),
         "missing_roots": [root.to_dict() for root in plan.missing_roots],

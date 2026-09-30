@@ -778,6 +778,73 @@ def known_root_candidates(
                 recursive=roots["aider"].suffix != ".md",
             )
         )
+    if "cursor" in roots:
+        cursor_root = roots["cursor"]
+        candidates.append(
+            RootCandidate(
+                kind="cursor_storage",
+                path=cursor_root,
+                reason="known Cursor Agent JSONL and Composer SQLite root",
+                source_role="transcript_root",
+                provider="cursor",
+                app="cursor",
+                platform=platform_for_path(cursor_root),
+                root_format="jsonl_or_sqlite",
+                recursive=cursor_root.suffix.lower() not in {".jsonl", ".vscdb", ".db"},
+            )
+        )
+        if safe_resolve(cursor_root) == safe_resolve(Path.home() / ".cursor"):
+            config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            for user_root in (
+                config_home / "Cursor" / "User",
+                Path.home() / "Library" / "Application Support" / "Cursor" / "User",
+            ):
+                if user_root.exists():
+                    candidates.append(
+                        RootCandidate(
+                            kind="cursor_storage",
+                            path=user_root,
+                            reason="detected Cursor User root with Composer SQLite state",
+                            source_role="transcript_root",
+                            provider="cursor",
+                            app="cursor",
+                            platform=platform_for_path(user_root),
+                            root_format="sqlite",
+                            include_when_missing=False,
+                        )
+                    )
+    if "opencode" in roots:
+        opencode_root = roots["opencode"]
+        candidates.append(
+            RootCandidate(
+                kind="opencode_storage",
+                path=opencode_root,
+                reason="known OpenCode SQLite or legacy JSON storage root",
+                source_role="transcript_root",
+                provider="opencode",
+                app="opencode_cli",
+                platform=platform_for_path(opencode_root),
+                root_format="sqlite_or_json",
+                recursive=opencode_root.suffix.lower() not in {".db", ".sqlite", ".sqlite3", ".json"},
+            )
+        )
+        default_data_root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "opencode"
+        if safe_resolve(opencode_root) == safe_resolve(default_data_root):
+            config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "opencode"
+            if config_root.exists():
+                candidates.append(
+                    RootCandidate(
+                        kind="opencode_storage",
+                        path=config_root,
+                        reason="detected OpenCode config-root database candidate",
+                        source_role="transcript_root",
+                        provider="opencode",
+                        app="opencode_cli",
+                        platform=platform_for_path(config_root),
+                        root_format="sqlite_or_json",
+                        include_when_missing=False,
+                    )
+                )
 
     default_codex = is_default_provider_home(codex_home, "codex")
     default_claude = is_default_provider_home(claude_home, "claude")
@@ -1058,7 +1125,7 @@ def known_candidate_for_resolved_path(resolved: Path, known: dict[Path, RootCand
     direct = known.get(resolved)
     if direct:
         return direct
-    if resolved.suffix not in {".jsonl", ".json", ".md"}:
+    if resolved.suffix.lower() not in {".jsonl", ".json", ".md", ".db", ".sqlite", ".sqlite3", ".vscdb"}:
         return None
     for root, candidate in known.items():
         if candidate.source_role != "transcript_root":
@@ -1079,12 +1146,20 @@ def known_candidate_for_resolved_path(resolved: Path, known: dict[Path, RootCand
                 kind = "grok_session_file"
             elif kind == "aider_history":
                 kind = "aider_history_file"
+            elif kind == "cursor_storage":
+                kind = "cursor_storage_file"
+            elif kind == "opencode_storage":
+                kind = "opencode_storage_file"
             return replace(
                 candidate,
                 kind=kind,
                 path=resolved,
                 recursive=False,
-                root_format="json" if resolved.suffix == ".json" else candidate.root_format,
+                root_format=(
+                    "json" if resolved.suffix == ".json"
+                    else "sqlite" if resolved.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".vscdb"}
+                    else candidate.root_format
+                ),
             )
     return None
 
@@ -1366,7 +1441,7 @@ def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None
     for root in plan.roots:
         base = root.path.expanduser()
         if base.is_file():
-            candidates = [base] if base.suffix in {".jsonl", ".json", ".md"} else []
+            candidates = [base] if base.suffix.lower() in {".jsonl", ".json", ".md", ".db", ".sqlite", ".sqlite3", ".vscdb"} else []
         elif base.is_dir():
             candidates = iter_directory_jsonl_files(
                 base,
@@ -1907,6 +1982,10 @@ def directory_file_suffixes(source_kind: str) -> tuple[str, ...]:
         return (".jsonl", ".json")
     if source_kind in {"aider_history", "aider_history_file"}:
         return (".md",)
+    if source_kind in {"cursor_storage", "cursor_storage_file"}:
+        return (".jsonl", ".vscdb", ".db")
+    if source_kind in {"opencode_storage", "opencode_storage_file"}:
+        return (".db", ".sqlite", ".sqlite3", ".json")
     return (".jsonl",)
 
 
@@ -1921,6 +2000,14 @@ def directory_file_allowed(path: Path, source_kind: str) -> bool:
         return path.name == "chat_history.jsonl" and not (path.parent / "updates.jsonl").is_file()
     if source_kind in {"aider_history", "aider_history_file"}:
         return path.name == ".aider.chat.history.md"
+    if source_kind in {"cursor_storage", "cursor_storage_file"}:
+        if path.suffix.lower() == ".jsonl":
+            return "agent-transcripts" in path.parts
+        return path.name == "state.vscdb"
+    if source_kind in {"opencode_storage", "opencode_storage_file"}:
+        if path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+            return path.name == "opencode.db" or source_kind == "opencode_storage_file"
+        return any(part in {"session", "message", "part"} for part in path.parts)
     return True
 
 
