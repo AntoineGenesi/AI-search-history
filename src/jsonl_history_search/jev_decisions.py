@@ -83,9 +83,20 @@ class SystemOneDecisionEngine:
             )
 
     def _parse_response(self, request: DecisionRequest, raw: object) -> DecisionResponse:
-        if not isinstance(raw, dict) or not isinstance(raw.get("answers"), dict):
+        if not isinstance(raw, dict):
             raise ValueError("invalid System One response")
-        raw_answers = raw["answers"]
+        response_model = raw.get("model")
+        raw_answers = raw.get("answers")
+        usage = raw.get("usage")
+        if not isinstance(response_model, str) or not response_model.strip():
+            raise ValueError("invalid System One response model")
+        if not isinstance(raw_answers, dict) or not raw_answers:
+            raise ValueError("invalid System One response answers")
+        if not isinstance(usage, dict) or not all(
+            isinstance(usage.get(field), int) and not isinstance(usage.get(field), bool)
+            for field in ("input_tokens", "output_tokens")
+        ):
+            raise ValueError("invalid System One response usage")
         answers: dict[str, DecisionAnswer] = {}
         for name, question in request.questions.items():
             answer = raw_answers.get(name)
@@ -105,7 +116,7 @@ class SystemOneDecisionEngine:
         )
         return DecisionResponse(
             engine=self.name,
-            model=str(raw.get("model") or self.model),
+            model=response_model,
             answers=answers,
             fallback_reason=",".join(fallback_reasons) or None,
         )
