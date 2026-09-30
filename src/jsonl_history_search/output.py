@@ -887,7 +887,49 @@ def render_ask_answer_text(payload: dict) -> str:
             f"answer_action_status={source_contract.get('answer_action_status')} "
             f"promotion_status={source_contract.get('promotion_status')}"
         )
+        if source_contract.get("built_from") == "direct_history_answer":
+            _append_direct_history_answer_contract_text(lines, source_contract)
     return "\n".join(lines)
+
+
+def _append_direct_history_answer_contract_text(lines: list[str], contract: dict) -> None:
+    anchor = contract.get("anchor") or {}
+    interval = contract.get("searched_interval") or {}
+    coverage = contract.get("coverage") or {}
+    missing = contract.get("missing_or_capped_scope") or {}
+    lines.append(
+        "Anchor: "
+        f"{anchor.get('source_ref') or '(unavailable)'} "
+        f"timestamp={anchor.get('timestamp_utc') or '(unknown)'} "
+        f"wording={anchor.get('snippet') or '(unavailable)'}"
+    )
+    lines.append(
+        "Searched interval: "
+        f"entries={interval.get('chronological_entry_count', 0)} "
+        f"boundary={json.dumps(interval.get('boundary') or {}, sort_keys=True)}"
+    )
+    lines.append(
+        "Coverage: "
+        f"status={coverage.get('status') or 'unknown'} "
+        f"complete={str(coverage.get('complete') is True).lower()} "
+        f"records_after_anchor={coverage.get('records_after_anchor', 0)}"
+    )
+    lines.append(
+        "Missing/capped scope: "
+        f"status={missing.get('status') or 'unknown'} "
+        f"omitted={missing.get('omitted_activity_entry_count', 0)} "
+        f"missing_logs={len(missing.get('missing_logs') or [])}"
+    )
+    inventory = contract.get("source_inventory") or []
+    if inventory:
+        rendered = []
+        for item in inventory:
+            suffix = ",selected" if item.get("selected_for_direct_answer") else ""
+            rendered.append(f"{item.get('provider')}={item.get('status')}{suffix}")
+        lines.append(f"Provider/source inventory: {', '.join(rendered)}")
+    limits = contract.get("limits") or {}
+    if limits:
+        lines.append(f"Caps: {json.dumps(limits, sort_keys=True)}")
 
 
 def render_ask_execute_text(payload: dict) -> str:
@@ -1071,6 +1113,12 @@ def render_ask_answer_markdown(payload: dict) -> str:
             lines.append(f"- {item}")
     if report.get("next_proof_step"):
         lines.extend(["", "## Next Proof Step", "", f"`{report.get('next_proof_step')}`"])
+    source_contract = report.get("source_contract") or {}
+    if source_contract.get("built_from") == "direct_history_answer":
+        details: list[str] = []
+        _append_direct_history_answer_contract_text(details, source_contract)
+        lines.extend(["", "## Direct History Coverage", ""])
+        lines.extend(f"- {item}" for item in details)
     return "\n".join(lines)
 
 

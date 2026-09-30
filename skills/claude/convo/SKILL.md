@@ -1,51 +1,31 @@
 ---
 name: convo
-description: Explicit alias for local prior-conversation history: `use the convo tool`, latest-message status, provenance, or agent action proof. Route to `jsonl-history-search`, not connector discovery or `convo --help`. Do not use for bare `what happened?`, local status, or self-contained writing/editing; history-dependent writing is allowed.
+description: Explicit alias for local coding-assistant conversation history. `use the convo tool` routes directly to `jsonl-history-search`; do not discover connectors, install plugins, or run `convo --help`.
 metadata:
-  short-description: Alias to JSONL history search
+  short-description: Alias to direct history answer
 ---
 
 # Convo Alias
 
-Use this alias only for explicit local conversation-history retrieval.
-
-## First Move
-
-For a parent/main latest-message ask paired with an explicit alias, remove only
-the alias, preserve parent/main-thread variants with `--parent-thread`, and run the matching
-`what-happened-since` command before repo search,
-`which/command -v`, `convo --help`, connector discovery, plugin install, Git,
-or visible-context synthesis:
+Preserve the exact request, including parent/main/current-thread wording, and
+run one command:
 
 ```bash
-jsonl-history-search what-happened-since "what has happened since my last message?" --parent-thread --cwd "$PWD" --complete-interval --format answer
+jsonl-history-search ask --answer '<exact user wording>' --cwd "$PWD" --format text
 ```
 
-For unscoped latest-message wording, omit `--parent-thread` and
-`--complete-interval`, and use `--format text`.
+This is also the default for `what happened since my last message?`. Parent
+selection and bounded interval recovery happen inside that invocation. Do not
+replace missing history with visible context, Git, TODO, task/report summaries,
+or another semantic search.
 
-For a current-chat/conversation audit that asks what went wrong or what to fix,
-retain the original wording and run `jsonl-history-search ask --answer` so the
-current-session source is selected and primary refs are opened before fixes. If
-there is no recoverable current-session source, return that boundary rather
-than asking the user to restate the chat anchor or broadening history.
+If the result names one recoverable missing raw-history range, run only its one
+bounded recovery command. Otherwise answer from the returned raw refs or state
+the precise missing/ambiguous boundary. Use `read-more <source-ref> --mode
+window` only when the answer needs exact wording, chronology, or action proof.
 
-For explicit history-tool aliases that are not latest-message asks, immediately
-run:
+Legacy `what-happened-since`, packet, and `execute-continuation` surfaces are
+compatibility tools, not the normal workflow.
 
-```bash
-jsonl-history-search ask --execute "<user wording>" --cwd "$PWD" --format text
-```
-
-Then follow the returned refs and stop rules from the JSONL history output.
-For latest-status, inspect `post_anchor_interval_reconstruction` coverage and
-its `next_read_guidance`; do not answer from the selected anchor, visible
-context, or secondary task/report/Git evidence alone.
-
-## Non-Triggers
-
-Do not invoke JSONL for self-contained writing/editing, local repo status,
-branch status, current file/task status, or bare ambiguous `what happened?`
-prompts. Writing/editing that depends on prior conversation remains in scope.
-Ask one short clarifying question when the user has not asked for prior
-conversation history, provenance, action proof, or latest-message status.
+Do not invoke conversation history for ordinary repo/Git/current-file status or
+a bare unanchored `what happened?`; ask one short clarification in that case.
