@@ -26,11 +26,21 @@ possible mirrors as leads to resolve, not independent action evidence.
 ## OpenCode
 
 Start with an explicit `OPENCODE_SQLITE_DB` or selected XDG database candidate.
-Inspect whether the schema uses `session` or `session_v2` and how `message` and
-`part` relate. Do not assume a v1 query fits v2. Match project/session first,
-then retrieve bounded messages and parts using actual native keys/relationships.
-Preserve text, reasoning and tool parts separately with tool IDs, arguments,
-results/status; message text alone may omit the execution evidence.
+Inspect transcript tables before choosing a schema:
+
+- Current v2 uses `session_message` joined to `session_v2`, or to `session` in
+  later 2.x builds. Message and tool blocks are embedded in `session_message.data`
+  JSON. Select project/session first, retrieve bounded rows in native `seq`
+  order, and retain each native row ID and JSON pointer. A `session` table alone
+  does not identify v1.
+- Legacy v1 uses `session` + `message` + `part`. Resolve message/part joins
+  using actual native keys and retain both row locators. Only this SQLite
+  schema requires the separate message/part join.
+
+Do not substitute v1 queries when v2 content is unavailable or malformed.
+Preserve text, reasoning and tool blocks separately with tool IDs, arguments,
+results/status; message text alone may omit execution evidence. Missing tables
+or unknown relationships make coverage partial/unsupported rather than empty.
 
 Legacy `OPENCODE_STORAGE_ROOT`/XDG `opencode/storage` trees can contain separate
 session/message/part JSON files. Resolve references using native IDs, retain
@@ -63,15 +73,20 @@ Retrieve only a selected key with bound parameters when scripting. Do not
 interpolate user phrases or IDs into SQL. Inspect large row lengths first,
 cap rows/bytes/time and record any omitted data. If only `ItemTable` exists,
 inspect its columns and actual keys before adapting the query. For OpenCode,
-inspect `PRAGMA table_info('message')` and `PRAGMA table_info('part')` before
-constructing a schema-specific session/message/part join.
+first inspect `PRAGMA table_info('session_message')`. If present, inspect
+`session_v2` or the later `session` table and resolve the actual relationship
+before reading bounded `data` JSON in native `seq` order. If `session_message`
+is absent, verify v1 `session`, `message` and `part` columns before constructing
+that join. Unknown/mixed schemas require explicit inspection, not a blind fallback.
 
 ## Locators And Failure Boundaries
 
 Cite `state.vscdb#cursorDiskKV:composerData:<native-id>` plus a nested pointer
-or message ID, or `opencode.db#message:<native-id>` and the supporting
-`#part:<native-id>` rows. These are native row locators, never invented text
-lines. Retain the key map for any session/sequence shorthand.
+or message ID. For OpenCode v2 cite `opencode.db#session_message:<native-id>`
+and the pointer within `data`, retaining session ID and native `seq` for order.
+For v1 cite `opencode.db#message:<native-id>` and supporting `#part:<native-id>`
+rows. These are native row locators, never invented text lines. Retain the key
+map for any session/sequence shorthand.
 
 Missing tables, unknown schemas, malformed row JSON, locked/unreadable stores,
 missing linked parts, metadata-only records and query caps must be reported.

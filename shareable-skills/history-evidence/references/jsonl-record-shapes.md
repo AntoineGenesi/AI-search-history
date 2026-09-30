@@ -30,7 +30,7 @@ Keep unknown roles and times unknown. Synthetic/derived normalized indices are n
 | JSON array | `session.json:messages[3]` | Array indices are 0-based; record the actual array/object pointer and native ID. Pretty-print line numbers are not original refs. |
 | JSON object/event file | `event.json#/action` | Original file, JSON pointer, event ID/ordinal. |
 | Markdown | `.aider.chat.history.md:42` | 1-based block start and end lines; role attribution is format-derived. |
-| SQLite | `state.vscdb#cursorDiskKV:composerData:sample-id` or `opencode.db#message:sample-id` | Exact table and native key, session/part IDs and JSON pointer within the row. A `db#session-id:seq` locator also needs the table/key map and native sequence to be reproducible. |
+| SQLite | `state.vscdb#cursorDiskKV:composerData:sample-id`; OpenCode v2 `opencode.db#session_message:sample-id`; v1 `opencode.db#message:sample-id` plus `#part:sample-id` | Exact table/native key and JSON pointer; v2 embedded `data`, session ID and native `seq`, or v1 supporting part IDs. A `db#session-id:seq` locator also needs the table/key map and native sequence to be reproducible. |
 
 These are evidence locators, not necessarily clickable editor links. If a message is assembled from several chunks, cite the original line range or multiple refs. For replayed JSONL snapshots cite the header/patch line and array pointer supplying the message; retain relevant later patches. For joined database parts cite both message and part keys. Explain reconstruction instead of inventing a synthetic path or line.
 
@@ -38,7 +38,7 @@ These are evidence locators, not necessarily clickable editor links. If a messag
 
 Inventory only selected roots and recognizable transcript/database names, without opening auth/config files. Record existence, format, provider, session/workspace hints and why the source was selected. Confirm format from bounded structural inspection; suffix alone is insufficient. A metadata sidecar may guide scope but is not a transcript.
 
-Apply provider-specific reconstruction before inferring chronology or roles: Gemini `$set.messages` reseeds, Grok chunks/tool updates, Cursor row JSON, OpenCode message/part joins, and branching Pi records are not interchangeable flat messages. Keep copied prompts, injected context and model-input echoes distinct from original human turns.
+Apply provider-specific reconstruction before inferring chronology or roles: Gemini `$set.messages` reseeds, Grok chunks/tool updates, Cursor row JSON, OpenCode v2 `session_message.data` blocks in native `seq` order or v1 message/part joins, and branching Pi records are not interchangeable flat messages. Keep copied prompts, injected context and model-input echoes distinct from original human turns.
 
 ## Partial Failure
 
