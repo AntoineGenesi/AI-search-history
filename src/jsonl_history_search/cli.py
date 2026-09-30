@@ -91,6 +91,7 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
+from .jev_decisions import DEFAULT_SYSTEMONE_ENDPOINT, SystemOneDecisionEngine
 from .gittools import (
     commit_is_reachable,
     commit_metadata,
@@ -288,6 +289,16 @@ def _command_shape_guidance(argv: list[str]) -> str | None:
     return None
 
 
+def _probability_argument(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a probability from 0 to 1") from exc
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("expected a probability from 0 to 1")
+    return parsed
+
+
 def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jsonl-history-search",
@@ -383,6 +394,29 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             "After routing, execute only high-confidence bounded no-evidence prompts "
             "through the safe no-evidence-report path. All other routes remain route-only."
         ),
+    )
+    ask.add_argument(
+        "--decision-engine",
+        choices=("deterministic", "jev"),
+        default="deterministic",
+        help=(
+            "Optional low-confidence route helper. deterministic (default) performs no remote call; "
+            "jev requires explicit selection and falls back locally on any failure."
+        ),
+    )
+    ask.add_argument(
+        "--jev-model",
+        default=None,
+        help=(
+            "System One model name for --decision-engine jev. Falls back to "
+            "JSONL_HISTORY_SEARCH_JEV_MODEL; no model is selected implicitly."
+        ),
+    )
+    ask.add_argument(
+        "--decision-confidence",
+        type=_probability_argument,
+        default=0.75,
+        help="Minimum confidence before accepting a remote typed decision (default: 0.75).",
     )
     ask.add_argument(
         "--report-output",
@@ -20700,6 +20734,22 @@ def _resolve_ask_original_prompt_identity(args: argparse.Namespace) -> dict:
     }
 
 
+def _ask_decision_engine_from_args(args: argparse.Namespace):
+    if args.decision_engine != "jev":
+        return None
+    return SystemOneDecisionEngine(
+        api_key=os.environ.get("TYPESAFE_API_KEY"),
+        model=args.jev_model or os.environ.get("JSONL_HISTORY_SEARCH_JEV_MODEL"),
+        endpoint=(
+            os.environ.get("JSONL_HISTORY_SEARCH_JEV_ENDPOINT")
+            or DEFAULT_SYSTEMONE_ENDPOINT
+        ),
+        timeout=2.0,
+        min_confidence=args.decision_confidence,
+        allow_remote_content=False,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv == ["--help-internal"]:
@@ -20733,6 +20783,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_source=args.evidence_source,
             activation_mode=args.activation_mode,
             audit_depth=args.audit_depth,
+            decision_engine=_ask_decision_engine_from_args(args),
         )
         payload["ask_router"]["original_prompt_identity"] = args.original_prompt_identity
         auto_execute_bounded = (
