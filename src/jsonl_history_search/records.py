@@ -25,6 +25,12 @@ class Record:
     conversation_id: str | None = None
     unsupported_fields: list[str] | None = None
     lossy_conversions: list[str] | None = None
+    provider: str | None = None
+    source_ref: str | None = None
+    source_refs: list[str] | None = None
+    native_id: str | None = None
+    timestamp_quality: str = "record"
+    coverage_notes: list[str] | None = None
 
 
 def text_from_item(value: Any) -> str:

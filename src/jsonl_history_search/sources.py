@@ -593,13 +593,15 @@ def build_source_plan(
     allow_arbitrary_root: bool,
     limits: Limits,
     current_session_only: bool = False,
+    provider_roots: dict[str, Path] | None = None,
 ) -> SourcePlan:
     plan = SourcePlan(limits=limits)
     codex_home = normalize_local_path(codex_home)
     claude_home = normalize_local_path(claude_home)
     normalized_roots = [normalize_local_path(root) for root in roots] if roots is not None else None
-    candidates = known_root_candidates(codex_home, claude_home, cwd=cwd)
-    known = known_roots(codex_home, claude_home, cwd=cwd, candidates=candidates)
+    provider_roots = {key: normalize_local_path(value) for key, value in (provider_roots or {}).items()}
+    candidates = known_root_candidates(codex_home, claude_home, cwd=cwd, provider_roots=provider_roots)
+    known = known_roots(codex_home, claude_home, cwd=cwd, candidates=candidates, provider_roots=provider_roots)
     record_root_inventory(plan, candidates)
     if normalized_roots is None and current_session_only:
         latest, latest_warning = latest_known_session_file(codex_home, claude_home, root_candidates=candidates)
@@ -635,7 +637,7 @@ def build_source_plan(
         return plan
 
     for requested_root in normalized_roots:
-        for root in normalize_requested_root(requested_root, codex_home, claude_home):
+        for root in normalize_requested_root(requested_root, codex_home, claude_home, provider_roots=provider_roots):
             if requested_root_uses_symlinked_provider_root(root, codex_home, claude_home):
                 plan.rejected_roots.append(RejectedRoot(str(root), "symlinked known transcript root rejected before traversal"))
                 continue
@@ -652,7 +654,7 @@ def build_source_plan(
                 plan.rejected_roots.append(RejectedRoot(str(root), danger))
                 continue
             if not kind and not allow_arbitrary_root:
-                plan.rejected_roots.append(RejectedRoot(str(root), "not a known Codex/Claude transcript root; pass --allow-arbitrary-root with explicit hard caps"))
+                plan.rejected_roots.append(RejectedRoot(str(root), "not a known provider transcript root; pass --allow-arbitrary-root with explicit hard caps"))
                 continue
             if allow_arbitrary_root and not kind:
                 plan.warnings.append(f"Arbitrary root enabled for {root}; strict hard caps apply.")
@@ -664,18 +666,18 @@ def build_source_plan(
                         kind=arbitrary_root_kind(root),
                         path=root,
                         reason="explicit arbitrary root override",
-                        recursive=root.suffix not in {".jsonl", ".json"},
+                        recursive=root.suffix not in {".jsonl", ".json", ".md"},
                         known=False,
                         source_role="transcript_root",
                         provider="unknown",
                         app="unknown",
                         platform=platform_for_path(root),
-                        root_format="json" if root.suffix == ".json" else "jsonl",
+                        root_format="json" if root.suffix == ".json" else "markdown" if root.suffix == ".md" else "jsonl",
                     )
                 )
 
     if not plan.roots:
-        plan.blind_spots.append("No transcript roots selected; search will not open JSONL files.")
+        plan.blind_spots.append("No transcript roots selected; search will not open history files.")
     for root in plan.roots:
         if not root.path.exists():
             plan.blind_spots.append(f"Missing transcript root: {root.path}")
@@ -722,12 +724,60 @@ def root_diagnostic(candidate: RootCandidate, *, exists: bool, status: str) -> R
     )
 
 
-def known_root_candidates(codex_home: Path, claude_home: Path, *, cwd: Path) -> list[RootCandidate]:
+def known_root_candidates(
+    codex_home: Path,
+    claude_home: Path,
+    *,
+    cwd: Path,
+    provider_roots: dict[str, Path] | None = None,
+) -> list[RootCandidate]:
     codex_home = normalize_local_path(codex_home)
     claude_home = normalize_local_path(claude_home)
     candidates: list[RootCandidate] = []
     candidates.extend(codex_root_candidates(codex_home, platform=platform_for_path(codex_home)))
     candidates.extend(claude_code_root_candidates(claude_home, platform=platform_for_path(claude_home)))
+    roots = provider_roots or {}
+    if "gemini" in roots:
+        candidates.append(
+            RootCandidate(
+                kind="gemini_sessions",
+                path=roots["gemini"],
+                reason="known Gemini CLI session root",
+                source_role="transcript_root",
+                provider="gemini",
+                app="gemini_cli",
+                platform=platform_for_path(roots["gemini"]),
+                root_format="json_or_jsonl",
+            )
+        )
+    if "grok" in roots:
+        grok_sessions = roots["grok"] if roots["grok"].name == "sessions" else roots["grok"] / "sessions"
+        candidates.append(
+            RootCandidate(
+                kind="grok_sessions",
+                path=grok_sessions,
+                reason="known Grok Build compound session root",
+                source_role="transcript_root",
+                provider="grok",
+                app="grok_build",
+                platform=platform_for_path(grok_sessions),
+                root_format="compound_jsonl",
+            )
+        )
+    if "aider" in roots:
+        candidates.append(
+            RootCandidate(
+                kind="aider_history",
+                path=roots["aider"],
+                reason="known Aider Markdown history root",
+                source_role="transcript_root",
+                provider="aider",
+                app="aider",
+                platform=platform_for_path(roots["aider"]),
+                root_format="markdown",
+                recursive=roots["aider"].suffix != ".md",
+            )
+        )
 
     default_codex = is_default_provider_home(codex_home, "codex")
     default_claude = is_default_provider_home(claude_home, "claude")
@@ -988,8 +1038,14 @@ def known_roots(
     *,
     cwd: Path | None = None,
     candidates: list[RootCandidate] | None = None,
+    provider_roots: dict[str, Path] | None = None,
 ) -> dict[Path, RootCandidate]:
-    roots = candidates or known_root_candidates(codex_home, claude_home, cwd=cwd or Path.cwd())
+    roots = candidates or known_root_candidates(
+        codex_home,
+        claude_home,
+        cwd=cwd or Path.cwd(),
+        provider_roots=provider_roots,
+    )
     return {safe_resolve(candidate.path): candidate for candidate in roots}
 
 
@@ -1002,7 +1058,7 @@ def known_candidate_for_resolved_path(resolved: Path, known: dict[Path, RootCand
     direct = known.get(resolved)
     if direct:
         return direct
-    if resolved.suffix not in {".jsonl", ".json"}:
+    if resolved.suffix not in {".jsonl", ".json", ".md"}:
         return None
     for root, candidate in known.items():
         if candidate.source_role != "transcript_root":
@@ -1017,6 +1073,12 @@ def known_candidate_for_resolved_path(resolved: Path, known: dict[Path, RootCand
                 kind = "claude_session_file"
             elif kind == "claude_desktop_json_directory":
                 kind = "claude_desktop_json_sessions"
+            elif kind == "gemini_sessions":
+                kind = "gemini_session_file"
+            elif kind == "grok_sessions":
+                kind = "grok_session_file"
+            elif kind == "aider_history":
+                kind = "aider_history_file"
             return replace(
                 candidate,
                 kind=kind,
@@ -1141,7 +1203,13 @@ def _tail_jsonl_lines(path: Path, *, max_bytes: int, max_lines: int) -> list[str
     return lines[-max_lines:]
 
 
-def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) -> list[Path]:
+def normalize_requested_root(
+    root: Path,
+    codex_home: Path,
+    claude_home: Path,
+    *,
+    provider_roots: dict[str, Path] | None = None,
+) -> list[Path]:
     root = normalize_local_path(root)
     resolved = safe_resolve(root)
     if resolved == safe_resolve(codex_home):
@@ -1152,6 +1220,12 @@ def normalize_requested_root(root: Path, codex_home: Path, claude_home: Path) ->
         ]
     if resolved == safe_resolve(claude_home):
         return [claude_home / "projects"]
+    for provider, provider_root in (provider_roots or {}).items():
+        if resolved != safe_resolve(provider_root):
+            continue
+        if provider == "grok" and provider_root.name != "sessions":
+            return [provider_root / "sessions"]
+        return [provider_root]
     return [root]
 
 
@@ -1292,7 +1366,7 @@ def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None
     for root in plan.roots:
         base = root.path.expanduser()
         if base.is_file():
-            candidates = [base] if base.suffix in {".jsonl", ".json"} else []
+            candidates = [base] if base.suffix in {".jsonl", ".json", ".md"} else []
         elif base.is_dir():
             candidates = iter_directory_jsonl_files(
                 base,
@@ -1829,12 +1903,24 @@ def filename_preference_score(path: Path, preferred_terms: list[str]) -> int:
 def directory_file_suffixes(source_kind: str) -> tuple[str, ...]:
     if source_kind == "claude_desktop_json_directory":
         return (".json",)
+    if source_kind in {"gemini_sessions", "gemini_session_file"}:
+        return (".jsonl", ".json")
+    if source_kind in {"aider_history", "aider_history_file"}:
+        return (".md",)
     return (".jsonl",)
 
 
 def directory_file_allowed(path: Path, source_kind: str) -> bool:
     if source_kind == "claude_desktop_json_directory":
         return path.name.startswith("local_") and path.suffix == ".json"
+    if source_kind in {"gemini_sessions", "gemini_session_file"}:
+        return path.name.startswith("session-") and path.parent.name == "chats"
+    if source_kind in {"grok_sessions", "grok_session_file"}:
+        if path.name == "updates.jsonl":
+            return True
+        return path.name == "chat_history.jsonl" and not (path.parent / "updates.jsonl").is_file()
+    if source_kind in {"aider_history", "aider_history_file"}:
+        return path.name == ".aider.chat.history.md"
     return True
 
 

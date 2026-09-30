@@ -64,6 +64,12 @@ class Match:
     session: str | None = None
     tasks: list[str] = field(default_factory=list)
     preferences: list[str] = field(default_factory=list)
+    provider: str | None = None
+    source_ref: str | None = None
+    source_refs: list[str] = field(default_factory=list)
+    native_id: str | None = None
+    timestamp_quality: str = "record"
+    coverage_notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
