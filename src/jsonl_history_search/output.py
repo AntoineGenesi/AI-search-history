@@ -378,6 +378,33 @@ def render_text(payload: dict) -> str:
     lines.append(
         f"Searched: {payload.get('searched_files', 0)} files, {payload.get('searched_bytes', 0)} bytes"
     )
+    diagnostics = payload.get("source_diagnostics") or {}
+    cap_hits = payload.get("cap_hits") or {}
+    missing_roots = payload.get("missing_roots") or []
+    providers = payload.get("providers_searched") or []
+    lines.append(
+        "Coverage: "
+        f"{diagnostics.get('coverage', 'not_scanned')}; "
+        f"providers={','.join(str(item) for item in providers) or '(none)'}; "
+        f"missing_roots={len(missing_roots)}; "
+        f"caps=file:{bool(cap_hits.get('file'))},byte:{bool(cap_hits.get('byte'))},elapsed:{bool(cap_hits.get('elapsed'))}; "
+        f"malformed={diagnostics.get('malformed_rows', 0)}; "
+        f"skipped={diagnostics.get('skipped_rows', 0)}; "
+        f"ignored={diagnostics.get('ignored_rows', 0)}; "
+        f"fallback_records={diagnostics.get('fallback_records', 0)}"
+    )
+    if missing_roots:
+        missing_labels = sorted(
+            {str(item.get("provider") or item.get("kind") or "unknown") for item in missing_roots}
+        )
+        lines.append(f"Missing providers/roots: {', '.join(missing_labels)}")
+    for failure in (diagnostics.get("partial_failures") or [])[:5]:
+        location = str(failure.get("path") or "unknown")
+        if failure.get("line") is not None:
+            location += f":{failure['line']}"
+        lines.append(
+            f"Partial source: {failure.get('provider') or 'unknown'} {location}: {failure.get('reason') or 'unknown'}"
+        )
     for warning in payload.get("warnings", []):
         lines.append(f"Warning: {warning}")
     for blind in payload.get("blind_spots", []):
@@ -402,7 +429,18 @@ def render_text(payload: dict) -> str:
                 where = f"line {match['line']}"
                 stamp = f", {match['timestamp']}" if match["timestamp"] else ""
                 role = f", {match['role']}" if match["role"] else ""
-                lines.append(f"  {where}{stamp}{role}: {match['snippet']}")
+                provider = match.get("provider") or "unknown"
+                native_id = match.get("native_id") or "(none)"
+                timestamp_quality = match.get("timestamp_quality") or "unknown"
+                lines.append(
+                    f"  {where}{stamp}{role}, provider={provider}, native_id={native_id}, "
+                    f"timestamp_quality={timestamp_quality}: {match['snippet']}"
+                )
+                source_ref = match.get("source_ref") or f"{match['path']}:{match['line']}"
+                lines.append(f"    source_ref={source_ref}")
+                supporting = match.get("source_refs") or []
+                if len(supporting) > 1:
+                    lines.append(f"    supporting_refs={'; '.join(str(item) for item in supporting)}")
     return "\n".join(lines)
 
 

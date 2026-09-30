@@ -326,6 +326,7 @@ def search(
         "source_diagnostics": {
             "malformed_rows": raw_line_stats.malformed_rows,
             "skipped_rows": raw_line_stats.skipped_rows,
+            "ignored_rows": raw_line_stats.ignored_rows,
             "weak_timestamp_records": raw_line_stats.weak_timestamp_records,
             "fallback_records": raw_line_stats.fallback_records,
             "partial_failures": list(raw_line_stats.partial_failures or []),

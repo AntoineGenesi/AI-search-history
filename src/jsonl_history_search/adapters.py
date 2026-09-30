@@ -21,6 +21,7 @@ class RawLineScanStats:
     full_json_records_parsed: int = 0
     malformed_rows: int = 0
     skipped_rows: int = 0
+    ignored_rows: int = 0
     weak_timestamp_records: int = 0
     fallback_records: int = 0
     partial_failures: list[dict[str, object]] | None = None
@@ -305,11 +306,14 @@ class GrokSessionAdapter:
         session_dir = path.parent
         summary_path = session_dir / "summary.json"
         summary: dict[str, Any] = {}
+        summary_usable = False
         if summary_path.is_file():
             try:
                 parsed = json.loads(summary_path.read_text(encoding="utf-8", errors="replace"))
                 if isinstance(parsed, dict):
                     summary = parsed
+                    summary_id, summary_cwd = _grok_summary_identity(summary)
+                    summary_usable = bool(summary_id or summary_cwd)
             except (OSError, json.JSONDecodeError):
                 _note_malformed(raw_line_stats, "grok", summary_path, None, "malformed or unreadable summary sidecar")
         updates_path = session_dir / "updates.jsonl"
@@ -319,6 +323,7 @@ class GrokSessionAdapter:
             summary=summary,
             default_tz=default_tz,
             stats=raw_line_stats,
+            summary_usable=summary_usable,
             on_raw_line_examined=on_raw_line_examined,
         ) if updates_path.is_file() else []
         if records:
@@ -332,6 +337,7 @@ class GrokSessionAdapter:
                 summary=summary,
                 default_tz=default_tz,
                 stats=raw_line_stats,
+                summary_usable=summary_usable,
                 on_raw_line_examined=on_raw_line_examined,
             )
             if raw_line_stats is not None:
@@ -503,6 +509,11 @@ def _note_skipped(stats: RawLineScanStats | None, provider: str, path: Path, lin
         stats.note_partial(provider=provider, path=path, line=line, reason=reason)
 
 
+def _note_ignored(stats: RawLineScanStats | None) -> None:
+    if stats is not None:
+        stats.ignored_rows += 1
+
+
 def _grok_timestamp(event: dict[str, Any], update: dict[str, Any], default_tz):
     value = (((event.get("params") or {}).get("_meta") or {}).get("agentTimestampMs")
              or ((update.get("_meta") or {}).get("agentTimestampMs")) or event.get("timestamp"))
@@ -511,16 +522,25 @@ def _grok_timestamp(event: dict[str, Any], update: dict[str, Any], default_tz):
     return parse_datetime(value, default_tz), str(value) if value is not None else None
 
 
+def _grok_summary_identity(summary: dict[str, Any]) -> tuple[str | None, str | None]:
+    info = summary.get("info")
+    if not isinstance(info, dict):
+        return None, None
+    return _string_or_none(info.get("id")), _string_or_none(info.get("cwd"))
+
+
 def _grok_update_records(path: Path, *, source_kind: str, summary: dict[str, Any], default_tz,
-                         stats: RawLineScanStats | None, on_raw_line_examined=None) -> list[Record]:
+                         stats: RawLineScanStats | None, summary_usable: bool,
+                         on_raw_line_examined=None) -> list[Record]:
     records: list[Record] = []
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return records
-    session_id = _string_or_none(summary.get("id")) or path.parent.name
-    cwd = _string_or_none(summary.get("cwd"))
-    summary_ref = f"{path.parent / 'summary.json'}#metadata" if (path.parent / "summary.json").is_file() else None
+    summary_id, summary_cwd = _grok_summary_identity(summary)
+    session_id = summary_id or path.parent.name
+    cwd = summary_cwd
+    summary_ref = f"{path.parent / 'summary.json'}#info" if summary_usable else None
     last_chunk_kind: str | None = None
     tool_by_id: dict[str, Record] = {}
     with handle:
@@ -594,10 +614,13 @@ def _grok_update_records(path: Path, *, source_kind: str, summary: dict[str, Any
 
 
 def _grok_fallback_records(path: Path, *, source_kind: str, summary: dict[str, Any], default_tz,
-                           stats: RawLineScanStats | None, on_raw_line_examined=None) -> list[Record]:
+                           stats: RawLineScanStats | None, summary_usable: bool,
+                           on_raw_line_examined=None) -> list[Record]:
     records: list[Record] = []
-    session_id = _string_or_none(summary.get("id")) or path.parent.name
-    cwd = _string_or_none(summary.get("cwd"))
+    summary_id, summary_cwd = _grok_summary_identity(summary)
+    session_id = summary_id or path.parent.name
+    cwd = summary_cwd
+    summary_ref = f"{path.parent / 'summary.json'}#info" if summary_usable else None
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
@@ -619,7 +642,7 @@ def _grok_fallback_records(path: Path, *, source_kind: str, summary: dict[str, A
                 continue
             role = str(message.get("type") or "")
             if role == "user" and (message.get("synthetic_reason") is not None or message.get("prompt_index") is None):
-                _note_skipped(stats, "grok", path, line_number, "synthetic or non-prompt fallback user row")
+                _note_ignored(stats)
                 continue
             if role not in {"user", "assistant"}:
                 continue
@@ -633,7 +656,8 @@ def _grok_fallback_records(path: Path, *, source_kind: str, summary: dict[str, A
             records.append(Record(
                 path=str(path), line=line_number, role=role, text=text, timestamp=None,
                 cwd=cwd, raw=message, source_format=source_kind, record_id=f"fallback-{line_number}",
-                conversation_id=session_id, provider="grok", source_ref=locator, source_refs=[locator],
+                conversation_id=session_id, provider="grok", source_ref=locator,
+                source_refs=[locator] + ([summary_ref] if summary_ref else []),
                 native_id=_string_or_none(message.get("prompt_index")), timestamp_quality="unavailable",
                 coverage_notes=["Fallback chat_history.jsonl used because authoritative updates had no message-bearing events."],
             ))
