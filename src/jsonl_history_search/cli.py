@@ -85,6 +85,7 @@ from .harness_artifacts import (
 )
 from .harness_loop import DEFAULT_MINIMUM_LOOP_CASE_ID, build_harness_minimum_loop_payload
 from .history_home import history_home_from_args
+from .history_answer import build_direct_history_answer_payload, is_direct_latest_message_history_query
 from .providers import provider_catalog
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
@@ -306,7 +307,8 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         "ask",
         description=(
             "Natural-language first-command resolver for JSONL history/status/"
-            "action/currentness/wrap-up prompts. It does not produce final answers."
+            "action/currentness/wrap-up prompts. Add --answer for one direct, "
+            "source-backed invocation."
         ),
     )
     ask.add_argument("query", help="Original user wording, or a summary paired with --original-query-file.")
@@ -11183,6 +11185,11 @@ _ACTION_CHRONOLOGY_FOLLOWUP_MARKERS = (
 
 
 def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) -> dict:
+    if (
+        route_payload["ask_router"].get("route_family") == "latest_status"
+        and is_direct_latest_message_history_query(str(args.query or ""))
+    ):
+        return build_direct_history_answer_payload(args, route_payload=route_payload)
     execute_args = args
     if route_payload["ask_router"].get("route_family") == "bounded_no_evidence":
         execute_args = _args_with_bounded_auto_execute_prompt_scope(args)

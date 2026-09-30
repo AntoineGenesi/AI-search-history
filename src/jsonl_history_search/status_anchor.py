@@ -4307,15 +4307,27 @@ def _lineage_for_anchor(anchor: dict, *, codex_home: Path, cwd: Path) -> dict:
     }
 
 
-def _session_lineage_metadata(path: Path, *, cwd: Path) -> dict:
+def _session_lineage_metadata(
+    path: Path,
+    *,
+    cwd: Path,
+    deadline: float | None = None,
+    max_bytes: int | None = None,
+) -> dict:
     session_meta: Mapping[str, Any] | None = None
     workspace_roots: list[str] = []
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return {"status": "missing", "reason": "session_file_open_failed"}
+    bytes_read = 0
     with handle:
         for line in handle:
+            if deadline is not None and time.monotonic() >= deadline:
+                return {"status": "missing", "reason": "session_metadata_elapsed_cap"}
+            bytes_read += len(line.encode("utf-8", errors="replace"))
+            if max_bytes is not None and bytes_read > max_bytes:
+                return {"status": "missing", "reason": "session_metadata_byte_cap"}
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
@@ -4791,14 +4803,31 @@ def _canonical_occurrence_has_status_failure_evidence(rows: list[dict], occurren
     return has_status_boundary and has_wrong_context and has_parent_main_boundary
 
 
-def _canonical_history_human_rows(path: Path, *, query: str) -> list[dict]:
+def _canonical_history_human_rows(
+    path: Path,
+    *,
+    query: str,
+    deadline: float | None = None,
+    max_bytes: int | None = None,
+    scan_state: dict | None = None,
+) -> list[dict]:
     rows = []
+    bytes_read = 0
+    complete = True
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return []
     with handle:
         for line_number, line in enumerate(handle, 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                complete = False
+                break
+            line_bytes = len(line.encode("utf-8", errors="replace"))
+            if max_bytes is not None and bytes_read + line_bytes > max_bytes:
+                complete = False
+                break
+            bytes_read += line_bytes
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
@@ -4820,6 +4849,8 @@ def _canonical_history_human_rows(path: Path, *, query: str) -> list[dict]:
             if _history_row_is_non_human_or_boundary(record, candidate):
                 continue
             rows.append(candidate)
+    if scan_state is not None:
+        scan_state.update({"complete": complete, "bytes_read": bytes_read, "rows_read": line_number if 'line_number' in locals() else 0})
     return rows
 
 
@@ -8115,7 +8146,7 @@ def _session_files_for_id(codex_home: Path, session_id: Any) -> list[Path]:
     if not sessions_root.is_dir():
         return []
     needle = str(session_id)
-    return sorted(path for path in sessions_root.rglob("*.jsonl") if needle in path.name)
+    return sorted(sessions_root.rglob(f"*{needle}*.jsonl"))
 
 
 def _dedupe_session_contexts(contexts: list[dict]) -> list[dict]:
