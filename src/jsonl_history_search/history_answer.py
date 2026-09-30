@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .latest_user_messages import _bounded_session_paths
+from .latest_user_messages import _bounded_session_paths, _session_ref
 from .providers import PROVIDERS, resolve_provider_root
 from .status_anchor import (
     _canonical_history_human_rows,
@@ -94,6 +94,7 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
         return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
     reconstruction = _reconstruct_codex_interval(
         selection=selection,
+        codex_home=codex_home,
         deadline=deadline,
         max_bytes=int(getattr(args, "max_bytes", 100 * 1024 * 1024) or 0),
     )
@@ -411,11 +412,13 @@ def _latest_matching_parent_row(
 
 def _build_lineage_index(*, codex_home: Path, cwd: Path, max_files: int, deadline: float) -> dict:
     warnings: list[str] = []
+    scan_state: dict[str, Any] = {}
     paths = _bounded_session_paths(
         codex_home / "sessions",
         limit=max_files,
         deadline=deadline,
         warnings=warnings,
+        scan_state=scan_state,
     ) if (codex_home / "sessions").is_dir() else []
     by_hash: dict[str, dict] = {}
     for path in paths:
@@ -433,7 +436,13 @@ def _build_lineage_index(*, codex_home: Path, cwd: Path, max_files: int, deadlin
         if ref and ref not in seen_refs:
             seen_refs.add(ref)
             metas.append(meta)
-    return {"by_hash": by_hash, "metas": metas, "warnings": warnings, "paths_inspected": len(paths)}
+    return {
+        "by_hash": by_hash,
+        "metas": metas,
+        "warnings": warnings,
+        "paths_inspected": len(paths),
+        "scan_state": scan_state,
+    }
 
 
 def _lineage_for_row(row: Mapping[str, Any] | None, lineage_index: dict) -> dict:
@@ -495,7 +504,9 @@ def _boundary_summary(boundary: dict | None, lineage: dict, source: str | None) 
     }
 
 
-def _reconstruct_codex_interval(*, selection: dict, deadline: float, max_bytes: int) -> dict:
+def _reconstruct_codex_interval(
+    *, selection: dict, codex_home: Path, deadline: float, max_bytes: int
+) -> dict:
     """Read the selected Codex lineage directly, bounded by the same deadline."""
 
     selected = dict(selection["selected_anchor"])
@@ -531,7 +542,7 @@ def _reconstruct_codex_interval(*, selection: dict, deadline: float, max_bytes: 
             warnings.append("Stopped before the next Codex lineage file at max byte cap.")
             break
         bytes_read += size
-        records = _read_codex_activity(path, deadline=deadline)
+        records = _read_codex_activity(path, codex_home=codex_home, deadline=deadline)
         if records is None:
             warnings.append("Stopped within a Codex lineage file at max elapsed cap.")
             break
@@ -544,7 +555,8 @@ def _reconstruct_codex_interval(*, selection: dict, deadline: float, max_bytes: 
                 continue
             activities.append(record)
     activities.sort(key=lambda item: (str(item.get("timestamp_utc") or ""), str(item.get("source_ref") or "")))
-    complete = not warnings and bool(metas) and inspected == len(metas)
+    scan_state = index.get("scan_state") if isinstance(index.get("scan_state"), dict) else {}
+    complete = not warnings and scan_state.get("complete", True) and bool(metas) and inspected == len(metas)
     coverage = {
         "status": "complete" if complete else "partial" if metas else "missing",
         "complete": complete,
@@ -552,6 +564,10 @@ def _reconstruct_codex_interval(*, selection: dict, deadline: float, max_bytes: 
         "warnings": warnings,
         "searched_files": inspected,
         "searched_bytes": bytes_read,
+        "file_cap_hit": scan_state.get("file_cap_hit", False),
+        "enumeration_complete": scan_state.get("complete", True),
+        "omitted_source_file_lower_bound": scan_state.get("omitted_file_lower_bound", 0),
+        "omitted_source_directory_lower_bound": scan_state.get("omitted_directory_lower_bound", 0),
     }
     interval = {
         "anchor": _public_anchor(selected),
@@ -564,7 +580,7 @@ def _reconstruct_codex_interval(*, selection: dict, deadline: float, max_bytes: 
     return {"selected_anchor": selected, "interval": interval, "coverage": coverage}
 
 
-def _read_codex_activity(path: Path, *, deadline: float) -> list[dict] | None:
+def _read_codex_activity(path: Path, *, codex_home: Path, deadline: float) -> list[dict] | None:
     activities: list[dict] = []
     try:
         handle = path.open("r", encoding="utf-8", errors="replace")
@@ -612,7 +628,7 @@ def _read_codex_activity(path: Path, *, deadline: float) -> list[dict] | None:
                 "activity_kind": activity_kind,
                 "classification": classification,
                 "snippet": snippet,
-                "source_ref": f"codex_session:{path}:{line_number}",
+                "source_ref": _session_ref(path, codex_home, line_number),
                 "openable_target": f"{path}:{line_number}",
             })
     return activities
@@ -698,6 +714,9 @@ def _missing_or_capped_scope(interval: dict, coverage: dict) -> dict:
         "omitted_activity_entry_count": coverage.get("omitted_activity_entry_count", 0),
         "omitted_ranges": interval.get("omitted_ranges") or [],
         "warnings": coverage.get("warnings") or [],
+        "file_cap_hit": coverage.get("file_cap_hit", False),
+        "omitted_source_file_lower_bound": coverage.get("omitted_source_file_lower_bound", 0),
+        "omitted_source_directory_lower_bound": coverage.get("omitted_source_directory_lower_bound", 0),
     }
 
 
@@ -853,7 +872,14 @@ def _build_claude_direct_history_answer(
     max_files = max(0, int(getattr(args, "max_files", 200) or 0))
     max_bytes = max(0, int(getattr(args, "max_bytes", 100 * 1024 * 1024) or 0))
     warnings: list[str] = []
-    paths = _bounded_session_paths(search_root, limit=max_files, deadline=deadline, warnings=warnings) if search_root.is_dir() else []
+    scan_state: dict[str, Any] = {}
+    paths = _bounded_session_paths(
+        search_root,
+        limit=max_files,
+        deadline=deadline,
+        warnings=warnings,
+        scan_state=scan_state,
+    ) if search_root.is_dir() else []
     bytes_read = 0
     matching: list[dict] = []
     capped = bool(warnings)
@@ -887,7 +913,12 @@ def _build_claude_direct_history_answer(
         selection = {
             "status": "partial",
             "reason": "claude_history_scan_stopped_at_explicit_byte_or_elapsed_cap",
-            "boundary": {"root": str(search_root), "warnings": warnings, "bytes_read": bytes_read},
+            "boundary": {
+                "root": str(search_root),
+                "warnings": warnings,
+                "bytes_read": bytes_read,
+                **scan_state,
+            },
             "recovery": "bounded_claude_history_scan_stopped_at_cap",
         }
         return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
@@ -896,7 +927,7 @@ def _build_claude_direct_history_answer(
             "status": "ambiguous" if len(matching) > 1 else "not_found",
             "reason": "multiple_claude_query_boundaries" if len(matching) > 1 else "claude_query_boundary_or_prior_human_turn_not_found",
             "boundary": {"root": str(search_root), "matching_files": len(matching)},
-            "candidate_refs": [f"claude_jsonl:{item['path']}:{item['anchor']['line']}" for item in matching[:8]],
+            "candidate_refs": [f"{item['path']}:{item['anchor']['line']}" for item in matching[:8]],
             "recovery": "bounded_claude_same_root_scan_exhausted",
         }
         return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
@@ -904,21 +935,21 @@ def _build_claude_direct_history_answer(
     anchor = match["anchor"]
     query_turn = match["turns"][match["query_index"]]
     activity = [turn for turn in match["turns"] if anchor["line"] < turn["line"] < query_turn["line"]]
-    anchor_ref = f"claude_jsonl:{match['path']}:{anchor['line']}"
+    anchor_ref = f"{match['path']}:{anchor['line']}"
     refs = [{"target": f"{match['path']}:{anchor['line']}", "source_ref": anchor_ref, "kind": "selected_main_human_anchor", "proof_surface": "primary_raw_history", "target_source_role": "human_user_message"}]
     recap = []
     for turn in activity[:DIRECT_RECAP_ITEM_CAP]:
-        ref = f"claude_jsonl:{match['path']}:{turn['line']}"
+        ref = f"{match['path']}:{turn['line']}"
         refs.append({"target": f"{match['path']}:{turn['line']}", "source_ref": ref, "kind": f"{turn['role']}_message", "proof_surface": "primary_raw_session_interval", "target_source_role": turn["role"]})
         recap.append(f"{turn['role']} message: {turn['text']}")
-    public_anchor = {"source_ref": anchor_ref, "openable_target": f"{match['path']}:{anchor['line']}", "timestamp_utc": anchor.get("timestamp"), "snippet": anchor["text"], "source_kind": "claude_jsonl"}
+    public_anchor = {"source_ref": anchor_ref, "openable_target": f"{match['path']}:{anchor['line']}", "timestamp_utc": anchor.get("timestamp"), "snippet": anchor["text"], "source_kind": "claude_projects"}
     coverage = {"status": "complete", "complete": True, "records_after_anchor": len(activity), "warnings": []}
     contract = {
         "built_from": "direct_history_answer", "answer_action_status": "answered-from-proof",
         "promotion_status": "direct_lineage_chronology_and_bounded_interval",
         "selection_policy": "provider_native_session_chronology; no semantic ranking",
         "anchor": public_anchor,
-        "searched_interval": {"anchor": public_anchor, "boundary": {"source_ref": f"claude_jsonl:{match['path']}:{query_turn['line']}", "timestamp_utc": query_turn.get("timestamp")}, "chronological_entry_count": len(activity)},
+        "searched_interval": {"anchor": public_anchor, "boundary": {"source_ref": f"{match['path']}:{query_turn['line']}", "timestamp_utc": query_turn.get("timestamp")}, "chronological_entry_count": len(activity)},
         "coverage": coverage, "missing_or_capped_scope": _missing_or_capped_scope({}, coverage),
         "source_inventory": inventory, "limits": limits,
         "native_source_refs": [item["source_ref"] for item in refs],

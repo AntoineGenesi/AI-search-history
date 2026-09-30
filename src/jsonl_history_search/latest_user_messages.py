@@ -238,16 +238,34 @@ def _bounded_session_paths(
     limit: int,
     deadline: float | None,
     warnings: list[str],
+    scan_state: dict | None = None,
 ) -> list[Path]:
     """Enumerate newest name-ordered session paths without statting the whole tree."""
 
     if limit <= 0:
+        if root.is_dir():
+            warnings.append("Stopped session source enumeration at zero max file cap.")
+        if scan_state is not None:
+            scan_state.update(
+                {
+                    "complete": not root.is_dir(),
+                    "deadline_hit": False,
+                    "file_cap_hit": root.is_dir(),
+                    "returned_file_count": 0,
+                    "omitted_file_lower_bound": 0,
+                    "omitted_directory_lower_bound": 1 if root.is_dir() else 0,
+                }
+            )
         return []
     selected: list[Path] = []
     pending = [root]
+    deadline_hit = False
+    omitted_file_lower_bound = 0
+    omitted_directory_lower_bound = 0
     while pending and len(selected) < limit:
         if deadline is not None and time.monotonic() >= deadline:
             warnings.append("Stopped session source enumeration at max elapsed cap.")
+            deadline_hit = True
             break
         directory = pending.pop()
         directories: list[Path] = []
@@ -257,6 +275,7 @@ def _bounded_session_paths(
                 for entry in entries:
                     if deadline is not None and time.monotonic() >= deadline:
                         warnings.append("Stopped within session directory enumeration at max elapsed cap.")
+                        deadline_hit = True
                         break
                     if entry.is_dir(follow_symlinks=False):
                         directories.append(Path(entry.path))
@@ -266,9 +285,29 @@ def _bounded_session_paths(
             continue
         directories.sort(key=lambda path: path.name)
         files.sort(key=lambda path: path.name, reverse=True)
-        selected.extend(files[: max(0, limit - len(selected))])
+        remaining = max(0, limit - len(selected))
+        selected.extend(files[:remaining])
+        omitted_file_lower_bound += max(0, len(files) - remaining)
         # Stack order makes lexically newest year/month/day directories pop first.
         pending.extend(directories)
+    if len(selected) >= limit and (pending or omitted_file_lower_bound):
+        omitted_directory_lower_bound = len(pending)
+        warnings.append(
+            "Stopped session source enumeration at max file cap; "
+            f"at least {omitted_file_lower_bound} files and "
+            f"{omitted_directory_lower_bound} directories were not inspected."
+        )
+    if scan_state is not None:
+        scan_state.update(
+            {
+                "complete": not deadline_hit and not (len(selected) >= limit and (pending or omitted_file_lower_bound)),
+                "deadline_hit": deadline_hit,
+                "file_cap_hit": len(selected) >= limit and bool(pending or omitted_file_lower_bound),
+                "returned_file_count": len(selected),
+                "omitted_file_lower_bound": omitted_file_lower_bound,
+                "omitted_directory_lower_bound": omitted_directory_lower_bound,
+            }
+        )
     return selected
 
 

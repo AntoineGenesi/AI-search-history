@@ -918,7 +918,9 @@ def _append_direct_history_answer_contract_text(lines: list[str], contract: dict
         "Missing/capped scope: "
         f"status={missing.get('status') or 'unknown'} "
         f"omitted={missing.get('omitted_activity_entry_count', 0)} "
-        f"missing_logs={len(missing.get('missing_logs') or [])}"
+        f"missing_logs={len(missing.get('missing_logs') or [])} "
+        f"omitted_source_files_at_least={missing.get('omitted_source_file_lower_bound', 0)} "
+        f"omitted_source_directories_at_least={missing.get('omitted_source_directory_lower_bound', 0)}"
     )
     inventory = contract.get("source_inventory") or []
     if inventory:
