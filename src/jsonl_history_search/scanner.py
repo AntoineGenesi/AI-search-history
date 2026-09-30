@@ -21,7 +21,15 @@ from .ranking import (
     strong_evidence_retention_tier,
 )
 from .rg_prefilter import filter_planned_files
-from .sources import PlannedJsonlFiles, SourcePlan, enumerate_jsonl_files, filename_preference_score, source_kind_for_path, stat_mtime
+from .sources import (
+    PlannedJsonlFiles,
+    SourcePlan,
+    cap_hits_from_warnings,
+    enumerate_jsonl_files,
+    filename_preference_score,
+    source_kind_for_path,
+    stat_mtime,
+)
 
 
 SCAN_RECORD_QUANTUM = 128
@@ -315,6 +323,16 @@ def search(
         "raw_lines_examined": raw_line_stats.raw_lines_examined,
         "raw_lines_skipped_before_full_json_parse": raw_line_stats.raw_lines_skipped_before_full_json_parse,
         "full_json_records_parsed": raw_line_stats.full_json_records_parsed,
+        "source_diagnostics": {
+            "malformed_rows": raw_line_stats.malformed_rows,
+            "skipped_rows": raw_line_stats.skipped_rows,
+            "weak_timestamp_records": raw_line_stats.weak_timestamp_records,
+            "fallback_records": raw_line_stats.fallback_records,
+            "partial_failures": list(raw_line_stats.partial_failures or []),
+            "coverage": "partial" if raw_line_stats.partial_failures or stopped else "complete_within_caps",
+        },
+        "providers_searched": sorted({root.provider for root in plan.roots if root.provider}),
+        "missing_roots": [root.to_dict() for root in plan.missing_roots],
         "pre_parse": _pre_parse_stats(pre_parse_filter, raw_line_stats),
         "records_rejected_by_should_consider": records_rejected_by_should_consider,
         "candidate_records_scored": candidate_records_scored,
@@ -327,6 +345,7 @@ def search(
         ),
         "groups": groups,
         "warnings": sorted(set(warnings + plan.warnings)),
+        "cap_hits": cap_hits_from_warnings(sorted(set(warnings + plan.warnings))),
         "blind_spots": sorted(set(blind_spots)),
     }
     if prefilter is not None:
@@ -892,6 +911,12 @@ def _materialize_match(
         session=facets.session,
         tasks=facets.tasks,
         preferences=facets.preferences,
+        provider=record.provider,
+        source_ref=record.source_ref,
+        source_refs=list(record.source_refs or []),
+        native_id=record.native_id,
+        timestamp_quality=record.timestamp_quality,
+        coverage_notes=list(record.coverage_notes or []),
     )
 
 

@@ -85,6 +85,7 @@ from .harness_artifacts import (
 )
 from .harness_loop import DEFAULT_MINIMUM_LOOP_CASE_ID, build_harness_minimum_loop_payload
 from .history_home import history_home_from_args
+from .providers import provider_catalog
 from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
@@ -2017,6 +2018,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--codex-home", default=None)
     parser.add_argument("--claude-home", default=None)
+    parser.add_argument("--gemini-home", default=None)
+    parser.add_argument("--grok-home", default=None)
+    parser.add_argument("--aider-root", default=None)
     parser.add_argument("--root", action="append", default=[])
     parser.add_argument("--role", default=None)
     parser.add_argument("--max-files", type=int, default=200)
@@ -2143,6 +2147,10 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
     cwd = Path(args.cwd).expanduser().resolve()
     codex_home = normalize_local_path(_history_home_from_args(args, provider="codex"))
     claude_home = normalize_local_path(_history_home_from_args(args, provider="claude"))
+    provider_roots = {
+        provider: normalize_local_path(_history_home_from_args(args, provider=provider))
+        for provider in ("gemini", "grok", "aider")
+    }
     limits = Limits(
         max_files=args.max_files,
         max_bytes=args.max_bytes,
@@ -2175,6 +2183,7 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         allow_arbitrary_root=args.allow_arbitrary_root,
         limits=limits,
         current_session_only=current_session_only,
+        provider_roots=provider_roots,
     )
     source_plan = {
         "query": intent.to_dict(),
@@ -2182,6 +2191,8 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         "cwd": str(cwd),
         "codex_home": str(codex_home),
         "claude_home": str(claude_home),
+        "provider_roots": {key: str(value) for key, value in provider_roots.items()},
+        "provider_catalog": provider_catalog(),
         "now": now.isoformat(),
     }
     if args.mask_manifest:
