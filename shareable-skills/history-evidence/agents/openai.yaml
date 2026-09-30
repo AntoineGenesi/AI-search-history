@@ -1,0 +1,4 @@
+interface:
+  display_name: "History Evidence"
+  short_description: "Find source-backed evidence in local AI history"
+  default_prompt: "Use $history-evidence to answer this history question from local source records, with exact refs and searched-scope boundaries."
