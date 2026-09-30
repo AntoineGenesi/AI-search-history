@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import timezone
@@ -90,7 +91,12 @@ def latest_user_messages(
     records_read = 0
     rejected_records = 0
 
-    for source in _codex_sources(codex_home, max_files=max_files, warnings=warnings):
+    for source in _codex_sources(
+        codex_home,
+        max_files=max_files,
+        warnings=warnings,
+        deadline=started + max_elapsed,
+    ):
         if time.monotonic() - started > max_elapsed:
             warnings.append("Stopped before opening next file at max elapsed cap.")
             excluded_sources.append(_source_metadata(source, "max_elapsed_before_open"))
@@ -182,7 +188,13 @@ class _Source:
     raw_session_identity_source: str | None = None
 
 
-def _codex_sources(codex_home: Path, *, max_files: int, warnings: list[str]) -> list[_Source]:
+def _codex_sources(
+    codex_home: Path,
+    *,
+    max_files: int,
+    warnings: list[str],
+    deadline: float | None = None,
+) -> list[_Source]:
     sources: list[_Source] = []
     history = codex_home / "history.jsonl"
     if history.is_file():
@@ -192,10 +204,11 @@ def _codex_sources(codex_home: Path, *, max_files: int, warnings: list[str]) -> 
     sessions_root = codex_home / "sessions"
     session_paths: list[Path] = []
     if sessions_root.is_dir():
-        session_paths = sorted(
-            sessions_root.rglob("*.jsonl"),
-            key=lambda path: _mtime(path),
-            reverse=True,
+        session_paths = _bounded_session_paths(
+            sessions_root,
+            limit=max(0, max_files - len(sources)),
+            deadline=deadline,
+            warnings=warnings,
         )
     elif not sessions_root.exists():
         warnings.append("Missing Codex sessions root.")
@@ -217,6 +230,46 @@ def _codex_sources(codex_home: Path, *, max_files: int, warnings: list[str]) -> 
     if not sources:
         warnings.append("No Codex history or session JSONL sources found.")
     return sources
+
+
+def _bounded_session_paths(
+    root: Path,
+    *,
+    limit: int,
+    deadline: float | None,
+    warnings: list[str],
+) -> list[Path]:
+    """Enumerate newest name-ordered session paths without statting the whole tree."""
+
+    if limit <= 0:
+        return []
+    selected: list[Path] = []
+    pending = [root]
+    while pending and len(selected) < limit:
+        if deadline is not None and time.monotonic() >= deadline:
+            warnings.append("Stopped session source enumeration at max elapsed cap.")
+            break
+        directory = pending.pop()
+        directories: list[Path] = []
+        files: list[Path] = []
+        try:
+            with os.scandir(str(directory)) as entries:
+                for entry in entries:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        warnings.append("Stopped within session directory enumeration at max elapsed cap.")
+                        break
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".jsonl"):
+                        files.append(Path(entry.path))
+        except OSError:
+            continue
+        directories.sort(key=lambda path: path.name)
+        files.sort(key=lambda path: path.name, reverse=True)
+        selected.extend(files[: max(0, limit - len(selected))])
+        # Stack order makes lexically newest year/month/day directories pop first.
+        pending.extend(directories)
+    return selected
 
 
 def _extract_user_message(

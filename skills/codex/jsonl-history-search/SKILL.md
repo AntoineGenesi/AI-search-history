@@ -1,6 +1,6 @@
 ---
 name: jsonl-history-search
-description: Use for questions that depend on prior local coding-assistant conversations: what happened since a message, earlier instructions or decisions, action proof, provenance, failures, or evidence in a bounded history scope. `convo tool` means this CLI. Do not use for bare `what happened?`, ordinary Git/repo status, or self-contained writing.
+description: "Use for questions that depend on prior local coding-assistant conversations: what happened since a message, earlier instructions or decisions, action proof, provenance, failures, or evidence in a bounded history scope. `convo tool` means this CLI. Do not use for bare `what happened?`, ordinary Git/repo status, or self-contained writing."
 ---
 
 # JSONL History Search
