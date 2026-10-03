@@ -149,6 +149,15 @@ def _retire_owned_search_helper(target_home: Path, scripts_root: Path) -> list[d
     if scripts_root.is_symlink() or backups.is_symlink():
         raise ValueError('Upgrade directories must be regular local directories; inspect symlink targets first.')
     backups.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # mkdir's mode does not apply to an existing archive. Harden only this
+    # owned directory through its nonsymlink descriptor, never recursively.
+    descriptor = os.open(backups, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(descriptor).st_uid != os.geteuid():
+            raise ValueError('Retirement archive belongs to another owner; original helper preserved.')
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
     before = target.stat()
     digest = hashlib.sha256()
     with target.open('rb') as source, tempfile.NamedTemporaryFile(
