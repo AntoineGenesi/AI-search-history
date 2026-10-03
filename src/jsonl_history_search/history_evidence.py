@@ -118,7 +118,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         continue
                     kind = raw.get('type')
                     if state['session'] and record.raw_timestamp and kind in {'response_item', 'event_msg'}:
-                        signature = (record.role, record.raw_timestamp, hashlib.sha256(record.text.encode()).hexdigest())
+                        signature = (classification.label, record.raw_timestamp, hashlib.sha256(record.text.encode()).hexdigest())
                         previous = state['mirrors'].get(signature)
                         if previous and {previous, kind} == {'response_item', 'event_msg'}:
                             mirrors += 1

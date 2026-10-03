@@ -29,8 +29,10 @@ Do not fabricate a recap from inherited visible context or later task summaries.
 No match means no match in searched scope, not absence from all history.
 
 Do not reread sufficient opened evidence. If a required detail is missing,
-optionally make one bounded read of the returned native source ref with
-`read-more`; otherwise stop with the precise gap. Ordinary use needs no saved
+use targeted bounded `read-more` calls on returned native refs while relevant
+evidence remains available within authorized scope/resources. Do not repeat
+sufficient evidence or launch fresh broad loops. Stop on actual exhaustion,
+unavailable scope or unresolved ambiguity, naming the gap. Ordinary use needs no saved
 report, packet readiness gate or continuation workflow.
 
 Supported stores are read directly without installing provider CLIs. Preserve
