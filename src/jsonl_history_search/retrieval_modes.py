@@ -46,6 +46,7 @@ def run_retrieval_mode(
     rrf_fusion_materialization_dir: str | None = None,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
     continuation_ledger: bool = False,
+    budget=None,
 ) -> dict[str, Any]:
     if retrieval_mode == RETRIEVAL_MODE_PACKAGE:
         return search(
@@ -55,6 +56,7 @@ def run_retrieval_mode(
             cwd=cwd,
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
+            budget=budget,
         )
     if retrieval_mode == RETRIEVAL_MODE_RRF_FUSION:
         return run_rrf_fusion_retrieval(
@@ -64,9 +66,11 @@ def run_retrieval_mode(
             cwd=cwd,
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
+            budget=budget,
             fielded_bm25_index_dir=fielded_bm25_index_dir,
             rrf_fusion_storage=rrf_fusion_storage,
             rrf_fusion_materialization_dir=rrf_fusion_materialization_dir,
+            query_plan_mode=query_plan_mode,
         )
     if retrieval_mode == RETRIEVAL_MODE_FIELDED_BM25:
         return run_fielded_bm25_retrieval(
@@ -78,6 +82,7 @@ def run_retrieval_mode(
             fielded_bm25_index_dir=fielded_bm25_index_dir,
             query_plan_mode=query_plan_mode,
             continuation_ledger=continuation_ledger,
+            budget=budget,
         )
     raise ValueError(f"unsupported retrieval mode: {retrieval_mode}")
 
@@ -92,10 +97,11 @@ def run_fielded_bm25_retrieval(
     fielded_bm25_index_dir: str | None = None,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
     continuation_ledger: bool = False,
+    budget=None,
 ) -> dict[str, Any]:
     total_profile_token = start_phase_profile("total_fielded_bm25_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
-    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
+    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms, budget=budget)
     enumeration_profile = finish_phase_profile(
         enumeration_profile_token,
         file_count=planned_jsonl_files.file_count,
@@ -111,6 +117,7 @@ def run_fielded_bm25_retrieval(
         default_tz=default_tz,
         planned_jsonl_files=planned_jsonl_files,
         persistent_index_dir=fielded_bm25_index_dir,
+        budget=budget,
     )
     fielded_index_profile = finish_phase_profile(
         fielded_index_profile_token,
@@ -130,9 +137,13 @@ def run_fielded_bm25_retrieval(
         cwd=cwd,
         mask_context=mask_context,
         include_private_diagnostics=True,
+        budget=budget,
         query_plan_mode=query_plan_mode,
         continuation_ledger=continuation_ledger,
     )
+    if budget is not None:
+        fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
         fielded_started,
@@ -143,6 +154,8 @@ def run_fielded_bm25_retrieval(
         records_considered=int(fielded_result.get("records_considered", 0)),
     )
     fielded_elapsed_ms = float(fielded_profile["elapsed_ms"])
+    if budget is not None and fielded_index.connection is not None:
+        fielded_index.connection.close()
     fielded_result.pop("_searched_file_paths", None)
     warnings = sorted(set(fielded_result.get("warnings", []) or []))
     total_profile = finish_phase_profile(
@@ -194,12 +207,14 @@ def run_rrf_fusion_retrieval(
     fielded_bm25_index_dir: str | None = None,
     rrf_fusion_storage: str = RRF_FUSION_STORAGE_MEMORY,
     rrf_fusion_materialization_dir: str | None = None,
+    query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
+    budget=None,
 ) -> dict[str, Any]:
     if rrf_fusion_storage not in RRF_FUSION_STORAGE_MODES:
         raise ValueError(f"unsupported RRF fusion storage mode: {rrf_fusion_storage}")
     total_profile_token = start_phase_profile("total_explicit_rrf_retrieval")
     enumeration_profile_token = start_phase_profile("shared_source_enumeration")
-    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms)
+    planned_jsonl_files = materialize_planned_jsonl_files(plan, preferred_terms=intent.base_terms, budget=budget)
     enumeration_profile = finish_phase_profile(
         enumeration_profile_token,
         file_count=planned_jsonl_files.file_count,
@@ -215,6 +230,7 @@ def run_rrf_fusion_retrieval(
         default_tz=default_tz,
         planned_jsonl_files=planned_jsonl_files,
         persistent_index_dir=fielded_bm25_index_dir,
+        budget=budget,
     )
     fielded_index_profile = finish_phase_profile(
         fielded_index_profile_token,
@@ -233,7 +249,12 @@ def run_rrf_fusion_retrieval(
         cwd=cwd,
         mask_context=mask_context,
         include_private_diagnostics=True,
+        budget=budget,
+        query_plan_mode=query_plan_mode,
     )
+    if budget is not None:
+        fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
         fielded_started,
@@ -244,6 +265,8 @@ def run_rrf_fusion_retrieval(
         records_considered=int(fielded_result.get("records_considered", 0)),
     )
     fielded_elapsed_ms = float(fielded_profile["elapsed_ms"])
+    if budget is not None and fielded_index.connection is not None:
+        fielded_index.connection.close()
     fielded_searched_paths = set(fielded_result.pop("_searched_file_paths", []) or [])
 
     package_profile_token = start_phase_profile("package_lane")
@@ -256,6 +279,7 @@ def run_rrf_fusion_retrieval(
         use_rg_prefilter=use_rg_prefilter,
         planned_jsonl_files=planned_jsonl_files,
         include_private_diagnostics=True,
+        budget=budget,
         prioritized_file_paths=fielded_searched_paths,
     )
     package_count = _candidate_count(package_result)
@@ -314,6 +338,9 @@ def run_rrf_fusion_retrieval(
     fused_result.update(
         {
             "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
+            "operation_source_errors": fielded_result.get("operation_source_errors", []),
+            "source_diagnostics": package_result.get("source_diagnostics", {}),
+            "admitted_source_files": planned_jsonl_files.file_count,
             "preserve_match_order": True,
             "rrf_storage": rrf_materialization,
             "rrf_materialization": rrf_materialization,

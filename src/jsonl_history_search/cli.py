@@ -36,6 +36,8 @@ from .agent_loop_cost import (
 from .archive_snapshot import build_archive_snapshot_proof_payload
 from .ask_router import (
     build_ask_router_payload,
+    select_ask_route,
+    DIRECT_HISTORY_ROUTE_FAMILIES,
     execution_kind_for_route_family,
     _looks_like_parent_main_complete_interval_status_query,
 )
@@ -11224,6 +11226,32 @@ def _run_ask_answer(args: argparse.Namespace, *, cwd: str, route_payload: dict) 
         and is_direct_latest_message_history_query(str(args.query or ""))
     ):
         return build_direct_history_answer_payload(args, route_payload=route_payload)
+    if route_payload["ask_router"].get("route_family") in DIRECT_HISTORY_ROUTE_FAMILIES:
+        from .history_evidence import retrieve_history_evidence
+        from .operation_budget import OperationBudget
+        budget = OperationBudget(limit_bytes=min(args.max_bytes, args.hard_cap_bytes) if args.hard_cap_bytes else args.max_bytes,
+                                 max_elapsed=args.max_elapsed)
+        route = route_payload["ask_router"]
+        evidence_args = argparse.Namespace(**vars(args))
+        evidence_args.query = route.get("structured_execution_query") or args.query
+        source_plan, intent, plan = payload_from_args(evidence_args)
+        return retrieve_history_evidence(
+            request={"query": args.query, "route": route}, source_plan=source_plan,
+            intent=intent, plan=plan, default_tz=timezone_from_args(args.timezone, args.timezone_offset),
+            mask_context=_mask_context_from_args(args), budget=budget,
+            retrieval_options={
+                "retrieval_mode": getattr(args, "retrieval_mode", RETRIEVAL_MODE_PACKAGE),
+                "use_rg_prefilter": args.rg_prefilter,
+                "fielded_bm25_index_dir": _fielded_bm25_index_dir_from_args(args),
+                "rrf_fusion_storage": getattr(args, "rrf_fusion_storage", "memory"),
+                "rrf_fusion_materialization_dir": _rrf_fusion_materialization_dir_from_args(args),
+                "query_plan_mode": getattr(args, "query_plan", QUERY_PLAN_MODE_AUTO),
+                "continuation_ledger": False})
+    return _run_specialized_ask_answer(args, cwd=cwd, route_payload=route_payload)
+
+
+def _run_specialized_ask_answer(args, *, cwd, route_payload):
+    """Compatibility boundary for explicit local, audit and whole-session capabilities."""
     execute_args = args
     if route_payload["ask_router"].get("route_family") == "bounded_no_evidence":
         execute_args = _args_with_bounded_auto_execute_prompt_scope(args)
@@ -20777,14 +20805,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         cwd = str(Path(args.cwd).expanduser().resolve())
-        payload = build_ask_router_payload(
-            args.query,
-            cwd=cwd,
-            evidence_source=args.evidence_source,
-            activation_mode=args.activation_mode,
-            audit_depth=args.audit_depth,
-            decision_engine=_ask_decision_engine_from_args(args),
-        )
+        decision_engine = _ask_decision_engine_from_args(args)
+        if args.answer:
+            route, route_query, decision_support = select_ask_route(
+                args.query, evidence_source=args.evidence_source,
+                activation_mode=args.activation_mode, decision_engine=decision_engine)
+            if route.route_family in DIRECT_HISTORY_ROUTE_FAMILIES or (
+                route.route_family == "latest_status" and is_direct_latest_message_history_query(str(args.query or ""))
+            ):
+                payload = {"ask_router": {
+                    "route_family": route.route_family, "chosen_route": route.chosen_route,
+                    "why_it_applies": route.why_it_applies,
+                    "structured_execution_query": route.command_query(route_query),
+                    "decision_support": decision_support}}
+            else:
+                payload = build_ask_router_payload(args.query, cwd=cwd,
+                    evidence_source=args.evidence_source, activation_mode=args.activation_mode,
+                    audit_depth=args.audit_depth)
+        else:
+            payload = build_ask_router_payload(args.query, cwd=cwd,
+                evidence_source=args.evidence_source, activation_mode=args.activation_mode,
+                audit_depth=args.audit_depth, decision_engine=decision_engine)
         payload["ask_router"]["original_prompt_identity"] = args.original_prompt_identity
         auto_execute_bounded = (
             args.auto_execute_bounded_no_evidence

@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .adapters import AdapterReadError, iter_records_for_file
+from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
+from .operation_budget import BudgetExceeded, open_source_text, iter_source_bytes
 from .clustering import facets_for_record
 from .profiling import finish_phase_profile, start_phase_profile
 from .query import QueryIntent
@@ -694,6 +695,7 @@ def build_fielded_bm25_index(
     default_tz,
     planned_jsonl_files: PlannedJsonlFiles | None = None,
     persistent_index_dir: Path | str | None = None,
+    budget=None,
 ) -> FieldedBm25Index:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_index_build")
@@ -738,6 +740,7 @@ def build_fielded_bm25_index(
             "indexed_records": 0,
             "indexed_chunks": 0,
             "read_error_files": 0,
+            "operation_source_errors": [],
             "persistent_index_enabled": persistent_index_dir is not None,
             "persistent_storage_kind": "durable_sqlite_fts5" if persistent_cache is not None else "ephemeral_memory_fts5",
             "index_path_category": "user_supplied_fielded_bm25_index_dir" if persistent_cache is not None else "ephemeral_memory",
@@ -776,9 +779,12 @@ def build_fielded_bm25_index(
     if planned_jsonl_files is not None:
         enumerated_files = [(path, size, list(planned_jsonl_files.warnings)) for path, size in planned_jsonl_files.files]
     else:
-        enumerated_files = enumerate_jsonl_files(plan)
+        enumerated_files = enumerate_jsonl_files(plan, budget=budget)
 
     for path, size, enum_warnings in enumerated_files:
+        if budget is not None and not budget.available("index_build"):
+            index.warnings.append("Stopped index build at operation max elapsed cap.")
+            break
         index.warnings = list(enum_warnings)
         source_kind = source_kind_for_path(path, plan)
         file_records = 0
@@ -786,8 +792,18 @@ def build_fielded_bm25_index(
         segment_start_rowid = rowid
         content_hasher = hashlib.sha256()
         content_fingerprint = ""
+        source_stats = RawLineScanStats() if budget is not None else None
         if persistent_cache is not None:
-            content_fingerprint, fingerprint_bytes = _source_content_fingerprint(path)
+            try:
+                content_fingerprint, fingerprint_bytes = _source_content_fingerprint(path, budget=budget)
+            except BudgetExceeded as exc:
+                index.warnings.append(str(exc))
+                break
+            except OSError as exc:
+                index.metrics["read_error_files"] += 1
+                index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
+                index.warnings.append(f"Could not fingerprint {path}: {exc}")
+                continue
             index.metrics["content_fingerprint_files"] += 1
             index.metrics["content_fingerprint_bytes"] += fingerprint_bytes
             source_key = persistent_cache.source_key(path)
@@ -797,6 +813,10 @@ def build_fielded_bm25_index(
                 source_kind=source_kind,
                 content_fingerprint=content_fingerprint,
             )
+            if budget is not None:
+                # Old caches were indexed without complete-source diagnostics.
+                # Partial rows remain usable now but never match fresh metadata.
+                metadata.update(coverage_validation="ordinary-source-diagnostics-v1", coverage_complete=True)
             durable_metadata = persistent_cache.durable_source_metadata(connection, source_key)
             if durable_metadata == metadata:
                 loaded_rows = _load_durable_source_rows(
@@ -805,7 +825,11 @@ def build_fielded_bm25_index(
                     source_key=source_key,
                     path=path,
                     source_kind=source_kind,
+                    budget=budget,
                 )
+                if budget is not None and budget.exhausted_reasons:
+                    index.warnings.append("Stopped durable materialization at operation budget cap.")
+                    break
                 if loaded_rows:
                     file_records = _durable_source_record_count(connection, source_key)
                     index.files[str(path)] = {
@@ -829,12 +853,23 @@ def build_fielded_bm25_index(
                 persistent_cache._drop_source(source_key)
                 index.metrics["sources_invalidated"] += 1
             index.metrics["sources_reindexed"] += 1
+        if budget is not None:
+            _flush_insert_buffer(connection, insert_buffer)
+            connection.execute("SAVEPOINT operation_source")
         try:
             if path.suffix == ".jsonl":
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                with open_source_text(path, budget=budget, phase="index_build") as handle:
                     chunk_lines: list[tuple[int, str]] = []
                     for line_number, raw_line in enumerate(handle, 1):
                         content_hasher.update(raw_line.encode("utf-8", errors="replace"))
+                        if source_stats is not None and raw_line.strip():
+                            try:
+                                raw_value = json.loads(raw_line)
+                                failure = "non-object JSONL row" if not isinstance(raw_value, dict) else None
+                            except json.JSONDecodeError:
+                                failure = "malformed JSONL row"
+                            if failure:
+                                source_stats.note_partial(provider="jsonl", path=path, line=line_number, reason=failure)
                         file_records += 1
                         chunk_lines.append((line_number, raw_line.rstrip("\n")))
                         if len(chunk_lines) >= CHUNK_RECORD_LIMIT:
@@ -860,7 +895,8 @@ def build_fielded_bm25_index(
                         )
                 _flush_insert_buffer(connection, insert_buffer)
             else:
-                for record in iter_records_for_file(path, source_kind, default_tz):
+                for record in iter_records_for_file(path, source_kind, default_tz, raw_line_stats=source_stats,
+                                                    budget=budget, budget_phase="index_build"):
                     content_hasher.update(record.text.encode("utf-8", errors="replace"))
                     rowid += 1
                     file_records += 1
@@ -878,20 +914,43 @@ def build_fielded_bm25_index(
                         day_key=_record_day_grouping_key(record),
                         record=record,
                     )
+        except BudgetExceeded as exc:
+            connection.execute("ROLLBACK TO operation_source")
+            connection.execute("RELEASE operation_source")
+            insert_buffer.clear()
+            for partial_rowid in range(segment_start_rowid + 1, rowid + 1):
+                index.records.pop(partial_rowid, None)
+            rowid = segment_start_rowid
+            index.warnings.append(str(exc))
+            break
         except AdapterReadError as exc:
+            if budget is not None:
+                connection.execute("ROLLBACK TO operation_source")
+                connection.execute("RELEASE operation_source")
             index.metrics["read_error_files"] += 1
+            index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
             index.warnings.append(str(exc))
             continue
         except OSError as exc:
+            if budget is not None:
+                connection.execute("ROLLBACK TO operation_source")
+                connection.execute("RELEASE operation_source")
             index.metrics["read_error_files"] += 1
+            index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
             index.warnings.append(f"Could not open {path}: {exc}")
             continue
+        finally:
+            if source_stats is not None:
+                index.metrics["operation_source_errors"].extend(source_stats.partial_failures or [])
+        source_failures = list(source_stats.partial_failures or []) if source_stats is not None else []
         index.files[str(path)] = {
             "source_kind": source_kind,
             "record_count": file_records,
             "byte_count": file_bytes,
         }
         index.metrics["indexed_files"] += 1
+        if budget is not None:
+            connection.execute("RELEASE operation_source")
         index.metrics["indexed_records"] += file_records
         if path.suffix != ".jsonl":
             index.metrics["indexed_chunks"] += file_records
@@ -904,21 +963,28 @@ def build_fielded_bm25_index(
                 source_kind=source_kind,
                 content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
             )
+            if budget is not None:
+                metadata.update(coverage_validation="ordinary-source-diagnostics-v1",
+                                coverage_complete=not source_failures)
             segment_rows = [
                 _persistent_row_from_ref(connection, index.records[candidate_rowid])
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
                 if candidate_rowid in index.records
             ]
-            persistent_cache.write_segment(
-                path,
-                size=file_bytes,
-                source_kind=source_kind,
-                record_count=file_records,
-                byte_count=file_bytes,
-                rows=segment_rows,
-                content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
-            )
-            index.metrics["segments_written"] += len(segment_rows)
+            if source_failures:
+                # Do not publish a compatibility segment without coverage facts.
+                persistent_cache._drop_source(source_key)
+            else:
+                persistent_cache.write_segment(
+                    path,
+                    size=file_bytes,
+                    source_kind=source_kind,
+                    record_count=file_records,
+                    byte_count=file_bytes,
+                    rows=segment_rows,
+                    content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
+                )
+                index.metrics["segments_written"] += len(segment_rows)
             durable_refs = [
                 index.records[candidate_rowid]
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
@@ -979,6 +1045,7 @@ def search_with_fielded_bm25(
     include_private_diagnostics: bool = False,
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
     continuation_ledger: bool = False,
+    budget=None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     profile_token = start_phase_profile("fielded_bm25_search_materialization")
@@ -997,6 +1064,11 @@ def search_with_fielded_bm25(
         candidate_limit_uncapped=candidate_limit_uncapped,
         candidate_pool_limit_uncapped=candidate_pool_limit_uncapped,
     )
+    if budget is not None:
+        remaining = budget.remaining_seconds
+        retrieval_budget["timeout_seconds"] = min(retrieval_budget["timeout_seconds"], remaining)
+        retrieval_budget["deadline_monotonic"] = time.perf_counter() + retrieval_budget["timeout_seconds"]
+        budget.available("bm25_query")
     candidate_limit = int(retrieval_budget["candidate_row_limit"])
     candidate_pool_limit = int(retrieval_budget["candidate_row_pool_limit"])
     if retrieval_budget["candidate_row_pool_cap_hit"]:
@@ -1849,10 +1921,10 @@ def _load_durable_source_rows(
     source_key: str,
     path: Path,
     source_kind: str,
+    budget=None,
 ) -> int:
     try:
-        rows = list(
-            connection.execute(
+        cursor = connection.execute(
                 """
                 SELECT rowid, source_kind, path, line, line_end, source_ordinal,
                        role_bucket, timestamp_bucket, session_key, day_key, record_json
@@ -1862,10 +1934,16 @@ def _load_durable_source_rows(
                 """,
                 (source_key,),
             )
-        )
+        rows = []
+        for row in cursor:
+            if budget is not None and not budget.available("cache_materialization"):
+                break
+            rows.append(row)
     except sqlite3.Error:
         return 0
     for row in rows:
+        if budget is not None and not budget.available("cache_materialization"):
+            break
         record_payload = None
         if row[10]:
             try:
@@ -2179,13 +2257,12 @@ def _valid_persistent_segment(segment: Any, *, metadata: dict[str, Any]) -> bool
     )
 
 
-def _source_content_fingerprint(path: Path) -> tuple[str, int]:
+def _source_content_fingerprint(path: Path, *, budget=None) -> tuple[str, int]:
     hasher = hashlib.sha256()
     byte_count = 0
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            byte_count += len(chunk)
-            hasher.update(chunk)
+    for chunk in iter_source_bytes(path, budget=budget):
+        byte_count += len(chunk)
+        hasher.update(chunk)
     return hasher.hexdigest(), byte_count
 
 

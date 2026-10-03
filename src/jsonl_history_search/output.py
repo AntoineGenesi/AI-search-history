@@ -889,7 +889,18 @@ def render_ask_answer_text(payload: dict) -> str:
         )
         if source_contract.get("built_from") == "direct_history_answer":
             _append_direct_history_answer_contract_text(lines, source_contract)
+        elif source_contract.get("built_from") == "direct_history_evidence":
+            _append_ordinary_evidence_contract(lines, source_contract)
     return "\n".join(lines)
+
+
+def _append_ordinary_evidence_contract(lines, contract):
+    lines.append("Coverage: " + json.dumps(contract.get("coverage", {}), sort_keys=True))
+    lines.append("Output omissions: " + json.dumps(contract.get("output_omissions", {}), sort_keys=True))
+    for label, key in (("Source error", "source_errors"), ("Evidence gap", "recoverable_gaps")):
+        for item in contract.get(key, []):
+            lines.append(label + ": " + json.dumps(item, sort_keys=True))
+    lines.append("Boundary: " + contract.get("claim_boundary", "bounded source evidence"))
 
 
 def _append_direct_history_answer_contract_text(lines: list[str], contract: dict) -> None:
@@ -1125,6 +1136,11 @@ def render_ask_answer_markdown(payload: dict) -> str:
     if report.get("next_proof_step"):
         lines.extend(["", "## Next Proof Step", "", f"`{report.get('next_proof_step')}`"])
     source_contract = report.get("source_contract") or {}
+    if source_contract.get("built_from") == "direct_history_evidence":
+        details = []
+        _append_ordinary_evidence_contract(details, source_contract)
+        lines.extend(["", "## Evidence Coverage", ""])
+        lines.extend(f"- {item}" for item in details)
     if source_contract.get("built_from") == "direct_history_answer":
         details: list[str] = []
         _append_direct_history_answer_contract_text(details, source_contract)

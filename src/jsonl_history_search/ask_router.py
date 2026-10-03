@@ -1353,6 +1353,21 @@ ROUTES: tuple[AskRoute, ...] = (
 )
 
 
+DIRECT_HISTORY_ROUTE_FAMILIES = (
+    EXECUTABLE_SEMANTIC_DEBUG_ROUTE_FAMILIES - {"deep_history_audit"}
+) | EXECUTABLE_NO_EVIDENCE_ROUTE_FAMILIES | {RAW_PHRASE_SOURCE_SEARCH_ROUTE_FAMILY}
+
+
+def select_ask_route(query, *, evidence_source=None, activation_mode="implicit", decision_engine=None):
+    """Shared classification; neither selection nor direct answers build packets."""
+    route_query = _explicit_history_tool_alias_query(query) or query
+    route = classify_ask_route(query, evidence_source=evidence_source, activation_mode=activation_mode)
+    decision_support = None
+    if decision_engine is not None:
+        route, decision_support = _apply_optional_route_decision(route=route, query=route_query, engine=decision_engine)
+    return route, route_query, decision_support
+
+
 def build_ask_router_payload(
     query: str,
     cwd: str = ".",
@@ -1363,19 +1378,9 @@ def build_ask_router_payload(
     decision_engine: DecisionEngine | None = None,
 ) -> dict:
     explicit_history_tool_alias = _explicit_history_tool_alias(query)
-    route_query = _explicit_history_tool_alias_query(query) or query
-    route = classify_ask_route(
-        query,
-        evidence_source=evidence_source,
-        activation_mode=activation_mode,
-    )
-    decision_support = None
-    if decision_engine is not None:
-        route, decision_support = _apply_optional_route_decision(
-            route=route,
-            query=route_query,
-            engine=decision_engine,
-        )
+    route, route_query, decision_support = select_ask_route(
+        query, evidence_source=evidence_source, activation_mode=activation_mode,
+        decision_engine=decision_engine)
     explicit_convo_trigger = explicit_history_tool_alias is not None
     named_task_target = _has_explicit_task_path(query)
     structured_execution_query = route.command_query(route_query)
