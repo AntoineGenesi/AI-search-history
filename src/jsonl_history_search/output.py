@@ -18,7 +18,6 @@ from .real_history_post_jsh763_date_timeline_diagnostic import (
     render_post_jsh763_date_timeline_diagnostic_text,
 )
 from .real_run_gate import render_real_run_gate_report, render_real_run_gate_text
-from .status_anchor import parent_thread_interval_continuation_packet
 
 
 SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE = re.compile(
@@ -264,8 +263,6 @@ def render_text(payload: dict) -> str:
         return render_failure_analysis_text(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_text(payload)
-    if "status_anchor" in payload:
-        return render_status_anchor_text(payload)
     if "artifact_currentness" in payload:
         return render_artifact_currentness_text(payload)
     if "local_evidence_diagnostic" in payload:
@@ -455,8 +452,6 @@ def render_markdown(payload: dict) -> str:
         return render_failure_analysis_markdown(payload)
     if "latest_user_messages" in payload:
         return render_latest_user_messages_markdown(payload)
-    if "status_anchor" in payload:
-        return render_status_anchor_markdown(payload)
     if "artifact_currentness" in payload:
         return render_artifact_currentness_markdown(payload)
     if "local_evidence_diagnostic" in payload:
@@ -578,6 +573,19 @@ def render_history_evidence(payload: dict) -> str:
     lines = [payload['query'], 'Status: ' + payload['status'],
              'Selected sources fully read: ' + str(payload['coverage']['complete'])]
     lines.append('Searched scope: ' + json.dumps(payload['scope'], ensure_ascii=False))
+    if 'chronology' in payload:
+        chronology = payload['chronology']
+        lines.append('Chronological scope: ' + chronology['scope'])
+        anchor = chronology.get('anchor')
+        if anchor:
+            lines.append('Human boundary: %s | %s | %s' % (ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
+        lines.append('Time uncertainty: ' + str(not chronology['temporal_complete']))
+        for item in payload['evidence']:
+            lines.extend(['', '%s | %s' % (ref_target(item['source_ref']), item['timestamp']), item['text']])
+        lines.append('Retained evidence: ' + json.dumps(chronology['interval_artifact']))
+        lines.append('Display coverage: ' + json.dumps(chronology['display']))
+        lines.extend(['', 'Omissions: ' + json.dumps(payload['omissions']), payload['claim_boundary']])
+        return '\n'.join(lines)
     for field in ('cap_reasons', 'unavailable_roots', 'source_errors'):
         if payload['coverage'][field]:
             lines.append(field + ': ' + json.dumps(payload['coverage'][field], ensure_ascii=False))
@@ -593,8 +601,6 @@ def render_history_evidence(payload: dict) -> str:
 
 
 def render_answer(payload: dict) -> str:
-    if "status_anchor" in payload:
-        return render_status_anchor_answer(payload)
     return render_text(payload)
 
 
@@ -782,9 +788,7 @@ def render_ask_answer_text(payload: dict) -> str:
             f"answer_action_status={source_contract.get('answer_action_status')} "
             f"promotion_status={source_contract.get('promotion_status')}"
         )
-        if source_contract.get("built_from") == "direct_history_answer":
-            _append_direct_history_answer_contract_text(lines, source_contract)
-        elif source_contract.get("built_from") == "direct_history_evidence":
+        if source_contract.get("built_from") == "direct_history_evidence":
             _append_ordinary_evidence_contract(lines, source_contract)
     return "\n".join(lines)
 
@@ -798,55 +802,6 @@ def _append_ordinary_evidence_contract(lines, contract):
     lines.append("Boundary: " + contract.get("claim_boundary", "bounded source evidence"))
 
 
-def _append_direct_history_answer_contract_text(lines: list[str], contract: dict) -> None:
-    anchor = contract.get("anchor") or {}
-    interval = contract.get("searched_interval") or {}
-    coverage = contract.get("coverage") or {}
-    missing = contract.get("missing_or_capped_scope") or {}
-    output_coverage = contract.get("output_coverage") or {}
-    if output_coverage:
-        lines.append(f"Displayed evidence: complete={output_coverage.get('complete')} omitted records={output_coverage.get('omitted_record_count', 0)} truncated records={output_coverage.get('truncated_record_count', 0)} omitted text chars={output_coverage.get('omitted_text_char_count', 0)}")
-        if output_coverage.get("omitted_ranges"):
-            lines.append(f"Output omitted ranges: {json.dumps(output_coverage['omitted_ranges'], sort_keys=True)}")
-        if output_coverage.get("artifact_path"):
-            lines.append(f"Full interval evidence artifact (plain text): {output_coverage['artifact_path']}")
-        if output_coverage.get("artifact_error"):
-            lines.append(f"Evidence gap: {output_coverage['artifact_error']}")
-    lines.append(
-        "Anchor: "
-        f"{anchor.get('source_ref') or '(unavailable)'} "
-        f"timestamp={anchor.get('timestamp_utc') or '(unknown)'} "
-        f"wording={anchor.get('snippet') or '(unavailable)'}"
-    )
-    lines.append(
-        "Searched interval: "
-        f"entries={interval.get('chronological_entry_count', 0)} "
-        f"boundary={json.dumps(interval.get('boundary') or {}, sort_keys=True)}"
-    )
-    lines.append(
-        "Coverage: "
-        f"status={coverage.get('status') or 'unknown'} "
-        f"complete={str(coverage.get('complete') is True).lower()} "
-        f"records_after_anchor={coverage.get('records_after_anchor', 0)}"
-    )
-    lines.append(
-        "Missing/capped scope: "
-        f"status={missing.get('status') or 'unknown'} "
-        f"omitted={missing.get('omitted_activity_entry_count', 0)} "
-        f"missing_logs={len(missing.get('missing_logs') or [])} "
-        f"omitted_source_files_at_least={missing.get('omitted_source_file_lower_bound', 0)} "
-        f"omitted_source_directories_at_least={missing.get('omitted_source_directory_lower_bound', 0)}"
-    )
-    inventory = contract.get("source_inventory") or []
-    if inventory:
-        rendered = []
-        for item in inventory:
-            suffix = ",selected" if item.get("selected_for_direct_answer") else ""
-            rendered.append(f"{item.get('provider')}={item.get('status')}{suffix}")
-        lines.append(f"Provider/source inventory: {', '.join(rendered)}")
-    limits = contract.get("limits") or {}
-    if limits:
-        lines.append(f"Caps: {json.dumps(limits, sort_keys=True)}")
 
 
 def render_ask_answer_markdown(payload: dict) -> str:
@@ -886,11 +841,6 @@ def render_ask_answer_markdown(payload: dict) -> str:
         details = []
         _append_ordinary_evidence_contract(details, source_contract)
         lines.extend(["", "## Evidence Coverage", ""])
-        lines.extend(f"- {item}" for item in details)
-    if source_contract.get("built_from") == "direct_history_answer":
-        details: list[str] = []
-        _append_direct_history_answer_contract_text(details, source_contract)
-        lines.extend(["", "## Direct History Coverage", ""])
         lines.extend(f"- {item}" for item in details)
     return "\n".join(lines)
 
@@ -4289,651 +4239,36 @@ def render_latest_user_messages_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def _status_anchor_navigation_only(report: dict) -> bool:
-    contract = report.get("generated_report_contract") or {}
-    return bool(
-        contract.get("navigation_only")
-        and contract.get("answer_from_report_allowed") is False
-    )
 
 
-def _status_anchor_active_continuation_command(report: dict) -> str | None:
-    packet = parent_thread_interval_continuation_packet(report)
-    if not isinstance(packet, dict) or not packet.get("steps"):
-        return None
-    if packet.get("answer_ready") is True:
-        return None
-    selected = report.get("selected_anchor") or {}
-    if not selected:
-        return None
-    report_written = report.get("report_written")
-    packet_id = packet.get("packet_id")
-    if not report_written or not packet_id:
-        return None
-    return " ".join(
-        [
-            "jsonl-history-search",
-            "execute-continuation",
-            "--from-report",
-            shlex.quote(str(report_written)),
-            "--packet-id",
-            shlex.quote(str(packet_id)),
-            "--format",
-            "text",
-        ]
-    )
 
 
-def _render_status_anchor_navigation_only_text(report: dict) -> str:
-    contract = report.get("generated_report_contract") or {}
-    selected = report.get("selected_anchor") or {}
-    readiness = report.get("answer_readiness") or {}
-    freshness = readiness.get("parent_main_anchor_freshness") or {}
-    interval = report.get("post_anchor_interval_reconstruction") or {}
-    coverage = interval.get("coverage") or {}
-    summary = report.get("summary") or {}
-    command = _status_anchor_active_continuation_command(report)
-    lines = [
-        "Status Anchor",
-        f"Status: {report.get('status')}",
-        "Answer status: not-ready/required-primary-followthrough",
-        "Navigation only: true",
-        "Answer from report allowed: false",
-        "Required primary windows opened: "
-        f"false (0/{contract.get('required_primary_window_count', 0)})",
-        (
-            "Selected parent history row: "
-            f"{selected.get('timestamp_utc')} {selected.get('source_ref')}"
-        ),
-        (
-            "Parent/main anchor freshness: "
-            f"status={freshness.get('status')} current={freshness.get('current')}"
-        ),
-        (
-            "Scanner coverage: "
-            f"status={coverage.get('status')} complete={coverage.get('complete')} "
-            f"records_after_anchor={coverage.get('records_after_anchor')} "
-            f"retained_entries={summary.get('post_anchor_interval_entry_count', 0)} "
-            f"omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}"
-        ),
-    ]
-    if command:
-        packet = parent_thread_interval_continuation_packet(report) or {}
-        anchor_state = packet.get("anchor_state") or {}
-        lines.extend(
-            [
-                "Investigation finalization: state=actionable_canonical_continuation answer_ready=False terminal=False receiver_action=run_canonical_continuation",
-                f"- Canonical next command: {command}",
-                "- Continue boundary: run this saved packet-bound action; do not run direct read-more, broad search, or fresh ask as the default plan.",
-                (
-                    "Selected anchor authority: "
-                    f"shortlist={anchor_state.get('shortlist_selected_anchor_ref')} "
-                    f"selected_anchor={anchor_state.get('selected_anchor_ref')} "
-                    f"readiness={anchor_state.get('readiness_selected_anchor_ref')} "
-                    f"continuation={anchor_state.get('authoritative_selected_anchor_ref')}"
-                ),
-                f"Report written: {report.get('report_written')}",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "Canonical follow-through path: "
-                f"{contract.get('canonical_follow_through_path')}",
-                f"STOP: {contract.get('stop')}",
-            ]
-        )
-    return "\n".join(lines)
 
 
-def _render_status_anchor_navigation_only_markdown(report: dict) -> str:
-    contract = report.get("generated_report_contract") or {}
-    selected = report.get("selected_anchor") or {}
-    readiness = report.get("answer_readiness") or {}
-    freshness = readiness.get("parent_main_anchor_freshness") or {}
-    interval = report.get("post_anchor_interval_reconstruction") or {}
-    coverage = interval.get("coverage") or {}
-    summary = report.get("summary") or {}
-    command = _status_anchor_active_continuation_command(report)
-    lines = [
-        "# Status Anchor",
-        "",
-        f"- Status: `{report.get('status')}`",
-        "- Answer status: `not-ready/required-primary-followthrough`",
-        "- Navigation only: `true`",
-        "- Answer from report allowed: `false`",
-        "- Required primary windows opened: "
-        f"`false` (`0/{contract.get('required_primary_window_count', 0)}`)",
-        "- Selected parent history row: "
-        f"`{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`",
-        "- Parent/main anchor freshness: "
-        f"`status={freshness.get('status')}` `current={freshness.get('current')}`",
-        "- Scanner coverage: "
-        f"`status={coverage.get('status')}` `complete={coverage.get('complete')}` "
-        f"`records_after_anchor={coverage.get('records_after_anchor')}` "
-        f"`retained_entries={summary.get('post_anchor_interval_entry_count', 0)}` "
-        f"`omitted_entries={summary.get('post_anchor_interval_omitted_entry_count', 0)}`",
-    ]
-    if command:
-        packet = parent_thread_interval_continuation_packet(report) or {}
-        anchor_state = packet.get("anchor_state") or {}
-        lines.extend(
-            [
-                "",
-                "## Investigation Finalization",
-                "",
-                "- `state`: `actionable_canonical_continuation`",
-                "- `answer_ready`: `False`",
-                "- `terminal`: `False`",
-                "- `required_receiver_action`: `run_canonical_continuation`",
-                "",
-                "```bash",
-                command,
-                "```",
-                "- Continue boundary: run this saved packet-bound action; do not run direct `read-more`, broad search, or fresh `ask` as the default plan.",
-                "- Selected anchor authority: "
-                f"`shortlist={anchor_state.get('shortlist_selected_anchor_ref')}` "
-                f"`selected_anchor={anchor_state.get('selected_anchor_ref')}` "
-                f"`readiness={anchor_state.get('readiness_selected_anchor_ref')}` "
-                f"`continuation={anchor_state.get('authoritative_selected_anchor_ref')}`",
-                f"- Report written: `{report.get('report_written')}`",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "- Canonical follow-through path: "
-                f"`{contract.get('canonical_follow_through_path')}`",
-                f"- **STOP:** {contract.get('stop')}",
-            ]
-        )
-    return "\n".join(lines)
 
 
-def _status_anchor_needs_clarification(report: dict) -> bool:
-    if parent_thread_interval_continuation_packet(report):
-        return False
-    source_tiers = report.get("source_tiers") or {}
-    structured_continuation_available = any(
-        read.get("read_more_command")
-        for read in source_tiers.get("required_primary") or []
-    )
-    return (
-        report.get("status") == "anchor_ambiguous"
-        and not report.get("selected_anchor")
-        and not structured_continuation_available
-    )
 
 
-def _render_status_anchor_clarification_text(report: dict) -> str:
-    clarification = report.get("clarification_request") or {}
-    request = clarification.get("request") or (
-        "I cannot safely identify the intended anchor. Please provide a quoted message, "
-        "an exact timestamp, or a thread/session boundary."
-    )
-    return "\n".join(
-        [
-            "NOT ANSWERABLE YET",
-            "Status: anchor_ambiguous",
-            f"Clarification required: {request}",
-            "STOP: Do not inspect transcript files or synthesize an answer until the user supplies the anchor.",
-        ]
-    )
 
 
-def _render_status_anchor_clarification_markdown(report: dict) -> str:
-    clarification = report.get("clarification_request") or {}
-    request = clarification.get("request") or (
-        "I cannot safely identify the intended anchor. Please provide a quoted message, "
-        "an exact timestamp, or a thread/session boundary."
-    )
-    return "\n".join(
-        [
-            "# Not Answerable Yet",
-            "",
-            "- Status: `anchor_ambiguous`",
-            f"- Clarification required: {request}",
-            "- **STOP:** Do not inspect transcript files or synthesize an answer until the user supplies the anchor.",
-        ]
-    )
 
 
-def render_status_anchor_text(payload: dict) -> str:
-    report = payload["status_anchor"]
-    if _status_anchor_needs_clarification(report):
-        return _render_status_anchor_clarification_text(report)
-    if _status_anchor_navigation_only(report):
-        return _render_status_anchor_navigation_only_text(report)
-    summary = report["summary"]
-    reads = report.get("next_reads") or []
-    source_tiers = report.get("source_tiers") or {}
-    follow_through_plan = report.get("follow_through_plan") or {}
-    selected = report.get("selected_anchor")
-    instruction = report.get("agent_instruction") or {}
-    session_activity = report.get("session_activity") or {}
-    fail_closed = report.get("fail_closed_guidance") or {}
-    clarification = report.get("clarification_request") or {}
-    answer_readiness = report.get("answer_readiness") or {}
-    parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
-    status_boundary = report.get("status_as_of_boundary") or {}
-    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
-    open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
-    answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
-    if _is_answer_ready_parent_main_status(report):
-        return _render_answer_ready_parent_main_status_text(report, answer_status=answer_status)
-    lines = [
-        "Status Anchor",
-        f"Status: {report['status']}",
-        f"Answer status: {answer_status}",
-        "Evidence contract: raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
-    ]
-    if clarification.get("request"):
-        lines.append(f"Clarification request: {clarification.get('request')}")
-        if clarification.get("candidate_refs_policy"):
-            lines.append(f"Clarification boundary: {clarification.get('candidate_refs_policy')}")
-    if fail_closed.get("guidance"):
-        lines.append(
-            "Fail-closed guidance: "
-            f"{fail_closed.get('guidance')} "
-            f"answer_allowed={fail_closed.get('answer_allowed')}"
-        )
-    if _status_anchor_parent_main_complete_interval_recovery_required(report):
-        lines.append(
-            "Complete-interval answer command: "
-            f"{_status_anchor_rerun_answer_command(report)}"
-        )
-        lines.append(
-            "Combined-history boundary: combined Codex history.jsonl is not an unrecoverable blocker; "
-            "use the canonical parent history row/session linkage or fail closed with this exact command/read."
-        )
-    if answer_readiness:
-        lines.append(
-            "Answer readiness: "
-            f"status={answer_readiness.get('status')} "
-            f"answer_allowed={answer_readiness.get('answer_allowed')} "
-            f"selected_anchor_answer_ready={answer_readiness.get('selected_anchor_answer_ready')}"
-        )
-        facets = answer_readiness.get("required_answer_facets") or []
-        if facets:
-            lines.append(f"Required answer facets: {', '.join(facets)}")
-        missing = answer_readiness.get("missing_required_answer_facets") or []
-        if missing:
-            lines.append(f"Missing required answer facets: {', '.join(missing)}")
-        if answer_readiness.get("stop_condition"):
-            lines.append(f"Answer-readiness stop condition: {answer_readiness.get('stop_condition')}")
-    if status_boundary:
-        lines.append(
-            "Status as-of boundary: "
-            f"{status_boundary.get('timestamp_utc')} {status_boundary.get('source_ref')} "
-            f"audit_run_requested={report.get('routing', {}).get('audit_run_requested')}"
-        )
-    _append_parent_main_anchor_shortlist_text(lines, parent_main_shortlist)
-    _append_status_follow_through_plan_text(lines, follow_through_plan)
-    _append_status_post_anchor_interval_text(lines, post_anchor_interval)
-    lines.append("Open these source refs first:")
-    if selected:
-        _append_text_read(lines, selected)
-    for read in open_first_reads[:4]:
-        if not selected or read.get("source_ref") != selected.get("source_ref"):
-            _append_text_read(lines, read)
-    if not selected and not open_first_reads:
-        lines.append("- (no source refs surfaced)")
-    if instruction.get("stop_condition"):
-        lines.append(f"Stop condition: {instruction.get('stop_condition')}")
-    lines.append("Only continue if: direct anchor/artifact reads fail, conflict, or leave a named status gap.")
-    lines.append("Optional diagnostics/adjacent evidence: rejected anchors, broad work products, blind spots, and warnings below.")
-    lines.extend([
-        f"Route: {report['routing']['route']}",
-        f"JSONL-first: {report['routing']['jsonl_first']}",
-        f"Raw session trace: {session_activity.get('status')}",
-        f"Commit-only answers allowed: {report.get('evidence_contract', {}).get('commit_only_answers_allowed')}",
-        (
-            "Summary: "
-            f"{summary['anchor_candidate_count']} anchors, "
-            f"{summary.get('current_window_work_product_count', 0)} current-window work products, "
-            f"{summary.get('diagnostic_optional_work_product_count', 0)} diagnostic optional work products, "
-            f"{summary['behavior_delta_count']} behavior deltas, "
-            f"{summary['non_delta_count']} non-deltas, "
-            f"{summary['unresolved_blocker_count']} blockers"
-        ),
-    ])
-    if selected:
-        lines.append(
-            "Anchor decision: "
-            f"context_boundary={selected.get('context_boundary')} "
-            f"anchor_scope={selected.get('anchor_scope')} "
-            f"anchor_reason={selected.get('anchor_reason')} "
-            f"anchor_ref={selected.get('anchor_ref')}"
-        )
-        lines.append(
-            "Selected anchor: "
-            f"{selected.get('timestamp_utc')} {selected.get('source_ref')}: "
-            f"{selected.get('snippet')}"
-        )
-        if selected.get("openable_target"):
-            lines.append(f"Selected anchor openable target: {selected.get('openable_target')}")
-        if selected.get("read_more_command"):
-            lines.append(f"Selected anchor read-more: {selected.get('read_more_command')}")
-        lines.append(f"Anchor rationale: {selected.get('rationale')}")
-    rejected = (report.get("anchor_decision") or {}).get("rejected_anchor_alternatives") or []
-    if rejected:
-        lines.append("Rejected anchor alternatives:")
-        for item in rejected[:5]:
-            lines.append(
-                "- "
-                f"{item.get('source_ref')} "
-                f"classification={item.get('classification')} "
-                f"reason={item.get('rationale')}: "
-                f"{item.get('snippet')}"
-            )
-    if session_activity:
-        activity = session_activity.get("activity_after_anchor") or {}
-        lines.append(
-            "Raw session activity after anchor: "
-            f"records={activity.get('records_after_anchor')} "
-            f"conversation_actions={activity.get('conversation_actions')} "
-            f"tool_calls={activity.get('tool_calls')} "
-            f"tool_outputs={activity.get('tool_outputs')} "
-            f"spawned_sessions={activity.get('spawned_session_calls')} "
-            f"compactions={activity.get('compacted_summaries')}"
-        )
-        lines.append(
-            "Secondary evidence boundary: commits/merges and current repo state can support the answer only after raw JSONL source refs are inspected."
-        )
-    lines.append("Answer brief:")
-    answer_brief = report.get("answer_brief", [])
-    if answer_brief:
-        for item in answer_brief:
-            lines.append(f"- {item}")
-    elif answer_readiness.get("answer_allowed") is False:
-        lines.append("- (suppressed until required_answer_facets are proven; missing facets are a stop condition)")
-    if source_tiers:
-        lines.append("Source tiers:")
-        for tier in source_tiers.get("tier_order") or ["required_primary", "required_secondary", "diagnostic_optional"]:
-            tier_reads = source_tiers.get(tier) or []
-            lines.append(f"{tier}: {len(tier_reads)}")
-            for read in tier_reads[:5]:
-                _append_text_read(lines, read)
-    if report.get("unresolved_blockers"):
-        lines.append("Unresolved blockers:")
-        for blocker in report["unresolved_blockers"]:
-            lines.append(f"- {blocker['blocker']}: {blocker['summary']}")
-    if reads:
-        lines.append("Next reads:")
-        for read in reads[:10]:
-            _append_text_read(lines, read)
-    for blind in report.get("blind_spots", []):
-        lines.append(f"Blind spot: {blind}")
-    for warning in report.get("warnings", []):
-        lines.append(f"Warning: {warning}")
-    return "\n".join(lines)
 
 
-def render_status_anchor_answer(payload: dict) -> str:
-    report = payload["status_anchor"]
-    continuation_packet = parent_thread_interval_continuation_packet(report)
-    if continuation_packet:
-        return "\n".join(
-            [
-                "NOT ANSWERABLE YET",
-                "CANONICAL CONTINUATION PACKET",
-                json.dumps(continuation_packet, ensure_ascii=True, sort_keys=True),
-                "answer_ready=false",
-            ]
-        )
-    if _status_anchor_needs_clarification(report):
-        return _render_status_anchor_clarification_text(report)
-    if not _status_anchor_answer_format_ready(report):
-        lines = ["NOT ANSWERABLE YET", _status_anchor_canonical_continuation_command(report)]
-        freshness = (report.get("answer_readiness") or {}).get("parent_main_anchor_freshness") or {}
-        if freshness.get("status") == "stale_selected_anchor":
-            newest = freshness.get("newest_candidate") or {}
-            lines.append(
-                "parent_main_anchor_freshness: "
-                "status=stale_selected_anchor "
-                "selected_anchor_freshness=false "
-                f"newest_ref={newest.get('source_ref') or '(unknown)'} "
-                f"newest_timestamp={newest.get('timestamp_utc') or '(unknown)'}"
-            )
-        lines.append("answer_ready=false")
-        return "\n".join(lines)
-
-    selected = report.get("selected_anchor") or {}
-    routing = report.get("routing") or {}
-    interval = report.get("post_anchor_interval_reconstruction") or {}
-    coverage = interval.get("coverage") or {}
-    boundary = interval.get("boundary") or {}
-    session_activity = report.get("session_activity") or {}
-    followups = session_activity.get("session_followups") or []
-    joins = interval.get("secondary_evidence_joins") or {}
-    entries = interval.get("chronological_activity") or []
-    parent_identity = selected.get("source_identifier") or selected.get("source_ref")
-    parent_hash = selected.get("session_id_hash") or selected.get("source_identifier")
-    lines = [
-        "ANSWER READY",
-        "answer_ready=true",
-        "terminal_answer_and_stop=true",
-        (
-            "Selected parent history row: "
-            f"{selected.get('timestamp_utc')} {selected.get('source_ref')} "
-            f"identity={parent_identity} hash={parent_hash}"
-        ),
-        (
-            "Parent-thread boundary: "
-            f"scope={routing.get('anchor_scope')} reason={routing.get('anchor_reason')} "
-            f"ref={routing.get('anchor_ref')}"
-        ),
-        (
-            "Interval bounds: "
-            f"anchor={selected.get('timestamp_utc')} "
-            f"boundary={boundary.get('timestamp_utc') or 'now/latest'} "
-            f"boundary_ref={boundary.get('source_ref') or '(none)'}"
-        ),
-        (
-            "Coverage: "
-            f"status={coverage.get('status')} complete={coverage.get('complete')} "
-            f"records_after_anchor={coverage.get('records_after_anchor')} "
-            f"entries={interval.get('chronological_entry_count')} "
-            f"omitted={coverage.get('omitted_activity_entry_count', 0)}"
-        ),
-        "Touched session files:",
-    ]
-    if followups:
-        for item in followups[:12]:
-            lines.append(
-                "- "
-                f"role={item.get('role')} session_hash={item.get('session_id_hash')} "
-                f"records_after_anchor={item.get('records_after_anchor')} "
-                f"file={item.get('session_file')}"
-            )
-    else:
-        lines.append("- (none surfaced)")
-    lines.append("Timeline:")
-    if entries:
-        timeline_entries = _status_anchor_answer_timeline_entries(entries, limit=16)
-        for entry in timeline_entries:
-            if entry.get("activity_kind") == "summary_gap":
-                lines.append(
-                    "- "
-                    f"... {entry.get('omitted_count')} compact timeline entries summarized between "
-                    f"{entry.get('after_source_ref')} and {entry.get('before_source_ref')}"
-                )
-                continue
-            lines.append(
-                "- "
-                f"{entry.get('timestamp_utc')} {entry.get('source_ref')} "
-                f"{entry.get('activity_kind')}: {entry.get('snippet')}"
-            )
-    else:
-        lines.append("- (no chronological activity refs surfaced)")
-    lines.append("Secondary joins (capped):")
-    for key in ("tasks", "reports", "reviews", "git_commits"):
-        items = joins.get(key) or []
-        lines.append(f"- {key}: {len(items)}")
-        for item in items[:3]:
-            lines.append(
-                "  - "
-                f"{item.get('source_ref')} {item.get('evidence_timestamp_utc') or item.get('committed_at')}: "
-                f"{item.get('snippet')}"
-            )
-    return "\n".join(lines)
 
 
-def _status_anchor_answer_timeline_entries(entries: list[dict], *, limit: int) -> list[dict]:
-    if len(entries) <= limit:
-        return entries
-    head_count = max(1, limit // 2)
-    tail_count = max(1, limit - head_count - 1)
-    head = entries[:head_count]
-    tail = entries[-tail_count:]
-    gap = {
-        "activity_kind": "summary_gap",
-        "omitted_count": max(0, len(entries) - len(head) - len(tail)),
-        "after_source_ref": head[-1].get("source_ref") if head else None,
-        "before_source_ref": tail[0].get("source_ref") if tail else None,
-    }
-    return head + [gap] + tail
 
 
-def _status_anchor_answer_format_ready(report: dict) -> bool:
-    readiness = report.get("answer_readiness") or {}
-    if readiness.get("answer_from_report_allowed") is False:
-        return False
-    interval = report.get("post_anchor_interval_reconstruction") or {}
-    coverage = interval.get("coverage") or {}
-    selected = report.get("selected_anchor") or {}
-    routing = report.get("routing") or {}
-    command_options = report.get("command_options") or {}
-    if not selected:
-        return False
-    if readiness.get("answer_allowed") is not True:
-        return False
-    if coverage.get("complete") is not True:
-        return False
-    if command_options.get("parent_thread") and routing.get("anchor_scope") != "parent_thread":
-        return False
-    return True
 
 
-def _status_anchor_canonical_continuation_command(report: dict) -> str:
-    freshness = ((report.get("answer_readiness") or {}).get("parent_main_anchor_freshness") or {})
-    if freshness.get("current") is False and freshness.get("canonical_continuation_command"):
-        return str(freshness["canonical_continuation_command"])
-    if _status_anchor_parent_main_complete_interval_recovery_required(report):
-        return _status_anchor_rerun_answer_command(report)
-    source_tiers = report.get("source_tiers") or {}
-    for read in source_tiers.get("required_primary") or []:
-        if read.get("read_more_command"):
-            return str(read["read_more_command"])
-    generated_contract = report.get("generated_report_contract") or {}
-    if generated_contract.get("canonical_follow_through_path"):
-        return str(generated_contract["canonical_follow_through_path"])
-    interval = report.get("post_anchor_interval_reconstruction") or {}
-    guidance = interval.get("next_read_guidance") or {}
-    commands = [str(command) for command in guidance.get("commands") or [] if command]
-    if commands:
-        return commands[0]
-    for item in interval.get("omitted_ranges") or []:
-        if item.get("read_next_command"):
-            return str(item["read_next_command"])
-    selected = report.get("selected_anchor") or {}
-    if selected.get("read_more_command"):
-        return str(selected["read_more_command"])
-    return _status_anchor_rerun_answer_command(report)
 
 
-def _status_anchor_rerun_answer_command(report: dict) -> str:
-    command_options = report.get("command_options") or {}
-    parent_thread = bool(command_options.get("parent_thread")) or _status_anchor_parent_main_complete_interval_recovery_required(
-        report
-    )
-    parts = [
-        "jsonl-history-search",
-        "what-happened-since",
-        str(report.get("query") or "what happened since my last message?"),
-        "--cwd",
-        str(command_options.get("cwd") or "."),
-    ]
-    if command_options.get("codex_home"):
-        parts.extend(["--codex-home", str(command_options["codex_home"])])
-    if parent_thread:
-        parts.append("--parent-thread")
-    if command_options.get("anchor_ref"):
-        parts.extend(["--anchor-ref", str(command_options["anchor_ref"])])
-    parts.extend(["--complete-interval", "--format", "answer"])
-    if command_options.get("max_matches"):
-        parts.extend(["--max-matches", str(command_options["max_matches"])])
-    return " ".join(shlex.quote(part) for part in parts)
 
 
-def _status_anchor_parent_main_complete_interval_recovery_required(report: dict) -> bool:
-    command_options = report.get("command_options") or {}
-    routing = report.get("routing") or {}
-    selected = report.get("selected_anchor") or {}
-    if command_options.get("complete_interval") and command_options.get("parent_thread"):
-        return False
-    query = " ".join(str(report.get("query") or "").casefold().replace("?", " ").replace("!", " ").split())
-    parent_main = (
-        bool(command_options.get("parent_thread"))
-        or (routing.get("anchor_scope") == "parent_thread" and not selected)
-        or any(
-            marker in query
-            for marker in (
-                "parent thread",
-                "main thread",
-                "parent/main",
-                "main/parent",
-            )
-        )
-    )
-    if not parent_main:
-        return False
-    since_or_after = any(
-        marker in query
-        for marker in (
-            "what happened since",
-            "what has happened since",
-            "what happened after",
-            "what has happened after",
-            "since my last",
-            "since my latest",
-            "after my last",
-            "after my latest",
-        )
-    )
-    message_anchor = any(
-        marker in query
-        for marker in (
-            "last message",
-            "latest message",
-            "last user message",
-            "latest user message",
-            "last actual message",
-            "latest actual message",
-            "last substantive instruction",
-            "latest substantive instruction",
-            "last substantive message",
-            "last real instruction",
-        )
-    )
-    return since_or_after and message_anchor
 
 
-def _status_anchor_answer_status(report: dict, *, reads: list[dict], selected: dict | None) -> str:
-    fail_closed = report.get("fail_closed_guidance") or {}
-    if fail_closed.get("answer_allowed") is False:
-        return "not-ready/needs-more-proof"
-    return _source_use_answer_status(report.get("status"), has_required_reads=bool(reads), has_refs=bool(reads or selected))
 
 
-def _is_answer_ready_parent_main_status(report: dict) -> bool:
-    shortlist = report.get("parent_main_anchor_shortlist") or {}
-    readiness = report.get("answer_readiness") or {}
-    return (
-        shortlist.get("status") == "selected"
-        and shortlist.get("answer_allowed") is True
-        and readiness.get("answer_allowed") is True
-    )
 
 
 def _answer_ready_parent_main_reads(report: dict) -> tuple[dict, list[dict], list[dict]]:
@@ -4979,68 +4314,6 @@ def _bounded_commit_confirmation_command(reads: list[dict]) -> str | None:
     )
 
 
-def _render_answer_ready_parent_main_status_text(report: dict, *, answer_status: str) -> str:
-    selected = report.get("selected_anchor") or {}
-    readiness = report.get("answer_readiness") or {}
-    activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
-    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
-    canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
-    activity_location = selected.get("session_activity_location") or {}
-    required_facets = readiness.get("required_answer_facets") or []
-    lines = [
-        "Status Anchor",
-        f"Status: {report.get('status')}",
-        f"Answer status: {answer_status}",
-        "Answer-ready parent/main path: run only these bounded reads, in order.",
-        "1. Read the selected canonical anchor:",
-        f"- Authority: {selected.get('source_ref')}",
-    ]
-    _append_text_read(lines, canonical)
-    if activity_location.get("source_ref"):
-        lines.append(
-            "- Activity boundary: "
-            f"{activity_location.get('source_ref')} (required session reads start strictly after this logical row)."
-        )
-    lines.append("2. Read the required raw post-anchor session windows:")
-    if raw_activity:
-        for read in raw_activity:
-            _append_text_read(lines, read)
-    else:
-        lines.append("- No additional raw session window is required.")
-    lines.append(
-        "- Trace coverage: "
-        f"records={activity.get('records_after_anchor')} "
-        f"tool_calls={activity.get('tool_calls')} "
-        f"spawned_sessions={activity.get('spawned_session_calls')}"
-    )
-    _append_status_post_anchor_interval_text(lines, post_anchor_interval)
-    lines.append("3. Run one bounded secondary commit/status confirmation batch if listed:")
-    if secondary:
-        lines.append("- Exact refs: " + ", ".join(str(read.get("source_ref")) for read in secondary))
-        batch_command = _bounded_commit_confirmation_command(secondary)
-        if batch_command:
-            lines.append(f"  command: {batch_command}")
-        else:
-            for read in secondary:
-                _append_text_read(lines, read)
-    else:
-        lines.append("- None required; do not add a repo, task, state, or Git-history scan.")
-    lines.extend(
-        [
-            "4. Answer the user and stop:",
-            "- After the reads above succeed without contradiction, answer now and stop.",
-            (
-                "- Continue only when a named required facet is still missing or contradictory: "
-                + ", ".join(required_facets)
-                + ". Name that facet before one targeted follow-up read."
-            ),
-            (
-                "- Do not run broad rg over sessions, state files, old task families, reports, or Git history; "
-                "do not open rejected, diagnostic, or optional refs after the required reads are complete."
-            ),
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict) -> None:
@@ -5080,273 +4353,8 @@ def _append_parent_main_anchor_shortlist_text(lines: list[str], shortlist: dict)
         lines.append(f"Shortlist recovery: {recovery.get('rerun_instruction')}")
 
 
-def render_status_anchor_markdown(payload: dict) -> str:
-    report = payload["status_anchor"]
-    if _status_anchor_needs_clarification(report):
-        return _render_status_anchor_clarification_markdown(report)
-    if _status_anchor_navigation_only(report):
-        return _render_status_anchor_navigation_only_markdown(report)
-    summary = report["summary"]
-    reads = report.get("next_reads") or []
-    source_tiers = report.get("source_tiers") or {}
-    follow_through_plan = report.get("follow_through_plan") or {}
-    selected = report.get("selected_anchor")
-    instruction = report.get("agent_instruction") or {}
-    session_activity = report.get("session_activity") or {}
-    fail_closed = report.get("fail_closed_guidance") or {}
-    clarification = report.get("clarification_request") or {}
-    answer_readiness = report.get("answer_readiness") or {}
-    parent_main_shortlist = report.get("parent_main_anchor_shortlist") or {}
-    status_boundary = report.get("status_as_of_boundary") or {}
-    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
-    open_first_reads = [read for read in reads if read.get("source_tier") != "diagnostic_optional"]
-    answer_status = _status_anchor_answer_status(report, reads=reads, selected=selected)
-    if _is_answer_ready_parent_main_status(report):
-        return _render_answer_ready_parent_main_status_markdown(report, answer_status=answer_status)
-    lines = [
-        "# Status Anchor",
-        "",
-        f"**Status:** {report['status']}",
-        f"**Answer status:** `{answer_status}`",
-        "**Evidence contract:** raw history/session JSONL is primary; commits, merges, and repo state are secondary only.",
-        "",
-    ]
-    if clarification.get("request"):
-        lines.extend(
-            [
-                "## Clarification Request",
-                "",
-                f"- {clarification.get('request')}",
-            ]
-        )
-        if clarification.get("candidate_refs_policy"):
-            lines.append(f"- Boundary: {clarification.get('candidate_refs_policy')}")
-        lines.append("")
-    if fail_closed.get("guidance"):
-        lines.extend(["## Fail-Closed Guidance", "", f"- {fail_closed.get('guidance')}"])
-        lines.append(f"- Answer allowed: `{fail_closed.get('answer_allowed')}`")
-        if _status_anchor_parent_main_complete_interval_recovery_required(report):
-            lines.append(f"- Complete-interval answer command: `{_status_anchor_rerun_answer_command(report)}`")
-            lines.append(
-                "- Combined-history boundary: combined Codex `history.jsonl` is not an unrecoverable blocker; "
-                "use the canonical parent history row/session linkage or fail closed with this exact command/read."
-            )
-        lines.append("")
-    if answer_readiness:
-        lines.extend(
-            [
-                "## Answer Readiness",
-                "",
-                f"- Status: `{answer_readiness.get('status')}`",
-                f"- Answer allowed: `{answer_readiness.get('answer_allowed')}`",
-                f"- Selected anchor answer-ready: `{answer_readiness.get('selected_anchor_answer_ready')}`",
-            ]
-        )
-        facets = answer_readiness.get("required_answer_facets") or []
-        if facets:
-            lines.append(f"- Required answer facets: `{', '.join(facets)}`")
-        missing = answer_readiness.get("missing_required_answer_facets") or []
-        if missing:
-            lines.append(f"- Missing required answer facets: `{', '.join(missing)}`")
-        if answer_readiness.get("stop_condition"):
-            lines.append(f"- Stop condition: {answer_readiness.get('stop_condition')}")
-        lines.append("")
-    if status_boundary:
-        lines.extend(
-            [
-                "## Status As-Of Boundary",
-                "",
-                (
-                    f"- `{status_boundary.get('timestamp_utc')}` `{status_boundary.get('source_ref')}`; "
-                    f"audit_run_requested=`{report.get('routing', {}).get('audit_run_requested')}`"
-                ),
-                "",
-            ]
-        )
-    _append_parent_main_anchor_shortlist_markdown(lines, parent_main_shortlist)
-    lines.extend(["## Follow-Through Plan", ""])
-    _append_status_follow_through_plan_markdown(lines, follow_through_plan)
-    lines.extend(["", "## Post-Anchor Interval Reconstruction", ""])
-    _append_status_post_anchor_interval_markdown(lines, post_anchor_interval)
-    lines.extend([
-        "",
-        "## Open These Source Refs First",
-        "",
-    ])
-    if selected:
-        _append_markdown_read(lines, selected)
-    for read in open_first_reads[:4]:
-        if not selected or read.get("source_ref") != selected.get("source_ref"):
-            _append_markdown_read(lines, read)
-    if not selected and not open_first_reads:
-        lines.append("- No source refs surfaced.")
-    lines.extend(["", "## Stop / Continue", ""])
-    if instruction.get("stop_condition"):
-        lines.append(f"- Stop condition: {instruction.get('stop_condition')}")
-    lines.extend([
-        "- Only continue if: direct anchor/artifact reads fail, conflict, or leave a named status gap.",
-        "",
-        "## Optional Diagnostics / Adjacent Evidence",
-        "",
-        f"**Route:** `{report['routing']['route']}`",
-        f"**JSONL-first:** `{report['routing']['jsonl_first']}`",
-        f"**Raw session trace:** `{session_activity.get('status')}`",
-        f"**Commit-only answers allowed:** `{report.get('evidence_contract', {}).get('commit_only_answers_allowed')}`",
-        (
-            f"**Summary:** {summary['anchor_candidate_count']} anchors, "
-            f"{summary.get('current_window_work_product_count', 0)} current-window work products, "
-            f"{summary.get('diagnostic_optional_work_product_count', 0)} diagnostic optional work products, "
-            f"{summary['behavior_delta_count']} behavior deltas, "
-            f"{summary['non_delta_count']} non-deltas, "
-            f"{summary['unresolved_blocker_count']} blockers"
-        ),
-        "",
-    ])
-    if selected:
-        lines.extend(
-            [
-                "## Selected Anchor",
-                "",
-                (
-                    f"- Decision: `context_boundary={selected.get('context_boundary')}` "
-                    f"`anchor_scope={selected.get('anchor_scope')}` "
-                    f"`anchor_reason={selected.get('anchor_reason')}` "
-                    f"`anchor_ref={selected.get('anchor_ref')}`"
-                ),
-                (
-                    f"- `{selected.get('timestamp_utc')}` `{selected.get('source_ref')}`: "
-                    f"{selected.get('snippet')}"
-                ),
-            ]
-        )
-        if selected.get("openable_target"):
-            lines.append(f"- Openable target: `{selected.get('openable_target')}`")
-        if selected.get("read_more_command"):
-            lines.append(f"- Read more: `{selected.get('read_more_command')}`")
-        lines.extend([f"- Rationale: {selected.get('rationale')}", ""])
-    rejected = (report.get("anchor_decision") or {}).get("rejected_anchor_alternatives") or []
-    if rejected:
-        lines.extend(["## Rejected Anchor Alternatives", ""])
-        for item in rejected[:5]:
-            lines.append(
-                f"- `{item.get('source_ref')}` `{item.get('classification')}`: "
-                f"{item.get('rationale')} - {item.get('snippet')}"
-            )
-        lines.append("")
-    if session_activity:
-        activity = session_activity.get("activity_after_anchor") or {}
-        lines.extend(
-            [
-                "## Raw Session Activity After Anchor",
-                "",
-                (
-                    f"- Records: `{activity.get('records_after_anchor')}`; "
-                    f"conversation actions: `{activity.get('conversation_actions')}`; "
-                    f"tool calls: `{activity.get('tool_calls')}`; "
-                    f"tool outputs: `{activity.get('tool_outputs')}`; "
-                    f"spawned sessions: `{activity.get('spawned_session_calls')}`; "
-                    f"compactions: `{activity.get('compacted_summaries')}`"
-                ),
-                "- Secondary evidence boundary: commits/merges and current repo state can support the answer only after raw JSONL source refs are inspected.",
-                "",
-            ]
-        )
-    lines.extend(["## Answer Brief", ""])
-    answer_brief = report.get("answer_brief", [])
-    if answer_brief:
-        lines.extend(f"- {item}" for item in answer_brief)
-    elif answer_readiness.get("answer_allowed") is False:
-        lines.append("- Suppressed until `required_answer_facets` are proven; missing facets are a stop condition.")
-    lines.append("")
-    if source_tiers:
-        lines.extend(["## Source Tiers", ""])
-        for tier in source_tiers.get("tier_order") or ["required_primary", "required_secondary", "diagnostic_optional"]:
-            tier_reads = source_tiers.get(tier) or []
-            lines.extend([f"### `{tier}`", ""])
-            if not tier_reads:
-                lines.append("- No refs surfaced.")
-            for read in tier_reads[:5]:
-                _append_markdown_read(lines, read)
-            lines.append("")
-    if reads:
-        lines.extend(["## Next Reads", ""])
-        for read in reads[:10]:
-            _append_markdown_read(lines, read)
-        lines.append("")
-    if report.get("blind_spots"):
-        lines.extend(["## Blind Spots", ""])
-        lines.extend(f"- {blind}" for blind in report["blind_spots"])
-    return "\n".join(lines)
 
 
-def _render_answer_ready_parent_main_status_markdown(report: dict, *, answer_status: str) -> str:
-    selected = report.get("selected_anchor") or {}
-    readiness = report.get("answer_readiness") or {}
-    activity = (report.get("session_activity") or {}).get("activity_after_anchor") or {}
-    post_anchor_interval = report.get("post_anchor_interval_reconstruction") or {}
-    canonical, raw_activity, secondary = _answer_ready_parent_main_reads(report)
-    activity_location = selected.get("session_activity_location") or {}
-    required_facets = readiness.get("required_answer_facets") or []
-    lines = [
-        "# Status Anchor",
-        "",
-        f"- Status: `{report.get('status')}`",
-        f"- Answer status: `{answer_status}`",
-        "- Answer-ready parent/main path: run only these bounded reads, in order.",
-        "",
-        "## 1. Selected Canonical Anchor",
-        "",
-        f"- Authority: `{selected.get('source_ref')}`",
-    ]
-    _append_markdown_read(lines, canonical)
-    if activity_location.get("source_ref"):
-        lines.append(
-            f"- Activity boundary: `{activity_location.get('source_ref')}`; required session reads start "
-            "strictly after this logical row."
-        )
-    lines.extend(["", "## 2. Required Raw Session Reads", ""])
-    if raw_activity:
-        for read in raw_activity:
-            _append_markdown_read(lines, read)
-    else:
-        lines.append("- No additional raw session window is required.")
-    lines.append(
-        "- Trace coverage: "
-        f"records=`{activity.get('records_after_anchor')}`, "
-        f"tool calls=`{activity.get('tool_calls')}`, "
-        f"spawned sessions=`{activity.get('spawned_session_calls')}`."
-    )
-    lines.extend(["", "## Post-Anchor Interval Reconstruction", ""])
-    _append_status_post_anchor_interval_markdown(lines, post_anchor_interval)
-    lines.extend(["", "## 3. Bounded Secondary Confirmation", ""])
-    if secondary:
-        lines.append("- Exact refs: " + ", ".join(f"`{read.get('source_ref')}`" for read in secondary))
-        batch_command = _bounded_commit_confirmation_command(secondary)
-        if batch_command:
-            lines.append(f"- Command: `{batch_command}`")
-        else:
-            for read in secondary:
-                _append_markdown_read(lines, read)
-    else:
-        lines.append("- None required; do not add a repo, task, state, or Git-history scan.")
-    lines.extend(
-        [
-            "",
-            "## 4. Answer And Stop",
-            "",
-            "- After the reads above succeed without contradiction, answer now and stop.",
-            (
-                "- Continue only when a named required facet is still missing or contradictory: `"
-                + ", ".join(required_facets)
-                + "`. Name that facet before one targeted follow-up read."
-            ),
-            (
-                "- Do not run broad `rg` over sessions, state files, old task families, reports, or Git history; "
-                "do not open rejected, diagnostic, or optional refs after the required reads are complete."
-            ),
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _append_parent_main_anchor_shortlist_markdown(lines: list[str], shortlist: dict) -> None:
@@ -5452,220 +4460,12 @@ def render_agent_loop_cost_contract_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def _append_status_follow_through_plan_text(lines: list[str], plan: dict) -> None:
-    if not plan:
-        return
-    lines.append("Follow-through plan:")
-    lines.append(f"Plan status: {plan.get('status')}")
-    open_first = plan.get("open_first") or []
-    lines.append("Plan open_first:")
-    if open_first:
-        for read in open_first[:4]:
-            _append_text_read(lines, read)
-    else:
-        lines.append("- (no required primary refs surfaced)")
-    then_confirm = plan.get("then_confirm") or []
-    lines.append("Plan then_confirm:")
-    if then_confirm:
-        for group in then_confirm:
-            label = group.get("task_id") or group.get("label") or "secondary_support"
-            lines.append(f"- {label}: {group.get('purpose')}")
-            for read in (group.get("refs") or [])[:4]:
-                _append_text_read(lines, read)
-    else:
-        lines.append("- (no required secondary refs surfaced)")
-    diagnostics = plan.get("do_not_open_by_default") or []
-    lines.append("Plan do_not_open_by_default:")
-    if diagnostics:
-        for read in diagnostics[:5]:
-            _append_text_read(lines, read)
-    else:
-        lines.append("- (no diagnostic refs surfaced)")
-    facets = plan.get("expected_status_answer_facets") or []
-    if facets:
-        lines.append(f"Expected status-answer facets: {', '.join(facets)}")
-    required_facets = plan.get("required_answer_facets") or []
-    if required_facets:
-        lines.append(f"Required answer facets: {', '.join(required_facets)}")
-    if plan.get("required_facets_stop_condition"):
-        lines.append(f"Required-facets stop_condition: {plan.get('required_facets_stop_condition')}")
-    if plan.get("stop_condition"):
-        lines.append(f"Plan stop_condition: {plan.get('stop_condition')}")
-    if plan.get("read_more_boundary_warning"):
-        lines.append(f"Read-more boundary warning: {plan.get('read_more_boundary_warning')}")
-    if plan.get("rerun_policy"):
-        lines.append(f"Rerun policy: {plan.get('rerun_policy')}")
 
 
-def _append_status_follow_through_plan_markdown(lines: list[str], plan: dict) -> None:
-    if not plan:
-        lines.append("- No follow-through plan surfaced.")
-        return
-    lines.append(f"- Plan status: `{plan.get('status')}`")
-    lines.extend(["", "### `open_first`", ""])
-    open_first = plan.get("open_first") or []
-    if open_first:
-        for read in open_first[:4]:
-            _append_markdown_read(lines, read)
-    else:
-        lines.append("- No required primary refs surfaced.")
-    lines.extend(["", "### `then_confirm`", ""])
-    then_confirm = plan.get("then_confirm") or []
-    if then_confirm:
-        for group in then_confirm:
-            label = group.get("task_id") or group.get("label") or "secondary_support"
-            lines.append(f"- `{label}`: {group.get('purpose')}")
-            for read in (group.get("refs") or [])[:4]:
-                _append_markdown_read(lines, read)
-    else:
-        lines.append("- No required secondary refs surfaced.")
-    lines.extend(["", "### `do_not_open_by_default`", ""])
-    diagnostics = plan.get("do_not_open_by_default") or []
-    if diagnostics:
-        for read in diagnostics[:5]:
-            _append_markdown_read(lines, read)
-    else:
-        lines.append("- No diagnostic refs surfaced.")
-    facets = plan.get("expected_status_answer_facets") or []
-    if facets:
-        lines.extend(["", f"- Expected status-answer facets: `{', '.join(facets)}`"])
-    required_facets = plan.get("required_answer_facets") or []
-    if required_facets:
-        lines.append(f"- Required answer facets: `{', '.join(required_facets)}`")
-    if plan.get("required_facets_stop_condition"):
-        lines.append(f"- Required-facets stop condition: {plan.get('required_facets_stop_condition')}")
-    if plan.get("stop_condition"):
-        lines.append(f"- Stop condition: {plan.get('stop_condition')}")
-    if plan.get("read_more_boundary_warning"):
-        lines.append(f"- Read-more boundary warning: {plan.get('read_more_boundary_warning')}")
-    if plan.get("rerun_policy"):
-        lines.append(f"- Rerun policy: {plan.get('rerun_policy')}")
 
 
-def _append_status_post_anchor_interval_text(lines: list[str], interval: dict) -> None:
-    if not interval:
-        return
-    coverage = interval.get("coverage") or {}
-    anchor = interval.get("anchor") or {}
-    boundary = interval.get("boundary") or {}
-    lines.append("Post-anchor interval reconstruction:")
-    lines.append(
-        "Interval coverage: "
-        f"status={coverage.get('status')} complete={coverage.get('complete')} "
-        f"records_after_anchor={coverage.get('records_after_anchor')} "
-        f"entries={interval.get('chronological_entry_count')} "
-        f"omitted={coverage.get('omitted_activity_entry_count', 0)}"
-    )
-    if anchor:
-        lines.append(f"Interval anchor: {anchor.get('timestamp_utc')} {anchor.get('source_ref')}")
-    if boundary:
-        lines.append(
-            "Interval boundary: "
-            f"{boundary.get('kind')} {boundary.get('timestamp_utc')} {boundary.get('source_ref')}"
-        )
-    entries = interval.get("chronological_activity") or []
-    lines.append("Interval chronological activity:")
-    if entries:
-        for entry in entries[:8]:
-            lines.append(
-                "- "
-                f"{entry.get('timestamp_utc')} {entry.get('source_ref')} "
-                f"{entry.get('activity_kind')}: {entry.get('snippet')}"
-            )
-            if entry.get("read_more_command"):
-                lines.append(f"  read-more: {entry.get('read_more_command')}")
-    else:
-        lines.append("- (no chronological activity refs surfaced)")
-    spawned_refs = interval.get("spawned_session_launch_refs") or []
-    if spawned_refs:
-        lines.append("Interval spawned/worker/reviewer launch refs: " + ", ".join(str(ref) for ref in spawned_refs[:8]))
-    joins = interval.get("secondary_evidence_joins") or {}
-    join_counts = {
-        key: len(joins.get(key) or [])
-        for key in ("tasks", "reports", "reviews", "git_commits")
-    }
-    lines.append(
-        "Interval secondary joins: "
-        f"tasks={join_counts['tasks']} reports={join_counts['reports']} "
-        f"reviews={join_counts['reviews']} git_commits={join_counts['git_commits']}"
-    )
-    omitted_ranges = interval.get("omitted_ranges") or []
-    if omitted_ranges:
-        lines.append("Interval omitted ranges:")
-        for item in omitted_ranges:
-            lines.append(
-                "- "
-                f"after={item.get('after_ref')} last={item.get('last_ref')} "
-                f"omitted={item.get('omitted_count')}: {item.get('guidance')}"
-            )
-            if item.get("read_next_command"):
-                lines.append(f"  next-read: {item.get('read_next_command')}")
-    guidance = interval.get("next_read_guidance") or {}
-    if guidance:
-        lines.append(
-            f"Interval next-read guidance: status={guidance.get('status')} policy={guidance.get('policy')}"
-        )
 
 
-def _append_status_post_anchor_interval_markdown(lines: list[str], interval: dict) -> None:
-    if not interval:
-        lines.append("- No post-anchor interval reconstruction surfaced.")
-        return
-    coverage = interval.get("coverage") or {}
-    anchor = interval.get("anchor") or {}
-    boundary = interval.get("boundary") or {}
-    lines.append(
-        f"- Coverage: `status={coverage.get('status')}` `complete={coverage.get('complete')}` "
-        f"`records_after_anchor={coverage.get('records_after_anchor')}` "
-        f"`entries={interval.get('chronological_entry_count')}` "
-        f"`omitted={coverage.get('omitted_activity_entry_count', 0)}`"
-    )
-    if anchor:
-        lines.append(f"- Anchor: `{anchor.get('timestamp_utc')}` `{anchor.get('source_ref')}`")
-    if boundary:
-        lines.append(
-            f"- Boundary: `{boundary.get('kind')}` `{boundary.get('timestamp_utc')}` `{boundary.get('source_ref')}`"
-        )
-    entries = interval.get("chronological_activity") or []
-    lines.extend(["", "### Chronological Activity", ""])
-    if entries:
-        for entry in entries[:8]:
-            lines.append(
-                f"- `{entry.get('timestamp_utc')}` `{entry.get('source_ref')}` "
-                f"`{entry.get('activity_kind')}`: {entry.get('snippet')}"
-            )
-            if entry.get("read_more_command"):
-                lines.append(f"  - Read more: `{entry.get('read_more_command')}`")
-    else:
-        lines.append("- No chronological activity refs surfaced.")
-    spawned_refs = interval.get("spawned_session_launch_refs") or []
-    if spawned_refs:
-        lines.append("")
-        lines.append("- Spawned/worker/reviewer launch refs: " + ", ".join(f"`{ref}`" for ref in spawned_refs[:8]))
-    joins = interval.get("secondary_evidence_joins") or {}
-    join_counts = {
-        key: len(joins.get(key) or [])
-        for key in ("tasks", "reports", "reviews", "git_commits")
-    }
-    lines.append("")
-    lines.append(
-        f"- Secondary joins: `tasks={join_counts['tasks']}` `reports={join_counts['reports']}` "
-        f"`reviews={join_counts['reviews']}` `git_commits={join_counts['git_commits']}`"
-    )
-    omitted_ranges = interval.get("omitted_ranges") or []
-    if omitted_ranges:
-        lines.extend(["", "### Omitted Ranges", ""])
-        for item in omitted_ranges:
-            lines.append(
-                f"- `after={item.get('after_ref')}` `last={item.get('last_ref')}` "
-                f"`omitted={item.get('omitted_count')}`: {item.get('guidance')}"
-            )
-            if item.get("read_next_command"):
-                lines.append(f"  - Next read: `{item.get('read_next_command')}`")
-    guidance = interval.get("next_read_guidance") or {}
-    if guidance:
-        lines.append("")
-        lines.append(f"- Next-read guidance: `status={guidance.get('status')}` {guidance.get('policy')}")
 
 
 def render_retained_trace_counters_text(payload: dict) -> str:
