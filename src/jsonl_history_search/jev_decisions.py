@@ -6,6 +6,9 @@ Rationale: docs/package-map.md#optional-decisions.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+import hashlib
+import time
 from typing import Callable, Mapping
 
 from .decisions import (
@@ -75,17 +78,26 @@ class SystemOneDecisionEngine:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        raw = None
+        started = time.monotonic()
         try:
             transport = self._transport or _systemone_http_transport
             raw = transport(self.endpoint, payload, headers, self.timeout)
-            return self._parse_response(request, raw)
+            result = self._parse_response(request, raw)
         except Exception as exc:  # Network/schema failures must preserve the local route.
-            return fallback_response(
+            result = fallback_response(
                 request,
                 engine=self.name,
                 model=self.model,
                 reason=f"jev_unavailable:{type(exc).__name__}",
             )
+        # Metering belongs to the attempt, independently of answer validity.
+        receipt = dict(raw.get("_receipt", {})) if isinstance(raw, dict) else {}
+        receipt.update(attempted=True, requested_model=self.model,
+                       resolved_model=raw.get("model") if isinstance(raw, dict) else None,
+                       elapsed_seconds=round(time.monotonic() - started, 6),
+                       payload_sha256=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest())
+        return replace(result, usage=_valid_usage(raw), receipt=receipt)
 
     def _parse_response(self, request: DecisionRequest, raw: object) -> DecisionResponse:
         if not isinstance(raw, dict):
@@ -97,10 +109,7 @@ class SystemOneDecisionEngine:
             raise ValueError("invalid System One response model")
         if not isinstance(raw_answers, dict) or not raw_answers:
             raise ValueError("invalid System One response answers")
-        if not isinstance(usage, dict) or not all(
-            isinstance(usage.get(field), int) and not isinstance(usage.get(field), bool)
-            for field in ("input_tokens", "output_tokens")
-        ):
+        if _valid_usage(raw) is None:
             raise ValueError("invalid System One response usage")
         answers: dict[str, DecisionAnswer] = {}
         for name, question in request.questions.items():
@@ -124,6 +133,7 @@ class SystemOneDecisionEngine:
             model=response_model,
             answers=answers,
             fallback_reason=",".join(fallback_reasons) or None,
+            usage=usage,
         )
 
     def _parse_answer(self, question, answer: object) -> DecisionAnswer:
@@ -181,6 +191,16 @@ def _probability(value: object) -> float:
     return result
 
 
+def _valid_usage(raw: object) -> dict[str, int] | None:
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict) or not all(
+        isinstance(usage.get(name), int) and not isinstance(usage.get(name), bool)
+        and usage[name] >= 0 for name in ("input_tokens", "output_tokens")
+    ):
+        return None
+    return {name: usage[name] for name in ("input_tokens", "output_tokens")}
+
+
 def _probability_map(value: object) -> dict[str, float]:
     if not isinstance(value, dict):
         raise ValueError("probabilities must be an object")
@@ -195,6 +215,7 @@ def _systemone_http_transport(
 ) -> dict:
     # Keep the optional remote path dependency-free and lazy at call time.
     from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
 
     request = Request(
         endpoint,
@@ -202,8 +223,24 @@ def _systemone_http_transport(
         headers=dict(headers),
         method="POST",
     )
-    with urlopen(request, timeout=timeout) as response:
-        decoded = json.loads(response.read().decode("utf-8"))
-    if not isinstance(decoded, dict):
-        raise ValueError("System One response must be a JSON object")
+    try:
+        response = urlopen(request, timeout=timeout)
+    except HTTPError as exc:
+        response = exc
+    with response:
+        content = response.read()
+        receipt = {"http_status": response.status,
+                   "response_sha256": hashlib.sha256(content).hexdigest(),
+                   "request_id": response.headers.get("x-request-id"),
+                   "retry_after": response.headers.get("retry-after")}
+        try:
+            decoded = json.loads(content.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            decoded = {}
+        if not isinstance(decoded, dict):
+            decoded = {}
+        # An HTTP error must never yield an accepted remote decision.
+        if response.status != 200:
+            decoded.pop("answers", None)
+        decoded["_receipt"] = receipt
     return decoded

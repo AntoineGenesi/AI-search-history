@@ -56,8 +56,10 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
                               retrieval_options, budget, mask_context=None):
     result = run_retrieval_mode(plan=plan, intent=intent, default_tz=default_tz,
                                 cwd=source_plan["cwd"], mask_context=mask_context,
-                                budget=budget, **retrieval_options) if budget.available("retrieval") else {
+                                budget=budget, retain_candidate_records=True,
+                                **retrieval_options) if budget.available("retrieval") else {
                                     "groups": [], "warnings": ["Stopped retrieval at operation max elapsed cap."]}
+    retained = result.pop("_candidate_records", {})
     candidates = build_candidate_rows(result)
     admitted_source_files = result.get("admitted_source_files", result.get("planned_files_count", 0))
     # Capture retrieval reads before candidate-dependent readback. Repeated lanes
@@ -94,17 +96,27 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
             reader.close()
         errors.extend(stats.partial_failures or [])
         selected_positions = set()
+        retained_positions = set()
+        readback_count = len(records)
         for candidate in source_candidates:
             native = candidate.source_ref.get("native_ref")
-            positions = [index for index, record in enumerate(records)
+            positions = [index for index, record in enumerate(records[:readback_count])
                          if native == record.source_ref or native in (record.source_refs or [])] if native else [
-                             index for index, record in enumerate(records) if record.line == candidate.line]
+                             index for index, record in enumerate(records[:readback_count]) if record.line == candidate.line]
             if len(positions) != 1:
                 gaps.append({"status": "ambiguous_native_ref" if len(positions) > 1 else "candidate_window_not_opened",
                              "target": ref_target(candidate.source_ref), "matches": len(positions)})
+                original = retained.get(evidence_identity(candidate.source_ref))
+                if not positions and original is not None:
+                    # No extra source read or fresh allowance. An exact record
+                    # inspected during retrieval remains evidence; its neighbors
+                    # were not acquired here and are never synthesized.
+                    records.append(original)
+                    retained_positions.add(len(records) - 1)
+                    selected_positions.add(len(records) - 1)
                 continue
             position = positions[0]
-            selected_positions.update(range(max(0, position - 3), min(len(records), position + 4)))
+            selected_positions.update(range(max(0, position - 3), min(readback_count, position + 4)))
         opened = []
         for position in sorted(selected_positions):
             record = records[position]
@@ -122,7 +134,11 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
                 omitted_records.append({"target": ref_target(ref), "omitted_text_bytes": len(encoded) - available})
                 passage = encoded[:available].decode("utf-8", errors="ignore")
             presentation_bytes += len(passage.encode("utf-8"))
+            if not passage:
+                # A locator whose entire text was omitted is not presented proof.
+                continue
             opened.append({"text": passage, "role": record.role,
+                           "acquisition": "retained_during_retrieval" if position in retained_positions else "source_readback",
                            "timestamp": record.timestamp.isoformat() if record.timestamp else None,
                            "timestamp_quality": record.timestamp_quality, "source_ref": ref,
                            "target": ref_target(ref), "line": record.line})
@@ -136,8 +152,10 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
                                if key not in {"arguments", "payload_excerpt", "command"}})
         if opened:
             windows.append({"source": path, "records": opened,
-                            "read_complete": source_complete and not stats.partial_failures,
-                            "window_policy": "ranked anchors with up to three adjacent records on either side"})
+                            "read_complete": source_complete and not stats.partial_failures and not retained_positions,
+                            "neighborhood_available": not bool(retained_positions),
+                            "window_policy": "readback neighborhoods plus exact retained singleton records; retained neighborhoods unavailable"
+                                             if retained_positions else "ranked anchors with up to three adjacent records on either side"})
     warnings = list(result.get("warnings", []))
     cap_reasons = cap_labels_from_warnings(warnings)
     cap_reasons.extend(budget.exhausted_reasons)

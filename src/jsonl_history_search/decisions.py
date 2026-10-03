@@ -5,7 +5,7 @@ Rationale: docs/package-map.md#optional-decisions.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Mapping, Protocol
 
 
@@ -99,12 +99,16 @@ class DecisionResponse:
     model: str | None
     answers: Mapping[str, DecisionAnswer]
     fallback_reason: str | None = None
+    usage: Mapping[str, int] | None = None
+    receipt: Mapping[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
             "engine": self.engine,
             "model": self.model,
             "fallback_reason": self.fallback_reason,
+            "usage": dict(self.usage) if self.usage is not None else None,
+            "receipt": dict(self.receipt),
             "answers": {name: answer.as_dict() for name, answer in self.answers.items()},
         }
 
