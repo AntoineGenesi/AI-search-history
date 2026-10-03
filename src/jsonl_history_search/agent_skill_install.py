@@ -21,7 +21,6 @@ class AgentSkillAssets:
     alias_skill: Path
     alias_policy: Path
     references: Path
-    search_helper: Path
     ask_first_helper: Path
     source: str
 
@@ -93,7 +92,6 @@ def install_agent_skill(
     if references_root.exists():
         shutil.rmtree(references_root)
     shutil.copytree(assets.references, references_root)
-    _copy_executable(assets.search_helper, scripts_root / "search_jsonl_history.py")
     _copy_executable(assets.ask_first_helper, scripts_root / "jsonl_ask_first.py")
     route_note = _route_note(agent, target_home)
 
@@ -187,7 +185,6 @@ def _source_checkout_assets(root: Path, *, agent: str, source: str) -> AgentSkil
         alias_skill=root / "skills" / agent / "convo" / "SKILL.md",
         alias_policy=root / "skills" / agent / "convo" / "agents" / "openai.yaml",
         references=skill_root / "references",
-        search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
         source=source,
     )
@@ -203,7 +200,6 @@ def _assets_from_root(root: Path, *, agent: str, source: str) -> AgentSkillAsset
         alias_skill=alias_skill,
         alias_policy=alias_skill.parent / "agents" / "openai.yaml",
         references=root / "references",
-        search_helper=root / "scripts" / "search_jsonl_history.py",
         ask_first_helper=root / "scripts" / "jsonl_ask_first.py",
         source=source,
     )
@@ -217,7 +213,6 @@ def _assets_complete(assets: AgentSkillAssets) -> bool:
         and assets.alias_policy.is_file()
         and assets.references.is_dir()
         and any(assets.references.glob("*.md"))
-        and assets.search_helper.is_file()
         and assets.ask_first_helper.is_file()
     )
 

@@ -404,7 +404,7 @@ def _optional_commands_capability() -> Capability:
         category="core",
         status="available" if not missing else "degraded",
         benefit="Exposes specialized diagnostics, benchmark, manifest, and workflow evidence commands.",
-        fallback="plan_search_find",
+        fallback="direct_ask_or_native_inspection",
         expected_slowdown_or_lost_feature="Agents may need extra manual searches when specialized command surfaces are absent.",
         suggested_next_action="No action needed." if not missing else "Restore missing CLI parser entries.",
         details={"expected_commands": sorted(expected), "missing_commands": missing},
