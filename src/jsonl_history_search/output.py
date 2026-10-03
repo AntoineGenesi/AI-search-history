@@ -576,7 +576,7 @@ def render(payload: dict, output_format: str) -> str:
 def render_history_evidence(payload: dict) -> str:
     from .source_refs import ref_target
     lines = [payload['query'], 'Status: ' + payload['status'],
-             'Scope complete: ' + str(payload['coverage']['complete'])]
+             'Selected sources fully read: ' + str(payload['coverage']['complete'])]
     lines.append('Searched scope: ' + json.dumps(payload['scope'], ensure_ascii=False))
     for field in ('cap_reasons', 'unavailable_roots', 'source_errors'):
         if payload['coverage'][field]:

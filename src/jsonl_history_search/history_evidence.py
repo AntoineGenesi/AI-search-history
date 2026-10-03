@@ -13,7 +13,7 @@ from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
 from .conversation_records import (COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
     TURN_CONTROL_OR_STATUS, UNKNOWN, classify_conversation_record)
 from .operation_budget import BudgetExceeded
-from .query import infer_terms
+from .query import DATE_TOKEN_RE
 from .source_refs import evidence_identity, evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
@@ -25,22 +25,16 @@ WORD = re.compile(r'[a-z0-9][a-z0-9_.:/-]*')
 class Context:
     passage: dict
     opening: dict | None
-    terms: dict
-    length: int
     score: float
     cost: int
 
 
-def query_spans(query):
-    paragraphs = [p for p in re.split(r'\n\s*\n', query) if p.strip()]
-    return paragraphs or [query]
-
-
-def lexical_score(words, profiles):
+def lexical_score(words, profile):
     """TF cosine; norm includes ALL vocabulary in the actual returned passage."""
     norm = math.sqrt(sum(n * n for n in words.values()))
-    return max((sum(words.get(t, 0) * n for t, n in profile.items()) / (norm * query_norm)
-                for profile, query_norm in profiles if norm and query_norm), default=0)
+    query, query_norm = profile
+    return (sum(words.get(t, 0) * n for t, n in query.items()) / (norm * query_norm)
+            if norm and query_norm else 0)
 
 
 def visible(record, intent):
@@ -51,7 +45,7 @@ def visible(record, intent):
         and (not intent.date_window_end or record.timestamp < intent.date_window_end))
 
 
-def native_passage(record, terms, mask_context, *, kind='passage', role=None, profiles=(), budget=None):
+def native_passage(record, mask_context, *, kind='passage', role=None, profile=None, budget=None):
     original = record.text.encode('utf-8')
     start, text, best = 0, '', -1
     for offset in range(0, len(original), PASSAGE_LIMIT):
@@ -60,7 +54,7 @@ def native_passage(record, terms, mask_context, *, kind='passage', role=None, pr
         excerpt = original[offset:offset + PASSAGE_LIMIT].decode('utf-8', errors='ignore')
         if mask_context:
             excerpt = mask_context.mask_text(excerpt, source_path=record.path, source_index=record.line)
-        value = lexical_score(Counter(WORD.findall(excerpt.lower())), profiles) if profiles else 0
+        value = lexical_score(Counter(WORD.findall(excerpt.lower())), profile) if profile else 0
         if value > best:
             start, text, best = offset, excerpt, value
     item = {'source_ref': evidence_ref(record), 'role': role or record.role,
@@ -74,12 +68,9 @@ def native_passage(record, terms, mask_context, *, kind='passage', role=None, pr
 
 
 def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=None):
-    profiles = []
-    for span in query_spans(query):
-        eligible = set(infer_terms(span.lower(), []))
-        words = Counter(t for t in WORD.findall(span.lower()) if t in eligible)
-        profiles.append((words, math.sqrt(sum(n * n for n in words.values()))))
-    terms = set(t for profile, _ in profiles for t in profile)
+    words = Counter(WORD.findall(query.lower()))
+    profile = (words, math.sqrt(sum(n * n for n in words.values())))
+    terms = set(words)
     files = list(enumerate_jsonl_files(plan, preferred_terms=list(terms), budget=budget,
                                       measured_byte_admission=True))
     states = [{'path': p, 'kind': source_kind_for_path(p, plan), 'reader': None,
@@ -105,7 +96,8 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     raw = record.raw or {}
                     payload = raw.get('payload', raw)
                     if raw.get('type') == 'session_meta' and isinstance(payload, dict):
-                        state['session'] = payload.get('id') or payload.get('session_id')
+                        session = payload.get('id') or payload.get('session_id')
+                        state['session'] = hashlib.sha256(str(session).encode()).hexdigest() if session else None
                         state['worker'] = payload.get('thread_source') == 'subagent' or (
                             isinstance(payload.get('source'), dict) and 'subagent' in payload['source'])
                         continue
@@ -117,8 +109,8 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         controls += 1
                         continue
                     kind = raw.get('type')
-                    if state['session'] and record.raw_timestamp and kind in {'response_item', 'event_msg'}:
-                        signature = (classification.label, record.raw_timestamp, hashlib.sha256(record.text.encode()).hexdigest())
+                    if state['session'] and record.timestamp and kind in {'response_item', 'event_msg'}:
+                        signature = (classification.label, record.timestamp.isoformat(), hashlib.sha256(record.text.encode()).hexdigest())
                         previous = state['mirrors'].get(signature)
                         if previous and {previous, kind} == {'response_item', 'event_msg'}:
                             mirrors += 1
@@ -130,9 +122,9 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         and raw.get('role') == 'user' and not raw.get('type') and isinstance(raw.get('text'), str))
                     opening = classification.is_human_authored or plain_user
                     if opening:
-                        observed = native_passage(record, terms, mask_context,
+                        observed = native_passage(record, mask_context,
                             kind='worker_assignment' if state['worker'] else 'request', role='user',
-                            profiles=profiles, budget=budget)
+                            profile=profile, budget=budget)
                         observed_cost = len(json.dumps(observed, ensure_ascii=False).encode())
                         opening_cost -= state['opening_cost']
                         state['opening'] = observed if cost + opening_cost + observed_cost <= RETAIN_LIMIT else None
@@ -141,28 +133,27 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     lower = record.text.lower()
                     if not any(t in lower for t in terms):
                         continue
-                    passage = state['opening'] if opening else native_passage(record, terms, mask_context,
-                                                                           profiles=profiles, budget=budget)
+                    passage = state['opening'] if opening else native_passage(record, mask_context,
+                                                                            profile=profile, budget=budget)
                     if passage is None:
                         continue
                     words = Counter(WORD.findall(passage['text'].lower()))
-                    length = sum(words.values())
                     if not terms.intersection(words) or not limit:
                         continue
                     matched += 1
                     identity = evidence_identity(record)
-                    value = lexical_score(words, profiles)
+                    value = lexical_score(words, profile)
                     if len(heap) >= limit and (value, identity) <= heap[0]:
                         continue
                     observed = state['opening'] if not opening else None
-                    item_cost = len(json.dumps([passage, observed, words], ensure_ascii=False).encode())
+                    item_cost = len(json.dumps([passage, observed], ensure_ascii=False).encode())
                     weakest = heap[0][1] if len(heap) >= limit else None
                     replaced_cost = contexts[weakest].cost if weakest is not None else 0
                     if cost - replaced_cost + opening_cost + item_cost <= RETAIN_LIMIT:
                         if weakest is not None:
                             heapq.heappop(heap)
                             cost -= contexts.pop(weakest).cost
-                        contexts[identity] = Context(passage, observed, words, length, value, item_cost)
+                        contexts[identity] = Context(passage, observed, value, item_cost)
                         heapq.heappush(heap, (value, identity))
                         cost += item_cost
             except StopIteration:
@@ -255,8 +246,10 @@ def retrieve_history_evidence(*, query, intent, plan, default_tz, budget,
     payload = {'query': query, 'status': status, 'evidence': [],
         'scope': {'roots': [str(r.path) for r in plan.roots], 'root_count': len(plan.roots),
                   'role': intent.role if intent.role_filter_explicit else None,
-                  'since': intent.date_window_start.isoformat() if intent.date_window_start else None,
-                  'until': intent.date_window_end.isoformat() if intent.date_window_end else None},
+                  'since': intent.date_window_start.isoformat() if intent.date_window_filter and intent.date_window_start else None,
+                  'until': intent.date_window_end.isoformat() if intent.date_window_filter and intent.date_window_end else None,
+                  'unresolved_natural_date_qualifier': bool(DATE_TOKEN_RE.search(query)) and intent.date_reason != 'explicit_cli_window',
+                  'constraint_boundary': 'Roots/explicit role/applied record-time filters only. Natural session-date/local-time wording is not resolved.'},
         'coverage': {'complete': complete, 'files_admitted': len(scan['states']),
             'files_read': len(budget.opened_sources), 'records_inspected': scan['records'],
             'cap_reasons': reasons, 'unavailable_roots': unavailable[:20], 'unavailable_root_count': len(unavailable),
