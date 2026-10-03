@@ -1261,28 +1261,36 @@ def _build_claude_direct_history_answer(
                     "anchor": anchors[-1],
                 }
             )
-    if capped and not matching:
+    if (capped or warnings) and not matching:
+        coverage = _interval_coverage(
+            reads=reads, warnings=warnings, scan_state=scan_state,
+            selected_count=len(paths), inspected=len(reads), record_count=0,
+        )
         selection = {
             "status": "partial",
-            "reason": "claude_history_scan_stopped_at_explicit_byte_or_elapsed_cap",
+            "reason": "claude_history_scan_stopped_at_explicit_byte_or_elapsed_cap"
+            if capped else "claude_history_selected_source_reads_incomplete",
             "boundary": {
                 "root": str(search_root),
                 "warnings": warnings,
                 "bytes_read": bytes_read,
                 **scan_state,
             },
-            "recovery": "bounded_claude_history_scan_stopped_at_cap",
+            "recovery": "bounded_claude_history_scan_stopped_at_cap"
+            if capped else "bounded_claude_history_scan_incomplete",
         }
-        return {
-            "ask_answer": _boundary_answer(
-                query=query,
-                cwd=cwd,
-                route=route,
-                selection=selection,
-                inventory=inventory,
-                limits=limits,
-            )
+        answer = _boundary_answer(
+            query=query, cwd=cwd, route=route, selection=selection,
+            inventory=inventory, limits=limits,
+        )
+        answer["source_contract"]["coverage"] = coverage
+        answer["source_contract"]["missing_or_capped_scope"] = _missing_or_capped_scope({}, coverage)
+        answer["fail_closed_reason"] = selection["reason"] + ": " + "; ".join(warnings)
+        answer["next_proof_step"] = {
+            "required_next_proof": "Recover the failed or capped Claude sources, then retry the query boundary scan.",
+            "root": str(search_root), "warnings": warnings,
         }
+        return {"ask_answer": answer}
     if len(matching) != 1:
         selection = {
             "status": "ambiguous" if len(matching) > 1 else "not_found",
