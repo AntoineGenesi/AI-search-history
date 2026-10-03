@@ -76,6 +76,7 @@ def search(
     include_private_diagnostics: bool = False,
     prioritized_file_paths: set[str] | None = None,
     budget=None,
+    retain_candidate_records=False,
 ) -> dict:
     started = time.monotonic()
     warnings = list(plan.warnings)
@@ -105,6 +106,18 @@ def search(
     # Retain the legacy optimization only outside the budgeted direct operation.
     pre_parse_filter = _build_pre_parse_filter(match_profile) if budget is None else None
     raw_line_stats = RawLineScanStats()
+    retained_records = {}
+
+    def remember(record):
+        # Only the ordinary operation requests this ephemeral sidecar. Records
+        # are original parsed source objects, never reconstructed from snippets.
+        if not retain_candidate_records:
+            return
+        retained_records[evidence_identity(record)] = record
+        live = {evidence_identity(match) for match in matches + weak_matches}
+        for key in list(retained_records):
+            if key not in live:
+                del retained_records[key]
 
     if planned_jsonl_files is not None:
         planned_files = list(planned_jsonl_files.files)
@@ -247,6 +260,7 @@ def search(
                         expected_state["candidate_strength_label"] = strength_label
                     if len(weak_matches) < weak_reservoir_limit:
                         weak_matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
+                        remember(record)
                         candidate_strength["weak_reservoir_retained"] += 1
                         if expected_state is not None:
                             expected_state["reservoir_phase_label"] = "weak_reservoir_retained"
@@ -259,6 +273,7 @@ def search(
                             weak_matches[weakest_index] = _materialize_match(
                                 record, score, reasons, artifacts, intent, mask_context
                             )
+                            remember(record)
                             candidate_strength["weak_reservoir_replaced"] += 1
                             if expected_state is not None:
                                 expected_state["reservoir_phase_label"] = "weak_reservoir_replaced_existing_candidate"
@@ -278,6 +293,7 @@ def search(
                 candidate_sort_key = match_candidate_sort_key(record, score, reasons)
                 if len(matches) < strong_reservoir_limit:
                     matches.append(_materialize_match(record, score, reasons, artifacts, intent, mask_context))
+                    remember(record)
                     candidate_strength["strong_reservoir_retained"] += 1
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_retained"
@@ -290,6 +306,7 @@ def search(
                     matches[weakest_index] = _materialize_match(
                         record, score, reasons, artifacts, intent, mask_context
                     )
+                    remember(record)
                     candidate_strength["strong_reservoir_replaced"] += 1
                     if expected_state is not None:
                         expected_state["reservoir_phase_label"] = "strong_reservoir_replaced_existing_candidate"
@@ -383,6 +400,9 @@ def search(
     }
     if prefilter is not None:
         payload["prefilter"] = prefilter
+    if retain_candidate_records:
+        final_keys = {evidence_identity(match) for match in matches}
+        payload["_candidate_records"] = {key: record for key, record in retained_records.items() if key in final_keys}
     if planned_jsonl_files is not None:
         payload["planned_file_enumeration"] = planned_jsonl_files.to_diagnostics()
     if include_private_diagnostics:

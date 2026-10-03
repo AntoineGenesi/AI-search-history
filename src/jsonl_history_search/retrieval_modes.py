@@ -52,6 +52,7 @@ def run_retrieval_mode(
     query_plan_mode: str = QUERY_PLAN_MODE_AUTO,
     continuation_ledger: bool = False,
     budget=None,
+    retain_candidate_records=False,
 ) -> dict[str, Any]:
     if retrieval_mode == RETRIEVAL_MODE_PACKAGE:
         return search(
@@ -62,6 +63,7 @@ def run_retrieval_mode(
             mask_context=mask_context,
             use_rg_prefilter=use_rg_prefilter,
             budget=budget,
+            retain_candidate_records=retain_candidate_records,
         )
     if retrieval_mode == RETRIEVAL_MODE_RRF_FUSION:
         return run_rrf_fusion_retrieval(
