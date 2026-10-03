@@ -585,6 +585,7 @@ def render_history_evidence(payload: dict) -> str:
         lines.append('[Displayed question excerpt; original question was used locally.]')
     for item in payload['evidence']:
         lines.extend(['', '%s | %s | %s' % (ref_target(item['source_ref']), item['role'], item['timestamp']), item['text']])
+        lines.append('Native views: ' + json.dumps(item['passage'].get('spans', [])))
         if not item['passage']['complete']:
             lines.append('[Bounded excerpt; original text bytes: %s]' % item['passage']['original_text_bytes'])
     lines.extend(['', 'Omissions: ' + json.dumps(payload['omissions']), payload['claim_boundary']])

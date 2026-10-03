@@ -1,4 +1,8 @@
-"""One local streaming history operation: native passages, not packet gates."""
+"""One local streaming history operation; see docs/package-map.md#ordinary-history-workflow.
+
+One full-question vector prevents header-only OR matches. A relevant body span
+does not replace its independently observed native message start.
+"""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -52,23 +56,39 @@ def visible(record, intent, speaker):
         and (not intent.date_window_end or record.timestamp < intent.date_window_end))
 
 
-def native_passage(record, mask_context, *, kind='passage', speaker=None, profile=None, budget=None):
+def utf8_end(original, start):
+    """An exact <=16KiB native span; never discard a split UTF-8 character."""
+    end = min(start + PASSAGE_LIMIT, len(original))
+    while end < len(original) and original[end] & 0xc0 == 0x80:
+        end -= 1
+    return end
+
+
+def native_passage(record, mask_context, *, kind='matched_excerpt', speaker=None,
+                   profile=None, budget=None, message_start=False):
     original = record.text.encode('utf-8')
-    start, text, best = 0, '', -1
-    for offset in range(0, len(original), PASSAGE_LIMIT):
+    start, stop, text, best, offset = 0, 0, '', -1, 0
+    while offset < len(original):
         if offset and budget and not budget.available('history'):
             break
-        excerpt = original[offset:offset + PASSAGE_LIMIT].decode('utf-8', errors='ignore')
+        end = utf8_end(original, offset)
+        excerpt = original[offset:end].decode('utf-8')
         if mask_context:
             excerpt = mask_context.mask_text(excerpt, source_path=record.path, source_index=record.line)
         value = lexical_score(Counter(WORD.findall(excerpt.lower())), profile) if profile else 0
         if value > best:
-            start, text, best = offset, excerpt, value
+            start, stop, text, best = offset, end, excerpt, value
+        if message_start:
+            break
+        offset = end
     item = {'source_ref': evidence_ref(record), 'role': record.role, 'speaker': speaker or record.role,
             'timestamp': record.timestamp.isoformat() if record.timestamp else None,
             'timestamp_quality': record.timestamp_quality, 'kind': kind, 'text': text,
-            'passage': {'text_byte_start': start, 'original_text_bytes': len(original),
-                        'complete': start == 0 and len(original) <= PASSAGE_LIMIT}}
+            'passage': {'text_byte_start': start, 'text_byte_end': stop,
+                        'original_text_bytes': len(original),
+                        'complete': start == 0 and stop == len(original),
+                        'spans': [{'text_byte_start': start, 'text_byte_end': stop, 'views': [kind]}],
+                        'gaps': []}}
     if record.source_refs:
         item['source_refs'] = list(record.source_refs)
     return item, best
@@ -81,7 +101,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
     files = list(enumerate_jsonl_files(plan, preferred_terms=list(terms), budget=budget,
                                       measured_byte_admission=True))
     states = [{'path': p, 'kind': source_kind_for_path(p, plan), 'reader': None,
-               'opening': None, 'opening_cost': 0, 'opening_score': 0, 'mirrors': {},
+               'opening': None, 'opening_cost': 0, 'mirrors': {},
                'turn': None, 'last_native': None,
                'session': None, 'worker': False, 'complete': False, 'records': 0} for p, _, _ in files]
     contexts, errors, heap = {}, [], []
@@ -145,22 +165,18 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     opening = classification.is_human_authored or plain_user
                     if opening:
                         observed, value = native_passage(record, mask_context,
-                            kind='worker_assignment' if state['worker'] else 'request', speaker=speaker,
-                            profile=profile, budget=budget)
+                            kind='worker_assignment_start' if state['worker'] else 'human_message_start',
+                            speaker=speaker, message_start=True)
                         observed_cost = len(json.dumps(observed, ensure_ascii=False).encode())
                         opening_cost -= state['opening_cost']
                         state['opening'] = observed if cost + opening_cost + observed_cost <= RETAIN_LIMIT else None
                         state['opening_cost'] = observed_cost if state['opening'] else 0
-                        state['opening_score'] = value
                         opening_cost += state['opening_cost']
                     lower = record.text.lower()
                     if not any(t in lower for t in terms):
                         continue
-                    if opening:
-                        passage, value = state['opening'], state['opening_score']
-                    else:
-                        passage, value = native_passage(record, mask_context,
-                            speaker=speaker, profile=profile, budget=budget)
+                    passage, value = native_passage(record, mask_context,
+                        speaker=speaker, profile=profile, budget=budget)
                     if passage is None:
                         continue
                     if value <= 0 or not limit:
@@ -169,7 +185,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     identity = evidence_identity(record)
                     if len(heap) >= limit and (value, identity) <= heap[0]:
                         continue
-                    observed = state['opening'] if not opening else None
+                    observed = state['opening']
                     item_cost = len(json.dumps([passage, observed], ensure_ascii=False).encode())
                     weakest = heap[0][1] if len(heap) >= limit else None
                     replaced_cost = contexts[weakest].cost if weakest is not None else 0
@@ -210,8 +226,54 @@ def select_contexts(contexts):
     return first + rest
 
 
+def union_native_views(views):
+    """Same validated event only. Text once; nonadjacent spans explicitly gapped.
+
+    Views share the UTF-8 partition, so ranges are identical or disjoint even
+    when display redaction changes text length. No masked/native byte guessing.
+    """
+    pieces = {}
+    for view in views:
+        p = view['passage']
+        key = (p['text_byte_start'], p['text_byte_end'])
+        if key not in pieces:
+            pieces[key] = [view['text'], []]
+        for label in p['spans'][0]['views']:
+            if label not in pieces[key][1]:
+                pieces[key][1].append(label)
+    spans, gaps, parts = [], [], []
+    for (start, end), (text, labels) in sorted(pieces.items()):
+        if spans and start < spans[-1]['text_byte_end']:
+            raise ValueError('Native views must use the same exact UTF-8 partition.')
+        if spans and start > spans[-1]['text_byte_end']:
+            gap = {'text_byte_start': spans[-1]['text_byte_end'], 'text_byte_end': start}
+            gaps.append(gap)
+            parts.append('\n[Native text bytes %s:%s omitted]\n' % (gap['text_byte_start'], start))
+        parts.append(text)
+        if spans and start == spans[-1]['text_byte_end']:
+            spans[-1]['text_byte_end'] = end
+            spans[-1]['views'] = list(dict.fromkeys(spans[-1]['views'] + labels))
+        else:
+            spans.append({'text_byte_start': start, 'text_byte_end': end, 'views': labels})
+    item = dict(views[0])
+    original_bytes = item['passage']['original_text_bytes']
+    item['text'] = ''.join(parts)
+    item['passage'] = {'text_byte_start': spans[0]['text_byte_start'],
+        'text_byte_end': spans[-1]['text_byte_end'], 'original_text_bytes': original_bytes,
+        'complete': len(spans) == 1 and spans[0]['text_byte_start'] == 0
+                    and spans[0]['text_byte_end'] == original_bytes,
+        'spans': spans, 'gaps': gaps}
+    return item
+
+
 def pack_evidence(payload, contexts, output_format):
     from .output import render
+    items = [item for context in contexts for item in (context.opening, context.passage) if item]
+    original_status = payload['status']
+    payload['status'] = 'evidence_found'
+    # Reserve final metadata before ANY response-size admission.
+    payload['omissions']['presentation_contexts'] = len(items)
+    payload['omissions']['clipped_passages'] = len(items)
     # Bound copied diagnostics/query too; never slice serialized JSON or mutate the local request.
     payload['omissions']['diagnostic_examples'] = 0
     payload['query_display'] = {'original_bytes': len(payload['query'].encode()), 'complete': True}
@@ -228,33 +290,38 @@ def pack_evidence(payload, contexts, output_format):
         else:
             payload['query'] = payload['query'][:len(payload['query']) // 2]
             payload['query_display']['complete'] = False
-    seen, text_bytes, omitted = set(), 0, 0
-    items = [item for context in contexts for item in (context.opening, context.passage) if item]
+    admitted, text_bytes, omitted = {}, 0, 0
     for item in items:
         identity = evidence_identity(item['source_ref'])
-        if identity in seen:
+        previous = admitted.get(identity)
+        views = previous[1] if previous else []
+        if any(view['passage']['text_byte_start'] == item['passage']['text_byte_start']
+               and view['passage']['text_byte_end'] == item['passage']['text_byte_end']
+               and view['kind'] == item['kind'] for view in views):
             continue
-        seen.add(identity)
-        size = len(item['text'].encode())
-        if text_bytes + size > TEXT_LIMIT:
+        merged = union_native_views(views + [item])
+        old_size = len(payload['evidence'][previous[0]]['text'].encode()) if previous else 0
+        delta = len(merged['text'].encode()) - old_size
+        if text_bytes + delta > TEXT_LIMIT:
             omitted += 1
             continue
-        payload['evidence'].append(item)
+        if previous:
+            old_item = payload['evidence'][previous[0]]
+            payload['evidence'][previous[0]] = merged
+        else:
+            payload['evidence'].append(merged)
         if len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT:
-            payload['evidence'].pop()
+            if previous:
+                payload['evidence'][previous[0]] = old_item
+            else:
+                payload['evidence'].pop()
             omitted += 1
         else:
-            text_bytes += size
+            admitted[identity] = (previous[0] if previous else len(payload['evidence']) - 1, views + [item])
+            text_bytes += delta
     payload['omissions']['presentation_contexts'] = omitted
     payload['omissions']['clipped_passages'] = sum(not i['passage']['complete'] for i in payload['evidence'])
-    original_status = payload['status']
     payload['status'] = 'evidence_found' if payload['evidence'] else original_status
-    while len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT and payload['evidence']:
-        payload['evidence'].pop()
-        payload['omissions']['presentation_contexts'] += 1
-    payload['omissions']['clipped_passages'] = sum(not i['passage']['complete'] for i in payload['evidence'])
-    if not payload['evidence']:
-        payload['status'] = original_status
     return payload
 
 
