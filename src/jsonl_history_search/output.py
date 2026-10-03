@@ -252,6 +252,8 @@ def _semantic_debug_safe_continuation_packet(packet: dict) -> dict:
 
 
 def render_text(payload: dict) -> str:
+    if 'evidence' in payload:
+        return render_history_evidence(payload)
     if "retained_source_read" in payload:
         return render_retained_source_read_text(payload)
     if "ask_answer" in payload:
@@ -445,6 +447,8 @@ def render_text(payload: dict) -> str:
 
 
 def render_markdown(payload: dict) -> str:
+    if 'evidence' in payload:
+        return render_history_evidence(payload)
     if "retained_source_read" in payload:
         return render_retained_source_read_markdown(payload)
     if "ask_answer" in payload:
@@ -575,6 +579,18 @@ def render(payload: dict, output_format: str) -> str:
     if output_format == "answer":
         return render_answer(payload)
     return render_text(payload)
+
+
+def render_history_evidence(payload: dict) -> str:
+    from .source_refs import ref_target
+    lines = [payload['query'], 'Status: ' + payload['status'],
+             'Scope complete: ' + str(payload['coverage']['complete'])]
+    for item in payload['evidence']:
+        lines.extend(['', '%s | %s | %s' % (ref_target(item['source_ref']), item['role'], item['timestamp']), item['text']])
+        if not item['passage']['complete']:
+            lines.append('[Bounded excerpt; original text bytes: %s]' % item['passage']['original_text_bytes'])
+    lines.extend(['', 'Omissions: ' + json.dumps(payload['omissions']), payload['claim_boundary']])
+    return '\n'.join(lines)
 
 
 def render_answer(payload: dict) -> str:

@@ -321,129 +321,10 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         required=True,
         metavar="COMMAND" if public_help else None,
     )
-    ask = subparsers.add_parser(
-        "ask",
-        description=(
-            "Natural-language first-command resolver for JSONL history/status/"
-            "action/currentness/wrap-up prompts. Add --answer for one direct, "
-            "source-backed invocation."
-        ),
-    )
-    ask.add_argument("query", help="Original user wording, or a summary paired with --original-query-file.")
+    ask = subparsers.add_parser("ask", description="Read bounded local history evidence directly; no packets or model access.")
+    ask.add_argument("query", help="Original question, including followups.")
     add_common_args(ask)
-    ask.add_argument(
-        "--evidence-source",
-        choices=("local", "conversation-history"),
-        default=None,
-        help=(
-            "Required for prompts naming tasks/...md: local selects bounded Git/task "
-            "evidence; conversation-history selects JSONL semantic debugging."
-        ),
-    )
-    ask.add_argument(
-        "--activation-mode",
-        choices=("implicit", "explicit-only"),
-        default=os.environ.get("JSONL_HISTORY_SEARCH_ACTIVATION_MODE", "implicit"),
-        help=(
-            "Latest-status trigger mode. implicit (default) routes natural prior-message wording; "
-            "explicit-only requires an explicit history-tool alias such as leading `convo` "
-            "or suffix `use the convo tool`. The environment variable "
-            "JSONL_HISTORY_SEARCH_ACTIVATION_MODE sets the default."
-        ),
-    )
-    ask.add_argument(
-        "--audit-depth",
-        choices=AUDIT_DEPTH_CHOICES,
-        default=None,
-        help=(
-            "Audit-depth contract for history routes. quick is the default; "
-            "in-depth and exhaustive are explicit deeper contracts for later "
-            "coverage workflows. Omit to infer only from strong audit wording."
-        ),
-    )
-    ask.add_argument(
-        "--execute",
-        action="store_true",
-        help=(
-            "Execute the selected route only when it is an allow-listed JSONL "
-            "semantic-debug or no-evidence route; unsupported routes return a fail-closed contract."
-        ),
-    )
-    ask.add_argument(
-        "--query-origin",
-        choices=("original", "summary"),
-        default=None,
-        help=(
-            "Declare whether the positional query is exact original wording or a retrieval summary. "
-            "summary requires --original-query-file or the free-running prompt-file environment contract."
-        ),
-    )
-    ask.add_argument(
-        "--original-query-file",
-        default=None,
-        help=(
-            "UTF-8 file containing the exact original prompt. Its canonical path, byte count, and "
-            "SHA-256 are recorded without copying its contents into the route report."
-        ),
-    )
-    ask.add_argument(
-        "--answer",
-        action="store_true",
-        help=(
-            "Execute the selected safe route, inspect bounded proof refs from the "
-            "answer contract, and return a concise source-backed answer when supported."
-        ),
-    )
-    ask.add_argument(
-        "--auto-execute-bounded-no-evidence",
-        action="store_true",
-        help=(
-            "After routing, execute only high-confidence bounded no-evidence prompts "
-            "through the safe no-evidence-report path. All other routes remain route-only."
-        ),
-    )
-    ask.add_argument(
-        "--decision-engine",
-        choices=("deterministic", "jev"),
-        default="deterministic",
-        help=(
-            "Optional low-confidence route helper. deterministic (default) performs no remote call; "
-            "jev requires explicit selection and falls back locally on any failure."
-        ),
-    )
-    ask.add_argument(
-        "--jev-model",
-        default=None,
-        help=(
-            "System One model name for --decision-engine jev. Falls back to "
-            "JSONL_HISTORY_SEARCH_JEV_MODEL; no model is selected implicitly."
-        ),
-    )
-    ask.add_argument(
-        "--decision-confidence",
-        type=_probability_argument,
-        default=0.75,
-        help="Minimum confidence before accepting a remote typed decision (default: 0.75).",
-    )
-    ask.add_argument(
-        "--report-output",
-        default=None,
-        help="Optional path where ask --execute writes the full selected-route JSON report.",
-    )
-    ask.add_argument("--task", default=None)
-    ask.add_argument("--path", default=None)
-    ask.add_argument("--commit", default=None)
-    ask.add_argument("--branch", default=None)
-    ask.add_argument("--around", default=None)
-    ask.add_argument("--watchlist", action="append", default=[])
-    ask.add_argument("--gold-manifest", default=str(DEFAULT_GOLD_MANIFEST))
-    ask.add_argument("--evaluate-sanitized-manifest-gate", action="store_true")
-    ask.add_argument("--include-manifest", action="store_true")
-    ask.add_argument("--compact-provenance-handoff", action="store_true")
-    ask.add_argument("--evidence-context-window", type=int, default=0)
-    ask.add_argument("--retrieval-mode", choices=RETRIEVAL_MODES, default=RETRIEVAL_MODE_PACKAGE)
-    ask.add_argument("--query-plan", choices=QUERY_PLAN_MODES, default=QUERY_PLAN_MODE_AUTO)
-    ask.add_argument("--continuation-ledger", action="store_true")
+    ask.set_defaults(max_files=20, max_matches=30, format="json")
     for name in ("plan", "search"):
         sub = subparsers.add_parser(name)
         sub.add_argument("query", nargs="?", default="")
@@ -20796,52 +20677,16 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(effective_argv)
     if args.command == "ask":
-        try:
-            args.original_prompt_identity = _resolve_ask_original_prompt_identity(args)
-        except (OSError, UnicodeError, ValueError) as exc:
-            print(f"ask original prompt identity error: {exc}", file=sys.stderr)
-            return 2
+        from .history_evidence import retrieve_history_evidence
+        from .operation_budget import OperationBudget
         if not args.query.strip():
-            print(
-                "ask requires the original user wording; retry: "
-                'jsonl-history-search ask --execute "<original-user-wording>" '
-                '--cwd "$PWD" --format text',
-                file=sys.stderr,
-            )
+            print("ask requires the original question", file=sys.stderr)
             return 2
-        cwd = str(Path(args.cwd).expanduser().resolve())
-        decision_engine = _ask_decision_engine_from_args(args)
-        if args.answer:
-            route, route_query, decision_support = select_ask_route(
-                args.query, evidence_source=args.evidence_source,
-                activation_mode=args.activation_mode, decision_engine=decision_engine)
-            if route.route_family in DIRECT_HISTORY_ROUTE_FAMILIES or (
-                route.route_family == "latest_status" and is_direct_latest_message_history_query(str(args.query or ""))
-            ):
-                payload = {"ask_router": {
-                    "route_family": route.route_family, "chosen_route": route.chosen_route,
-                    "why_it_applies": route.why_it_applies,
-                    "structured_execution_query": route.command_query(route_query),
-                    "decision_support": decision_support}}
-            else:
-                payload = build_ask_router_payload(args.query, cwd=cwd,
-                    evidence_source=args.evidence_source, activation_mode=args.activation_mode,
-                    audit_depth=args.audit_depth)
-        else:
-            payload = build_ask_router_payload(args.query, cwd=cwd,
-                evidence_source=args.evidence_source, activation_mode=args.activation_mode,
-                audit_depth=args.audit_depth, decision_engine=decision_engine)
-        payload["ask_router"]["original_prompt_identity"] = args.original_prompt_identity
-        auto_execute_bounded = (
-            args.auto_execute_bounded_no_evidence
-            and payload["ask_router"].get("route_family") == "bounded_no_evidence"
-        )
-        if args.answer:
-            payload = _run_ask_answer(args, cwd=cwd, route_payload=payload)
-        elif args.execute or auto_execute_bounded:
-            if auto_execute_bounded and not args.execute:
-                args = _args_with_bounded_auto_execute_prompt_scope(args)
-            payload = _run_ask_execute(args, cwd=cwd, route_payload=payload)
+        budget = OperationBudget(limit_bytes=min(args.max_bytes, args.hard_cap_bytes) if args.hard_cap_bytes else args.max_bytes, max_elapsed=args.max_elapsed)
+        _source_plan, intent, plan = payload_from_args(args)
+        payload = retrieve_history_evidence(query=args.query, intent=intent, plan=plan,
+            default_tz=timezone_from_args(args.timezone, args.timezone_offset), budget=budget,
+            mask_context=_mask_context_from_args(args), output_format=args.format)
         print(render(payload, args.format))
         return 0
     if args.command == "retained-source-read":
