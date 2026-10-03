@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .adapters import AdapterReadError, iter_records_for_file
+from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
 from .operation_budget import BudgetExceeded, open_source_text, iter_source_bytes
 from .clustering import facets_for_record
 from .profiling import finish_phase_profile, start_phase_profile
@@ -792,6 +792,7 @@ def build_fielded_bm25_index(
         segment_start_rowid = rowid
         content_hasher = hashlib.sha256()
         content_fingerprint = ""
+        source_stats = RawLineScanStats() if budget is not None else None
         if persistent_cache is not None:
             try:
                 content_fingerprint, fingerprint_bytes = _source_content_fingerprint(path, budget=budget)
@@ -812,6 +813,10 @@ def build_fielded_bm25_index(
                 source_kind=source_kind,
                 content_fingerprint=content_fingerprint,
             )
+            if budget is not None:
+                # Old caches were indexed without complete-source diagnostics.
+                # Partial rows remain usable now but never match fresh metadata.
+                metadata.update(coverage_validation="ordinary-source-diagnostics-v1", coverage_complete=True)
             durable_metadata = persistent_cache.durable_source_metadata(connection, source_key)
             if durable_metadata == metadata:
                 loaded_rows = _load_durable_source_rows(
@@ -857,6 +862,14 @@ def build_fielded_bm25_index(
                     chunk_lines: list[tuple[int, str]] = []
                     for line_number, raw_line in enumerate(handle, 1):
                         content_hasher.update(raw_line.encode("utf-8", errors="replace"))
+                        if source_stats is not None and raw_line.strip():
+                            try:
+                                raw_value = json.loads(raw_line)
+                                failure = "non-object JSONL row" if not isinstance(raw_value, dict) else None
+                            except json.JSONDecodeError:
+                                failure = "malformed JSONL row"
+                            if failure:
+                                source_stats.note_partial(provider="jsonl", path=path, line=line_number, reason=failure)
                         file_records += 1
                         chunk_lines.append((line_number, raw_line.rstrip("\n")))
                         if len(chunk_lines) >= CHUNK_RECORD_LIMIT:
@@ -882,7 +895,8 @@ def build_fielded_bm25_index(
                         )
                 _flush_insert_buffer(connection, insert_buffer)
             else:
-                for record in iter_records_for_file(path, source_kind, default_tz, budget=budget, budget_phase="index_build"):
+                for record in iter_records_for_file(path, source_kind, default_tz, raw_line_stats=source_stats,
+                                                    budget=budget, budget_phase="index_build"):
                     content_hasher.update(record.text.encode("utf-8", errors="replace"))
                     rowid += 1
                     file_records += 1
@@ -925,6 +939,10 @@ def build_fielded_bm25_index(
             index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
             index.warnings.append(f"Could not open {path}: {exc}")
             continue
+        finally:
+            if source_stats is not None:
+                index.metrics["operation_source_errors"].extend(source_stats.partial_failures or [])
+        source_failures = list(source_stats.partial_failures or []) if source_stats is not None else []
         index.files[str(path)] = {
             "source_kind": source_kind,
             "record_count": file_records,
@@ -945,21 +963,28 @@ def build_fielded_bm25_index(
                 source_kind=source_kind,
                 content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
             )
+            if budget is not None:
+                metadata.update(coverage_validation="ordinary-source-diagnostics-v1",
+                                coverage_complete=not source_failures)
             segment_rows = [
                 _persistent_row_from_ref(connection, index.records[candidate_rowid])
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
                 if candidate_rowid in index.records
             ]
-            persistent_cache.write_segment(
-                path,
-                size=file_bytes,
-                source_kind=source_kind,
-                record_count=file_records,
-                byte_count=file_bytes,
-                rows=segment_rows,
-                content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
-            )
-            index.metrics["segments_written"] += len(segment_rows)
+            if source_failures:
+                # Do not publish a compatibility segment without coverage facts.
+                persistent_cache._drop_source(source_key)
+            else:
+                persistent_cache.write_segment(
+                    path,
+                    size=file_bytes,
+                    source_kind=source_kind,
+                    record_count=file_records,
+                    byte_count=file_bytes,
+                    rows=segment_rows,
+                    content_fingerprint=content_fingerprint or content_hasher.hexdigest(),
+                )
+                index.metrics["segments_written"] += len(segment_rows)
             durable_refs = [
                 index.records[candidate_rowid]
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)

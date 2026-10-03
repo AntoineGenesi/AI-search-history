@@ -143,6 +143,7 @@ def run_fielded_bm25_retrieval(
     )
     if budget is not None:
         fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
         fielded_started,
@@ -253,6 +254,7 @@ def run_rrf_fusion_retrieval(
     )
     if budget is not None:
         fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
         fielded_started,
@@ -337,6 +339,8 @@ def run_rrf_fusion_retrieval(
         {
             "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
             "operation_source_errors": fielded_result.get("operation_source_errors", []),
+            "source_diagnostics": package_result.get("source_diagnostics", {}),
+            "admitted_source_files": planned_jsonl_files.file_count,
             "preserve_match_order": True,
             "rrf_storage": rrf_materialization,
             "rrf_materialization": rrf_materialization,

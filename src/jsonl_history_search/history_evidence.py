@@ -58,6 +58,10 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
                                 budget=budget, **retrieval_options) if budget.available("retrieval") else {
                                     "groups": [], "warnings": ["Stopped retrieval at operation max elapsed cap."]}
     candidates = build_candidate_rows(result)
+    admitted_source_files = result.get("admitted_source_files", result.get("planned_files_count", 0))
+    # Capture retrieval reads before candidate-dependent readback. Repeated lanes
+    # and fingerprint passes count once here, unlike logical extent metrics.
+    source_read_attempts = len(budget.opened_sources)
     by_source = OrderedDict()
     for candidate in candidates:
         by_source.setdefault(candidate.path, []).append(candidate)
@@ -141,13 +145,15 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
                   if item.get("path") and _in_scope(item["path"], plan))
     errors.extend(item for item in result.get("operation_source_errors", [])
                   if item.get("path") and _in_scope(item["path"], plan))
+    errors = list({(item.get("path"), item.get("line"), item.get("provider"), item.get("reason")): item
+                   for item in errors}.values())
     # A native/file reader's missing or malformed records cannot become absence.
     complete = not (cap_reasons or errors or gaps)
     inventory = [{**root.to_dict(), "selected_for_direct_answer": True,
                   "status": "selected"} for root in plan.roots]
     if windows:
         status = "evidence_found"
-    elif not result.get("searched_files", 0) and not candidates and not cap_reasons and not errors:
+    elif not admitted_source_files and not candidates and not cap_reasons and not errors:
         status = "empty_scope"
         complete = False
     elif not complete:
@@ -170,7 +176,11 @@ def retrieve_history_evidence(*, request, source_plan, intent, plan, default_tz,
         "source_contract": {"built_from": "direct_history_evidence",
             "legacy_packet_or_execute_continuation_used": False,
             "coverage": {"complete": complete, "status": "complete_within_selected_scope" if complete else "partial",
-                         "searched_files": result.get("searched_files", 0),
+                         "searched_files": source_read_attempts,
+                         "admitted_source_files": admitted_source_files,
+                         "source_read_attempts": source_read_attempts,
+                         "candidate_source_files": len(by_source),
+                         "source_count_basis": "admitted files, distinct retrieval source-read attempts, and candidate files are separate; read attempts are not successful validation",
                          "records_considered": result.get("records_considered", result.get("records_read", 0)),
                          "cap_reasons": sorted(set(cap_reasons))},
             "source_inventory": inventory, "source_errors": errors,

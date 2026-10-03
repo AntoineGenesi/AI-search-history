@@ -101,7 +101,9 @@ def search(
     planned_files = []
     expected_diag = _init_expected_ref_diagnostics(expected_ref_diagnostics)
     match_profile = build_match_profile(intent)
-    pre_parse_filter = _build_pre_parse_filter(match_profile)
+    # Ordinary absence claims require validating even nonmatching source rows.
+    # Retain the legacy optimization only outside the budgeted direct operation.
+    pre_parse_filter = _build_pre_parse_filter(match_profile) if budget is None else None
     raw_line_stats = RawLineScanStats()
 
     if planned_jsonl_files is not None:
