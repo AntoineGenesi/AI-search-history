@@ -10,8 +10,9 @@ import math
 import re
 
 from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
-from .conversation_records import (COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
-    TURN_CONTROL_OR_STATUS, UNKNOWN, classify_conversation_record)
+from .conversation_records import (ASSISTANT_OR_AGENT_MESSAGE, COMPACTED_HISTORY_SUMMARY,
+    INJECTED_ENVIRONMENT_CONTEXT, TOOL_ACTION_OUTPUT, TURN_CONTROL_OR_STATUS, UNKNOWN,
+    classify_conversation_record)
 from .operation_budget import BudgetExceeded
 from .query import DATE_TOKEN_RE
 from .source_refs import evidence_identity, evidence_ref
@@ -37,15 +38,21 @@ def lexical_score(words, profile):
             if norm and query_norm else 0)
 
 
-def visible(record, intent):
-    if intent.role_filter_explicit and record.role != intent.role:
+def logical_speaker(record, classification):
+    if classification.is_human_authored:
+        return 'user'
+    return {ASSISTANT_OR_AGENT_MESSAGE: 'assistant', TOOL_ACTION_OUTPUT: 'tool'}.get(classification.label, record.role)
+
+
+def visible(record, intent, speaker):
+    if intent.role_filter_explicit and speaker != intent.role:
         return False
     return not intent.date_window_filter or (record.timestamp is not None
         and (not intent.date_window_start or record.timestamp >= intent.date_window_start)
         and (not intent.date_window_end or record.timestamp < intent.date_window_end))
 
 
-def native_passage(record, mask_context, *, kind='passage', role=None, profile=None, budget=None):
+def native_passage(record, mask_context, *, kind='passage', speaker=None, profile=None, budget=None):
     original = record.text.encode('utf-8')
     start, text, best = 0, '', -1
     for offset in range(0, len(original), PASSAGE_LIMIT):
@@ -57,14 +64,14 @@ def native_passage(record, mask_context, *, kind='passage', role=None, profile=N
         value = lexical_score(Counter(WORD.findall(excerpt.lower())), profile) if profile else 0
         if value > best:
             start, text, best = offset, excerpt, value
-    item = {'source_ref': evidence_ref(record), 'role': role or record.role,
+    item = {'source_ref': evidence_ref(record), 'role': record.role, 'speaker': speaker or record.role,
             'timestamp': record.timestamp.isoformat() if record.timestamp else None,
             'timestamp_quality': record.timestamp_quality, 'kind': kind, 'text': text,
             'passage': {'text_byte_start': start, 'original_text_bytes': len(original),
                         'complete': start == 0 and len(original) <= PASSAGE_LIMIT}}
     if record.source_refs:
         item['source_refs'] = list(record.source_refs)
-    return item
+    return item, best
 
 
 def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=None):
@@ -74,7 +81,8 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
     files = list(enumerate_jsonl_files(plan, preferred_terms=list(terms), budget=budget,
                                       measured_byte_admission=True))
     states = [{'path': p, 'kind': source_kind_for_path(p, plan), 'reader': None,
-               'opening': None, 'opening_cost': 0, 'mirrors': {},
+               'opening': None, 'opening_cost': 0, 'opening_score': 0, 'mirrors': {},
+               'turn': None, 'last_native': None,
                'session': None, 'worker': False, 'complete': False, 'records': 0} for p, _, _ in files]
     contexts, errors, heap = {}, [], []
     cost = opening_cost = matched = controls = mirrors = 0
@@ -101,9 +109,18 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         state['worker'] = payload.get('thread_source') == 'subagent' or (
                             isinstance(payload.get('source'), dict) and 'subagent' in payload['source'])
                         continue
-                    if not visible(record, intent) or not record.text.strip():
+                    if raw.get('type') == 'turn_context' and isinstance(payload, dict):
+                        turn = payload.get('turn_id')
+                        state['turn'] = hashlib.sha256(str(turn).encode()).hexdigest() if turn else None
+                        state['last_native'] = None
+                        controls += 1
+                        continue
+                    if not record.text.strip():
                         continue
                     classification = classify_conversation_record(record)
+                    speaker = logical_speaker(record, classification)
+                    if not visible(record, intent, speaker):
+                        continue
                     if classification.label in {COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
                                                 TURN_CONTROL_OR_STATUS}:
                         controls += 1
@@ -112,9 +129,14 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     if state['session'] and record.timestamp and kind in {'response_item', 'event_msg'}:
                         signature = (classification.label, record.timestamp.isoformat(), hashlib.sha256(record.text.encode()).hexdigest())
                         previous = state['mirrors'].get(signature)
-                        if previous and {previous, kind} == {'response_item', 'event_msg'}:
+                        last = state['last_native']
+                        adjacent_turn_mirror = (state['turn'] and last and last[0] == state['turn']
+                            and last[1] + 1 == record.line and last[2] == signature[0] and last[3] == signature[2]
+                            and {last[4], kind} == {'response_item', 'event_msg'})
+                        if adjacent_turn_mirror or (previous and {previous, kind} == {'response_item', 'event_msg'}):
                             mirrors += 1
                             continue
+                        state['last_native'] = (state['turn'], record.line, signature[0], signature[2], kind)
                         state['mirrors'][signature] = kind
                         if len(state['mirrors']) > 64:
                             del state['mirrors'][next(iter(state['mirrors']))]
@@ -122,27 +144,29 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         and raw.get('role') == 'user' and not raw.get('type') and isinstance(raw.get('text'), str))
                     opening = classification.is_human_authored or plain_user
                     if opening:
-                        observed = native_passage(record, mask_context,
-                            kind='worker_assignment' if state['worker'] else 'request', role='user',
+                        observed, value = native_passage(record, mask_context,
+                            kind='worker_assignment' if state['worker'] else 'request', speaker=speaker,
                             profile=profile, budget=budget)
                         observed_cost = len(json.dumps(observed, ensure_ascii=False).encode())
                         opening_cost -= state['opening_cost']
                         state['opening'] = observed if cost + opening_cost + observed_cost <= RETAIN_LIMIT else None
                         state['opening_cost'] = observed_cost if state['opening'] else 0
+                        state['opening_score'] = value
                         opening_cost += state['opening_cost']
                     lower = record.text.lower()
                     if not any(t in lower for t in terms):
                         continue
-                    passage = state['opening'] if opening else native_passage(record, mask_context,
-                                                                            profile=profile, budget=budget)
+                    if opening:
+                        passage, value = state['opening'], state['opening_score']
+                    else:
+                        passage, value = native_passage(record, mask_context,
+                            speaker=speaker, profile=profile, budget=budget)
                     if passage is None:
                         continue
-                    words = Counter(WORD.findall(passage['text'].lower()))
-                    if not terms.intersection(words) or not limit:
+                    if value <= 0 or not limit:
                         continue
                     matched += 1
                     identity = evidence_identity(record)
-                    value = lexical_score(words, profile)
                     if len(heap) >= limit and (value, identity) <= heap[0]:
                         continue
                     observed = state['opening'] if not opening else None
@@ -205,7 +229,7 @@ def pack_evidence(payload, contexts, output_format):
             payload['query'] = payload['query'][:len(payload['query']) // 2]
             payload['query_display']['complete'] = False
     seen, text_bytes, omitted = set(), 0, 0
-    items = [item for context in contexts for item in (context.passage, context.opening) if item]
+    items = [item for context in contexts for item in (context.opening, context.passage) if item]
     for item in items:
         identity = evidence_identity(item['source_ref'])
         if identity in seen:
