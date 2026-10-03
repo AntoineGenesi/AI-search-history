@@ -1,3 +1,8 @@
+"""Human-origin and parent-thread lineage checks for status boundaries.
+
+Injected/worker user-shaped rows cannot become a chronological human anchor.
+Rationale: docs/package-map.md#chronological-intervals.
+"""
 from __future__ import annotations
 
 import hashlib
