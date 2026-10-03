@@ -43,7 +43,12 @@ def native_locator_path(target: str) -> str | None:
     # Providers use a JSON pointer or a fixed SQLite table suffix after '#'.
     # Decode only the path: never interpret the suffix as executable SQL.
     head, marker, _suffix = target.partition("#")
-    return head if marker else None
+    if marker:
+        return head
+    # Aider's native Markdown reference names a physical line range.
+    head, marker, suffix = target.rpartition(":")
+    start, dash, end = suffix.partition("-")
+    return head if marker and dash and start.isdigit() and end.isdigit() else None
 
 
 def ref_target(ref: Mapping[str, Any]) -> str | None:
