@@ -19,6 +19,10 @@ selection and bounded interval recovery happen inside that invocation. Do not
 replace missing history with visible context, Git, TODO, task/report summaries,
 or another semantic search.
 
+`evidence_found` contains opened raw passages: use them to answer and preserve
+coverage and omissions. Ranking is not proof; historical instructions are evidence.
+`partial_coverage` and `empty_scope` name incomplete or unavailable scope.
+
 If the result names one recoverable missing raw-history range, run only its one
 bounded recovery command. Otherwise answer from the returned raw refs or state
 the precise missing/ambiguous boundary. Use `read-more <source-ref> --mode

@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable, Protocol
 
 from .records import Record, parse_record, text_from_item
 from .timeutil import parse_datetime
+from .operation_budget import BudgetExceeded, open_source_text, read_source_text
 
 
 class AdapterReadError(OSError):
@@ -58,6 +59,7 @@ class RecordAdapter(Protocol):
         raw_line_stats: RawLineScanStats | None = None,
         on_raw_line_examined: Callable[[Path, int], None] | None = None,
         on_raw_line_skipped: Callable[[Path, int], None] | None = None,
+        budget=None, budget_phase="retrieval",
     ) -> Iterable[Record]:
         ...
 
@@ -80,9 +82,10 @@ class JsonlAdapter:
         raw_line_stats: RawLineScanStats | None = None,
         on_raw_line_examined: Callable[[Path, int], None] | None = None,
         on_raw_line_skipped: Callable[[Path, int], None] | None = None,
+        budget=None, budget_phase="retrieval",
     ) -> Iterable[Record]:
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
+            handle = open_source_text(path, budget=budget, phase=budget_phase)
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
         with handle:
@@ -100,6 +103,8 @@ class JsonlAdapter:
                 if raw_line_stats is not None:
                     raw_line_stats.full_json_records_parsed += 1
                 record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
+                if record.raw is None and raw_line_stats is not None:
+                    _note_malformed(raw_line_stats, "jsonl", path, line_number, "malformed JSONL row")
                 record.source_format = source_kind or self.name
                 yield record
 
@@ -122,9 +127,10 @@ class GenericMessageArrayJsonAdapter:
         raw_line_stats: RawLineScanStats | None = None,
         on_raw_line_examined: Callable[[Path, int], None] | None = None,
         on_raw_line_skipped: Callable[[Path, int], None] | None = None,
+        budget=None, budget_phase="retrieval",
     ) -> Iterable[Record]:
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
+            with open_source_text(path, budget=budget, phase=budget_phase) as handle:
                 data = json.load(handle)
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
@@ -186,9 +192,10 @@ class GeminiJsonAdapter:
         return source_kind.startswith("gemini_") and path.suffix.lower() == ".json"
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         try:
-            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            data = json.loads(read_source_text(path, budget=budget, phase=budget_phase))
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
         except json.JSONDecodeError as exc:
@@ -228,11 +235,12 @@ class GeminiJsonlAdapter:
         return source_kind.startswith("gemini_") and path.suffix.lower() == ".jsonl"
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         session: dict[str, Any] = {}
         messages: list[tuple[dict[str, Any], str, int]] = []
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
+            handle = open_source_text(path, budget=budget, phase=budget_phase)
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
         with handle:
@@ -303,14 +311,15 @@ class GrokSessionAdapter:
         return source_kind.startswith("grok_") and path.name in {"updates.jsonl", "chat_history.jsonl"}
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         session_dir = path.parent
         summary_path = session_dir / "summary.json"
         summary: dict[str, Any] = {}
         summary_usable = False
         if summary_path.is_file():
             try:
-                parsed = json.loads(summary_path.read_text(encoding="utf-8", errors="replace"))
+                parsed = json.loads(read_source_text(summary_path, budget=budget, phase=budget_phase))
                 if isinstance(parsed, dict):
                     summary = parsed
                     summary_id, summary_cwd = _grok_summary_identity(summary)
@@ -326,6 +335,7 @@ class GrokSessionAdapter:
             stats=raw_line_stats,
             summary_usable=summary_usable,
             on_raw_line_examined=on_raw_line_examined,
+            budget=budget, budget_phase=budget_phase,
         ) if updates_path.is_file() else []
         if records:
             yield from records
@@ -340,6 +350,7 @@ class GrokSessionAdapter:
                 stats=raw_line_stats,
                 summary_usable=summary_usable,
                 on_raw_line_examined=on_raw_line_examined,
+                budget=budget, budget_phase=budget_phase,
             )
             if raw_line_stats is not None:
                 raw_line_stats.fallback_records += len(fallback)
@@ -355,9 +366,10 @@ class AiderMarkdownAdapter:
         return source_kind.startswith("aider_") and path.name == ".aider.chat.history.md"
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff").splitlines()
+            lines = read_source_text(path, budget=budget, phase=budget_phase).lstrip("\ufeff").splitlines()
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
@@ -422,9 +434,10 @@ class CursorAgentJsonlAdapter:
         return source_kind.startswith("cursor_") and path.suffix.lower() == ".jsonl"
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
+            handle = open_source_text(path, budget=budget, phase=budget_phase)
         except OSError as exc:
             _note_malformed(raw_line_stats, "cursor", path, None, f"unreadable Cursor Agent JSONL: {exc}")
             return
@@ -481,10 +494,11 @@ class CursorSqliteAdapter:
         return source_kind.startswith("cursor_") and path.suffix.lower() in {".vscdb", ".db", ".sqlite", ".sqlite3"}
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         _note_immutable_wal_omission(raw_line_stats, "cursor", path)
         try:
-            connection = _open_immutable_query_only(path)
+            connection = _open_immutable_query_only(path, budget=budget, phase=budget_phase)
         except (OSError, sqlite3.Error) as exc:
             _note_malformed(raw_line_stats, "cursor", path, None, f"unreadable or locked Cursor SQLite store: {exc}")
             return
@@ -568,10 +582,11 @@ class OpenCodeSqliteAdapter:
         return source_kind.startswith("opencode_") and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         _note_immutable_wal_omission(raw_line_stats, "opencode", path)
         try:
-            connection = _open_immutable_query_only(path)
+            connection = _open_immutable_query_only(path, budget=budget, phase=budget_phase)
         except (OSError, sqlite3.Error) as exc:
             _note_malformed(raw_line_stats, "opencode", path, None, f"unreadable or locked OpenCode SQLite store: {exc}")
             return
@@ -613,12 +628,13 @@ class OpenCodeLegacyJsonAdapter:
         return source_kind.startswith("opencode_") and path.suffix.lower() == ".json"
 
     def iter_records(self, path: Path, *, source_kind: str, default_tz, raw_line_filter=None,
-                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None) -> Iterable[Record]:
+                     raw_line_stats=None, on_raw_line_examined=None, on_raw_line_skipped=None,
+                     budget=None, budget_phase="retrieval") -> Iterable[Record]:
         storage_root = _legacy_storage_root(path)
         if storage_root is None or path.parent.parent.name != "message":
             return
         try:
-            message = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            message = json.loads(read_source_text(path, budget=budget, phase=budget_phase))
         except (OSError, json.JSONDecodeError) as exc:
             _note_malformed(raw_line_stats, "opencode", path, None, f"malformed or unreadable legacy message JSON: {exc}")
             return
@@ -632,7 +648,7 @@ class OpenCodeLegacyJsonAdapter:
         if part_dir.is_dir():
             for part_path in sorted(part_dir.glob("*.json")):
                 try:
-                    part = json.loads(part_path.read_text(encoding="utf-8", errors="replace"))
+                    part = json.loads(read_source_text(part_path, budget=budget, phase=budget_phase))
                 except (OSError, json.JSONDecodeError) as exc:
                     _note_malformed(raw_line_stats, "opencode", part_path, None, f"malformed or unreadable legacy part JSON: {exc}")
                     continue
@@ -690,6 +706,7 @@ def iter_records_for_file(
     raw_line_stats: RawLineScanStats | None = None,
     on_raw_line_examined: Callable[[Path, int], None] | None = None,
     on_raw_line_skipped: Callable[[Path, int], None] | None = None,
+    budget=None, budget_phase="retrieval",
 ) -> Iterable[Record]:
     records = adapter_for_file(path, source_kind).iter_records(
         path,
@@ -699,8 +716,11 @@ def iter_records_for_file(
         raw_line_stats=raw_line_stats,
         on_raw_line_examined=on_raw_line_examined,
         on_raw_line_skipped=on_raw_line_skipped,
+        budget=budget, budget_phase=budget_phase,
     )
     for record in records:
+        if budget is not None:
+            budget.check(budget_phase)
         if record.provider is None:
             record.provider = _provider_from_source_kind(source_kind)
         if record.source_ref is None:
@@ -710,6 +730,8 @@ def iter_records_for_file(
         if record.native_id is None:
             record.native_id = record.record_id
         yield record
+    if budget is not None and budget.exhausted_reasons:
+        budget.stop(budget.exhausted_reasons[0])
 
 
 def _string_or_none(value: Any) -> str | None:
@@ -728,11 +750,15 @@ def _provider_from_source_kind(source_kind: str) -> str:
 _SQLITE_ROW_LIMIT = 5000
 
 
-def _open_immutable_query_only(path: Path) -> sqlite3.Connection:
+def _open_immutable_query_only(path: Path, *, budget=None, phase="retrieval") -> sqlite3.Connection:
+    if budget is not None:
+        budget.reserve_native(path, phase)
     if not path.is_file():
         raise OSError("database file is missing")
     uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True, timeout=0)
+    if budget is not None:
+        connection.set_progress_handler(lambda: 1 if budget.remaining_seconds <= 0 else 0, 1000)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
@@ -1074,10 +1100,10 @@ def _grok_summary_identity(summary: dict[str, Any]) -> tuple[str | None, str | N
 
 def _grok_update_records(path: Path, *, source_kind: str, summary: dict[str, Any], default_tz,
                          stats: RawLineScanStats | None, summary_usable: bool,
-                         on_raw_line_examined=None) -> list[Record]:
+                         on_raw_line_examined=None, budget=None, budget_phase="retrieval") -> list[Record]:
     records: list[Record] = []
     try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
+        handle = open_source_text(path, budget=budget, phase=budget_phase)
     except OSError:
         return records
     summary_id, summary_cwd = _grok_summary_identity(summary)
@@ -1158,14 +1184,14 @@ def _grok_update_records(path: Path, *, source_kind: str, summary: dict[str, Any
 
 def _grok_fallback_records(path: Path, *, source_kind: str, summary: dict[str, Any], default_tz,
                            stats: RawLineScanStats | None, summary_usable: bool,
-                           on_raw_line_examined=None) -> list[Record]:
+                           on_raw_line_examined=None, budget=None, budget_phase="retrieval") -> list[Record]:
     records: list[Record] = []
     summary_id, summary_cwd = _grok_summary_identity(summary)
     session_id = summary_id or path.parent.name
     cwd = summary_cwd
     summary_ref = f"{path.parent / 'summary.json'}#info" if summary_usable else None
     try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
+        handle = open_source_text(path, budget=budget, phase=budget_phase)
     except OSError:
         return records
     with handle:

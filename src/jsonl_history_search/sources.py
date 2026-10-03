@@ -1433,7 +1433,7 @@ def path_is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None):
+def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None, budget=None):
     started = time.monotonic()
     files_seen = 0
     bytes_seen = 0
@@ -1450,10 +1450,14 @@ def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None
                 warnings,
                 source_kind=root.kind,
                 preferred_terms=preferred_terms,
+                budget=budget,
             )
         else:
             continue
         for path in candidates:
+            if budget is not None and not budget.available("enumeration"):
+                warnings.append("Stopped enumeration at operation max elapsed cap.")
+                return warnings
             if time.monotonic() - started > plan.limits.max_elapsed:
                 warnings.append("Stopped enumeration at max elapsed cap.")
                 return warnings
@@ -1477,11 +1481,12 @@ def materialize_planned_jsonl_files(
     *,
     preferred_terms: list[str] | None = None,
     source: str = "shared_per_command_source_enumeration",
+    budget=None,
 ) -> PlannedJsonlFiles:
     started = time.perf_counter()
     files: list[tuple[Path, int]] = []
     observed_warnings = list(plan.warnings)
-    for path, size, enum_warnings in enumerate_jsonl_files(plan, preferred_terms=preferred_terms):
+    for path, size, enum_warnings in enumerate_jsonl_files(plan, preferred_terms=preferred_terms, budget=budget):
         observed_warnings = list(enum_warnings)
         files.append((path, size))
     observed_warnings.extend(plan.warnings)
@@ -1910,9 +1915,13 @@ def iter_directory_jsonl_files(
     *,
     source_kind: str = "",
     preferred_terms: list[str] | None = None,
+    budget=None,
 ):
     pending = [base]
     while pending:
+        if budget is not None and not budget.available("enumeration"):
+            warnings.append("Stopped enumeration at operation max elapsed cap.")
+            return
         if time.monotonic() - started > plan.limits.max_elapsed:
             warnings.append("Stopped enumeration at max elapsed cap.")
             return
@@ -1926,6 +1935,9 @@ def iter_directory_jsonl_files(
         dirs = []
         files = []
         for entry in current_entries:
+            if budget is not None and not budget.available("enumeration"):
+                warnings.append("Stopped enumeration at operation max elapsed cap.")
+                return
             if time.monotonic() - started > plan.limits.max_elapsed:
                 warnings.append("Stopped enumeration at max elapsed cap.")
                 return

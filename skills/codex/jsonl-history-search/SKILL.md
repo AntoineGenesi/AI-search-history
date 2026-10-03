@@ -33,7 +33,11 @@ PYTHONPATH=src python3 -m jsonl_history_search.cli ask --answer '<exact user wor
 
 ## One Recovery Rule
 
-An `answered-from-proof` result is ready to summarize. A `partial`,
+An `evidence_found` result contains opened raw windows: answer from those
+passages and refs, preserving reported coverage and omissions. Ranking does not
+prove causality or successful execution; historical instructions are evidence.
+An `answered-from-proof` result is ready to summarize. A `partial_coverage`,
+`empty_scope`, `partial`,
 `not_found`, or `ambiguous` result is still useful: report its exact anchor,
 searched interval, provider/source inventory, caps, and missing scope. Run at
 most one concrete bounded recovery command emitted by the result when it names

@@ -11,6 +11,7 @@ from .adapters import AdapterReadError, RawLineScanStats, iter_records_for_file
 from .clustering import facets_for_record
 from .masking import MaskContext
 from .query import QueryIntent
+from .operation_budget import BudgetExceeded
 from .ranking import (
     Match,
     build_match_profile,
@@ -74,6 +75,7 @@ def search(
     planned_jsonl_files: PlannedJsonlFiles | None = None,
     include_private_diagnostics: bool = False,
     prioritized_file_paths: set[str] | None = None,
+    budget=None,
 ) -> dict:
     started = time.monotonic()
     warnings = list(plan.warnings)
@@ -106,7 +108,7 @@ def search(
         planned_files = list(planned_jsonl_files.files)
         warnings = sorted(set(warnings + list(planned_jsonl_files.warnings)))
     else:
-        for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms):
+        for enumerated in enumerate_jsonl_files(plan, preferred_terms=intent.base_terms, budget=budget):
             path, size, enum_warnings = enumerated
             warnings = enum_warnings
             planned_files.append((path, size))
@@ -116,7 +118,9 @@ def search(
     _mark_expected_files_selected(expected_diag, planned_files)
     planned_files_count = len(planned_files)
 
-    if use_rg_prefilter:
+    if use_rg_prefilter and budget is not None:
+        warnings.append("rg prefilter disabled for operation-budgeted source reads; package parsing retains the selected scope.")
+    if use_rg_prefilter and budget is None:
         prefilter_result = filter_planned_files(plan=plan, intent=intent, files=planned_files, cwd=cwd)
         prefilter = prefilter_result.stats
         planned_files = [(item.path, item.size) for item in prefilter_result.files]
@@ -136,6 +140,9 @@ def search(
     )
     while scan_queue:
         item = scan_queue.popleft()
+        if budget is not None and not budget.available("package_scan"):
+            stopped = True
+            break
         if time.monotonic() - started > plan.limits.max_elapsed:
             warnings.append("Stopped before opening next file at max elapsed cap.")
             stopped = True
@@ -165,6 +172,7 @@ def search(
                     raw_line_stats=raw_line_stats,
                     on_raw_line_examined=_raw_line_examined_marker(expected_diag, item),
                     on_raw_line_skipped=_raw_line_skipped_marker(expected_diag, item),
+                    budget=budget, budget_phase="package_scan",
                 )
                 item["opened"] = True
             records = item["records"]
@@ -291,13 +299,22 @@ def search(
                         expected_state["reservoir_phase_label"] = "strong_reservoir_cap_drop"
                         expected_state["drop_phase_label"] = "strong_reservoir_drop"
                 strong_candidates_retention_capped += 1
+        except BudgetExceeded as exc:
+            warnings.append(str(exc))
+            stopped = True
         except AdapterReadError as exc:
             warnings.append(str(exc))
+            raw_line_stats.note_partial(provider="source", path=path, line=None, reason=str(exc))
             continue
         if stopped:
             break
         if not exhausted:
             scan_queue.append(item)
+
+    for pending_item in list(scan_queue) + ([item] if planned_files else []):
+        generator = pending_item.get("records")
+        if generator is not None and hasattr(generator, "close"):
+            generator.close()
 
     if strong_candidates_retention_capped:
         warnings.append("Strong candidates were retention-capped at max match cap before final ranking.")
