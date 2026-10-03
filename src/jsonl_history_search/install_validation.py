@@ -1122,6 +1122,7 @@ def _check_global_codex_install(
     compare_packaged = assets is not None or source_checkout
     checks: list[ValidationCheck] = []
     checks.append(_check_global_backup_skill_dirs(codex_home))
+    checks.append(_check_retired_search_helper(skill_root, 'global_', 'Codex'))
     if skill.is_file():
         checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, compare_packaged=compare_packaged))
     else:
@@ -1359,6 +1360,7 @@ def _check_global_agent_install(
             install_command=install_command,
         )
     ]
+    checks.append(_check_retired_search_helper(skill_root, id_prefix, label))
     installed, packaged = targets["skill"]
     if installed.is_file():
         checks.append(
@@ -1452,7 +1454,6 @@ def _check_global_agent_install(
             )
         )
     for key, title in (
-        ("helper", "helper script"),
         ("ask_first_launcher", "ask-first launcher"),
     ):
         installed, packaged = targets[key]
@@ -1481,6 +1482,15 @@ def _check_global_agent_install(
                 )
             )
     return checks
+
+
+def _check_retired_search_helper(skill_root: Path, prefix: str, label: str) -> ValidationCheck:
+    path = skill_root / 'scripts/search_jsonl_history.py'
+    present = path.exists() or path.is_symlink()
+    return ValidationCheck(id=prefix + 'retired_search_helper',
+        name=f'{label} retired ordinary engine absence', status='fail' if present else 'pass',
+        detail='Retired search helper remains active.' if present else 'No retired second ordinary engine is installed.',
+        paths=[str(path)], recovery=['Run the current installer to back up and retire this exact helper.'] if present else [])
 
 
 def _check_agent_backup_skill_dirs(
